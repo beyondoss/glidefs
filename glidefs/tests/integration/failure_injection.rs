@@ -163,6 +163,8 @@ fn create_test_cache(
         device_name: name.to_string(),
         device_size: 10 * 1024 * 1024, // 10MB
         block_size: BLOCK_SIZE,
+        dirty_budget_bytes: 0,
+        flush_trigger: None,
     };
 
     let metrics = Arc::new(ExportMetrics::new());

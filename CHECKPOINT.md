@@ -85,9 +85,9 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 │  │  Block-level (Glide v2):     File-level (this doc):    │  │
 │  │  • snapshot / fork           • vsock server             │  │
 │  │  • S3 packs + manifests      • checkpoint coordinator  │  │
-│  │  • cache, WAL, compression   • blob upload to S3       │  │
-│  │  • flush scheduler           • write-blobs-to-VM       │  │
-│  │  • sleep / wake / migrate      (fetch S3 → agent)      │  │
+│  │  • cache, WAL, compression   • presigned URL relay     │  │
+│  │  • flush scheduler           • write plan dispatch     │  │
+│  │  • sleep / wake / migrate      (vsock → agent)         │  │
 │  └────────────────────────────────────────────────────────┘  │
 │           │                                                   │
 │           ▼                                                   │
@@ -114,9 +114,9 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 **Separation of concerns:**
 
-- **glidefs-agent** (guest): file I/O only. Walks filesystem, hashes files, writes files, reports changes. No storage logic, no S3 access, no merge logic, no policy decisions.
-- **glidefs daemon** (host): block storage + vsock bridge. Handles block-level operations (Glide v2), coordinates with the agent over vsock, uploads blob content to S3 on checkpoint, and executes file write plans by fetching blobs from S3 and streaming them to the agent. Does NOT compute diffs, merges, or manage the checkpoint DAG.
-- **Control plane** (separate service): file-level intelligence. Manages the checkpoint DAG, computes diffs and stacked merges, orchestrates promotions, decides when to auto-checkpoint. Sends write plans to glidefs for execution.
+- **glidefs-agent** (guest): file I/O + S3 data transfer. Walks filesystem, hashes files, reports changes. Uploads blobs and manifests to S3 via presigned PUT URLs (checkpoint). Downloads blobs from S3 via presigned GET URLs and writes files atomically (write plan execution). No storage logic, no AWS credentials, no merge logic, no policy decisions. S3 access is scoped and time-limited via presigned URLs.
+- **glidefs daemon** (host): block storage + vsock control plane. Handles block-level operations (Glide v2), coordinates with the agent over vsock for checkpoint and write plan control flow. Relays presigned URLs between control plane (NATS) and agent (vsock). Does NOT transfer file data — the agent talks to S3 directly. Does NOT compute diffs, merges, or manage the checkpoint DAG.
+- **Control plane** (separate service): file-level intelligence. Manages the checkpoint DAG, computes diffs and stacked merges, orchestrates promotions, decides when to auto-checkpoint. Generates presigned URLs for S3 access. Sends write plans (with presigned GET URLs) to glidefs for relay to the agent.
 
 ---
 
@@ -290,88 +290,87 @@ MessagePack for the payload — compact binary, fast to encode/decode, libraries
 
 **Host → Agent:**
 
-| Type | Name         | Payload                           | Description                       |
-| ---- | ------------ | --------------------------------- | --------------------------------- |
-| 0x01 | CHECKPOINT   | `{ parent_manifest_hash }`        | Request file manifest + new blobs |
-| 0x02 | WRITE_FILES  | stream of `(path, mode, content)` | Write files to /repo              |
-| 0x03 | DELETE_FILES | `{ paths: [string] }`             | Delete files from /repo           |
-| 0x04 | READ_FILES   | `{ paths: [string] }`             | Read specific file contents       |
-| 0x05 | PING         | `{}`                              | Health check                      |
+| Type | Name                   | Payload                                        | Description                                |
+| ---- | ---------------------- | ---------------------------------------------- | ------------------------------------------ |
+| 0x10 | CHECKPOINT             | `{ parent_manifest_hash, working_dir, watch }` | Request file walk + hash                   |
+| 0x16 | PING                   | `{}`                                           | Health check                               |
+| 0x17 | CHECKPOINT_UPLOAD_URLS | `{ blob_urls, manifest_url }`                  | Presigned PUT URLs for S3 upload           |
+| 0x18 | WRITE_PLAN             | `{ working_dir, downloads, deletes }`          | Download blobs from S3, write/delete files |
 
 **Agent → Host:**
 
-| Type | Name            | Payload                                  | Description                              |
-| ---- | --------------- | ---------------------------------------- | ---------------------------------------- |
-| 0x81 | MANIFEST_ENTRY  | `(path, hash, size, mode)`               | One file entry (streamed)                |
-| 0x82 | BLOB            | `(hash, content)`                        | File content for a new blob              |
-| 0x83 | CHECKPOINT_DONE | `{ total_files, new_blobs, elapsed_ms }` | End of checkpoint stream                 |
-| 0x84 | WRITE_DONE      | `{ written, errors: [(path, error)] }`   | Write result                             |
-| 0x85 | DELETE_DONE     | `{ deleted, errors: [(path, error)] }`   | Delete result                            |
-| 0x86 | FILE_CONTENT    | `(path, content)`                        | Requested file content                   |
-| 0x87 | FILE_CHANGED    | `{ }`                                    | Notification: something changed in /repo |
-| 0x88 | PONG            | `{ uptime_ms }`                          | Health response                          |
-| 0xFF | ERROR           | `{ code, message }`                      | Error response                           |
+| Type | Name             | Payload                                                                | Description                              |
+| ---- | ---------------- | ---------------------------------------------------------------------- | ---------------------------------------- |
+| 0x92 | CHECKPOINT_DONE  | `{ manifest_hash, total_files, new_blobs, elapsed_ms, upload_errors }` | Checkpoint complete (after S3 upload)    |
+| 0x96 | FILE_CHANGED     | `{ }`                                                                  | Notification: something changed in /repo |
+| 0x97 | PONG             | `{ uptime_ms }`                                                        | Health response                          |
+| 0x98 | CHECKPOINT_READY | `{ new_blob_hashes, total_files }`                                     | Files hashed, ready for upload URLs      |
+| 0x99 | WRITE_PLAN_DONE  | `{ written, deleted, errors }`                                         | Write plan execution complete            |
+| 0xFF | ERROR            | `{ code, message }`                                                    | Error response                           |
 
 ### Checkpoint Protocol Flow
 
 ```
-glidefs (host)                          glidefs-agent (guest)
-     │                                       │
-     │  CHECKPOINT { parent_manifest_hash }   │
-     ├──────────────────────────────────────►│
-     │                                       │
-     │                                       │ 1. Load mtime index
-     │                                       │ 2. Walk /repo (skip .gitignore + .checkpointignore)
-     │                                       │ 3. For each file:
-     │                                       │    stat() → compare to mtime index
-     │                                       │    unchanged? reuse cached hash
-     │                                       │    changed? read + hash + update index
-     │                                       │ 4. Load parent manifest (if cached locally)
-     │                                       │
-     │       MANIFEST_ENTRY (path, hash, ..) │
-     │◄──────────────────────────────────────┤  (one per file, streamed)
-     │       MANIFEST_ENTRY ...              │
-     │◄──────────────────────────────────────┤
-     │       ...                             │
-     │                                       │
-     │       BLOB (hash, content)            │  (only hashes NOT in parent manifest)
-     │◄──────────────────────────────────────┤
-     │       BLOB ...                        │
-     │◄──────────────────────────────────────┤
-     │                                       │
-     │       CHECKPOINT_DONE { stats }       │
-     │◄──────────────────────────────────────┤
-     │                                       │
+glidefs (host)            control plane              glidefs-agent (guest)        S3
+     │                         │                           │                       │
+     │  CHECKPOINT { parent_manifest_hash, working_dir }   │                       │
+     ├────────────────────────────────────────────────────►│                       │
+     │                                                     │                       │
+     │                                                     │ 1. Load mtime index   │
+     │                                                     │ 2. Walk /repo         │
+     │                                                     │ 3. Hash changed files │
+     │                                                     │                       │
+     │       CHECKPOINT_READY { new_blob_hashes, total }   │                       │
+     │◄────────────────────────────────────────────────────┤                       │
+     │                         │                           │                       │
+     │  presign-upload request │                           │                       │
+     ├────────────────────────►│                           │                       │
+     │  presigned PUT URLs     │                           │                       │
+     │◄────────────────────────┤                           │                       │
+     │                         │                           │                       │
+     │  CHECKPOINT_UPLOAD_URLS { blob_urls, manifest_url } │                       │
+     ├────────────────────────────────────────────────────►│                       │
+     │                                                     │                       │
+     │                                                     │  PUT blobs (LZ4)     │
+     │                                                     ├─────────────────────►│
+     │                                                     │  PUT manifest (LZ4)  │
+     │                                                     ├─────────────────────►│
+     │                                                     │                       │
+     │       CHECKPOINT_DONE { manifest_hash, stats }      │                       │
+     │◄────────────────────────────────────────────────────┤                       │
+     │                                                     │                       │
 ```
 
-The agent sends the **full manifest** (all source files, not just changes) so the host has a self-contained snapshot. But it only sends **blob content for new hashes** — files whose hash differs from the parent manifest. For a typical checkpoint with ~100 changed files out of ~5-10K source files, this means ~5-10K small manifest entries (~1MB over vsock at >1 GB/s = ~1ms) plus ~100 blob payloads (~1MB).
+**Vsock carries only control flow — file data goes directly from guest to S3.** The agent builds a complete manifest (all source files) and identifies new blob hashes (files that differ from the parent). The host relays presigned PUT URLs from the control plane. The agent uploads blobs + manifest to S3, then reports completion. For a typical checkpoint with ~100 changed files out of ~5-10K source files, the vsock messages are tiny (hashes + URLs + stats). The bulk data (~1MB of blobs) goes to S3 in parallel via HTTP.
 
-### Restore Protocol Flow
+### Write Plan Protocol Flow (Restore / Merge)
 
 ```
-glidefs (host)                          glidefs-agent (guest)
-     │                                       │
-     │  WRITE_FILES                          │
-     │  (path: "src/main.rs",               │
-     │   mode: "0644",                       │
-     │   content: <bytes>)                   │
-     ├──────────────────────────────────────►│
-     │  (path: "src/lib.rs", ...)            │  Agent writes each file:
-     ├──────────────────────────────────────►│    write to {path}.tmp
-     │  ...                                  │    fsync
-     │                                       │    chmod
-     │  DELETE_FILES                          │    rename to {path}
-     │  { paths: ["old_file.rs"] }           │
-     ├──────────────────────────────────────►│
-     │                                       │
-     │       WRITE_DONE { written: 42 }      │
-     │◄──────────────────────────────────────┤
-     │       DELETE_DONE { deleted: 1 }      │
-     │◄──────────────────────────────────────┤
-     │                                       │
+glidefs (host)                          glidefs-agent (guest)          S3
+     │                                       │                          │
+     │  WRITE_PLAN {                         │                          │
+     │    working_dir: "/repo",              │                          │
+     │    downloads: [                       │                          │
+     │      { url, path, mode, hash }, ...   │                          │
+     │    ],                                 │                          │
+     │    deletes: ["old_file.rs"]           │                          │
+     │  }                                    │                          │
+     ├──────────────────────────────────────►│                          │
+     │                                       │                          │
+     │                                       │  GET blobs (parallel)    │
+     │                                       ├─────────────────────────►│
+     │                                       │  LZ4 decompress          │
+     │                                       │  Verify BLAKE3 hash      │
+     │                                       │  Atomic write per file:  │
+     │                                       │    tmp → fsync → rename  │
+     │                                       │  Delete removed files    │
+     │                                       │                          │
+     │  WRITE_PLAN_DONE { written, deleted } │                          │
+     │◄──────────────────────────────────────┤                          │
+     │                                       │                          │
 ```
 
-glidefs receives a write plan from the control plane, fetches blobs from S3 by hash, and streams the file content to the agent. The agent applies them with atomic per-file replacement (write to temp, fsync, rename).
+The control plane computes a write plan (what to download, what to delete) and includes presigned GET URLs for each blob. glidefs relays the plan to the agent via vsock. The agent pulls data directly from S3, decompresses, verifies hashes, and applies files with atomic per-file replacement (write to temp, fsync, rename).
 
 ### FILE_CHANGED Notifications
 
@@ -530,15 +529,20 @@ sequenceDiagram
 
     Note over GFS: 1. Glide v2 snapshot (instant)<br/>Save point exists NOW.
 
-    GFS->>AGT: CHECKPOINT { parent_manifest_hash }
+    GFS->>AGT: CHECKPOINT { parent_manifest_hash, working_dir }
     Note over AGT: Walk /repo with mtime index<br/>Hash changed files only
 
-    AGT-->>GFS: MANIFEST_ENTRY (streamed, all files)
-    AGT-->>GFS: BLOB (streamed, new hashes only)
-    AGT-->>GFS: CHECKPOINT_DONE { stats }
+    AGT-->>GFS: CHECKPOINT_READY { new_blob_hashes, total_files }
 
-    GFS->>S3: PUT blobs/{tenant}/{hash} (new blobs, parallel)
-    GFS->>S3: PUT checkpoints/{tenant}/{id}.manifest.lz4
+    GFS->>CP: NATS presign-upload { blob_hashes }
+    CP-->>GFS: { blob_urls, manifest_url }
+
+    GFS->>AGT: CHECKPOINT_UPLOAD_URLS { blob_urls, manifest_url }
+
+    AGT->>S3: PUT blobs (LZ4 compressed, parallel)
+    AGT->>S3: PUT manifest (LZ4 compressed)
+
+    AGT-->>GFS: CHECKPOINT_DONE { manifest_hash, stats }
 
     GFS-->>CP: { checkpoint_id, snapshot_id, stats }
 
@@ -553,7 +557,7 @@ sequenceDiagram
 | Agent identifies changed files               | <1ms (dirty set)      | 10-50ms (stat walk source files) |
 | Agent hash changed files (100 files, ~1MB)   | 5-20ms                | 5-20ms                           |
 | Agent walk for full manifest (paths only)    | 20-50ms               | (already done)                   |
-| vsock transfer (full manifest + new blobs)   | 10-50ms               | 10-50ms                          |
+| vsock control messages (hashes + URLs)       | <1ms                  | <1ms                             |
 | S3 uploads (manifest + ~100 blobs, parallel) | 50-200ms              | 50-200ms                         |
 | **Total**                                    | **~90-320ms**         | **~120-470ms**                   |
 
@@ -770,11 +774,11 @@ sequenceDiagram
     Note over GFS: Fork production block device
     Note over GFS: Boot new VM on fork
 
-    CP->>GFS: POST /api/exports/{name}/write-files<br/>{ writes: [(path, blob_hash)], deletes: [path] }
-    GFS->>S3: Fetch blobs by hash
-    GFS->>AGT: WRITE_FILES (stream content via vsock)
-    GFS->>AGT: DELETE_FILES
-    AGT-->>GFS: WRITE_DONE, DELETE_DONE
+    CP->>GFS: POST /api/exports/{name}/write-plan<br/>{ downloads: [(url, path, mode, hash)], deletes: [path] }
+    GFS->>AGT: WRITE_PLAN (vsock — control only)
+    AGT->>S3: GET blobs via presigned URLs (parallel)
+    Note over AGT: LZ4 decompress, verify hash,<br/>atomic write per file, delete removed files
+    AGT-->>GFS: WRITE_PLAN_DONE
     GFS-->>CP: done
 
     Note over CP: Run setup_command (npm install)<br/>Reconciles deps with merged source files.
@@ -789,7 +793,7 @@ sequenceDiagram
 
 **The common path (no overlapping files) requires zero agent involvement.** The control plane computes the write plan from manifests and precomputed changesets alone. Only when the same file was modified by both the agent and a concurrent promotion does the agent get involved — and even then, it's re-applying a tiny changeset, not merging hours of work.
 
-**The key split:** The control plane decides _what_ to write (changeset classification + write plan). glidefs decides _how_ to write it (fetch from S3, stream to agent via vsock). glidefs receives a write plan — a list of `(path, blob_hash)` pairs — and doesn't know or care that it came from a merge. It's just "put these blobs at these paths."
+**The key split:** The control plane decides _what_ to write (changeset classification + write plan with presigned URLs). glidefs relays the plan to the agent via vsock. The agent decides _how_ to write it (download from S3, decompress, verify, atomic write). glidefs receives a write plan — a list of `(url, path, mode, hash)` entries — and doesn't know or care that it came from a merge. It's just "tell the agent to apply these files."
 
 **Why the build step matters:** The merge only touches source files. Dependencies and build output are left from the production fork. `setup_command` (`npm install`) sees the merged `package.json` and installs any new dependencies. `build_command` compiles from the merged source. This is the same build pipeline as any promotion — the merge just changes which source files land before the build runs.
 
@@ -848,10 +852,11 @@ Used when restoring to a completely different checkpoint (e.g., rollback to yest
 
 1. Control plane fetches the target manifest and current VM's manifest from S3
 2. Computes diff: files to write, files to delete
-3. Sends write plan to glidefs: `{ writes: [(path, blob_hash)], deletes: [path] }`
-4. glidefs fetches blob content from S3 by hash
-5. glidefs streams WRITE_FILES + DELETE_FILES to agent via vsock
-6. Agent applies atomically per-file (temp → fsync → rename)
+3. Generates presigned GET URLs for each blob to download
+4. Sends write plan to glidefs: `{ downloads: [(url, path, mode, hash)], deletes: [path] }`
+5. glidefs relays the write plan to the agent via vsock (WRITE_PLAN message)
+6. Agent downloads blobs directly from S3, LZ4-decompresses, verifies BLAKE3 hash
+7. Agent applies atomically per-file (temp → fsync → rename), deletes removed files
 
 ### Selective Restore (Promotion)
 
@@ -928,7 +933,7 @@ At 60 checkpoints/hour, an active AI agent produces 400+ checkpoints in a workda
 
 ### When Watching is Paused
 
-- During restore (agent pauses fanotify processing while receiving WRITE_FILES, resumes after)
+- During restore (agent pauses fanotify processing while executing WRITE_PLAN, resumes after)
 - During build (the control plane disables auto-checkpoint while setup_command / build_command runs, re-enables after)
 - In production mode (no auto-checkpoint — explicit only)
 
@@ -982,7 +987,7 @@ The agent enforces:
 
 - **Path confinement.** Only reads/writes under the configured checkpoint root (/repo). Requests for paths outside (e.g., `../../etc/shadow`) are rejected. Path traversal is normalized before checking.
 - **No shell execution.** The agent reads files, writes files, and walks directories. It never executes commands, interprets arguments as shell, or spawns processes.
-- **No S3 access.** The agent never touches S3. All storage goes through glidefs on the host.
+- **S3 via presigned URLs only.** The agent uploads/downloads blobs to/from S3 using presigned URLs provided by the host. No AWS credentials are stored or accessible in the guest. URLs are scoped to specific keys and expire after minutes. The agent cannot list, delete, or access any S3 objects beyond the URLs it receives.
 
 ### Blob Isolation
 
@@ -1004,11 +1009,11 @@ Manifests are stored in S3 with SSE-KMS using the tenant's key (same encryption 
 
 New endpoints on glidefs alongside the existing Glide v2 block-level API. These are execution-level — glidefs does what it's told.
 
-| Method | Path                              | Description                                                |
-| ------ | --------------------------------- | ---------------------------------------------------------- |
-| POST   | `/api/exports/{name}/checkpoint`  | Glide v2 snapshot + file manifest + blob upload            |
-| POST   | `/api/exports/{name}/write-files` | Execute a write plan: fetch blobs from S3, stream to agent |
-| PUT    | `/api/exports/{name}`             | Export config (checkpoint root, auto-checkpoint flag)      |
+| Method | Path                             | Description                                                                |
+| ------ | -------------------------------- | -------------------------------------------------------------------------- |
+| POST   | `/api/exports/{name}/checkpoint` | Glide v2 snapshot + file manifest + blob upload                            |
+| POST   | `/api/exports/{name}/write-plan` | Execute a write plan: agent downloads blobs from S3 via presigned GET URLs |
+| PUT    | `/api/exports/{name}`            | Export config (checkpoint root, auto-checkpoint flag)                      |
 
 ```
 POST /api/exports/{name}/checkpoint
@@ -1029,11 +1034,11 @@ POST /api/exports/{name}/checkpoint
 ```
 
 ```
-POST /api/exports/{name}/write-files
+POST /api/exports/{name}/write-plan
 {
-  "writes": [
-    { "path": "src/main.rs", "blob_hash": "blake3:2b4c...", "mode": "0644" },
-    { "path": "src/lib.rs", "blob_hash": "blake3:9e1d...", "mode": "0644" }
+  "downloads": [
+    { "url": "https://s3.../blob1", "path": "src/main.rs", "mode": 420, "hash": "2b4c..." },
+    { "url": "https://s3.../blob2", "path": "src/lib.rs", "mode": 420, "hash": "9e1d..." }
   ],
   "deletes": ["src/deprecated.rs"]
 }
@@ -1113,13 +1118,14 @@ A single static binary (`glidefs-agent`) baked into the base image. No runtime d
 The agent does:
 
 - Watch /repo for file changes (fanotify)
-- Walk /repo, hash files, stream manifest to host (vsock)
-- Write files to /repo on restore/merge (vsock)
+- Walk /repo, hash files, build manifest
+- Upload blobs + manifest to S3 via presigned PUT URLs (checkpoint)
+- Download blobs from S3 via presigned GET URLs and write files atomically (write plan)
 - Maintain mtime index for incremental hashing
 
 The agent does NOT:
 
-- Manage block devices or talk to S3
+- Manage block devices or hold AWS credentials
 - Know about tenants, apps, boxes, or checkpoints
 - Run builds or user commands
 - Serve HTTP or expose network ports
@@ -1137,7 +1143,7 @@ It reads files, hashes files, writes files, and reports changes. The host tells 
 | **Lines of code** | ~2000-3000 (gitignore-compatible glob parsing, fanotify filesystem watching, atomic writes with error propagation, mtime index with corruption detection) |
 | **Memory usage**  | ~10-50MB (mtime index + vsock buffers)                                                                                                                    |
 | **CPU usage**     | Negligible except during checkpoint (hashing)                                                                                                             |
-| **Dependencies**  | blake3, rmp-serde (MessagePack), vsock, ignore (gitignore-compatible glob matching for .checkpointignore)                                                 |
+| **Dependencies**  | blake3, rmp-serde (MessagePack), vsock, ignore (gitignore-compatible glob matching), reqwest (S3 HTTP), lz4_flex (compression)                            |
 
 ### File Ownership
 
@@ -1176,10 +1182,10 @@ On SIGTERM:
 
 | Component                     | Location                  | Role                                                                                          |
 | ----------------------------- | ------------------------- | --------------------------------------------------------------------------------------------- |
-| **glidefs-agent**             | Guest VM (~2000-3000 LOC) | File I/O — walk, hash, read, write. vsock client. fanotify watcher.                           |
-| **vsock server**              | glidefs host daemon       | Connects to agent, sends requests, receives manifests and blobs.                              |
-| **Checkpoint coordinator**    | glidefs host daemon       | Orchestrates: Glide v2 snapshot → agent manifest → blob upload → S3 store.                    |
-| **Write plan executor**       | glidefs host daemon       | Fetches blobs from S3 by hash, streams to agent via vsock.                                    |
+| **glidefs-agent**             | Guest VM (~2000-3000 LOC) | File I/O + S3 transfer. Walk, hash, upload blobs/manifest to S3. Download blobs, write files. |
+| **vsock server**              | glidefs host daemon       | Connects to agent, sends control messages, relays presigned URLs.                             |
+| **Checkpoint coordinator**    | glidefs host daemon       | Orchestrates: Glide v2 snapshot → agent checkpoint → presigned URL relay → completion.        |
+| **Write plan dispatcher**     | glidefs host daemon       | Relays write plans (with presigned GET URLs) from control plane to agent via vsock.           |
 | **Manifest store**            | S3                        | `checkpoints/{tenant}/{id}.manifest.lz4` — file-level manifests.                              |
 | **Blob store**                | S3                        | `blobs/{tenant}/{prefix}/{hash}` — file content, content-addressed.                           |
 | **Diff engine**               | Control plane             | Compares two manifests, fetches blobs, generates unified diffs.                               |
@@ -1216,9 +1222,8 @@ N = checkpoints_in_DAG (per export)
 | **Hash changed files**                 | O(C × avg_file_size) | O(max_file_size) | No          | BLAKE3, ~1GB/s                                          |
 | **Build full manifest**                | O(F)                 | O(F)             | **Watch**   | Must enumerate all paths for self-contained manifest    |
 | **Determine new blobs**                | O(C)                 | —                | No          | Compare hashes against parent manifest (HashMap lookup) |
-| **vsock transfer (manifest)**          | O(F)                 | O(F)             | No          | ~5-10K entries at ~150 bytes = ~1MB, <1ms at >1GB/s     |
-| **vsock transfer (blobs)**             | O(B × avg_file_size) | O(max_file_size) | No          | Streaming, ~100 files ≈ 1MB                             |
-| **S3 blob upload**                     | O(B)                 | —                | No          | Parallel PUTs, idempotent (content-addressed)           |
+| **vsock control (hashes + URLs)**      | O(B)                 | O(B)             | No          | ~100 hashes + URLs, <1ms over vsock                     |
+| **S3 blob upload (agent → S3)**        | O(B × avg_file_size) | O(max_file_size) | No          | Parallel PUTs via presigned URLs, LZ4 compressed        |
 | **S3 manifest upload**                 | O(1)                 | —                | No          | Single object, ~3MB compressed                          |
 | **DB checkpoint record**               | O(1)                 | —                | No          | One INSERT into checkpoint DAG                          |
 
@@ -1254,12 +1259,11 @@ Without the path cache, every checkpoint requires a full stat walk of /repo to e
 
 ### Restore / Write Plan Execution
 
-| Operation                   | Time            | Space            | Bottleneck? | Notes                             |
-| --------------------------- | --------------- | ---------------- | ----------- | --------------------------------- |
-| **Compute write plan**      | O(F)            | O(F)             | No          | Diff current manifest vs target   |
-| **Fetch blobs from S3**     | O(R)            | O(R × avg_size)  | No          | Parallel GETs, only changed files |
-| **Stream to agent (vsock)** | O(R × avg_size) | O(max_file_size) | No          | >1GB/s vsock throughput           |
-| **Agent writes files**      | O(R × avg_size) | O(max_file_size) | No          | write → fsync → rename per file   |
+| Operation                   | Time            | Space            | Bottleneck? | Notes                            |
+| --------------------------- | --------------- | ---------------- | ----------- | -------------------------------- |
+| **Compute write plan**      | O(F)            | O(F)             | No          | Diff current manifest vs target  |
+| **Agent downloads from S3** | O(R × avg_size) | O(R × avg_size)  | No          | Parallel GETs via presigned URLs |
+| **Agent writes files**      | O(R × avg_size) | O(max_file_size) | No          | LZ4 decompress → fsync → rename  |
 
 **Verdict: O(R) — proportional to files being restored.** For a promotion merge with 50 changed source files, this is <1 second.
 

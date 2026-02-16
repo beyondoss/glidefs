@@ -42,7 +42,8 @@
       "WebFetch(domain:lib.rs)",
       "WebFetch(domain:foyer-rs.github.io)",
       "Bash(ls:*)",
-      "Bash(cargo metadata:*)"
+      "Bash(cargo metadata:*)",
+      "Bash(gsed:*)"
     ]
   }
 }

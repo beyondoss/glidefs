@@ -275,6 +275,8 @@ mod tests {
             device_name: "test".to_string(),
             device_size: 1024 * 1024, // 1MB
             block_size: 4096,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
 
         // Create in-memory S3 store for tests

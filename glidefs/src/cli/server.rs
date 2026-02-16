@@ -104,6 +104,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         nbd_config.block_size(),
         nbd_config.blocks_per_batch(),
         nbd_config.sync_delay_ms(),
+        nbd_config.dirty_budget_gb(),
         auto_create_size_gb,
         clean_cache,
     ));

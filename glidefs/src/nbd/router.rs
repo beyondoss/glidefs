@@ -7,13 +7,14 @@ use crate::config::ExportConfig;
 use crate::nbd::block_store::S3BlockStore;
 use crate::nbd::cache::BlockCache;
 use crate::nbd::content_store::ContentStore;
+use crate::nbd::flush_scheduler::{flush_scheduler, FlushMode};
 use crate::nbd::handler::NBDBlockHandler;
 use crate::nbd::manifest::Manifest;
 use crate::nbd::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::nbd::pack::PackLocation;
 use crate::nbd::pack_index::HostPackIndex;
 use crate::nbd::state::Active;
-use crate::nbd::write_cache::{sync_worker, CacheError, SnapshotResult, WriteCache, WriteCacheConfig};
+use crate::nbd::write_cache::{CacheError, SnapshotResult, WriteCache, WriteCacheConfig};
 use crate::task::spawn_named;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -24,7 +25,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -88,17 +89,33 @@ pub struct ExportState {
     pub pack_index: Arc<HostPackIndex>,
     pub readonly: bool,
     pub metrics: Arc<ExportMetrics>,
-    sync_shutdown: watch::Sender<bool>,
-    sync_handle: JoinHandle<()>,
+    flush_mode_tx: watch::Sender<FlushMode>,
+    flush_trigger: Arc<Notify>,
+    flush_shutdown_tx: watch::Sender<bool>,
+    flush_handle: JoinHandle<()>,
 }
 
 impl ExportState {
-    /// Drain all dirty blocks to S3.
+    /// Drain all dirty blocks to S3 via v2 content-addressed packs.
     pub async fn drain(&self) -> Result<(), RouterError> {
-        self.cache
-            .drain_for_snapshot(&self.s3_store)
-            .await
-            .map_err(RouterError::Cache)
+        // Loop until no more dirty blocks remain (concurrent writes may
+        // produce new dirty data between flushes).
+        loop {
+            let stats = self
+                .cache
+                .flush_to_s3(&self.content_store, &self.pack_index)
+                .await
+                .map_err(RouterError::Cache)?;
+            if stats.blocks_flushed == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Get the current flush mode.
+    pub fn flush_mode(&self) -> FlushMode {
+        self.flush_mode_tx.borrow().clone()
     }
 }
 
@@ -126,6 +143,9 @@ pub struct ExportRouter {
 
     /// Sync delay in milliseconds (time to coalesce writes before S3 upload)
     sync_delay_ms: u64,
+
+    /// Dirty budget in GB per export (triggers flush when exceeded)
+    dirty_budget_gb: f64,
 
     /// Auto-create size for on-demand export creation (None = disabled)
     auto_create_size_gb: Option<f64>,
@@ -156,6 +176,7 @@ impl ExportRouter {
         block_size: usize,
         blocks_per_batch: u64,
         sync_delay_ms: u64,
+        dirty_budget_gb: f64,
         auto_create_size_gb: Option<f64>,
         clean_cache: Arc<dyn BlockCache>,
     ) -> Self {
@@ -167,6 +188,7 @@ impl ExportRouter {
             block_size,
             blocks_per_batch,
             sync_delay_ms,
+            dirty_budget_gb,
             auto_create_size_gb,
             pack_index: Arc::new(HostPackIndex::new()),
             clean_cache,
@@ -326,12 +348,19 @@ impl ExportRouter {
         let clean_cache = Arc::clone(&self.clean_cache);
         let pack_index = Arc::clone(&self.pack_index);
 
+        // Flush trigger shared between cache write path and scheduler
+        let flush_trigger = Arc::new(Notify::new());
+        let dirty_budget_bytes = (config.dirty_budget_gb
+            .unwrap_or(self.dirty_budget_gb) * 1024.0 * 1024.0 * 1024.0) as u64;
+
         // Create write cache — either from manifest (fork) or fresh (normal)
         let cache_config = WriteCacheConfig {
             cache_dir: self.cache_dir.clone(),
             device_name: name.clone(),
             device_size: config.size_bytes(),
             block_size,
+            dirty_budget_bytes,
+            flush_trigger: Some(Arc::clone(&flush_trigger)),
         };
 
         let cache = if let Some(manifest_name) = manifest_name {
@@ -412,18 +441,18 @@ impl ExportRouter {
             Arc::clone(&metrics),
         ));
 
-        // Start sync worker for this export
-        let (sync_shutdown_tx, sync_shutdown_rx) = watch::channel(false);
-        let sync_cache = Arc::clone(&cache);
-        let sync_s3 = Arc::clone(&s3_store);
+        // Start flush scheduler for this export
+        let flush_mode = config.flush_mode.clone().unwrap_or_default();
+        let (flush_mode_tx, flush_mode_rx) = watch::channel(flush_mode);
+        let (flush_shutdown_tx, flush_shutdown_rx) = watch::channel(false);
+        let flush_cache = Arc::clone(&cache);
+        let flush_cs = Arc::clone(&content_store);
+        let flush_pi = Arc::clone(&pack_index);
+        let flush_trig = Arc::clone(&flush_trigger);
         let export_name = name.clone();
-        let sync_config = super::write_cache::SyncWorkerConfig {
-            hot_batch_cooldown: std::time::Duration::from_millis(self.sync_delay_ms),
-            ..Default::default()
-        };
-        let sync_handle = spawn_named(&format!("sync-{}", name), async move {
-            sync_worker(sync_cache, sync_s3, sync_config, sync_shutdown_rx).await;
-            info!("Sync worker for export '{}' stopped", export_name);
+        let flush_handle = spawn_named(&format!("flush-{}", name), async move {
+            flush_scheduler(flush_cache, flush_cs, flush_pi, flush_mode_rx, flush_trig, flush_shutdown_rx).await;
+            info!("Flush scheduler for export '{}' stopped", export_name);
         });
 
         // Store export state
@@ -435,8 +464,10 @@ impl ExportRouter {
             pack_index,
             readonly,
             metrics,
-            sync_shutdown: sync_shutdown_tx,
-            sync_handle,
+            flush_mode_tx,
+            flush_trigger,
+            flush_shutdown_tx,
+            flush_handle,
         };
 
         let mut exports = self.exports.write().await;
@@ -546,6 +577,25 @@ impl ExportRouter {
         Ok(())
     }
 
+    /// Change the flush mode for an export at runtime.
+    pub async fn set_flush_mode(&self, name: &str, mode: FlushMode) -> Result<(), RouterError> {
+        let exports = self.exports.read().await;
+        let state = exports
+            .get(name)
+            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+        state
+            .flush_mode_tx
+            .send(mode)
+            .map_err(|_| RouterError::Manifest("flush scheduler stopped".to_string()))?;
+        Ok(())
+    }
+
+    /// Get the current flush mode for an export.
+    pub async fn get_flush_mode(&self, name: &str) -> Option<FlushMode> {
+        let exports = self.exports.read().await;
+        exports.get(name).map(|s| s.flush_mode())
+    }
+
     /// Promote a readonly export to read-write.
     pub async fn promote_export(&self, name: &str) -> Result<(), RouterError> {
         let mut exports = self.exports.write().await;
@@ -624,6 +674,8 @@ impl ExportRouter {
             size_gb: new_size_gb,
             s3_prefix: None, // Will use name as prefix (same as before)
             block_size: Some(block_size),
+            flush_mode: None,
+            dirty_budget_gb: None,
         };
 
         self.create_export(config, readonly, None).await?;
@@ -659,21 +711,44 @@ impl ExportRouter {
 
         info!("Removing export '{}'...", name);
 
-        // 1. Signal sync worker to stop
-        let _ = state.sync_shutdown.send(true);
+        let ExportState {
+            handler,
+            cache,
+            s3_store,
+            content_store,
+            pack_index,
+            flush_shutdown_tx,
+            flush_handle,
+            ..
+        } = state;
 
-        // 2. Wait for sync worker to exit (releases its Arc clone)
-        if let Err(e) = state.sync_handle.await {
-            warn!("Sync worker for '{}' panicked: {}", name, e);
+        // 1. Signal flush scheduler to stop
+        let _ = flush_shutdown_tx.send(true);
+
+        // 2. Wait for flush scheduler to exit (releases its Arc clone)
+        if let Err(e) = flush_handle.await {
+            warn!("Flush scheduler for '{}' panicked: {}", name, e);
         }
 
-        // 3. Drop the handler (releases its Arc clone)
-        drop(state.handler);
+        // 3. V2 drain: flush remaining dirty data
+        loop {
+            match cache.flush_to_s3(&content_store, &pack_index).await {
+                Ok(stats) if stats.blocks_flushed == 0 => break,
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to drain export '{}': {}", name, e);
+                    break;
+                }
+            }
+        }
 
-        // 6. Unwrap the Arc and transition through Draining state
-        match Arc::try_unwrap(state.cache) {
+        // 4. Drop the handler (releases its Arc clone)
+        drop(handler);
+
+        // 5. Unwrap the Arc and transition through Draining state
+        match Arc::try_unwrap(cache) {
             Ok(cache) => {
-                match cache.shutdown(&state.s3_store).await {
+                match cache.shutdown(&s3_store).await {
                     Ok(draining) => {
                         draining.finish();
                         info!("Export '{}' drained and removed cleanly", name);
@@ -684,15 +759,11 @@ impl ExportRouter {
                 }
             }
             Err(arc) => {
-                // Fallback if someone still holds a reference
                 warn!(
-                    "Export '{}' has {} references, using fallback drain",
+                    "Export '{}' has {} references, cannot transition typestate",
                     name,
                     Arc::strong_count(&arc)
                 );
-                if let Err(e) = arc.drain_for_snapshot(&state.s3_store).await {
-                    warn!("Failed to drain export '{}': {}", name, e);
-                }
             }
         }
 
@@ -728,24 +799,45 @@ impl ExportRouter {
         for (name, state) in export_list {
             info!("Shutting down export '{}'...", name);
 
-            // 1. Signal sync worker to stop
-            let _ = state.sync_shutdown.send(true);
+            let ExportState {
+                handler,
+                cache,
+                s3_store,
+                content_store,
+                pack_index,
+                flush_shutdown_tx,
+                flush_handle,
+                ..
+            } = state;
 
-            // 2. Wait for sync worker to exit (releases its Arc clone)
-            if let Err(e) = state.sync_handle.await {
-                warn!("Sync worker for '{}' panicked: {}", name, e);
+            // 1. Signal flush scheduler to stop
+            let _ = flush_shutdown_tx.send(true);
+
+            // 2. Wait for flush scheduler to exit (releases its Arc clone)
+            if let Err(e) = flush_handle.await {
+                warn!("Flush scheduler for '{}' panicked: {}", name, e);
             }
 
-            // 3. Drop the handler (releases its Arc clone)
-            drop(state.handler);
+            // 3. V2 drain: flush remaining dirty data
+            loop {
+                match cache.flush_to_s3(&content_store, &pack_index).await {
+                    Ok(stats) if stats.blocks_flushed == 0 => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Failed to drain export '{}': {}", name, e);
+                        break;
+                    }
+                }
+            }
 
-            // 4. Now we should be the only holder - unwrap the Arc
-            match Arc::try_unwrap(state.cache) {
+            // 4. Drop the handler (releases its Arc clone)
+            drop(handler);
+
+            // 5. Unwrap the Arc and transition through Draining state
+            match Arc::try_unwrap(cache) {
                 Ok(cache) => {
-                    // 7. Transition Active → Draining via shutdown()
-                    match cache.shutdown(&state.s3_store).await {
+                    match cache.shutdown(&s3_store).await {
                         Ok(draining) => {
-                            // 8. Finish draining
                             draining.finish();
                             info!("Export '{}' shut down cleanly", name);
                         }
@@ -755,15 +847,11 @@ impl ExportRouter {
                     }
                 }
                 Err(arc) => {
-                    // Someone still holds a reference - fall back to drain_for_snapshot
                     warn!(
-                        "Export '{}' has {} references, using fallback drain",
+                        "Export '{}' has {} references, cannot transition typestate",
                         name,
                         Arc::strong_count(&arc)
                     );
-                    if let Err(e) = arc.drain_for_snapshot(&state.s3_store).await {
-                        warn!("Failed to drain export '{}': {}", name, e);
-                    }
                 }
             }
         }
@@ -788,6 +876,7 @@ impl ExportRouter {
             128 * 1024, // 128KB blocks
             10,         // 10 blocks per batch
             100,        // 100ms sync delay
+            5.0,        // 5GB dirty budget
             None,       // No auto-create in tests
             Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
         )
@@ -826,6 +915,7 @@ mod tests {
             128 * 1024, // 128KB blocks
             10,         // 10 blocks per batch
             100,        // 100ms sync delay
+            5.0,        // 5GB dirty budget
             None,       // No auto-create in tests
             Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
         )
@@ -837,6 +927,8 @@ mod tests {
             size_gb: 0.01, // 10MB
             s3_prefix: None,
             block_size: None,
+            flush_mode: None,
+            dirty_budget_gb: None,
         }
     }
 
@@ -1173,18 +1265,24 @@ mod tests {
                 size_gb: 1.0,
                 s3_prefix: None,
                 block_size: None,
+                flush_mode: None,
+                dirty_budget_gb: None,
             },
             ExportConfig {
                 name: "discover-vol2".to_string(),
                 size_gb: 2.0,
                 s3_prefix: None,
                 block_size: None,
+                flush_mode: None,
+                dirty_budget_gb: None,
             },
             ExportConfig {
                 name: "discover-vol3".to_string(),
                 size_gb: 3.0,
                 s3_prefix: None,
                 block_size: None,
+                flush_mode: None,
+                dirty_budget_gb: None,
             },
         ];
 
@@ -1293,6 +1391,8 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("source".to_string()), // same S3 prefix as source
             block_size: None,
+            flush_mode: None,
+            dirty_budget_gb: None,
         };
         router.create_export(fork_config, false, Some("source")).await.unwrap();
 
@@ -1319,6 +1419,8 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("src".to_string()),
             block_size: None,
+            flush_mode: None,
+            dirty_budget_gb: None,
         };
         router.create_export(fork_config, false, Some("src")).await.unwrap();
 
@@ -1351,6 +1453,8 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("nonexistent-source".to_string()),
             block_size: None,
+            flush_mode: None,
+            dirty_budget_gb: None,
         };
 
         let result = router.create_export(config, false, Some("does-not-exist")).await;

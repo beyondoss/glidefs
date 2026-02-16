@@ -27,6 +27,8 @@ fn test_config(dir: &TempDir, name: &str) -> WriteCacheConfig {
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
+        dirty_budget_bytes: 0,
+        flush_trigger: None,
     }
 }
 
@@ -613,6 +615,8 @@ async fn test_device_size_shrink_rejected() {
         device_name: config.device_name.clone(),
         device_size: config.device_size / 2, // Halve the size
         block_size: config.block_size,
+        dirty_budget_bytes: 0,
+        flush_trigger: None,
     };
 
     // Resize data file to match new config

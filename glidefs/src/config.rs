@@ -5,6 +5,8 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
+use crate::nbd::flush_scheduler::FlushMode;
+
 // Note: Block-level compression is intentionally NOT implemented.
 // ZFS handles compression at its layer, and block-level compression would:
 // 1. Interfere with ZFS's own compression
@@ -106,6 +108,11 @@ pub struct NbdConfig {
     /// Size of the block device in gigabytes (DEPRECATED: use exports array instead)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub device_size_gb: Option<f64>,
+
+    /// Dirty budget in GB (default: 5GB). When an export's unflushed data
+    /// exceeds this threshold, the flush scheduler is triggered.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dirty_budget_gb: Option<f64>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -127,6 +134,14 @@ pub struct ExportConfig {
     /// Larger blocks (256KB+) improve throughput for sequential I/O.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block_size: Option<usize>,
+
+    /// Flush mode for this export (default: inherit from global or DemandDriven).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub flush_mode: Option<FlushMode>,
+
+    /// Dirty budget in GB for this export (default: inherit from global dirty_budget_gb).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dirty_budget_gb: Option<f64>,
 }
 
 impl ExportConfig {
@@ -172,6 +187,13 @@ impl NbdConfig {
         self.auto_create_size_gb
     }
 
+    pub const DEFAULT_DIRTY_BUDGET_GB: f64 = 5.0;
+
+    /// Get the dirty budget in GB (default: 5GB).
+    pub fn dirty_budget_gb(&self) -> f64 {
+        self.dirty_budget_gb.unwrap_or(Self::DEFAULT_DIRTY_BUDGET_GB)
+    }
+
     /// Get the list of exports, handling legacy single-device config.
     pub fn get_exports(&self) -> Vec<ExportConfig> {
         if !self.exports.is_empty() {
@@ -185,6 +207,8 @@ impl NbdConfig {
                 size_gb,
                 s3_prefix: None,
                 block_size: None,
+                flush_mode: None,
+                dirty_budget_gb: None,
             }];
         }
 
@@ -194,6 +218,8 @@ impl NbdConfig {
             size_gb: Self::DEFAULT_DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
+            flush_mode: None,
+            dirty_budget_gb: None,
         }]
     }
 }
@@ -380,9 +406,12 @@ impl Settings {
                         size_gb: 100.0,
                         s3_prefix: None,
                         block_size: None,
+                        flush_mode: None,
+                        dirty_budget_gb: None,
                     }],
                     device_name: None,
                     device_size_gb: None,
+                    dirty_budget_gb: None,
                 }),
             },
             aws: Some(AwsConfig(aws_config)),

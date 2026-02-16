@@ -457,6 +457,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                         size_gb,
                         s3_prefix: None,
                         block_size: None,
+                        flush_mode: None,
+                        dirty_budget_gb: None,
                     };
 
                     if let Err(e) = self.router.create_export(config, false, None).await {

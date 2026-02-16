@@ -33,6 +33,8 @@ fn create_test_cache(
         device_name: "proptest".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
+        dirty_budget_bytes: 0,
+        flush_trigger: None,
     };
 
     let metrics = Arc::new(ExportMetrics::new());

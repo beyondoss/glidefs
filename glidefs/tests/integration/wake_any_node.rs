@@ -26,6 +26,8 @@ fn create_test_cache(
         device_name: name.to_string(),
         device_size: 10 * 1024 * 1024, // 10MB
         block_size: 128 * 1024,        // 128KB
+        dirty_budget_bytes: 0,
+        flush_trigger: None,
     };
 
     let _s3_store = Arc::new(

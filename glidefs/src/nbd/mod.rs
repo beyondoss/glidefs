@@ -3,6 +3,7 @@ pub mod block_map;
 pub mod block_store;
 pub mod cache;
 pub mod error;
+pub mod flush_scheduler;
 pub mod handler;
 pub mod content_store;
 pub mod manifest;

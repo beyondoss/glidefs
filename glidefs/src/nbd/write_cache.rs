@@ -281,6 +281,14 @@ pub struct WriteCacheConfig {
 
     /// Block size in bytes
     pub block_size: usize,
+
+    /// Dirty byte budget (0 = no budget). When exceeded, the flush scheduler
+    /// is notified to perform a flush cycle.
+    pub dirty_budget_bytes: u64,
+
+    /// Flush trigger notification. When dirty bytes exceed the budget,
+    /// the write path calls `notify_one()` to wake the flush scheduler.
+    pub flush_trigger: Option<Arc<Notify>>,
 }
 
 impl WriteCacheConfig {
@@ -371,8 +379,14 @@ pub(crate) struct CacheInner {
     /// Mutex is effectively uncontended: single writer per export.
     wal: Mutex<Wal>,
 
-    /// Total dirty bytes (for budget enforcement in Phase 6).
+    /// Total dirty bytes for budget enforcement.
+    /// Incremented when a block transitions Clean→Dirty or Syncing→Dirty.
+    /// Decremented in flush_dirty_inner when a block is successfully flushed.
     dirty_bytes: AtomicU64,
+
+    /// Flush trigger notification. When dirty bytes exceed the budget,
+    /// the write path calls `notify_one()` to wake the flush scheduler.
+    flush_trigger: Option<Arc<Notify>>,
 
     /// Export name (used in WAL entries).
     export_name: String,
@@ -788,6 +802,7 @@ impl WriteCache<Initializing> {
         };
 
         let dirty_bytes_count: u64 = dirty_store_map.len() as u64 * chunk_size as u64;
+        let flush_trigger = config.flush_trigger.clone();
 
         let inner = Arc::new(CacheInner {
             config,
@@ -805,6 +820,7 @@ impl WriteCache<Initializing> {
             dirty_store: Mutex::new(dirty_store_map),
             wal: Mutex::new(wal),
             dirty_bytes: AtomicU64::new(dirty_bytes_count),
+            flush_trigger,
             export_name,
         });
 
@@ -873,6 +889,7 @@ impl WriteCache<Initializing> {
         let sequence = SequenceNumber::new(manifest.sequence);
         let wal = Wal::open(&config.wal_path())?;
         let export_name = config.device_name.clone();
+        let flush_trigger = config.flush_trigger.clone();
 
         let inner = Arc::new(CacheInner {
             config,
@@ -889,6 +906,7 @@ impl WriteCache<Initializing> {
             dirty_store: Mutex::new(HashMap::new()),
             wal: Mutex::new(wal),
             dirty_bytes: AtomicU64::new(0),
+            flush_trigger,
             export_name,
         });
 
@@ -1112,8 +1130,6 @@ impl WriteCache<Active> {
         self.inner.data_file.write_all_at(data, offset)?;
 
         // Mark affected blocks as dirty (lock-free)
-        let mut newly_dirty = false;
-
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx >= self.inner.num_blocks {
@@ -1143,8 +1159,8 @@ impl WriteCache<Active> {
                         .is_ok()
                     {
                         self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        self.inner.dirty_queue.push(block);
-                        newly_dirty = true;
+                        self.inner.dirty_bytes.fetch_add(block_size as u64, Ordering::Relaxed);
+
                         break;
                     }
                     // CAS failed, retry
@@ -1161,8 +1177,8 @@ impl WriteCache<Active> {
                     {
                         self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
                         self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        self.inner.dirty_queue.push(block);
-                        newly_dirty = true;
+                        self.inner.dirty_bytes.fetch_add(block_size as u64, Ordering::Relaxed);
+
                         break;
                     }
                     // CAS failed, retry
@@ -1215,9 +1231,6 @@ impl WriteCache<Active> {
 
                 // Dirty store insert (Mutex, uncontended)
                 self.inner.dirty_store.lock().unwrap().insert(hash, Bytes::from(chunk_buf));
-
-                // Track dirty bytes
-                self.inner.dirty_bytes.fetch_add(block_size as u64, Ordering::Relaxed);
             }
 
             // Flush WAL buffer
@@ -1226,9 +1239,14 @@ impl WriteCache<Active> {
             }
         }
 
-        // Wake sync worker if we added dirty blocks
-        if newly_dirty {
-            self.inner.dirty_notify.notify_one();
+        // Budget enforcement — signal flush scheduler if over budget
+        if let Some(ref trigger) = self.inner.flush_trigger {
+            if self.inner.config.dirty_budget_bytes > 0 {
+                let current = self.inner.dirty_bytes.load(Ordering::Relaxed);
+                if current > self.inner.config.dirty_budget_bytes {
+                    trigger.notify_one();
+                }
+            }
         }
 
         // If using a forked block map, check if overlay is large enough to flatten
@@ -1721,8 +1739,6 @@ impl WriteCache<Active> {
         let start_block = offset / block_size;
         let end_block = (offset + len - 1) / block_size;
 
-        let mut newly_dirty = false;
-
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx >= self.inner.num_blocks {
@@ -1751,8 +1767,8 @@ impl WriteCache<Active> {
                         .is_ok()
                     {
                         self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        self.inner.dirty_queue.push(block);
-                        newly_dirty = true;
+                        self.inner.dirty_bytes.fetch_add(self.inner.config.block_size as u64, Ordering::Relaxed);
+
                         break;
                     }
                 } else if current == BlockState::Syncing as u8 {
@@ -1767,19 +1783,14 @@ impl WriteCache<Active> {
                     {
                         self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
                         self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        self.inner.dirty_queue.push(block);
-                        newly_dirty = true;
+                        self.inner.dirty_bytes.fetch_add(self.inner.config.block_size as u64, Ordering::Relaxed);
+
                         break;
                     }
                 } else {
                     break;
                 }
             }
-        }
-
-        // Wake sync worker if we added dirty blocks
-        if newly_dirty {
-            self.inner.dirty_notify.notify_one();
         }
     }
 
@@ -2332,6 +2343,39 @@ impl WriteCache<Active> {
         Ok(etag)
     }
 
+    /// Flush dirty blocks to S3 as packs (no manifest upload).
+    ///
+    /// Returns flush statistics and the sequence cutpoint for a subsequent
+    /// `sync_manifest()` call. Used by the flush scheduler to separate
+    /// pack flushes (~5s) from manifest syncs (~60s).
+    pub async fn flush_packs(
+        &self,
+        content_store: &ContentStore,
+        host_pack_index: &HostPackIndex,
+    ) -> Result<(FlushStats, u64), CacheError> {
+        self.flush_dirty_inner(content_store, host_pack_index).await
+    }
+
+    /// Upload a manifest reflecting the current block map state.
+    ///
+    /// Call after `flush_packs()` with the returned `seq_cutpoint` to persist
+    /// a recovery manifest. Separated from pack flushes so the scheduler can
+    /// sync manifests at a lower frequency.
+    pub async fn sync_manifest(
+        &self,
+        content_store: &ContentStore,
+        host_pack_index: &HostPackIndex,
+        seq_cutpoint: u64,
+    ) -> Result<(), CacheError> {
+        self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        Ok(())
+    }
+
+    /// Current dirty bytes outstanding (unflushed writes).
+    pub fn dirty_bytes(&self) -> u64 {
+        self.inner.dirty_bytes.load(Ordering::Relaxed)
+    }
+
     /// Flush dirty blocks to S3 as content-addressed packs + manifest.
     ///
     /// This is the v2 flush path:
@@ -2341,8 +2385,6 @@ impl WriteCache<Active> {
     /// 4. Upload packs to S3
     /// 5. Clear dirty flags (with concurrent-write safety)
     /// 6. Upload a self-contained manifest
-    ///
-    /// Manual trigger for now; Phase 6 adds scheduling.
     #[instrument(skip(self, content_store, host_pack_index))]
     pub async fn flush_to_s3(
         &self,
@@ -2800,6 +2842,8 @@ mod tests {
             device_name: "test".to_string(),
             device_size: 1024 * 1024, // 1MB
             block_size: 4096,         // 4KB for testing
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         }
     }
 
@@ -3112,6 +3156,8 @@ mod tests {
             device_name: "prefetch_test".to_string(),
             device_size: 100 * 4096, // 100 blocks
             block_size: 4096,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery(&s3).await.unwrap();
@@ -3169,6 +3215,8 @@ mod tests {
             device_name: "cross_batch_test".to_string(),
             device_size: 30 * 4096, // 30 blocks = 3 batches
             block_size: 4096,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery(&s3).await.unwrap();
@@ -3215,6 +3263,8 @@ mod tests {
             device_name: "span_test".to_string(),
             device_size: 10 * 4096,
             block_size: 4096,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery(&s3).await.unwrap();
@@ -3334,6 +3384,8 @@ mod tests {
             device_name: "dirty_test".to_string(),
             device_size: 10 * 4096,
             block_size: 4096,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery(&s3).await.unwrap();
@@ -3378,6 +3430,8 @@ mod tests {
             device_name: "zero_test".to_string(),
             device_size: 10 * 4096,
             block_size: 4096,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery(&s3).await.unwrap();
@@ -3486,6 +3540,8 @@ mod tests {
             device_name: "race_test".to_string(),
             device_size: 10 * 4096,
             block_size: 4096,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
         let cache = Arc::new(
             WriteCache::<Initializing>::open(config)
@@ -3587,6 +3643,8 @@ mod tests {
                 device_name: format!("stress_{}", iteration),
                 device_size: 10 * 4096,
                 block_size: 4096,
+                dirty_budget_bytes: 0,
+                flush_trigger: None,
             };
             let cache = Arc::new(
                 WriteCache::<Initializing>::open(config)
@@ -3761,6 +3819,8 @@ mod tests {
             device_name: "partial_test".to_string(),
             device_size,
             block_size,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
 
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -3828,6 +3888,8 @@ mod tests {
                 device_name: "test".to_string(),
                 device_size,
                 block_size,
+                dirty_budget_bytes: 0,
+                flush_trigger: None,
             };
             let s3 = test_s3();
             let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -4311,6 +4373,8 @@ mod tests {
             device_name: "test-manifest".to_string(),
             device_size,
             block_size,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
 
         let cache = WriteCache::<Initializing>::open_from_manifest(
@@ -4370,6 +4434,8 @@ mod tests {
             device_name: "test-forked".to_string(),
             device_size,
             block_size,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
 
         let cache = WriteCache::<Initializing>::open_from_manifest(
@@ -4426,6 +4492,8 @@ mod tests {
             device_name: "test-fork-write".to_string(),
             device_size,
             block_size,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
         };
 
         let cache = WriteCache::<Initializing>::open_from_manifest(

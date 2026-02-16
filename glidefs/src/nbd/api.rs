@@ -4,6 +4,7 @@
 //! Used by orchestrators for microVM scale-to-zero and live migration.
 
 use crate::config::ExportConfig;
+use crate::nbd::flush_scheduler::FlushMode;
 use crate::nbd::metrics::prometheus_header;
 use crate::nbd::router::{ExportRouter, RouterError};
 use bytes::Bytes;
@@ -35,6 +36,12 @@ pub struct PutExportRequest {
     /// If set, fork this export from the named S3 manifest.
     #[serde(default)]
     pub manifest_name: Option<String>,
+    /// Flush mode for this export.
+    #[serde(default)]
+    pub flush_mode: Option<FlushMode>,
+    /// Dirty budget in GB for this export.
+    #[serde(default)]
+    pub dirty_budget_gb: Option<f64>,
 }
 
 /// Response for export info.
@@ -43,6 +50,7 @@ pub struct ExportInfoResponse {
     pub name: String,
     pub size_bytes: u64,
     pub readonly: bool,
+    pub flush_mode: Option<FlushMode>,
 }
 
 /// Response for list exports.
@@ -107,17 +115,17 @@ async fn handle_request(
         // GET /api/exports - List all exports
         (Method::GET, ["api", "exports"]) => {
             let exports = router.list_exports().await;
-            let response = ListExportsResponse {
-                exports: exports
-                    .into_iter()
-                    .map(|e| ExportInfoResponse {
-                        name: e.name,
-                        size_bytes: e.size,
-                        readonly: e.readonly,
-                    })
-                    .collect(),
-            };
-            json_response(StatusCode::OK, &response)
+            let mut responses = Vec::new();
+            for e in exports {
+                let flush_mode = router.get_flush_mode(&e.name).await;
+                responses.push(ExportInfoResponse {
+                    name: e.name,
+                    size_bytes: e.size,
+                    readonly: e.readonly,
+                    flush_mode,
+                });
+            }
+            json_response(StatusCode::OK, &ListExportsResponse { exports: responses })
         }
 
         // PUT /api/exports/{name} - Create or resize export (idempotent)
@@ -180,6 +188,8 @@ async fn handle_request(
                         size_gb: put_req.size_gb,
                         s3_prefix: put_req.s3_prefix,
                         block_size: put_req.block_size,
+                        flush_mode: put_req.flush_mode,
+                        dirty_budget_gb: put_req.dirty_budget_gb,
                     };
 
                     match router.create_export(config, put_req.readonly, put_req.manifest_name.as_deref()).await {
@@ -195,6 +205,7 @@ async fn handle_request(
 
         // GET /api/exports/{name} - Get export info
         (Method::GET, ["api", "exports", name]) => {
+            let flush_mode = router.get_flush_mode(name).await;
             let exports = router.list_exports().await;
             match exports.into_iter().find(|e| e.name == *name) {
                 Some(export) => json_response(
@@ -203,9 +214,39 @@ async fn handle_request(
                         name: export.name,
                         size_bytes: export.size,
                         readonly: export.readonly,
+                        flush_mode,
                     },
                 ),
                 None => error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name)),
+            }
+        }
+
+        // POST /api/exports/{name}/flush-mode - Set flush mode
+        (Method::POST, ["api", "exports", name, "flush-mode"]) => {
+            let body = match req.collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+
+            let mode: FlushMode = match serde_json::from_slice(&body) {
+                Ok(m) => m,
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid JSON: {}", e),
+                    ))
+                }
+            };
+
+            match router.set_flush_mode(name, mode).await {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    &ApiResponse::success(format!("Flush mode updated for '{}'", name)),
+                ),
+                Err(RouterError::ExportNotFound(name)) => {
+                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
 
