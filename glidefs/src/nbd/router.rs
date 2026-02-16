@@ -745,7 +745,49 @@ impl ExportRouter {
         };
 
         info!("Removing export '{}'...", name);
+        Self::teardown_export(name, state).await;
 
+        if purge {
+            let cache_file = self.cache_dir.join(format!("{}.cache", name));
+            let meta_file = self.cache_dir.join(format!("{}.meta", name));
+            let _ = std::fs::remove_file(&cache_file);
+            let _ = std::fs::remove_file(&meta_file);
+            info!("Purged cache files for export '{}'", name);
+
+            // Also delete export definition from S3
+            if let Err(e) = self.delete_export_definition(name).await {
+                warn!("Failed to delete export definition from S3: {}", e);
+            }
+        }
+
+        info!("Export '{}' removed", name);
+        Ok(())
+    }
+
+    /// Shutdown all exports gracefully.
+    ///
+    /// This properly transitions each cache through the typestate:
+    /// Active → Draining → finished
+    pub async fn shutdown(&self) -> Result<(), RouterError> {
+        info!("Shutting down all exports...");
+
+        // Take ownership of all exports
+        let mut exports = self.exports.write().await;
+        let export_list: Vec<_> = exports.drain().collect();
+        drop(exports); // Release the lock
+
+        for (name, state) in export_list {
+            info!("Shutting down export '{}'...", name);
+            Self::teardown_export(&name, state).await;
+        }
+
+        info!("All exports shut down");
+        Ok(())
+    }
+
+    /// Drain dirty blocks, stop flush scheduler, and transition cache through
+    /// the Draining typestate. Shared by `remove_export` and `shutdown`.
+    async fn teardown_export(name: &str, state: ExportState) {
         let ExportState {
             handler,
             cache,
@@ -786,7 +828,7 @@ impl ExportRouter {
                 match cache.shutdown(&s3_store).await {
                     Ok(draining) => {
                         draining.finish();
-                        info!("Export '{}' drained and removed cleanly", name);
+                        info!("Export '{}' torn down cleanly", name);
                     }
                     Err(e) => {
                         warn!("Failed to drain export '{}': {}", name, e);
@@ -801,98 +843,6 @@ impl ExportRouter {
                 );
             }
         }
-
-        if purge {
-            let cache_file = self.cache_dir.join(format!("{}.cache", name));
-            let meta_file = self.cache_dir.join(format!("{}.meta", name));
-            let _ = std::fs::remove_file(&cache_file);
-            let _ = std::fs::remove_file(&meta_file);
-            info!("Purged cache files for export '{}'", name);
-
-            // Also delete export definition from S3
-            if let Err(e) = self.delete_export_definition(name).await {
-                warn!("Failed to delete export definition from S3: {}", e);
-            }
-        }
-
-        info!("Export '{}' removed", name);
-        Ok(())
-    }
-
-    /// Shutdown all exports gracefully.
-    ///
-    /// This properly transitions each cache through the typestate:
-    /// Active → Draining → finished
-    pub async fn shutdown(&self) -> Result<(), RouterError> {
-        info!("Shutting down all exports...");
-
-        // Take ownership of all exports
-        let mut exports = self.exports.write().await;
-        let export_list: Vec<_> = exports.drain().collect();
-        drop(exports); // Release the lock
-
-        for (name, state) in export_list {
-            info!("Shutting down export '{}'...", name);
-
-            let ExportState {
-                handler,
-                cache,
-                s3_store,
-                content_store,
-                pack_index,
-                flush_shutdown_tx,
-                flush_handle,
-                ..
-            } = state;
-
-            // 1. Signal flush scheduler to stop
-            let _ = flush_shutdown_tx.send(true);
-
-            // 2. Wait for flush scheduler to exit (releases its Arc clone)
-            if let Err(e) = flush_handle.await {
-                warn!("Flush scheduler for '{}' panicked: {}", name, e);
-            }
-
-            // 3. V2 drain: flush remaining dirty data
-            loop {
-                match cache.flush_to_s3(&content_store, &pack_index).await {
-                    Ok(stats) if stats.blocks_flushed == 0 => break,
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("Failed to drain export '{}': {}", name, e);
-                        break;
-                    }
-                }
-            }
-
-            // 4. Drop the handler (releases its Arc clone)
-            drop(handler);
-
-            // 5. Unwrap the Arc and transition through Draining state
-            match Arc::try_unwrap(cache) {
-                Ok(cache) => {
-                    match cache.shutdown(&s3_store).await {
-                        Ok(draining) => {
-                            draining.finish();
-                            info!("Export '{}' shut down cleanly", name);
-                        }
-                        Err(e) => {
-                            warn!("Failed to drain export '{}': {}", name, e);
-                        }
-                    }
-                }
-                Err(arc) => {
-                    warn!(
-                        "Export '{}' has {} references, cannot transition typestate",
-                        name,
-                        Arc::strong_count(&arc)
-                    );
-                }
-            }
-        }
-
-        info!("All exports shut down");
-        Ok(())
     }
 
     /// Create a minimal router for testing protocol handling.

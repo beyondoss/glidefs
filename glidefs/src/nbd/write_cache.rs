@@ -746,23 +746,46 @@ impl WriteCache<Initializing> {
             }
         };
 
-        // Apply WAL entries to block map and build dirty store
+        // Apply WAL entries to block map and build dirty store.
+        // WAL stores metadata only — block data is re-read from the SSD cache file
+        // (which was pwrite'd before the WAL entry was appended).
         let mut dirty_store_map: HashMap<Blake3Hash, Bytes> = HashMap::new();
         let mut max_wal_seq = persisted_max_seq;
+        let chunk_size_u64 = chunk_size as u64;
 
         for entry in &wal_entries {
             if entry.name != export_name {
                 continue; // Skip entries for other exports (shouldn't happen with per-export WAL)
             }
             let chunk_index = entry.chunk_index as usize;
+
+            // Re-read block data from SSD and re-hash for consistency.
+            // The SSD may have been overwritten by a later write that didn't
+            // make it to the WAL, so we trust the SSD state over the WAL hash.
+            let chunk_offset = entry.chunk_index * chunk_size_u64;
+            let valid_bytes = std::cmp::min(chunk_size_u64, config.device_size.saturating_sub(chunk_offset)) as usize;
+            let mut chunk_buf = vec![0u8; chunk_size as usize];
+            if valid_bytes > 0 {
+                if let Err(e) = data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset) {
+                    warn!(chunk_index, error = %e, "WAL recovery: failed to re-read block from SSD, using WAL hash");
+                    // Fall back to WAL hash without data (block will be re-fetched from S3 on read)
+                    persisted_bm.set(chunk_index, BlockMapEntry {
+                        hash: entry.hash,
+                        flags: BlockMapEntry::FLAG_DIRTY,
+                        sequence: entry.sequence,
+                    });
+                    max_wal_seq = max_wal_seq.max(entry.sequence);
+                    continue;
+                }
+            }
+
+            let hash = blake3_128(&chunk_buf);
             persisted_bm.set(chunk_index, BlockMapEntry {
-                hash: entry.hash,
+                hash,
                 flags: BlockMapEntry::FLAG_DIRTY,
                 sequence: entry.sequence,
             });
-            if !entry.data.is_empty() {
-                dirty_store_map.insert(entry.hash, entry.data.clone());
-            }
+            dirty_store_map.insert(hash, Bytes::from(chunk_buf));
             max_wal_seq = max_wal_seq.max(entry.sequence);
         }
 
@@ -1166,9 +1189,13 @@ impl WriteCache<Active> {
         // === v2: content-addressed updates ===
         // For each affected chunk, read the full chunk from SSD, hash it,
         // and update block map + WAL + dirty store.
+        //
+        // The chunk buffer is allocated once and reused across blocks to
+        // avoid a 128KB allocation per block on the hot path.
         {
             let block_size = self.inner.config.block_size;
             let device_size = self.inner.config.device_size;
+            let mut chunk_buf = vec![0u8; block_size];
 
             for block in start_block..=end_block {
                 let idx = block as usize;
@@ -1179,9 +1206,11 @@ impl WriteCache<Active> {
                 // Read the full chunk from SSD (to get correct merged data for sub-chunk writes)
                 let chunk_offset = block * block_size as u64;
                 let valid_bytes = std::cmp::min(block_size as u64, device_size.saturating_sub(chunk_offset)) as usize;
-                let mut chunk_buf = vec![0u8; block_size];
                 if valid_bytes > 0 {
                     self.inner.data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset)?;
+                }
+                if valid_bytes < block_size {
+                    chunk_buf[valid_bytes..].fill(0);
                 }
 
                 let hash = blake3_128(&chunk_buf);
@@ -1190,21 +1219,20 @@ impl WriteCache<Active> {
                 // Update atomic block map (lock-free)
                 self.inner.block_map_set(idx, hash, seq);
 
-                // WAL append (Mutex, uncontended)
+                // WAL append — metadata only (Mutex, uncontended).
+                // Block data lives on SSD; recovery re-reads from there.
                 let wal_entry = WalEntry {
                     name: self.inner.export_name.clone(),
                     chunk_index: block,
                     hash,
                     sequence: seq,
-                    data: Bytes::copy_from_slice(&chunk_buf),
                 };
                 if let Err(e) = self.inner.wal.lock().unwrap().append(&wal_entry) {
                     error!(block = block, error = %e, "WAL append failed");
-                    // Non-fatal: v1 SSD file still has the data
                 }
 
                 // Dirty store insert (Mutex, uncontended)
-                self.inner.dirty_store.lock().unwrap().insert(hash, Bytes::from(chunk_buf));
+                self.inner.dirty_store.lock().unwrap().insert(hash, Bytes::copy_from_slice(&chunk_buf));
             }
 
             // Flush WAL buffer
@@ -1704,13 +1732,12 @@ impl WriteCache<Active> {
                 // Update atomic block map with zero-block hash
                 self.inner.block_map_set(idx, zero_hash, seq);
 
-                // WAL entry with empty data (TRIM marker)
+                // WAL entry for zero range
                 let wal_entry = WalEntry {
                     name: self.inner.export_name.clone(),
                     chunk_index: block,
                     hash: zero_hash,
                     sequence: seq,
-                    data: Bytes::new(),
                 };
                 if let Err(e) = self.inner.wal.lock().unwrap().append(&wal_entry) {
                     error!(block = block, error = %e, "WAL append failed for zero range");

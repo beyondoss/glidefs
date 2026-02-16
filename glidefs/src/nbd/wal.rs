@@ -1,24 +1,28 @@
 //! Write-Ahead Log for crash recovery.
 //!
-//! Append-only log on local SSD. Each entry is self-contained with a CRC32
-//! trailer so replay can detect and discard a torn final write. Truncated
-//! after each block map persistence (~5s).
+//! Append-only log on local SSD. Each entry records which chunk was modified
+//! (metadata only — no block data). On recovery, block data is re-read from the
+//! SSD cache file and re-hashed. Each entry has a CRC32 trailer so replay can
+//! detect and discard a torn final write. Truncated after each block map
+//! persistence (~5s).
 
-use bytes::Bytes;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write as IoWrite, Seek, SeekFrom, BufWriter};
 use std::path::{Path, PathBuf};
 
 use super::block_map::Blake3Hash;
 
-/// A single WAL entry: one block write (or TRIM when data is empty).
+/// A single WAL entry: records that a chunk was modified.
+///
+/// Block data is NOT stored in the WAL — on recovery, the SSD cache file
+/// is the source of truth for block contents (the SSD pwrite always completes
+/// before the WAL append).
 #[derive(Debug, Clone)]
 pub struct WalEntry {
     pub name: String,
     pub chunk_index: u64,
     pub hash: Blake3Hash,
     pub sequence: u64,
-    pub data: Bytes,
 }
 
 /// Append-only write-ahead log backed by a file on local SSD.
@@ -52,6 +56,8 @@ impl Wal {
 
     /// Serialize and append an entry in wire format.
     ///
+    /// Wire format: [name_len:u16][name][chunk_index:u64][hash:16][sequence:u64][crc32:u32]
+    ///
     /// Does NOT fsync -- the local SSD file provides durability guarantees.
     pub fn append(&mut self, entry: &WalEntry) -> io::Result<()> {
         let mut hasher = crc32fast::Hasher::new();
@@ -76,21 +82,11 @@ impl Wal {
         hasher.update(&sequence_le);
         self.writer.write_all(&sequence_le)?;
 
-        let data_length = entry.data.len() as u32;
-        let data_length_le = data_length.to_le_bytes();
-        hasher.update(&data_length_le);
-        self.writer.write_all(&data_length_le)?;
-
-        if !entry.data.is_empty() {
-            hasher.update(&entry.data);
-            self.writer.write_all(&entry.data)?;
-        }
-
         let crc = hasher.finalize();
         self.writer.write_all(&crc.to_le_bytes())?;
 
-        // 2 + name_len + 8 + 16 + 8 + 4 + data_length + 4
-        self.offset += 2 + name_len as u64 + 8 + 16 + 8 + 4 + data_length as u64 + 4;
+        // 2 + name_len + 8 + 16 + 8 + 4
+        self.offset += 2 + name_len as u64 + 8 + 16 + 8 + 4;
 
         Ok(())
     }
@@ -191,23 +187,8 @@ impl Wal {
         hasher.update(&buf8);
         let sequence = u64::from_le_bytes(buf8);
 
-        // data_length
-        let mut buf4 = [0u8; 4];
-        reader.read_exact(&mut buf4)?;
-        hasher.update(&buf4);
-        let data_length = u32::from_le_bytes(buf4) as usize;
-
-        // data
-        let data = if data_length > 0 {
-            let mut data_buf = vec![0u8; data_length];
-            reader.read_exact(&mut data_buf)?;
-            hasher.update(&data_buf);
-            Bytes::from(data_buf)
-        } else {
-            Bytes::new()
-        };
-
         // crc32
+        let mut buf4 = [0u8; 4];
         reader.read_exact(&mut buf4)?;
         let stored_crc = u32::from_le_bytes(buf4);
         let computed_crc = hasher.finalize();
@@ -224,7 +205,6 @@ impl Wal {
             chunk_index,
             hash,
             sequence,
-            data,
         }))
     }
 }
@@ -242,7 +222,6 @@ mod tests {
             chunk_index: seq * 10,
             hash: blake3_128(data),
             sequence: seq,
-            data: Bytes::copy_from_slice(data),
         }
     }
 
@@ -271,7 +250,6 @@ mod tests {
             assert_eq!(entry.chunk_index, seq * 10);
             assert_eq!(entry.hash, blake3_128(expected_data.as_bytes()));
             assert_eq!(entry.sequence, seq);
-            assert_eq!(entry.data.as_ref(), expected_data.as_bytes());
         }
     }
 
@@ -390,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_zero_length_data() {
+    fn test_wal_trim_entry() {
         let dir = TempDir::new().unwrap();
         let wal_path = dir.path().join("test.wal");
 
@@ -401,7 +379,6 @@ mod tests {
                 chunk_index: 42,
                 hash: blake3_128(&[]),
                 sequence: 1,
-                data: Bytes::new(),
             };
             wal.append(&entry).unwrap();
             wal.flush_buf().unwrap();
@@ -412,7 +389,6 @@ mod tests {
         assert_eq!(entries[0].name, "trim-export");
         assert_eq!(entries[0].chunk_index, 42);
         assert_eq!(entries[0].sequence, 1);
-        assert!(entries[0].data.is_empty());
         assert_eq!(entries[0].hash, blake3_128(&[]));
     }
 
