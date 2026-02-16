@@ -14,7 +14,6 @@
 //! POSIX semantics, eliminating the need for any locking on the hot path.
 
 use bytes::Bytes;
-use crossbeam::queue::SegQueue;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
@@ -346,15 +345,6 @@ pub(crate) struct CacheInner {
     /// Statistics
     dirty_block_count: AtomicU64,
     syncing_block_count: AtomicU64,
-
-    /// Queue of dirty block numbers for O(1) claiming (no scanning).
-    /// Blocks are pushed here when transitioning to Dirty state.
-    /// The sync worker pops from this queue instead of scanning all blocks.
-    dirty_queue: SegQueue<u64>,
-
-    /// Notification for waking the sync worker when dirty blocks are available.
-    /// The sync worker waits on this instead of polling.
-    dirty_notify: Notify,
 
     // === v2 content-addressed structures ===
 
@@ -718,15 +708,6 @@ impl WriteCache<Initializing> {
             .map(|c| c.load(Ordering::Relaxed).count_ones() as usize)
             .sum();
 
-        // Pre-populate dirty queue with blocks that are dirty from recovery.
-        // This avoids needing to scan on first sync cycle.
-        let dirty_queue = SegQueue::new();
-        for (idx, state) in block_states.iter().enumerate() {
-            if state.load(Ordering::Relaxed) == BlockState::Dirty as u8 {
-                dirty_queue.push(idx as u64);
-            }
-        }
-
         // === v2 initialization ===
         let block_map_path = config.block_map_path();
         let wal_path = config.wal_path();
@@ -812,8 +793,6 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
-            dirty_queue,
-            dirty_notify: Notify::new(),
             // v2 fields
             block_map: RwLock::new(BlockMapKind::Full(atomic_block_map)),
             sequence,
@@ -865,9 +844,6 @@ impl WriteCache<Initializing> {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
-        // Empty dirty queue: no local dirty data
-        let dirty_queue = SegQueue::new();
-
         // Build BlockMapKind from manifest or parent
         let block_map_kind = if let Some(parent) = parent_block_map {
             BlockMapKind::Forked(ForkedBlockMap::new(parent))
@@ -899,8 +875,6 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
             syncing_block_count: AtomicU64::new(0),
-            dirty_queue,
-            dirty_notify: Notify::new(),
             block_map: RwLock::new(block_map_kind),
             sequence,
             dirty_store: Mutex::new(HashMap::new()),
@@ -1794,100 +1768,6 @@ impl WriteCache<Active> {
         }
     }
 
-    /// Claim dirty blocks for syncing (lock-free, O(1) per block).
-    ///
-    /// Pops block numbers from the dirty queue and transitions them from Dirty
-    /// to Syncing. The sync worker should call this, upload the blocks, then call
-    /// `mark_synced` or `mark_sync_failed` for each block.
-    ///
-    /// Uses CAS to atomically transition Dirty → Syncing. If a block is no longer
-    /// Dirty (e.g., already synced or transitioned by another thread), it is skipped.
-    #[instrument(skip(self))]
-    pub fn claim_dirty_blocks(&self, max_blocks: usize) -> Vec<u64> {
-        let mut claimed = Vec::with_capacity(max_blocks);
-
-        while claimed.len() < max_blocks {
-            // Pop from dirty queue - O(1)
-            let Some(block_num) = self.inner.dirty_queue.pop() else {
-                break;
-            };
-
-            let idx = block_num as usize;
-            if idx >= self.inner.num_blocks {
-                continue;
-            }
-
-            // Try CAS: Dirty → Syncing
-            // The block might not be Dirty anymore if:
-            // - It was already synced (duplicate in queue from recovery)
-            // - Another thread claimed it (shouldn't happen with single sync worker)
-            if self.inner.block_states[idx]
-                .compare_exchange(
-                    BlockState::Dirty as u8,
-                    BlockState::Syncing as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                claimed.push(block_num);
-                self.inner.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
-                self.inner.syncing_block_count.fetch_add(1, Ordering::Relaxed);
-            }
-            // If CAS fails, the block is no longer dirty - skip it
-        }
-
-        if !claimed.is_empty() {
-            debug!(count = claimed.len(), "claimed dirty blocks for sync");
-        }
-        claimed
-    }
-
-    /// Mark a block as successfully synced (lock-free).
-    pub fn mark_synced(&self, block_num: u64) {
-        let idx = block_num as usize;
-        if idx >= self.inner.num_blocks {
-            return;
-        }
-
-        // CAS: Syncing → Clean
-        if self.inner.block_states[idx]
-            .compare_exchange(
-                BlockState::Syncing as u8,
-                BlockState::Clean as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Mark a block sync as failed (will retry) - lock-free.
-    pub fn mark_sync_failed(&self, block_num: u64) {
-        let idx = block_num as usize;
-        if idx >= self.inner.num_blocks {
-            return;
-        }
-
-        // CAS: Syncing → Dirty
-        if self.inner.block_states[idx]
-            .compare_exchange(
-                BlockState::Syncing as u8,
-                BlockState::Dirty as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-        {
-            self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-            self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-            // Re-queue for retry - without this, drain would miss failed blocks
-            self.inner.dirty_queue.push(block_num);
-        }
-    }
-
     /// Read a single block from local cache.
     /// Handles partial last block correctly when device_size is not a multiple of block_size.
     #[allow(dead_code)] // Used by tests
@@ -1950,228 +1830,28 @@ impl WriteCache<Active> {
         self.inner.config.block_size
     }
 
-    /// Wait for dirty blocks to become available.
-    ///
-    /// Returns immediately if there are already dirty blocks in the queue.
-    /// Otherwise, waits until a write operation adds dirty blocks and notifies.
-    pub async fn wait_for_dirty(&self) {
-        self.inner.dirty_notify.notified().await
-    }
-
     /// Save metadata to disk.
     pub fn save_metadata(&self) -> Result<(), CacheError> {
         self.inner.save_metadata()
     }
 
-    /// Sync dirty blocks to S3 using batch writes with conditional PUT.
+    /// Graceful shutdown: save metadata and transition to Draining.
     ///
-    /// Groups blocks by batch number, performs GET-modify-PUT for each batch.
-    /// Uses conditional PUT (If-Match) as defense-in-depth against concurrent writers.
-    ///
-    /// **Zero-block optimization**: Blocks that are all zeros are skipped if the
-    /// corresponding position in S3 is already zeros (or the batch doesn't exist).
-    /// Since missing blocks return zeros on read, this is safe and reduces S3 writes
-    /// for fresh VMs, TRIM operations, and sparse filesystems.
-    ///
-    /// Returns the number of blocks successfully synced.
-    pub async fn sync_blocks_batched(&self, s3: &S3BlockStore, block_nums: Vec<u64>) -> Result<usize, CacheError> {
-        self.sync_blocks_batched_parallel(s3, block_nums, 1).await
-    }
-
-    /// Sync dirty blocks to S3 with parallel uploads.
-    ///
-    /// Like `sync_blocks_batched`, but processes up to `max_concurrent` batches
-    /// in parallel. This significantly improves throughput when syncing many
-    /// batches, as S3 latency (~100ms) is the bottleneck.
-    ///
-    /// Unlike the sequential version, this method does NOT fail-fast on errors.
-    /// Each batch is processed independently - if one fails, others continue.
-    /// Failed batches have their blocks marked for retry.
-    ///
-    /// Returns the number of blocks successfully synced.
-    pub async fn sync_blocks_batched_parallel(
-        &self,
-        s3: &S3BlockStore,
-        block_nums: Vec<u64>,
-        max_concurrent: usize,
-    ) -> Result<usize, CacheError> {
-        use futures::stream::{self, StreamExt};
-        use std::collections::HashMap;
-        use std::sync::atomic::AtomicUsize;
-
-        if block_nums.is_empty() {
-            return Ok(0);
-        }
-
-        let max_concurrent = max_concurrent.max(1); // At least 1
-
-        // Group blocks by batch number
-        let mut batches: HashMap<u64, Vec<u64>> = HashMap::new();
-        for block_num in block_nums {
-            let batch_num = s3.batch_num(block_num);
-            batches.entry(batch_num).or_default().push(block_num);
-        }
-
-        let block_size = self.inner.config.block_size;
-        let synced_count = AtomicUsize::new(0);
-
-        // Process batches in parallel with bounded concurrency
-        let results: Vec<_> = stream::iter(batches)
-            .map(|(batch_num, blocks_in_batch)| {
-                let synced_count = &synced_count;
-                async move {
-                    // GET existing batch with ETag for conditional PUT
-                    let batch_result = match s3.get_batch_with_etag(batch_num).await {
-                        Ok(result) => result,
-                        Err(e) => {
-                            // Mark all blocks in this batch as failed
-                            for block_num in &blocks_in_batch {
-                                self.mark_sync_failed(*block_num);
-                            }
-                            warn!(batch = batch_num, error = %e, "failed to fetch batch for sync");
-                            return;
-                        }
-                    };
-
-                    let mut batch_data = batch_result.data;
-                    let etag = batch_result.etag;
-                    let mut batch_modified = false;
-
-                    // Update dirty block slots with local data
-                    // Use sync FD to avoid contention with NBD reads
-                    for &block_num in &blocks_in_batch {
-                        let local_data = match self.sync_read_local_block(block_num) {
-                            Ok(data) => data,
-                            Err(e) => {
-                                warn!(block = block_num, error = %e, "failed to read local block");
-                                self.mark_sync_failed(block_num);
-                                continue;
-                            }
-                        };
-                        let offset = s3.offset_in_batch(block_num) as usize;
-                        let s3_slice = &batch_data[offset..offset + block_size];
-
-                        // Zero-block optimization
-                        let local_is_zero = is_zero_block(&local_data);
-                        let s3_is_zero = is_zero_block(s3_slice);
-
-                        if local_is_zero && s3_is_zero {
-                            debug!(block = block_num, "skipping zero block (S3 already zeros)");
-                        } else {
-                            batch_data[offset..offset + local_data.len()].copy_from_slice(&local_data);
-                            batch_modified = true;
-                        }
-                    }
-
-                    // Only PUT if we actually modified the batch
-                    if batch_modified
-                        && let Err(e) = s3.put_batch_conditional(batch_num, batch_data, etag).await
-                    {
-                        // Mark all blocks in this batch as failed
-                        for block_num in &blocks_in_batch {
-                            self.mark_sync_failed(*block_num);
-                        }
-                        warn!(batch = batch_num, error = %e, "failed to upload batch");
-                        return;
-                    }
-
-                    // Mark all blocks in this batch as synced
-                    for block_num in blocks_in_batch {
-                        self.mark_synced(block_num);
-                        synced_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            })
-            .buffer_unordered(max_concurrent)
-            .collect()
-            .await;
-
-        // All futures completed (results is Vec<()>)
-        drop(results);
-
-        Ok(synced_count.load(Ordering::Relaxed))
-    }
-
-    /// Graceful shutdown: sync all blocks and transition to Draining.
-    #[allow(dead_code)]
-    #[instrument(skip(self, s3))]
-    pub async fn shutdown(self, s3: &S3BlockStore) -> Result<WriteCache<Draining>, CacheError> {
+    /// The v2 flush scheduler is responsible for ensuring dirty blocks are
+    /// flushed to S3 before shutdown. This method only persists local metadata
+    /// and transitions the cache state.
+    #[instrument(skip(self, _s3))]
+    pub async fn shutdown(self, _s3: &S3BlockStore) -> Result<WriteCache<Draining>, CacheError> {
         info!("starting graceful shutdown");
-
-        // Claim and sync all remaining dirty blocks using batched writes
-        loop {
-            let dirty = self.claim_dirty_blocks(1000);
-            if dirty.is_empty() {
-                break;
-            }
-
-            if let Err(e) = self.sync_blocks_batched(s3, dirty).await {
-                warn!(error = %e, "shutdown sync failed");
-            }
-        }
-
-        // Wait for any in-flight syncs
-        while self.syncing_block_count() > 0 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
 
         // Save final metadata
         self.inner.save_metadata()?;
-        info!("shutdown complete, all blocks synced");
+        info!("shutdown complete");
 
         Ok(WriteCache {
             inner: self.inner,
             _state: PhantomData,
         })
-    }
-
-    /// Drain all dirty blocks to S3 for a consistent snapshot.
-    ///
-    /// Call this before cross-host clone operations to ensure all data is
-    /// visible to other hosts. Normal FLUSH operations use fast local fsync.
-    ///
-    /// Returns when all dirty blocks have been uploaded to S3.
-    #[instrument(skip(self, s3))]
-    pub async fn drain_for_snapshot(&self, s3: &S3BlockStore) -> Result<(), CacheError> {
-        let initial_dirty = self.dirty_block_count();
-        if initial_dirty == 0 && self.syncing_block_count() == 0 {
-            debug!("no dirty blocks, drain complete");
-            return Ok(());
-        }
-
-        info!(dirty_blocks = initial_dirty, "draining for snapshot");
-
-        // Outer loop handles the case where blocks are re-queued during sync
-        // (e.g., by background worker failures or our own sync failures)
-        loop {
-            // Inner loop: claim and sync all dirty blocks
-            loop {
-                let dirty = self.claim_dirty_blocks(100);
-                if dirty.is_empty() {
-                    break;
-                }
-
-                self.sync_blocks_batched(s3, dirty).await?;
-            }
-
-            // Wait for any in-flight syncs (from background worker or our parallel syncs)
-            while self.syncing_block_count() > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-
-            // Re-check: blocks may have been re-queued by failed syncs during the wait
-            if self.dirty_block_count() == 0 {
-                break;
-            }
-
-            debug!(
-                dirty = self.dirty_block_count(),
-                "blocks re-queued during drain, continuing"
-            );
-        }
-
-        info!("drain complete, all blocks in S3");
-        Ok(())
     }
 
     /// Shared inner logic for flush/snapshot: snapshot dirty entries, dedup,
@@ -2440,27 +2120,6 @@ impl WriteCache<Active> {
         }
     }
 
-    /// Persist the v2 block map to disk and truncate the WAL.
-    ///
-    /// Called periodically (~5s) by the block map persistence worker.
-    /// Uses atomic file write (tempfile + rename) for crash safety.
-    pub fn persist_block_map(&self) -> Result<(), CacheError> {
-        // Snapshot the atomic block map (lock-free)
-        let snapshot = self.inner.block_map_snapshot();
-
-        // Persist to file atomically
-        let path = self.inner.config.block_map_path();
-        snapshot.persist_to_file(&path).map_err(CacheError::Io)?;
-
-        // Truncate WAL (entries are now in the persisted block map)
-        if let Err(e) = self.inner.wal.lock().unwrap().truncate() {
-            warn!(error = %e, "WAL truncate failed after block map persist");
-        }
-
-        debug!(entries = snapshot.non_empty_count(), "persisted v2 block map");
-        Ok(())
-    }
-
     /// Get a clone of the inner Arc for sharing with the sync worker.
     #[allow(dead_code)]
     pub(crate) fn inner(&self) -> Arc<CacheInner> {
@@ -2473,359 +2132,6 @@ impl WriteCache<Draining> {
     /// Finish draining and drop the cache.
     pub fn finish(self) {
         info!("cache drained and closed");
-    }
-}
-
-// ============================================================================
-// Background Sync Worker
-// ============================================================================
-
-/// Configuration for the sync worker.
-#[derive(Clone, Debug)]
-pub struct SyncWorkerConfig {
-    /// Maximum number of blocks to claim per sync cycle.
-    /// Higher values reduce per-cycle overhead but increase memory usage during sync.
-    pub batch_size: usize,
-
-    /// Maximum concurrent S3 uploads per sync cycle.
-    /// Higher values increase throughput but use more memory and connections.
-    /// Set to 1 for sequential uploads (original behavior).
-    pub max_concurrent_uploads: usize,
-
-    /// Hot batch cooldown: don't re-sync an S3 batch within this duration.
-    ///
-    /// When a batch is synced, it enters a "cooldown" period. If more blocks
-    /// in that batch become dirty during cooldown, they're deferred to the next
-    /// cycle. This prevents repeated GET-modify-PUT of the same batch when
-    /// writes are spread over time.
-    ///
-    /// Example: With 100ms cooldown and blocks 0,1,2 all in batch 0:
-    /// - t=0ms:   Block 0 dirty → sync batch 0 (GET+PUT)
-    /// - t=50ms:  Block 1 dirty → deferred (batch 0 in cooldown)
-    /// - t=80ms:  Block 2 dirty → deferred (batch 0 in cooldown)
-    /// - t=100ms: Cooldown expires → sync batch 0 with blocks 1,2 (single GET+PUT)
-    ///
-    /// Set to 0 to disable (every dirty block synced immediately).
-    pub hot_batch_cooldown: std::time::Duration,
-
-    /// Maximum times a block can be deferred due to hot batch cooldown.
-    ///
-    /// After a block has been deferred this many times, it will be force-synced
-    /// even if its batch is still hot. This prevents starvation when a batch
-    /// receives continuous writes.
-    ///
-    /// Set to 0 to disable (blocks can be deferred indefinitely).
-    pub max_deferrals: u32,
-
-    /// How often to save metadata (every N sync cycles).
-    pub metadata_save_interval: usize,
-
-    /// Back-pressure: warn when dirty queue exceeds this depth.
-    /// With 128KB blocks, 1000 blocks = 128MB of uncommitted data.
-    /// Set to 0 to disable warning.
-    pub dirty_queue_warn_threshold: u64,
-
-    /// Back-pressure: log errors when dirty queue exceeds this depth.
-    /// Indicates S3 sync cannot keep up with write rate.
-    /// Set to 0 to disable.
-    pub dirty_queue_critical_threshold: u64,
-}
-
-impl Default for SyncWorkerConfig {
-    fn default() -> Self {
-        Self {
-            batch_size: 100,
-            // 1 concurrent S3 upload - minimizes I/O contention with reads
-            max_concurrent_uploads: 1,
-            // 8 second sync interval: testing PUT count reduction.
-            // Longer interval = more coalescing = fewer S3 PUTs.
-            // Recently written blocks are likely still in page cache when sync reads them.
-            hot_batch_cooldown: std::time::Duration::from_secs(8),
-            // After 10 deferrals, force sync even if batch is hot
-            // At 8s cooldown, this means ~80 second max delay
-            max_deferrals: 10,
-            metadata_save_interval: 10,
-            // 1000 blocks @ 128KB = 128MB uncommitted - time to investigate
-            dirty_queue_warn_threshold: 1_000,
-            // 10000 blocks @ 128KB = 1.28GB uncommitted - serious problem
-            dirty_queue_critical_threshold: 10_000,
-        }
-    }
-}
-
-/// Sync worker that continuously drains dirty blocks to S3.
-///
-/// This function runs in a background task and uploads dirty blocks using
-/// batched S3 writes. Blocks are grouped by batch number and uploaded
-/// together to reduce S3 PUT costs by ~10x.
-///
-/// # Cancellation
-/// The worker checks the shutdown signal between upload batches and exits
-/// gracefully when signaled.
-///
-/// # Example
-/// ```ignore
-/// let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-/// let cache = Arc::new(cache);
-/// let s3 = Arc::new(s3_store);
-///
-/// let worker_handle = tokio::spawn(sync_worker(
-///     Arc::clone(&cache),
-///     Arc::clone(&s3),
-///     SyncWorkerConfig::default(),
-///     shutdown_rx,
-/// ));
-///
-/// // To stop:
-/// let _ = shutdown_tx.send(true);
-/// worker_handle.await;
-/// ```
-#[instrument(skip(cache, s3, config, shutdown))]
-pub async fn sync_worker(
-    cache: Arc<WriteCache<Active>>,
-    s3: Arc<S3BlockStore>,
-    config: SyncWorkerConfig,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    use std::collections::HashMap;
-
-    info!(
-        batch_size = config.batch_size,
-        hot_batch_cooldown_ms = config.hot_batch_cooldown.as_millis(),
-        max_deferrals = config.max_deferrals,
-        blocks_per_batch = s3.blocks_per_batch(),
-        "sync worker started (event-driven)"
-    );
-
-    let mut batches_since_save = 0;
-    let mut last_backpressure_warn = std::time::Instant::now() - std::time::Duration::from_secs(60);
-
-    // Hot batch tracking: batch_num -> last sync time
-    // Batches synced recently are "hot" and we defer syncing them again
-    let mut hot_batches: HashMap<u64, std::time::Instant> = HashMap::new();
-
-    // Deferral count tracking: block_num -> times deferred
-    // When a block exceeds max_deferrals, force sync even if batch is hot
-    let mut deferral_counts: HashMap<u64, u32> = HashMap::new();
-
-    loop {
-        // Check for shutdown
-        if *shutdown.borrow() {
-            info!("sync worker received shutdown signal");
-            break;
-        }
-
-        // Claim a batch of dirty blocks from the queue (O(1) per block)
-        let dirty = cache.claim_dirty_blocks(config.batch_size);
-
-        if dirty.is_empty() {
-            // No dirty blocks - wait for notification from write path.
-            // Use a timeout as safety net in case notification was missed.
-            tokio::select! {
-                _ = cache.wait_for_dirty() => {}  // Woken by write path
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        info!("sync worker received shutdown signal");
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Back-pressure monitoring: check queue depth and warn/error if too deep
-        let current_dirty = cache.dirty_block_count();
-        if config.dirty_queue_critical_threshold > 0
-            && current_dirty > config.dirty_queue_critical_threshold
-        {
-            // Rate-limit critical logs to once per 10 seconds
-            if last_backpressure_warn.elapsed() > std::time::Duration::from_secs(10) {
-                tracing::error!(
-                    dirty_blocks = current_dirty,
-                    threshold = config.dirty_queue_critical_threshold,
-                    block_size = cache.block_size(),
-                    uncommitted_mb = (current_dirty as usize * cache.block_size()) / (1024 * 1024),
-                    "CRITICAL: dirty queue depth exceeds critical threshold - S3 sync cannot keep up"
-                );
-                last_backpressure_warn = std::time::Instant::now();
-            }
-        } else if config.dirty_queue_warn_threshold > 0
-            && current_dirty > config.dirty_queue_warn_threshold
-        {
-            // Rate-limit warnings to once per 30 seconds
-            if last_backpressure_warn.elapsed() > std::time::Duration::from_secs(30) {
-                warn!(
-                    dirty_blocks = current_dirty,
-                    threshold = config.dirty_queue_warn_threshold,
-                    uncommitted_mb = (current_dirty as usize * cache.block_size()) / (1024 * 1024),
-                    "dirty queue depth elevated - consider investigating S3 latency"
-                );
-                last_backpressure_warn = std::time::Instant::now();
-            }
-        }
-
-        // === Hot Batch Filtering ===
-        // Group blocks by batch and filter out batches that are still "hot" (recently synced).
-        // This reduces write amplification by letting more blocks accumulate before re-syncing.
-        let now = std::time::Instant::now();
-        let cooldown_enabled = !config.hot_batch_cooldown.is_zero();
-
-        // Clean up expired hot batch entries (older than 2x cooldown to avoid unbounded growth)
-        if cooldown_enabled {
-            let expiry = config.hot_batch_cooldown * 2;
-            hot_batches.retain(|_, last_sync| now.duration_since(*last_sync) < expiry);
-        }
-
-        // Group claimed blocks by batch number
-        let mut blocks_by_batch: HashMap<u64, Vec<u64>> = HashMap::new();
-        for block_num in dirty {
-            let batch_num = s3.batch_num(block_num);
-            blocks_by_batch.entry(batch_num).or_default().push(block_num);
-        }
-
-        // Separate into ready-to-sync and deferred (hot batch)
-        let mut blocks_to_sync = Vec::new();
-        let mut deferred_count = 0u64;
-        let mut force_synced_count = 0u64;
-        let max_deferrals_enabled = config.max_deferrals > 0;
-
-        for (batch_num, blocks) in blocks_by_batch {
-            let is_hot = cooldown_enabled
-                && hot_batches
-                    .get(&batch_num)
-                    .map(|last_sync| now.duration_since(*last_sync) < config.hot_batch_cooldown)
-                    .unwrap_or(false);
-
-            if is_hot {
-                // Batch is hot - check each block's deferral count
-                for block_num in blocks {
-                    let count = deferral_counts.entry(block_num).or_insert(0);
-                    *count += 1;
-
-                    if max_deferrals_enabled && *count > config.max_deferrals {
-                        // Block has been deferred too many times - force sync
-                        blocks_to_sync.push(block_num);
-                        force_synced_count += 1;
-                    } else {
-                        // Defer this block
-                        cache.mark_sync_failed(block_num);
-                        deferred_count += 1;
-                    }
-                }
-            } else {
-                // Batch is cool - include these blocks for sync
-                blocks_to_sync.extend(blocks);
-            }
-        }
-
-        if deferred_count > 0 || force_synced_count > 0 {
-            debug!(
-                deferred = deferred_count,
-                force_synced = force_synced_count,
-                syncing = blocks_to_sync.len(),
-                "hot batch filtering complete"
-            );
-        }
-
-        // If all blocks were deferred, continue to next cycle
-        if blocks_to_sync.is_empty() {
-            continue;
-        }
-
-        let block_count = blocks_to_sync.len();
-        let start = std::time::Instant::now();
-
-        // Sync blocks using batched writes (groups by S3 batch, GET-modify-PUT)
-        // Track which batches and blocks we're about to sync
-        let batches_syncing: std::collections::HashSet<u64> = blocks_to_sync
-            .iter()
-            .map(|&b| s3.batch_num(b))
-            .collect();
-        let blocks_syncing: Vec<u64> = blocks_to_sync.clone();
-
-        match cache.sync_blocks_batched_parallel(&s3, blocks_to_sync, config.max_concurrent_uploads).await {
-            Ok(synced) => {
-                let elapsed = start.elapsed();
-
-                // Mark synced batches as hot
-                let sync_time = std::time::Instant::now();
-                for batch_num in batches_syncing {
-                    hot_batches.insert(batch_num, sync_time);
-                }
-
-                // Clear deferral counts for synced blocks
-                for block_num in &blocks_syncing {
-                    deferral_counts.remove(block_num);
-                }
-
-                debug!(
-                    blocks = synced,
-                    elapsed_ms = elapsed.as_millis(),
-                    throughput_mb_s = (synced * cache.block_size()) as f64 / elapsed.as_secs_f64() / 1_000_000.0,
-                    hot_batches = hot_batches.len(),
-                    "sync batch completed"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    blocks = block_count,
-                    error = %e,
-                    "sync batch failed, backing off 1s"
-                );
-                // Simple backoff: sleep 1s after any failure to avoid retry spam
-                // during S3 outages. Blocks are already re-queued by mark_sync_failed.
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
-
-        // Periodically save metadata to persist sync progress
-        batches_since_save += 1;
-        if batches_since_save >= config.metadata_save_interval {
-            if let Err(e) = cache.save_metadata() {
-                warn!(error = %e, "failed to save metadata during sync");
-            }
-            batches_since_save = 0;
-        }
-    }
-
-    // Final metadata save on shutdown
-    if let Err(e) = cache.save_metadata() {
-        warn!(error = %e, "failed to save metadata on sync worker shutdown");
-    }
-
-    info!("sync worker stopped");
-}
-
-/// Background worker that periodically persists the v2 block map.
-///
-/// Runs every 5 seconds. Persists the block map snapshot to disk and
-/// truncates the WAL. This bounds WAL replay time on recovery.
-#[instrument(skip(cache, shutdown))]
-pub async fn block_map_persist_worker(
-    cache: Arc<WriteCache<Active>>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    info!("block map persist worker started (5s interval)");
-
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    // Final persist before shutdown
-                    if let Err(e) = cache.persist_block_map() {
-                        warn!(error = %e, "final block map persist failed");
-                    }
-                    info!("block map persist worker stopped");
-                    return;
-                }
-            }
-        }
-
-        if let Err(e) = cache.persist_block_map() {
-            warn!(error = %e, "periodic block map persist failed");
-        }
     }
 }
 
@@ -2902,51 +2208,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_claim_and_sync() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config(dir.path());
-        let s3 = test_s3();
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = cache.finish_recovery(&s3).await.unwrap();
-
-        // Write to first block
-        cache.write(0, b"block data").unwrap();
-        assert_eq!(cache.dirty_block_count(), 1);
-
-        // Claim dirty blocks
-        let claimed = cache.claim_dirty_blocks(100);
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0], 0);
-        assert_eq!(cache.dirty_block_count(), 0);
-        assert_eq!(cache.syncing_block_count(), 1);
-
-        // Mark as synced
-        cache.mark_synced(0);
-        assert_eq!(cache.syncing_block_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_write_during_sync() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config(dir.path());
-        let s3 = test_s3();
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = cache.finish_recovery(&s3).await.unwrap();
-
-        // Write and claim
-        cache.write(0, b"first").unwrap();
-        let _ = cache.claim_dirty_blocks(100);
-        assert_eq!(cache.syncing_block_count(), 1);
-
-        // Write again during sync - should go back to dirty
-        cache.write(0, b"second").unwrap();
-        assert_eq!(cache.dirty_block_count(), 1);
-        assert_eq!(cache.syncing_block_count(), 0);
-    }
-
-    #[tokio::test]
     async fn test_metadata_persistence() {
         let dir = TempDir::new().unwrap();
         let config = test_config(dir.path());
@@ -2971,74 +2232,6 @@ mod tests {
             let data = cache.read(0, 10).unwrap();
             assert_eq!(&data[..], b"persistent");
         }
-    }
-
-    #[tokio::test]
-    async fn test_drain_for_snapshot() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config(dir.path());
-        let s3 = test_s3();
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = cache.finish_recovery(&s3).await.unwrap();
-
-        // Write some data
-        cache.write(0, b"snapshot data").unwrap();
-        assert!(cache.dirty_block_count() > 0);
-
-        // Drain for snapshot
-        cache.drain_for_snapshot(&s3).await.unwrap();
-
-        // All blocks should be synced
-        assert_eq!(cache.dirty_block_count(), 0);
-        assert_eq!(cache.syncing_block_count(), 0);
-
-        // Data should be in S3
-        let s3_data = s3.read_block(0).await.unwrap();
-        assert_eq!(&s3_data[..13], b"snapshot data");
-    }
-
-    #[tokio::test]
-    async fn test_sync_worker() {
-        let dir = TempDir::new().unwrap();
-        let config = test_config(dir.path());
-        let s3 = Arc::new(test_s3());
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = Arc::new(cache.finish_recovery(&s3).await.unwrap());
-
-        // Create shutdown channel
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-        // Start sync worker
-        let worker_cache = Arc::clone(&cache);
-        let worker_s3 = Arc::clone(&s3);
-        let worker_handle = tokio::spawn(super::sync_worker(
-            worker_cache,
-            worker_s3,
-            super::SyncWorkerConfig::default(),
-            shutdown_rx,
-        ));
-
-        // Write some data
-        cache.write(0, b"worker test").unwrap();
-
-        // Wait for sync to complete (with timeout)
-        let start = std::time::Instant::now();
-        while cache.dirty_block_count() > 0 && start.elapsed().as_secs() < 5 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        }
-
-        // Should be synced
-        assert_eq!(cache.dirty_block_count(), 0);
-
-        // Stop worker
-        let _ = shutdown_tx.send(true);
-        worker_handle.await.unwrap();
-
-        // Data should be in S3
-        let s3_data = s3.read_block(0).await.unwrap();
-        assert_eq!(&s3_data[..11], b"worker test");
     }
 
     #[tokio::test]
@@ -3286,82 +2479,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_max_deferrals_prevents_starvation() {
-        // Verify that blocks aren't deferred forever when their batch
-        // keeps getting updated (hot batch scenario).
-        //
-        // Strategy:
-        // 1. Write and sync to establish the batch as "hot"
-        // 2. Write again while batch is hot
-        // 3. Verify that with max_deferrals, the block eventually syncs
-        //    even though the batch remains "hot"
-
-        let dir = TempDir::new().unwrap();
-        let config = test_config(dir.path());
-        let s3 = Arc::new(test_s3());
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = Arc::new(cache.finish_recovery(&s3).await.unwrap());
-
-        // Write initial data and manually sync to establish batch 0 as "hot"
-        cache.write(0, &[0x11u8; 100]).unwrap();
-        let dirty = cache.claim_dirty_blocks(10);
-        cache.sync_blocks_batched(&s3, dirty).await.unwrap();
-
-        // Verify initial sync worked
-        let s3_data = s3.read_block(0).await.unwrap();
-        assert_eq!(s3_data[0], 0x11, "initial sync should succeed");
-
-        // Now write again - batch 0 is "hot" from the sync we just did
-        cache.write(0, &[0x22u8; 100]).unwrap();
-        assert_eq!(cache.dirty_block_count(), 1);
-
-        // Create shutdown channel
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-        // Start sync worker with very long cooldown (simulates perpetually hot batch)
-        // but low max_deferrals to force sync quickly
-        let worker_cache = Arc::clone(&cache);
-        let worker_s3 = Arc::clone(&s3);
-        let worker_handle = tokio::spawn(super::sync_worker(
-            worker_cache,
-            worker_s3,
-            super::SyncWorkerConfig {
-                batch_size: 100,
-                max_concurrent_uploads: 1, // Sequential for predictable test behavior
-                hot_batch_cooldown: std::time::Duration::from_secs(60), // Very long - batch stays hot
-                max_deferrals: 3, // Force sync after 3 deferrals
-                metadata_save_interval: 100,
-                dirty_queue_warn_threshold: 0,
-                dirty_queue_critical_threshold: 0,
-            },
-            shutdown_rx,
-        ));
-
-        // Wait for sync to complete - with max_deferrals=3, should happen within ~4 cycles
-        // Each cycle is nearly instant since we're just deferring/syncing
-        let start = std::time::Instant::now();
-        while cache.dirty_block_count() > 0 && start.elapsed().as_millis() < 500 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        // Stop worker
-        let _ = shutdown_tx.send(true);
-        worker_handle.await.unwrap();
-
-        // Block should have been synced despite the batch being "hot"
-        assert_eq!(
-            cache.dirty_block_count(),
-            0,
-            "max_deferrals should force sync even for hot batches"
-        );
-
-        // Verify updated data made it to S3
-        let s3_data = s3.read_block(0).await.unwrap();
-        assert_eq!(s3_data[0], 0x22, "updated data should be in S3");
-    }
-
-    #[tokio::test]
     async fn test_batch_prefetch_with_local_dirty_blocks() {
         // Verify that batch prefetching correctly handles the case where
         // some blocks are dirty locally and others need to be fetched from S3.
@@ -3406,81 +2523,6 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.cache_hits, 1, "block 0 was local (hit)");
         assert_eq!(snapshot.cache_misses, 1, "block 1 was fetched (miss)");
-    }
-
-    #[tokio::test]
-    async fn test_zero_block_skip_optimization() {
-        // Verify that zero blocks are skipped during sync when S3 already has zeros.
-        // This reduces S3 writes for fresh VMs and TRIM operations.
-
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let s3 = Arc::new(
-            S3BlockStore::new(Arc::clone(&object_store), "test", 4096).with_blocks_per_batch(10),
-        );
-        let metrics = Arc::new(super::super::metrics::ExportMetrics::new());
-        let s3_with_metrics = Arc::new(
-            S3BlockStore::new(Arc::clone(&object_store), "test", 4096)
-                .with_blocks_per_batch(10)
-                .with_metrics(Arc::clone(&metrics)),
-        );
-
-        let dir = TempDir::new().unwrap();
-        let config = WriteCacheConfig {
-            cache_dir: dir.path().to_path_buf(),
-            device_name: "zero_test".to_string(),
-            device_size: 10 * 4096,
-            block_size: 4096,
-            dirty_budget_bytes: 0,
-            flush_trigger: None,
-        };
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = cache.finish_recovery(&s3).await.unwrap();
-
-        // Write zeros to block 0 (simulates TRIM or fresh VM)
-        cache.write(0, &[0u8; 4096]).unwrap();
-        assert_eq!(cache.dirty_block_count(), 1, "block should be dirty");
-
-        // Sync - should skip the S3 write since block is zeros and S3 has no batch
-        let dirty = cache.claim_dirty_blocks(10);
-        assert_eq!(dirty.len(), 1);
-        let synced = cache.sync_blocks_batched(&s3_with_metrics, dirty).await.unwrap();
-        assert_eq!(synced, 1, "block should be marked synced");
-        assert_eq!(cache.dirty_block_count(), 0, "no more dirty blocks");
-
-        // Verify NO S3 write happened (zero block was skipped)
-        let snapshot = metrics.snapshot();
-        assert_eq!(
-            snapshot.batches_written, 0,
-            "zero block should not trigger S3 write when S3 already zeros"
-        );
-
-        // Now write non-zero data and sync - this should write to S3
-        cache.write(0, &[42u8; 4096]).unwrap();
-        let dirty = cache.claim_dirty_blocks(10);
-        cache.sync_blocks_batched(&s3_with_metrics, dirty).await.unwrap();
-
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.batches_written, 1, "non-zero block should trigger S3 write");
-
-        // Verify data in S3
-        let batch = s3.get_batch_or_empty(0).await.unwrap();
-        assert_eq!(batch[0], 42, "non-zero data should be in S3");
-
-        // Now write zeros again - this time S3 has non-zero data
-        // So zeros MUST be written to overwrite the old data
-        cache.write(0, &[0u8; 4096]).unwrap();
-        let dirty = cache.claim_dirty_blocks(10);
-        cache.sync_blocks_batched(&s3_with_metrics, dirty).await.unwrap();
-
-        let snapshot = metrics.snapshot();
-        assert_eq!(
-            snapshot.batches_written, 2,
-            "zeros must be written to overwrite non-zero S3 data"
-        );
-
-        // Verify S3 now has zeros
-        let batch = s3.get_batch_or_empty(0).await.unwrap();
-        assert_eq!(batch[0], 0, "S3 should have zeros after overwrite");
     }
 
     #[test]
@@ -3688,173 +2730,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn test_mark_sync_failed_requeues_block() {
-        // Regression test: mark_sync_failed must re-queue blocks for retry.
-        //
-        // Previously, mark_sync_failed would transition blocks from Syncing→Dirty
-        // but NOT push them back onto the dirty_queue. This caused drain_for_snapshot
-        // to complete prematurely, leaving data only in the local cache (not S3).
-        //
-        // This would manifest as "cannot import pool: one or more devices unavailable"
-        // after NBD disconnect/reconnect because ZFS metadata never made it to S3.
-
-        let dir = TempDir::new().unwrap();
-        let config = test_config(dir.path());
-        let s3 = test_s3();
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = cache.finish_recovery(&s3).await.unwrap();
-
-        // Write data to a block
-        cache.write(0, b"important data").unwrap();
-        assert_eq!(cache.dirty_block_count(), 1);
-
-        // Claim the block (simulating sync worker starting)
-        let claimed = cache.claim_dirty_blocks(100);
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(cache.dirty_block_count(), 0);
-        assert_eq!(cache.syncing_block_count(), 1);
-
-        // Simulate sync failure
-        cache.mark_sync_failed(0);
-
-        // Block should be back to dirty
-        assert_eq!(cache.dirty_block_count(), 1);
-        assert_eq!(cache.syncing_block_count(), 0);
-
-        // CRITICAL: Block must be re-claimable (this was the bug)
-        let reclaimed = cache.claim_dirty_blocks(100);
-        assert_eq!(
-            reclaimed.len(),
-            1,
-            "failed blocks must be re-queued for retry"
-        );
-        assert_eq!(reclaimed[0], 0);
-
-        // Now mark as synced to complete the test
-        cache.mark_synced(0);
-        assert_eq!(cache.dirty_block_count(), 0);
-        assert_eq!(cache.syncing_block_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_drain_retries_after_sync_complete() {
-        // Regression test: drain_for_snapshot must recheck dirty queue after
-        // waiting for syncing blocks to complete.
-        //
-        // Previously, if blocks were re-queued (via mark_sync_failed) AFTER
-        // drain's claim loop completed but BEFORE syncing_count reached 0,
-        // those blocks would be missed. This could happen when:
-        // 1. Background sync worker claims blocks
-        // 2. drain_for_snapshot starts, finds queue empty (worker has them)
-        // 3. drain waits for syncing_count == 0
-        // 4. Worker's sync fails for some blocks → re-queued via mark_sync_failed
-        // 5. Worker finishes, syncing_count = 0
-        // 6. drain returns OK, but queue has dirty blocks!
-
-        let dir = TempDir::new().unwrap();
-        let config = test_config(dir.path());
-        let s3 = test_s3();
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = cache.finish_recovery(&s3).await.unwrap();
-
-        // Write data
-        cache.write(0, b"important data").unwrap();
-        assert_eq!(cache.dirty_block_count(), 1);
-
-        // Simulate background worker claiming the block
-        let claimed = cache.claim_dirty_blocks(100);
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(cache.dirty_block_count(), 0);
-        assert_eq!(cache.syncing_block_count(), 1);
-
-        // Now simulate what happens when drain runs while worker is syncing:
-        // drain would see empty queue and wait for syncing == 0
-
-        // Simulate worker sync failure - block goes back to dirty
-        cache.mark_sync_failed(0);
-        assert_eq!(cache.dirty_block_count(), 1);
-        assert_eq!(cache.syncing_block_count(), 0);
-
-        // Now drain should pick up this block and sync it
-        cache.drain_for_snapshot(&s3).await.unwrap();
-
-        // After drain, no dirty or syncing blocks should remain
-        assert_eq!(cache.dirty_block_count(), 0);
-        assert_eq!(cache.syncing_block_count(), 0);
-
-        // Verify data made it to S3
-        let s3_data = s3.read_block(0).await.unwrap();
-        assert_eq!(&s3_data[..14], b"important data");
-    }
-
-    #[tokio::test]
-    async fn test_partial_last_block_sync() {
-        // Regression test: When device_size is not a multiple of block_size,
-        // the last block is partial. sync_read_local_block must handle this
-        // by reading only valid bytes and padding with zeros.
-        //
-        // This bug caused migration failures because the last partial block
-        // (containing ZFS label L3) would fail to sync to S3, and the drain
-        // would report success despite leaving data behind.
-        //
-        // Example: 2GB device (2,000,000,000 bytes) with 128KB blocks:
-        // - num_blocks = 15,259
-        // - last block starts at 1,999,998,208
-        // - only 1,792 bytes are valid in last block
-
-        let dir = TempDir::new().unwrap();
-
-        // Use a device size that's NOT a multiple of block_size
-        // 100 blocks + 1000 extra bytes = partial last block
-        let block_size = 4096;
-        let device_size = 100 * block_size as u64 + 1000; // 101 blocks, last is partial
-
-        let config = WriteCacheConfig {
-            cache_dir: dir.path().to_path_buf(),
-            device_name: "partial_test".to_string(),
-            device_size,
-            block_size,
-            dirty_budget_bytes: 0,
-            flush_trigger: None,
-        };
-
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let s3 = S3BlockStore::new(Arc::clone(&object_store), "test", block_size)
-            .with_blocks_per_batch(10);
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = cache.finish_recovery(&s3).await.unwrap();
-
-        // Write data to the LAST (partial) block
-        let last_block = 100u64; // block indices 0-100, so 101 blocks total
-        let last_block_offset = last_block * block_size as u64;
-
-        // Write 1000 bytes (all valid bytes in the partial block)
-        let data = vec![0xABu8; 1000];
-        cache.write(last_block_offset, &data).unwrap();
-
-        assert_eq!(cache.dirty_block_count(), 1);
-
-        // This is the critical test: sync_read_local_block must not fail
-        // Previously it would try to read 4096 bytes starting at offset 409600
-        // but the file is only 410600 bytes (100*4096 + 1000), so read_exact_at
-        // would fail trying to read 4096 bytes when only 1000 are available.
-        let block_data = cache.sync_read_local_block(last_block).unwrap();
-
-        // Verify: first 1000 bytes should be our data, rest should be zeros
-        assert_eq!(&block_data[..1000], &data[..]);
-        assert!(block_data[1000..].iter().all(|&b| b == 0));
-
-        // Now verify full drain works
-        cache.drain_for_snapshot(&s3).await.unwrap();
-
-        assert_eq!(cache.dirty_block_count(), 0);
-        assert_eq!(cache.syncing_block_count(), 0);
     }
 
     // ====================================================================

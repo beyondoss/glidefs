@@ -43,7 +43,9 @@
       "WebFetch(domain:foyer-rs.github.io)",
       "Bash(ls:*)",
       "Bash(cargo metadata:*)",
-      "Bash(gsed:*)"
+      "Bash(gsed:*)",
+      "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/scripts/gen_dedup_images.sh:*)",
+      "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/glidefs/target/release/dedup_measure:*)"
     ]
   }
 }

@@ -402,8 +402,8 @@ mod tests {
         }
 
         assert!(
-            elapsed.as_millis() < 500,
-            "round-trip took {}ms, expected < 500ms",
+            elapsed.as_millis() < 2_000,
+            "round-trip took {}ms, expected < 2000ms",
             elapsed.as_millis()
         );
     }

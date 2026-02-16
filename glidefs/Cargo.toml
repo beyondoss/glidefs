@@ -92,6 +92,10 @@ name = "flush_v2"
 harness = false
 required-features = ["test-utils"]
 
+[[bin]]
+name = "dedup_measure"
+path = "src/bin/dedup_measure.rs"
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
