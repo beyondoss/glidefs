@@ -2,18 +2,26 @@
 #
 # Generate real ext4 filesystem images for dedup block-size measurement.
 #
-# Creates ext4 images from real Ubuntu + Node.js containers:
-#   base.raw         - Ubuntu 22.04 minimal
-#   vm-0-express.raw - base + Node 20 + express
-#   vm-1-express.raw - identical to vm-0 (same-workload dedup test)
-#   vm-2-nextjs.raw  - base + Node 20 + next/react
-#   vm-3-app.raw     - base + Node 20 + express + unique app code
+# Two test sets:
 #
-# All ext4 creation happens inside Docker (works on macOS and Linux).
+# SET 1: Independent builds (worst case — simulates cross-host without bless)
+#   independent/base.raw         - Ubuntu 22.04 minimal
+#   independent/vm-0-express.raw - base + Node 20 + express
+#   independent/vm-1-express.raw - identical build (same Dockerfile)
+#   independent/vm-2-nextjs.raw  - base + Node 20 + next/react
+#   independent/vm-3-app.raw     - base + Node 20 + express + unique app code
+#
+# SET 2: Forked images (realistic — simulates fork-then-write like GLIDEv2)
+#   forked/base.raw              - blessed base: Ubuntu 22.04 + Node 20
+#   forked/vm-0-express.raw      - copy of base, then npm install express
+#   forked/vm-1-express.raw      - copy of base, then npm install express
+#   forked/vm-2-nextjs.raw       - copy of base, then npm install next react
+#   forked/vm-3-app.raw          - copy of base, then npm install express + app code
 #
 # Usage:
 #   ./scripts/gen_dedup_images.sh [output_dir]
-#   cargo run --release --bin dedup_measure -- /tmp/glidefs-dedup-test/*.raw
+#   cargo run --release --bin dedup_measure -- /tmp/glidefs-dedup-test/independent/*.raw
+#   cargo run --release --bin dedup_measure -- /tmp/glidefs-dedup-test/forked/*.raw
 #
 # Requirements: docker
 
@@ -22,20 +30,20 @@ set -euo pipefail
 OUT="${1:-/tmp/glidefs-dedup-test}"
 IMG_SIZE_MB=512
 
-mkdir -p "$OUT"
+mkdir -p "$OUT/independent" "$OUT/forked"
 
 echo "=== Generating dedup test images in $OUT ==="
 echo "    Image size: ${IMG_SIZE_MB}MB each"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Build all app images first (docker layer caching makes this fast).
+# SET 1: Independent builds
 # ---------------------------------------------------------------------------
 
 build_app_image() {
     local name="$1"
     local dockerfile="$2"
-    echo "[$name] Building..."
+    echo "[independent/$name] Building..."
     echo "$dockerfile" | docker build -q -t "glidefs-dedup-${name}" -f - . >/dev/null 2>&1
 }
 
@@ -86,55 +94,153 @@ RUN echo 'const express = require(\"express\"); const app = express(); app.liste
 
 echo ""
 
-# ---------------------------------------------------------------------------
-# Export each container and pack into an ext4 image.
-# All done inside a privileged Ubuntu container for portability.
-# ---------------------------------------------------------------------------
+INDEP_NAMES="base vm-0-express vm-1-express vm-2-nextjs vm-3-app"
 
-NAMES="base vm-0-express vm-1-express vm-2-nextjs vm-3-app"
-
-# Export all containers as tarballs.
-for name in $NAMES; do
-    echo "[$name] Exporting container filesystem..."
+for name in $INDEP_NAMES; do
+    echo "[independent/$name] Exporting..."
     cid=$(docker create "glidefs-dedup-${name}")
-    docker export "$cid" > "$OUT/${name}.tar"
+    docker export "$cid" > "$OUT/independent/${name}.tar"
     docker rm "$cid" >/dev/null
 done
 
+# ---------------------------------------------------------------------------
+# SET 2: Forked images — build base, then write into copies
+# ---------------------------------------------------------------------------
+
 echo ""
-echo "Packing into ext4 images (inside Docker)..."
-
-# Build a helper image with e2fsprogs.
-docker build -q -t glidefs-dedup-helper -f - . >/dev/null 2>&1 <<'HELPER_DOCKERFILE'
+echo "[forked/base] Building blessed base (Ubuntu 22.04 + Node 20)..."
+docker build -q -t glidefs-dedup-forked-base -f - . >/dev/null 2>&1 <<'EOF'
 FROM ubuntu:22.04
-RUN apt-get update -qq && apt-get install -y -qq e2fsprogs tar >/dev/null 2>&1
-HELPER_DOCKERFILE
+RUN apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null 2>&1
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 && \
+    apt-get install -y -qq nodejs >/dev/null 2>&1
+EOF
 
-# Run the helper to create all ext4 images from the tarballs.
+echo "[forked/base] Exporting..."
+cid=$(docker create glidefs-dedup-forked-base)
+docker export "$cid" > "$OUT/forked/base.tar"
+docker rm "$cid" >/dev/null
+
+# ---------------------------------------------------------------------------
+# Build the helper image for ext4 work
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "Building ext4 helper..."
+docker build -q -t glidefs-dedup-helper -f - . >/dev/null 2>&1 <<'HELPER'
+FROM ubuntu:22.04
+RUN apt-get update -qq && apt-get install -y -qq e2fsprogs tar nodejs npm >/dev/null 2>&1
+HELPER
+
+# ---------------------------------------------------------------------------
+# Pack independent set into ext4
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Packing independent set into ext4 ==="
+
 docker run --rm --privileged \
     -v "$OUT:/work" \
     glidefs-dedup-helper bash -c "
         set -e
-        for name in $NAMES; do
-            echo \"[\$name] Creating ${IMG_SIZE_MB}MB ext4 image...\"
-            dd if=/dev/zero of=/work/\${name}.raw bs=1M count=$IMG_SIZE_MB status=none
-            mkfs.ext4 -q -F /work/\${name}.raw
+        for name in $INDEP_NAMES; do
+            echo \"[\$name] Creating ${IMG_SIZE_MB}MB ext4...\"
+            dd if=/dev/zero of=/work/independent/\${name}.raw bs=1M count=$IMG_SIZE_MB status=none
+            mkfs.ext4 -q -F /work/independent/\${name}.raw
             mkdir -p /mnt/img
-            mount -o loop /work/\${name}.raw /mnt/img
-            tar xf /work/\${name}.tar -C /mnt/img 2>/dev/null || true
+            mount -o loop /work/independent/\${name}.raw /mnt/img
+            tar xf /work/independent/\${name}.tar -C /mnt/img 2>/dev/null || true
             umount /mnt/img
-            rm -f /work/\${name}.tar
+            rm -f /work/independent/\${name}.tar
             echo \"[\$name] Done\"
         done
     "
 
+# ---------------------------------------------------------------------------
+# Pack forked set into ext4 — base image is created once, then COPIED,
+# then each copy is mounted and written into. This simulates the fork-then-write
+# pattern where all VMs start from the same ext4 state.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Packing forked set into ext4 (fork-then-write) ==="
+
+docker run --rm --privileged \
+    -v "$OUT:/work" \
+    glidefs-dedup-helper bash -c '
+        set -e
+
+        # Create the blessed base ext4 image.
+        echo "[forked/base] Creating base ext4..."
+        dd if=/dev/zero of=/work/forked/base.raw bs=1M count='"$IMG_SIZE_MB"' status=none
+        mkfs.ext4 -q -F /work/forked/base.raw
+        mkdir -p /mnt/img
+        mount -o loop /work/forked/base.raw /mnt/img
+        tar xf /work/forked/base.tar -C /mnt/img 2>/dev/null || true
+        umount /mnt/img
+        rm -f /work/forked/base.tar
+        echo "[forked/base] Done"
+
+        # Fork: copy the base image, then mount and write into each copy.
+
+        echo "[forked/vm-0-express] Forking + npm install express..."
+        cp /work/forked/base.raw /work/forked/vm-0-express.raw
+        mount -o loop /work/forked/vm-0-express.raw /mnt/img
+        cd /mnt/img/root && mkdir -p app && cd app
+        npm init -y >/dev/null 2>&1
+        npm install express >/dev/null 2>&1
+        cd / && umount /mnt/img
+        echo "[forked/vm-0-express] Done"
+
+        echo "[forked/vm-1-express] Forking + npm install express..."
+        cp /work/forked/base.raw /work/forked/vm-1-express.raw
+        mount -o loop /work/forked/vm-1-express.raw /mnt/img
+        cd /mnt/img/root && mkdir -p app && cd app
+        npm init -y >/dev/null 2>&1
+        npm install express >/dev/null 2>&1
+        cd / && umount /mnt/img
+        echo "[forked/vm-1-express] Done"
+
+        echo "[forked/vm-2-nextjs] Forking + npm install next react..."
+        cp /work/forked/base.raw /work/forked/vm-2-nextjs.raw
+        mount -o loop /work/forked/vm-2-nextjs.raw /mnt/img
+        cd /mnt/img/root && mkdir -p app && cd app
+        npm init -y >/dev/null 2>&1
+        npm install next react react-dom >/dev/null 2>&1
+        cd / && umount /mnt/img
+        echo "[forked/vm-2-nextjs] Done"
+
+        echo "[forked/vm-3-app] Forking + express + app code..."
+        cp /work/forked/base.raw /work/forked/vm-3-app.raw
+        mount -o loop /work/forked/vm-3-app.raw /mnt/img
+        cd /mnt/img/root && mkdir -p app && cd app
+        npm init -y >/dev/null 2>&1
+        npm install express >/dev/null 2>&1
+        mkdir -p src
+        for i in $(seq 1 50); do
+            dd if=/dev/urandom bs=4096 count=4 2>/dev/null | base64 > src/module_${i}.js
+        done
+        echo "const express = require(\"express\"); const app = express(); app.listen(3000);" > index.js
+        cd / && umount /mnt/img
+        echo "[forked/vm-3-app] Done"
+    '
+
 echo ""
 echo "=== Generated images ==="
-for name in $NAMES; do
-    size=$(ls -lh "$OUT/${name}.raw" | awk '{print $5}')
-    echo "  $OUT/${name}.raw  ($size)"
+echo ""
+echo "Independent builds (worst case):"
+for name in $INDEP_NAMES; do
+    size=$(ls -lh "$OUT/independent/${name}.raw" | awk '{print $5}')
+    echo "  $OUT/independent/${name}.raw  ($size)"
+done
+echo ""
+echo "Forked from same base (realistic):"
+for name in base vm-0-express vm-1-express vm-2-nextjs vm-3-app; do
+    size=$(ls -lh "$OUT/forked/${name}.raw" | awk '{print $5}')
+    echo "  $OUT/forked/${name}.raw  ($size)"
 done
 
 echo ""
-echo "Run measurement:"
-echo "  cargo run --release --bin dedup_measure -- $OUT/*.raw"
+echo "Run measurements:"
+echo "  cargo run --release --bin dedup_measure -- $OUT/independent/*.raw"
+echo "  cargo run --release --bin dedup_measure -- $OUT/forked/*.raw"

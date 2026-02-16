@@ -45,7 +45,8 @@
       "Bash(cargo metadata:*)",
       "Bash(gsed:*)",
       "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/scripts/gen_dedup_images.sh:*)",
-      "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/glidefs/target/release/dedup_measure:*)"
+      "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/glidefs/target/release/dedup_measure:*)",
+      "Bash(cargo run:*)"
     ]
   }
 }

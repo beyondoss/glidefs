@@ -103,6 +103,8 @@ For each dimension, assess: **present** (fully implemented), **partial** (some c
 
 ## Step 4: Score with ICE
 
+ICE is a **prioritization framework**, not a severity assessment. The question is never "is this worth doing vs. doing nothing?" — there is always work to do. The question is "what should we pick up next?" A low-impact, high-confidence, high-ease finding is a legitimate quick win that belongs high in the priority list. Do not editorialize over the scores. Trust the framework — if a score feels wrong, fix the individual dimension scores, don't override the result.
+
 | Dimension      | Scale | Description                                                |
 | -------------- | ----- | ---------------------------------------------------------- |
 | **Impact**     | 1-10  | How much does this gap hurt production reliability?        |
@@ -117,6 +119,13 @@ For each dimension, assess: **present** (fully implemented), **partial** (some c
 - 5-6: Would meaningfully reduce MTTR or prevent incidents
 - 7-8: Absence will cause incidents or make debugging very difficult
 - 9-10: Absence will cause data loss, extended outages, or security incidents
+
+### Composite Score
+
+- **8.0–10.0**: Do it now — high-ROI, no reason to wait
+- **6.0–7.9**: Do it soon — meaningful improvement, plan it in
+- **4.0–5.9**: Backlog — worth doing when time allows
+- **Below 4.0**: Ignore unless it compounds with other issues
 
 ## Step 5: Output Format
 

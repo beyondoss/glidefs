@@ -1,219 +1,209 @@
 ---
-name: audit
-description: Deep technical audit of a codebase area. Auto-detects language persona (rustacean/gopher/product engineer), evaluates architecture, operations, performance, security, and idioms. Findings scored with ICE model. Use when asked to audit, review quality of, or evaluate a package or directory.
+name: audit-testing
+description: Audit test coverage, quality, and gaps for a codebase area. Identifies missing critical tests, evaluates test patterns, and scores gaps with ICE model. Use when asked about test coverage, missing tests, or testing quality.
 allowed-tools: Read, Glob, Grep, Bash, LSP
 ---
 
-# Technical Codebase Audit
+# Testing Audit
 
-You are performing a deep technical audit. Your job is to find real issues, not rubber-stamp code. Be honest, be specific, be calibrated.
+You are auditing the testing posture of a codebase area. Your job is to find the tests that are MISSING — the ones that would have caught the bug that ships at 2am on a Friday. Prioritize ruthlessly.
 
-## Step 1: Detect Persona and Domain
+## Step 1: Detect Persona
 
-Auto-detect from the audit target. Do not ask the user.
+Use the same persona auto-detection as the `audit` skill based on target directory language. A rustacean evaluates `#[cfg(test)]` modules and integration tests differently than a gopher evaluates `_test.go` files.
 
-| Target directory | Language | Persona           | Domain expertise                                          |
-| ---------------- | -------- | ----------------- | --------------------------------------------------------- |
-| `boxes/`         | Rust     | Rustacean         | Firecracker, ZFS, OVN, typestate, process isolation       |
-| `edge/`          | Rust     | Rustacean         | Reverse proxy, TLS, caching (S3-FIFO), WAF                |
-| `tunnel/`        | Rust     | Rustacean         | TCP proxy, SSH/TLS routing, certificate auth, mTLS        |
-| `orchestrator/`  | Rust     | Rustacean         | CAS racing, typestate, blue-green deploys, crash recovery |
-| `rustlib/`       | Rust     | Rustacean         | Shared crates, wire types, circuit breakers, telemetry    |
-| `native/`        | Rust     | Rustacean         | GPUI, macOS app, SSH client, NDJSON streaming             |
-| `api/`           | Go       | Gopher            | Multi-tenant SaaS, ReBAC, state machines, NATS consumers  |
-| `cli/`           | Go       | Gopher            | CLI UX, API client, device auth                           |
-| `web/`           | TS/React | Product engineer  | React, real-time, terminal emulation                      |
-| Mixed / multiple | Mixed    | Systems architect | Cross-service cohesion, data flow, messaging              |
-
-Adopt the persona fully. You live and breathe this language and domain. Apply language-specific idioms rigorously, not generic advice.
+| Target          | Language | Test ecosystem                                             |
+| --------------- | -------- | ---------------------------------------------------------- |
+| `boxes/`        | Rust     | `#[cfg(test)]`, `/tests/`, mock traits, test harnesses     |
+| `edge/`         | Rust     | `#[cfg(test)]`, `/tests/`, mock store, test certificates   |
+| `tunnel/`       | Rust     | `#[cfg(test)]`, `/tests/`, mock certs, integration tests   |
+| `orchestrator/` | Rust     | `#[cfg(test)]`, mock traits                                |
+| `rustlib/`      | Rust     | `#[cfg(test)]`, fixture-based schema validation            |
+| `api/`          | Go       | `_test.go`, build tags, seeder pattern, `testutil` package |
+| `cli/`          | Go       | `_test.go`, integration tests                              |
+| `web/`          | TS/React | Jest/Vitest, React Testing Library, component tests        |
 
 ## Step 2: Pre-Work
 
-Do ALL of these before writing a single finding:
+1. **Read `.architecture-index`** and the target's ARCHITECTURE.md
+2. **Read `CLAUDE.md`** — note the idempotency/atomicity requirements (these MUST be tested)
+3. **Inventory all test files**:
+   - Rust: `Grep` for `#[cfg(test)]` and `#[test]`, `Glob` for `tests/*.rs`
+   - Go: `Glob` for `*_test.go`, check for `//go:build integration` tags
+   - TS: `Glob` for `*.test.ts`, `*.spec.ts`
+4. **Read `api/pkg/testutil/ARCHITECTURE.md`** if auditing Go code (understand seeder pattern)
+5. **Check for wire compat tests** if the target consumes NATS messages: look for `wire_compat_test.go`
+6. **Read the testing infrastructure**: mock traits, test harnesses, fixtures
 
-1. **Read `.architecture-index`** to understand the docs map
-2. **Read the ARCHITECTURE.md** for the target directory (and sub-package ARCHITECTURE.md files)
-3. **Read `CLAUDE.md`** to understand project values (minimum effective abstraction, performance as a feature, idempotent/atomic operations, NATS backbone)
-4. **Scan the directory structure** of the target to understand package layout
-5. **Read key source files** — focus on:
-   - Entry points (main.rs, main.go, mod.rs, service.go)
-   - Core types and traits/interfaces
-   - State machines and FSMs
-   - Error handling patterns
-   - Configuration and initialization
-6. **Check for tests** — find `#[cfg(test)]` modules, `*_test.go` files, `/tests/` directories
-7. **Check for NATS messaging** — if the target publishes or consumes NATS messages, verify wire types are in `rustlib/wire` (not defined locally)
+## Step 3: Evaluate Test Quality
 
-## Step 3: Evaluate Across Dimensions
+### Test Taxonomy
 
-Audit each dimension that applies to the target. Skip dimensions that are genuinely not relevant.
+Classify existing tests into these categories:
 
-### Architecture
+| Category          | What it tests                                | Example                         |
+| ----------------- | -------------------------------------------- | ------------------------------- |
+| **Unit**          | Single function/method, mocked dependencies  | State machine transitions       |
+| **Integration**   | Multiple components with real dependencies   | Service + repo + real Postgres  |
+| **Wire compat**   | Go/Rust schema agreement via JSON fixtures   | `wire_compat_test.go`           |
+| **Property/fuzz** | Invariants across random inputs              | Fuzz config parsing             |
+| **Benchmark**     | Performance characteristics                  | `bench_test.go`, `#[bench]`     |
+| **E2E**           | Full system flow                             | Relay e2e test                  |
+| **Idempotency**   | Operation safe to retry                      | Create-if-not-exists            |
+| **State machine** | All transitions, guards, invalid transitions | FSM transition table coverage   |
+| **Error path**    | Failure modes, error propagation             | Network timeout, disk full      |
+| **Concurrency**   | Race conditions, deadlocks                   | Parallel access to shared state |
 
-- Is the module boundary clean? Single responsibility?
-- Are traits/interfaces used for abstraction, or are there concrete dependencies?
-- Is the dependency direction correct (no circular imports, no upward dependencies)?
-- Does the architecture match what ARCHITECTURE.md describes? Flag drift.
-- Are there God structs/functions that do too much?
-- Is the abstraction level appropriate? (Project value: minimum effective abstraction)
+### Evaluation Dimensions
 
-### Operations (Idempotency & Atomicity)
+**1. Critical Path Coverage**
 
-- Do state-modifying operations check-before-create / check-before-destroy?
-- Can operations be safely retried after crashes or network failures?
-- Are multi-step operations **ATOMIC** or do they have safe intermediate states?
-- Is there crash recovery logic? Does it work?
-- Are compensating actions implemented for saga-style operations?
+- Is the happy path tested end-to-end?
+- Are the top 3 most common operations tested?
 
-### Performance
+**2. State Machine Coverage**
 
-- Is work being done that could be avoided? (Project value: do less work)
-- Are allocations minimized? Buffers reused where it matters?
-- Are hot paths free of unnecessary copies, locks, or syscalls?
-- Is concurrency used only when the work itself is the bottleneck?
-- For Rust: unnecessary `.clone()`, `Box<dyn>` where generics suffice, excessive `Arc`?
-- For Go: goroutine leaks, unbounded channels, missing context cancellation?
+- Are ALL states reachable in tests?
+- Are ALL valid transitions tested?
+- Are INVALID transitions tested (should error/panic)?
+- Does test coverage match the transition table in ARCHITECTURE.md?
 
-### Language Idioms
+**3. Error Path Coverage**
 
-- **Rust**: Typestate pattern where appropriate? Error handling with `thiserror`/`anyhow`? Proper lifetime management? `#[must_use]` on important return values? Builder pattern where constructors are complex?
-- **Go**: Error wrapping with `fmt.Errorf("...: %w", err)`? Table-driven tests? Context propagation? Interface satisfaction checks? Exported types documented?
-- **TypeScript**: Proper type narrowing? No `any` escape hatches? Discriminated unions for state?
+- What happens when the database is down?
+- What happens when NATS is unreachable?
+- What happens on invalid input at every boundary?
 
-### Security (when applicable)
+**4. Idempotency Tests** (CLAUDE.md requirement)
 
-- What is the trust model? What is verified? What is NOT verified?
-- Are secrets handled correctly (no logging, no plaintext storage)?
-- Input validation at boundaries?
-- Are there TOCTOU races in permission checks?
+- For every state-modifying operation: is there a test that runs it twice and asserts same result?
+- For infrastructure ops (ZFS, OVN, iptables): are "already exists" and "not found" paths tested?
 
-### Error Handling
+**5. Concurrency Tests**
 
-- Are errors informative enough to debug without reproducing?
-- Is error context preserved through the call chain?
-- Are errors typed/categorized (retryable vs fatal)?
-- Are there silent error swallows (`let _ =` in Rust, `_ = err` in Go)?
+- Are shared data structures tested under concurrent access?
+- Are there tests for goroutine/task cancellation?
 
-### NATS Messaging (when applicable)
+**6. Wire Compatibility** (for NATS consumers)
 
-- Are wire types defined in `rustlib/wire`, not locally? (CLAUDE.md requirement)
-- Do Go consumers have `wire_compat_test.go`?
-- Are subjects following conventions?
-- Is there proper error handling for publish/subscribe failures?
+- Does every Go consumer have a `wire_compat_test.go`?
+- Do fixture tests cover all fields?
 
-## Step 4: Score Each Finding with ICE
+**7. Test Quality Smells**
 
-For every finding, assign:
+- Tests with no assertions
+- Tests that depend on execution order
+- Tests with sleeps instead of synchronization
+- Tests with excessive mocking (testing the mocks, not the code)
 
-| Dimension      | Scale | Description                                            |
-| -------------- | ----- | ------------------------------------------------------ |
-| **Impact**     | 1-10  | How much will fixing this improve the system?          |
-| **Confidence** | 1-10  | How sure are you this is actually a problem?           |
-| **Ease**       | 1-10  | How easy is this to fix? (10 = trivial)                |
-| **ICE Score**  |       | (Impact + Confidence + Ease) / 3, rounded to 1 decimal |
+## Step 4: Score with ICE
 
-### Calibration Guide
+ICE is a **prioritization framework**, not a severity assessment. The question is never "is this worth doing vs. doing nothing?" — there is always work to do. The question is "what test should we write next?" A low-impact, high-confidence, high-ease gap is a legitimate quick win that belongs high in the priority list. Do not editorialize over the scores. Trust the framework — if a score feels wrong, fix the individual dimension scores, don't override the result.
 
-**Impact:**
+| Dimension      | Scale | Description                                               |
+| -------------- | ----- | --------------------------------------------------------- |
+| **Impact**     | 1-10  | How bad would the untested failure mode be in production? |
+| **Confidence** | 1-10  | How sure are you this test is actually missing?           |
+| **Ease**       | 1-10  | How easy is this test to write? (10 = trivial)            |
+| **ICE Score**  |       | (Impact + Confidence + Ease) / 3                          |
 
-- 1-2: Cosmetic, style preference
-- 3-4: Minor code quality improvement
-- 5-6: Meaningful improvement to maintainability or correctness
-- 7-8: Prevents likely bugs or significant performance issue
-- 9-10: Prevents data loss, security vulnerability, or system outage
+### Impact Calibration for Tests
 
-**Confidence:**
+- 1-2: Style/convention test
+- 3-4: Catches minor regressions in non-critical paths
+- 5-6: Catches regressions in important but not critical paths
+- 7-8: Catches bugs that would cause user-visible errors or data inconsistency
+- 9-10: Catches bugs that would cause data loss, security breach, or extended outage
 
-- 1-3: Uncertain — would need profiling/testing to confirm
-- 4-6: Likely issue based on code reading
-- 7-8: Clear issue, seen the pattern cause problems before
-- 9-10: Definite issue, can point to the exact failure mode
+### Composite Score
 
-**Ease:**
-
-- 1-2: Major refactor, architectural change
-- 3-4: Multi-file change, needs careful migration
-- 5-6: Contained change, moderate effort
-- 7-8: Small change, well-understood
-- 9-10: One-liner or trivial fix
+- **8.0–10.0**: Do it now — high-ROI, no reason to wait
+- **6.0–7.9**: Do it soon — meaningful improvement, plan it in
+- **4.0–5.9**: Backlog — worth doing when time allows
+- **Below 4.0**: Ignore unless it compounds with other issues
 
 ## Step 5: Output Format
 
-```
-## Audit: {target directory}
+````
+## Testing Audit: {target directory}
 
-**Persona**: {persona and domain}
-**Scope**: {what was audited}
+**Persona**: {persona}
+**Scope**: {what was examined}
 
 ---
 
 ## Overall: {X}/10
 
-{2-3 sentence summary. Be honest. A 7 is good. A 9 is exceptional. A 5 needs work.}
+{2-3 sentence summary. "Has solid unit tests but integration tests are thin and idempotency is untested."}
 
 ## Ratings
 
-| Dimension | Rating | Notes |
+| Category | Rating | Notes |
 | --- | --- | --- |
-| Architecture | {X}/10 | {one-line assessment} |
-| Operations | {X}/10 | {one-line assessment} |
-| Performance | {X}/10 | {one-line assessment} |
-| Idioms | {X}/10 | {one-line assessment} |
-| Idempotency | {X}/10 | {one-line assessment} |
-| Atomicity | {X}/10 | {one-line assessment} |
-| Elegance | {X}/10 | {one-line assessment} |
-| Error Handling | {X}/10 | {one-line assessment} |
-| Security | {X}/10 | {one-line assessment} |
-| NATS Messaging | {X}/10 | {one-line assessment} |
+| Critical Path Coverage | {X}/10 | {one-line} |
+| State Machine Coverage | {X}/10 | {one-line} |
+| Error Path Coverage | {X}/10 | {one-line} |
+| Idempotency Tests | {X}/10 | {one-line} |
+| Concurrency Tests | {X}/10 | {one-line} |
+| Wire Compatibility | {X}/10 | {one-line} |
+| Test Quality | {X}/10 | {one-line} |
 
-Skip dimensions that don't apply. The overall rating is NOT an average — it's a holistic judgment.
+Skip categories that don't apply (e.g. should only use Wire Compatibility for Go)
+
+## Test Inventory
+
+| Category | Count | Key files |
+| --- | --- | --- |
+| Unit | {n} | {files} |
+| Integration | {n} | {files} |
+| Wire compat | {n} | {files} |
+| Benchmark | {n} | {files} |
+| E2E | {n} | {files} |
 
 ---
 
 ## What I Like
 
-{Specific things the code does well. Each with a file:line reference. Not generic praise — cite the exact pattern, function, or design choice and why it's good. These are the things worth preserving and propagating.}
+{Specific things the tests do well. File references. Not generic — cite the exact test pattern, helper, or coverage choice.}
 
-- **{Merit title}** — `{file:line}`. {Why this is good. Be specific.}
-- **{Merit title}** — `{file:line}`. {Why this is good.}
+- **{Merit}** — `{file:line}`. {Why this is good.}
 - ...
 
 ---
 
 ## What Concerns Me
 
-{Only real issues. Each concern gets a compact ICE score. Only include a suggested fix for clear shortcomings — not for stylistic preferences or "it could be slightly better." If it works and isn't going to cause problems, don't suggest a fix.}
+{Missing tests and test quality issues. Compact ICE. Only suggest what to write for clear gaps.}
 
-### {Concern title}
-`{file:line}` · ICE {I}/{C}/{E} → {score}
+### {Missing test or quality issue}
+`{file or area}` · {type} · ICE {I}/{C}/{E} → {score} · {trivial | moderate | significant}
 
-{What's wrong and why it matters. 2-4 sentences max.}
+{What's missing and what production failure it would catch. 2-4 sentences.}
 
-**Fix**: {Only if this is a clear shortcoming. Omit this line for minor concerns or things that are judgment calls.}
-
-### {Concern title}
-`{file:line}` · ICE {I}/{C}/{E} → {score}
-
-{What's wrong and why it matters.}
+**Sketch** (only for high-ICE items):
+```{language}
+// Brief test skeleton — 5-10 lines max
+````
 
 ---
 
 ## Concerns Summary
 
-| # | Concern | Location | ICE |
-| --- | --- | --- | --- |
-| 1 | {title} | `{file:line}` | {n.n} |
-| 2 | {title} | `{file:line}` | {n.n} |
+| # | Gap           | Type                   | Effort   | ICE   |
+| - | ------------- | ---------------------- | -------- | ----- |
+| 1 | {description} | {unit/integration/...} | {effort} | {n.n} |
+| 2 | {description} | {type}                 | {effort} | {n.n} |
 
-## Architecture Alignment
+## Quick Wins
 
-{Does the code match what ARCHITECTURE.md says? Flag drift. If no ARCHITECTURE.md exists, note it.}
+{Top 3 tests that add the most confidence with least effort.}
+
 ```
-
 ## Calibration Rules
 
-- **Do not inflate ratings or overclaim severity.** Most code that "works" is 4-6 for production readiness. An 8 means you'd be comfortable being oncall for it.
-- **Do not list more than 15 concerns.** Keep the top 15 by ICE score.
-- **Every concern must have a specific file and location.** No vague "the codebase could benefit from..."
-- **Merits are mandatory and specific.** Not "good error handling" but "error types in `error.rs` use `thiserror` with structured context including VM ID and operation."
-- **Only suggest fixes for clear shortcomings.** If it's a style preference or minor quibble, state the concern but don't prescribe a fix.
+- **Stack rank honestly.** The #1 missing test should catch the most dangerous bug.
+- **Do not list more than 15 gaps.** Keep the top 15 by ICE score.
+- **Every gap must be specific.** Not "add more error tests" but "test that `CreateVM` returns `AlreadyExists` when called twice with the same ID."
+- **Sketches only for high-ICE items.** Don't pad the output with boilerplate test skeletons for every gap.
+- **Wire compat tests are non-negotiable.** If a Go consumer lacks `wire_compat_test.go`, that is always high-ICE.
+```

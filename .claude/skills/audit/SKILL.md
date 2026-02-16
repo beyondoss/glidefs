@@ -103,14 +103,16 @@ Audit each dimension that applies to the target. Skip dimensions that are genuin
 
 ## Step 4: Score Each Finding with ICE
 
+ICE is a **prioritization framework**, not a severity assessment. The question is never "is this worth doing vs. doing nothing?" — there is always work to do. The question is "what should we pick up next?" A low-impact, high-confidence, high-ease finding (2/9/10 → 7.0) is a legitimate quick win — it belongs high in the priority list precisely because the cost is near-zero. Do not editorialize over the scores ("the formula is lying," "real priority: lowest"). Trust the framework. If a score feels wrong, fix the individual dimension scores, don't override the result.
+
 For every finding, assign:
 
-| Dimension      | Scale | Description                                            |
-| -------------- | ----- | ------------------------------------------------------ |
-| **Impact**     | 1-10  | How much will fixing this improve the system?          |
-| **Confidence** | 1-10  | How sure are you this is actually a problem?           |
-| **Ease**       | 1-10  | How easy is this to fix? (10 = trivial)                |
-| **ICE Score**  |       | (Impact + Confidence + Ease) / 3, rounded to 1 decimal |
+| Dimension      | Scale | Description                                                  |
+| -------------- | ----- | ------------------------------------------------------------ |
+| **Impact**     | 1-10  | How much does fixing this improve the system vs. other work? |
+| **Confidence** | 1-10  | How sure are you this is actually a problem?                 |
+| **Ease**       | 1-10  | How easy is this to fix? (10 = trivial)                      |
+| **ICE Score**  |       | (Impact + Confidence + Ease) / 3, rounded to 1 decimal       |
 
 ### Calibration Guide
 
@@ -136,6 +138,13 @@ For every finding, assign:
 - 5-6: Contained change, moderate effort
 - 7-8: Small change, well-understood
 - 9-10: One-liner or trivial fix
+
+### Composite Score
+
+- **8.0–10.0**: Do it now — high-ROI, no reason to wait
+- **6.0–7.9**: Do it soon — meaningful improvement, plan it in
+- **4.0–5.9**: Backlog — worth doing when time allows
+- **Below 4.0**: Ignore unless it compounds with other issues
 
 ## Step 5: Output Format
 
@@ -213,6 +222,7 @@ Skip dimensions that don't apply. The overall rating is NOT an average — it's 
 ## Calibration Rules
 
 - **Do not inflate ratings or overclaim severity.** Most code that "works" is 4-6 for production readiness. An 8 means you'd be comfortable being oncall for it.
+- **ICE is prioritization, not severity.** A high ICE score means "do this soon" — not "this is scary." Quick wins (low impact, high confidence, high ease) legitimately rank high because the ROI is favorable. Do not deflate scores to signal that something is unimportant; that's what the Impact dimension is for.
 - **Do not list more than 15 concerns.** Keep the top 15 by ICE score.
 - **Every concern must have a specific file and location.** No vague "the codebase could benefit from..."
 - **Merits are mandatory and specific.** Not "good error handling" but "error types in `error.rs` use `thiserror` with structured context including VM ID and operation."
