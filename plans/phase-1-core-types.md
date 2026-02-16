@@ -58,7 +58,7 @@ write(offset, data):
   3. chunk_index = offset / chunk_size
   4. block_map[chunk_index] = (hash, dirty=true, seq)
   5. dirty_set.insert(chunk_index)
-  6. wal.append(vm_id, chunk_index, hash, data, seq)
+  6. wal.append(export_name, chunk_index, hash, data, seq)
   7. dirty_store[hash] = data   // pinned, not evictable
   8. return Ok(())
 ```
@@ -67,7 +67,8 @@ write(offset, data):
 
 ```
 WAL Entry:
-  vm_id:        [u8; 16]    (UUID)
+  name_len:     u16          (export name length)
+  name:         [u8; name_len]  (export name, UTF-8)
   chunk_index:  u64
   hash:         [u8; 16]    (BLAKE3-128)
   sequence:     u64
@@ -128,7 +129,7 @@ WAL Entry:
 
 ### Unit Tests — WAL
 
-- **`test_wal_append_and_replay`**: Append 10 entries, close, replay. All 10 entries recovered with correct vm_id, chunk_index, hash, sequence, and data.
+- **`test_wal_append_and_replay`**: Append 10 entries, close, replay. All 10 entries recovered with correct export name, chunk_index, hash, sequence, and data.
 - **`test_wal_truncated_entry`**: Append 5 entries, then write a partial 6th entry (truncate mid-write). Replay recovers exactly 5 entries.
 - **`test_wal_crc_corruption`**: Append 3 entries, flip a bit in entry 2's CRC. Replay recovers entry 1, stops at entry 2 (or skips to entry 3 depending on recovery strategy).
 - **`test_wal_truncate_after_persist`**: Append entries, truncate WAL. Verify WAL is empty. New appends work correctly.

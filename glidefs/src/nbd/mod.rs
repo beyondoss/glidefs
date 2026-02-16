@@ -1,7 +1,12 @@
 pub mod api;
+pub mod block_map;
 pub mod block_store;
 pub mod error;
 pub mod handler;
+pub mod content_store;
+pub mod manifest;
+pub mod pack;
+pub mod pack_index;
 
 pub mod metrics;
 pub mod protocol;
@@ -9,6 +14,7 @@ pub mod router;
 pub mod server;
 pub mod state;
 pub mod sync;
+pub mod wal;
 pub mod write_cache;
 
 // Re-export protocol types for fuzzing

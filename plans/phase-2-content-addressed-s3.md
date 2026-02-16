@@ -98,7 +98,7 @@ flush(vm):
 ### Unit Tests — Manifest Format
 
 - **`test_manifest_round_trip`**: Create manifest with 1,000 block map entries + 40 pack index entries. Serialize to bytes. Deserialize. All entries match.
-- **`test_manifest_header_fields`**: Serialize manifest. Parse header. Magic = `"GLDE"`, version = 1, vm_id matches, sequence matches, chunk_size = 131072, device_size matches, entry counts match.
+- **`test_manifest_header_fields`**: Serialize manifest. Parse header. Magic = `"GLDE"`, version = 1, export name matches, sequence matches, chunk_size = 131072, device_size matches, entry counts match.
 - **`test_manifest_sparse_encoding`**: Create block map with entries at indices 0, 500, 100000. Serialize. Byte count = 64 (header) + 3*25 (block map) + pack index. NOT 100001*25.
 - **`test_manifest_empty`**: VM with zero writes. Manifest has 0 block map entries, 0 pack index entries. Serializes and deserializes correctly.
 - **`test_manifest_large`**: 800K block map entries (fully written 100GB disk). Serialize and deserialize. Verify correctness. Measure time — should be <100ms.

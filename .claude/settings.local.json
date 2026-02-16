@@ -37,7 +37,8 @@
       "WebFetch(domain:fly.io)",
       "Bash(git -C /Users/jared/Code/Apps/paraglidehq/glidefs log --oneline)",
       "Bash(python3:*)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:crates.io)"
     ]
   }
 }

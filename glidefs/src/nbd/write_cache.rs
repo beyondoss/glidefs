@@ -15,20 +15,40 @@
 
 use bytes::Bytes;
 use crossbeam::queue::SegQueue;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::marker::PhantomData;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, instrument, warn};
 
+use super::block_map::{AtomicBlockMap, BlockMap, BlockMapEntry, Blake3Hash, SequenceNumber, blake3_128, lz4_compress, ZERO_BLOCK_HASH};
 use super::block_store::{BlockStoreError, S3BlockStore};
+use super::content_store::{ContentStore, ContentStoreError};
+use super::manifest::{Manifest, ManifestBlockEntry};
+use super::pack::{self, PackLocation, BLOCKS_PER_PACK};
+use super::pack_index::HostPackIndex;
 use super::state::{Active, BlockState, Draining, Initializing, Recovering};
+use super::wal::{Wal, WalEntry};
+
+/// Statistics from a flush operation.
+#[derive(Debug, Default)]
+pub struct FlushStats {
+    /// Total blocks included in the flush snapshot.
+    pub blocks_flushed: usize,
+    /// Blocks skipped (already in S3 or zero blocks).
+    pub blocks_deduped: usize,
+    /// Number of pack objects uploaded.
+    pub packs_uploaded: usize,
+    /// Total bytes uploaded to S3.
+    pub bytes_uploaded: u64,
+}
 
 /// A file handle safe for concurrent positional I/O.
 ///
@@ -203,7 +223,8 @@ pub enum CacheError {
     #[error("Offset {0} exceeds device size {1}")]
     OffsetOutOfBounds(u64, u64),
 
-
+    #[error("Content store error: {0}")]
+    ContentStore(#[from] ContentStoreError),
 }
 
 impl CacheError {
@@ -253,6 +274,16 @@ impl WriteCacheConfig {
     pub fn metadata_path(&self) -> PathBuf {
         self.cache_dir.join(format!("{}.meta", self.device_name))
     }
+
+    /// Path to the v2 block map persistence file.
+    pub fn block_map_path(&self) -> PathBuf {
+        self.cache_dir.join(format!("{}.blockmap", self.device_name))
+    }
+
+    /// Path to the v2 WAL file.
+    pub fn wal_path(&self) -> PathBuf {
+        self.cache_dir.join(format!("{}.wal", self.device_name))
+    }
 }
 
 /// Internal state shared across all cache states.
@@ -292,6 +323,31 @@ pub(crate) struct CacheInner {
     /// Notification for waking the sync worker when dirty blocks are available.
     /// The sync worker waits on this instead of polling.
     dirty_notify: Notify,
+
+    // === v2 content-addressed structures ===
+
+    /// Content-addressed block map: chunk_index -> (Blake3Hash, sequence)
+    /// Lock-free parallel atomic arrays extending v1's AtomicU8 pattern.
+    block_map: AtomicBlockMap,
+
+    /// Monotonic sequence counter for snapshot consistency.
+    /// Lock-free AtomicU64.
+    sequence: SequenceNumber,
+
+    /// Dirty block data store: hash -> data.
+    /// Pinned in memory until flushed to S3 (Phase 2).
+    /// Mutex is effectively uncontended: single writer per export.
+    dirty_store: Mutex<HashMap<Blake3Hash, Bytes>>,
+
+    /// Write-ahead log for crash recovery.
+    /// Mutex is effectively uncontended: single writer per export.
+    wal: Mutex<Wal>,
+
+    /// Total dirty bytes (for budget enforcement in Phase 6).
+    dirty_bytes: AtomicU64,
+
+    /// Export name (used in WAL entries).
+    export_name: String,
 }
 
 impl CacheInner {
@@ -612,6 +668,82 @@ impl WriteCache<Initializing> {
             }
         }
 
+        // === v2 initialization ===
+        let block_map_path = config.block_map_path();
+        let wal_path = config.wal_path();
+        let export_name = config.device_name.clone();
+        let chunk_size = config.block_size as u32;
+
+        // Load persisted block map (or create empty)
+        let mut persisted_bm = if block_map_path.exists() {
+            match BlockMap::load_from_file(&block_map_path) {
+                Ok(bm) => {
+                    info!(path = %block_map_path.display(), entries = bm.non_empty_count(), "loaded v2 block map");
+                    bm
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to load v2 block map, starting fresh");
+                    BlockMap::new(config.device_size, chunk_size)
+                }
+            }
+        } else {
+            BlockMap::new(config.device_size, chunk_size)
+        };
+
+        let persisted_max_seq = persisted_bm.max_sequence();
+
+        // Replay WAL entries after persisted sequence
+        let wal_entries = match Wal::replay(&wal_path, persisted_max_seq) {
+            Ok(entries) => {
+                if !entries.is_empty() {
+                    info!(entries = entries.len(), min_seq = persisted_max_seq + 1, "replaying WAL entries");
+                }
+                entries
+            }
+            Err(e) => {
+                warn!(error = %e, "WAL replay failed, continuing with persisted block map");
+                vec![]
+            }
+        };
+
+        // Apply WAL entries to block map and build dirty store
+        let mut dirty_store_map: HashMap<Blake3Hash, Bytes> = HashMap::new();
+        let mut max_wal_seq = persisted_max_seq;
+
+        for entry in &wal_entries {
+            if entry.name != export_name {
+                continue; // Skip entries for other exports (shouldn't happen with per-export WAL)
+            }
+            let chunk_index = entry.chunk_index as usize;
+            persisted_bm.set(chunk_index, BlockMapEntry {
+                hash: entry.hash,
+                flags: BlockMapEntry::FLAG_DIRTY,
+                sequence: entry.sequence,
+            });
+            if !entry.data.is_empty() {
+                dirty_store_map.insert(entry.hash, entry.data.clone());
+            }
+            max_wal_seq = max_wal_seq.max(entry.sequence);
+        }
+
+        // Build AtomicBlockMap from the merged block map
+        let atomic_block_map = AtomicBlockMap::from_block_map(&persisted_bm);
+
+        // Initialize sequence counter
+        let initial_seq = persisted_max_seq.max(max_wal_seq);
+        let sequence = SequenceNumber::new(initial_seq);
+
+        // Open WAL for new appends
+        let wal = match Wal::open(&wal_path) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "failed to open WAL, creating new");
+                Wal::open(&wal_path).map_err(CacheError::Io)?
+            }
+        };
+
+        let dirty_bytes_count: u64 = dirty_store_map.len() as u64 * chunk_size as u64;
+
         let inner = Arc::new(CacheInner {
             config,
             data_file,
@@ -622,6 +754,13 @@ impl WriteCache<Initializing> {
             syncing_block_count: AtomicU64::new(0),
             dirty_queue,
             dirty_notify: Notify::new(),
+            // v2 fields
+            block_map: atomic_block_map,
+            sequence,
+            dirty_store: Mutex::new(dirty_store_map),
+            wal: Mutex::new(wal),
+            dirty_bytes: AtomicU64::new(dirty_bytes_count),
+            export_name,
         });
 
         info!(
@@ -906,6 +1045,59 @@ impl WriteCache<Active> {
                     // Unknown state, just break
                     break;
                 }
+            }
+        }
+
+        // === v2: content-addressed updates ===
+        // For each affected chunk, read the full chunk from SSD, hash it,
+        // and update block map + WAL + dirty store.
+        {
+            let block_size = self.inner.config.block_size;
+            let device_size = self.inner.config.device_size;
+
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx >= self.inner.num_blocks {
+                    continue;
+                }
+
+                // Read the full chunk from SSD (to get correct merged data for sub-chunk writes)
+                let chunk_offset = block * block_size as u64;
+                let valid_bytes = std::cmp::min(block_size as u64, device_size.saturating_sub(chunk_offset)) as usize;
+                let mut chunk_buf = vec![0u8; block_size];
+                if valid_bytes > 0 {
+                    self.inner.data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset)?;
+                }
+
+                let hash = blake3_128(&chunk_buf);
+                let seq = self.inner.sequence.next();
+
+                // Update atomic block map (lock-free)
+                self.inner.block_map.set(idx, hash, seq);
+
+                // WAL append (Mutex, uncontended)
+                let wal_entry = WalEntry {
+                    name: self.inner.export_name.clone(),
+                    chunk_index: block,
+                    hash,
+                    sequence: seq,
+                    data: Bytes::copy_from_slice(&chunk_buf),
+                };
+                if let Err(e) = self.inner.wal.lock().unwrap().append(&wal_entry) {
+                    error!(block = block, error = %e, "WAL append failed");
+                    // Non-fatal: v1 SSD file still has the data
+                }
+
+                // Dirty store insert (Mutex, uncontended)
+                self.inner.dirty_store.lock().unwrap().insert(hash, Bytes::from(chunk_buf));
+
+                // Track dirty bytes
+                self.inner.dirty_bytes.fetch_add(block_size as u64, Ordering::Relaxed);
+            }
+
+            // Flush WAL buffer
+            if let Err(e) = self.inner.wal.lock().unwrap().flush_buf() {
+                error!(error = %e, "WAL flush failed");
             }
         }
 
@@ -1202,6 +1394,44 @@ impl WriteCache<Active> {
 
         // Mark affected blocks as dirty and present
         self.mark_range_dirty_and_present(offset, len);
+
+        // === v2: content-addressed updates for zeroed chunks ===
+        {
+            let block_size = self.inner.config.block_size as u64;
+            let start_block = offset / block_size;
+            let end_block = (offset + len - 1) / block_size;
+            let zero_hash = *ZERO_BLOCK_HASH;
+
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx >= self.inner.num_blocks {
+                    continue;
+                }
+
+                let seq = self.inner.sequence.next();
+
+                // Update atomic block map with zero-block hash
+                self.inner.block_map.set(idx, zero_hash, seq);
+
+                // WAL entry with empty data (TRIM marker)
+                let wal_entry = WalEntry {
+                    name: self.inner.export_name.clone(),
+                    chunk_index: block,
+                    hash: zero_hash,
+                    sequence: seq,
+                    data: Bytes::new(),
+                };
+                if let Err(e) = self.inner.wal.lock().unwrap().append(&wal_entry) {
+                    error!(block = block, error = %e, "WAL append failed for zero range");
+                }
+                // No dirty store insert for zero blocks -- read path returns zeros
+            }
+
+            // Flush WAL buffer
+            if let Err(e) = self.inner.wal.lock().unwrap().flush_buf() {
+                error!(error = %e, "WAL flush failed");
+            }
+        }
 
         Ok(())
     }
@@ -1678,6 +1908,192 @@ impl WriteCache<Active> {
         Ok(())
     }
 
+    /// Flush dirty blocks to S3 as content-addressed packs.
+    ///
+    /// This is the v2 flush path:
+    /// 1. Snapshot dirty block map entries up to the current sequence
+    /// 2. Dedup against the host pack index (blocks already in S3)
+    /// 3. LZ4-compress new blocks and assemble into 25-block packs
+    /// 4. Upload packs to S3
+    /// 5. Clear dirty flags (with concurrent-write safety)
+    /// 6. Upload a self-contained manifest
+    ///
+    /// Manual trigger for now; Phase 6 adds scheduling.
+    #[instrument(skip(self, content_store, host_pack_index))]
+    pub async fn flush_to_s3(
+        &self,
+        content_store: &ContentStore,
+        host_pack_index: &HostPackIndex,
+    ) -> Result<FlushStats, CacheError> {
+        let mut stats = FlushStats::default();
+        let chunk_size = self.inner.config.block_size as u32;
+
+        // 1. Capture sequence cut point
+        let seq_cutpoint = self.inner.sequence.current();
+
+        // 2. Snapshot dirty entries: non-empty, dirty, sequence <= cutpoint
+        let snapshot: Vec<(usize, Blake3Hash)> = {
+            let block_map_snap = self.inner.block_map.snapshot(&self.inner.block_states);
+            block_map_snap
+                .iter_non_empty()
+                .filter(|(_, entry)| {
+                    entry.is_dirty() && entry.sequence <= seq_cutpoint
+                })
+                .map(|(idx, entry)| (idx, entry.hash))
+                .collect()
+        };
+
+        if snapshot.is_empty() {
+            debug!("flush: no dirty blocks to flush");
+            return Ok(stats);
+        }
+
+        info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
+
+        // 3. Dedup check + compress new blocks
+        let zero_hash = *ZERO_BLOCK_HASH;
+        let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
+
+        for &(_chunk_index, hash) in &snapshot {
+            stats.blocks_flushed += 1;
+
+            // Skip zero blocks — read path returns zeros directly
+            if hash == zero_hash {
+                stats.blocks_deduped += 1;
+                continue;
+            }
+
+            // Skip blocks already in the host pack index (cross-VM dedup)
+            if host_pack_index.contains(&hash) {
+                stats.blocks_deduped += 1;
+                continue;
+            }
+
+            // Get data from dirty store
+            let data = self
+                .inner
+                .dirty_store
+                .lock()
+                .unwrap()
+                .get(&hash)
+                .cloned();
+
+            let Some(data) = data else {
+                // Data missing from dirty store — could have been cleaned by a
+                // concurrent flush. Skip; it's already in S3.
+                stats.blocks_deduped += 1;
+                continue;
+            };
+
+            let compressed = lz4_compress(&data);
+            to_upload.push((hash, compressed));
+        }
+
+        // 4. Assemble packs and upload
+        for chunk in to_upload.chunks(BLOCKS_PER_PACK) {
+            let pack_id = uuid::Uuid::new_v4();
+            let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size);
+            let pack_size = pack_bytes.len() as u64;
+
+            content_store.put_pack(pack_id, pack_bytes).await?;
+            stats.packs_uploaded += 1;
+            stats.bytes_uploaded += pack_size;
+
+            // Register in host pack index for future dedup
+            for entry in &index_entries {
+                host_pack_index.insert(
+                    entry.hash,
+                    PackLocation {
+                        pack_id,
+                        offset: entry.offset,
+                        comp_length: entry.comp_length,
+                    },
+                );
+            }
+        }
+
+        // 5. Clear dirty state for blocks whose hash hasn't changed
+        for &(chunk_index, snapshot_hash) in &snapshot {
+            let (current_hash, _seq) = self.inner.block_map.get(chunk_index);
+            if current_hash == snapshot_hash {
+                // Hash unchanged since snapshot — safe to clear dirty flag.
+                // CAS Dirty → Clean on the block_states AtomicU8.
+                let _ = self.inner.block_states[chunk_index].compare_exchange(
+                    BlockMapEntry::FLAG_DIRTY,
+                    0, // clean
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                // Remove from dirty store (keyed by hash, so safe)
+                self.inner
+                    .dirty_store
+                    .lock()
+                    .unwrap()
+                    .remove(&snapshot_hash);
+                self.inner
+                    .dirty_bytes
+                    .fetch_sub(chunk_size as u64, Ordering::Relaxed);
+            }
+            // else: concurrent write produced a new hash — leave dirty for next flush
+        }
+
+        // 6. Build and upload manifest
+        let post_flush_snap = self.inner.block_map.snapshot(&self.inner.block_states);
+        let block_map_entries: Vec<ManifestBlockEntry> = post_flush_snap
+            .iter_non_empty()
+            .map(|(idx, entry)| ManifestBlockEntry {
+                chunk_index: idx as u64,
+                hash: entry.hash,
+                flags: entry.flags,
+            })
+            .collect();
+        let pack_entries = host_pack_index.derive_for_block_map(&post_flush_snap);
+
+        let manifest = Manifest {
+            name: self.inner.export_name.clone(),
+            sequence: seq_cutpoint,
+            chunk_size,
+            device_size: self.inner.config.device_size,
+            block_map: block_map_entries,
+            pack_index: pack_entries,
+        };
+
+        content_store
+            .put_manifest(&self.inner.export_name, manifest.serialize())
+            .await?;
+
+        info!(
+            blocks_flushed = stats.blocks_flushed,
+            blocks_deduped = stats.blocks_deduped,
+            packs_uploaded = stats.packs_uploaded,
+            bytes_uploaded = stats.bytes_uploaded,
+            "flush complete"
+        );
+
+        Ok(stats)
+    }
+
+    /// Persist the v2 block map to disk and truncate the WAL.
+    ///
+    /// Called periodically (~5s) by the block map persistence worker.
+    /// Uses atomic file write (tempfile + rename) for crash safety.
+    pub fn persist_block_map(&self) -> Result<(), CacheError> {
+        // Snapshot the atomic block map (lock-free)
+        let snapshot = self.inner.block_map.snapshot(&self.inner.block_states);
+
+        // Persist to file atomically
+        let path = self.inner.config.block_map_path();
+        snapshot.persist_to_file(&path).map_err(CacheError::Io)?;
+
+        // Truncate WAL (entries are now in the persisted block map)
+        if let Err(e) = self.inner.wal.lock().unwrap().truncate() {
+            warn!(error = %e, "WAL truncate failed after block map persist");
+        }
+
+        debug!(entries = snapshot.non_empty_count(), "persisted v2 block map");
+        Ok(())
+    }
+
     /// Get a clone of the inner Arc for sharing with the sync worker.
     #[allow(dead_code)]
     pub(crate) fn inner(&self) -> Arc<CacheInner> {
@@ -2012,6 +2428,38 @@ pub async fn sync_worker(
     }
 
     info!("sync worker stopped");
+}
+
+/// Background worker that periodically persists the v2 block map.
+///
+/// Runs every 5 seconds. Persists the block map snapshot to disk and
+/// truncates the WAL. This bounds WAL replay time on recovery.
+#[instrument(skip(cache, shutdown))]
+pub async fn block_map_persist_worker(
+    cache: Arc<WriteCache<Active>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    info!("block map persist worker started (5s interval)");
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    // Final persist before shutdown
+                    if let Err(e) = cache.persist_block_map() {
+                        warn!(error = %e, "final block map persist failed");
+                    }
+                    info!("block map persist worker stopped");
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = cache.persist_block_map() {
+            warn!(error = %e, "periodic block map persist failed");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3022,6 +3470,219 @@ mod tests {
 
         assert_eq!(cache.dirty_block_count(), 0);
         assert_eq!(cache.syncing_block_count(), 0);
+    }
+
+    // ====================================================================
+    // v2 Test Harness + Flush Tests
+    // ====================================================================
+
+    /// Test harness for v2 content-addressed flush tests.
+    ///
+    /// Bundles the full v2 stack (cache + content store + pack index) in one
+    /// struct so tests can focus on behavior, not setup boilerplate.
+    struct V2Harness {
+        cache: WriteCache<Active>,
+        content_store: ContentStore,
+        pack_index: HostPackIndex,
+        #[allow(dead_code)]
+        dir: TempDir,
+    }
+
+    impl V2Harness {
+        /// Create a harness with default 1MB device / 4KB blocks.
+        async fn new() -> Self {
+            Self::with_config(1024 * 1024, 4096).await
+        }
+
+        /// Create a harness with custom device size and block size.
+        async fn with_config(device_size: u64, block_size: usize) -> Self {
+            let dir = TempDir::new().unwrap();
+            let config = WriteCacheConfig {
+                cache_dir: dir.path().to_path_buf(),
+                device_name: "test".to_string(),
+                device_size,
+                block_size,
+            };
+            let s3 = test_s3();
+            let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+            let content_store = ContentStore::new(object_store, "test-bucket");
+            let pack_index = HostPackIndex::new();
+            let cache = WriteCache::<Initializing>::open(config).unwrap();
+            let cache = cache.finish_recovery(&s3).await.unwrap();
+            Self { cache, content_store, pack_index, dir }
+        }
+
+        /// Flush and return stats.
+        async fn flush(&self) -> FlushStats {
+            self.cache
+                .flush_to_s3(&self.content_store, &self.pack_index)
+                .await
+                .unwrap()
+        }
+
+        /// Get the manifest from S3.
+        async fn manifest(&self) -> Manifest {
+            let bytes = self.content_store
+                .get_manifest("test")
+                .await
+                .unwrap()
+                .expect("manifest should exist");
+            Manifest::deserialize(&bytes).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flush_end_to_end() {
+        let h = V2Harness::new().await;
+
+        // Write 10 distinct blocks (each 4KB = block_size)
+        for i in 0u8..10 {
+            h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        }
+
+        let stats = h.flush().await;
+        assert_eq!(stats.blocks_flushed, 10);
+        assert_eq!(stats.blocks_deduped, 0);
+        assert!(stats.packs_uploaded > 0);
+        assert!(stats.bytes_uploaded > 0);
+
+        let manifest = h.manifest().await;
+        assert_eq!(manifest.name, "test");
+        assert_eq!(manifest.chunk_size, 4096);
+        assert_eq!(manifest.block_map.len(), 10);
+        assert!(!manifest.pack_index.is_empty());
+        assert!(h.pack_index.len() >= 10);
+    }
+
+    #[tokio::test]
+    async fn test_flush_dedup_skips_existing() {
+        let h = V2Harness::new().await;
+
+        // Write 5 blocks
+        for i in 0u8..5 {
+            h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        }
+
+        let stats1 = h.flush().await;
+        assert_eq!(stats1.blocks_flushed, 5);
+        assert_eq!(stats1.blocks_deduped, 0);
+        assert!(stats1.packs_uploaded > 0);
+
+        // Write the same data again to new offsets — same content, new positions
+        for i in 0u8..5 {
+            h.cache.write((i as u64 + 5) * 4096, &vec![i + 1; 4096]).unwrap();
+        }
+
+        let stats2 = h.flush().await;
+        assert_eq!(stats2.blocks_flushed, 5);
+        assert_eq!(stats2.blocks_deduped, 5, "all blocks should be deduped");
+        assert_eq!(stats2.packs_uploaded, 0, "no new packs needed");
+    }
+
+    #[tokio::test]
+    async fn test_flush_partial_dedup() {
+        let h = V2Harness::new().await;
+
+        // Write 10 blocks with unique data
+        for i in 0u8..10 {
+            h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        }
+
+        let stats1 = h.flush().await;
+        assert_eq!(stats1.blocks_flushed, 10);
+        assert_eq!(stats1.blocks_deduped, 0);
+
+        // Write 10 more blocks: 5 with SAME data as before (dedup), 5 with NEW data
+        for i in 0u8..5 {
+            h.cache.write((i as u64 + 10) * 4096, &vec![i + 1; 4096]).unwrap();
+        }
+        for i in 0u8..5 {
+            h.cache.write((i as u64 + 15) * 4096, &vec![i + 100; 4096]).unwrap();
+        }
+
+        let stats2 = h.flush().await;
+        assert_eq!(stats2.blocks_flushed, 10);
+        assert_eq!(stats2.blocks_deduped, 5, "5 blocks should be deduped");
+        assert_eq!(stats2.packs_uploaded, 1, "5 new blocks = 1 pack");
+    }
+
+    #[tokio::test]
+    async fn test_flush_zero_blocks_skipped() {
+        // Use 128KB blocks so ZERO_BLOCK_HASH matches
+        let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+
+        // Write one real block
+        h.cache.write(0, &vec![42u8; 128 * 1024]).unwrap();
+        // Write a block of zeros — this should get ZERO_BLOCK_HASH
+        h.cache.write(128 * 1024, &vec![0u8; 128 * 1024]).unwrap();
+
+        let stats = h.flush().await;
+        assert_eq!(stats.blocks_flushed, 2);
+        assert_eq!(stats.blocks_deduped, 1, "zero block should be deduped");
+        assert_eq!(stats.packs_uploaded, 1, "only one pack for the real block");
+    }
+
+    #[tokio::test]
+    async fn test_flush_clears_dirty_state() {
+        let h = V2Harness::new().await;
+
+        for i in 0u8..3 {
+            h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        }
+
+        assert!(h.cache.inner.dirty_store.lock().unwrap().len() >= 3);
+
+        h.flush().await;
+
+        assert_eq!(
+            h.cache.inner.dirty_store.lock().unwrap().len(), 0,
+            "dirty store should be empty after flush"
+        );
+
+        // A second flush should be a no-op
+        let stats = h.flush().await;
+        assert_eq!(stats.blocks_flushed, 0, "no dirty blocks after flush");
+    }
+
+    #[tokio::test]
+    async fn test_flush_concurrent_write_stays_dirty() {
+        let h = V2Harness::new().await;
+
+        h.cache.write(0, &vec![1u8; 4096]).unwrap();
+        h.flush().await;
+
+        // Overwrite block 0 with different data
+        h.cache.write(0, &vec![2u8; 4096]).unwrap();
+
+        let stats = h.flush().await;
+        assert_eq!(stats.blocks_flushed, 1, "overwritten block should be flushed");
+    }
+
+    #[tokio::test]
+    async fn test_flush_manifest_self_contained() {
+        let h = V2Harness::new().await;
+
+        // Write 30 blocks (will produce 2 packs: 25 + 5)
+        for i in 0u8..30 {
+            h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        }
+
+        let stats = h.flush().await;
+        assert_eq!(stats.packs_uploaded, 2, "should produce 2 packs (25+5)");
+
+        let manifest = h.manifest().await;
+        let pack_hashes: std::collections::HashSet<_> =
+            manifest.pack_index.iter().map(|e| e.hash).collect();
+
+        for bm_entry in &manifest.block_map {
+            if !bm_entry.hash.is_zero() {
+                assert!(
+                    pack_hashes.contains(&bm_entry.hash),
+                    "block map hash {:?} should have pack index entry",
+                    bm_entry.hash
+                );
+            }
+        }
     }
 }
 

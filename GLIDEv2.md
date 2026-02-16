@@ -842,7 +842,7 @@ For production VMs: continuous flush bounds the loss to seconds.
 ### WAL Properties
 
 - Append-only file on local SSD. Sequential writes only — fast and predictable.
-- Each entry: `(vm-id, offset, blake3_128_hash, raw_chunk_data)`. Self-contained for replay.
+- Each entry: `(export-name, offset, blake3_128_hash, raw_chunk_data)`. Self-contained for replay.
 - **The WAL is for local crash recovery only.** It bridges the gap between the last locally-persisted block map and the crash point. It is NOT the source of data for S3 flushes — that's the SSD cache + dirty flags in the block map.
 - Truncated after each local block map persistence (every ~5 seconds). Once the block map is persisted and block data is in the SSD cache, the WAL entries are redundant.
 - **WAL size is bounded by local persist interval, not S3 flush interval.** This is critical for demand-driven mode, where S3 flushes may be hours apart. The WAL doesn't accumulate across that window.
@@ -1115,18 +1115,18 @@ The manifest is the portability unit. It contains a complete block map and pack 
 
 ```
 ┌──────────────────────────────────────────────────┐
-│ Header (64 bytes, fixed)                         │
+│ Header (variable length)                         │
 ├──────────────────────────────────────────────────┤
 │ magic            [u8; 4]    = "GLDE"             │
 │ version          u16        = 1                  │
 │ flags            u16        (reserved, 0)        │
-│ vm_id            [u8; 16]   (UUID)               │
+│ name_len         u16        (export name length) │
 │ sequence         u64        (snapshot seq number) │
 │ chunk_size       u32        (bytes, default 131072)│
 │ device_size      u64        (bytes)              │
 │ block_map_count  u64        (non-zero entries)   │
 │ pack_index_count u64        (entries)            │
-│ _reserved        [u8; 4]                         │
+│ name             [u8; name_len]  (export name, UTF-8) │
 ├──────────────────────────────────────────────────┤
 │ Block Map (block_map_count × 25 bytes)           │
 │   Per entry:                                     │
