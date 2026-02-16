@@ -25,3 +25,7 @@ All operations that modify state—infrastructure (ZFS, OVN, OVS, iptables, TAP 
 - If you can't make it atomic, make the intermediate states safe to observe
 
 These properties are critical for crash recovery, distributed coordination, and reasoning about system behavior.
+
+## Testing
+
+Our approach to testing is to create **USEFUL** tests that exercise the system's behavior under various conditions. That means integration tests that cover a wide range of scenarios, including edge cases and error conditions, rather than unit tests that focus on individual components.

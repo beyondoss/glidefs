@@ -1,4 +1,3 @@
-use crate::bucket_identity;
 use crate::config::Settings;
 use crate::nbd::api::ApiServer;
 use crate::nbd::router::ExportRouter;
@@ -50,15 +49,8 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     info!("Starting GlideFS NBD server with {} backend", object_store);
     info!("Storage path: {}", db_path);
 
-    info!("Checking bucket identity...");
-    let bucket = bucket_identity::BucketIdentity::get_or_create(&object_store, &db_path).await?;
-
-    let cache_dir = settings.cache.dir.join(bucket.cache_directory_name());
-    info!(
-        "Bucket ID: {}, Cache directory: {}",
-        bucket.id(),
-        cache_dir.display()
-    );
+    let cache_dir = settings.cache.dir.clone();
+    info!("Cache directory: {}", cache_dir.display());
 
     // Create cache directory if it doesn't exist
     std::fs::create_dir_all(&cache_dir)?;
@@ -72,11 +64,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         .nbd
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("NBD server configuration is required"))?;
-
-    // Generate a unique node ID for lease coordination
-    // UUID ensures uniqueness even across restarts
-    let node_id = format!("node-{}", uuid::Uuid::new_v4().as_simple());
-    info!("Node ID for lease coordination: {}", node_id);
 
     // Create the export router
     let auto_create_size_gb = nbd_config.auto_create_size_gb();
@@ -95,7 +82,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         nbd_config.blocks_per_batch(),
         nbd_config.sync_delay_ms(),
         auto_create_size_gb,
-        node_id,
     ));
 
     // Discover exports from S3 (recovers exports created via API)

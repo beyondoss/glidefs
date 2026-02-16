@@ -1,6 +1,5 @@
 use anyhow::Result;
 
-mod bucket_identity;
 mod cli;
 mod config;
 mod nbd;

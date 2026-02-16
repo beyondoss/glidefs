@@ -597,6 +597,35 @@ The source VM **keeps writing during the flush**. Concurrent writes get sequence
 
 The source VM is **never paused**. The only cost is the time to upload dirty data. For a steady-state production VM, that's a handful of blocks. For a demand-driven VM that's been active for hours, it's proportional to total unique dirty blocks.
 
+### Snapshot Concurrency Model
+
+The snapshot mechanism runs concurrently with the VM's write path. Here's why it's safe:
+
+**Key invariant:** The dirty store is keyed by *content hash*, not by *block offset*. A concurrent write to the same offset creates a *new* entry (different data → different hash → different key). It never overwrites the entry the snapshot flush is reading.
+
+```
+Snapshot captured: [(offset=42, hash=abc), (offset=17, hash=bbb)]
+Snapshot flush reading dirty_store[abc]...
+
+Meanwhile, VM writes to offset 42:
+  → blake3(new_data) = hash:xyz
+  → dirty_store[xyz] = new_data     ← NEW key, does not touch dirty_store[abc]
+  → block_map[42] = (xyz, dirty, seq=N+1)
+  → dirty_store[abc] still exists, still readable ✓
+```
+
+**Dirty set capture.** The snapshot needs a consistent set of `(offset, hash)` pairs at sequence ≤ N. Two approaches:
+
+1. **Clone-and-filter (simple).** Clone the block map's dirty entries atomically (read lock), filter to `seq ≤ N`. The read lock blocks writes briefly during the clone — at 80K dirty entries × 25 bytes, this is ~2MB memcpy, <1ms. Acceptable for a snapshot that runs at most every few seconds.
+
+2. **Epoch-based (lock-free).** Partition dirty entries by sequence ranges. The snapshot reads all partitions up to N. Writes always append to the current partition. No lock contention. More complex, worth it only if profiling shows the clone-and-filter lock is a bottleneck.
+
+Start with (1). Switch to (2) if needed.
+
+**Dirty store cleanup after flush.** After the snapshot flush uploads blocks to S3:
+- For each `(offset, hash)` in the snapshot: check if `block_map[offset]` still has the same hash. If yes, clear the dirty flag and remove the offset from the dirty set. If no (a concurrent write changed it), leave it dirty — the new data will be captured by the next snapshot.
+- For each unique hash in the snapshot: move data from dirty store to clean cache. The hash may still be referenced by *other* offsets (dedup), so only remove from dirty store when no block map entry references it. A simple refcount on dirty store entries handles this.
+
 ### Race Conditions
 
 **Fork during write:** A write arrives at the source between the manifest read and the fork's first access. Not a problem — the fork's manifest doesn't reference the new block. The fork has a consistent snapshot.
@@ -1073,6 +1102,128 @@ Content-addressing gives free integrity checks.
 - **Cache reads (hit):** Don't verify on every read. Trust local SSD/memory.
 - **Background scrubber:** Periodically re-verify cached blocks. Catches silent bit rot off the hot path.
 - **On mismatch:** Retry once (transient corruption), then alert.
+
+---
+
+## Wire Formats
+
+Binary formats for cross-host interop. These are the contracts — any host must read any other host's manifests and packs. All multi-byte integers are little-endian.
+
+### Manifest Format
+
+The manifest is the portability unit. It contains a complete block map and pack index for one VM. Stored at `manifests/{tenant}/{vm-id}` in S3.
+
+```
+┌──────────────────────────────────────────────────┐
+│ Header (64 bytes, fixed)                         │
+├──────────────────────────────────────────────────┤
+│ magic            [u8; 4]    = "GLDE"             │
+│ version          u16        = 1                  │
+│ flags            u16        (reserved, 0)        │
+│ vm_id            [u8; 16]   (UUID)               │
+│ sequence         u64        (snapshot seq number) │
+│ chunk_size       u32        (bytes, default 131072)│
+│ device_size      u64        (bytes)              │
+│ block_map_count  u64        (non-zero entries)   │
+│ pack_index_count u64        (entries)            │
+│ _reserved        [u8; 4]                         │
+├──────────────────────────────────────────────────┤
+│ Block Map (block_map_count × 25 bytes)           │
+│   Per entry:                                     │
+│     chunk_index  u64                             │
+│     hash         [u8; 16]   (BLAKE3-128)         │
+│     flags        u8         (bit 0 = dirty)      │
+├──────────────────────────────────────────────────┤
+│ Pack Index (pack_index_count × 40 bytes)         │
+│   Per entry:                                     │
+│     hash         [u8; 16]   (BLAKE3-128)         │
+│     pack_id      [u8; 16]   (UUID)               │
+│     offset       u32        (byte offset in pack)│
+│     comp_length  u32        (compressed bytes)   │
+└──────────────────────────────────────────────────┘
+```
+
+**Sparse representation.** Only non-zero entries are stored. A 100GB disk with 10GB written stores ~80K block map entries (~2MB), not 800K (~20MB). On load, missing indices resolve to the zero-block hash.
+
+**Versioning.** The `version` field allows forward-compatible changes. Readers reject manifests with `version > max_supported`. New fields go in reserved space or after the pack index (appendable). Breaking changes increment version.
+
+**Sizes:**
+
+| VM state | Block map | Pack index | Total |
+|----------|-----------|-----------|-------|
+| 10GB written (typical) | 80K × 25 = 2.0MB | ~3.2K × 40 = 128KB | ~2.1MB |
+| 100GB fully written | 800K × 25 = 20MB | ~32K × 40 = 1.3MB | ~21MB |
+| Fork with 1% divergence | ~800 × 25 = 20KB | Shared with parent | ~20KB |
+
+### Pack Format
+
+A pack is a batch of LZ4-compressed blocks stored as a single S3 object. Key: `packs/{hex-prefix}/{pack-id}` where hex-prefix is the first 2 hex chars of pack-id.
+
+```
+┌──────────────────────────────────────────────────┐
+│ Header (16 bytes, fixed)                         │
+├──────────────────────────────────────────────────┤
+│ magic            [u8; 4]    = "GLPK"             │
+│ version          u16        = 1                  │
+│ block_count      u16        (blocks in this pack)│
+│ chunk_size       u32        (uncompressed size)  │
+│ _reserved        [u8; 4]                         │
+├──────────────────────────────────────────────────┤
+│ Block Index (block_count × 24 bytes)             │
+│   Per entry:                                     │
+│     hash         [u8; 16]   (BLAKE3-128)         │
+│     offset       u32        (byte offset in pack)│
+│     comp_length  u32        (compressed bytes)   │
+├──────────────────────────────────────────────────┤
+│ Block Data                                       │
+│   [LZ4-compressed blocks, concatenated]          │
+│   Offsets and lengths from the block index.      │
+└──────────────────────────────────────────────────┘
+```
+
+**Reading a block from a pack:**
+1. Parse header → block_count.
+2. Read block index (block_count × 24 bytes, immediately after header).
+3. Find entry by hash → get offset + compressed length.
+4. Seek to offset, read comp_length bytes, LZ4 decompress.
+5. Verify: `blake3_128(decompressed) == expected_hash`.
+
+**Pack ID:** UUID v4, generated at pack creation. Deterministic pack IDs (content hash) aren't needed — dedup is handled by the block-level hash in the pack index, not by pack identity.
+
+**Typical pack:** 25 blocks × 128KB = 3.2MB uncompressed, ~1.6-2.1MB compressed. Index overhead: 16 + (25 × 24) = 616 bytes. Negligible.
+
+### Control Plane API
+
+The daemon communicates with the control plane for pack refcount management. The daemon never connects to the database directly — all access goes through the control plane HTTP API. This keeps the data layer decoupled from infrastructure and lets the control plane enforce authorization, rate limiting, and audit logging.
+
+```
+POST /api/internal/packs/refcounts
+Content-Type: application/json
+
+{
+  "increments": ["pack-uuid-1", "pack-uuid-2"],
+  "decrements": ["pack-uuid-3"]
+}
+
+→ 200 OK
+```
+
+**When called:**
+
+| Event | Request body | Frequency |
+|-------|-------------|-----------|
+| Flush (continuous) | increments: new packs, decrements: overwritten | Every ~5s (if dirty) |
+| Flush (demand-driven) | Same | On fork/sleep/promote/migrate |
+| Fork | increments: all packs in manifest | One-time per fork |
+| VM delete | decrements: all packs in manifest | One-time per delete |
+
+**Failure handling:** If the API call fails after packs have been uploaded to S3:
+- The daemon retries with exponential backoff (1s, 2s, 4s, max 30s).
+- Packs without refcounts are orphans — safe. The 24-hour GC grace period covers transient failures.
+- If retries are exhausted, log an error and continue. Monthly reconciliation catches the drift.
+- The daemon never blocks the VM's I/O path on a refcount update.
+
+**Bulk operations:** Fork and delete send the full pack list (up to ~3,200 entries for a 10GB VM). The API accepts batch updates in a single request. The control plane wraps the batch in a single DB transaction.
 
 ---
 

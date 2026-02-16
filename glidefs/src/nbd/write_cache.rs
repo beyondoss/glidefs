@@ -203,9 +203,7 @@ pub enum CacheError {
     #[error("Offset {0} exceeds device size {1}")]
     OffsetOutOfBounds(u64, u64),
 
-    #[allow(dead_code)] // Part of public error API for lease coordination
-    #[error("Lease lost - another node may have taken ownership")]
-    LeaseLost,
+
 }
 
 impl CacheError {
@@ -1772,19 +1770,11 @@ impl Default for SyncWorkerConfig {
     }
 }
 
-use super::lease::LeaseState;
-
 /// Sync worker that continuously drains dirty blocks to S3.
 ///
 /// This function runs in a background task and uploads dirty blocks using
 /// batched S3 writes. Blocks are grouped by batch number and uploaded
 /// together to reduce S3 PUT costs by ~10x.
-///
-/// # Lease Coordination
-///
-/// If `lease_state` is provided, the worker checks the lease before each sync
-/// cycle. If the lease is lost (renewal failed or another node took it), the
-/// worker stops syncing to prevent conflicting writes.
 ///
 /// # Cancellation
 /// The worker checks the shutdown signal between upload batches and exits
@@ -1801,20 +1791,18 @@ use super::lease::LeaseState;
 ///     Arc::clone(&s3),
 ///     SyncWorkerConfig::default(),
 ///     shutdown_rx,
-///     None, // No lease coordination
 /// ));
 ///
 /// // To stop:
 /// let _ = shutdown_tx.send(true);
 /// worker_handle.await;
 /// ```
-#[instrument(skip(cache, s3, config, shutdown, lease_state))]
+#[instrument(skip(cache, s3, config, shutdown))]
 pub async fn sync_worker(
     cache: Arc<WriteCache<Active>>,
     s3: Arc<S3BlockStore>,
     config: SyncWorkerConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-    lease_state: Option<Arc<LeaseState>>,
 ) {
     use std::collections::HashMap;
 
@@ -1823,7 +1811,6 @@ pub async fn sync_worker(
         hot_batch_cooldown_ms = config.hot_batch_cooldown.as_millis(),
         max_deferrals = config.max_deferrals,
         blocks_per_batch = s3.blocks_per_batch(),
-        has_lease = lease_state.is_some(),
         "sync worker started (event-driven)"
     );
 
@@ -1844,16 +1831,6 @@ pub async fn sync_worker(
             info!("sync worker received shutdown signal");
             break;
         }
-
-        // Check if lease is still valid (fencing check)
-        if let Some(ref state) = lease_state
-            && !state.is_valid() {
-                warn!(
-                    generation = state.generation(),
-                    "lease lost, stopping sync worker to prevent conflicting writes"
-                );
-                break;
-            }
 
         // Claim a batch of dirty blocks from the queue (O(1) per block)
         let dirty = cache.claim_dirty_blocks(config.batch_size);
@@ -1904,21 +1881,6 @@ pub async fn sync_worker(
                 last_backpressure_warn = std::time::Instant::now();
             }
         }
-
-        // Final lease check before S3 write (fencing)
-        if let Some(ref state) = lease_state
-            && !state.is_valid() {
-                warn!(
-                    generation = state.generation(),
-                    blocks = dirty.len(),
-                    "lease lost before S3 write, aborting sync"
-                );
-                // Mark blocks as failed so they'll be retried if lease is reacquired
-                for block_num in dirty {
-                    cache.mark_sync_failed(block_num);
-                }
-                break;
-            }
 
         // === Hot Batch Filtering ===
         // Group blocks by batch and filter out batches that are still "hot" (recently synced).
@@ -2239,7 +2201,6 @@ mod tests {
             worker_s3,
             super::SyncWorkerConfig::default(),
             shutdown_rx,
-            None, // No lease coordination in test
         ));
 
         // Write some data
@@ -2349,209 +2310,6 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.cache_hits, 1);
         assert_eq!(snapshot.cache_misses, 0);
-    }
-
-    #[tokio::test]
-    async fn test_lease_fencing_prevents_sync_after_lease_lost() {
-        // This test verifies that the sync_worker stops syncing when the lease is lost,
-        // preventing split-brain writes that could corrupt data.
-        //
-        // Scenario:
-        // 1. Node A has valid lease, writes data to blocks 0-3
-        // 2. Sync worker starts, lease state is marked as lost mid-sync
-        // 3. Verify sync worker stops and marks blocks as failed (dirty again)
-        // 4. Verify S3 does NOT have the data (sync was aborted)
-
-        let dir = TempDir::new().unwrap();
-        let config = test_config(dir.path());
-        let s3 = Arc::new(test_s3());
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = Arc::new(cache.finish_recovery(&s3).await.unwrap());
-
-        // Write data to multiple blocks
-        cache.write(0, &[42u8; 4096]).unwrap();
-        cache.write(4096, &[43u8; 4096]).unwrap();
-        cache.write(8192, &[44u8; 4096]).unwrap();
-        assert_eq!(cache.dirty_block_count(), 3);
-
-        // Create lease state and mark it as lost BEFORE starting sync worker
-        let (lease_state, _lost_rx) = super::super::lease::LeaseState::new(1);
-        lease_state.mark_lost(); // Simulate lease loss
-
-        // Create shutdown channel
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-        // Start sync worker with the "lost" lease
-        let worker_cache = Arc::clone(&cache);
-        let worker_s3 = Arc::clone(&s3);
-        let worker_handle = tokio::spawn(super::sync_worker(
-            worker_cache,
-            worker_s3,
-            super::SyncWorkerConfig {
-                batch_size: 100,
-                metadata_save_interval: 1,
-                ..Default::default()
-            },
-            shutdown_rx,
-            Some(lease_state), // Lost lease - sync should abort
-        ));
-
-        // Wait for sync worker to notice the lost lease and exit
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            worker_handle
-        ).await.expect("sync worker should exit quickly when lease is lost").unwrap();
-
-        // Verify: blocks should still be dirty (sync was aborted)
-        assert_eq!(cache.dirty_block_count(), 3, "blocks should remain dirty when lease is lost");
-
-        // Verify: S3 should NOT have the data (sync was prevented)
-        let s3_result = s3.read_block(0).await;
-        assert!(
-            matches!(s3_result, Err(super::super::block_store::BlockStoreError::NotFound(_))),
-            "S3 should NOT have data when sync was aborted due to lost lease"
-        );
-
-        // Cleanup
-        let _ = shutdown_tx.send(true);
-    }
-
-    #[tokio::test]
-    async fn test_sync_worker_stops_when_lease_lost_mid_cycle() {
-        // Test that sync_worker checks lease validity between cycles and stops
-        // when the lease becomes invalid.
-
-        let dir = TempDir::new().unwrap();
-        let config = test_config(dir.path());
-        let s3 = Arc::new(test_s3());
-
-        let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = Arc::new(cache.finish_recovery(&s3).await.unwrap());
-
-        // Create lease state (valid initially)
-        let (lease_state, _lost_rx) = super::super::lease::LeaseState::new(1);
-        let lease_state_clone = Arc::clone(&lease_state);
-
-        // Create shutdown channel
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-        // Start sync worker with valid lease
-        let worker_cache = Arc::clone(&cache);
-        let worker_s3 = Arc::clone(&s3);
-        let worker_handle = tokio::spawn(super::sync_worker(
-            worker_cache,
-            worker_s3,
-            super::SyncWorkerConfig {
-                batch_size: 100,
-                metadata_save_interval: 10,
-                ..Default::default()
-            },
-            shutdown_rx,
-            Some(lease_state),
-        ));
-
-        // Let the worker run a few cycles (no dirty blocks, so just sleeping)
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-        // Now mark the lease as lost
-        lease_state_clone.mark_lost();
-
-        // The worker should exit soon
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            worker_handle
-        ).await;
-
-        assert!(result.is_ok(), "sync worker should exit when lease is lost");
-
-        // Cleanup
-        let _ = shutdown_tx.send(true);
-    }
-
-    #[tokio::test]
-    async fn test_two_nodes_cannot_corrupt_same_batch() {
-        // This test demonstrates that with lease fencing, two nodes cannot
-        // simultaneously modify the same S3 batch.
-        //
-        // Scenario simulated:
-        // 1. Node A writes blocks 0-2, syncs them (has lease)
-        // 2. Node A's lease expires
-        // 3. Node B acquires lease, writes blocks 5-7 (same batch)
-        // 4. Node B syncs - should see Node A's data preserved in batch
-        //
-        // The key invariant: whoever holds the lease is the only writer.
-        // Lost leases mean no more writes.
-
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-
-        // Use small batches so blocks 0-2 and 5-7 are in the same batch
-        let s3 = S3BlockStore::new(Arc::clone(&object_store), "test", 4096)
-            .with_blocks_per_batch(10);  // Blocks 0-9 all in batch 0
-
-        // === Node A: has lease, writes blocks 0-2 ===
-        let dir_a = TempDir::new().unwrap();
-        let config_a = WriteCacheConfig {
-            cache_dir: dir_a.path().to_path_buf(),
-            device_name: "node_a".to_string(),
-            device_size: 1024 * 1024,
-            block_size: 4096,
-        };
-
-        let cache_a = WriteCache::<Initializing>::open(config_a).unwrap();
-        let cache_a = cache_a.finish_recovery(&s3).await.unwrap();
-
-        // Node A writes blocks 0, 1, 2 with pattern 0xAA
-        cache_a.write(0, &[0xAAu8; 4096]).unwrap();
-        cache_a.write(4096, &[0xAAu8; 4096]).unwrap();
-        cache_a.write(8192, &[0xAAu8; 4096]).unwrap();
-
-        // Node A syncs (simulating holding the lease)
-        let dirty = cache_a.claim_dirty_blocks(10);
-        cache_a.sync_blocks_batched(&s3, dirty).await.unwrap();
-
-        // Verify Node A's data is in S3
-        let block0 = s3.read_block(0).await.unwrap();
-        assert_eq!(block0[0], 0xAA, "Node A's data should be in S3");
-
-        // === Node B: acquires lease, writes blocks 5-7 ===
-        let dir_b = TempDir::new().unwrap();
-        let config_b = WriteCacheConfig {
-            cache_dir: dir_b.path().to_path_buf(),
-            device_name: "node_b".to_string(),
-            device_size: 1024 * 1024,
-            block_size: 4096,
-        };
-
-        let cache_b = WriteCache::<Initializing>::open(config_b).unwrap();
-        let cache_b = cache_b.finish_recovery(&s3).await.unwrap();
-
-        // Node B writes blocks 5, 6, 7 with pattern 0xBB
-        cache_b.write(5 * 4096, &[0xBBu8; 4096]).unwrap();
-        cache_b.write(6 * 4096, &[0xBBu8; 4096]).unwrap();
-        cache_b.write(7 * 4096, &[0xBBu8; 4096]).unwrap();
-
-        // Node B syncs (now holding the lease)
-        let dirty = cache_b.claim_dirty_blocks(10);
-        cache_b.sync_blocks_batched(&s3, dirty).await.unwrap();
-
-        // === Verify: Both nodes' data coexists in the batch ===
-        // The GET-modify-PUT pattern preserves Node A's blocks when Node B updates
-
-        let block0 = s3.read_block(0).await.unwrap();
-        assert_eq!(block0[0], 0xAA, "Node A's block 0 should be preserved");
-
-        let block1 = s3.read_block(1).await.unwrap();
-        assert_eq!(block1[0], 0xAA, "Node A's block 1 should be preserved");
-
-        let block5 = s3.read_block(5).await.unwrap();
-        assert_eq!(block5[0], 0xBB, "Node B's block 5 should be written");
-
-        let block7 = s3.read_block(7).await.unwrap();
-        assert_eq!(block7[0], 0xBB, "Node B's block 7 should be written");
-
-        // This proves the GET-modify-PUT pattern correctly merges both nodes' writes
-        // as long as they don't write to the same block (which the lease prevents).
     }
 
     #[tokio::test]
@@ -2755,7 +2513,6 @@ mod tests {
                 dirty_queue_critical_threshold: 0,
             },
             shutdown_rx,
-            None,
         ));
 
         // Wait for sync to complete - with max_deferrals=3, should happen within ~4 cycles

@@ -234,7 +234,7 @@ impl S3BlockStore {
 
     /// Write a batch to S3 with conditional PUT.
     ///
-    /// Provides defense-in-depth against concurrent writers (in addition to leases):
+    /// Provides defense-in-depth against concurrent writers:
     ///
     /// - If `etag` is `Some`: Uses If-Match, fails if ETag doesn't match (batch was modified)
     /// - If `etag` is `None`: Uses Create mode, fails if batch already exists (race condition)

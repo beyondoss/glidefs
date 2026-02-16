@@ -2,7 +2,7 @@ pub mod api;
 pub mod block_store;
 pub mod error;
 pub mod handler;
-pub mod lease;
+
 pub mod metrics;
 pub mod protocol;
 pub mod router;

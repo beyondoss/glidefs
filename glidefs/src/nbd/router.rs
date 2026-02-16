@@ -6,7 +6,6 @@
 use crate::config::ExportConfig;
 use crate::nbd::block_store::S3BlockStore;
 use crate::nbd::handler::NBDBlockHandler;
-use crate::nbd::lease::{lease_renewal_task, LeaseHandle, LeaseManager, LeaseState};
 use crate::nbd::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::nbd::state::Active;
 use crate::nbd::write_cache::{sync_worker, CacheError, WriteCache, WriteCacheConfig};
@@ -40,9 +39,6 @@ pub enum RouterError {
         requested_gb: f64,
     },
 
-    #[error("Lease error: {0}")]
-    Lease(#[from] super::lease::LeaseError),
-
     #[error("Cache error: {0}")]
     Cache(#[from] CacheError),
 
@@ -71,16 +67,8 @@ pub struct ExportState {
     pub s3_store: Arc<S3BlockStore>,
     pub readonly: bool,
     pub metrics: Arc<ExportMetrics>,
-    /// Lease handle when export is read-write (None if readonly or no lease required)
-    pub lease: Option<LeaseHandle>,
-    /// Lease state for coordination with sync worker (None if readonly)
-    /// Stored to keep the Arc alive; sync_worker and renewal task hold clones.
-    #[allow(dead_code)]
-    lease_state: Option<Arc<LeaseState>>,
     sync_shutdown: watch::Sender<bool>,
     sync_handle: JoinHandle<()>,
-    /// Lease renewal task handle (None if readonly)
-    lease_renewal_handle: Option<JoinHandle<()>>,
 }
 
 impl ExportState {
@@ -96,7 +84,6 @@ impl ExportState {
 /// Multi-tenant export router.
 ///
 /// Manages multiple NBD exports, each with independent storage and caching.
-/// Uses S3 leases for distributed coordination during migrations.
 pub struct ExportRouter {
     /// Active exports: name → state
     exports: RwLock<HashMap<String, ExportState>>,
@@ -121,9 +108,6 @@ pub struct ExportRouter {
 
     /// Auto-create size for on-demand export creation (None = disabled)
     auto_create_size_gb: Option<f64>,
-
-    /// Lease manager for distributed coordination (Arc for sharing with renewal tasks)
-    lease_manager: Arc<LeaseManager>,
 }
 
 impl ExportRouter {
@@ -137,8 +121,6 @@ impl ExportRouter {
     /// * `blocks_per_batch` - Number of blocks per S3 batch object
     /// * `sync_delay_ms` - Delay before syncing writes to S3
     /// * `auto_create_size_gb` - Size for auto-created exports (None = disabled)
-    /// * `node_id` - Unique identifier for this node (for lease coordination)
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         object_store: Arc<dyn ObjectStore>,
         db_path: String,
@@ -147,14 +129,7 @@ impl ExportRouter {
         blocks_per_batch: u64,
         sync_delay_ms: u64,
         auto_create_size_gb: Option<f64>,
-        node_id: String,
     ) -> Self {
-        let lease_manager = Arc::new(LeaseManager::new(
-            Arc::clone(&object_store),
-            db_path.clone(),
-            node_id,
-        ));
-
         Self {
             exports: RwLock::new(HashMap::new()),
             object_store,
@@ -164,7 +139,6 @@ impl ExportRouter {
             blocks_per_batch,
             sync_delay_ms,
             auto_create_size_gb,
-            lease_manager,
         }
     }
 
@@ -323,38 +297,12 @@ impl ExportRouter {
         let cache = Arc::new(cache);
         info!("Export '{}' cache ready", name);
 
-        // Acquire lease FIRST if this is a read-write export
-        // This determines whether we can actually write, and we need the generation
-        // for fencing coordination with the sync worker
-        let (lease, lease_state, actual_readonly) = if !readonly {
-            match self.lease_manager.acquire(&name).await {
-                Ok(handle) => {
-                    info!(
-                        "Acquired lease for export '{}' (generation {})",
-                        name, handle.lease.generation
-                    );
-                    // Create lease state for sync worker coordination
-                    let (state, _lost_rx) = LeaseState::new(handle.lease.generation);
-                    (Some(handle), Some(state), false)
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to acquire lease for export '{}': {}. Starting as readonly.",
-                        name, e
-                    );
-                    (None, None, true)
-                }
-            }
-        } else {
-            (None, None, true)
-        };
-
         // Create handler with S3 store for read-through caching
         let handler = Arc::new(NBDBlockHandler::new(
             Arc::clone(&cache),
             Arc::clone(&s3_store),
             config.size_bytes(),
-            actual_readonly,
+            readonly,
             Arc::clone(&metrics),
         ));
 
@@ -367,43 +315,26 @@ impl ExportRouter {
             hot_batch_cooldown: std::time::Duration::from_millis(self.sync_delay_ms),
             ..Default::default()
         };
-        let sync_lease_state = lease_state.clone();
         let sync_handle = spawn_named(&format!("sync-{}", name), async move {
-            sync_worker(sync_cache, sync_s3, sync_config, sync_shutdown_rx, sync_lease_state).await;
+            sync_worker(sync_cache, sync_s3, sync_config, sync_shutdown_rx).await;
             info!("Sync worker for export '{}' stopped", export_name);
         });
-
-        // Start lease renewal task if we have a lease
-        let lease_renewal_handle = if let Some(ref state) = lease_state {
-            let manager = Arc::clone(&self.lease_manager);
-            let export_name = name.clone();
-            let state_clone = Arc::clone(state);
-            let shutdown_rx = sync_shutdown_tx.subscribe();
-            Some(spawn_named(&format!("lease-renew-{}", name), async move {
-                lease_renewal_task(manager, export_name, state_clone, shutdown_rx).await;
-            }))
-        } else {
-            None
-        };
 
         // Store export state
         let state = ExportState {
             handler,
             cache,
             s3_store,
-            readonly: actual_readonly,
+            readonly,
             metrics,
-            lease,
-            lease_state,
             sync_shutdown: sync_shutdown_tx,
             sync_handle,
-            lease_renewal_handle,
         };
 
         let mut exports = self.exports.write().await;
         exports.insert(name.clone(), state);
 
-        info!("Export '{}' created successfully (readonly={})", name, actual_readonly);
+        info!("Export '{}' created successfully (readonly={})", name, readonly);
 
         // Persist export definition to S3 for discovery on restart
         if let Err(e) = self.save_export(&config).await {
@@ -481,17 +412,7 @@ impl ExportRouter {
     }
 
     /// Promote a readonly export to read-write.
-    ///
-    /// This acquires the distributed lease before promoting, ensuring only one
-    /// node can be the writer for this export at a time.
     pub async fn promote_export(&self, name: &str) -> Result<(), RouterError> {
-        // First, acquire the lease (before taking the write lock)
-        let lease_handle = self.lease_manager.acquire(name).await?;
-        info!(
-            "Acquired lease for export '{}' (generation {})",
-            name, lease_handle.lease.generation
-        );
-
         let mut exports = self.exports.write().await;
         let state = exports
             .get_mut(name)
@@ -499,14 +420,9 @@ impl ExportRouter {
 
         if !state.readonly {
             info!("Export '{}' is already read-write", name);
-            // We acquired a lease but export was already read-write
-            // This is fine - we just renewed/took over the lease
-            state.lease = Some(lease_handle);
             return Ok(());
         }
 
-        // Update state with the lease and promote to read-write
-        state.lease = Some(lease_handle);
         state.readonly = false;
         state.handler.set_readonly(false);
         info!("Export '{}' promoted to read-write", name);
@@ -608,30 +524,15 @@ impl ExportRouter {
 
         info!("Removing export '{}'...", name);
 
-        // 1. Signal sync worker and lease renewal to stop FIRST
-        // (must stop renewal task before releasing lease to avoid race condition)
+        // 1. Signal sync worker to stop
         let _ = state.sync_shutdown.send(true);
 
-        // 2. Wait for lease renewal task to exit (if any)
-        // This prevents the renewal task from racing with lease release
-        if let Some(handle) = state.lease_renewal_handle
-            && let Err(e) = handle.await {
-                warn!("Lease renewal task for '{}' panicked: {}", name, e);
-            }
-
-        // 3. Now release the lease (renewal task is stopped, no race condition)
-        if let Some(ref lease_handle) = state.lease
-            && let Err(e) = self.lease_manager.release(name, lease_handle).await {
-                warn!("Failed to release lease for '{}': {}", name, e);
-                // Continue with removal - lease will expire eventually
-            }
-
-        // 4. Wait for sync worker to exit (releases its Arc clone)
+        // 2. Wait for sync worker to exit (releases its Arc clone)
         if let Err(e) = state.sync_handle.await {
             warn!("Sync worker for '{}' panicked: {}", name, e);
         }
 
-        // 5. Drop the handler (releases its Arc clone)
+        // 3. Drop the handler (releases its Arc clone)
         drop(state.handler);
 
         // 6. Unwrap the Arc and transition through Draining state
@@ -692,41 +593,18 @@ impl ExportRouter {
         for (name, state) in export_list {
             info!("Shutting down export '{}'...", name);
 
-            // 1. Signal sync worker and lease renewal to stop FIRST
-            // (must stop renewal task before releasing lease to avoid race condition)
+            // 1. Signal sync worker to stop
             let _ = state.sync_shutdown.send(true);
 
-            // 2. Wait for lease renewal task to exit (if any)
-            // This prevents the renewal task from racing with lease release
-            if let Some(handle) = state.lease_renewal_handle
-                && let Err(e) = handle.await {
-                    warn!("Lease renewal task for '{}' panicked: {}", name, e);
-                }
-
-            // 3. Now release the lease (renewal task is stopped, no race condition)
-            if let Some(ref lease_handle) = state.lease {
-                match self.lease_manager.release(&name, lease_handle).await {
-                    Ok(()) => {
-                        info!("Released lease for export '{}'", name);
-                    }
-                    Err(e) => {
-                        warn!("Failed to release lease for '{}': {}", name, e);
-                        // Continue with shutdown - lease will expire eventually
-                    }
-                }
-            } else {
-                info!("No lease to release for export '{}' (was readonly)", name);
-            }
-
-            // 4. Wait for sync worker to exit (releases its Arc clone)
+            // 2. Wait for sync worker to exit (releases its Arc clone)
             if let Err(e) = state.sync_handle.await {
                 warn!("Sync worker for '{}' panicked: {}", name, e);
             }
 
-            // 5. Drop the handler (releases its Arc clone)
+            // 3. Drop the handler (releases its Arc clone)
             drop(state.handler);
 
-            // 6. Now we should be the only holder - unwrap the Arc
+            // 4. Now we should be the only holder - unwrap the Arc
             match Arc::try_unwrap(state.cache) {
                 Ok(cache) => {
                     // 7. Transition Active → Draining via shutdown()
@@ -775,7 +653,6 @@ impl ExportRouter {
             10,         // 10 blocks per batch
             100,        // 100ms sync delay
             None,       // No auto-create in tests
-            "test-node".to_string(),
         )
     }
 }
@@ -812,7 +689,6 @@ mod tests {
             10,         // 10 blocks per batch
             100,        // 100ms sync delay
             None,       // No auto-create in tests
-            "test-node".to_string(),
         )
     }
 
