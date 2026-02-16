@@ -57,13 +57,27 @@ All entries point to blocks already in the global store. As the VM writes, indiv
 
 ---
 
-## Testable Milestone
+## Suggested Verifications
 
-1. Bless a raw disk image. Verify packs appear in S3 with correct content.
-2. Create VM from base manifest. Verify all blocks resolve (reads succeed through S3).
-3. Bless again. Verify no re-uploads (all HEAD requests return 200).
-4. Bless a similar image (same Ubuntu, different Node version). Verify ~95% of packs are deduped (shared OS blocks).
-5. Verify manifest is valid: round-trip serialize/deserialize, all hashes have pack index entries.
+### Integration Tests — Bless
+
+- **`test_bless_uploads_packs_and_manifest`**: Bless a small test image (e.g., 10MB). Verify: packs appear in S3, manifest appears at `manifests/bases/{name}`, manifest is valid (round-trip serialize/deserialize), all block map hashes have pack index entries.
+- **`test_bless_idempotent`**: Bless the same image twice with the same name. Second run: zero S3 PUTs (all HEAD requests return 200, everything already exists). Manifest is byte-identical.
+- **`test_bless_content_correct`**: Bless a test image with known data patterns. Parse the manifest. For each block map entry: fetch the pack from S3, decompress the block, verify `blake3_128(data) == hash`. Verify data matches the corresponding chunk of the original image file.
+
+### Integration Tests — Dedup Across Images
+
+- **`test_bless_dedup_similar_images`**: Create two test images that share 80% of their content (e.g., same base + different 20% payload). Bless both. Count total S3 PUTs. Second bless should upload ~20% as many packs as the first (shared content deduped). Both manifests reference the shared packs.
+
+### Integration Tests — VM from Base Image
+
+- **`test_create_vm_from_base`**: Bless a test image. Copy the base manifest to a VM manifest key. Create an export pointing at this manifest. Read various offsets through the NBD path. All data matches the original image.
+- **`test_vm_writes_diverge_from_base`**: Create VM from base image. Write new data to offset 0. Read offset 0 — gets new data. Read offset 128KB (untouched) — gets base image data. Base manifest is unchanged.
+
+### Validation Tests
+
+- **`test_bless_manifest_self_contained`**: After bless, verify: every hash in the block map has a pack index entry. Every pack index entry references a pack that exists in S3.
+- **`test_bless_handles_sparse_image`**: Bless an image that's mostly zeros (e.g., 1GB image with 50MB of data). Verify the manifest only contains entries for non-zero chunks. Zero regions resolve to the zero-block hash.
 
 ---
 

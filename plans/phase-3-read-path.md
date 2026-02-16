@@ -70,14 +70,36 @@ On S3 cache miss, fetch the entire pack (25 blocks), decompress all, cache all.
 
 ---
 
-## Testable Milestone
+## Suggested Verifications
 
-1. Write blocks via Phase 1, flush via Phase 2, clear local dirty store. Read back — verify data comes from S3 via pack fetch.
-2. Read again — verify cache hit (no S3 call).
-3. Verify pack-level prefetch: read one block from a pack, then read a sibling block from the same pack — second read should be a cache hit.
-4. Verify hash verification: inject corrupted pack data, confirm the read path detects the mismatch and rejects it.
-5. Verify zero-block reads: read an offset that was never written, get zeros.
-6. End-to-end: NBD read/write cycle through the full v2 path (write -> flush -> read back).
+### Unit Tests — Block Resolution
+
+- **`test_read_from_dirty_store`**: Write a block (dirty, not flushed). Read it back. Data comes from dirty store. No S3 call. Verify data matches.
+- **`test_read_from_clean_cache`**: Write a block, flush to S3, verify it moved to clean cache. Read it back. Data comes from cache. No S3 call.
+- **`test_read_zero_block`**: Read an offset that was never written. Returns all zeros. No S3 call. No cache lookup (short-circuit on zero-block hash).
+- **`test_read_sub_chunk`**: Write a full 128KB chunk. Read only bytes [4096..8192] (4KB slice from the middle). Returns correct 4KB slice.
+- **`test_read_triggers_s3_fetch`**: Write blocks, flush, clear local cache AND dirty store (simulate cross-host wake). Read a block. Verify S3 GET is made. Data is correct.
+
+### Integration Tests — Pack Prefetch
+
+- **`test_pack_prefetch_warms_siblings`**: Flush 25 blocks (one pack). Clear local cache. Read block 0 (cache miss, fetches pack from S3). Immediately read blocks 1-24 — all should be cache hits (no additional S3 calls). Count total S3 GETs: exactly 1.
+- **`test_pack_prefetch_different_packs`**: Flush 50 blocks (two packs). Clear cache. Read block 0 (fetches pack 1). Read block 25 (fetches pack 2). Total S3 GETs: 2. Then read blocks 1-24 and 26-49 — all cache hits.
+
+### Integration Tests — Hash Verification
+
+- **`test_s3_ingestion_verifies_hash`**: Flush blocks to S3. Corrupt a block in S3 (flip a byte in the pack data). Clear local cache. Read the corrupted block. Verify the read path detects the BLAKE3 mismatch and returns an error (not silently corrupt data).
+- **`test_valid_pack_passes_verification`**: Flush blocks normally. Clear cache. Read back. All hash verifications pass. Data matches original writes.
+
+### End-to-End Tests
+
+- **`test_full_read_write_cycle`**: Write 200 blocks with known patterns. Flush. Clear all local state (simulate restart on new host). Load manifest from S3. Read all 200 blocks back. Every block matches the original data.
+- **`test_mixed_dirty_and_clean_reads`**: Write 50 blocks. Flush. Write 50 more blocks (dirty). Read all 100 blocks. First 50 come from cache (flushed). Last 50 come from dirty store (not flushed). All data correct.
+- **`test_nbd_read_write_through_v2_path`**: Full NBD protocol test. Connect NBD client, write blocks via NBD_CMD_WRITE, read back via NBD_CMD_READ. Data matches. This verifies the entire stack from protocol to block resolution.
+
+### Performance Assertions
+
+- **`test_dirty_store_read_latency`**: Write 1000 blocks. Read each from dirty store. Assert p99 latency < 1us (in-memory HashMap lookup).
+- **`test_cache_hit_latency`**: Populate cache with 1000 blocks. Read each. Assert p99 latency < 10us for in-memory cache (will be ~100ns in production, but test overhead is higher).
 
 ---
 

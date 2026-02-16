@@ -75,12 +75,43 @@ Periodically verify cached blocks by re-hashing.
 
 ---
 
-## Testable Milestone
+## Suggested Verifications
 
-1. **Boot prefetch:** Benchmark cold boot with and without hot set prefetch. Measure time to first instruction. Target: >2x improvement on cold host.
-2. **Read-ahead:** Read a large file sequentially. Verify the next pack is fetched before it's requested (count S3 GETs vs cache hits). Compare sequential read throughput with and without read-ahead.
-3. **TRIM:** Write blocks, TRIM them, verify block map entries reset to zero-block hash. Verify memory usage decreases. Read trimmed offset, verify zeros returned.
-4. **Scrubber:** Inject bit corruption into a cached block (flip a byte). Verify scrubber detects the mismatch and evicts the block. Verify re-read fetches correct data from S3.
+### Integration Tests — Boot Hot Set Prefetch
+
+- **`test_hot_set_recorded_during_bless`**: Bless a test image with boot recording enabled. Verify a `.boot-hot-set` file appears alongside the base manifest in S3. Parse it — contains a list of chunk indices.
+- **`test_hot_set_prefetch_warms_cache`**: Load a boot hot set (e.g., 100 chunk indices). Trigger prefetch. Verify all 100 blocks are in the memory cache before the VM starts. Count S3 GETs: equal to the number of packs containing hot set blocks (much less than 100 due to pack-level fetch).
+- **`test_hot_set_prefetch_skips_cached`**: Pre-populate the cache with 50 of the 100 hot set blocks (simulating sibling VMs). Trigger prefetch. Verify: only the remaining 50 blocks are fetched from S3. The 50 cached blocks are not re-fetched.
+
+### Benchmarks — Boot Prefetch
+
+- **`bench_cold_boot_with_prefetch`**: Create VM from base image on a cold host (empty cache). Measure time from VM start to first NBD read completion. Compare with and without hot set prefetch. Target: >2x improvement.
+- **`bench_warm_boot_with_prefetch`**: Same test but with sibling VMs having warmed the cache. Prefetch should be mostly no-ops. Verify zero or near-zero S3 GETs.
+
+### Integration Tests — Sequential Read-Ahead
+
+- **`test_sequential_detection`**: Read chunks at indices 0, 1, 2, 3 (sequential). Verify the detector identifies this as sequential. Read chunk at index 100 (non-sequential). Verify the detector resets.
+- **`test_readahead_prefetches_next_pack`**: Clear cache. Read chunk 0 (cache miss, fetches pack 0 from S3). Read chunks 1, 2, 3 (sequential pattern detected). Verify: the pack containing chunks 25-49 is proactively fetched (read-ahead). When the VM reads chunk 25, it's a cache hit.
+- **`test_readahead_disabled_on_random`**: Read chunks at random offsets. Verify: no proactive fetches beyond the normal pack-level prefetch (25 blocks per miss). Read-ahead does not trigger.
+
+### Benchmarks — Sequential Read-Ahead
+
+- **`bench_sequential_read_throughput`**: Read 10,000 consecutive chunks. Measure throughput (MB/s) with and without read-ahead. Target: read-ahead should approach SSD throughput (S3 latency hidden by prefetch).
+
+### Integration Tests — TRIM
+
+- **`test_trim_resets_block_map`**: Write block at offset 0 (hash A). TRIM offset 0. Read block map entry at offset 0 — hash is `ZERO_BLOCK_HASH`.
+- **`test_trim_returns_zeros`**: Write block at offset 0. TRIM offset 0. Read offset 0 — returns all zeros.
+- **`test_trim_reduces_sparse_size`**: Write 1000 blocks. Verify block map has 1000 non-zero entries. TRIM 900 of them. Verify block map has 100 non-zero entries. Serialize — verify serialized size is ~100 entries (not 1000).
+- **`test_trim_wal_entry`**: TRIM offset 0. Kill daemon, restart, replay WAL. Verify offset 0 is correctly trimmed (block map entry is zero hash).
+- **`test_trim_range`**: Write blocks at offsets [0, 128KB, 256KB, 384KB, 512KB]. TRIM the range [128KB, 384KB]. Verify: offsets 128KB and 256KB are trimmed (zero hash). Offsets 0, 384KB, 512KB are unchanged.
+
+### Integration Tests — Background Scrubber
+
+- **`test_scrubber_detects_corruption`**: Insert a block into cache. Manually flip a byte in the cached data (simulating bit rot). Run scrubber. Verify: the corrupted block is evicted from cache. A warning is logged.
+- **`test_scrubber_leaves_valid_blocks`**: Insert 100 valid blocks. Run scrubber. Verify: all 100 blocks still in cache. No warnings.
+- **`test_scrubber_re_fetch_after_eviction`**: Corrupt a cached block. Run scrubber (evicts it). Read the block. Verify: S3 fetch occurs, correct data returned, block re-cached.
+- **`test_scrubber_rate_limiting`**: Configure scrubber to check 10 blocks/second. Insert 100 blocks. Start scrubber. Verify: takes ~10 seconds to complete a full pass (rate limited, not a burst).
 
 ---
 

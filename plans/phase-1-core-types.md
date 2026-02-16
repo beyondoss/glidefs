@@ -102,15 +102,53 @@ WAL Entry:
 
 ---
 
-## Testable Milestone
+## Suggested Verifications
 
-1. Write blocks through the new path. Verify block map tracks correct hashes.
-2. Read back from dirty store. Verify data integrity (re-hash matches).
-3. Kill daemon, restart. Verify WAL replay reconstructs the block map and dirty store.
-4. Verify dirty set tracks the correct offsets (insert on write, contains only dirty entries).
-5. Verify sparse block map: unwritten offsets return zero-block hash.
-6. Verify sequence numbers are monotonically increasing across writes.
-7. All unit-testable with in-memory stores (no S3 dependency).
+### Unit Tests — BlockMap
+
+- **`test_block_map_insert_and_lookup`**: Write entry at chunk index 42, read it back. Hash and flags match.
+- **`test_block_map_sparse_default`**: Read an index that was never written. Returns `ZERO_BLOCK_HASH`.
+- **`test_block_map_overwrite`**: Write to the same index twice. Second hash replaces first. Dirty flag set on both writes.
+- **`test_block_map_persist_and_load`**: Write 1,000 entries, persist to temp file, load into a new BlockMap. All entries match. Unwritten indices still return zero hash.
+- **`test_block_map_sparse_serialization`**: Write entries at indices 0, 100, 50000. Serialize. Verify only 3 entries are written to disk (not 50001).
+- **`test_block_map_sequence_tracking`**: Write entries with increasing sequence numbers. Each entry records its write sequence. Query by sequence range returns correct entries.
+
+### Unit Tests — DirtySet
+
+- **`test_dirty_set_insert_and_contains`**: Insert offset, verify contains returns true. Non-inserted offset returns false.
+- **`test_dirty_set_drain`**: Insert 100 offsets, drain. Returns all 100. Set is empty after drain.
+- **`test_dirty_set_idempotent_insert`**: Insert the same offset twice. Drain returns it once.
+
+### Unit Tests — Blake3Hash
+
+- **`test_blake3_deterministic`**: Hash the same data twice. Same hash both times.
+- **`test_blake3_different_data`**: Hash two different blocks. Different hashes.
+- **`test_blake3_zero_block`**: Hash a 128KB zero block. Matches the `ZERO_BLOCK_HASH` constant.
+- **`test_blake3_performance`**: Hash a 128KB block. Assert completes in <50us (10x margin over expected 5us).
+
+### Unit Tests — WAL
+
+- **`test_wal_append_and_replay`**: Append 10 entries, close, replay. All 10 entries recovered with correct vm_id, chunk_index, hash, sequence, and data.
+- **`test_wal_truncated_entry`**: Append 5 entries, then write a partial 6th entry (truncate mid-write). Replay recovers exactly 5 entries.
+- **`test_wal_crc_corruption`**: Append 3 entries, flip a bit in entry 2's CRC. Replay recovers entry 1, stops at entry 2 (or skips to entry 3 depending on recovery strategy).
+- **`test_wal_truncate_after_persist`**: Append entries, truncate WAL. Verify WAL is empty. New appends work correctly.
+
+### Integration Tests — Write Path
+
+- **`test_write_path_end_to_end`**: Write 100 blocks through the new path. For each block: verify block map has correct hash, dirty set contains the offset, dirty store contains the data, sequence is monotonically increasing.
+- **`test_write_then_read_from_dirty_store`**: Write a block, read it back via the dirty store. Data matches. Re-hash the returned data, matches the block map hash.
+- **`test_overwrite_updates_everything`**: Write block at offset 0 (hash=A), then overwrite with different data (hash=B). Block map has hash B. Dirty store has both A and B (A is still there — referenced by old WAL entry until cleanup). Dirty set still contains offset 0.
+
+### Crash Recovery Tests
+
+- **`test_crash_recovery_wal_replay`**: Write 50 blocks. Kill the daemon (drop without clean shutdown). Restart, load block map from last persist + replay WAL. Verify all 50 blocks are present with correct hashes. Read each block from dirty store — data matches.
+- **`test_crash_recovery_partial_persist`**: Write 50 blocks. Persist block map (captures all 50). Write 20 more blocks. Kill daemon. Restart — load persisted block map (50 entries) + replay WAL (20 entries). Verify all 70 blocks present.
+- **`test_crash_recovery_empty_wal`**: Persist block map, then kill daemon with no new writes. Restart — load block map, WAL is empty. All previously persisted entries present.
+
+### Property Tests (proptest)
+
+- **`prop_any_write_sequence_produces_consistent_state`**: Generate random sequence of writes (random offsets, random data). After all writes: every offset in dirty set has a corresponding dirty entry in block map. Every dirty entry's hash matches `blake3_128(data)` in dirty store. Sequence numbers are strictly increasing.
+- **`prop_persist_load_roundtrip`**: Generate random block map state. Persist, load. Identical.
 
 ---
 

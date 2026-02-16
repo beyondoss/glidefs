@@ -109,14 +109,42 @@ async fn flush_scheduler(export, mode, shutdown):
 
 ---
 
-## Testable Milestone
+## Suggested Verifications
 
-1. Create export with demand-driven mode. Write heavily. Verify zero S3 PUTs until an explicit flush trigger.
-2. Trigger a fork. Verify flush happens (packs + manifest in S3).
-3. Switch to continuous mode. Verify background flushes happen on ~5s schedule.
-4. Verify adaptive intervals: write heavily, observe shorter intervals. Stop writing, observe skipped cycles.
-5. Exceed dirty budget. Verify forced partial flush: some packs uploaded, dirty_bytes drops below budget, but not all dirty data is flushed.
-6. Verify runtime switch: start demand-driven, switch to continuous mid-operation, verify background flushes begin.
+### Integration Tests — Demand-Driven Mode
+
+- **`test_demand_driven_zero_s3_traffic`**: Create export with `flush_mode: demand_driven`. Write 1000 blocks over 30 seconds. Count S3 PUTs during this window: exactly 0.
+- **`test_demand_driven_fork_triggers_flush`**: Create demand-driven export, write 100 blocks. Trigger snapshot (fork request). Verify: packs appear in S3, manifest appears in S3, dirty set is empty after flush.
+- **`test_demand_driven_sleep_triggers_flush`**: Create demand-driven export, write blocks. Trigger portable sleep. Verify flush completes (packs + manifest in S3).
+- **`test_demand_driven_delete_no_flush`**: Create demand-driven export, write blocks. Delete the export. Verify: NO S3 PUTs (ephemeral data discarded). Local state cleaned up.
+
+### Integration Tests — Continuous Mode
+
+- **`test_continuous_flush_on_schedule`**: Create export with `flush_mode: continuous`, block interval 1s (shortened for test). Write blocks. Wait 3 seconds. Verify: at least 2 flush cycles occurred (packs in S3). Dirty set is drained periodically.
+- **`test_continuous_skips_empty_cycles`**: Create continuous export, write 10 blocks. Wait for flush (packs uploaded, dirty set empty). Wait 5 more seconds with no writes. Verify: no additional S3 PUTs during idle period (cycles are skipped when dirty set is empty).
+- **`test_continuous_manifest_sync_interval`**: Configure block flush at 1s, manifest sync at 5s. Write blocks over 10 seconds. Verify: packs uploaded every ~1s, manifest updated every ~5s (fewer manifest PUTs than pack PUTs).
+
+### Integration Tests — Adaptive Intervals
+
+- **`test_adaptive_faster_under_heavy_writes`**: Configure base interval 5s. Write heavily (thousands of blocks per second). Observe flush intervals. Verify: intervals shorter than 5s (adaptive formula kicks in). Dirty set stays bounded.
+- **`test_adaptive_slower_under_light_writes`**: Configure base interval 5s. Write 1 block per second. Observe flush intervals. Verify: intervals close to 5s (not much to flush, default interval is fine).
+
+### Integration Tests — Dirty Budget
+
+- **`test_dirty_budget_enforced`**: Set `dirty_budget_gb = 0.001` (~1MB, small for test). Write 20 blocks (20 x 128KB = 2.5MB, exceeding budget). Verify: forced partial flush triggered. After the flush, dirty_bytes is below budget. Some (not all) blocks flushed to S3.
+- **`test_dirty_budget_flushes_oldest_first`**: Write blocks A (seq=1), B (seq=2), C (seq=3). Budget allows 2 blocks. Writing block D exceeds budget. Verify: block A (oldest) is flushed first, then B if needed. C and D remain dirty.
+- **`test_dirty_budget_demand_driven_still_flushes`**: Create demand-driven export with small dirty budget. Write past the budget. Verify: partial flush occurs even though mode is demand-driven. This is the safety valve.
+- **`test_dirty_budget_counter_accurate`**: Write 10 blocks. Verify dirty_bytes = 10 * 128KB. Flush 5 blocks. Verify dirty_bytes = 5 * 128KB. Flush remaining. Verify dirty_bytes = 0.
+
+### Integration Tests — Mode Switching
+
+- **`test_switch_demand_to_continuous`**: Create demand-driven export. Write blocks. Switch to continuous via API. Verify: background flushes begin within one flush interval. Dirty data starts draining.
+- **`test_switch_continuous_to_demand`**: Create continuous export. Verify background flushes are running. Switch to demand-driven. Wait 10 seconds with no triggers. Verify: no additional S3 PUTs after the switch (background scheduler stopped).
+
+### API Tests
+
+- **`test_create_export_with_flush_mode`**: `POST /api/exports { flush_mode: "continuous" }`. Verify export created with continuous flush active.
+- **`test_flush_mode_switch_api`**: `POST /api/exports/{name}/flush-mode { flush_mode: "continuous" }`. Returns 200. Verify mode changed. `GET /api/exports/{name}` reflects new mode.
 
 ---
 

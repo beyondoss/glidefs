@@ -106,16 +106,44 @@ impl ForkedBlockMap {
 
 ---
 
-## Testable Milestone
+## Suggested Verifications
 
-1. Start VM A, write known data patterns to various offsets.
-2. Trigger snapshot. Verify manifest appears in S3 with correct ETag.
-3. Fork to VM B on the "same host" (simulated). Verify VM B reads exact data as of snapshot point.
-4. Write more data to VM A after snapshot. Verify VM B does NOT see VM A's post-snapshot writes.
-5. Write data to VM B. Verify VM A does NOT see VM B's writes.
-6. Verify fork overlay shares memory: check that parent BlockMap has refcount > 1.
-7. **Stress test:** Fork during heavy writes (background writer doing continuous writes to VM A while snapshots are taken). Verify every fork is internally consistent — no torn reads, no missing blocks.
-8. Verify lazy fork: fork without snapshot, verify fork has state as of last flush.
+### Unit Tests — Snapshot Capture
+
+- **`test_snapshot_captures_at_sequence`**: Write blocks at seq 1-5. Take snapshot at seq=3. Snapshot contains entries with seq <= 3 only. Entries at seq 4-5 are NOT in the snapshot.
+- **`test_snapshot_captures_latest_hash_per_offset`**: Write offset 0 at seq 1 (hash A), overwrite offset 0 at seq 2 (hash B). Snapshot at seq=3. Snapshot has (offset=0, hash=B), not hash A.
+- **`test_snapshot_empty_dirty_set`**: No writes (or all previously flushed). Snapshot captures nothing. Manifest reflects last-known state. No S3 pack uploads.
+
+### Unit Tests — Fork Overlay
+
+- **`test_overlay_read_from_parent`**: Create parent with 100 entries. Fork (empty overlay). Read all 100 entries — all come from parent.
+- **`test_overlay_write_diverges`**: Fork from parent. Write to offset 42 in the fork. Fork reads offset 42 — gets new data. Parent reads offset 42 — still has original data.
+- **`test_overlay_flatten`**: Fork from parent (100 entries). Write 60 new entries to fork (>50% of parent). Trigger flatten. Verify fork is now a standalone BlockMap with all 100 parent entries + 60 overlay entries merged. Parent Arc refcount decreases.
+- **`test_overlay_memory_sharing`**: Fork 10 times from same parent. Verify parent Arc refcount = 11 (1 original + 10 forks). Each fork's overlay is empty (0 entries). Total memory: ~1x parent + 10x empty HashMaps.
+
+### Integration Tests — Consistent Fork
+
+- **`test_consistent_fork_exact_state`**: VM-A writes blocks [0..99] with pattern 0xAA. Snapshot. Fork to VM-B. VM-B reads all 100 blocks — all contain 0xAA.
+- **`test_fork_isolation_source_writes`**: VM-A writes blocks [0..49]. Snapshot + fork to VM-B. VM-A writes blocks [50..99] (AFTER snapshot). VM-B reads blocks [50..99] — gets zeros (not VM-A's post-snapshot data).
+- **`test_fork_isolation_fork_writes`**: VM-A writes blocks [0..49]. Fork to VM-B. VM-B writes block 0 with 0xBB. VM-A reads block 0 — still 0xAA. VM-B reads block 0 — gets 0xBB.
+- **`test_fork_of_fork`**: VM-A -> fork to VM-B -> fork VM-B to VM-C. Write to each after forking. All three have independent state. Shared blocks resolve correctly through the chain.
+- **`test_lazy_fork_uses_last_flush`**: VM-A writes 50 blocks. Flush. Write 50 more blocks (NOT flushed). Lazy fork to VM-B (no snapshot). VM-B has only the first 50 blocks (the flushed ones). The 50 unflushed blocks are NOT in VM-B.
+
+### Concurrency Tests
+
+- **`test_snapshot_during_active_writes`**: Spawn a background writer doing 1000 writes/sec to VM-A. Take a snapshot at some point. Verify: (a) snapshot manifest is internally consistent, (b) every hash in the manifest has data in S3, (c) fork from this manifest reads correctly, (d) no blocks from after the snapshot sequence appear in the fork.
+- **`test_concurrent_snapshots`**: Request two snapshots of VM-A simultaneously. Both succeed. Each manifest is internally consistent. Sequence numbers may differ (second snapshot captures writes that happened between the two requests).
+- **`test_snapshot_does_not_pause_writes`**: Start a background writer tracking write latencies. Take a snapshot mid-stream. Verify: no write takes >10ms (snapshot should not block writes for more than the brief clone-and-filter lock, <1ms).
+
+### Stress Tests
+
+- **`test_fork_storm`**: Fork VM-A 50 times in rapid succession. All 50 forks have consistent state. Memory usage is ~1x parent + 50x empty overlays (not 50x full copies). Each fork can independently read and write.
+- **`test_snapshot_under_heavy_write_load`**: Write at 500MB/s to VM-A. Take 10 snapshots 1 second apart. Each snapshot is internally consistent. Sequence numbers increase. No data corruption.
+
+### API Tests
+
+- **`test_snapshot_api_returns_etag`**: `POST /api/exports/vm-a/snapshot` returns `{ manifest_etag: "...", sequence: N }`. ETag matches the actual S3 object ETag. Sequence is a positive integer.
+- **`test_fork_via_export_creation`**: Create export with `manifest_url` pointing to a previously-snapshotted manifest. Export loads successfully. Reads resolve correctly.
 
 ---
 

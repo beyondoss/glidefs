@@ -44,13 +44,34 @@ Drop-in replacement for the simple cache from Phase 3.
 
 ---
 
-## Testable Milestone
+## Suggested Verifications
 
-1. Boot a VM. Verify memory tier serves hot blocks (blocks accessed more than once get promoted to main queue).
-2. Verify SSD tier catches evicted memory-tier blocks (read a block, evict from memory, read again — should hit SSD, not S3).
-3. Verify S3-FIFO scan resistance: simulate boot pattern (sequential read of 1000 blocks, then re-read 10 "hot" blocks). Hot blocks should still be in cache despite the sequential scan.
-4. Benchmark: compare hit rates and p99 read latencies against the simple cache from Phase 3.
-5. Verify configuration: set memory_cache_gb to a small value, confirm eviction happens at the expected threshold.
+### Integration Tests — Tier Behavior
+
+- **`test_memory_tier_serves_hot_blocks`**: Insert a block into cache. Read it twice (access count > 1, promoted to main queue). Verify reads complete in <1us (memory tier, not SSD).
+- **`test_ssd_tier_catches_evictions`**: Configure memory tier to hold 10 blocks. Insert 20 blocks. Read block 0 (evicted from memory). Verify it's still available (fetched from SSD tier, not S3). Count S3 GETs: 0.
+- **`test_eviction_to_s3_on_ssd_full`**: Configure both tiers to be very small. Insert more blocks than both tiers can hold. Read an evicted block. Verify S3 GET is triggered (block fell out of both tiers).
+
+### Integration Tests — S3-FIFO Scan Resistance
+
+- **`test_boot_scan_does_not_evict_hot_blocks`**: Insert 10 "hot" blocks, read each twice (promoted to main queue). Then do a sequential scan of 1000 "boot" blocks (read each once). After the scan, read the 10 hot blocks again. All 10 should still be cache hits (not evicted by the scan). This is the core S3-FIFO property.
+- **`test_one_time_reads_wash_through`**: Read 500 blocks once each (simulating boot). Verify they enter the small queue. Read 500 different blocks once each. Verify the first 500 are evicted (one-time access, never promoted to main queue). Main queue should still have space.
+
+### Integration Tests — BlockCache Trait Compatibility
+
+- **`test_foyer_implements_block_cache_trait`**: The foyer-backed cache implements the same `BlockCache` trait as the simple cache from Phase 3. Swap in the foyer cache, run all Phase 3 read path tests. All pass without modification.
+- **`test_dirty_store_priority_over_cache`**: Write a dirty block (in dirty store). Also insert stale data for the same hash in the clean cache. Read the block. Verify data comes from dirty store (not the stale cache entry).
+
+### Configuration Tests
+
+- **`test_memory_cache_size_limit`**: Set `memory_cache_gb = 0.001` (~1MB). Insert 100 blocks (100 x 128KB = 12.8MB). Verify memory usage stays near 1MB (eviction is working). Blocks are still accessible via SSD tier fallback.
+- **`test_cache_survives_restart`**: Insert blocks into cache (SSD tier persists). Restart the daemon. Verify SSD-cached blocks are still accessible without S3 fetch.
+
+### Benchmarks
+
+- **`bench_memory_cache_read_latency`**: Populate memory cache. Read 10,000 blocks. Report p50, p99, p999 latency. Expect p99 < 500ns.
+- **`bench_ssd_cache_read_latency`**: Evict from memory, read from SSD tier. Report p50, p99. Expect p99 < 500us.
+- **`bench_cache_hit_rate_under_boot_pattern`**: Simulate VM boot (sequential read of 2000 blocks, then steady-state access of 200 hot blocks). Report hit rate after warmup. Expect > 99% for steady-state reads.
 
 ---
 

@@ -104,16 +104,42 @@ reconcile():
 
 ---
 
-## Testable Milestone
+## Suggested Verifications
 
-1. Create VM, write, flush. Verify refcounts > 0 for all packs.
-2. Delete VM. Verify refcounts decrement to 0.
-3. Advance clock past grace period (mock time in test). Verify deletion worker removes packs from S3.
-4. Verify packs still referenced by other VMs are NOT deleted.
-5. Fork VM A to VM B. Delete VM A. Verify shared packs have refcount=1 (not 0).
-6. Run reconciliation. Verify zero drift under normal operation.
-7. Inject drift: manually delete a refcount row. Run reconciliation. Verify it detects and corrects.
-8. Verify dry-run mode: deletion worker logs but doesn't delete.
+### Unit Tests — Refcount Client
+
+- **`test_refcount_increment`**: Call the API with increments for 3 pack IDs. Verify DB has refcount=1 for each.
+- **`test_refcount_decrement`**: Increment 3 packs, then decrement 1. Verify refcount=0 for the decremented pack, refcount=1 for the other two. `last_decremented` is set.
+- **`test_refcount_batch_update`**: Single API call with 100 increments and 50 decrements. Verify all applied atomically (all-or-nothing on the DB side).
+- **`test_refcount_idempotent_increment`**: Increment the same pack twice. Refcount = 2 (not an error, not 1 — legitimate for shared packs referenced by two VMs).
+
+### Integration Tests — Lifecycle Events
+
+- **`test_flush_updates_refcounts`**: Write 50 blocks, flush (creates 2 packs). Verify refcount=1 for both packs in DB.
+- **`test_overwrite_decrements_old_pack`**: Write 25 blocks, flush (pack A). Overwrite all 25 blocks with new data, flush again (pack B). Verify: pack A refcount=0, pack B refcount=1. Pack A's `last_decremented` is set.
+- **`test_fork_increments_all_packs`**: VM-A has 5 packs (from previous flushes). Fork VM-A to VM-B. Verify all 5 packs now have refcount=2.
+- **`test_delete_decrements_all_packs`**: VM-A has 5 packs. Delete VM-A. Verify all 5 packs have refcount=0.
+- **`test_fork_then_delete_source`**: VM-A -> fork to VM-B -> delete VM-A. Shared packs have refcount=1 (VM-B still references them). Packs are NOT deleted.
+- **`test_fork_then_delete_both`**: VM-A -> fork to VM-B -> delete VM-A -> delete VM-B. All shared packs have refcount=0. After grace period, deletion worker removes them.
+
+### Integration Tests — Pack Deletion Worker
+
+- **`test_deletion_worker_respects_grace_period`**: Create a pack with refcount=0 and `last_decremented = now()`. Run deletion worker. Pack is NOT deleted (within grace period). Advance mock clock past 24 hours. Run again. Pack is deleted from S3 and DB.
+- **`test_deletion_worker_skips_live_packs`**: Pack A has refcount=0 (grace period expired). Pack B has refcount=1. Run deletion worker. Pack A deleted. Pack B untouched.
+- **`test_deletion_worker_caps_per_cycle`**: Create 500 packs with refcount=0 (all past grace period). Run one deletion cycle. Verify only 100 are deleted (cap per cycle). Run 4 more cycles — all 500 deleted.
+- **`test_deletion_worker_dry_run`**: Enable dry-run mode. Run deletion worker with expired refcount=0 packs. Verify packs still exist in S3. Verify log output lists what would be deleted.
+
+### Integration Tests — Reconciliation
+
+- **`test_reconciliation_finds_no_drift`**: Normal operation — flush, fork, delete. Run reconciliation. Verify zero discrepancies.
+- **`test_reconciliation_detects_missing_refcount`**: Delete a refcount row from DB manually (simulating a failed update). Run reconciliation. Verify it detects the pack is referenced by a manifest but has no refcount. Verify it corrects the refcount.
+- **`test_reconciliation_detects_orphaned_pack`**: Insert a pack in S3 that isn't referenced by any manifest and has no DB refcount. Run reconciliation. Verify it identifies the orphan and marks it for deletion.
+- **`test_reconciliation_detects_inflated_refcount`**: Set a pack's refcount to 5 when it's only referenced by 2 manifests. Run reconciliation. Verify it corrects the refcount to 2.
+
+### Failure Handling Tests
+
+- **`test_refcount_api_retry_on_failure`**: Mock the control plane API to fail twice, then succeed. Verify the daemon retries and the refcount is eventually updated. Verify VM I/O is not blocked during retries.
+- **`test_refcount_api_total_failure`**: Mock the API to fail permanently. Verify the daemon logs an error after exhausting retries but continues operating. Packs become orphans — reconciliation would catch them later.
 
 ---
 

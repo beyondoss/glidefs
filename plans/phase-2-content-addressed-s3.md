@@ -84,13 +84,49 @@ flush(vm):
 
 ---
 
-## Testable Milestone
+## Suggested Verifications
 
-1. Write blocks (Phase 1), trigger flush. Verify packs appear in S3 with correct content (decompress + hash check).
-2. Verify manifest round-trips: serialize -> deserialize -> identical block map and pack index.
-3. Verify host-level dedup: two VMs with overlapping content, second flush skips already-uploaded blocks. Count S3 PUTs to confirm.
-4. Verify manifest is self-contained: every hash in the block map has a corresponding pack index entry. Every pack index entry references a pack that exists in S3.
-5. Integration test: write -> flush -> delete local state -> load manifest from S3 -> verify block map matches.
+### Unit Tests — Pack Format
+
+- **`test_pack_round_trip`**: Assemble a pack from 25 blocks (known data). Write to bytes. Parse back. All 25 blocks recovered with correct hashes and data.
+- **`test_pack_single_block`**: Pack with 1 block (underful pack at end of flush). Round-trips correctly.
+- **`test_pack_header_magic`**: Parse a pack. First 4 bytes are `"GLPK"`. Version is 1. Block count matches.
+- **`test_pack_block_lookup_by_hash`**: Assemble pack, look up a specific block by its BLAKE3 hash. Returns correct offset and length. Decompress and verify data.
+- **`test_pack_lz4_compression`**: Compress a block, decompress it. `blake3_128(decompressed) == blake3_128(original)`. Compressed size < original size for compressible data.
+- **`test_pack_incompressible_data`**: Pack with random (incompressible) data. Still works — LZ4 handles it (compressed may be slightly larger, that's fine).
+
+### Unit Tests — Manifest Format
+
+- **`test_manifest_round_trip`**: Create manifest with 1,000 block map entries + 40 pack index entries. Serialize to bytes. Deserialize. All entries match.
+- **`test_manifest_header_fields`**: Serialize manifest. Parse header. Magic = `"GLDE"`, version = 1, vm_id matches, sequence matches, chunk_size = 131072, device_size matches, entry counts match.
+- **`test_manifest_sparse_encoding`**: Create block map with entries at indices 0, 500, 100000. Serialize. Byte count = 64 (header) + 3*25 (block map) + pack index. NOT 100001*25.
+- **`test_manifest_empty`**: VM with zero writes. Manifest has 0 block map entries, 0 pack index entries. Serializes and deserializes correctly.
+- **`test_manifest_large`**: 800K block map entries (fully written 100GB disk). Serialize and deserialize. Verify correctness. Measure time — should be <100ms.
+
+### Unit Tests — Host Pack Index
+
+- **`test_pack_index_insert_and_lookup`**: Insert entry, look up by hash. Returns correct PackLocation.
+- **`test_pack_index_dedup_check`**: Insert hash A. Check if hash A exists — returns true. Check hash B — returns false.
+- **`test_pack_index_concurrent_access`**: Spawn 10 tasks, each inserting 1000 entries concurrently. No panics, all entries present after completion.
+- **`test_pack_index_rebuild`**: Build index from 3 manifests. Verify all hashes from all manifests are present. Verify no duplicates (same hash from different VMs stored once).
+
+### Integration Tests — Flush
+
+- **`test_flush_end_to_end`**: Write 100 blocks, trigger flush. Verify: (a) packs appear in S3, (b) each pack parses correctly, (c) each block in each pack has correct hash, (d) manifest appears in S3, (e) manifest is self-contained (every block map hash has a pack index entry, every pack index entry references an existing S3 object).
+- **`test_flush_dedup_skips_existing`**: VM-A writes 50 blocks, flushes (uploads 2 packs). VM-B writes the exact same 50 blocks, flushes. Count S3 PUTs for VM-B's flush — should be 0 pack PUTs (all deduped via host pack index). VM-B's manifest should reference VM-A's packs.
+- **`test_flush_partial_dedup`**: VM-A writes blocks [0..49], flushes. VM-B writes blocks [25..74] (50% overlap), flushes. VM-B should upload 1 pack (blocks 50-74) and skip 1 pack (blocks 25-49 already in host index).
+- **`test_flush_clears_dirty_state`**: Write 50 blocks. Verify dirty_set has 50 entries. Flush. Verify dirty_set is empty. Verify dirty_store is empty. Verify block_map entries have dirty=false.
+- **`test_flush_then_load_manifest`**: Write blocks, flush, delete all local state. Load manifest from S3. Verify block map matches pre-flush state (same hashes, same entries, dirty flags cleared).
+
+### Corruption Tests
+
+- **`test_pack_corruption_detected`**: Upload a valid pack to S3. Flip a byte in the compressed data. Read through the read path (Phase 3). Verify the hash check catches the corruption and returns an error.
+- **`test_manifest_corruption_detected`**: Corrupt a manifest in S3. Load it. Verify deserialization fails (magic mismatch, or entry count doesn't match actual data).
+
+### Property Tests
+
+- **`prop_flush_preserves_all_data`**: Generate random writes. Flush. For every block written: the hash exists in a pack in S3, and `lz4_decompress(pack_block) == original_data`.
+- **`prop_manifest_self_contained`**: After any flush, every hash in the manifest's block map has exactly one entry in the manifest's pack index, and that entry's pack_id exists in S3.
 
 ---
 
