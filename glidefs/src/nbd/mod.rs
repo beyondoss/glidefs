@@ -1,6 +1,7 @@
 pub mod api;
 pub mod block_map;
 pub mod block_store;
+pub mod cache;
 pub mod error;
 pub mod handler;
 pub mod content_store;

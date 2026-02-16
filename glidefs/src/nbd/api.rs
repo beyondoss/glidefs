@@ -32,6 +32,9 @@ pub struct PutExportRequest {
     pub readonly: bool,
     #[serde(default)]
     pub block_size: Option<usize>,
+    /// If set, fork this export from the named S3 manifest.
+    #[serde(default)]
+    pub manifest_name: Option<String>,
 }
 
 /// Response for export info.
@@ -179,7 +182,7 @@ async fn handle_request(
                         block_size: put_req.block_size,
                     };
 
-                    match router.create_export(config, put_req.readonly).await {
+                    match router.create_export(config, put_req.readonly, put_req.manifest_name.as_deref()).await {
                         Ok(()) => json_response(
                             StatusCode::CREATED,
                             &ApiResponse::success(format!("Export '{}' created", name)),
@@ -213,6 +216,17 @@ async fn handle_request(
                     StatusCode::OK,
                     &ApiResponse::success(format!("Export '{}' drained", name)),
                 ),
+                Err(RouterError::ExportNotFound(name)) => {
+                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // POST /api/exports/{name}/snapshot - Snapshot export to S3 manifest
+        (Method::POST, ["api", "exports", name, "snapshot"]) => {
+            match router.snapshot_export(name).await {
+                Ok(result) => json_response(StatusCode::OK, &result),
                 Err(RouterError::ExportNotFound(name)) => {
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
                 }

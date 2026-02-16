@@ -53,19 +53,19 @@ impl ContentStore {
         Ok(bytes.to_vec())
     }
 
-    /// Upload a manifest to S3.
+    /// Upload a manifest to S3. Returns the S3 ETag if the backend provides one.
     #[instrument(skip(self, data), fields(name = %name, size = data.len()))]
     pub async fn put_manifest(
         &self,
         name: &str,
         data: Vec<u8>,
-    ) -> Result<(), ContentStoreError> {
+    ) -> Result<Option<String>, ContentStoreError> {
         let key = format!("{}/{}", self.base_path, manifest_s3_key(name));
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
-        self.object_store.put(&path, payload).await?;
+        let result = self.object_store.put(&path, payload).await?;
         debug!("uploaded manifest");
-        Ok(())
+        Ok(result.e_tag)
     }
 
     /// Download a manifest from S3. Returns None if not found.

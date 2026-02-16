@@ -1,5 +1,6 @@
 use crate::config::Settings;
 use crate::nbd::api::ApiServer;
+use crate::nbd::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
 use crate::nbd::router::ExportRouter;
 use crate::nbd::server::NBDServer;
 use crate::parse_object_store::parse_url_opts;
@@ -74,6 +75,28 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         );
     }
 
+    // Shared clean block cache — foyer HybridCache with memory + SSD tiers
+    let memory_bytes =
+        (settings.cache.memory_size_gb.unwrap_or(1.0) * 1024.0 * 1024.0 * 1024.0) as usize;
+    let ssd_bytes =
+        (settings.cache.ssd_cache_size_gb.unwrap_or(10.0) * 1024.0 * 1024.0 * 1024.0) as usize;
+    let foyer_dir = cache_dir.join("foyer");
+    info!(
+        "Opening clean cache: {}MB memory, {}GB SSD at {}",
+        memory_bytes / (1024 * 1024),
+        ssd_bytes / (1024 * 1024 * 1024),
+        foyer_dir.display(),
+    );
+    let clean_cache: Arc<dyn BlockCache> = Arc::new(
+        FoyerBlockCache::open(FoyerCacheConfig {
+            memory_bytes,
+            ssd_bytes,
+            ssd_dir: foyer_dir,
+        })
+        .await
+        .context("Failed to open foyer clean cache")?,
+    );
+
     let router = Arc::new(ExportRouter::new(
         Arc::clone(&object_store),
         db_path,
@@ -82,6 +105,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         nbd_config.blocks_per_batch(),
         nbd_config.sync_delay_ms(),
         auto_create_size_gb,
+        clean_cache,
     ));
 
     // Discover exports from S3 (recovers exports created via API)
@@ -94,7 +118,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                     "Discovered export '{}' ({}GB) from S3",
                     config.name, config.size_gb
                 );
-                if let Err(e) = router.create_export(config.clone(), false).await {
+                if let Err(e) = router.create_export(config.clone(), false, None).await {
                     tracing::warn!("Failed to restore export '{}': {}", config.name, e);
                 } else {
                     discovered_count += 1;
@@ -123,7 +147,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             export_config.name, export_config.size_gb
         );
         router
-            .create_export(export_config.clone(), false)
+            .create_export(export_config.clone(), false, None)
             .await
             .with_context(|| format!("Failed to create export '{}'", export_config.name))?;
     }

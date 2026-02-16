@@ -33,6 +33,9 @@ pub struct CacheConfig {
     pub disk_size_gb: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_size_gb: Option<f64>,
+    /// SSD tier capacity for foyer clean cache in GB (default: 10GB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssd_cache_size_gb: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -358,6 +361,7 @@ impl Settings {
                 dir: PathBuf::from("${HOME}/.cache/glidefs"),
                 disk_size_gb: 10.0,
                 memory_size_gb: Some(1.0),
+                ssd_cache_size_gb: None,
             },
             storage: StorageConfig {
                 url: "s3://your-bucket/glidefs-data".to_string(),

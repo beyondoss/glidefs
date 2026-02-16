@@ -459,7 +459,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
                         block_size: None,
                     };
 
-                    if let Err(e) = self.router.create_export(config, false).await {
+                    if let Err(e) = self.router.create_export(config, false, None).await {
                         warn!("Failed to auto-create export '{}': {}", export_name, e);
                         self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
                             .await?;

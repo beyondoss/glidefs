@@ -5,8 +5,11 @@
 //! - `NBDDevice`: Device descriptor used during NBD transmission phase
 
 use super::block_store::S3BlockStore;
+use super::cache::BlockCache;
+use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
 use super::metrics::ExportMetrics;
+use super::pack_index::HostPackIndex;
 use super::state::Active;
 use super::write_cache::WriteCache;
 use bytes::Bytes;
@@ -33,8 +36,17 @@ pub struct NBDBlockHandler {
     /// The write-behind cache (must be in Active state)
     cache: Arc<WriteCache<Active>>,
 
-    /// S3 block store for read-through caching
+    /// S3 block store for v1 read-through caching
     s3_store: Arc<S3BlockStore>,
+
+    /// Content-addressed S3 store for v2 pack reads
+    content_store: Arc<ContentStore>,
+
+    /// v2 clean block cache (decompressed blocks from S3 packs)
+    clean_cache: Arc<dyn BlockCache>,
+
+    /// Host-level pack index for hash→pack location lookup
+    pack_index: Arc<HostPackIndex>,
 
     /// Device size in bytes (atomic for live resize)
     device_size: AtomicU64,
@@ -59,6 +71,9 @@ impl NBDBlockHandler {
     pub fn new(
         cache: Arc<WriteCache<Active>>,
         s3_store: Arc<S3BlockStore>,
+        content_store: Arc<ContentStore>,
+        clean_cache: Arc<dyn BlockCache>,
+        pack_index: Arc<HostPackIndex>,
         device_size: u64,
         readonly: bool,
         metrics: Arc<ExportMetrics>,
@@ -66,6 +81,9 @@ impl NBDBlockHandler {
         Self {
             cache,
             s3_store,
+            content_store,
+            clean_cache,
+            pack_index,
             device_size: AtomicU64::new(device_size),
             readonly: AtomicBool::new(readonly),
             metrics,
@@ -118,7 +136,14 @@ impl NBDBlockHandler {
 
         let data = self
             .cache
-            .read_with_fetch(offset, length as usize, &self.s3_store, &self.metrics)
+            .read_v2(
+                offset,
+                length as usize,
+                self.clean_cache.as_ref(),
+                &self.pack_index,
+                &self.content_store,
+                &self.metrics,
+            )
             .await?;
 
         self.metrics.record_read_latency(start.elapsed());
@@ -234,6 +259,7 @@ impl NBDBlockHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nbd::cache::SimpleBlockCache;
     use crate::nbd::write_cache::WriteCacheConfig;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
@@ -252,8 +278,14 @@ mod tests {
         };
 
         // Create in-memory S3 store for tests
-        let object_store = Arc::new(InMemory::new());
-        let s3_store = Arc::new(S3BlockStore::new(object_store, "test", 4096));
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let s3_store = Arc::new(S3BlockStore::new(Arc::clone(&object_store), "test", 4096));
+
+        // v2 read path components
+        let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
+        let clean_cache: Arc<dyn BlockCache> =
+            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index = Arc::new(HostPackIndex::new());
 
         // Create metrics for this handler
         let metrics = Arc::new(ExportMetrics::new());
@@ -265,6 +297,9 @@ mod tests {
         let handler = NBDBlockHandler::new(
             Arc::new(cache),
             s3_store,
+            content_store,
+            clean_cache,
+            pack_index,
             1024 * 1024,
             readonly,
             metrics,
