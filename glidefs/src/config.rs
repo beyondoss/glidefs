@@ -113,6 +113,11 @@ pub struct NbdConfig {
     /// exceeds this threshold, the flush scheduler is triggered.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub dirty_budget_gb: Option<f64>,
+
+    /// Background scrubber rate: blocks verified per second (default: 1000, 0 = disabled).
+    /// Periodically re-hashes cached blocks to detect silent corruption.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub scrubber_blocks_per_second: Option<u64>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -188,10 +193,17 @@ impl NbdConfig {
     }
 
     pub const DEFAULT_DIRTY_BUDGET_GB: f64 = 5.0;
+    pub const DEFAULT_SCRUBBER_BPS: u64 = 1000;
 
     /// Get the dirty budget in GB (default: 5GB).
     pub fn dirty_budget_gb(&self) -> f64 {
         self.dirty_budget_gb.unwrap_or(Self::DEFAULT_DIRTY_BUDGET_GB)
+    }
+
+    /// Get the scrubber rate in blocks per second (default: 1000, 0 = disabled).
+    pub fn scrubber_blocks_per_second(&self) -> u64 {
+        self.scrubber_blocks_per_second
+            .unwrap_or(Self::DEFAULT_SCRUBBER_BPS)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -412,6 +424,7 @@ impl Settings {
                     device_name: None,
                     device_size_gb: None,
                     dirty_budget_gb: None,
+                    scrubber_blocks_per_second: None,
                 }),
             },
             aws: Some(AwsConfig(aws_config)),

@@ -9,7 +9,7 @@ use crate::nbd::cache::BlockCache;
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::flush_scheduler::{flush_scheduler, FlushMode};
 use crate::nbd::handler::NBDBlockHandler;
-use crate::nbd::manifest::Manifest;
+use crate::nbd::manifest::{deserialize_hot_set, Manifest};
 use crate::nbd::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::nbd::pack::PackLocation;
 use crate::nbd::pack_index::HostPackIndex;
@@ -198,6 +198,16 @@ impl ExportRouter {
     /// Get the auto-create size (if enabled).
     pub fn auto_create_size_gb(&self) -> Option<f64> {
         self.auto_create_size_gb
+    }
+
+    /// Get a reference to the shared pack index (for scrubber).
+    pub fn pack_index(&self) -> &Arc<HostPackIndex> {
+        &self.pack_index
+    }
+
+    /// Get a reference to the shared clean cache (for scrubber).
+    pub fn clean_cache(&self) -> &Arc<dyn BlockCache> {
+        &self.clean_cache
     }
 
     // =========================================================================
@@ -429,10 +439,35 @@ impl ExportRouter {
             Arc::new(cache)
         };
 
-        // Create handler with S3 store for read-through caching
+        // Boot hot set prefetch: warm the clean cache before the VM reads
+        if let Some(manifest_name) = manifest_name {
+            // Extract base name from manifest_name (e.g., "bases/ubuntu-22.04" → "ubuntu-22.04")
+            let hot_set_name = manifest_name.strip_prefix("bases/").unwrap_or(manifest_name);
+            match content_store.get_hot_set(hot_set_name).await {
+                Ok(Some(hot_set_data)) => {
+                    match deserialize_hot_set(&hot_set_data) {
+                        Ok(chunks) => {
+                            info!(chunks = chunks.len(), "prefetching boot hot set");
+                            let cache_clone = Arc::clone(&cache);
+                            let cc = Arc::clone(&clean_cache);
+                            let pi = Arc::clone(&pack_index);
+                            let cs = Arc::clone(&content_store);
+                            spawn_named("hot-set-prefetch", async move {
+                                cache_clone.prefetch_chunks(&chunks, cc.as_ref(), &pi, &cs).await;
+                                info!("boot hot set prefetch complete");
+                            });
+                        }
+                        Err(e) => warn!("failed to deserialize hot set: {}", e),
+                    }
+                }
+                Ok(None) => debug!("no hot set found for '{}'", hot_set_name),
+                Err(e) => warn!("failed to fetch hot set: {}", e),
+            }
+        }
+
+        // Create handler for block I/O
         let handler = Arc::new(NBDBlockHandler::new(
             Arc::clone(&cache),
-            Arc::clone(&s3_store),
             Arc::clone(&content_store),
             Arc::clone(&clean_cache),
             Arc::clone(&pack_index),

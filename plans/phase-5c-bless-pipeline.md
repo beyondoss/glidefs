@@ -2,6 +2,8 @@
 
 **Goal:** `glidefs bless` produces content-addressed base images in the new pack format. Base images are the starting point for all VMs.
 
+**Why this is the primary dedup lever:** Empirical measurement shows that post-fork block dedup is ~6% at 128KB (see [BLOCK_SIZE_ANALYSIS.md](../BLOCK_SIZE_ANALYSIS.md)). Content in the blessed base is 100% deduplicated by construction. **Everything that isn't in the base image is stored once per VM.** The bless pipeline should include the OS, language runtime, and system tools. Application-level packages (npm, pip) can't be pre-installed — tenants pin specific versions via lockfiles.
+
 **Depends on:** Phase 2 (pack format + manifest format).
 **Can run in parallel with:** everything else after Phase 2.
 **Critical path:** No.
@@ -83,7 +85,8 @@ All entries point to blocks already in the global store. As the VM writes, indiv
 
 ## Key Decisions
 
-- **HEAD-before-PUT, not content-hash pack IDs.** Pack IDs are UUIDs, not content hashes. So dedup at the pack level uses HEAD to check existence. This is a one-time cost during bless (offline pipeline, not latency-sensitive). An alternative would be deterministic pack IDs from content, but that adds complexity for a pipeline that runs infrequently.
+- **HEAD-before-PUT, not content-hash pack IDs.** Pack IDs are UUIDs (v4), not content hashes. So dedup at the pack level uses HEAD to check existence. This is a one-time cost during bless (offline pipeline, not latency-sensitive). An alternative would be deterministic pack IDs from content, but that adds complexity for a pipeline that runs infrequently.
+- **Bless OS + runtime, not packages.** Language-specific bases include the runtime and system tools (e.g., `ubuntu-22.04-node20.raw`). Application packages (npm, pip) can't be pre-installed — tenants pin specific versions via lockfiles. Every byte in the blessed base deduplicates perfectly across all forked VMs. Post-fork writes (including `npm install`) don't dedup at the block level.
 - **Flat disk images, not layered.** No Docker-style layers. A base image is just a raw disk. Content-addressing handles the dedup that layers would provide, without the complexity of layer management.
 - **Base manifests in a separate namespace.** `manifests/bases/{name}` vs `manifests/{tenant}/{vm-id}`. Keeps base images discoverable and separate from per-tenant state.
 

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod bless;
 pub mod server;
 
 #[derive(Parser)]
@@ -22,6 +23,21 @@ pub enum Commands {
     Run {
         #[arg(short, long)]
         config: PathBuf,
+    },
+    /// Bless a raw disk image into a content-addressed base image
+    Bless {
+        /// Path to raw disk image file
+        #[arg(long)]
+        image: PathBuf,
+        /// Base image name (e.g., "ubuntu-22.04-node20-v3")
+        #[arg(long)]
+        name: String,
+        /// Config file (for storage URL + credentials)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Chunk size in bytes
+        #[arg(long, default_value = "131072")]
+        chunk_size: u32,
     },
 }
 

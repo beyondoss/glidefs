@@ -45,6 +45,12 @@ impl HostPackIndex {
         self.index.is_empty()
     }
 
+    /// Return all hashes in the index. Used by the background scrubber
+    /// to iterate over known blocks for integrity verification.
+    pub fn all_hashes(&self) -> Vec<Blake3Hash> {
+        self.index.iter().map(|r| *r.key()).collect()
+    }
+
     /// Rebuild the index from a set of manifests.
     /// Clears existing entries and inserts all pack index entries from the manifests.
     /// Called on VM arrive/depart to keep the index current.

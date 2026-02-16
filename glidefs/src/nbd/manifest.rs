@@ -194,6 +194,59 @@ pub fn manifest_s3_key(name: &str) -> String {
     format!("manifests/{name}")
 }
 
+// ============================================================================
+// Boot Hot Set — list of chunk indices needed during boot
+// ============================================================================
+
+const HOT_SET_MAGIC: &[u8; 4] = b"GLHS";
+
+/// Serialize a list of chunk indices into a hot set binary format.
+/// Format: magic (4 bytes) + count (4 bytes LE) + chunk_indices (8 bytes LE each)
+pub fn serialize_hot_set(chunks: &[u64]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8 + chunks.len() * 8);
+    data.extend_from_slice(HOT_SET_MAGIC);
+    data.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    for &chunk in chunks {
+        data.extend_from_slice(&chunk.to_le_bytes());
+    }
+    data
+}
+
+/// Deserialize a hot set from binary format.
+pub fn deserialize_hot_set(data: &[u8]) -> anyhow::Result<Vec<u64>> {
+    if data.len() < 8 {
+        anyhow::bail!("hot set too small");
+    }
+    if &data[..4] != HOT_SET_MAGIC {
+        anyhow::bail!("invalid hot set magic");
+    }
+    let count = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+    let expected_len = 8 + count * 8;
+    if data.len() < expected_len {
+        anyhow::bail!(
+            "hot set truncated: expected {} bytes, got {}",
+            expected_len,
+            data.len()
+        );
+    }
+    let mut chunks = Vec::with_capacity(count);
+    for i in 0..count {
+        let offset = 8 + i * 8;
+        let chunk = u64::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]);
+        chunks.push(chunk);
+    }
+    Ok(chunks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

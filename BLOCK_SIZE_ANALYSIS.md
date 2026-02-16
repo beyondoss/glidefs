@@ -139,7 +139,7 @@ At any block size above 4KB, cross-VM dedup is binary:
 
 This means the bless pipeline isn't just important — it's the only mechanism that produces meaningful dedup. **Every byte of dedup savings comes from what's in the blessed image.** Anything a tenant writes after fork (packages, dependencies, app code) is stored once per VM.
 
-**Action:** The bless pipeline should include as much as possible. Don't just bless "Ubuntu 22.04" — bless "Ubuntu 22.04 + Node 20 + the top 50 npm packages pre-installed." The more you put in the base, the less tenants write after fork, the more dedup you get.
+**Action:** The bless pipeline should include the OS and language runtime. Don't just bless "Ubuntu 22.04" — bless "Ubuntu 22.04 + Node 20 + system tools (git, curl, build-essential)." Application-level packages (npm, pip) can't be pre-installed because tenants pin specific versions via lockfiles. The blessed base ceiling is ~500-700MB per language runtime.
 
 ### 3. The dedup cliff is at the ext4 page size
 
@@ -184,21 +184,208 @@ If post-fork dedup turns out to matter (tenants write a lot after fork, bless co
 
 1. **File-level storage (virtio-fs / FUSE):** Bypass the block device layer entirely. Dedup at the file level where metadata can't poison content hashes. Fundamental architecture change — no more NBD.
 
-2. **Aggressive bless coverage:** Pre-install common packages in blessed bases. Language-specific bases (Node, Python, Go) with popular packages pre-installed. This doesn't fix dedup — it avoids the problem by reducing post-fork writes.
+2. **Maximize bless coverage:** Include OS, language runtime, and system tools in blessed bases. Application-level packages can't be pre-installed (version pinning), so the bless ceiling is ~500-700MB per runtime. This doesn't fix dedup — it avoids the problem for the blessable portion, but everything tenants install after fork (all of `node_modules`) remains in the gap.
 
 3. **4KB blocks with different memory model:** Use 4KB for addressing but don't keep the full block map resident. Page-fault style loading of block map regions. Complex, essentially building a page table for the page table.
 
 None of these are simple. Option 2 (aggressive bless) is the pragmatic choice.
 
+## Full Metadata Budget: 128KB vs 4KB
+
+Previous analysis only counted block map memory. This section accounts for *every* metadata structure that scales with block count: runtime block maps, host pack index, manifest wire format, and cache indexes.
+
+### Reference Host
+
+- 256GB RAM, 2TB NVMe SSD
+- 600 VMs, 10GB virtual disk each
+- 10 production VMs (continuous flush), 590 forks (previews/dev)
+- 32GB memory cache, 500GB SSD cache (foyer)
+- Post-fork divergence: 5% baseline (500MB new writes per fork, typical npm install + build)
+
+### Entry Sizes (from code, not design doc)
+
+**Runtime block map (dense arrays, allocated for ALL chunks in virtual disk):**
+
+| Field | Size | Source |
+|-------|------|--------|
+| AtomicBlockMap per chunk | 24 bytes | `hash_lo: AtomicU64` + `hash_hi: AtomicU64` + `sequences: AtomicU64` |
+| `block_states` per chunk | 1 byte | `AtomicU8` (Clean/Dirty/Syncing) |
+| `present_chunks` bitmap | 1 bit | `AtomicU64` packed, 1 per 64 blocks |
+| **Total per chunk** | **~25 bytes** | `block_map.rs:162-169`, `write_cache.rs:335` |
+
+**Manifest (serialized to S3, sparse — only non-zero entries):**
+
+| Field | Size | Source |
+|-------|------|--------|
+| `ManifestBlockEntry` | 25 bytes | `chunk_index: u64` + `hash: [u8; 16]` + `flags: u8` |
+| `ManifestPackEntry` | 40 bytes | `hash: [u8; 16]` + `pack_id: Uuid` (16B) + `offset: u32` + `comp_length: u32` |
+| **Total per non-zero block** | **65 bytes** | `manifest.rs:23-24` |
+
+**Host pack index (`DashMap<Blake3Hash, PackLocation>`, shared across all VMs):**
+
+| Field | Size | Source |
+|-------|------|--------|
+| Key: `Blake3Hash` | 16 bytes | |
+| Value: `PackLocation` | 24 bytes | `pack_id: Uuid` (16B) + `offset: u32` + `comp_length: u32` |
+| DashMap overhead per entry | ~16 bytes | hashbrown control bytes, bucket metadata |
+| **Total per unique block** | **~56 bytes** | `pack_index.rs:13-14` |
+
+### Per-VM Runtime Memory (Current Implementation — Dense Arrays)
+
+The runtime uses dense `AtomicBlockMap` — every chunk slot in the virtual disk is allocated, regardless of whether it's been written. This is the **actual code**, not the fork overlay design.
+
+10GB virtual disk = 10GB / chunk_size chunks.
+
+| Component | 128KB (81,920 chunks) | 4KB (2,621,440 chunks) |
+|-----------|----------------------|------------------------|
+| AtomicBlockMap (24 B/chunk) | 1.97MB | 62.9MB |
+| block_states (1 B/chunk) | 80KB | 2.5MB |
+| present_chunks (1 bit/chunk) | 10KB | 320KB |
+| **Per VM** | **2.06MB** | **65.7MB** |
+| **600 VMs** | **1.24GB** | **39.4GB (15.4% of host)** |
+
+**At 4KB without fork overlays, block maps alone consume 39.4GB.** Fork overlays (GLIDEv2.md §Block Map Design) are designed but not implemented in the codebase. They are a prerequisite for 4KB viability.
+
+### With Fork Overlays (Designed, Not Yet Implemented)
+
+Fork overlay: `Arc<AtomicBlockMap>` (shared parent, dense) + `HashMap<u64, OverlayEntry>` (per-fork, sparse).
+
+10 parents hold dense block maps. 590 forks hold only diverged entries.
+
+**Parents (10 VMs, dense):**
+
+| | 128KB | 4KB |
+|---|---|---|
+| Per parent | 2.06MB | 65.7MB |
+| **10 parents** | **20.6MB** | **657MB** |
+
+**Forks (590 VMs, HashMap with ~38 bytes per entry):**
+
+| Divergence | 128KB entries/fork | 128KB 590 forks | 4KB entries/fork | 4KB 590 forks |
+|------------|-------------------|-----------------|-----------------|---------------|
+| 1% (100MB) | 819 | 18MB | 26,214 | 585MB |
+| 5% (500MB) | 4,096 | 90MB | 131,072 | 2.93GB |
+| 10% (1GB) | 8,192 | 180MB | 262,144 | 5.86GB |
+| 20% (2GB) | 16,384 | 360MB | 524,288 | 11.7GB |
+
+**Total block map memory with overlays:**
+
+| Divergence | 128KB | 4KB | Ratio |
+|------------|-------|-----|-------|
+| 1% | 39MB | 1.24GB | 32x |
+| **5%** | **111MB** | **3.59GB** | **32x** |
+| 10% | 201MB | 6.52GB | 32x |
+| 20% | 381MB | 12.4GB | 33x |
+
+The ratio is ~32x at every divergence level. Fork overlays don't change the relative cost — they reduce the absolute cost at both sizes equally.
+
+### Host Pack Index
+
+One `DashMap` for all blocks uploaded to S3. Deduplicated — same hash appears once.
+
+Estimate: 60 VMs flushed to S3 (10 production + 50 that forked/slept). With host-level dedup, base blocks stored once.
+
+| | 128KB | 4KB |
+|---|---|---|
+| Unique base blocks | ~80K | ~2.56M |
+| Unique post-fork blocks (60 VMs, ~50% cross-VM overlap) | ~220K | ~4.5M |
+| **Total unique entries** | **~300K** | **~7M** |
+| **Memory (56 B/entry)** | **17MB** | **392MB** |
+
+### Manifest Size
+
+Manifest is sparse (only non-zero entries). 65 bytes per block (25B block entry + 40B pack entry with UUID pack ID).
+
+For a 10GB VM with 10GB of written data (all blocks non-zero):
+
+| | 128KB (80K entries) | 4KB (2.56M entries) |
+|---|---|---|
+| Block map section | 2.0MB | 64.0MB |
+| Pack index section | 3.2MB | 102.4MB |
+| **Total manifest** | **5.2MB** | **166.4MB** |
+| Time to upload (10Gbps) | ~4ms | ~133ms |
+
+Continuous flush (manifest upload every ~60s per production VM):
+- At 128KB: 5.2MB/min — negligible
+- At 4KB: 166.4MB/min — 2.8MB/s sustained per production VM
+
+Fork operation (S3 CopyObject of manifest):
+- At 128KB: 5.2MB copy — instant
+- At 4KB: 166.4MB copy — noticeable but bounded
+
+### Cache Index Overhead (Estimated — Needs Measurement)
+
+foyer maintains an in-memory index for cached entries in both memory and SSD tiers. Per-entry overhead depends on foyer internals. Estimates below use ~150B (memory tier, S3-FIFO queues) and ~50B (SSD tier, location tracking).
+
+| Tier | Cache Size | 128KB | 4KB |
+|------|-----------|-------|-----|
+| Memory (150 B/entry est.) | 32GB | 38MB (256K entries) | 1.2GB (8M entries) |
+| SSD (50 B/entry est.) | 500GB | 200MB (4M entries) | 6.4GB (128M entries) |
+| **Cache index total** | | **238MB** | **7.6GB** |
+
+The SSD cache index is the single largest metadata cost at 4KB. This estimate needs empirical validation with foyer.
+
+### Dirty Block Scanning
+
+Current code scans *all* `block_states` to find dirty blocks — `O(num_chunks)` per flush:
+- At 128KB: 82K entries — fast
+- At 4KB: 2.6M entries — 32x slower
+
+The dirty set (`HashSet<u64>` of dirty offsets, making flush `O(dirty_count)`) is designed in GLIDEv2.md but not yet implemented. It becomes essential at 4KB.
+
+### Total Metadata Budget
+
+All structures combined, at 5% fork divergence:
+
+| Structure | 128KB | 4KB | Source |
+|-----------|-------|-----|--------|
+| Block maps (fork overlays) | 111MB | 3.59GB | Dense parents + sparse fork HashMaps |
+| Host pack index | 17MB | 392MB | Shared DashMap, deduplicated, 56 B/entry |
+| SSD cache index | 200MB | 6.4GB | **Estimated**, needs measurement |
+| Memory cache index | 38MB | 1.2GB | **Estimated**, needs measurement |
+| **Total metadata** | **366MB** | **11.6GB** | |
+| **% of 256GB host** | **0.14%** | **4.5%** | |
+
+At 10% divergence:
+
+| Structure | 128KB | 4KB |
+|-----------|-------|-----|
+| Block maps | 201MB | 6.52GB |
+| Host pack index | 17MB | 392MB |
+| SSD cache index | 200MB | 6.4GB |
+| Memory cache index | 38MB | 1.2GB |
+| **Total** | **456MB** | **14.5GB** |
+| **% of 256GB host** | **0.18%** | **5.7%** |
+
+### Corrections to Prior Analysis
+
+Previous sessions cited "1.3GB for 600 VMs at 4KB with fork overlays" and "only 50% more than 128KB's 880MB." This was wrong:
+
+1. **Block maps only.** Excluded host pack index (~336MB), SSD cache index (~6.4GB), memory cache index (~1.2GB).
+2. **Assumed 1% divergence.** Based on npm-install-express on 512MB test images. Real Boxes workloads (full npm install + build) are 5-10% divergence.
+3. **Used design doc entry sizes, not code.** Doc: 17 bytes/entry (hash + flags). Runtime: 25 bytes/chunk (AtomicBlockMap + block_states).
+4. **Pack ID is UUID (16B).** ManifestPackEntry: 40 bytes. Host pack index entries: ~56 bytes. Snowflake IDs (8B) were considered but rejected — no coordinator exists for worker ID assignment, and the savings (~640KB per manifest) don't justify the complexity.
+
+### Prerequisites for 4KB Viability
+
+If 4KB were pursued, these would need to be implemented first:
+1. **Fork overlays** — without them, dense block maps consume 39.4GB for 600 VMs
+2. **Dirty set** — without it, flush scans 2.6M entries per VM per cycle
+3. **Evaluation of foyer overhead** — the SSD cache index (6.4GB estimated) is the largest unknown
+
 ## Open questions
 
-1. **How much do tenants write after fork in practice?** If it's 5% of disk, the block size barely matters. If it's 30%, the lack of post-fork dedup is significant. Need production data.
+1. **How much do tenants write after fork in practice?** If it's 5% of disk, the block size barely matters. If it's 30%, the lack of post-fork dedup is significant. Need production data. This directly determines block map memory at 4KB (3.6GB at 5% divergence vs 12.4GB at 20%).
 
 2. **Would a sub-block dirty tracking scheme help?** Track dirty regions at 4KB granularity within 128KB blocks. Hash and store at 128KB for metadata efficiency, but only re-hash the 128KB block when one of its 4KB pages changes. This doesn't help dedup, but could reduce write amplification.
 
-3. **How compressible are block maps with better algorithms?** LZ4 gets 1.2x on hash data. zstd might get 1.3-1.5x. But even 2x compression doesn't make 4KB viable (21MB per 10GB VM). The hashes are fundamentally incompressible.
+3. ~~**How compressible are block maps with better algorithms?**~~ **Answered.** Measured LZ4 at 1.2x. The hashes are pseudorandom — no compressor can help. See §Block map compression.
 
 4. **Would a different guest filesystem change the picture?** The 4KB cliff is specific to ext4's page size. A filesystem that separates metadata from data (like a log-structured FS) might improve dedup at larger block sizes. But changing the guest filesystem may not be acceptable.
+
+5. **What is foyer's actual per-entry memory overhead?** The SSD cache index is estimated at ~6.4GB for 4KB blocks with 500GB cache. This is the single largest metadata unknown and the largest contributor to 4KB's memory cost. Needs empirical measurement.
+
+6. ~~**GLIDEv2.md manifest size numbers are wrong.**~~ **Fixed.** GLIDEv2.md manifest sizes and pack index memory numbers updated to match code (UUID pack IDs, 40B pack entries).
 
 ## Reproducing
 

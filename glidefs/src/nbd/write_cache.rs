@@ -1347,6 +1347,53 @@ impl WriteCache<Active> {
         Ok(Bytes::from(result))
     }
 
+    /// Prefetch a single chunk into the clean cache.
+    ///
+    /// Triggers pack-level sibling prefetch: fetching one block from a pack
+    /// automatically caches all blocks in that pack via `resolve_chunk`.
+    pub async fn prefetch_chunk(
+        &self,
+        chunk_index: usize,
+        clean_cache: &dyn BlockCache,
+        pack_index: &HostPackIndex,
+        content_store: &ContentStore,
+    ) -> Result<(), CacheError> {
+        let (hash, _seq) = self.inner.block_map_get(chunk_index);
+        if hash.is_zero() || hash == *ZERO_BLOCK_HASH {
+            return Ok(());
+        }
+        if clean_cache.get(&hash).await.is_some() {
+            return Ok(());
+        }
+        let _ = self
+            .resolve_chunk(chunk_index, clean_cache, pack_index, content_store)
+            .await;
+        Ok(())
+    }
+
+    /// Prefetch multiple chunks with bounded concurrency.
+    ///
+    /// Used for boot hot set prefetch: given a list of chunk indices, resolves
+    /// each one (triggering pack-level sibling prefetch). Pack-level dedup means
+    /// the second chunk from the same pack hits the clean cache immediately.
+    pub async fn prefetch_chunks(
+        &self,
+        chunk_indices: &[u64],
+        clean_cache: &dyn BlockCache,
+        pack_index: &HostPackIndex,
+        content_store: &ContentStore,
+    ) {
+        use futures::stream::{self, StreamExt};
+
+        stream::iter(chunk_indices.iter().copied())
+            .for_each_concurrent(8, |chunk_idx| async move {
+                let _ = self
+                    .prefetch_chunk(chunk_idx as usize, clean_cache, pack_index, content_store)
+                    .await;
+            })
+            .await;
+    }
+
     /// Resolve a single chunk through the v2 tier hierarchy.
     ///
     /// 1. block_map lookup → if zero hash, return zeros

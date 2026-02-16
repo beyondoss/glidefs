@@ -10,7 +10,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -25,6 +25,8 @@ use super::block_map::Blake3Hash;
 pub trait BlockCache: Send + Sync {
     async fn get(&self, hash: &Blake3Hash) -> Option<Bytes>;
     fn insert(&self, hash: Blake3Hash, data: Bytes);
+    /// Remove a block from the cache. Returns true if it was present.
+    fn remove(&self, hash: &Blake3Hash) -> bool;
 }
 
 // ============================================================================
@@ -91,6 +93,12 @@ impl BlockCache for FoyerBlockCache {
     fn insert(&self, hash: Blake3Hash, data: Bytes) {
         self.inner.insert(hash, data);
     }
+
+    fn remove(&self, hash: &Blake3Hash) -> bool {
+        self.inner.remove(hash);
+        // foyer's remove is fire-and-forget; assume it was present
+        true
+    }
 }
 
 // ============================================================================
@@ -109,7 +117,7 @@ pub struct SimpleBlockCache {
 struct SimpleCacheInner {
     map: HashMap<Blake3Hash, Bytes>,
     /// Insertion-order keys for FIFO eviction.
-    order: Vec<Blake3Hash>,
+    order: VecDeque<Blake3Hash>,
     current_bytes: usize,
 }
 
@@ -118,7 +126,7 @@ impl SimpleBlockCache {
         Self {
             inner: Mutex::new(SimpleCacheInner {
                 map: HashMap::new(),
-                order: Vec::new(),
+                order: VecDeque::new(),
                 current_bytes: 0,
             }),
             max_bytes,
@@ -143,16 +151,29 @@ impl BlockCache for SimpleBlockCache {
         }
 
         // Evict oldest entries until we have room.
-        while inner.current_bytes + data_len > self.max_bytes && !inner.order.is_empty() {
-            let oldest = inner.order.remove(0);
+        while inner.current_bytes + data_len > self.max_bytes {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
             if let Some(evicted) = inner.map.remove(&oldest) {
                 inner.current_bytes -= evicted.len();
             }
         }
 
         inner.current_bytes += data_len;
-        inner.order.push(hash);
+        inner.order.push_back(hash);
         inner.map.insert(hash, data);
+    }
+
+    fn remove(&self, hash: &Blake3Hash) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(evicted) = inner.map.remove(hash) {
+            inner.current_bytes -= evicted.len();
+            inner.order.retain(|h| h != hash);
+            true
+        } else {
+            false
+        }
     }
 }
 

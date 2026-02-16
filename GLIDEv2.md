@@ -26,7 +26,7 @@ A storage layer for Boxes — Paraglide's microVMs. Provides fast boot, near-ins
 
 **Cheap cross-host forks.** Forking a 100G VM is a metadata copy — duplicate the block map in S3, done. Zero data copied. The forked VM shares 100% of its blocks with the parent until it writes. Storage cost is proportional to unique writes, not total disk size. This works across hosts — the fork can materialize anywhere. This unlocks preview environments, branch deploys, and dev/prod parity at near-zero cost.
 
-**Storage efficiency.** Content-addressing deduplicates automatically across all tenants. A thousand tenants running Next.js apps share one copy of the base OS, Node runtime, and common npm packages — ~2.7GB stored once instead of ~3TB of per-tenant copies (15x reduction). LZ4 compression before upload further reduces S3 storage by ~1.5-2x for typical OS/application data. The marginal S3 cost of tenant N+1 converges to the cost of storing their unique source code (~50-200MB).
+**Storage efficiency.** Content-addressing deduplicates automatically across all tenants. A thousand tenants running Next.js apps share one copy of the base OS and Node runtime from the blessed base image — ~500-700MB stored once instead of per-tenant copies. LZ4 compression before upload further reduces S3 storage by ~1.5-2x for typical OS/application data. Note: deduplication at the block level only works for content in the blessed base image. Packages installed after fork (e.g., `npm install`) do not deduplicate across VMs at 128KB block size due to ext4 metadata interleaving (see [BLOCK_SIZE_ANALYSIS.md](BLOCK_SIZE_ANALYSIS.md)). Application packages can't be pre-installed in blessed bases — tenants pin specific versions via lockfiles. The marginal S3 cost of tenant N+1 is the cost of their unique post-fork writes (~200MB-1GB depending on dependencies).
 
 **Operational simplicity.** No ZFS to tune (ARC, zpool, scrub schedules). No distributed filesystem to operate (quorum, rebalancing, split-brain). No QoS code in the daemon (cgroup v2 handles it). No application-layer encryption (SSE-KMS handles it). One global block namespace, one GC. Each component does one thing.
 
@@ -442,23 +442,27 @@ Block Map for VM-A (100GB disk, 128KB chunks):
   Index 819199 → blake3:11223344...    (bytes 99.99GB - 100GB)
 ```
 
-**Per-entry size:** 17 bytes (16-byte BLAKE3-128 hash + 1-byte flags). No offset needed — the array index *is* the offset (index × chunk_size = byte offset). The flags byte encodes:
+**Serialized entry size:** 17 bytes (16-byte BLAKE3-128 hash + 1-byte flags). No offset needed — the array index *is* the offset (index × chunk_size = byte offset). The flags byte encodes:
 - **Dirty** (1 bit): whether the block has been flushed to S3. Set on write, cleared on S3 flush. A separate dirty set (`HashSet<u64>` of offsets) tracks which entries are dirty so the flush path iterates O(dirty count), not O(block map size). The WAL is not involved in S3 flush.
 
 No source tag needed — all blocks live in one global namespace (`packs/{prefix}/{pack-id}`, prefix-sharded). The block map contains only the content hash and the dirty flag.
 
+**Runtime entry size:** 25 bytes per chunk. The lock-free `AtomicBlockMap` uses parallel atomic arrays: `hash_lo: AtomicU64` (8B) + `hash_hi: AtomicU64` (8B) + `sequences: AtomicU64` (8B) = 24 bytes, plus `block_states: AtomicU8` (1B) per chunk. Dense arrays — all chunk slots are allocated regardless of whether they've been written.
+
 **Why BLAKE3-128 over SHA256:** Content-addressing needs collision resistance, not cryptographic security against adversaries. 128 bits gives a birthday bound of ~2^64 blocks — at 128KB per block, that's 2 exabytes of unique data per tenant. BLAKE3 is ~3-4x faster than SHA256, reducing hashing cost on the write path (~5μs for 128KB vs ~20μs). Shorter hashes mean smaller block maps, smaller manifests, shorter S3 keys.
 
-**Memory analysis:**
+**Memory analysis (runtime, 25 bytes/chunk):**
 
-| VMs per host | Block map memory (100GB disks) | Block map memory (10GB actual) |
+| VMs per host | Block map memory (100GB disks) | Block map memory (10GB disks) |
 |-------------|-------------------------------|-------------------------------|
-| 10 | 133MB | 13MB |
-| 50 | 664MB | 66MB |
-| 100 | 1.33GB | 133MB |
-| 500 | 6.64GB | 664MB |
+| 10 | 195MB | 19.5MB |
+| 50 | 977MB | 98MB |
+| 100 | 1.95GB | 195MB |
+| 500 | 9.77GB | 977MB |
 
-**Sparse representation:** Most VMs don't touch all 100GB. Unwritten regions point to a well-known "zero block" hash. A sparse map only stores non-zero entries. A VM with 10GB of written data on a 100GB disk stores ~80K entries (~1.3MB), not 800K (~13MB).
+Note: These are dense (all slots allocated). Fork overlays reduce forked VM cost — see below.
+
+**Sparse representation (serialized, not runtime):** The S3 manifest uses sparse encoding — only non-zero entries. A VM with 10GB of written data on a 100GB disk serializes ~80K entries (~1.3MB block map), not 800K (~13MB). The runtime `AtomicBlockMap` is always dense for lock-free O(1) access.
 
 ### Fork Overlay
 
@@ -493,7 +497,7 @@ The manifest (block map + pack index) is synced to S3 only when data needs to be
 - On demand-driven flush (fork, portable sleep, promote, migrate)
 - On continuous-flush schedule (~60 seconds) for production VMs
 
-Manifest size for a 100GB fully-written disk: ~32MB uncompressed (~13MB block map + ~19MB pack index), ~10-15MB compressed. For a typical 10GB VM: ~3.2MB uncompressed, ~1MB compressed.
+Manifest size for a 100GB fully-written disk: ~52MB uncompressed (~20MB sparse block map at 25B/entry + ~32MB pack index at 40B/entry). For a typical 10GB VM: ~5.2MB uncompressed (~2MB block map + ~3.2MB pack index). BLAKE3 hashes are pseudorandom and incompressible — LZ4 achieves only ~1.2x on hash data (see [BLOCK_SIZE_ANALYSIS.md](BLOCK_SIZE_ANALYSIS.md)).
 
 ---
 
@@ -673,19 +677,21 @@ VM-A flushes:  hash:abc → pack-42 (uploaded)     host_index[hash:abc] = pack-4
 VM-B flushes:  hash:abc → host_index hit → skip   manifest references pack-42
 ```
 
-**Why this matters:** On a host with 10 tenants running similar stacks, each VM's post-fork `npm install` writes ~4000 blocks of overlapping packages. Without host-level dedup, that's 10 × 160 = 1,600 pack PUTs. With it, VM-1 uploads 160 packs, subsequent VMs skip ~80-90% of their blocks. Total: ~240 packs. 7x fewer uploads, 7x less network I/O competing for the uplink.
+**Why this matters:** On a host with 10 tenants forked from the same blessed base, base image blocks are identical (same content → same hash). Without host-level dedup, every VM re-uploads the base blocks — 10 × 160 = 1,600 pack PUTs. With the shared host index, VM-1 uploads, subsequent VMs skip base blocks entirely. Note: post-fork writes (e.g., `npm install` after fork) deduplicate poorly at the block level (~6% match at 128KB due to ext4 metadata interleaving — see [BLOCK_SIZE_ANALYSIS.md](BLOCK_SIZE_ANALYSIS.md)). The host index primarily saves uploads of blessed base content, not post-fork content.
 
 **Staleness:** When a VM leaves the host (delete, migrate, sleep), its entries remain in the index but may become stale if GC eventually deletes the referenced packs. Rebuild the host index from active VMs' pack indices on each VM arrival/departure. Rebuild cost: 50 VMs × 80K entries ≈ 4M lookups, ~100ms. Stale entries live at most minutes — well within the 24-hour GC grace period.
 
 **Manifest serialization:** Each VM's manifest includes a complete pack index for portability (self-contained, resolves on any host). Derived from the host index at serialization time — filter to hashes in this VM's block map.
 
-**Memory cost:** ~24 bytes per unique block (16-byte hash key + 4-byte pack-id + 4-byte offset/length). Shared across VMs, so deduplicated content (base image, common packages) is stored once in the index.
+**Memory cost:** ~62 bytes per unique block (16-byte hash key + 24-byte `PackLocation` (pack_id: UUID 16B + offset: 4B + comp_length: 4B) + ~22 bytes DashMap overhead). Shared across VMs, so deduplicated content (base image blocks) is stored once in the index.
 
-| Scenario | Pack index memory | Block map memory | Total |
-|----------|------------------|-----------------|-------|
-| 10GB actual data (80K blocks) | ~1.9MB | ~1.3MB | ~3.2MB |
-| 100GB fully written (800K blocks) | ~19MB | ~13MB | ~32MB |
-| 50 VMs × 10GB each (shared host index) | ~95MB (deduplicated) | ~66MB | ~161MB |
+| Scenario | Pack index memory | Block map memory (runtime, 25B/chunk) | Total |
+|----------|------------------|--------------------------------------|-------|
+| 10GB disk (80K blocks) | ~5.0MB | ~2.0MB | ~7.0MB |
+| 100GB disk fully written (800K blocks) | ~50MB | ~19.5MB | ~69.5MB |
+| 50 VMs × 10GB each (shared host index) | ~220MB (deduplicated) | ~98MB | ~318MB |
+
+**Pack ID format:** UUID v4, generated at pack creation. No coordinator required — globally unique by randomness.
 
 ### Read Path with Packs
 
@@ -1137,7 +1143,7 @@ The manifest is the portability unit. It contains a complete block map and pack 
 │ Pack Index (pack_index_count × 40 bytes)         │
 │   Per entry:                                     │
 │     hash         [u8; 16]   (BLAKE3-128)         │
-│     pack_id      [u8; 16]   (UUID)               │
+│     pack_id      [u8; 16]   (UUID v4)            │
 │     offset       u32        (byte offset in pack)│
 │     comp_length  u32        (compressed bytes)   │
 └──────────────────────────────────────────────────┘
@@ -1151,8 +1157,8 @@ The manifest is the portability unit. It contains a complete block map and pack 
 
 | VM state | Block map | Pack index | Total |
 |----------|-----------|-----------|-------|
-| 10GB written (typical) | 80K × 25 = 2.0MB | ~3.2K × 40 = 128KB | ~2.1MB |
-| 100GB fully written | 800K × 25 = 20MB | ~32K × 40 = 1.3MB | ~21MB |
+| 10GB written (typical) | 80K × 25 = 2.0MB | 80K × 40 = 3.2MB | ~5.2MB |
+| 100GB fully written | 800K × 25 = 20MB | 800K × 40 = 32MB | ~52MB |
 | Fork with 1% divergence | ~800 × 25 = 20KB | Shared with parent | ~20KB |
 
 ### Pack Format
@@ -1188,7 +1194,7 @@ A pack is a batch of LZ4-compressed blocks stored as a single S3 object. Key: `p
 4. Seek to offset, read comp_length bytes, LZ4 decompress.
 5. Verify: `blake3_128(decompressed) == expected_hash`.
 
-**Pack ID:** UUID v4, generated at pack creation. Deterministic pack IDs (content hash) aren't needed — dedup is handled by the block-level hash in the pack index, not by pack identity.
+**Pack ID:** 64-bit snowflake-style ID (timestamp + host-id + counter), generated at pack creation. Globally unique without the 16-byte cost of UUID. Deterministic pack IDs (content hash) aren't needed — dedup is handled by the block-level hash in the pack index, not by pack identity.
 
 **Typical pack:** 25 blocks × 128KB = 3.2MB uncompressed, ~1.6-2.1MB compressed. Index overhead: 16 + (25 × 24) = 616 bytes. Negligible.
 
@@ -1201,8 +1207,8 @@ POST /api/internal/packs/refcounts
 Content-Type: application/json
 
 {
-  "increments": ["pack-uuid-1", "pack-uuid-2"],
-  "decrements": ["pack-uuid-3"]
+  "increments": ["pack-id-1", "pack-id-2"],
+  "decrements": ["pack-id-3"]
 }
 
 → 200 OK

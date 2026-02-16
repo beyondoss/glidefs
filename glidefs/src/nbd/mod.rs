@@ -9,6 +9,8 @@ pub mod content_store;
 pub mod manifest;
 pub mod pack;
 pub mod pack_index;
+pub mod readahead;
+pub mod scrubber;
 
 pub mod metrics;
 pub mod protocol;

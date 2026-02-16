@@ -3,6 +3,7 @@
 //! Thin wrapper around `ObjectStore` providing typed PUT/GET for packs
 //! (shared across exports) and manifests (per-export).
 
+use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
 use std::sync::Arc;
@@ -75,6 +76,44 @@ impl ContentStore {
         name: &str,
     ) -> Result<Option<Vec<u8>>, ContentStoreError> {
         let key = format!("{}/{}", self.base_path, manifest_s3_key(name));
+        let path = ObjectPath::from(key);
+        match self.object_store.get(&path).await {
+            Ok(result) => {
+                let bytes = result.bytes().await.map_err(object_store::Error::from)?;
+                Ok(Some(bytes.to_vec()))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List all base manifest names under `manifests/bases/`.
+    pub async fn list_base_manifests(&self) -> Result<Vec<String>, ContentStoreError> {
+        let prefix = ObjectPath::from(format!("{}/manifests/bases/", self.base_path));
+        let mut names = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = result?;
+            if let Some(name) = meta.location.filename() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Upload a boot hot set to S3.
+    pub async fn put_hot_set(&self, name: &str, data: Vec<u8>) -> Result<(), ContentStoreError> {
+        let key = format!("{}/manifests/bases/{}.hot-set", self.base_path, name);
+        let path = ObjectPath::from(key);
+        let payload = PutPayload::from(data);
+        self.object_store.put(&path, payload).await?;
+        debug!(name = %name, "uploaded hot set");
+        Ok(())
+    }
+
+    /// Download a boot hot set from S3. Returns None if not found.
+    pub async fn get_hot_set(&self, name: &str) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        let key = format!("{}/manifests/bases/{}.hot-set", self.base_path, name);
         let path = ObjectPath::from(key);
         match self.object_store.get(&path).await {
             Ok(result) => {

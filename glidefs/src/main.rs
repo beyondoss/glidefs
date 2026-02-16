@@ -26,6 +26,14 @@ async fn main() -> Result<()> {
         cli::Commands::Run { config } => {
             cli::server::run_server(config).await?;
         }
+        cli::Commands::Bless {
+            image,
+            name,
+            config,
+            chunk_size,
+        } => {
+            cli::bless::run_bless(image, name, config, chunk_size).await?;
+        }
     }
 
     Ok(())

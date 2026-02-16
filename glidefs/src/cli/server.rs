@@ -155,6 +155,22 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     let mut handles = Vec::new();
 
+    // Start background scrubber (integrity verification)
+    {
+        use crate::nbd::scrubber::{scrubber, ScrubberConfig};
+        let bps = nbd_config.scrubber_blocks_per_second();
+        if bps > 0 {
+            info!("Starting background scrubber ({} blocks/sec)", bps);
+            let cc = Arc::clone(router.clean_cache());
+            let pi = Arc::clone(router.pack_index());
+            let shutdown_clone = shutdown.clone();
+            handles.push(spawn_named("scrubber", async move {
+                scrubber(cc, pi, ScrubberConfig { blocks_per_second: bps }, shutdown_clone).await;
+                Ok(())
+            }));
+        }
+    }
+
     // Start NBD TCP servers
     if let Some(addresses) = &nbd_config.addresses {
         for addr in addresses {

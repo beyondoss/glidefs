@@ -4,17 +4,17 @@
 //! - `NBDBlockHandler`: Thin handler that uses WriteCache for all I/O
 //! - `NBDDevice`: Device descriptor used during NBD transmission phase
 
-use super::block_store::S3BlockStore;
 use super::cache::BlockCache;
 use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
 use super::metrics::ExportMetrics;
 use super::pack_index::HostPackIndex;
+use super::readahead::SequentialDetector;
 use super::state::Active;
 use super::write_cache::WriteCache;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// NBD device descriptor used during transmission phase.
@@ -36,9 +36,6 @@ pub struct NBDBlockHandler {
     /// The write-behind cache (must be in Active state)
     cache: Arc<WriteCache<Active>>,
 
-    /// S3 block store for v1 read-through caching
-    s3_store: Arc<S3BlockStore>,
-
     /// Content-addressed S3 store for v2 pack reads
     content_store: Arc<ContentStore>,
 
@@ -57,6 +54,9 @@ pub struct NBDBlockHandler {
 
     /// I/O metrics for this export
     metrics: Arc<ExportMetrics>,
+
+    /// Sequential read-ahead detector
+    readahead: Mutex<SequentialDetector>,
 }
 
 impl NBDBlockHandler {
@@ -64,13 +64,11 @@ impl NBDBlockHandler {
     ///
     /// # Arguments
     /// * `cache` - Write-behind cache in Active state
-    /// * `s3_store` - S3 block store for read-through caching
     /// * `device_size` - Size of the block device in bytes
     /// * `readonly` - Whether this export rejects writes
     /// * `metrics` - Shared metrics for tracking I/O statistics
     pub fn new(
         cache: Arc<WriteCache<Active>>,
-        s3_store: Arc<S3BlockStore>,
         content_store: Arc<ContentStore>,
         clean_cache: Arc<dyn BlockCache>,
         pack_index: Arc<HostPackIndex>,
@@ -80,13 +78,13 @@ impl NBDBlockHandler {
     ) -> Self {
         Self {
             cache,
-            s3_store,
             content_store,
             clean_cache,
             pack_index,
             device_size: AtomicU64::new(device_size),
             readonly: AtomicBool::new(readonly),
             metrics,
+            readahead: Mutex::new(SequentialDetector::new()),
         }
     }
 
@@ -145,6 +143,28 @@ impl NBDBlockHandler {
                 &self.metrics,
             )
             .await?;
+
+        // Sequential read-ahead: detect patterns and prefetch next pack
+        {
+            let chunk_size = self.cache.block_size() as u64;
+            let chunk_idx = offset / chunk_size;
+            if let Some(readahead_chunk) = self.readahead.lock().unwrap().record(chunk_idx) {
+                let cache = Arc::clone(&self.cache);
+                let clean_cache = Arc::clone(&self.clean_cache);
+                let pack_index = Arc::clone(&self.pack_index);
+                let content_store = Arc::clone(&self.content_store);
+                tokio::spawn(async move {
+                    let _ = cache
+                        .prefetch_chunk(
+                            readahead_chunk as usize,
+                            clean_cache.as_ref(),
+                            &pack_index,
+                            &content_store,
+                        )
+                        .await;
+                });
+            }
+        }
 
         self.metrics.record_read_latency(start.elapsed());
         Ok(data)
@@ -281,7 +301,6 @@ mod tests {
 
         // Create in-memory S3 store for tests
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let s3_store = Arc::new(S3BlockStore::new(Arc::clone(&object_store), "test", 4096));
 
         // v2 read path components
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
@@ -298,7 +317,6 @@ mod tests {
         let cache = cache.skip_recovery_for_test();
         let handler = NBDBlockHandler::new(
             Arc::new(cache),
-            s3_store,
             content_store,
             clean_cache,
             pack_index,

@@ -46,7 +46,12 @@
       "Bash(gsed:*)",
       "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/scripts/gen_dedup_images.sh:*)",
       "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/glidefs/target/release/dedup_measure:*)",
-      "Bash(cargo run:*)"
+      "Bash(cargo run:*)",
+      "Bash(bash scripts/gen_dedup_images.sh /tmp/glidefs-dedup-test)",
+      "Bash(xargs:*)",
+      "Bash(docker run:*)",
+      "Skill(audit-impl)",
+      "Bash(echo:*)"
     ]
   }
 }
