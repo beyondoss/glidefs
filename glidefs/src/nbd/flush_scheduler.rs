@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Notify};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::pack_index::HostPackIndex;
@@ -179,6 +179,9 @@ async fn run_continuous(
     manifest_ticker.tick().await;
 
     let mut last_seq_cutpoint: u64 = 0;
+    let mut pack_backoff = Duration::from_secs(1);
+    let mut manifest_backoff = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
     loop {
         tokio::select! {
@@ -201,6 +204,8 @@ async fn run_continuous(
                 do_full_flush(cache, content_store, pack_index).await;
                 // A full flush includes a manifest sync, so reset cutpoint.
                 last_seq_cutpoint = 0;
+                pack_backoff = Duration::from_secs(1);
+                manifest_backoff = Duration::from_secs(1);
             }
 
             // Periodic pack flush.
@@ -218,10 +223,12 @@ async fn run_continuous(
                                 );
                             }
                             last_seq_cutpoint = seq_cutpoint;
+                            pack_backoff = Duration::from_secs(1);
                         }
                         Err(e) => {
-                            error!(error = %e, "periodic pack flush failed");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            warn!(error = %e, backoff_secs = pack_backoff.as_secs(), "periodic pack flush failed, backing off");
+                            tokio::time::sleep(pack_backoff).await;
+                            pack_backoff = (pack_backoff * 2).min(MAX_BACKOFF);
                         }
                     }
                 }
@@ -234,10 +241,12 @@ async fn run_continuous(
                         Ok(()) => {
                             info!(seq_cutpoint = last_seq_cutpoint, "manifest sync complete");
                             last_seq_cutpoint = 0;
+                            manifest_backoff = Duration::from_secs(1);
                         }
                         Err(e) => {
-                            error!(error = %e, "manifest sync failed");
-                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            warn!(error = %e, backoff_secs = manifest_backoff.as_secs(), "manifest sync failed, backing off");
+                            tokio::time::sleep(manifest_backoff).await;
+                            manifest_backoff = (manifest_backoff * 2).min(MAX_BACKOFF);
                         }
                     }
                 }
@@ -269,7 +278,6 @@ async fn do_full_flush(
         }
         Err(e) => {
             error!(error = %e, "full flush failed");
-            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 }

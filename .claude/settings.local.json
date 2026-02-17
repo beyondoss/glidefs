@@ -51,7 +51,8 @@
       "Bash(xargs:*)",
       "Bash(docker run:*)",
       "Skill(audit-impl)",
-      "Bash(echo:*)"
+      "Bash(echo:*)",
+      "Bash(cargo tree:*)"
     ]
   }
 }

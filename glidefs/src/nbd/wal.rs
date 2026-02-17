@@ -17,9 +17,19 @@ use super::block_map::Blake3Hash;
 /// Block data is NOT stored in the WAL — on recovery, the SSD cache file
 /// is the source of truth for block contents (the SSD pwrite always completes
 /// before the WAL append).
+///
+/// Used for replay (deserialized from WAL file).
 #[derive(Debug, Clone)]
 pub struct WalEntry {
     pub name: String,
+    pub chunk_index: u64,
+    pub hash: Blake3Hash,
+    pub sequence: u64,
+}
+
+/// Borrowed WAL entry for zero-alloc appends on the write hot path.
+pub struct WalEntryRef<'a> {
+    pub name: &'a str,
     pub chunk_index: u64,
     pub hash: Blake3Hash,
     pub sequence: u64,
@@ -59,7 +69,7 @@ impl Wal {
     /// Wire format: [name_len:u16][name][chunk_index:u64][hash:16][sequence:u64][crc32:u32]
     ///
     /// Does NOT fsync -- the local SSD file provides durability guarantees.
-    pub fn append(&mut self, entry: &WalEntry) -> io::Result<()> {
+    pub fn append(&mut self, entry: &WalEntryRef<'_>) -> io::Result<()> {
         let mut hasher = crc32fast::Hasher::new();
 
         let name_bytes = entry.name.as_bytes();
@@ -216,13 +226,19 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write as IoWrite};
     use tempfile::TempDir;
 
-    fn make_entry(seq: u64, data: &[u8]) -> WalEntry {
-        WalEntry {
-            name: "test-export".to_string(),
-            chunk_index: seq * 10,
-            hash: blake3_128(data),
-            sequence: seq,
-        }
+    fn make_entry_ref(seq: u64, data: &[u8]) -> (Blake3Hash, u64, u64) {
+        (blake3_128(data), seq * 10, seq)
+    }
+
+    fn append_test_entry(wal: &mut Wal, seq: u64, data: &[u8]) {
+        let (hash, chunk_index, sequence) = make_entry_ref(seq, data);
+        let entry = WalEntryRef {
+            name: "test-export",
+            chunk_index,
+            hash,
+            sequence,
+        };
+        wal.append(&entry).unwrap();
     }
 
     #[test]
@@ -234,8 +250,7 @@ mod tests {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=10 {
                 let data = format!("block-data-{i}");
-                let entry = make_entry(i, data.as_bytes());
-                wal.append(&entry).unwrap();
+                append_test_entry(&mut wal, i, data.as_bytes());
             }
             wal.flush_buf().unwrap();
         }
@@ -261,8 +276,7 @@ mod tests {
         {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=10 {
-                let entry = make_entry(i, &[i as u8; 64]);
-                wal.append(&entry).unwrap();
+                append_test_entry(&mut wal, i, &[i as u8; 64]);
             }
             wal.flush_buf().unwrap();
         }
@@ -282,8 +296,7 @@ mod tests {
         {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=5 {
-                let entry = make_entry(i, &[i as u8; 128]);
-                wal.append(&entry).unwrap();
+                append_test_entry(&mut wal, i, &[i as u8; 128]);
             }
             wal.flush_buf().unwrap();
         }
@@ -311,8 +324,7 @@ mod tests {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=3u64 {
                 let before = wal.size();
-                let entry = make_entry(i, &[i as u8; 64]);
-                wal.append(&entry).unwrap();
+                append_test_entry(&mut wal, i, &[i as u8; 64]);
                 let after = wal.size();
                 entry_offsets.push((before, after));
             }
@@ -345,8 +357,7 @@ mod tests {
 
         let mut wal = Wal::open(&wal_path).unwrap();
         for i in 1..=5 {
-            let entry = make_entry(i, &[i as u8; 32]);
-            wal.append(&entry).unwrap();
+            append_test_entry(&mut wal, i, &[i as u8; 32]);
         }
         wal.flush_buf().unwrap();
 
@@ -354,8 +365,7 @@ mod tests {
         assert_eq!(wal.size(), 0);
 
         for i in 10..=12 {
-            let entry = make_entry(i, &[i as u8; 32]);
-            wal.append(&entry).unwrap();
+            append_test_entry(&mut wal, i, &[i as u8; 32]);
         }
         wal.flush_buf().unwrap();
         drop(wal);
@@ -374,8 +384,8 @@ mod tests {
 
         {
             let mut wal = Wal::open(&wal_path).unwrap();
-            let entry = WalEntry {
-                name: "trim-export".to_string(),
+            let entry = WalEntryRef {
+                name: "trim-export",
                 chunk_index: 42,
                 hash: blake3_128(&[]),
                 sequence: 1,
