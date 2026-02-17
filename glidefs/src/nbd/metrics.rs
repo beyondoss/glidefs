@@ -133,6 +133,8 @@ impl LatencyHistogram {
             avg_us: self.avg_us(),
             min_us: self.min_us,
             max_us: self.max_us,
+            sum_us: self.sum_us,
+            buckets: self.buckets,
             p50_bucket: self.percentile_bucket(50),
             p99_bucket: self.percentile_bucket(99),
         }
@@ -162,8 +164,52 @@ pub struct LatencySnapshot {
     pub avg_us: f64,
     pub min_us: u64,
     pub max_us: u64,
+    pub sum_us: u64,
+    /// Raw bucket counts: [<100us, <1ms, <10ms, <100ms, <1s, >=1s]
+    pub buckets: [u64; 6],
     pub p50_bucket: &'static str,
     pub p99_bucket: &'static str,
+}
+
+/// Prometheus `le` boundaries in seconds matching our bucket layout.
+const HISTOGRAM_LE: [&str; 5] = ["0.0001", "0.001", "0.01", "0.1", "1"];
+
+impl LatencySnapshot {
+    /// Emit Prometheus histogram text lines for this latency.
+    ///
+    /// `metric_name` should already include the `_seconds` suffix.
+    /// `label` is the pre-formatted label string like `export="vol1"`.
+    pub fn write_prometheus(&self, out: &mut String, metric_name: &str, label: &str) {
+        use std::fmt::Write;
+        if self.count == 0 {
+            return;
+        }
+        // Cumulative buckets
+        let mut cumulative = 0u64;
+        for (i, le) in HISTOGRAM_LE.iter().enumerate() {
+            cumulative += self.buckets[i];
+            writeln!(
+                out,
+                "{metric_name}_bucket{{{label},le=\"{le}\"}} {cumulative}"
+            )
+            .unwrap();
+        }
+        // +Inf bucket (total count)
+        cumulative += self.buckets[5];
+        writeln!(
+            out,
+            "{metric_name}_bucket{{{label},le=\"+Inf\"}} {cumulative}"
+        )
+        .unwrap();
+        // Sum in seconds
+        writeln!(
+            out,
+            "{metric_name}_sum{{{label}}} {:.6}",
+            self.sum_us as f64 / 1_000_000.0
+        )
+        .unwrap();
+        writeln!(out, "{metric_name}_count{{{label}}} {}", self.count).unwrap();
+    }
 }
 
 impl Default for ExportMetrics {
@@ -504,43 +550,25 @@ impl MetricsSnapshot {
         writeln!(out, "glidefs_coalesce_ratio{{{label}}} {:.6}", self.coalesce_ratio).unwrap();
         writeln!(out, "glidefs_cache_hit_rate{{{label}}} {:.6}", self.cache_hit_rate).unwrap();
 
-        // Latency metrics
-        if let Some(ref lat) = self.read_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_read_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_read_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_read_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
-        if let Some(ref lat) = self.write_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_write_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_write_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_write_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
-        if let Some(ref lat) = self.s3_fetch_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_s3_fetch_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_s3_fetch_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_s3_fetch_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
-        if let Some(ref lat) = self.file_read_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_file_read_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_file_read_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_file_read_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
-        if let Some(ref lat) = self.file_write_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_file_write_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_file_write_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_file_write_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
-        if let Some(ref lat) = self.s3_put_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_s3_put_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_s3_put_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_s3_put_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
+        // Latency histograms (Prometheus histogram format)
+        if let Some(ref lat) = self.read_latency {
+            lat.write_prometheus(&mut out, "glidefs_read_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.write_latency {
+            lat.write_prometheus(&mut out, "glidefs_write_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.s3_fetch_latency {
+            lat.write_prometheus(&mut out, "glidefs_s3_fetch_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.file_read_latency {
+            lat.write_prometheus(&mut out, "glidefs_file_read_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.file_write_latency {
+            lat.write_prometheus(&mut out, "glidefs_file_write_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.s3_put_latency {
+            lat.write_prometheus(&mut out, "glidefs_s3_put_latency_seconds", &label);
+        }
 
         out
     }
@@ -623,6 +651,18 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_s3_get_errors_total counter
 # HELP glidefs_flush_errors_total Failed flush cycles
 # TYPE glidefs_flush_errors_total counter
+# HELP glidefs_read_latency_seconds NBD read operation latency
+# TYPE glidefs_read_latency_seconds histogram
+# HELP glidefs_write_latency_seconds NBD write operation latency
+# TYPE glidefs_write_latency_seconds histogram
+# HELP glidefs_s3_fetch_latency_seconds S3 block fetch latency
+# TYPE glidefs_s3_fetch_latency_seconds histogram
+# HELP glidefs_file_read_latency_seconds Local file read latency
+# TYPE glidefs_file_read_latency_seconds histogram
+# HELP glidefs_file_write_latency_seconds Local file write latency
+# TYPE glidefs_file_write_latency_seconds histogram
+# HELP glidefs_s3_put_latency_seconds S3 pack upload latency
+# TYPE glidefs_s3_put_latency_seconds histogram
 "#
 }
 

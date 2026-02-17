@@ -402,6 +402,19 @@ where
                 writeln!(output, "# TYPE glidefs_scrubber_blocks_evicted_total counter").unwrap();
                 writeln!(output, "glidefs_scrubber_blocks_evicted_total {evicted}").unwrap();
             }
+            // S3 circuit breaker state (0=closed, 1=open, 2=half-open)
+            {
+                use crate::circuit_breaker::CircuitState;
+                use std::fmt::Write;
+                let cb_value = match router.s3_circuit_state() {
+                    CircuitState::Closed { .. } => 0,
+                    CircuitState::Open => 1,
+                    CircuitState::HalfOpen { .. } => 2,
+                };
+                writeln!(output, "# HELP glidefs_s3_circuit_breaker_state S3 circuit breaker state (0=closed, 1=open, 2=half-open)").unwrap();
+                writeln!(output, "# TYPE glidefs_s3_circuit_breaker_state gauge").unwrap();
+                writeln!(output, "glidefs_s3_circuit_breaker_state {cb_value}").unwrap();
+            }
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

@@ -140,6 +140,16 @@ impl NbdClient {
 
     /// Write `data` to the device at `offset`.
     pub async fn write(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        let error = self.write_raw(offset, data).await?;
+        if error != NBD_SUCCESS {
+            bail!("write error: {}", error);
+        }
+        Ok(())
+    }
+
+    /// Write and return the raw NBD error code (0 = success).
+    /// Use this instead of `write()` when you expect an error (e.g., readonly export).
+    pub async fn write_raw(&mut self, offset: u64, data: &[u8]) -> Result<u32> {
         let cookie = self.next_cookie();
 
         // Send request header (28 bytes) + data
@@ -161,10 +171,7 @@ impl NbdClient {
         let reply_cookie = self.stream.read_u64().await?;
         assert_eq!(reply_cookie, cookie);
 
-        if error != NBD_SUCCESS {
-            bail!("write error: {}", error);
-        }
-        Ok(())
+        Ok(error)
     }
 
     /// Flush all pending writes to stable storage.

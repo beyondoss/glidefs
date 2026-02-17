@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn run_server(config_path: PathBuf) -> Result<()> {
     use tracing_subscriber::EnvFilter;
@@ -240,18 +240,31 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         }
     }
 
+    let shutdown_timeout = nbd_config.shutdown_timeout();
     info!("Cancelling all servers...");
     shutdown.cancel();
 
-    info!("Waiting for servers to exit...");
-    for handle in handles {
-        let _ = handle.await;
-    }
+    match tokio::time::timeout(shutdown_timeout, async {
+        info!("Waiting for servers to exit...");
+        for handle in handles {
+            let _ = handle.await;
+        }
 
-    // Graceful shutdown: drain all exports
-    info!("Final drain before shutdown...");
-    if let Err(e) = router.shutdown().await {
-        tracing::error!("Shutdown drain failed: {}", e);
+        // Graceful shutdown: drain all exports
+        info!("Final drain before shutdown...");
+        if let Err(e) = router.shutdown().await {
+            tracing::error!("Shutdown drain failed: {}", e);
+        }
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => {
+            warn!(
+                "Shutdown timed out after {}s, exiting with possible dirty blocks",
+                shutdown_timeout.as_secs()
+            );
+        }
     }
 
     info!("Shutdown complete");

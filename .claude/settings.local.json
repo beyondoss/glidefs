@@ -54,7 +54,8 @@
       "Bash(echo:*)",
       "Bash(cargo tree:*)",
       "Bash(cargo add:*)",
-      "Bash(RUST_LOG=glidefs=debug cargo test:*)"
+      "Bash(RUST_LOG=glidefs=debug cargo test:*)",
+      "Bash(rustfmt --check:*)"
     ]
   }
 }

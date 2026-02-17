@@ -3,6 +3,7 @@
 //! Thin wrapper around `ObjectStore` providing typed PUT/GET for packs
 //! (shared across exports) and manifests (per-export).
 
+use crate::circuit_breaker::CircuitBreaker;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
@@ -19,11 +20,22 @@ use super::pack_registry::registry_s3_key;
 pub enum ContentStoreError {
     #[error("S3 operation failed: {0}")]
     ObjectStore(#[from] object_store::Error),
+
+    #[error("S3 circuit breaker is open (service temporarily unavailable)")]
+    CircuitOpen,
+}
+
+/// Returns true for errors that indicate S3 connectivity failure (network,
+/// timeout, 5xx). NotFound, Precondition, etc. are valid S3 responses and
+/// prove the backend is reachable.
+fn is_connectivity_error(e: &object_store::Error) -> bool {
+    matches!(e, object_store::Error::Generic { .. })
 }
 
 pub struct ContentStore {
     object_store: Arc<dyn ObjectStore>,
     base_path: String,
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
 }
 
 impl ContentStore {
@@ -31,16 +43,47 @@ impl ContentStore {
         Self {
             object_store,
             base_path: base_path.trim_end_matches('/').to_string(),
+            circuit_breaker: None,
+        }
+    }
+
+    /// Attach a shared circuit breaker for S3 calls.
+    pub fn with_circuit_breaker(mut self, cb: Arc<CircuitBreaker>) -> Self {
+        self.circuit_breaker = Some(cb);
+        self
+    }
+
+    /// Check circuit breaker before an S3 call.
+    #[inline]
+    fn check_circuit(&self) -> Result<(), ContentStoreError> {
+        if let Some(cb) = &self.circuit_breaker {
+            cb.allow().map_err(|_| ContentStoreError::CircuitOpen)?;
+        }
+        Ok(())
+    }
+
+    /// Record the outcome of an S3 call to the circuit breaker.
+    #[inline]
+    fn record_s3_result<T>(&self, result: &Result<T, object_store::Error>) {
+        if let Some(cb) = &self.circuit_breaker {
+            match result {
+                Ok(_) => cb.record_success(),
+                Err(e) if is_connectivity_error(e) => cb.record_failure(),
+                Err(_) => cb.record_success(), // NotFound/Precondition = S3 is reachable
+            }
         }
     }
 
     /// Upload a pack to S3.
     #[instrument(skip(self, data), fields(pack_id = %pack_id, size = data.len()))]
     pub async fn put_pack(&self, pack_id: Uuid, data: Vec<u8>) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
-        self.object_store.put(&path, payload).await?;
+        let result = self.object_store.put(&path, payload).await;
+        self.record_s3_result(&result);
+        result?;
         debug!("uploaded pack");
         Ok(())
     }
@@ -48,10 +91,13 @@ impl ContentStore {
     /// Download a pack from S3 (buffered).
     #[instrument(skip(self), fields(pack_id = %pack_id))]
     pub async fn get_pack(&self, pack_id: Uuid) -> Result<Vec<u8>, ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
-        let result = self.object_store.get(&path).await?;
-        let bytes = result.bytes().await.map_err(object_store::Error::from)?;
+        let result = self.object_store.get(&path).await;
+        self.record_s3_result(&result);
+        let response = result?;
+        let bytes = response.bytes().await.map_err(object_store::Error::from)?;
         Ok(bytes.to_vec())
     }
 
@@ -66,12 +112,14 @@ impl ContentStore {
         offset: u32,
         comp_length: u32,
     ) -> Result<bytes::Bytes, ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
         let start = offset as u64;
         let end = start + comp_length as u64;
-        let bytes = self.object_store.get_range(&path, start..end).await?;
-        Ok(bytes)
+        let result = self.object_store.get_range(&path, start..end).await;
+        self.record_s3_result(&result);
+        Ok(result?)
     }
 
     /// Stream a pack from S3 as an async byte stream.
@@ -87,10 +135,13 @@ impl ContentStore {
         impl futures::Stream<Item = Result<bytes::Bytes, ContentStoreError>> + Send + Unpin,
         ContentStoreError,
     > {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
-        let result = self.object_store.get(&path).await?;
-        let stream = result.into_stream().map(|r| r.map_err(ContentStoreError::from));
+        let result = self.object_store.get(&path).await;
+        self.record_s3_result(&result);
+        let response = result?;
+        let stream = response.into_stream().map(|r| r.map_err(ContentStoreError::from));
         Ok(Box::pin(stream))
     }
 
@@ -101,12 +152,15 @@ impl ContentStore {
         name: &str,
         data: Vec<u8>,
     ) -> Result<Option<String>, ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, manifest_s3_key(name));
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
-        let result = self.object_store.put(&path, payload).await?;
+        let result = self.object_store.put(&path, payload).await;
+        self.record_s3_result(&result);
+        let put_result = result?;
         debug!("uploaded manifest");
-        Ok(result.e_tag)
+        Ok(put_result.e_tag)
     }
 
     /// Download a manifest from S3. Returns None if not found.
@@ -115,11 +169,14 @@ impl ContentStore {
         &self,
         name: &str,
     ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, manifest_s3_key(name));
         let path = ObjectPath::from(key);
-        match self.object_store.get(&path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.map_err(object_store::Error::from)?;
+        let result = self.object_store.get(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(response) => {
+                let bytes = response.bytes().await.map_err(object_store::Error::from)?;
                 Ok(Some(bytes.to_vec()))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -129,6 +186,7 @@ impl ContentStore {
 
     /// List all base manifest names under `manifests/bases/`.
     pub async fn list_base_manifests(&self) -> Result<Vec<String>, ContentStoreError> {
+        self.check_circuit()?;
         let prefix = ObjectPath::from(format!("{}/manifests/bases/", self.base_path));
         let mut names = Vec::new();
         let mut stream = self.object_store.list(Some(&prefix));
@@ -138,26 +196,35 @@ impl ContentStore {
                 names.push(name.to_string());
             }
         }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
         Ok(names)
     }
 
     /// Upload a boot hot set to S3.
     pub async fn put_hot_set(&self, name: &str, data: Vec<u8>) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/manifests/bases/{}.hot-set", self.base_path, name);
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
-        self.object_store.put(&path, payload).await?;
+        let result = self.object_store.put(&path, payload).await;
+        self.record_s3_result(&result);
+        result?;
         debug!(name = %name, "uploaded hot set");
         Ok(())
     }
 
     /// Download a boot hot set from S3. Returns None if not found.
     pub async fn get_hot_set(&self, name: &str) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/manifests/bases/{}.hot-set", self.base_path, name);
         let path = ObjectPath::from(key);
-        match self.object_store.get(&path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.map_err(object_store::Error::from)?;
+        let result = self.object_store.get(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(response) => {
+                let bytes = response.bytes().await.map_err(object_store::Error::from)?;
                 Ok(Some(bytes.to_vec()))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -175,10 +242,13 @@ impl ContentStore {
         name: &str,
         data: Vec<u8>,
     ) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, registry_s3_key(name));
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
-        self.object_store.put(&path, payload).await?;
+        let result = self.object_store.put(&path, payload).await;
+        self.record_s3_result(&result);
+        result?;
         debug!(name = %name, "uploaded pack registry");
         Ok(())
     }
@@ -188,11 +258,14 @@ impl ContentStore {
         &self,
         name: &str,
     ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, registry_s3_key(name));
         let path = ObjectPath::from(key);
-        match self.object_store.get(&path).await {
-            Ok(result) => {
-                let bytes = result.bytes().await.map_err(object_store::Error::from)?;
+        let result = self.object_store.get(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(response) => {
+                let bytes = response.bytes().await.map_err(object_store::Error::from)?;
                 Ok(Some(bytes.to_vec()))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -202,6 +275,7 @@ impl ContentStore {
 
     /// List all registry names under `pack-registries/`.
     pub async fn list_registries(&self) -> Result<Vec<String>, ContentStoreError> {
+        self.check_circuit()?;
         let prefix = ObjectPath::from(format!("{}/pack-registries/", self.base_path));
         let mut names = Vec::new();
         let mut stream = self.object_store.list(Some(&prefix));
@@ -211,14 +285,20 @@ impl ContentStore {
                 names.push(name.to_string());
             }
         }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
         Ok(names)
     }
 
     /// Delete a pack registry from S3 (idempotent).
     pub async fn delete_registry(&self, name: &str) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, registry_s3_key(name));
         let path = ObjectPath::from(key);
-        match self.object_store.delete(&path).await {
+        let result = self.object_store.delete(&path).await;
+        self.record_s3_result(&result);
+        match result {
             Ok(()) => Ok(()),
             Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(e.into()),
@@ -230,6 +310,7 @@ impl ContentStore {
     /// Returns paths relative to `manifests/`, e.g. `"vm1"`, `"bases/ubuntu-22.04"`.
     /// Filters out `.hot-set` files.
     pub async fn list_all_manifests(&self) -> Result<Vec<String>, ContentStoreError> {
+        self.check_circuit()?;
         let prefix_str = format!("{}/manifests/", self.base_path);
         let prefix = ObjectPath::from(prefix_str.clone());
         let mut names = Vec::new();
@@ -248,14 +329,20 @@ impl ContentStore {
                 }
             }
         }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
         Ok(names)
     }
 
     /// Delete a pack from S3 by pack_id (idempotent).
     pub async fn delete_pack(&self, pack_id: Uuid) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
-        match self.object_store.delete(&path).await {
+        let result = self.object_store.delete(&path).await;
+        self.record_s3_result(&result);
+        match result {
             Ok(()) => Ok(()),
             Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(e.into()),

@@ -134,6 +134,12 @@ pub struct NbdConfig {
     /// WAL durability at the cost of ~10ms per write batch.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub wal_sync: Option<bool>,
+
+    /// Graceful shutdown timeout in seconds (default: 30).
+    /// Exports are drained to S3 within this window; if exceeded, the process
+    /// exits with a warning. Set higher for large caches with many dirty blocks.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub shutdown_timeout_secs: Option<u64>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -205,6 +211,16 @@ impl NbdConfig {
     /// Whether to fsync the WAL after each write batch (default: false).
     pub fn wal_sync(&self) -> bool {
         self.wal_sync.unwrap_or(false)
+    }
+
+    pub const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
+
+    /// Graceful shutdown timeout.
+    pub fn shutdown_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.shutdown_timeout_secs
+                .unwrap_or(Self::DEFAULT_SHUTDOWN_TIMEOUT_SECS),
+        )
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -394,6 +410,9 @@ impl Settings {
             if let Some(bpb) = nbd.blocks_per_batch {
                 anyhow::ensure!(bpb > 0, "blocks_per_batch must be > 0, got {}", bpb);
             }
+            if let Some(t) = nbd.shutdown_timeout_secs {
+                anyhow::ensure!(t > 0, "shutdown_timeout_secs must be > 0, got {}", t);
+            }
             // Export validation
             let mut names = HashSet::new();
             for export in &nbd.exports {
@@ -489,6 +508,7 @@ impl Settings {
     
                     scrubber_blocks_per_second: None,
                     wal_sync: None,
+                    shutdown_timeout_secs: None,
                 }),
             },
             aws: Some(AwsConfig(aws_config)),

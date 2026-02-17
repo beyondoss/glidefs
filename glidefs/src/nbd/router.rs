@@ -3,6 +3,7 @@
 //! Manages multiple NBD exports, each with its own write cache and S3 storage.
 //! Supports dynamic export creation/removal for microVM scale-to-zero and live migration.
 
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 use crate::config::ExportConfig;
 use crate::nbd::block_store::S3BlockStore;
 use crate::nbd::cache::BlockCache;
@@ -25,6 +26,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{watch, Notify, RwLock};
 use tokio::task::JoinHandle;
@@ -83,6 +85,7 @@ pub struct ReadinessStatus {
     pub ready: bool,
     pub exports_count: usize,
     pub cache_writable: bool,
+    pub s3_reachable: bool,
 }
 
 /// Response from a snapshot operation.
@@ -106,21 +109,30 @@ pub struct ExportState {
     flush_handle: JoinHandle<()>,
 }
 
+/// Maximum drain iterations before giving up. Prevents infinite loops when
+/// concurrent writes keep producing new dirty blocks faster than we flush.
+const MAX_DRAIN_ITERATIONS: usize = 100;
+
 impl ExportState {
     /// Drain all dirty blocks to S3 via v2 content-addressed packs.
     pub async fn drain(&self) -> Result<(), RouterError> {
         // Loop until no more dirty blocks remain (concurrent writes may
         // produce new dirty data between flushes).
-        loop {
+        for _ in 0..MAX_DRAIN_ITERATIONS {
             let stats = self
                 .cache
                 .flush_to_s3(&self.content_store, &self.pack_index)
                 .await
                 .map_err(RouterError::Cache)?;
             if stats.blocks_flushed == 0 {
-                break;
+                return Ok(());
             }
         }
+        warn!(
+            "drain hit iteration limit ({}), {} dirty blocks remain",
+            MAX_DRAIN_ITERATIONS,
+            self.cache.dirty_block_count()
+        );
         Ok(())
     }
 
@@ -181,6 +193,9 @@ pub struct ExportRouter {
 
     /// Scrubber metrics (global, not per-export)
     scrubber_metrics: Arc<crate::nbd::scrubber::ScrubberMetrics>,
+
+    /// Shared S3 circuit breaker: opens after 5 consecutive failures, probes after 30s.
+    s3_circuit_breaker: Arc<CircuitBreaker>,
 }
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
@@ -203,6 +218,12 @@ fn validate_export_name(name: &str) -> Result<(), RouterError> {
 impl ExportRouter {
     /// Create a new export router.
     pub fn new(config: RouterConfig) -> Self {
+        let s3_circuit_breaker = Arc::new(CircuitBreaker::new(
+            CircuitBreakerConfig::consecutive(5)
+                .reset_timeout(Duration::from_secs(30))
+                .half_open_permits(3),
+        ));
+
         Self {
             exports: RwLock::new(HashMap::new()),
             object_store: config.object_store,
@@ -214,6 +235,7 @@ impl ExportRouter {
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
             scrubber_metrics: Arc::new(crate::nbd::scrubber::ScrubberMetrics::new()),
+            s3_circuit_breaker,
         }
     }
 
@@ -230,6 +252,11 @@ impl ExportRouter {
     /// Get the shared scrubber metrics (for scrubber + prometheus).
     pub fn scrubber_metrics(&self) -> &Arc<crate::nbd::scrubber::ScrubberMetrics> {
         &self.scrubber_metrics
+    }
+
+    /// Get the current S3 circuit breaker state for observability.
+    pub fn s3_circuit_state(&self) -> CircuitState {
+        self.s3_circuit_breaker.state()
     }
 
     // =========================================================================
@@ -374,10 +401,10 @@ impl ExportRouter {
         );
 
         // v2 read path components (shared pack_index from router)
-        let content_store = Arc::new(ContentStore::new(
-            Arc::clone(&self.object_store),
-            &s3_prefix,
-        ));
+        let content_store = Arc::new(
+            ContentStore::new(Arc::clone(&self.object_store), &s3_prefix)
+                .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker)),
+        );
         let clean_cache = Arc::clone(&self.clean_cache);
         let pack_index = Arc::clone(&self.pack_index);
 
@@ -631,7 +658,7 @@ impl ExportRouter {
         exports.keys().cloned().collect()
     }
 
-    /// Check readiness: at least one export exists and cache directory is writable.
+    /// Check readiness: exports exist, cache writable, and S3 reachable.
     pub async fn readiness_check(&self) -> ReadinessStatus {
         let exports = self.exports.read().await;
         let exports_count = exports.len();
@@ -644,10 +671,21 @@ impl ExportRouter {
                 && tokio::fs::remove_file(&probe).await.is_ok()
         };
 
+        let s3_reachable = {
+            let probe_path = Path::from(format!("{}/", self.db_path));
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.object_store.list_with_delimiter(Some(&probe_path)),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok())
+        };
+
         ReadinessStatus {
-            ready: exports_count > 0 && cache_writable,
+            ready: exports_count > 0 && cache_writable && s3_reachable,
             exports_count,
             cache_writable,
+            s3_reachable,
         }
     }
 
@@ -885,7 +923,7 @@ impl ExportRouter {
         }
 
         // 3. V2 drain: flush remaining dirty data
-        loop {
+        for _ in 0..MAX_DRAIN_ITERATIONS {
             match cache.flush_to_s3(&content_store, &pack_index).await {
                 Ok(stats) if stats.blocks_flushed == 0 => break,
                 Ok(_) => {}

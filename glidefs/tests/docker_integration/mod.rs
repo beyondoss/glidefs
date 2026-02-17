@@ -13,6 +13,11 @@ mod persistence;
 mod cold_wake;
 mod export_discovery;
 mod multi_export;
+mod live_migration;
+mod fork_roundtrip;
+mod data_integrity;
+mod concurrent;
+mod resize;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use glidefs::config::ExportConfig;
 use glidefs::nbd::cache::{BlockCache, SimpleBlockCache};
-use glidefs::nbd::router::{ExportRouter, RouterConfig};
+use glidefs::nbd::router::{ExportRouter, RouterConfig, SnapshotResponse};
 use glidefs::nbd::server::NBDServer;
 
 // ---------------------------------------------------------------------------
@@ -168,6 +173,51 @@ impl TestServer {
             .create_export(config, false, Some(name))
             .await
             .unwrap();
+    }
+
+    /// Snapshot an export (flush dirty blocks + upload manifest).
+    pub async fn snapshot_export(&self, name: &str) -> SnapshotResponse {
+        self.router.snapshot_export(name).await.unwrap()
+    }
+
+    /// Fork an export from a source manifest (read-write).
+    pub async fn fork_export(&self, name: &str, source_manifest: &str, size_gb: f64) {
+        let config = ExportConfig {
+            name: name.to_string(),
+            size_gb,
+            s3_prefix: None,
+            block_size: None,
+            flush_mode: None,
+        };
+        self.router
+            .create_export(config, false, Some(source_manifest))
+            .await
+            .unwrap();
+    }
+
+    /// Fork an export from a source manifest (readonly).
+    pub async fn fork_export_readonly(&self, name: &str, source_manifest: &str, size_gb: f64) {
+        let config = ExportConfig {
+            name: name.to_string(),
+            size_gb,
+            s3_prefix: None,
+            block_size: None,
+            flush_mode: None,
+        };
+        self.router
+            .create_export(config, true, Some(source_manifest))
+            .await
+            .unwrap();
+    }
+
+    /// Promote a readonly export to read-write.
+    pub async fn promote_export(&self, name: &str) {
+        self.router.promote_export(name).await.unwrap();
+    }
+
+    /// Resize an export (grow only). Client must reconnect to see new size.
+    pub async fn resize_export(&self, name: &str, new_size_gb: f64) {
+        self.router.resize_export(name, new_size_gb).await.unwrap();
     }
 
     /// Drain all exports and shut down gracefully.

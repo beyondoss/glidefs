@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+mod circuit_breaker;
 mod cli;
 mod config;
 mod nbd;
