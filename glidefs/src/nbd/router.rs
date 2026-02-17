@@ -451,7 +451,7 @@ impl ExportRouter {
             // Normal path: open cache, recover from WAL
             let cache = WriteCache::open(cache_config)?;
             info!("Recovering write cache for export '{}'...", name);
-            let cache = cache.finish_recovery(&s3_store).await?;
+            let cache = cache.finish_recovery().await?;
             info!("Export '{}' cache ready", name);
             Arc::new(cache)
         };

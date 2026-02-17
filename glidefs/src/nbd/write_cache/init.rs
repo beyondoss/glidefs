@@ -8,7 +8,7 @@ use tracing::{info, instrument, warn};
 
 use crate::nbd::block_map::{
     AtomicBlockMap, Blake3Hash, BlockMap, BlockMapEntry, BlockMapKind, ForkedBlockMap,
-    SequenceNumber, blake3_128,
+    SequenceNumber, blake3_128, zero_block_hash,
 };
 use crate::nbd::manifest::Manifest;
 use crate::nbd::state::{Active, BlockState, Initializing, Recovering};
@@ -158,6 +158,9 @@ impl WriteCache<Initializing> {
 
         let dirty_bytes_count: u64 = dirty_store_map.len() as u64 * chunk_size as u64;
         let flush_trigger = config.flush_trigger.clone();
+        let block_size = config.block_size;
+        let zbh = zero_block_hash(block_size);
+        let zbb = Bytes::from(vec![0u8; block_size]);
 
         let inner = Arc::new(CacheInner {
             config,
@@ -175,6 +178,8 @@ impl WriteCache<Initializing> {
             dirty_bytes: AtomicU64::new(dirty_bytes_count),
             flush_trigger,
             export_name,
+            zero_block_hash: zbh,
+            zero_block_bytes: zbb,
         });
 
         info!(
@@ -241,6 +246,9 @@ impl WriteCache<Initializing> {
         let wal = Wal::open(&config.wal_path())?;
         let export_name = config.device_name.clone();
         let flush_trigger = config.flush_trigger.clone();
+        let block_size = config.block_size;
+        let zbh = zero_block_hash(block_size);
+        let zbb = Bytes::from(vec![0u8; block_size]);
 
         let inner = Arc::new(CacheInner {
             config,
@@ -257,6 +265,8 @@ impl WriteCache<Initializing> {
             dirty_bytes: AtomicU64::new(0),
             flush_trigger,
             export_name,
+            zero_block_hash: zbh,
+            zero_block_bytes: zbb,
         });
 
         info!("cache opened from manifest, directly Active");

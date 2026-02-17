@@ -233,6 +233,14 @@ pub(crate) struct CacheInner {
 
     /// Export name (used in WAL entries).
     pub(super) export_name: String,
+
+    /// Pre-computed zero-block hash for this export's block_size.
+    /// Used by flush, write, and read paths to identify trimmed/unwritten chunks.
+    pub(super) zero_block_hash: Blake3Hash,
+
+    /// Pre-computed zero-block bytes for this export's block_size.
+    /// Avoids a heap allocation on every sparse read.
+    pub(super) zero_block_bytes: Bytes,
 }
 
 impl CacheInner {

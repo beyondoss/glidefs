@@ -44,7 +44,7 @@ impl ContentStore {
         Ok(())
     }
 
-    /// Download a pack from S3.
+    /// Download a pack from S3 (buffered).
     #[instrument(skip(self), fields(pack_id = %pack_id))]
     pub async fn get_pack(&self, pack_id: Uuid) -> Result<Vec<u8>, ContentStoreError> {
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
@@ -52,6 +52,45 @@ impl ContentStore {
         let result = self.object_store.get(&path).await?;
         let bytes = result.bytes().await.map_err(object_store::Error::from)?;
         Ok(bytes.to_vec())
+    }
+
+    /// Fetch a single compressed block from a pack via S3 range request.
+    ///
+    /// Returns only the compressed bytes at `[offset..offset+comp_length]` —
+    /// typically ~100KB vs ~3MB for the full pack.
+    #[instrument(skip(self), fields(pack_id = %pack_id, offset, comp_length))]
+    pub async fn get_block(
+        &self,
+        pack_id: Uuid,
+        offset: u32,
+        comp_length: u32,
+    ) -> Result<bytes::Bytes, ContentStoreError> {
+        let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
+        let path = ObjectPath::from(key);
+        let start = offset as u64;
+        let end = start + comp_length as u64;
+        let bytes = self.object_store.get_range(&path, start..end).await?;
+        Ok(bytes)
+    }
+
+    /// Stream a pack from S3 as an async byte stream.
+    ///
+    /// Returns a stream of `Bytes` chunks. The caller can parse the header/index
+    /// from early chunks and decompress blocks incrementally as data arrives,
+    /// avoiding buffering the full ~3MB pack in memory.
+    #[instrument(skip(self), fields(pack_id = %pack_id))]
+    pub async fn get_pack_stream(
+        &self,
+        pack_id: Uuid,
+    ) -> Result<
+        impl futures::Stream<Item = Result<bytes::Bytes, ContentStoreError>> + Send + Unpin,
+        ContentStoreError,
+    > {
+        let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
+        let path = ObjectPath::from(key);
+        let result = self.object_store.get(&path).await?;
+        let stream = result.into_stream().map(|r| r.map_err(ContentStoreError::from));
+        Ok(Box::pin(stream))
     }
 
     /// Upload a manifest to S3. Returns the S3 ETag if the backend provides one.

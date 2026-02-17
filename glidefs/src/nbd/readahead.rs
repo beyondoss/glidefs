@@ -43,15 +43,12 @@ impl SequentialDetector {
             return None;
         }
 
-        // Check if last 3 entries are consecutive (n, n+1, n+2)
-        let count = self.len.min(3) as usize;
-        let mut recent = Vec::with_capacity(count);
-        for i in 0..count {
-            let idx = (self.pos as usize + 4 - count + i) % 4;
-            recent.push(self.last_chunks[idx]);
-        }
-
-        let is_sequential = recent.windows(2).all(|w| w[1] == w[0] + 1);
+        // Check if last 3 entries are consecutive (n, n+1, n+2).
+        // Read directly from the ring buffer — no allocation needed.
+        let a = self.last_chunks[(self.pos as usize + 4 - 3) % 4];
+        let b = self.last_chunks[(self.pos as usize + 4 - 2) % 4];
+        let c = self.last_chunks[(self.pos as usize + 4 - 1) % 4];
+        let is_sequential = b == a + 1 && c == b + 1;
         if !is_sequential {
             self.last_readahead_chunk = None;
             return None;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument};
 
 use crate::nbd::block_map::{
-    BlockMapEntry, BlockMapKind, Blake3Hash, lz4_compress, ZERO_BLOCK_HASH,
+    BlockMapEntry, BlockMapKind, Blake3Hash, lz4_compress,
 };
 use crate::nbd::block_store::S3BlockStore;
 use crate::nbd::content_store::ContentStore;
@@ -108,7 +108,7 @@ impl WriteCache<Active> {
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
 
         // 3. Dedup check + compress new blocks
-        let zero_hash = *ZERO_BLOCK_HASH;
+        let zero_hash = self.inner.zero_block_hash;
         let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
         let mut seen_hashes = std::collections::HashSet::new();
 

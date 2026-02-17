@@ -155,7 +155,7 @@ async fn run_demand_driven(
 
             // Explicit flush trigger.
             () = flush_trigger.notified() => {
-                do_full_flush(cache, content_store, pack_index, metrics).await;
+                do_full_flush(cache, content_store, pack_index, flush_trigger, metrics).await;
             }
         }
     }
@@ -207,7 +207,7 @@ async fn run_continuous(
 
             // Explicit flush trigger (budget exceeded, API call).
             () = flush_trigger.notified() => {
-                do_full_flush(cache, content_store, pack_index, metrics).await;
+                do_full_flush(cache, content_store, pack_index, flush_trigger, metrics).await;
                 // A full flush includes a manifest sync, so reset cutpoint.
                 last_seq_cutpoint = 0;
                 pack_backoff = Duration::from_secs(1);
@@ -270,10 +270,15 @@ async fn run_continuous(
 // ---------------------------------------------------------------------------
 
 /// Perform a full flush: pack all dirty blocks and sync the manifest.
+///
+/// On failure, re-notifies the flush trigger so the scheduler retries on the
+/// next iteration. Without this, a failed demand-driven flush would leave
+/// dirty blocks stranded with no retry mechanism.
 async fn do_full_flush(
     cache: &Arc<WriteCache<Active>>,
     content_store: &Arc<ContentStore>,
     pack_index: &Arc<HostPackIndex>,
+    flush_trigger: &Arc<Notify>,
     metrics: &ExportMetrics,
 ) {
     let start = Instant::now();
@@ -291,7 +296,9 @@ async fn do_full_flush(
         }
         Err(e) => {
             metrics.record_flush_error();
-            error!(error = %e, "full flush failed");
+            error!(error = %e, "full flush failed, scheduling retry");
+            // Re-notify so the scheduler retries instead of silently dropping the flush.
+            flush_trigger.notify_one();
         }
     }
 }

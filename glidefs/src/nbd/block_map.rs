@@ -13,7 +13,7 @@ use std::fmt;
 use std::io::{self, Read, Write as IoWrite};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 
@@ -73,8 +73,14 @@ pub fn blake3_128(data: &[u8]) -> Blake3Hash {
     Blake3Hash(truncated)
 }
 
-/// Well-known hash of a 128KB zero block (the hash for trimmed/unwritten chunks).
-pub static ZERO_BLOCK_HASH: LazyLock<Blake3Hash> = LazyLock::new(|| blake3_128(&[0u8; 131072]));
+/// Compute the well-known zero-block hash for a given block size.
+///
+/// This is the BLAKE3-128 hash of `block_size` zero bytes. Used by the write cache
+/// to identify trimmed/unwritten chunks for dedup (zero blocks are never uploaded).
+pub fn zero_block_hash(block_size: usize) -> Blake3Hash {
+    blake3_128(&vec![0u8; block_size])
+}
+
 
 // ============================================================================
 // BlockMapEntry -- per-chunk metadata
@@ -716,8 +722,12 @@ impl BlockMapKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
     use std::time::Instant;
     use tempfile::TempDir;
+
+    static ZERO_BLOCK_HASH_128K: LazyLock<Blake3Hash> =
+        LazyLock::new(|| blake3_128(&[0u8; 131072]));
 
     #[test]
     fn test_blake3_deterministic() {
@@ -738,7 +748,7 @@ mod tests {
     fn test_blake3_zero_block() {
         let zero_block = [0u8; 131072]; // 128KB
         let h = blake3_128(&zero_block);
-        assert_eq!(h, *ZERO_BLOCK_HASH);
+        assert_eq!(h, *ZERO_BLOCK_HASH_128K);
         assert!(
             !h.is_zero(),
             "zero-block hash should not be the ZERO sentinel"

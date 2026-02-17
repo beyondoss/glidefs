@@ -4,10 +4,6 @@ use tokio::sync::Notify;
 
 use super::CacheError;
 
-/// The block size that ZERO_BLOCK_HASH and ZERO_BLOCK_BYTES are compiled for.
-/// Changing this requires updating those statics.
-pub const EXPECTED_BLOCK_SIZE: usize = 128 * 1024;
-
 /// Configuration for the write cache.
 #[derive(Clone, Debug)]
 pub struct WriteCacheConfig {
@@ -64,16 +60,9 @@ impl WriteCacheConfig {
         self.cache_dir.join(format!("{}.wal", self.device_name))
     }
 
-    /// Validate that block_size is compatible with the compiled-in ZERO_BLOCK_BYTES size.
-    ///
-    /// ZERO_BLOCK_BYTES is a static 128KB buffer used by resolve_chunk to serve
-    /// zero reads. block_size must not exceed it or slice() will panic.
-    /// ZERO_BLOCK_HASH is the hash of a 128KB zero block — zero-block dedup is
-    /// only correct when block_size == EXPECTED_BLOCK_SIZE.
+    /// Validate configuration. Currently a no-op — zero-block hash and buffer
+    /// are computed per block_size at construction time, so all sizes are supported.
     pub fn validate(&self) -> Result<(), CacheError> {
-        if self.block_size > EXPECTED_BLOCK_SIZE {
-            return Err(CacheError::UnsupportedBlockSize(self.block_size, EXPECTED_BLOCK_SIZE));
-        }
         Ok(())
     }
 }

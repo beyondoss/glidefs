@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use tracing::{debug, instrument};
 
-use crate::nbd::block_map::{blake3_128, ZERO_BLOCK_HASH};
+use crate::nbd::block_map::blake3_128;
 use crate::nbd::state::Active;
 use crate::nbd::wal::WalEntryRef;
 
@@ -196,7 +196,7 @@ impl WriteCache<Active> {
             let block_size = self.inner.config.block_size as u64;
             let start_block = offset / block_size;
             let end_block = (offset + len - 1) / block_size;
-            let zero_hash = *ZERO_BLOCK_HASH;
+            let zero_hash = self.inner.zero_block_hash;
 
             for block in start_block..=end_block {
                 let idx = block as usize;

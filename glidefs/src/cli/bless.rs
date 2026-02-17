@@ -1,5 +1,5 @@
 use crate::config::Settings;
-use crate::nbd::block_map::{blake3_128, lz4_compress, BlockMap, BlockMapEntry, ZERO_BLOCK_HASH};
+use crate::nbd::block_map::{blake3_128, lz4_compress, BlockMap, BlockMapEntry, zero_block_hash};
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::manifest::{serialize_hot_set, Manifest, ManifestBlockEntry};
 use crate::nbd::pack::{assemble_pack, PackLocation, BLOCKS_PER_PACK};
@@ -95,7 +95,7 @@ pub async fn run_bless(
         let hash = blake3_128(&buf);
 
         // Skip zero blocks entirely — read path returns zeros by convention
-        if hash == *ZERO_BLOCK_HASH {
+        if hash == zero_block_hash(chunk_size as usize) {
             stats.zero_chunks += 1;
             continue;
         }
@@ -303,7 +303,7 @@ mod tests {
 
             let hash = blake3_128(&buf);
 
-            if hash == *ZERO_BLOCK_HASH {
+            if hash == zero_block_hash(chunk_size as usize) {
                 stats.zero_chunks += 1;
                 continue;
             }

@@ -1,6 +1,5 @@
 use super::*;
 use crate::nbd::block_map::blake3_128;
-use crate::nbd::block_store::S3BlockStore;
 use crate::nbd::state::{Active, Initializing};
 use bytes::Bytes;
 use object_store::memory::InMemory;
@@ -21,19 +20,13 @@ fn test_config(dir: &Path) -> WriteCacheConfig {
     }
 }
 
-fn test_s3() -> S3BlockStore {
-    let object_store = Arc::new(InMemory::new());
-    S3BlockStore::with_defaults(object_store, "test")
-}
-
 #[tokio::test]
 async fn test_open_fresh_cache() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path());
-    let s3 = test_s3();
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery(&s3).await.unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
 
     assert_eq!(cache.dirty_block_count(), 0);
 }
@@ -42,10 +35,9 @@ async fn test_open_fresh_cache() {
 async fn test_write_read() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path());
-    let s3 = test_s3();
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery(&s3).await.unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
 
     // Write some data
     cache.write(0, b"hello world").unwrap();
@@ -62,10 +54,9 @@ async fn test_write_read() {
 async fn test_flush() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path());
-    let s3 = test_s3();
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery(&s3).await.unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
 
     cache.write(0, b"data").unwrap();
     cache.flush().unwrap();
@@ -79,12 +70,11 @@ async fn test_flush() {
 async fn test_metadata_persistence() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path());
-    let s3 = test_s3();
 
     // Create cache and write data
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
-        let cache = cache.finish_recovery(&s3).await.unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
         cache.write(0, b"persistent").unwrap();
         cache.save_metadata().unwrap();
     }
@@ -95,306 +85,11 @@ async fn test_metadata_persistence() {
         // Should have dirty blocks from previous session
         assert!(cache.inner.dirty_block_count.load(Ordering::Relaxed) > 0);
 
-        let cache = cache.finish_recovery(&s3).await.unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
         // Data should be readable
         let data = cache.read(0, 10).unwrap();
         assert_eq!(&data[..], b"persistent");
     }
-}
-
-#[tokio::test]
-async fn test_read_through_from_s3() {
-    // This test verifies the core read-through functionality:
-    // When a block exists in S3 but not locally, read_with_fetch should fetch it.
-
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let s3 = S3BlockStore::new(Arc::clone(&object_store), "test", 4096)
-        .with_blocks_per_batch(10); // 10 blocks per batch for testing
-    let metrics = crate::nbd::metrics::ExportMetrics::new();
-
-    // Pre-populate S3 with some data (simulating data from another node)
-    // Block 0 is in batch 0, block 5 is also in batch 0 (with 10 blocks per batch)
-    let mut batch0 = vec![0u8; s3.batch_size()];
-    // Block 0: fill with 42
-    batch0[..4096].copy_from_slice(&vec![42u8; 4096]);
-    // Block 5: fill with 99
-    let block5_offset = 5 * 4096;
-    batch0[block5_offset..block5_offset + 4096].copy_from_slice(&vec![99u8; 4096]);
-    s3.put_batch(0, batch0).await.unwrap();
-
-    // Create a fresh cache on a "new node" (no local data)
-    let dir = TempDir::new().unwrap();
-    let config = test_config(dir.path());
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery(&s3).await.unwrap();
-
-    // Read block 0 - should fetch from S3
-    let data = cache.read_with_fetch(0, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 42);
-    assert!(data.iter().all(|&b| b == 42));
-
-    // Read block 5 - should also fetch from S3
-    let offset = 5 * 4096;
-    let data = cache.read_with_fetch(offset, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 99);
-
-    // Second read of block 0 should come from local cache now
-    let data = cache.read_with_fetch(0, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 42);
-
-    // Read a block that doesn't exist in S3 - should return zeros
-    let offset = 10 * 4096;
-    let data = cache.read_with_fetch(offset, 4096, &s3, &metrics).await.unwrap();
-    assert!(data.iter().all(|&b| b == 0));
-
-    // Verify metrics were recorded
-    // With batch prefetching:
-    // - Read block 0: cache miss, fetches batch 0 (caches blocks 0-9), 1 S3 read
-    // - Read block 5: cache HIT (was prefetched with block 0's batch)
-    // - Read block 0 again: cache hit
-    // - Read block 10: cache miss, fetches batch 1 (returns zeros), 1 S3 read
-    let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.cache_misses, 2); // blocks 0 and 10 (block 5 was prefetched)
-    assert_eq!(snapshot.cache_hits, 2); // block 5 (prefetched) + second read of block 0
-    assert_eq!(snapshot.s3_read_ops, 2); // batch 0 + batch 1 (even though batch 1 is empty)
-}
-
-#[tokio::test]
-async fn test_write_then_read_local() {
-    // Verify that written blocks are marked as present and read locally
-    let dir = TempDir::new().unwrap();
-    let config = test_config(dir.path());
-    let s3 = test_s3();
-    let metrics = crate::nbd::metrics::ExportMetrics::new();
-
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery(&s3).await.unwrap();
-
-    // Write data locally
-    cache.write(0, b"local data!").unwrap();
-
-    // Read should come from local cache, not S3
-    let data = cache.read_with_fetch(0, 11, &s3, &metrics).await.unwrap();
-    assert_eq!(&data[..], b"local data!");
-
-    // S3 should NOT have this data yet (not synced)
-    let s3_result = s3.read_block(0).await;
-    assert!(matches!(
-        s3_result,
-        Err(crate::nbd::block_store::BlockStoreError::NotFound(_))
-    ));
-
-    // Verify cache hit (data was present locally)
-    let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.cache_hits, 1);
-    assert_eq!(snapshot.cache_misses, 0);
-}
-
-#[tokio::test]
-async fn test_batch_prefetch_single_batch_efficiency() {
-    // When reading multiple scattered blocks from the SAME S3 batch,
-    // we should only make ONE S3 call (not one per block).
-    //
-    // This tests the core efficiency gain of batch prefetching.
-
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let s3 = S3BlockStore::new(Arc::clone(&object_store), "test", 4096)
-        .with_blocks_per_batch(100); // 100 blocks per batch
-    let metrics = crate::nbd::metrics::ExportMetrics::new();
-
-    // Pre-populate S3 batch 0 with distinct data for blocks 0, 25, 50, 75
-    let mut batch0 = vec![0u8; s3.batch_size()];
-    batch0[0..4096].copy_from_slice(&vec![11u8; 4096]);           // block 0
-    batch0[25 * 4096..26 * 4096].copy_from_slice(&vec![22u8; 4096]); // block 25
-    batch0[50 * 4096..51 * 4096].copy_from_slice(&vec![33u8; 4096]); // block 50
-    batch0[75 * 4096..76 * 4096].copy_from_slice(&vec![44u8; 4096]); // block 75
-    s3.put_batch(0, batch0).await.unwrap();
-
-    // Create fresh cache
-    let dir = TempDir::new().unwrap();
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "prefetch_test".to_string(),
-        device_size: 100 * 4096, // 100 blocks
-        block_size: 4096,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
-        wal_sync: false,
-    };
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery(&s3).await.unwrap();
-
-    // Read block 0 - triggers fetch of entire batch 0
-    let data = cache.read_with_fetch(0, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 11, "block 0 should have correct data");
-
-    // Read block 25 - should be a CACHE HIT (prefetched with block 0)
-    let data = cache.read_with_fetch(25 * 4096, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 22, "block 25 should have correct data");
-
-    // Read block 50 - should be a CACHE HIT (prefetched with block 0)
-    let data = cache.read_with_fetch(50 * 4096, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 33, "block 50 should have correct data");
-
-    // Read block 75 - should be a CACHE HIT (prefetched with block 0)
-    let data = cache.read_with_fetch(75 * 4096, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 44, "block 75 should have correct data");
-
-    // Verify: only ONE S3 read operation for 4 block reads
-    let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.s3_read_ops, 1, "should only fetch batch once");
-    assert_eq!(snapshot.cache_misses, 1, "only first read should be a miss");
-    assert_eq!(snapshot.cache_hits, 3, "subsequent reads should hit cache");
-}
-
-#[tokio::test]
-async fn test_batch_prefetch_cross_batch_efficiency() {
-    // When reading blocks from N different S3 batches,
-    // we should make exactly N S3 calls.
-
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let s3 = S3BlockStore::new(Arc::clone(&object_store), "test", 4096)
-        .with_blocks_per_batch(10); // 10 blocks per batch for easier testing
-    let metrics = crate::nbd::metrics::ExportMetrics::new();
-
-    // Pre-populate 3 batches
-    let mut batch0 = vec![0u8; s3.batch_size()];
-    batch0[0..4096].copy_from_slice(&vec![0xAAu8; 4096]); // block 0
-    s3.put_batch(0, batch0).await.unwrap();
-
-    let mut batch1 = vec![0u8; s3.batch_size()];
-    batch1[5 * 4096..6 * 4096].copy_from_slice(&vec![0xBBu8; 4096]); // block 15 (5th in batch 1)
-    s3.put_batch(1, batch1).await.unwrap();
-
-    let mut batch2 = vec![0u8; s3.batch_size()];
-    batch2[3 * 4096..4 * 4096].copy_from_slice(&vec![0xCCu8; 4096]); // block 23 (3rd in batch 2)
-    s3.put_batch(2, batch2).await.unwrap();
-
-    // Create fresh cache
-    let dir = TempDir::new().unwrap();
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "cross_batch_test".to_string(),
-        device_size: 30 * 4096, // 30 blocks = 3 batches
-        block_size: 4096,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
-        wal_sync: false,
-    };
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery(&s3).await.unwrap();
-
-    // Read from batch 0
-    let data = cache.read_with_fetch(0, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 0xAA);
-
-    // Read from batch 1 (block 15)
-    let data = cache.read_with_fetch(15 * 4096, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 0xBB);
-
-    // Read from batch 2 (block 23)
-    let data = cache.read_with_fetch(23 * 4096, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 0xCC);
-
-    // Verify: exactly 3 S3 reads (one per batch)
-    let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.s3_read_ops, 3, "should fetch each batch once");
-    assert_eq!(snapshot.cache_misses, 3, "one miss per batch");
-}
-
-#[tokio::test]
-async fn test_batch_prefetch_multi_block_read_span() {
-    // When a single read spans multiple blocks in the same batch,
-    // we should prefetch the entire batch and serve the read efficiently.
-
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let s3 = S3BlockStore::new(Arc::clone(&object_store), "test", 4096)
-        .with_blocks_per_batch(10);
-    let metrics = crate::nbd::metrics::ExportMetrics::new();
-
-    // Pre-populate batch 0 with sequential pattern
-    let mut batch0 = vec![0u8; s3.batch_size()];
-    for i in 0..10 {
-        let block_start = i * 4096;
-        batch0[block_start..block_start + 4096].copy_from_slice(&vec![i as u8; 4096]);
-    }
-    s3.put_batch(0, batch0).await.unwrap();
-
-    let dir = TempDir::new().unwrap();
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "span_test".to_string(),
-        device_size: 10 * 4096,
-        block_size: 4096,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
-        wal_sync: false,
-    };
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery(&s3).await.unwrap();
-
-    // Read 3 blocks at once (blocks 2, 3, 4) - should fetch batch once
-    let data = cache.read_with_fetch(2 * 4096, 3 * 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 2, "block 2 should start with 2");
-    assert_eq!(data[4096], 3, "block 3 should start with 3");
-    assert_eq!(data[8192], 4, "block 4 should start with 4");
-
-    // Now read block 7 - should be a cache hit (prefetched)
-    let data = cache.read_with_fetch(7 * 4096, 4096, &s3, &metrics).await.unwrap();
-    assert_eq!(data[0], 7, "block 7 should have been prefetched");
-
-    let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.s3_read_ops, 1, "only one S3 fetch");
-    assert_eq!(snapshot.cache_misses, 3, "3 blocks were missing initially");
-    assert_eq!(snapshot.cache_hits, 1, "block 7 was a cache hit");
-}
-
-#[tokio::test]
-async fn test_batch_prefetch_with_local_dirty_blocks() {
-    // Verify that batch prefetching correctly handles the case where
-    // some blocks are dirty locally and others need to be fetched from S3.
-    // The local dirty blocks should NOT be overwritten by S3 data.
-
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let s3 = S3BlockStore::new(Arc::clone(&object_store), "test", 4096)
-        .with_blocks_per_batch(10);
-    let metrics = crate::nbd::metrics::ExportMetrics::new();
-
-    // Pre-populate S3 with old data
-    let mut batch0 = vec![0u8; s3.batch_size()];
-    batch0[0..4096].copy_from_slice(&vec![0xAAu8; 4096]); // block 0: old S3 data
-    batch0[4096..8192].copy_from_slice(&vec![0xBBu8; 4096]); // block 1: old S3 data
-    s3.put_batch(0, batch0).await.unwrap();
-
-    let dir = TempDir::new().unwrap();
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "dirty_test".to_string(),
-        device_size: 10 * 4096,
-        block_size: 4096,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
-        wal_sync: false,
-    };
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery(&s3).await.unwrap();
-
-    // Write NEW data to block 0 locally (makes it dirty and present)
-    cache.write(0, &[0xCCu8; 4096]).unwrap();
-
-    // Now read blocks 0 and 1 together
-    // Block 0 should come from local (dirty), block 1 should fetch from S3
-    let data = cache.read_with_fetch(0, 8192, &s3, &metrics).await.unwrap();
-
-    // Block 0 should have our local NEW data (not old S3 data)
-    assert_eq!(data[0], 0xCC, "block 0 should have local data, not S3");
-
-    // Block 1 should have S3 data (fetched)
-    assert_eq!(data[4096], 0xBB, "block 1 should have S3 data");
-
-    let snapshot = metrics.snapshot();
-    assert_eq!(snapshot.cache_hits, 1, "block 0 was local (hit)");
-    assert_eq!(snapshot.cache_misses, 1, "block 1 was fetched (miss)");
 }
 
 #[test]
@@ -417,190 +112,6 @@ fn test_is_zero_block() {
 
     // Empty slice
     assert!(super::inner::is_zero_block(&[]), "empty slice is 'all zeros'");
-}
-
-#[tokio::test]
-async fn test_prefetch_write_race_data_integrity() {
-    // Regression test for prefetch/write race condition.
-    //
-    // Without the fix, this sequence causes data loss:
-    // 1. S3 has old data (0xAA)
-    // 2. Write starts: pwrite(0xBB) completes
-    // 3. Prefetch: sees is_present=false, fetches S3, pwrite(0xAA) OVERWRITES
-    // 4. Write: set_present (too late)
-    // 5. File now has 0xAA (stale), but marked dirty → syncs stale data
-    //
-    // With the fix (set_present before pwrite in write path):
-    // - Write's set_present runs early, prefetch's CAS fails → prefetch skips
-    // - OR prefetch CAS wins, but write's pwrite comes after → write wins
-
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let s3 = Arc::new(
-        S3BlockStore::new(Arc::clone(&object_store), "test", 4096).with_blocks_per_batch(10),
-    );
-    let metrics = crate::nbd::metrics::ExportMetrics::new();
-
-    // Pre-populate S3 with OLD data (0xAA)
-    let mut batch0 = vec![0u8; s3.batch_size()];
-    batch0[0..4096].copy_from_slice(&[0xAAu8; 4096]);
-    s3.put_batch(0, batch0).await.unwrap();
-
-    let dir = TempDir::new().unwrap();
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "race_test".to_string(),
-        device_size: 10 * 4096,
-        block_size: 4096,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
-        wal_sync: false,
-    };
-    let cache = Arc::new(
-        WriteCache::<Initializing>::open(config)
-            .unwrap()
-            .skip_recovery_for_test(),
-    );
-
-    // Use barriers to force a specific interleaving
-    let write_started = Arc::new(AtomicBool::new(false));
-    let prefetch_can_continue = Arc::new(AtomicBool::new(false));
-
-    // Spawn concurrent tasks
-    let cache_write = Arc::clone(&cache);
-    let write_started_clone = Arc::clone(&write_started);
-    let prefetch_can_continue_clone = Arc::clone(&prefetch_can_continue);
-
-    let write_handle = tokio::spawn(async move {
-        // Write NEW data (0xBB) - should win over stale S3 data
-        cache_write.write(0, &[0xBBu8; 4096]).unwrap();
-        write_started_clone.store(true, AtomicOrdering::Release);
-        // Signal prefetch can continue
-        prefetch_can_continue_clone.store(true, AtomicOrdering::Release);
-    });
-
-    let cache_read = Arc::clone(&cache);
-    let s3_read = Arc::clone(&s3);
-    let write_started_read = Arc::clone(&write_started);
-    let _prefetch_can_continue_read = Arc::clone(&prefetch_can_continue);
-
-    let read_handle = tokio::spawn(async move {
-        // Wait until write has started (to maximize race window)
-        while !write_started_read.load(AtomicOrdering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        // Small delay to let write progress
-        tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
-
-        // Now do the read which triggers prefetch
-        cache_read
-            .read_with_fetch(0, 4096, &s3_read, &metrics)
-            .await
-            .unwrap()
-    });
-
-    // Wait for both
-    write_handle.await.unwrap();
-    let _read_data = read_handle.await.unwrap();
-
-    // The critical assertion: we must see the WRITE's data (0xBB), not S3's stale data (0xAA)
-    //
-    // Either:
-    // - Write completed first, read sees 0xBB (write won)
-    // - Prefetch completed first with 0xAA, but write overwrote it, read sees 0xBB (write won)
-    // - Prefetch won and write hasn't completed yet, read sees 0xAA (acceptable during race)
-    //   BUT: block is marked dirty, so sync will upload the final file contents
-    //
-    // What we CANNOT accept: file has 0xAA, read returns 0xAA, block is dirty,
-    // sync uploads 0xAA (stale) - this is data loss.
-
-    // Verify final file contents (the authoritative state)
-    let final_data = cache.read_local(0, 4096).unwrap();
-
-    // The file MUST have 0xBB (write's data). If it has 0xAA, the race caused data loss.
-    assert_eq!(
-        final_data[0], 0xBB,
-        "RACE CONDITION BUG: write's data was overwritten by stale S3 prefetch! \
-         File has 0x{:02X}, expected 0xBB",
-        final_data[0]
-    );
-
-    // Also verify block is dirty (will sync the correct data)
-    assert!(
-        cache.dirty_block_count() > 0 || cache.syncing_block_count() > 0,
-        "Block should be dirty to ensure write's data syncs to S3"
-    );
-}
-
-#[tokio::test]
-async fn test_concurrent_write_and_prefetch_stress() {
-    // Stress test: many concurrent writes and reads to maximize race probability.
-    // Run multiple iterations to increase chance of hitting the race window.
-
-    for iteration in 0..10 {
-        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let s3 = Arc::new(
-            S3BlockStore::new(Arc::clone(&object_store), "test", 4096).with_blocks_per_batch(10),
-        );
-        let metrics = Arc::new(crate::nbd::metrics::ExportMetrics::new());
-
-        // Pre-populate S3 with old data for blocks 0-9
-        let batch0 = vec![0xAAu8; s3.batch_size()];
-        s3.put_batch(0, batch0).await.unwrap();
-
-        let dir = TempDir::new().unwrap();
-        let config = WriteCacheConfig {
-            cache_dir: dir.path().to_path_buf(),
-            device_name: format!("stress_{}", iteration),
-            device_size: 10 * 4096,
-            block_size: 4096,
-            dirty_budget_bytes: 0,
-            flush_trigger: None,
-            wal_sync: false,
-        };
-        let cache = Arc::new(
-            WriteCache::<Initializing>::open(config)
-                .unwrap()
-                .skip_recovery_for_test(),
-        );
-
-        // Spawn many concurrent operations
-        let mut handles = vec![];
-
-        for block in 0..5u64 {
-            let cache_w = Arc::clone(&cache);
-            let write_val = (block + 1) as u8; // 1, 2, 3, 4, 5
-            handles.push(tokio::spawn(async move {
-                cache_w.write(block * 4096, &[write_val; 4096]).unwrap();
-            }));
-
-            let cache_r = Arc::clone(&cache);
-            let s3_r = Arc::clone(&s3);
-            let metrics_r = Arc::clone(&metrics);
-            handles.push(tokio::spawn(async move {
-                let _ = cache_r
-                    .read_with_fetch(block * 4096, 4096, &s3_r, &metrics_r)
-                    .await;
-            }));
-        }
-
-        // Wait for all
-        for h in handles {
-            let _ = h.await;
-        }
-
-        // Verify: each block should have its write value, not 0xAA
-        for block in 0..5u64 {
-            let data = cache.read_local(block * 4096, 4096).unwrap();
-            let expected = (block + 1) as u8;
-            assert_eq!(
-                data[0], expected,
-                "Iteration {}, block {}: expected 0x{:02X}, got 0x{:02X} (0xAA = stale S3 data)",
-                iteration, block, expected, data[0]
-            );
-        }
-    }
 }
 
 // ====================================================================
@@ -638,13 +149,12 @@ impl V2Harness {
             flush_trigger: None,
             wal_sync: false,
         };
-        let s3 = test_s3();
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = crate::nbd::content_store::ContentStore::new(object_store, "test-bucket");
         let pack_index = crate::nbd::pack_index::HostPackIndex::new();
         let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
         let cache = WriteCache::<Initializing>::open(config).unwrap();
-        let cache = cache.finish_recovery(&s3).await.unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
         Self { cache, content_store, pack_index, clean_cache, dir }
     }
 
@@ -929,6 +439,8 @@ async fn test_v2_read_from_s3_pack() {
 
 #[tokio::test]
 async fn test_v2_pack_prefetch_warms_siblings() {
+    use crate::nbd::cache::BlockCache;
+
     let h = V2Harness::new().await;
 
     // Write 25 blocks (1 full pack).
@@ -938,17 +450,33 @@ async fn test_v2_pack_prefetch_warms_siblings() {
     h.flush().await;
     h.clear_dirty_store();
 
-    // Read block 0 — triggers pack fetch, caches all 25 blocks.
-    let got = h.read(0, 4096).await;
-    assert!(got.iter().all(|&b| b == 1));
+    // Prefetch block 0 — fetches entire pack, caches all 25 blocks.
+    h.cache
+        .prefetch_chunk(0, &h.clean_cache, &h.pack_index, &h.content_store)
+        .await
+        .unwrap();
 
-    // Blocks 1-24 should now be clean_cache hits (no additional S3 fetch).
-    for i in 1u8..25 {
+    // All 25 blocks should now be in the clean cache.
+    for i in 0u8..25 {
+        let hash = {
+            let (hash, _) = h.cache.inner.block_map_get(i as usize);
+            hash
+        };
+        assert!(
+            h.clean_cache.get(&hash).await.is_some(),
+            "sibling block {} should be cached from pack prefetch",
+            i
+        );
+    }
+
+    // Reads should resolve from clean cache (no additional S3 fetch).
+    for i in 0u8..25 {
         let got = h.read(i as u64 * 4096, 4096).await;
         assert!(
             got.iter().all(|&b| b == i + 1),
-            "sibling block {} should be cached from pack prefetch",
-            i
+            "block {} should contain 0x{:02x}",
+            i,
+            i + 1
         );
     }
 }
