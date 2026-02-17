@@ -470,26 +470,26 @@ impl MetricsSnapshot {
         let label = format!("export=\"{}\"", export_name);
 
         // Guest I/O counters
-        writeln!(out, "glidefs_guest_bytes_written{{{label}}} {}", self.guest_bytes_written).unwrap();
-        writeln!(out, "glidefs_guest_write_ops{{{label}}} {}", self.guest_write_ops).unwrap();
-        writeln!(out, "glidefs_guest_bytes_read{{{label}}} {}", self.guest_bytes_read).unwrap();
-        writeln!(out, "glidefs_guest_read_ops{{{label}}} {}", self.guest_read_ops).unwrap();
+        writeln!(out, "glidefs_guest_bytes_written_total{{{label}}} {}", self.guest_bytes_written).unwrap();
+        writeln!(out, "glidefs_guest_write_ops_total{{{label}}} {}", self.guest_write_ops).unwrap();
+        writeln!(out, "glidefs_guest_bytes_read_total{{{label}}} {}", self.guest_bytes_read).unwrap();
+        writeln!(out, "glidefs_guest_read_ops_total{{{label}}} {}", self.guest_read_ops).unwrap();
 
         // S3 I/O counters
-        writeln!(out, "glidefs_s3_bytes_written{{{label}}} {}", self.s3_bytes_written).unwrap();
-        writeln!(out, "glidefs_s3_write_ops{{{label}}} {}", self.s3_write_ops).unwrap();
-        writeln!(out, "glidefs_s3_batches_written{{{label}}} {}", self.batches_written).unwrap();
-        writeln!(out, "glidefs_s3_bytes_read{{{label}}} {}", self.s3_bytes_read).unwrap();
-        writeln!(out, "glidefs_s3_read_ops{{{label}}} {}", self.s3_read_ops).unwrap();
+        writeln!(out, "glidefs_s3_bytes_written_total{{{label}}} {}", self.s3_bytes_written).unwrap();
+        writeln!(out, "glidefs_s3_write_ops_total{{{label}}} {}", self.s3_write_ops).unwrap();
+        writeln!(out, "glidefs_s3_batches_written_total{{{label}}} {}", self.batches_written).unwrap();
+        writeln!(out, "glidefs_s3_bytes_read_total{{{label}}} {}", self.s3_bytes_read).unwrap();
+        writeln!(out, "glidefs_s3_read_ops_total{{{label}}} {}", self.s3_read_ops).unwrap();
 
         // Cache counters
-        writeln!(out, "glidefs_cache_hits{{{label}}} {}", self.cache_hits).unwrap();
-        writeln!(out, "glidefs_cache_misses{{{label}}} {}", self.cache_misses).unwrap();
+        writeln!(out, "glidefs_cache_hits_total{{{label}}} {}", self.cache_hits).unwrap();
+        writeln!(out, "glidefs_cache_misses_total{{{label}}} {}", self.cache_misses).unwrap();
 
         // Error counters
-        writeln!(out, "glidefs_s3_put_errors{{{label}}} {}", self.s3_put_errors).unwrap();
-        writeln!(out, "glidefs_s3_get_errors{{{label}}} {}", self.s3_get_errors).unwrap();
-        writeln!(out, "glidefs_flush_errors{{{label}}} {}", self.flush_errors).unwrap();
+        writeln!(out, "glidefs_s3_put_errors_total{{{label}}} {}", self.s3_put_errors).unwrap();
+        writeln!(out, "glidefs_s3_get_errors_total{{{label}}} {}", self.s3_get_errors).unwrap();
+        writeln!(out, "glidefs_flush_errors_total{{{label}}} {}", self.flush_errors).unwrap();
 
         // Cache state (gauges)
         if let Some(dirty) = self.dirty_blocks {
@@ -585,28 +585,28 @@ impl MetricsSnapshot {
 /// Generate Prometheus metrics header (TYPE and HELP lines).
 /// Call once before iterating exports.
 pub fn prometheus_header() -> &'static str {
-    r#"# HELP glidefs_guest_bytes_written Total bytes written by guest
-# TYPE glidefs_guest_bytes_written counter
-# HELP glidefs_guest_write_ops Total NBD write commands from guest
-# TYPE glidefs_guest_write_ops counter
-# HELP glidefs_guest_bytes_read Total bytes read by guest
-# TYPE glidefs_guest_bytes_read counter
-# HELP glidefs_guest_read_ops Total NBD read commands from guest
-# TYPE glidefs_guest_read_ops counter
-# HELP glidefs_s3_bytes_written Total bytes written to S3
-# TYPE glidefs_s3_bytes_written counter
-# HELP glidefs_s3_write_ops Total blocks written to S3
-# TYPE glidefs_s3_write_ops counter
-# HELP glidefs_s3_batches_written Total S3 batch objects written
-# TYPE glidefs_s3_batches_written counter
-# HELP glidefs_s3_bytes_read Total bytes read from S3
-# TYPE glidefs_s3_bytes_read counter
-# HELP glidefs_s3_read_ops Total S3 read operations
-# TYPE glidefs_s3_read_ops counter
-# HELP glidefs_cache_hits Cache hits (reads served from local cache)
-# TYPE glidefs_cache_hits counter
-# HELP glidefs_cache_misses Cache misses (reads requiring S3 fetch)
-# TYPE glidefs_cache_misses counter
+    r#"# HELP glidefs_guest_bytes_written_total Total bytes written by guest
+# TYPE glidefs_guest_bytes_written_total counter
+# HELP glidefs_guest_write_ops_total Total NBD write commands from guest
+# TYPE glidefs_guest_write_ops_total counter
+# HELP glidefs_guest_bytes_read_total Total bytes read by guest
+# TYPE glidefs_guest_bytes_read_total counter
+# HELP glidefs_guest_read_ops_total Total NBD read commands from guest
+# TYPE glidefs_guest_read_ops_total counter
+# HELP glidefs_s3_bytes_written_total Total bytes written to S3
+# TYPE glidefs_s3_bytes_written_total counter
+# HELP glidefs_s3_write_ops_total Total blocks written to S3
+# TYPE glidefs_s3_write_ops_total counter
+# HELP glidefs_s3_batches_written_total Total S3 batch objects written
+# TYPE glidefs_s3_batches_written_total counter
+# HELP glidefs_s3_bytes_read_total Total bytes read from S3
+# TYPE glidefs_s3_bytes_read_total counter
+# HELP glidefs_s3_read_ops_total Total S3 read operations
+# TYPE glidefs_s3_read_ops_total counter
+# HELP glidefs_cache_hits_total Cache hits (reads served from local cache)
+# TYPE glidefs_cache_hits_total counter
+# HELP glidefs_cache_misses_total Cache misses (reads requiring S3 fetch)
+# TYPE glidefs_cache_misses_total counter
 # HELP glidefs_dirty_blocks Blocks waiting to sync to S3
 # TYPE glidefs_dirty_blocks gauge
 # HELP glidefs_syncing_blocks Blocks currently syncing to S3
@@ -617,12 +617,12 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_coalesce_ratio gauge
 # HELP glidefs_cache_hit_rate Fraction of reads served from cache
 # TYPE glidefs_cache_hit_rate gauge
-# HELP glidefs_s3_put_errors Failed S3 PUT operations
-# TYPE glidefs_s3_put_errors counter
-# HELP glidefs_s3_get_errors Failed S3 GET operations
-# TYPE glidefs_s3_get_errors counter
-# HELP glidefs_flush_errors Failed flush cycles
-# TYPE glidefs_flush_errors counter
+# HELP glidefs_s3_put_errors_total Failed S3 PUT operations
+# TYPE glidefs_s3_put_errors_total counter
+# HELP glidefs_s3_get_errors_total Failed S3 GET operations
+# TYPE glidefs_s3_get_errors_total counter
+# HELP glidefs_flush_errors_total Failed flush cycles
+# TYPE glidefs_flush_errors_total counter
 "#
 }
 

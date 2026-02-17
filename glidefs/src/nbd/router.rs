@@ -39,6 +39,9 @@ pub enum RouterError {
     #[error("Export '{0}' not found")]
     ExportNotFound(String),
 
+    #[error("Invalid export name '{0}': must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric")]
+    InvalidExportName(String),
+
     #[error("Cannot shrink export '{name}': current size {current_gb}GB, requested {requested_gb}GB")]
     CannotShrink {
         name: String,
@@ -192,6 +195,23 @@ pub struct ExportRouter {
     wal_sync: bool,
 }
 
+/// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
+/// must start with an alphanumeric character. Rejects path traversal attempts.
+fn validate_export_name(name: &str) -> Result<(), RouterError> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(RouterError::InvalidExportName(name.to_string()));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphanumeric() {
+        return Err(RouterError::InvalidExportName(name.to_string()));
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(RouterError::InvalidExportName(name.to_string()));
+    }
+    Ok(())
+}
+
 impl ExportRouter {
     /// Create a new export router.
     pub fn new(config: RouterConfig) -> Self {
@@ -333,6 +353,7 @@ impl ExportRouter {
         manifest_name: Option<&str>,
     ) -> Result<(), RouterError> {
         let name = config.name.clone();
+        validate_export_name(&name)?;
 
         // Check if export already exists - idempotent: return success if already exists
         {
@@ -524,6 +545,13 @@ impl ExportRouter {
         };
 
         let mut exports = self.exports.write().await;
+        // Re-check under write lock to prevent TOCTOU race: a concurrent
+        // create_export could have inserted between our read lock check and
+        // this write lock acquisition.
+        if exports.contains_key(&name) {
+            info!("Export '{}' already exists (concurrent create), skipping", name);
+            return Ok(());
+        }
         exports.insert(name.clone(), state);
 
         info!("Export '{}' created successfully (readonly={})", name, readonly);
@@ -540,6 +568,7 @@ impl ExportRouter {
     ///
     /// Returns the manifest ETag and sequence number for use by the control plane.
     pub async fn snapshot_export(&self, name: &str) -> Result<SnapshotResponse, RouterError> {
+        validate_export_name(name)?;
         let exports = self.exports.read().await;
         let state = exports
             .get(name)
@@ -602,9 +631,10 @@ impl ExportRouter {
 
         let cache_writable = {
             let probe = self.cache_dir.join(".health-probe");
-            std::fs::write(&probe, b"ok")
-                .and_then(|_| std::fs::remove_file(&probe))
+            tokio::fs::write(&probe, b"ok")
+                .await
                 .is_ok()
+                && tokio::fs::remove_file(&probe).await.is_ok()
         };
 
         ReadinessStatus {
@@ -627,6 +657,7 @@ impl ExportRouter {
 
     /// Drain an export's dirty blocks to S3.
     pub async fn drain_export(&self, name: &str) -> Result<(), RouterError> {
+        validate_export_name(name)?;
         let exports = self.exports.read().await;
         let state = exports
             .get(name)
@@ -670,6 +701,7 @@ impl ExportRouter {
 
     /// Promote a readonly export to read-write.
     pub async fn promote_export(&self, name: &str) -> Result<(), RouterError> {
+        validate_export_name(name)?;
         let mut exports = self.exports.write().await;
         let state = exports
             .get_mut(name)
@@ -696,6 +728,7 @@ impl ExportRouter {
     ///
     /// Note: NBD client must reconnect to see the new size.
     pub async fn resize_export(&self, name: &str, new_size_gb: f64) -> Result<(), RouterError> {
+        validate_export_name(name)?;
         // Get current export info
         let (current_size, readonly, block_size) = {
             let exports = self.exports.read().await;
@@ -763,6 +796,7 @@ impl ExportRouter {
     ///
     /// **Idempotent**: If export doesn't exist, returns Ok(()) without error.
     pub async fn remove_export(&self, name: &str, purge: bool) -> Result<(), RouterError> {
+        validate_export_name(name)?;
         let state = {
             let mut exports = self.exports.write().await;
             match exports.remove(name) {

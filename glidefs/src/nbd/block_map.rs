@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Read, Write as IoWrite};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -154,18 +154,19 @@ impl fmt::Debug for BlockMapEntry {
 // AtomicBlockMap -- lock-free runtime block map
 // ============================================================================
 
-/// Lock-free runtime block map using parallel atomic arrays.
+/// Lock-free runtime block map using atomic arrays with SeqLock protection.
 ///
-/// Each chunk's hash is stored as two `AtomicU64` values (lo and hi halves).
-/// The sequence number is a separate `AtomicU64`. The flags byte is NOT stored
-/// here -- it lives in v1's `block_states: Box<[AtomicU8]>` in `CacheInner`.
+/// Each chunk's 16-byte hash is stored as two `AtomicU64` values (lo and hi
+/// halves), guarded by a per-entry `AtomicU32` version counter (SeqLock).
+/// Writers increment the version to odd before updating, then to even after.
+/// Readers spin-retry if the version is odd or changed between reads.
+/// This guarantees readers always see a consistent (hash, sequence) triple
+/// with no torn reads.
 ///
-/// This layout avoids any locking on the read/write hot path. Hash updates
-/// are not atomic across the two u64s, but this is acceptable because:
-/// - A single writer per chunk (the NBD handler) means no torn writes in practice
-/// - Readers tolerate a brief inconsistency window (hash mismatch just means
-///   a cache miss, which is safe)
+/// The flags byte is NOT stored here — it lives in v1's
+/// `block_states: Box<[AtomicU8]>` in `CacheInner`.
 pub struct AtomicBlockMap {
+    versions: Box<[AtomicU32]>,
     hash_lo: Box<[AtomicU64]>,
     hash_hi: Box<[AtomicU64]>,
     sequences: Box<[AtomicU64]>,
@@ -178,6 +179,10 @@ impl AtomicBlockMap {
     /// Allocate a new block map with all entries zeroed.
     pub fn new(device_size: u64, chunk_size: u32) -> Self {
         let num_chunks = device_size.div_ceil(chunk_size as u64) as usize;
+        let versions = (0..num_chunks)
+            .map(|_| AtomicU32::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let hash_lo = (0..num_chunks)
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>()
@@ -191,6 +196,7 @@ impl AtomicBlockMap {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         AtomicBlockMap {
+            versions,
             hash_lo,
             hash_hi,
             sequences,
@@ -212,26 +218,55 @@ impl AtomicBlockMap {
         self.num_chunks == 0
     }
 
-    /// Load the hash and sequence for a chunk (lock-free).
+    /// Load the hash and sequence for a chunk (lock-free, SeqLock-protected).
+    ///
+    /// Spin-retries if the writer is mid-update (version is odd) or if the
+    /// version changed between reading the hash halves. In practice, contention
+    /// is near-zero because each chunk has its own version counter and writes
+    /// are sub-microsecond.
     #[inline]
     pub fn get(&self, chunk_index: usize) -> (Blake3Hash, u64) {
-        let lo = self.hash_lo[chunk_index].load(Ordering::Acquire);
-        let hi = self.hash_hi[chunk_index].load(Ordering::Acquire);
-        let seq = self.sequences[chunk_index].load(Ordering::Acquire);
-        let mut bytes = [0u8; 16];
-        bytes[..8].copy_from_slice(&lo.to_le_bytes());
-        bytes[8..].copy_from_slice(&hi.to_le_bytes());
-        (Blake3Hash(bytes), seq)
+        loop {
+            let v1 = self.versions[chunk_index].load(Ordering::Acquire);
+            if v1 & 1 != 0 {
+                // Writer in progress — spin.
+                std::hint::spin_loop();
+                continue;
+            }
+            let lo = self.hash_lo[chunk_index].load(Ordering::Relaxed);
+            let hi = self.hash_hi[chunk_index].load(Ordering::Relaxed);
+            let seq = self.sequences[chunk_index].load(Ordering::Relaxed);
+            // Acquire fence: ensures all data loads above complete before the
+            // v2 check below. Without this, ARM could reorder data loads after
+            // the v2 load, causing torn reads even when v1 == v2.
+            std::sync::atomic::fence(Ordering::Acquire);
+            let v2 = self.versions[chunk_index].load(Ordering::Relaxed);
+            if v1 == v2 {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&lo.to_le_bytes());
+                bytes[8..].copy_from_slice(&hi.to_le_bytes());
+                return (Blake3Hash(bytes), seq);
+            }
+            // Version changed — retry.
+            std::hint::spin_loop();
+        }
     }
 
-    /// Store the hash and sequence for a chunk (lock-free).
+    /// Store the hash and sequence for a chunk (lock-free, SeqLock-protected).
     #[inline]
     pub fn set(&self, chunk_index: usize, hash: Blake3Hash, sequence: u64) {
         let lo = u64::from_le_bytes(hash.0[..8].try_into().unwrap());
         let hi = u64::from_le_bytes(hash.0[8..].try_into().unwrap());
-        self.hash_lo[chunk_index].store(lo, Ordering::Release);
-        self.hash_hi[chunk_index].store(hi, Ordering::Release);
-        self.sequences[chunk_index].store(sequence, Ordering::Release);
+        // Increment version to odd (signals write in progress). AcqRel ensures
+        // the subsequent data stores cannot be reordered before this increment
+        // on weakly-ordered architectures (ARM/Graviton).
+        self.versions[chunk_index].fetch_add(1, Ordering::AcqRel);
+        self.hash_lo[chunk_index].store(lo, Ordering::Relaxed);
+        self.hash_hi[chunk_index].store(hi, Ordering::Relaxed);
+        self.sequences[chunk_index].store(sequence, Ordering::Relaxed);
+        // Increment version to even (signals write complete). Release ensures
+        // all data stores above are visible before the version goes even.
+        self.versions[chunk_index].fetch_add(1, Ordering::Release);
     }
 
     /// Produce a `BlockMap` snapshot by combining atomic hash/sequence data
@@ -257,6 +292,7 @@ impl AtomicBlockMap {
     /// Construct from a deserialized `BlockMap`.
     pub fn from_block_map(bm: &BlockMap) -> Self {
         let num_chunks = bm.entries.len();
+        let mut ver_vec = Vec::with_capacity(num_chunks);
         let mut lo_vec = Vec::with_capacity(num_chunks);
         let mut hi_vec = Vec::with_capacity(num_chunks);
         let mut seq_vec = Vec::with_capacity(num_chunks);
@@ -264,12 +300,14 @@ impl AtomicBlockMap {
         for entry in &bm.entries {
             let lo = u64::from_le_bytes(entry.hash.0[..8].try_into().unwrap());
             let hi = u64::from_le_bytes(entry.hash.0[8..].try_into().unwrap());
+            ver_vec.push(AtomicU32::new(0));
             lo_vec.push(AtomicU64::new(lo));
             hi_vec.push(AtomicU64::new(hi));
             seq_vec.push(AtomicU64::new(entry.sequence));
         }
 
         AtomicBlockMap {
+            versions: ver_vec.into_boxed_slice(),
             hash_lo: lo_vec.into_boxed_slice(),
             hash_hi: hi_vec.into_boxed_slice(),
             sequences: seq_vec.into_boxed_slice(),

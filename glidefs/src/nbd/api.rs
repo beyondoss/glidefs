@@ -7,6 +7,7 @@ use crate::config::ExportConfig;
 use crate::nbd::flush_scheduler::FlushMode;
 use crate::nbd::metrics::prometheus_header;
 use crate::nbd::router::{ExportRouter, RouterError};
+use url::form_urlencoded;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -102,6 +103,18 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     json_response(status, &ApiResponse::error(message))
 }
 
+/// Check if an export name is valid: 1-128 chars, alphanumeric/hyphen/underscore/dot,
+/// starting with an alphanumeric character.
+fn is_valid_export_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    first.is_ascii_alphanumeric()
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 /// Handle API requests.
 async fn handle_request(
     router: Arc<ExportRouter>,
@@ -135,6 +148,13 @@ async fn handle_request(
         // - Export exists, requested size larger → grow it
         // - Export exists, requested size same/smaller → no-op (success)
         (Method::PUT, ["api", "exports", name]) => {
+            if !is_valid_export_name(name) {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}': must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric", name),
+                ));
+            }
+
             let body = match req.collect().await {
                 Ok(b) => b.to_bytes(),
                 Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
@@ -246,6 +266,9 @@ async fn handle_request(
                 Err(RouterError::ExportNotFound(name)) => {
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
                 }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
+                }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
@@ -260,6 +283,9 @@ async fn handle_request(
                 Err(RouterError::ExportNotFound(name)) => {
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
                 }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
+                }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
@@ -270,6 +296,9 @@ async fn handle_request(
                 Ok(result) => json_response(StatusCode::OK, &result),
                 Err(RouterError::ExportNotFound(name)) => {
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
                 }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -284,6 +313,9 @@ async fn handle_request(
                 ),
                 Err(RouterError::ExportNotFound(name)) => {
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
                 }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -303,7 +335,10 @@ async fn handle_request(
             let purge = req
                 .uri()
                 .query()
-                .map(|q| q.contains("purge=true"))
+                .map(|q| {
+                    form_urlencoded::parse(q.as_bytes())
+                        .any(|(k, v)| k == "purge" && v == "true")
+                })
                 .unwrap_or(false);
 
             match router.remove_export(name, purge).await {
@@ -313,6 +348,9 @@ async fn handle_request(
                 ),
                 Err(RouterError::ExportNotFound(name)) => {
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
                 }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }

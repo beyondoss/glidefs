@@ -189,6 +189,12 @@ async fn run_continuous(
     let mut manifest_backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+    // Backoff deadlines: when set, suppress the corresponding tick until the
+    // deadline fires. This keeps the select loop responsive to shutdown/mode
+    // changes during backoff (unlike an inline sleep which blocks the loop).
+    let mut pack_backoff_until: Option<tokio::time::Instant> = None;
+    let mut manifest_backoff_until: Option<tokio::time::Instant> = None;
+
     loop {
         tokio::select! {
             biased;
@@ -212,10 +218,26 @@ async fn run_continuous(
                 last_seq_cutpoint = 0;
                 pack_backoff = Duration::from_secs(1);
                 manifest_backoff = Duration::from_secs(1);
+                pack_backoff_until = None;
+                manifest_backoff_until = None;
+            }
+
+            // Pack backoff deadline expired — clear it so the next tick proceeds.
+            _ = async {
+                tokio::time::sleep_until(pack_backoff_until.unwrap()).await
+            }, if pack_backoff_until.is_some() => {
+                pack_backoff_until = None;
+            }
+
+            // Manifest backoff deadline expired — clear it so the next tick proceeds.
+            _ = async {
+                tokio::time::sleep_until(manifest_backoff_until.unwrap()).await
+            }, if manifest_backoff_until.is_some() => {
+                manifest_backoff_until = None;
             }
 
             // Periodic pack flush.
-            _ = pack_ticker.tick() => {
+            _ = pack_ticker.tick(), if pack_backoff_until.is_none() => {
                 if cache.dirty_block_count() > 0 {
                     let start = Instant::now();
                     match cache.flush_packs(content_store, pack_index).await {
@@ -236,7 +258,7 @@ async fn run_continuous(
                         Err(e) => {
                             metrics.record_flush_error();
                             warn!(error = %e, backoff_secs = pack_backoff.as_secs(), "periodic pack flush failed, backing off");
-                            tokio::time::sleep(pack_backoff).await;
+                            pack_backoff_until = Some(tokio::time::Instant::now() + pack_backoff);
                             pack_backoff = (pack_backoff * 2).min(MAX_BACKOFF);
                         }
                     }
@@ -244,7 +266,7 @@ async fn run_continuous(
             }
 
             // Periodic manifest sync.
-            _ = manifest_ticker.tick() => {
+            _ = manifest_ticker.tick(), if manifest_backoff_until.is_none() => {
                 if last_seq_cutpoint > 0 {
                     match cache.sync_manifest(content_store, pack_index, last_seq_cutpoint).await {
                         Ok(()) => {
@@ -255,7 +277,7 @@ async fn run_continuous(
                         Err(e) => {
                             metrics.record_flush_error();
                             warn!(error = %e, backoff_secs = manifest_backoff.as_secs(), "manifest sync failed, backing off");
-                            tokio::time::sleep(manifest_backoff).await;
+                            manifest_backoff_until = Some(tokio::time::Instant::now() + manifest_backoff);
                             manifest_backoff = (manifest_backoff * 2).min(MAX_BACKOFF);
                         }
                     }
