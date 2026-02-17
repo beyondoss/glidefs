@@ -1227,18 +1227,14 @@ impl WriteCache<Active> {
                     hash,
                     sequence: seq,
                 };
-                if let Err(e) = self.inner.wal.lock().unwrap().append(&wal_entry) {
-                    error!(block = block, error = %e, "WAL append failed");
-                }
+                self.inner.wal.lock().unwrap().append(&wal_entry)?;
 
                 // Dirty store insert (Mutex, uncontended)
                 self.inner.dirty_store.lock().unwrap().insert(hash, Bytes::copy_from_slice(&chunk_buf));
             }
 
             // Flush WAL buffer
-            if let Err(e) = self.inner.wal.lock().unwrap().flush_buf() {
-                error!(error = %e, "WAL flush failed");
-            }
+            self.inner.wal.lock().unwrap().flush_buf()?;
         }
 
         // Budget enforcement — signal flush scheduler if over budget
@@ -1739,16 +1735,12 @@ impl WriteCache<Active> {
                     hash: zero_hash,
                     sequence: seq,
                 };
-                if let Err(e) = self.inner.wal.lock().unwrap().append(&wal_entry) {
-                    error!(block = block, error = %e, "WAL append failed for zero range");
-                }
+                self.inner.wal.lock().unwrap().append(&wal_entry)?;
                 // No dirty store insert for zero blocks -- read path returns zeros
             }
 
             // Flush WAL buffer
-            if let Err(e) = self.inner.wal.lock().unwrap().flush_buf() {
-                error!(error = %e, "WAL flush failed");
-            }
+            self.inner.wal.lock().unwrap().flush_buf()?;
         }
 
         // If using a forked block map, check if overlay is large enough to flatten

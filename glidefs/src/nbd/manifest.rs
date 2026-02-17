@@ -57,7 +57,8 @@ impl Manifest {
         let total_size = MANIFEST_HEADER_FIXED_SIZE
             + name_len
             + self.block_map.len() * MANIFEST_BLOCK_ENTRY_SIZE
-            + self.pack_index.len() * MANIFEST_PACK_ENTRY_SIZE;
+            + self.pack_index.len() * MANIFEST_PACK_ENTRY_SIZE
+            + 4; // trailing CRC32
 
         let mut buf = Vec::with_capacity(total_size);
 
@@ -87,6 +88,10 @@ impl Manifest {
             buf.extend_from_slice(&entry.offset.to_le_bytes());
             buf.extend_from_slice(&entry.comp_length.to_le_bytes());
         }
+
+        // Trailing CRC32 over all preceding bytes
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
 
         buf
     }
@@ -126,9 +131,10 @@ impl Manifest {
         let pack_index_count = u64::from_le_bytes(data[38..46].try_into().unwrap()) as usize;
 
         let header_total = MANIFEST_HEADER_FIXED_SIZE + name_len;
-        let expected_len = header_total
+        let payload_len = header_total
             + block_map_count * MANIFEST_BLOCK_ENTRY_SIZE
             + pack_index_count * MANIFEST_PACK_ENTRY_SIZE;
+        let expected_len = payload_len + 4; // + trailing CRC32
 
         if data.len() < expected_len {
             return Err(io::Error::new(
@@ -137,6 +143,18 @@ impl Manifest {
                     "manifest data too short: have {} bytes, need {expected_len}",
                     data.len()
                 ),
+            ));
+        }
+
+        // Verify trailing CRC32
+        let stored_crc = u32::from_le_bytes(
+            data[payload_len..payload_len + 4].try_into().unwrap(),
+        );
+        let computed_crc = crc32fast::hash(&data[..payload_len]);
+        if stored_crc != computed_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "manifest CRC32 mismatch",
             ));
         }
 
@@ -391,7 +409,7 @@ mod tests {
 
         let data = manifest.serialize();
         let name_len = "sparse".len();
-        let expected = MANIFEST_HEADER_FIXED_SIZE + name_len + 3 * MANIFEST_BLOCK_ENTRY_SIZE;
+        let expected = MANIFEST_HEADER_FIXED_SIZE + name_len + 3 * MANIFEST_BLOCK_ENTRY_SIZE + 4;
         assert_eq!(
             data.len(),
             expected,
