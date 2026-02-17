@@ -33,6 +33,16 @@ impl WriteCache<Active> {
             return Ok(());
         }
 
+        // Backpressure: reject writes when dirty bytes exceed 2x the flush budget.
+        // The budget trigger wakes the flush scheduler, but this hard cap prevents
+        // unbounded dirty_store memory growth if flushes can't keep up with write rate.
+        if self.inner.config.dirty_budget_bytes > 0 {
+            let hard_cap = self.inner.config.dirty_budget_bytes.saturating_mul(2);
+            if self.inner.dirty_bytes.load(Ordering::Relaxed) > hard_cap {
+                return Err(CacheError::DirtyBudgetExceeded);
+            }
+        }
+
         // Calculate affected blocks
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;

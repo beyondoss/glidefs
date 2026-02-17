@@ -303,6 +303,12 @@ impl WriteCache<Active> {
         seq_cutpoint: u64,
     ) -> Result<(), CacheError> {
         self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        // Checkpoint: persist block states then truncate the WAL.
+        // Hold the WAL lock across both operations so no writes can append
+        // entries between save_metadata and truncation.
+        let mut wal = self.inner.wal.lock();
+        self.inner.save_metadata()?;
+        wal.truncate()?;
         Ok(())
     }
 
@@ -328,6 +334,10 @@ impl WriteCache<Active> {
     ) -> Result<FlushStats, CacheError> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        // Checkpoint: persist block states then truncate the WAL.
+        let mut wal = self.inner.wal.lock();
+        self.inner.save_metadata()?;
+        wal.truncate()?;
         Ok(stats)
     }
 
@@ -343,6 +353,10 @@ impl WriteCache<Active> {
     ) -> Result<SnapshotResult, CacheError> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         let manifest_etag = self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        // Checkpoint: persist block states then truncate the WAL.
+        let mut wal = self.inner.wal.lock();
+        self.inner.save_metadata()?;
+        wal.truncate()?;
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,

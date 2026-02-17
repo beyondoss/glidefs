@@ -84,6 +84,7 @@ pub async fn run_bless(
     let mut buf = vec![0u8; chunk_size as usize];
 
     let mut stats = BlessStats::default();
+    let zero_hash = zero_block_hash(chunk_size as usize);
 
     for chunk_index in 0..num_chunks {
         // Read chunk (last chunk may be short, pad with zeros)
@@ -95,7 +96,7 @@ pub async fn run_bless(
         let hash = blake3_128(&buf);
 
         // Skip zero blocks entirely — read path returns zeros by convention
-        if hash == zero_block_hash(chunk_size as usize) {
+        if hash == zero_hash {
             stats.zero_chunks += 1;
             continue;
         }
@@ -294,6 +295,7 @@ mod tests {
         let mut block_entries: Vec<ManifestBlockEntry> = Vec::new();
         let mut batch: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
         let mut stats = BlessStats::default();
+        let zero_hash = zero_block_hash(chunk_size as usize);
 
         for chunk_index in 0..num_chunks {
             let start = chunk_index * chunk_size as usize;
@@ -303,7 +305,7 @@ mod tests {
 
             let hash = blake3_128(&buf);
 
-            if hash == zero_block_hash(chunk_size as usize) {
+            if hash == zero_hash {
                 stats.zero_chunks += 1;
                 continue;
             }

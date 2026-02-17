@@ -31,6 +31,11 @@ use tracing::{debug, error, info, warn};
 /// This limits memory usage while allowing high concurrency.
 const MAX_INFLIGHT_REQUESTS: usize = 256;
 
+/// Maximum option data size during NBD negotiation (64KB).
+/// NBD option data (export names, info requests) is small; anything larger
+/// is either a bug or a malicious client trying to OOM the server.
+const MAX_OPTION_DATA_LEN: u32 = 64 * 1024;
+
 /// Response to be sent back to the client.
 /// Sent through a channel from handler tasks to the writer task.
 #[derive(Debug)]
@@ -332,6 +337,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         &mut self,
         length: u32,
     ) -> Result<(NBDDevice, Arc<NBDBlockHandler>)> {
+        if length > MAX_OPTION_DATA_LEN {
+            return Err(NBDError::Protocol(format!(
+                "export name length {length} exceeds maximum {MAX_OPTION_DATA_LEN}"
+            )));
+        }
         let mut name_buf = vec![0u8; length as usize];
         self.reader.read_exact(&mut name_buf).await?;
 
@@ -520,12 +530,22 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     }
 
     async fn read_option_data(&mut self, length: u32) -> Result<Vec<u8>> {
+        if length > MAX_OPTION_DATA_LEN {
+            return Err(NBDError::Protocol(format!(
+                "option data length {length} exceeds maximum {MAX_OPTION_DATA_LEN}"
+            )));
+        }
         let mut data = vec![0u8; length as usize];
         self.reader.read_exact(&mut data).await?;
         Ok(data)
     }
 
     async fn drain_option_data(&mut self, length: u32) -> Result<()> {
+        if length > MAX_OPTION_DATA_LEN {
+            return Err(NBDError::Protocol(format!(
+                "option data length {length} exceeds maximum {MAX_OPTION_DATA_LEN}"
+            )));
+        }
         if length > 0 {
             let mut buf = vec![0u8; length as usize];
             self.reader.read_exact(&mut buf).await?;
