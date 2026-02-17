@@ -714,15 +714,17 @@ impl ExportRouter {
         Ok(())
     }
 
-    /// Drain all exports.
-    pub async fn drain_all(&self) -> Result<(), RouterError> {
+    /// Drain all exports. Returns the names of exports that failed to drain.
+    pub async fn drain_all(&self) -> Vec<String> {
         let names = self.list_export_names().await;
+        let mut failed = Vec::new();
         for name in names {
             if let Err(e) = self.drain_export(&name).await {
-                warn!("Failed to drain export '{}': {}", name, e);
+                warn!(export = %name, error = %e, "failed to drain export");
+                failed.push(name);
             }
         }
-        Ok(())
+        failed
     }
 
     /// Change the flush mode for an export at runtime.

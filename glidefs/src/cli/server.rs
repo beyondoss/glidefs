@@ -231,10 +231,11 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             }
             _ = sigusr1.recv() => {
                 info!("Received SIGUSR1, draining all exports to S3...");
-                if let Err(e) = router.drain_all().await {
-                    tracing::error!("Drain failed: {}", e);
-                } else {
+                let failed = router.drain_all().await;
+                if failed.is_empty() {
                     info!("Drain complete - all exports synced to S3");
+                } else {
+                    tracing::error!(failed = ?failed, "Drain incomplete - {} export(s) failed", failed.len());
                 }
             }
         }

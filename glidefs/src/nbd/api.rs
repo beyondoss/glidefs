@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Request to create or update an export (PUT /api/exports/{name}).
 /// Name comes from URL path, not body.
@@ -121,11 +121,12 @@ where
     B::Data: Send,
     B::Error: std::fmt::Display,
 {
+    let start = std::time::Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-    let response = match (method, path_parts.as_slice()) {
+    let response = match (method.clone(), path_parts.as_slice()) {
         // GET /api/exports - List all exports
         (Method::GET, ["api", "exports"]) => {
             let exports = router.list_exports().await;
@@ -425,6 +426,14 @@ where
         // 404 for everything else
         _ => error_response(StatusCode::NOT_FOUND, "Not found"),
     };
+
+    let status = response.status().as_u16();
+    let elapsed_us = start.elapsed().as_micros();
+    if status >= 500 {
+        warn!(method = %method, path = %path, status, elapsed_us, "API request");
+    } else {
+        info!(method = %method, path = %path, status, elapsed_us, "API request");
+    }
 
     Ok(response)
 }
