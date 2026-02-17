@@ -53,7 +53,8 @@
       "Skill(audit-impl)",
       "Bash(echo:*)",
       "Bash(cargo tree:*)",
-      "Bash(cargo add:*)"
+      "Bash(cargo add:*)",
+      "Bash(RUST_LOG=glidefs=debug cargo test:*)"
     ]
   }
 }

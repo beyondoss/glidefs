@@ -27,6 +27,8 @@ default = []
 tokio-console = ["dep:console-subscriber"]
 # Enable test utilities (skip_recovery_for_test, etc.) for integration tests
 test-utils = []
+# Docker-based integration tests (testcontainers + MinIO)
+docker-tests = ["test-utils"]
 # Expose protocol types for fuzzing
 fuzz = []
 
@@ -71,6 +73,8 @@ chrono = { version = "0.4.43", features = ["serde"] }
 futures = "0.3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.4"
+testcontainers = "0.26"
+testcontainers-modules = { version = "0.14", features = ["minio"] }
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
@@ -102,4 +106,9 @@ path = "src/bin/dedup_measure.rs"
 name = "integration"
 path = "tests/integration/mod.rs"
 required-features = ["test-utils"]
+
+[[test]]
+name = "docker_integration"
+path = "tests/docker_integration/mod.rs"
+required-features = ["docker-tests"]
 

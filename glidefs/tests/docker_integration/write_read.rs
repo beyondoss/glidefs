@@ -1,0 +1,63 @@
+use std::sync::Arc;
+
+use crate::nbd_client::NbdClient;
+use crate::TestContext;
+use crate::TestServer;
+
+const BLOCK_SIZE: u32 = 128 * 1024;
+
+#[tokio::test]
+async fn test_write_read_roundtrip() {
+    let ctx = TestContext::new().await;
+    let server = TestServer::start(Arc::clone(&ctx.object_store), "roundtrip").await;
+    server.create_export("vol1", 0.01).await; // 10MB
+
+    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+
+    // Write a known pattern
+    let data: Vec<u8> = (0..BLOCK_SIZE as usize).map(|i| (i % 256) as u8).collect();
+    client.write(0, &data).await.unwrap();
+    client.flush().await.unwrap();
+
+    // Read back and verify
+    let read_data = client.read(0, BLOCK_SIZE).await.unwrap();
+    assert_eq!(read_data, data);
+
+    client.disconnect().await.unwrap();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_unwritten_blocks_return_zeros() {
+    let ctx = TestContext::new().await;
+    let server = TestServer::start(Arc::clone(&ctx.object_store), "zeros").await;
+    server.create_export("vol1", 0.01).await;
+
+    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+
+    let data = client.read(512 * 1024, 4096).await.unwrap();
+    assert!(data.iter().all(|&b| b == 0), "unwritten blocks should be zeros");
+
+    client.disconnect().await.unwrap();
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_last_write_wins() {
+    let ctx = TestContext::new().await;
+    let server = TestServer::start(Arc::clone(&ctx.object_store), "last-write").await;
+    server.create_export("vol1", 0.01).await;
+
+    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+
+    // Write block, then overwrite
+    client.write(0, &vec![0x11; BLOCK_SIZE as usize]).await.unwrap();
+    client.write(0, &vec![0x22; BLOCK_SIZE as usize]).await.unwrap();
+    client.flush().await.unwrap();
+
+    let data = client.read(0, BLOCK_SIZE).await.unwrap();
+    assert!(data.iter().all(|&b| b == 0x22), "last write should win");
+
+    client.disconnect().await.unwrap();
+    server.shutdown().await;
+}
