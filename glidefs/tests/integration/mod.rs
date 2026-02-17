@@ -8,6 +8,7 @@
 
 mod crash_recovery;
 mod failure_injection;
+mod gc;
 mod property_tests;
 mod wake_any_node;
 

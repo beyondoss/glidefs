@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::nbd::block_map::{
     BlockMapKind, Blake3Hash, lz4_compress,
@@ -11,6 +11,7 @@ use crate::nbd::content_store::ContentStore;
 use crate::nbd::manifest::{Manifest, ManifestBlockEntry};
 use crate::nbd::pack::{self, PackLocation, BLOCKS_PER_PACK};
 use crate::nbd::pack_index::HostPackIndex;
+use crate::nbd::pack_registry::PackRegistry;
 use crate::nbd::state::{Active, BlockState, Draining};
 
 use super::inner::CacheInner;
@@ -153,8 +154,10 @@ impl WriteCache<Active> {
         }
 
         // 4. Assemble packs and upload
+        let mut new_pack_ids = Vec::new();
         for chunk in to_upload.chunks(BLOCKS_PER_PACK) {
             let pack_id = uuid::Uuid::new_v4();
+            new_pack_ids.push(pack_id);
             let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size);
             let pack_size = pack_bytes.len() as u64;
 
@@ -229,6 +232,8 @@ impl WriteCache<Active> {
                 }
             }
         }
+
+        stats.new_pack_ids = new_pack_ids;
 
         info!(
             blocks_flushed = stats.blocks_flushed,
@@ -317,6 +322,47 @@ impl WriteCache<Active> {
         self.inner.dirty_bytes.load(Ordering::Relaxed)
     }
 
+    /// Update the pack registry after a flush. Best-effort: warn on failure.
+    ///
+    /// This is off the critical I/O path — the manifest is already uploaded.
+    /// If the registry PUT fails, the packs become untracked orphans (harmless).
+    pub(crate) async fn update_registry(
+        &self,
+        content_store: &ContentStore,
+        new_pack_ids: &[uuid::Uuid],
+    ) {
+        if new_pack_ids.is_empty() {
+            return;
+        }
+        let name = &self.inner.export_name;
+        let result: Result<(), crate::nbd::content_store::ContentStoreError> = async {
+            let mut registry = match content_store.get_registry(name).await? {
+                Some(data) => PackRegistry::deserialize(&data).map_err(|e| {
+                    object_store::Error::Generic {
+                        store: "registry",
+                        source: Box::new(e),
+                    }
+                })?,
+                None => PackRegistry::new(),
+            };
+            registry.append(new_pack_ids);
+            content_store
+                .put_registry(name, registry.serialize())
+                .await?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = result {
+            warn!(
+                error = %e,
+                export = %name,
+                packs = new_pack_ids.len(),
+                "failed to update pack registry (packs are harmless orphans)"
+            );
+        }
+    }
+
     /// Flush dirty blocks to S3 as content-addressed packs + manifest.
     ///
     /// This is the v2 flush path:
@@ -326,6 +372,7 @@ impl WriteCache<Active> {
     /// 4. Upload packs to S3
     /// 5. Clear dirty flags (with concurrent-write safety)
     /// 6. Upload a self-contained manifest
+    /// 7. Update pack registry (best-effort)
     #[instrument(skip(self, content_store, host_pack_index))]
     pub async fn flush_to_s3(
         &self,
@@ -334,6 +381,7 @@ impl WriteCache<Active> {
     ) -> Result<FlushStats, CacheError> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        self.update_registry(content_store, &stats.new_pack_ids).await;
         // Checkpoint: persist block states then truncate the WAL.
         let mut wal = self.inner.wal.lock();
         self.inner.save_metadata()?;
@@ -353,6 +401,7 @@ impl WriteCache<Active> {
     ) -> Result<SnapshotResult, CacheError> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         let manifest_etag = self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        self.update_registry(content_store, &stats.new_pack_ids).await;
         // Checkpoint: persist block states then truncate the WAL.
         let mut wal = self.inner.wal.lock();
         self.inner.save_metadata()?;

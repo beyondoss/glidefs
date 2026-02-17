@@ -34,6 +34,15 @@ async fn main() -> Result<()> {
         } => {
             cli::bless::run_bless(image, name, config, chunk_size).await?;
         }
+        cli::Commands::Gc {
+            config,
+            dry_run,
+            grace_period,
+            max_deletes,
+            state_file,
+        } => {
+            cli::gc::run_gc(config, dry_run, grace_period, max_deletes, state_file).await?;
+        }
     }
 
     Ok(())

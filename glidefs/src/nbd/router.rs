@@ -13,6 +13,7 @@ use crate::nbd::manifest::{deserialize_hot_set, Manifest};
 use crate::nbd::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::nbd::pack::PackLocation;
 use crate::nbd::pack_index::HostPackIndex;
+use crate::nbd::pack_registry::PackRegistry;
 use crate::nbd::state::Active;
 use crate::nbd::write_cache::{CacheError, SnapshotResult, WriteCache, WriteCacheConfig};
 use crate::task::spawn_named;
@@ -474,6 +475,32 @@ impl ExportRouter {
                 &manifest,
                 Some(parent_block_map),
             )?;
+
+            // Create child pack registry from parent manifest's pack IDs (best-effort).
+            // This ensures GC can track all packs referenced by this fork.
+            {
+                let fork_pack_ids: Vec<uuid::Uuid> = manifest
+                    .pack_index
+                    .iter()
+                    .map(|e| e.pack_id)
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                if !fork_pack_ids.is_empty() {
+                    let child_registry = PackRegistry {
+                        pack_ids: fork_pack_ids,
+                    };
+                    if let Err(e) = content_store
+                        .put_registry(&name, child_registry.serialize())
+                        .await
+                    {
+                        warn!(
+                            "Failed to create pack registry for fork '{}': {}",
+                            name, e
+                        );
+                    }
+                }
+            }
 
             info!("Export '{}' created from manifest (fork)", name);
             Arc::new(cache)

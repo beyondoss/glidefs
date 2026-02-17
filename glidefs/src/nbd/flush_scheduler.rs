@@ -185,6 +185,7 @@ async fn run_continuous(
     manifest_ticker.tick().await;
 
     let mut last_seq_cutpoint: u64 = 0;
+    let mut accumulated_pack_ids: Vec<uuid::Uuid> = Vec::new();
     let mut pack_backoff = Duration::from_secs(1);
     let mut manifest_backoff = Duration::from_secs(1);
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -214,6 +215,8 @@ async fn run_continuous(
             // Explicit flush trigger (budget exceeded, API call).
             () = flush_trigger.notified() => {
                 do_full_flush(cache, content_store, pack_index, flush_trigger, metrics).await;
+                // flush_to_s3 handles registry update internally, so clear accumulated IDs.
+                accumulated_pack_ids.clear();
                 // A full flush includes a manifest sync, so reset cutpoint.
                 last_seq_cutpoint = 0;
                 pack_backoff = Duration::from_secs(1);
@@ -252,6 +255,7 @@ async fn run_continuous(
                                     "periodic pack flush complete"
                                 );
                             }
+                            accumulated_pack_ids.extend_from_slice(&stats.new_pack_ids);
                             last_seq_cutpoint = seq_cutpoint;
                             pack_backoff = Duration::from_secs(1);
                         }
@@ -271,6 +275,10 @@ async fn run_continuous(
                     match cache.sync_manifest(content_store, pack_index, last_seq_cutpoint).await {
                         Ok(()) => {
                             info!(seq_cutpoint = last_seq_cutpoint, "manifest sync complete");
+                            if !accumulated_pack_ids.is_empty() {
+                                cache.update_registry(content_store, &accumulated_pack_ids).await;
+                                accumulated_pack_ids.clear();
+                            }
                             last_seq_cutpoint = 0;
                             manifest_backoff = Duration::from_secs(1);
                         }

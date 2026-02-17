@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::manifest::manifest_s3_key;
 use super::pack::pack_s3_key;
+use super::pack_registry::registry_s3_key;
 
 #[derive(Error, Debug)]
 pub enum ContentStoreError {
@@ -162,6 +163,113 @@ impl ContentStore {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    // =========================================================================
+    // Pack registry operations (for GC)
+    // =========================================================================
+
+    /// Upload a pack registry to S3.
+    pub async fn put_registry(
+        &self,
+        name: &str,
+        data: Vec<u8>,
+    ) -> Result<(), ContentStoreError> {
+        let key = format!("{}/{}", self.base_path, registry_s3_key(name));
+        let path = ObjectPath::from(key);
+        let payload = PutPayload::from(data);
+        self.object_store.put(&path, payload).await?;
+        debug!(name = %name, "uploaded pack registry");
+        Ok(())
+    }
+
+    /// Download a pack registry from S3. Returns None if not found.
+    pub async fn get_registry(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        let key = format!("{}/{}", self.base_path, registry_s3_key(name));
+        let path = ObjectPath::from(key);
+        match self.object_store.get(&path).await {
+            Ok(result) => {
+                let bytes = result.bytes().await.map_err(object_store::Error::from)?;
+                Ok(Some(bytes.to_vec()))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List all registry names under `pack-registries/`.
+    pub async fn list_registries(&self) -> Result<Vec<String>, ContentStoreError> {
+        let prefix = ObjectPath::from(format!("{}/pack-registries/", self.base_path));
+        let mut names = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = result?;
+            if let Some(name) = meta.location.filename() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+
+    /// Delete a pack registry from S3 (idempotent).
+    pub async fn delete_registry(&self, name: &str) -> Result<(), ContentStoreError> {
+        let key = format!("{}/{}", self.base_path, registry_s3_key(name));
+        let path = ObjectPath::from(key);
+        match self.object_store.delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List all manifest names under `manifests/` (not just bases).
+    ///
+    /// Returns paths relative to `manifests/`, e.g. `"vm1"`, `"bases/ubuntu-22.04"`.
+    /// Filters out `.hot-set` files.
+    pub async fn list_all_manifests(&self) -> Result<Vec<String>, ContentStoreError> {
+        let prefix_str = format!("{}/manifests/", self.base_path);
+        let prefix = ObjectPath::from(prefix_str.clone());
+        let mut names = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = result?;
+            let path_str = meta.location.to_string();
+            // Extract path relative to manifests/
+            if let Some(relative) = path_str.strip_prefix(&prefix_str) {
+                // Skip hot-set files
+                if relative.ends_with(".hot-set") {
+                    continue;
+                }
+                if !relative.is_empty() {
+                    names.push(relative.to_string());
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// Delete a pack from S3 by pack_id (idempotent).
+    pub async fn delete_pack(&self, pack_id: Uuid) -> Result<(), ContentStoreError> {
+        let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
+        let path = ObjectPath::from(key);
+        match self.object_store.delete(&path).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get a reference to the underlying object store.
+    pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
+        &self.object_store
+    }
+
+    /// Get the base path.
+    pub fn base_path(&self) -> &str {
+        &self.base_path
     }
 }
 

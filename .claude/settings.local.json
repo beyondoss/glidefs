@@ -52,7 +52,8 @@
       "Bash(docker run:*)",
       "Skill(audit-impl)",
       "Bash(echo:*)",
-      "Bash(cargo tree:*)"
+      "Bash(cargo tree:*)",
+      "Bash(cargo add:*)"
     ]
   }
 }
