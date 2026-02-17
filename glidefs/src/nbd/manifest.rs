@@ -485,6 +485,97 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_rejects_corrupted_crc() {
+        let manifest = Manifest {
+            name: "crc-test".to_string(),
+            sequence: 42,
+            chunk_size: 131072,
+            device_size: 1024 * 1024 * 1024,
+            block_map: vec![ManifestBlockEntry {
+                chunk_index: 0,
+                hash: make_hash(0xAB),
+                flags: 0,
+            }],
+            pack_index: vec![],
+        };
+
+        let mut data = manifest.serialize();
+        let len = data.len();
+
+        // Flip the last byte (CRC32 region)
+        data[len - 1] ^= 0xFF;
+
+        let result = Manifest::deserialize(&data);
+        assert!(result.is_err(), "corrupted CRC should cause deserialization failure");
+        assert!(
+            result.unwrap_err().to_string().contains("CRC32"),
+            "error should mention CRC32"
+        );
+    }
+
+    #[test]
+    fn test_manifest_rejects_truncated_data() {
+        let manifest = Manifest {
+            name: "truncated".to_string(),
+            sequence: 1,
+            chunk_size: 131072,
+            device_size: 1024 * 1024,
+            block_map: vec![ManifestBlockEntry {
+                chunk_index: 0,
+                hash: make_hash(1),
+                flags: 0,
+            }],
+            pack_index: vec![],
+        };
+
+        let data = manifest.serialize();
+        // Truncate mid-block-map (remove last 10 bytes)
+        let truncated = &data[..data.len() - 10];
+
+        let result = Manifest::deserialize(truncated);
+        assert!(result.is_err(), "truncated manifest should fail");
+    }
+
+    #[test]
+    fn test_manifest_rejects_bad_magic() {
+        let manifest = Manifest {
+            name: "magic".to_string(),
+            sequence: 1,
+            chunk_size: 131072,
+            device_size: 1024 * 1024,
+            block_map: vec![],
+            pack_index: vec![],
+        };
+
+        let mut data = manifest.serialize();
+        data[0..4].copy_from_slice(b"NOPE");
+
+        let result = Manifest::deserialize(&data);
+        assert!(result.is_err(), "bad magic should fail");
+        assert!(result.unwrap_err().to_string().contains("magic"));
+    }
+
+    #[test]
+    fn test_manifest_rejects_bad_version() {
+        let manifest = Manifest {
+            name: "version".to_string(),
+            sequence: 1,
+            chunk_size: 131072,
+            device_size: 1024 * 1024,
+            block_map: vec![],
+            pack_index: vec![],
+        };
+
+        let mut data = manifest.serialize();
+        // Set version to 99
+        data[4..6].copy_from_slice(&99u16.to_le_bytes());
+
+        let result = Manifest::deserialize(&data);
+        assert!(result.is_err(), "bad version should fail");
+        assert!(result.unwrap_err().to_string().contains("version"));
+    }
+
+    #[test]
     fn test_manifest_name_utf8() {
         let manifest = Manifest {
             name: "vm-\u{00e9}\u{00e8}\u{00ea}-\u{1f600}".to_string(),

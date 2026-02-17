@@ -823,3 +823,214 @@ fn test_open_from_manifest_fork_writes_to_overlay() {
     // Should have 1 dirty block
     assert_eq!(cache.dirty_block_count(), 1);
 }
+
+// ========================================================================
+// Dirty budget enforcement
+// ========================================================================
+
+#[tokio::test]
+async fn test_write_rejected_when_dirty_budget_exceeded() {
+    let dir = TempDir::new().unwrap();
+    let block_size = 4096;
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "test-budget".to_string(),
+        device_size: 1024 * 1024,
+        block_size,
+        // Budget = 1 block (4096). Hard cap = 2x = 8192.
+        // dirty_bytes check is strict `>`, so:
+        //   write 0: dirty_bytes=0, pass → becomes 4096
+        //   write 1: dirty_bytes=4096, pass → becomes 8192
+        //   write 2: dirty_bytes=8192, 8192 > 8192 false, pass → becomes 12288
+        //   write 3: dirty_bytes=12288, 12288 > 8192 true → rejected
+        dirty_budget_bytes: block_size as u64,
+        flush_trigger: None,
+        wal_sync: false,
+    };
+
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+
+    // First 3 blocks succeed (dirty_bytes <= hard_cap at check time)
+    cache.write(0, &vec![1u8; block_size]).unwrap();
+    cache.write(block_size as u64, &vec![2u8; block_size]).unwrap();
+    cache.write(2 * block_size as u64, &vec![3u8; block_size]).unwrap();
+
+    // Fourth block: dirty_bytes=12288 > hard_cap=8192 → rejected
+    let result = cache.write(3 * block_size as u64, &vec![4u8; block_size]);
+    assert!(
+        matches!(result, Err(CacheError::DirtyBudgetExceeded)),
+        "write past 2x budget should return DirtyBudgetExceeded, got: {:?}",
+        result
+    );
+
+    // First three blocks should still be readable
+    let data = cache.read(0, block_size).unwrap();
+    assert!(data.iter().all(|&b| b == 1));
+}
+
+#[tokio::test]
+async fn test_dirty_budget_zero_means_no_limit() {
+    let dir = TempDir::new().unwrap();
+    let block_size = 4096;
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "test-no-budget".to_string(),
+        device_size: 1024 * 1024,
+        block_size,
+        dirty_budget_bytes: 0, // no budget
+        flush_trigger: None,
+        wal_sync: false,
+    };
+
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+
+    // Should be able to write many blocks without rejection
+    for i in 0u64..50 {
+        cache.write(i * block_size as u64, &vec![i as u8; block_size]).unwrap();
+    }
+    assert_eq!(cache.dirty_block_count(), 50);
+}
+
+// ========================================================================
+// Recovery hash drift
+// ========================================================================
+
+#[tokio::test]
+async fn test_recovery_detects_hash_drift() {
+    let dir = TempDir::new().unwrap();
+    let block_size = 4096;
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "test-drift".to_string(),
+        device_size: 1024 * 1024,
+        block_size,
+        dirty_budget_bytes: 0,
+        flush_trigger: None,
+        wal_sync: false,
+    };
+
+    let original_data = vec![0xAAu8; block_size];
+    let modified_data = vec![0xBBu8; block_size];
+    let original_hash = blake3_128(&original_data);
+
+    // Session 1: write data, persist block map + metadata, then corrupt SSD
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+        cache.write(0, &original_data).unwrap();
+
+        // Verify block_map has original hash
+        let (hash, _) = cache.inner.block_map_get(0);
+        assert_eq!(hash, original_hash);
+
+        // Persist both v1 metadata (block states) and v2 block map file
+        cache.save_metadata().unwrap();
+        let bm_snapshot = cache.inner.block_map_snapshot();
+        bm_snapshot.persist_to_file(&config.block_map_path()).unwrap();
+
+        // Simulate "SSD data drifted" by overwriting the data file directly
+        cache.inner.data_file.write_all_at(&modified_data, 0).unwrap();
+
+        // Truncate WAL so recovery has to re-read from SSD (no WAL entries)
+        cache.inner.wal.lock().truncate().unwrap();
+    }
+
+    // Session 2: reopen with recovery — should detect hash drift
+    {
+        let cache = WriteCache::<Initializing>::open(config).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // The block_map should now have the hash of modified_data, not original_data
+        let expected_hash = blake3_128(&modified_data);
+        let (hash, _) = cache.inner.block_map_get(0);
+        assert_eq!(
+            hash, expected_hash,
+            "block_map should reflect SSD contents after recovery drift detection"
+        );
+        assert_ne!(hash, original_hash, "hash should differ from pre-drift value");
+
+        // Read should return the modified data
+        let data = cache.read(0, block_size).unwrap();
+        assert_eq!(&data[..], &modified_data[..]);
+    }
+}
+
+// ========================================================================
+// Pack registry integration (flush updates registry)
+// ========================================================================
+
+#[tokio::test]
+async fn test_flush_updates_pack_registry() {
+    let h = V2Harness::new().await;
+
+    // Write enough blocks to produce at least 1 pack
+    for i in 0u8..5 {
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+    }
+
+    let stats = h.flush().await;
+    assert!(stats.packs_uploaded > 0);
+    assert!(!stats.new_pack_ids.is_empty());
+
+    // Update registry (the real flush_to_s3 does this, but V2Harness.flush() only
+    // calls flush_to_s3 which includes update_registry)
+    // Verify registry exists in S3
+    let registry_data = h.content_store
+        .get_registry("test")
+        .await
+        .unwrap();
+    assert!(registry_data.is_some(), "registry should exist after flush");
+
+    let reg = crate::nbd::pack_registry::PackRegistry::deserialize(
+        &registry_data.unwrap()
+    ).unwrap();
+    assert!(!reg.pack_ids.is_empty(), "registry should contain pack IDs");
+
+    // Verify the pack IDs from flush stats match the registry
+    for pack_id in &stats.new_pack_ids {
+        assert!(
+            reg.pack_ids.contains(pack_id),
+            "registry should contain flush pack ID {}",
+            pack_id
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_multiple_flushes_accumulate_registry() {
+    let h = V2Harness::new().await;
+
+    // First flush
+    for i in 0u8..5 {
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+    }
+    let stats1 = h.flush().await;
+
+    // Second flush with different data
+    for i in 5u8..10 {
+        h.cache.write(i as u64 * 4096, &vec![i + 100; 4096]).unwrap();
+    }
+    let stats2 = h.flush().await;
+
+    let all_expected_ids: Vec<uuid::Uuid> = stats1.new_pack_ids.iter()
+        .chain(stats2.new_pack_ids.iter())
+        .copied()
+        .collect();
+
+    let registry_data = h.content_store
+        .get_registry("test")
+        .await
+        .unwrap()
+        .expect("registry should exist");
+    let reg = crate::nbd::pack_registry::PackRegistry::deserialize(&registry_data).unwrap();
+
+    for pack_id in &all_expected_ids {
+        assert!(
+            reg.pack_ids.contains(pack_id),
+            "registry should contain pack ID {} from both flushes",
+            pack_id
+        );
+    }
+}
