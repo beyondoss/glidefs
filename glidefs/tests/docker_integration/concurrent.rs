@@ -104,7 +104,8 @@ async fn test_drain_during_active_writes() {
     let drain_router = Arc::clone(&router);
     let drain_handle = tokio::spawn(async move {
         rx.await.unwrap();
-        drain_router.drain_all().await.unwrap();
+        let failed = drain_router.drain_all().await;
+            assert!(failed.is_empty(), "drain_all failed for: {:?}", failed);
     });
 
     writer_handle.await.unwrap();
@@ -127,7 +128,7 @@ async fn test_drain_during_active_writes() {
     reader.disconnect().await.unwrap();
 
     // Second drain catches any blocks written after the first drain
-    server.router.drain_all().await.unwrap();
+    server.drain_all().await;
     server.shutdown().await;
 
     // Fresh server: restore and verify all 10 blocks survived

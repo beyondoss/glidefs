@@ -175,17 +175,35 @@ impl TestServer {
             .unwrap();
     }
 
+    /// Restore a forked export from S3 manifest (using the source's S3 prefix).
+    pub async fn restore_forked_export(&self, name: &str, source_prefix: &str, size_gb: f64) {
+        let config = ExportConfig {
+            name: name.to_string(),
+            size_gb,
+            s3_prefix: Some(source_prefix.to_string()),
+            block_size: None,
+            flush_mode: None,
+        };
+        self.router
+            .create_export(config, false, Some(name))
+            .await
+            .unwrap();
+    }
+
     /// Snapshot an export (flush dirty blocks + upload manifest).
     pub async fn snapshot_export(&self, name: &str) -> SnapshotResponse {
         self.router.snapshot_export(name).await.unwrap()
     }
 
     /// Fork an export from a source manifest (read-write).
+    ///
+    /// The child export uses the source's S3 prefix so it can read the
+    /// parent's packs and manifests (content-addressed storage is shared).
     pub async fn fork_export(&self, name: &str, source_manifest: &str, size_gb: f64) {
         let config = ExportConfig {
             name: name.to_string(),
             size_gb,
-            s3_prefix: None,
+            s3_prefix: Some(source_manifest.to_string()),
             block_size: None,
             flush_mode: None,
         };
@@ -200,7 +218,7 @@ impl TestServer {
         let config = ExportConfig {
             name: name.to_string(),
             size_gb,
-            s3_prefix: None,
+            s3_prefix: Some(source_manifest.to_string()),
             block_size: None,
             flush_mode: None,
         };
@@ -218,6 +236,20 @@ impl TestServer {
     /// Resize an export (grow only). Client must reconnect to see new size.
     pub async fn resize_export(&self, name: &str, new_size_gb: f64) {
         self.router.resize_export(name, new_size_gb).await.unwrap();
+    }
+
+    /// Drain all exports to S3, panicking if any fail.
+    pub async fn drain_all(&self) {
+        let failed = self.router.drain_all().await;
+        assert!(
+            failed.is_empty(),
+            "drain_all failed: {}",
+            failed
+                .iter()
+                .map(|(name, err)| format!("{name}: {err}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
 
     /// Drain all exports and shut down gracefully.

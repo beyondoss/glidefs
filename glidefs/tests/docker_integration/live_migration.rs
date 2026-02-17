@@ -115,7 +115,7 @@ async fn test_migration_survives_cold_wake() {
     client_b.flush().await.unwrap();
     client_b.disconnect().await.unwrap();
 
-    server_b.router.drain_all().await.unwrap();
+    server_b.drain_all().await;
     server_b.shutdown().await;
 
     // --- Server C: fresh node, restore from manifest, verify all 3 blocks ---

@@ -33,7 +33,7 @@ async fn test_corrupt_pack_detected() {
     client.flush().await.unwrap();
     client.disconnect().await.unwrap();
 
-    server.router.drain_all().await.unwrap();
+    server.drain_all().await;
     server.shutdown().await;
 
     // Phase 2: List packs in S3 and corrupt the first one.
@@ -47,10 +47,23 @@ async fn test_corrupt_pack_detected() {
     }
     assert!(!pack_paths.is_empty(), "expected at least one pack in S3");
 
-    ctx.object_store
-        .put(&pack_paths[0], Bytes::from(vec![0xDE, 0xAD]).into())
-        .await
-        .unwrap();
+    // Corrupt ALL packs to ensure we hit the corruption regardless of which
+    // pack each block is in.
+    for path in &pack_paths {
+        ctx.object_store
+            .put(path, Bytes::from(vec![0xDE, 0xAD]).into())
+            .await
+            .unwrap();
+    }
+
+    // Verify the corruption stuck by reading the raw object back
+    let corrupted = ctx.object_store.get(&pack_paths[0]).await.unwrap();
+    let corrupted_bytes = corrupted.bytes().await.unwrap();
+    assert_eq!(
+        &corrupted_bytes[..],
+        &[0xDE, 0xAD],
+        "pack should be corrupted in S3"
+    );
 
     // Phase 3: Fresh server, restore from manifest.
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
@@ -58,16 +71,18 @@ async fn test_corrupt_pack_detected() {
 
     let mut client2 = NbdClient::connect(server2.addr, "vol1").await.unwrap();
 
-    // Phase 4: Read both blocks. At least one should fail due to BLAKE3 hash mismatch.
+    // Phase 4: Read both blocks. At least one should fail due to BLAKE3 hash mismatch
+    // or decompression failure from the corrupted pack.
     let r0 = client2.read(0, BLOCK_SIZE as u32).await;
     let r1 = client2.read(BLOCK_SIZE as u64, BLOCK_SIZE as u32).await;
 
     assert!(
         r0.is_err() || r1.is_err(),
-        "at least one read should fail after pack corruption"
+        "at least one read should fail after pack corruption, but r0={:?}, r1={:?}",
+        r0.as_ref().map(|d| d.len()),
+        r1.as_ref().map(|d| d.len()),
     );
 
-    // Don't disconnect — the connection may already be broken from the error.
     server2.shutdown().await;
 }
 
@@ -88,7 +103,7 @@ async fn test_corrupt_manifest_rejected() {
     client.flush().await.unwrap();
     client.disconnect().await.unwrap();
 
-    server.router.drain_all().await.unwrap();
+    server.drain_all().await;
     server.shutdown().await;
 
     // Phase 2: Overwrite the manifest with garbage.

@@ -22,7 +22,7 @@ async fn test_cold_wake_from_different_node() {
     client_a.flush().await.unwrap();
     client_a.disconnect().await.unwrap();
 
-    server_a.router.drain_all().await.unwrap();
+    server_a.drain_all().await;
     server_a.shutdown().await;
 
     // --- Server B: completely fresh node, different cache dir, same S3 ---
@@ -56,7 +56,7 @@ async fn test_cold_wake_multiple_blocks() {
     client_a.flush().await.unwrap();
     client_a.disconnect().await.unwrap();
 
-    server_a.router.drain_all().await.unwrap();
+    server_a.drain_all().await;
     server_a.shutdown().await;
 
     // Cold reader verifies all blocks

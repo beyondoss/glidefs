@@ -49,13 +49,14 @@ async fn test_fork_flush_cold_wake() {
     child_client.disconnect().await.unwrap();
 
     // --- Phase 3: drain child, shutdown ---
-    server.router.drain_all().await.unwrap();
+    server.drain_all().await;
     server.shutdown().await;
 
     // --- Phase 4: fresh server, restore child, verify all 6 blocks ---
     // Same db_path so packs and manifests are visible in S3.
+    // Use restore_forked_export since child's data lives under parent's S3 prefix.
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), "fork-cold-wake").await;
-    server2.restore_export("child", 0.01).await;
+    server2.restore_forked_export("child", "parent", 0.01).await;
 
     let mut reader = NbdClient::connect(server2.addr, "child").await.unwrap();
 
@@ -137,12 +138,13 @@ async fn test_fork_independent_of_parent() {
     parent_client.disconnect().await.unwrap();
 
     // --- Phase 5: drain, shutdown, cold-wake child, re-verify ---
-    server.router.drain_all().await.unwrap();
+    server.drain_all().await;
     server.shutdown().await;
 
     // Same db_path so packs and manifests are visible in S3.
+    // Use restore_forked_export since child's data lives under parent's S3 prefix.
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), "fork-isolation").await;
-    server2.restore_export("child", 0.01).await;
+    server2.restore_forked_export("child", "parent", 0.01).await;
 
     let mut reader = NbdClient::connect(server2.addr, "child").await.unwrap();
     let restored = reader.read(0, BLOCK_SIZE as u32).await.unwrap();

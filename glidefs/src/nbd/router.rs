@@ -714,14 +714,14 @@ impl ExportRouter {
         Ok(())
     }
 
-    /// Drain all exports. Returns the names of exports that failed to drain.
-    pub async fn drain_all(&self) -> Vec<String> {
+    /// Drain all exports. Returns (name, error) pairs for any that failed.
+    pub async fn drain_all(&self) -> Vec<(String, RouterError)> {
         let names = self.list_export_names().await;
         let mut failed = Vec::new();
         for name in names {
             if let Err(e) = self.drain_export(&name).await {
                 warn!(export = %name, error = %e, "failed to drain export");
-                failed.push(name);
+                failed.push((name, e));
             }
         }
         failed
@@ -820,7 +820,8 @@ impl ExportRouter {
         // Remove export (preserves cache files)
         self.remove_export(name, false).await?;
 
-        // Recreate with new size
+        // Recreate with new size, loading from the manifest we just drained.
+        // This preserves access to pre-resize data via the block_map.
         let config = ExportConfig {
             name: name.to_string(),
             size_gb: new_size_gb,
@@ -829,7 +830,7 @@ impl ExportRouter {
             flush_mode: None,
         };
 
-        self.create_export(config, readonly, None).await?;
+        self.create_export(config, readonly, Some(name)).await?;
 
         info!("Export '{}' resized to {}GB", name, new_size_gb);
         Ok(())

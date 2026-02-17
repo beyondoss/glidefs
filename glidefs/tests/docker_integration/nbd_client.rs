@@ -128,7 +128,7 @@ impl NbdClient {
         let reply_cookie = self.stream.read_u64().await?;
         assert_eq!(reply_cookie, cookie);
 
-        // Read data
+        // Read data payload (server always sends `length` bytes, even on error)
         let mut data = vec![0u8; length as usize];
         self.stream.read_exact(&mut data).await?;
 

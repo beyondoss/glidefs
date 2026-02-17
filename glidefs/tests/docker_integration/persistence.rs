@@ -27,7 +27,7 @@ async fn test_persistence_through_restart() {
     client.flush().await.unwrap();
     client.disconnect().await.unwrap();
 
-    server1.router.drain_all().await.unwrap();
+    server1.drain_all().await;
     server1.shutdown().await;
 
     // --- Phase 2: New server (fresh cache), same S3 path, restore from manifest ---
@@ -62,7 +62,7 @@ async fn test_overwrite_survives_restart() {
     client.flush().await.unwrap();
 
     // Drain first batch
-    server1.router.drain_all().await.unwrap();
+    server1.drain_all().await;
 
     // Overwrite
     let mut client2 = NbdClient::connect(server1.addr, "vol1").await.unwrap();
@@ -70,7 +70,7 @@ async fn test_overwrite_survives_restart() {
     client2.flush().await.unwrap();
 
     // Drain again with new data
-    server1.router.drain_all().await.unwrap();
+    server1.drain_all().await;
 
     client.disconnect().await.unwrap();
     client2.disconnect().await.unwrap();

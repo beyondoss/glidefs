@@ -18,7 +18,7 @@ async fn test_export_discovery_from_s3() {
     client.flush().await.unwrap();
     client.disconnect().await.unwrap();
 
-    server1.router.drain_all().await.unwrap();
+    server1.drain_all().await;
     server1.shutdown().await;
 
     // --- Server 2: no static exports, discover from S3 ---

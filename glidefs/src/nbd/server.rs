@@ -643,7 +643,11 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                             Ok(data) => Response::Simple { cookie, error: NBD_SUCCESS, data },
                             Err(ref e) => {
                                 error!(offset, length, error = ?e, "NBD read failed");
-                                Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() }
+                                // Send zeros on read error — many NBD clients (including
+                                // the Linux kernel module) expect `length` bytes of data
+                                // in every read reply, even on error.
+                                let zeros = Bytes::from(vec![0u8; length as usize]);
+                                Response::Simple { cookie, error: e.to_errno(), data: zeros }
                             }
                         };
                         let _ = tx.send(response).await;
