@@ -118,14 +118,12 @@ impl WriteCache<Initializing> {
             let mut chunk_buf = vec![0u8; chunk_size as usize];
             if valid_bytes > 0 {
                 if let Err(e) = data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset) {
-                    warn!(chunk_index, error = %e, "WAL recovery: failed to re-read block from SSD, using WAL hash");
-                    // Fall back to WAL hash without data (block will be re-fetched from S3 on read)
-                    persisted_bm.set(chunk_index, BlockMapEntry {
-                        hash: entry.hash,
-                        flags: BlockMapEntry::FLAG_DIRTY,
-                        sequence: entry.sequence,
-                    });
-                    max_wal_seq = max_wal_seq.max(entry.sequence);
+                    warn!(chunk_index, error = %e, "WAL recovery: SSD read failed, skipping entry (block reverts to last checkpoint state)");
+                    // Don't mark dirty without data — that creates a block that
+                    // looks dirty but can never be flushed to S3. The persisted
+                    // block_map already has the last checkpointed state which is
+                    // consistent with S3. We lose this write, but that's the
+                    // safest option when SSD data is unreadable.
                     continue;
                 }
             }

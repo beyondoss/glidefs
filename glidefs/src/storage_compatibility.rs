@@ -65,3 +65,33 @@ pub async fn check_if_match_support(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_compatible_store_passes() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let result = check_if_match_support(&store, "test-compat").await;
+        assert!(result.is_ok(), "InMemory supports PutMode::Create: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_cleans_up_test_files() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+        // Run twice — second run should clean up files from the first
+        check_if_match_support(&store, "test-cleanup").await.unwrap();
+        check_if_match_support(&store, "test-cleanup").await.unwrap();
+
+        // Verify no leftover test files
+        let prefix = Path::from("test-cleanup").child(TEST_FILE_PREFIX);
+        let mut list = store.list(Some(&prefix));
+        let mut count = 0;
+        while let Some(Ok(_)) = list.next().await {
+            count += 1;
+        }
+        assert_eq!(count, 0, "test files should be cleaned up");
+    }
+}

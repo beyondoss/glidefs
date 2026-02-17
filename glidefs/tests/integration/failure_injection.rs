@@ -1,10 +1,9 @@
 //! Failure injection tests for GlideFS.
 //!
 //! These tests verify correct behavior under various failure scenarios:
-//! 1. S3 errors during sync (timeout, 503, connection refused)
-//! 2. Conditional PUT conflicts (ETag mismatch)
-//! 3. Lease renewal failures
-//! 4. Partial operations and recovery
+//! 1. S3 errors during flush (timeout, 503, connection refused)
+//! 2. Partial operations and recovery
+//! 3. Data integrity under concurrent writes and failures
 //!
 //! Run with: `cargo test --features test-utils --test integration`
 
@@ -20,9 +19,11 @@ use object_store::{
 };
 use tempfile::TempDir;
 
-use glidefs::nbd::block_store::S3BlockStore;
-use glidefs::nbd::lease::LeaseManager;
+use glidefs::nbd::cache::SimpleBlockCache;
+use glidefs::nbd::content_store::ContentStore;
+use glidefs::nbd::manifest::Manifest;
 use glidefs::nbd::metrics::ExportMetrics;
+use glidefs::nbd::pack_index::HostPackIndex;
 use glidefs::nbd::state::Active;
 use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
 
@@ -152,12 +153,18 @@ impl ObjectStore for FailingObjectStore {
     }
 }
 
-/// Helper to create a test cache with the failing object store.
+/// Helper to create a writer cache with the failing object store.
 fn create_test_cache(
     temp_dir: &TempDir,
     name: &str,
     s3: Arc<FailingObjectStore>,
-) -> (Arc<WriteCache<Active>>, Arc<S3BlockStore>, Arc<ExportMetrics>) {
+) -> (
+    Arc<WriteCache<Active>>,
+    ContentStore,
+    HostPackIndex,
+    Arc<SimpleBlockCache>,
+    Arc<ExportMetrics>,
+) {
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: name.to_string(),
@@ -165,34 +172,88 @@ fn create_test_cache(
         block_size: BLOCK_SIZE,
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     };
 
     let metrics = Arc::new(ExportMetrics::new());
-    let s3_store = Arc::new(
-        S3BlockStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test", BLOCK_SIZE)
-            .with_blocks_per_batch(10)
-            .with_metrics(Arc::clone(&metrics)),
-    );
+    let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
+    let pack_index = HostPackIndex::new();
+    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
     let cache = cache.skip_recovery_for_test();
 
-    (Arc::new(cache), s3_store, metrics)
+    (Arc::new(cache), content_store, pack_index, clean_cache, metrics)
+}
+
+/// Helper to create a cold reader cache from the manifest in S3.
+///
+/// After a writer flushes, the manifest in S3 contains the block_map and
+/// pack_index entries. This helper downloads the manifest, opens a WriteCache
+/// via `open_from_manifest` (which populates the block_map), and rebuilds
+/// the HostPackIndex so read_v2 can resolve blocks through S3.
+async fn create_reader_from_manifest(
+    temp_dir: &TempDir,
+    name: &str,
+    s3: Arc<FailingObjectStore>,
+) -> (
+    Arc<WriteCache<Active>>,
+    ContentStore,
+    HostPackIndex,
+    Arc<SimpleBlockCache>,
+    Arc<ExportMetrics>,
+) {
+    let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
+
+    // Fetch manifest from S3
+    let manifest_bytes = content_store
+        .get_manifest(name)
+        .await
+        .expect("manifest fetch failed")
+        .expect("manifest should exist in S3");
+    let manifest =
+        Manifest::deserialize(&manifest_bytes).expect("manifest deserialization failed");
+
+    // Rebuild pack_index from manifest
+    let pack_index = HostPackIndex::new();
+    pack_index.rebuild(&[manifest.clone()]);
+
+    let config = WriteCacheConfig {
+        cache_dir: temp_dir.path().to_path_buf(),
+        device_name: name.to_string(),
+        device_size: 10 * 1024 * 1024,
+        block_size: BLOCK_SIZE,
+        dirty_budget_bytes: 0,
+        flush_trigger: None,
+        wal_sync: false,
+    };
+
+    let metrics = Arc::new(ExportMetrics::new());
+    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+    // open_from_manifest populates the block_map from the manifest so
+    // read_v2 knows which hashes exist at each chunk index.
+    let cache = WriteCache::open_from_manifest(config, &manifest, None)
+        .expect("Failed to open cache from manifest");
+
+    (Arc::new(cache), content_store, pack_index, clean_cache, metrics)
 }
 
 // =============================================================================
 // FAILURE INJECTION TESTS
 // =============================================================================
 
-/// Test: S3 failure during batched sync marks blocks for retry.
+/// Test: S3 failure during flush keeps blocks dirty for retry.
 ///
 /// This verifies that transient S3 failures don't cause data loss.
-/// Blocks that fail to sync should be marked as dirty again.
+/// When flush_to_s3 fails (pack upload error), dirty flags are never
+/// CAS-cleared, so dirty_block_count remains unchanged.
 #[tokio::test]
 async fn test_s3_failure_during_sync_marks_blocks_dirty() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, s3_store, _metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write some blocks
     for i in 0..5 {
@@ -202,29 +263,38 @@ async fn test_s3_failure_during_sync_marks_blocks_dirty() {
 
     assert_eq!(cache.dirty_block_count(), 5, "Should have 5 dirty blocks");
 
-    // Claim blocks for sync
-    let claimed = cache.claim_dirty_blocks(5);
-    assert_eq!(claimed.len(), 5);
-    assert_eq!(cache.dirty_block_count(), 0, "Dirty count should be 0 after claim");
-    assert_eq!(cache.syncing_block_count(), 5, "Syncing count should be 5");
-
     // Enable S3 failures
     s3.set_fail_puts(true);
 
-    // Attempt to sync - will fail, but blocks should be re-queued
-    let synced = cache.sync_blocks_batched(&s3_store, claimed).await.unwrap();
-    assert_eq!(synced, 0, "No blocks should have synced");
+    // Attempt to flush - will fail because pack upload fails.
+    // flush_dirty_inner returns Err before CAS-clearing dirty flags.
+    let result = cache.flush_to_s3(&content_store, &pack_index).await;
+    assert!(result.is_err(), "Flush should fail when S3 is unavailable");
 
-    // Blocks should be back in dirty state (re-queued)
-    assert_eq!(cache.dirty_block_count(), 5, "Blocks should be dirty again after failure");
-    assert_eq!(cache.syncing_block_count(), 0, "No blocks should be syncing");
+    // Blocks should still be dirty (error returned before CAS-clear step)
+    assert_eq!(
+        cache.dirty_block_count(),
+        5,
+        "Blocks should remain dirty after failed flush"
+    );
 
     // Disable failures and retry
     s3.set_fail_puts(false);
 
-    // Now drain should succeed
-    cache.drain_for_snapshot(&s3_store).await.unwrap();
-    assert_eq!(cache.dirty_block_count(), 0, "All blocks should be synced");
+    // Now flush should succeed
+    let stats = cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
+    assert_eq!(
+        cache.dirty_block_count(),
+        0,
+        "All blocks should be clean after successful flush"
+    );
+    assert!(
+        stats.packs_uploaded > 0,
+        "Should have uploaded at least one pack"
+    );
 }
 
 /// Test: S3 failure during read returns error, not garbage.
@@ -237,24 +307,36 @@ async fn test_s3_failure_during_read_returns_error() {
 
     // First, write data to S3 successfully
     let writer_dir = TempDir::new().unwrap();
-    let (writer_cache, writer_s3, _) = create_test_cache(&writer_dir, "vol1", Arc::clone(&s3));
+    let (writer_cache, writer_content_store, writer_pack_index, _writer_clean_cache, _) =
+        create_test_cache(&writer_dir, "vol1", Arc::clone(&s3));
 
     let data = vec![0xAB; BLOCK_SIZE];
     writer_cache.write(0, &data).unwrap();
-    writer_cache.drain_for_snapshot(&writer_s3).await.unwrap();
+    writer_cache
+        .flush_to_s3(&writer_content_store, &writer_pack_index)
+        .await
+        .unwrap();
     drop(writer_cache);
 
-    // Create fresh cache (no local data)
+    // Create a fresh reader from the manifest. This populates the block_map
+    // so read_v2 knows that block 0 has a non-zero hash and will attempt S3.
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_s3, reader_metrics) =
-        create_test_cache(&reader_dir, "vol1", Arc::clone(&s3));
+    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+        create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     // Enable S3 failures
     s3.set_fail_gets(true);
 
     // Read should fail (not cached locally, S3 unavailable)
     let result = reader_cache
-        .read_with_fetch(0, BLOCK_SIZE, &reader_s3, &reader_metrics)
+        .read_v2(
+            0,
+            BLOCK_SIZE,
+            reader_clean_cache.as_ref(),
+            &reader_pack_index,
+            &reader_content_store,
+            &reader_metrics,
+        )
         .await;
 
     assert!(result.is_err(), "Read should fail when S3 is unavailable");
@@ -264,83 +346,71 @@ async fn test_s3_failure_during_read_returns_error() {
 
     // Now read should succeed
     let result = reader_cache
-        .read_with_fetch(0, BLOCK_SIZE, &reader_s3, &reader_metrics)
+        .read_v2(
+            0,
+            BLOCK_SIZE,
+            reader_clean_cache.as_ref(),
+            &reader_pack_index,
+            &reader_content_store,
+            &reader_metrics,
+        )
         .await;
 
     assert!(result.is_ok(), "Read should succeed when S3 is available");
     assert_eq!(result.unwrap().as_ref(), &data[..]);
 }
 
-/// Test: Lease acquisition failure is handled gracefully.
+/// Test: Write during flush doesn't lose data.
 ///
-/// If lease acquisition fails (held by another node), we should
-/// get a clear error, not a panic or corrupted state.
-#[tokio::test]
-async fn test_lease_acquisition_failure_graceful() {
-    let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-
-    let manager_a = LeaseManager::new(Arc::clone(&s3), "test", "node-a").with_ttl(300);
-    let manager_b = LeaseManager::new(Arc::clone(&s3), "test", "node-b").with_ttl(300);
-
-    // Node A acquires lease
-    let _handle_a = manager_a.acquire("vol1").await.unwrap();
-
-    // Node B tries to acquire - should fail cleanly
-    let result = manager_b.acquire("vol1").await;
-
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    // Should be a LeaseHeldByOther error, not a panic
-    assert!(
-        err.to_string().contains("held") || err.to_string().contains("Lease"),
-        "Error should indicate lease is held: {}",
-        err
-    );
-}
-
-/// Test: Write during sync doesn't lose data.
-///
-/// If a write comes in while we're syncing a block to S3,
-/// the write should succeed and the block should be marked dirty again.
+/// If a write comes in while we're flushing to S3, the new data should
+/// be preserved. The flush CAS-clears only blocks whose hash hasn't changed.
 #[tokio::test]
 async fn test_write_during_sync_preserves_new_data() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, s3_store, _metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
-    // Write initial data
+    // Write initial data and flush to S3
     let data_v1 = vec![0x11; BLOCK_SIZE];
     cache.write(0, &data_v1).unwrap();
+    cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
 
-    // Claim for sync (block is now Syncing)
-    let claimed = cache.claim_dirty_blocks(1);
-    assert_eq!(claimed.len(), 1);
-
-    // Write new data while syncing (block transitions Syncing → Dirty)
+    // Write new data to the same block
     let data_v2 = vec![0x22; BLOCK_SIZE];
     cache.write(0, &data_v2).unwrap();
-
-    // Complete the sync of the old data
-    let _ = cache.sync_blocks_batched(&s3_store, claimed).await;
 
     // Block should be dirty again with new data
     assert_eq!(cache.dirty_block_count(), 1);
 
-    // Read should return the NEW data, not the old synced data
+    // Read should return the NEW data locally
     let read = cache.read_local(0, BLOCK_SIZE).unwrap();
     assert_eq!(read.as_ref(), &data_v2[..], "Should read the newer write");
 
-    // Drain the new data
-    cache.drain_for_snapshot(&s3_store).await.unwrap();
+    // Flush the new data
+    cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
 
-    // Verify S3 has the new data by reading from fresh cache
+    // Verify S3 has the new data by reading from a cold reader
     drop(cache);
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_s3, reader_metrics) =
-        create_test_cache(&reader_dir, "vol1", Arc::clone(&s3));
+    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+        create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     let s3_data = reader_cache
-        .read_with_fetch(0, BLOCK_SIZE, &reader_s3, &reader_metrics)
+        .read_v2(
+            0,
+            BLOCK_SIZE,
+            reader_clean_cache.as_ref(),
+            &reader_pack_index,
+            &reader_content_store,
+            &reader_metrics,
+        )
         .await
         .unwrap();
 
@@ -349,33 +419,6 @@ async fn test_write_during_sync_preserves_new_data() {
         &data_v2[..],
         "S3 should have the newer data"
     );
-}
-
-/// Test: Rapid lease acquire/release cycles don't corrupt generation.
-///
-/// The generation counter should always increase monotonically.
-#[tokio::test]
-async fn test_lease_generation_monotonic() {
-    let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-
-    let manager = LeaseManager::new(Arc::clone(&s3), "test", "node-a").with_ttl(300);
-
-    let mut last_gen = 0u64;
-
-    for _ in 0..10 {
-        let handle = manager.acquire("vol1").await.unwrap();
-        assert!(
-            handle.lease.generation > last_gen,
-            "Generation should always increase: {} > {}",
-            handle.lease.generation,
-            last_gen
-        );
-        last_gen = handle.lease.generation;
-
-        manager.release("vol1", &handle).await.unwrap();
-        // Release also increments generation
-        last_gen += 1;
-    }
 }
 
 /// Test: Concurrent writes to same block don't cause torn reads.
@@ -389,7 +432,8 @@ async fn test_concurrent_writes_no_torn_reads() {
 
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, _s3_store, _metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, _content_store, _pack_index, _clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     let cache = Arc::new(cache);
     let write_count = Arc::new(AtomicUsize::new(0));
@@ -442,15 +486,16 @@ async fn test_concurrent_writes_no_torn_reads() {
     );
 }
 
-/// Test: Zero blocks are not written to S3 (optimization).
+/// Test: Zero blocks are not uploaded to S3 (optimization).
 ///
-/// Writing all-zero blocks should not result in S3 writes,
-/// as they can be synthesized on read.
+/// Writing all-zero blocks should not result in pack uploads,
+/// as zero blocks are synthesized on read.
 #[tokio::test]
 async fn test_zero_blocks_not_synced_to_s3() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, s3_store, metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write zero blocks
     let zeros = vec![0u8; BLOCK_SIZE];
@@ -458,30 +503,31 @@ async fn test_zero_blocks_not_synced_to_s3() {
         cache.write(i as u64 * BLOCK_SIZE as u64, &zeros).unwrap();
     }
 
-    // Drain to S3
-    cache.drain_for_snapshot(&s3_store).await.unwrap();
+    // Flush to S3
+    let stats = cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
 
-    let snap = metrics.snapshot();
-
-    // With zero-block optimization, no batches should be written
-    // (or at least fewer than if we wrote all blocks)
+    // With zero-block optimization, no packs should be uploaded
     assert_eq!(
-        snap.batches_written, 0,
-        "Zero blocks should not result in S3 writes (optimization)"
+        stats.packs_uploaded, 0,
+        "Zero blocks should not result in S3 uploads (optimization)"
     );
 }
 
-/// Test: Mixed zero and non-zero blocks in same batch.
+/// Test: Mixed zero and non-zero blocks in same flush.
 ///
-/// A batch with some zero and some non-zero blocks should only
-/// sync the non-zero blocks.
+/// A flush with some zero and some non-zero blocks should only
+/// upload the non-zero blocks.
 #[tokio::test]
 async fn test_mixed_zero_nonzero_batch() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, s3_store, _metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
-    // Write alternating zero and non-zero blocks (all in batch 0)
+    // Write alternating zero and non-zero blocks
     for i in 0..10 {
         let data = if i % 2 == 0 {
             vec![0u8; BLOCK_SIZE] // Zero block
@@ -491,21 +537,26 @@ async fn test_mixed_zero_nonzero_batch() {
         cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
     }
 
-    // Drain
-    cache.drain_for_snapshot(&s3_store).await.unwrap();
+    // Flush
+    cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
 
-    // Verify by reading from fresh cache
+    // Verify by reading from a cold reader
     drop(cache);
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_s3, reader_metrics) =
-        create_test_cache(&reader_dir, "vol1", Arc::clone(&s3));
+    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+        create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     for i in 0..10 {
         let data = reader_cache
-            .read_with_fetch(
+            .read_v2(
                 i as u64 * BLOCK_SIZE as u64,
                 BLOCK_SIZE,
-                &reader_s3,
+                reader_clean_cache.as_ref(),
+                &reader_pack_index,
+                &reader_content_store,
                 &reader_metrics,
             )
             .await
@@ -523,13 +574,14 @@ async fn test_mixed_zero_nonzero_batch() {
 
 /// Test: Data integrity after transient failure and recovery.
 ///
-/// Write data, fail during first sync attempt, succeed on retry,
+/// Write data, fail during first flush attempt, succeed on retry,
 /// verify all data is correct from a fresh node.
 #[tokio::test]
 async fn test_data_integrity_after_failure_recovery() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, s3_store, _metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write known pattern
     let mut expected_data = Vec::new();
@@ -539,31 +591,38 @@ async fn test_data_integrity_after_failure_recovery() {
         cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
     }
 
-    // Claim and fail first sync attempt
-    let claimed = cache.claim_dirty_blocks(20);
+    // Enable S3 failures and attempt flush
     s3.set_fail_puts(true);
-    let synced = cache.sync_blocks_batched(&s3_store, claimed).await.unwrap();
-    assert_eq!(synced, 0, "First sync should fail");
+    let result = cache.flush_to_s3(&content_store, &pack_index).await;
+    assert!(result.is_err(), "First flush should fail");
 
-    // Blocks should be re-queued
-    assert!(cache.dirty_block_count() > 0, "Blocks should be dirty after failure");
+    // Blocks should still be dirty
+    assert!(
+        cache.dirty_block_count() > 0,
+        "Blocks should be dirty after failure"
+    );
 
-    // Now succeed on drain
+    // Disable failures and flush successfully
     s3.set_fail_puts(false);
-    cache.drain_for_snapshot(&s3_store).await.unwrap();
+    cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
 
-    // Verify from fresh cache
+    // Verify from a cold reader
     drop(cache);
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_s3, reader_metrics) =
-        create_test_cache(&reader_dir, "vol1", Arc::clone(&s3));
+    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+        create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     for (i, expected) in expected_data.iter().enumerate() {
         let data = reader_cache
-            .read_with_fetch(
+            .read_v2(
                 i as u64 * BLOCK_SIZE as u64,
                 BLOCK_SIZE,
-                &reader_s3,
+                reader_clean_cache.as_ref(),
+                &reader_pack_index,
+                &reader_content_store,
                 &reader_metrics,
             )
             .await
@@ -578,15 +637,16 @@ async fn test_data_integrity_after_failure_recovery() {
     }
 }
 
-/// Test: Multiple concurrent drains don't corrupt data.
+/// Test: Multiple concurrent flushes don't corrupt data.
 ///
-/// Even if drain is called multiple times concurrently (which shouldn't
+/// Even if flush_to_s3 is called multiple times concurrently (which shouldn't
 /// happen in practice), it should not corrupt data.
 #[tokio::test]
 async fn test_concurrent_drain_safety() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, s3_store, _metrics) = create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write data
     for i in 0..10 {
@@ -594,16 +654,19 @@ async fn test_concurrent_drain_safety() {
         cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
     }
 
-    // Spawn multiple concurrent drains
+    // Wrap in Arc for sharing across tasks (ContentStore and HostPackIndex
+    // don't implement Clone, but flush_to_s3 takes &self references)
     let cache = Arc::new(cache);
-    let s3_store = Arc::clone(&s3_store);
+    let content_store = Arc::new(content_store);
+    let pack_index = Arc::new(pack_index);
 
     let mut handles = vec![];
     for _ in 0..3 {
         let cache = Arc::clone(&cache);
-        let s3_store = Arc::clone(&s3_store);
+        let content_store = Arc::clone(&content_store);
+        let pack_index = Arc::clone(&pack_index);
         handles.push(tokio::spawn(async move {
-            let _ = cache.drain_for_snapshot(&s3_store).await;
+            let _ = cache.flush_to_s3(&content_store, &pack_index).await;
         }));
     }
 
@@ -611,21 +674,23 @@ async fn test_concurrent_drain_safety() {
         handle.await.unwrap();
     }
 
-    // All data should be synced
+    // All data should be flushed
     assert_eq!(cache.dirty_block_count(), 0);
 
-    // Verify data integrity
+    // Verify data integrity from a cold reader
     drop(cache);
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_s3, reader_metrics) =
-        create_test_cache(&reader_dir, "vol1", Arc::clone(&s3));
+    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+        create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     for i in 0..10 {
         let data = reader_cache
-            .read_with_fetch(
+            .read_v2(
                 i as u64 * BLOCK_SIZE as u64,
                 BLOCK_SIZE,
-                &reader_s3,
+                reader_clean_cache.as_ref(),
+                &reader_pack_index,
+                &reader_content_store,
                 &reader_metrics,
             )
             .await

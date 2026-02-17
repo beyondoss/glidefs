@@ -169,9 +169,10 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             info!("Starting background scrubber ({} blocks/sec)", bps);
             let cc = Arc::clone(router.clean_cache());
             let pi = Arc::clone(router.pack_index());
+            let sm = Arc::clone(router.scrubber_metrics());
             let shutdown_clone = shutdown.clone();
             handles.push(spawn_named("scrubber", async move {
-                scrubber(cc, pi, ScrubberConfig { blocks_per_second: bps }, shutdown_clone).await;
+                scrubber(cc, pi, ScrubberConfig { blocks_per_second: bps }, sm, shutdown_clone).await;
                 Ok(())
             }));
         }

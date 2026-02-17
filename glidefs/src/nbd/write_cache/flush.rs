@@ -4,14 +4,14 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument};
 
 use crate::nbd::block_map::{
-    BlockMapEntry, BlockMapKind, Blake3Hash, lz4_compress,
+    BlockMapKind, Blake3Hash, lz4_compress,
 };
 use crate::nbd::block_store::S3BlockStore;
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::manifest::{Manifest, ManifestBlockEntry};
 use crate::nbd::pack::{self, PackLocation, BLOCKS_PER_PACK};
 use crate::nbd::pack_index::HostPackIndex;
-use crate::nbd::state::{Active, Draining};
+use crate::nbd::state::{Active, BlockState, Draining};
 
 use super::inner::CacheInner;
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
@@ -194,8 +194,8 @@ impl WriteCache<Active> {
                 // CAS Dirty → Clean on the block_states AtomicU8.
                 if self.inner.block_states[chunk_index]
                     .compare_exchange(
-                        BlockMapEntry::FLAG_DIRTY,
-                        0, // clean
+                        BlockState::Dirty as u8,
+                        BlockState::Clean as u8,
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )

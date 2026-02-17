@@ -193,6 +193,9 @@ pub struct ExportRouter {
 
     /// Whether to fsync the WAL after each write batch
     wal_sync: bool,
+
+    /// Scrubber metrics (global, not per-export)
+    scrubber_metrics: Arc<crate::nbd::scrubber::ScrubberMetrics>,
 }
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
@@ -228,6 +231,7 @@ impl ExportRouter {
             pack_index: Arc::new(HostPackIndex::new()),
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
+            scrubber_metrics: Arc::new(crate::nbd::scrubber::ScrubberMetrics::new()),
         }
     }
 
@@ -244,6 +248,11 @@ impl ExportRouter {
     /// Get a reference to the shared clean cache (for scrubber).
     pub fn clean_cache(&self) -> &Arc<dyn BlockCache> {
         &self.clean_cache
+    }
+
+    /// Get the shared scrubber metrics (for scrubber + prometheus).
+    pub fn scrubber_metrics(&self) -> &Arc<crate::nbd::scrubber::ScrubberMetrics> {
+        &self.scrubber_metrics
     }
 
     // =========================================================================
@@ -1517,6 +1526,68 @@ mod tests {
 
         let result = router.create_export(config, false, Some("does-not-exist")).await;
         assert!(result.is_err(), "Fork from missing manifest should fail");
+    }
+
+    // =========================================================================
+    // Resize tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_resize_export_grow() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false, None).await.unwrap();
+
+        let before = router.list_exports().await;
+        let old_size = before[0].size;
+
+        // Resize to 0.02 GB (double the 0.01 GB default)
+        router.resize_export("vol1", 0.02).await.unwrap();
+
+        let after = router.list_exports().await;
+        assert_eq!(after.len(), 1);
+        assert!(after[0].size > old_size, "Export should have grown");
+    }
+
+    #[tokio::test]
+    async fn test_resize_export_same_size_noop() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false, None).await.unwrap();
+
+        // Resize to same size — should succeed as no-op
+        let result = router.resize_export("vol1", 0.01).await;
+        assert!(result.is_ok(), "Same-size resize should be idempotent");
+    }
+
+    #[tokio::test]
+    async fn test_resize_export_shrink_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("vol1"), false, None).await.unwrap();
+
+        let result = router.resize_export("vol1", 0.001).await;
+        assert!(result.is_err(), "Shrink should be rejected");
+        match result.unwrap_err() {
+            RouterError::CannotShrink { .. } => {}
+            e => panic!("Expected CannotShrink, got {:?}", e),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resize_export_nonexistent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        let result = router.resize_export("nonexistent", 0.02).await;
+        assert!(result.is_err(), "Resize of nonexistent should fail");
+        match result.unwrap_err() {
+            RouterError::ExportNotFound(_) => {}
+            e => panic!("Expected ExportNotFound, got {:?}", e),
+        }
     }
 
     #[test]

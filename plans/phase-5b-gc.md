@@ -1,100 +1,88 @@
 # Phase 5b — Garbage Collection
 
-**Goal:** Orphaned packs are cleaned up. S3 storage doesn't grow unbounded. Event-driven refcounts make GC O(1) per flush event, not O(N manifests).
+**Goal:** Orphaned packs are cleaned up. S3 storage doesn't grow unbounded. Per-VM pack registries track pack existence; periodic reconciliation against manifests identifies and deletes orphans.
 
 **Depends on:** Phase 2 (packs + manifests exist in S3).
 **Can run in parallel with:** Phase 4, 5a, 5c, 6.
 **Critical path:** No (orphans accumulate slowly; GC can be added after the core product works).
-**Estimated LOC:** ~1,500 production, ~1,200 tests.
+**Estimated LOC:** ~800 production, ~800 tests.
 
-**Design doc references:** [Garbage Collection](../GLIDEv2.md#garbage-collection), [Control Plane API](../GLIDEv2.md#control-plane-api).
+**Design doc references:** [Garbage Collection](../GLIDEv2.md#garbage-collection).
 
 ---
 
 ## Deliverables
 
-### Control Plane DB Schema
+### Pack Registry (S3 Object)
 
-```sql
-CREATE TABLE pack_refcounts (
-    pack_id          UUID PRIMARY KEY,
-    refcount         INTEGER NOT NULL DEFAULT 0,
-    last_decremented TIMESTAMPTZ,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- GC worker queries this: "packs with refcount 0, older than grace period"
-CREATE INDEX idx_pack_refcounts_gc
-    ON pack_refcounts (last_decremented)
-    WHERE refcount = 0;
-```
-
-### Event-Driven Refcount Updates (Daemon Side)
-
-The daemon calls the [Control Plane API](../GLIDEv2.md#control-plane-api) after each lifecycle event:
+Per-VM S3 object at `pack-registries/{tenant}/{vm-id}`. Append-only list of pack UUIDs.
 
 ```
-POST /api/internal/packs/refcounts
-{ "increments": [...], "decrements": [...] }
+Format:
+  magic         [u8; 4]    = "GLPR"
+  count         u32 LE     (number of pack IDs)
+  pack_ids      [Uuid; count]  (16 bytes each, packed)
+
+Typical size: 4 + 4 + 3,200 × 16 = ~51KB for a 10GB VM
 ```
 
-| Event | Increments | Decrements | Typical size |
-|-------|-----------|-----------|-------------|
-| Flush (continuous, ~5s) | New packs | Packs with overwritten blocks | 2-5 entries |
-| Flush (demand-driven) | New packs | Packs with overwritten blocks | Same |
-| Fork | All packs in source manifest | (none) | ~3,200 entries |
-| VM delete | (none) | All packs in manifest | ~3,200 entries |
+Serialize/deserialize module in the daemon. Same pattern as manifest: magic + fixed header + packed entries.
 
-**Tracking the delta.** During flush, the daemon knows which packs are new (just uploaded) and which packs lost blocks (old hash overwritten by new hash). The delta is computed from the flush operation itself — no manifest diff needed.
+### Registry Updates (Daemon Side)
 
-**Fork and delete.** Read the full pack list from the S3 manifest (already in hand from the fork/delete operation). Send as a single bulk request.
+The daemon updates the pack registry on flush and fork:
+
+| Event | Operation | S3 ops |
+|-------|-----------|--------|
+| Flush | GET registry, append new pack IDs, PUT registry | 1 GET + 1 PUT (~51KB) |
+| Fork | Create child registry from parent manifest's pack IDs | 1 PUT (~51KB) |
+| VM delete | No-op (registry left for GC to clean up) | 0 |
+
+**On flush:** After uploading packs and manifest, the daemon reads the current registry, appends the IDs of newly created packs, and writes it back. This is off the critical I/O path — the manifest is already uploaded, the flush is complete.
+
+**On fork:** The child VM's registry is created from the parent manifest's pack index (pack IDs already in hand from the fork operation). This ensures every pack the child references is tracked independently of the parent.
 
 **Failure handling:**
-- Retry with exponential backoff (1s, 2s, 4s, max 30s).
-- On exhausted retries: log error, continue. Orphaned packs survive — no data loss. Monthly reconciliation catches the drift.
-- Never block VM I/O on a refcount update.
+- If the registry PUT fails after packs are uploaded: the packs become untracked orphans. They waste storage but cause no data loss. A periodic S3 LIST fallback sweep can catch them if needed.
+- Never block VM I/O on a registry update.
+- No retry logic needed — orphans are harmless and bounded by flush crash frequency.
 
-### Pack Deletion Worker (Control Plane Side)
+### GC Reconciliation Tool (Primary GC Mechanism)
 
-Background process that runs continuously:
-
-```
-loop:
-  packs = SELECT pack_id FROM pack_refcounts
-            WHERE refcount = 0
-            AND last_decremented < now() - interval '24 hours'
-            LIMIT 100;
-
-  for pack in packs:
-    s3.delete(pack_key(pack.pack_id))
-    DELETE FROM pack_refcounts WHERE pack_id = pack.pack_id;
-
-  sleep(5 seconds)
-```
-
-- **Grace period: 24 hours.** Protects against races: flush creates packs, then the refcount update fails transiently. The pack exists in S3 without a refcount for up to a few seconds. Grace period covers this.
-- **Cap per cycle: 100 packs.** Limits blast radius of a bug. At 100 packs x ~3MB = 300MB per cycle, 5s interval = 60MB/s sustained delete throughput. More than enough for steady-state churn.
-- **Dry-run mode:** Log what would be deleted without deleting. Enable in production first, verify behavior, then enable actual deletion.
-
-### Reconciliation Tool (Monthly Safety Net)
-
-An offline tool that verifies refcount consistency:
+CLI tool and/or scheduled job that identifies and deletes orphaned packs:
 
 ```
+glidefs gc [--dry-run] [--tenant TENANT] [--grace-period 24h] [--max-deletes 10000]
+
 reconcile():
-  1. List all manifests in S3 (manifests/{tenant}/{vm-id})
-  2. For each manifest: parse pack index, collect all pack_ids -> live_packs set
-  3. Query all pack_ids from pack_refcounts table
-  4. Compare:
-     - Pack in live_packs but refcount=0 in DB: increment to correct value
-     - Pack in DB with refcount>0 but not in any manifest: decrement, log discrepancy
-     - Pack in S3 (packs/ prefix) but not in any manifest AND not in DB: orphan, mark for deletion
-  5. Report: total packs, live packs, orphans found, corrections made
+  1. S3 LIST manifests/ prefix → all VM manifests
+  2. For each manifest: parse pack index → collect pack_ids into live_packs set
+  3. S3 LIST pack-registries/ prefix → all registries
+  4. For each registry: parse → collect pack_ids into all_known_packs set
+  5. dead_packs = all_known_packs - live_packs
+  6. Filter: skip packs that haven't been dead for > grace period
+     (track first-seen-dead timestamp in a local state file between runs)
+  7. Delete dead packs from S3 (batched, capped at --max-deletes)
+  8. Compact registries: rewrite without dead pack IDs
+  9. Delete empty registries (no corresponding manifest = deleted VM, all packs cleaned)
+  10. Report: total packs, live packs, dead found, deleted, registries compacted
 ```
 
-- Run monthly, or on-demand after incidents.
-- At 1M VMs: ~60 minutes. At 10M VMs: hours, run incrementally (rotate through tenant subsets weekly).
-- **Read-only first.** Run in report-only mode before enabling corrections.
+**Grace period tracking:** The tool maintains a local state file (`gc-state.json`) mapping pack IDs to their first-seen-dead timestamp. On each run:
+- New dead packs get timestamped
+- Packs dead longer than grace period are eligible for deletion
+- Deleted packs are removed from state
+- Packs that become live again (re-referenced) are removed from state
+
+**Performance:**
+
+| Fleet size | Wall time (~500 concurrent S3 ops) | S3 cost per run |
+|-----------|-----------------------------------|-----------------|
+| 1K VMs | ~1 minute | ~$0.01 |
+| 100K VMs | ~15 minutes | ~$0.25 |
+| 1M VMs | ~60 minutes | ~$2.50 |
+
+**Optimization:** Only the pack index section of each manifest is needed. Since the manifest header contains `block_map_count` and `pack_index_count`, an S3 range request can skip the block map and read only the pack index — cutting data volume by ~40%.
 
 ---
 
@@ -106,54 +94,57 @@ reconcile():
 
 ## Suggested Verifications
 
-### Unit Tests — Refcount Client
+### Unit Tests — Pack Registry
 
-- **`test_refcount_increment`**: Call the API with increments for 3 pack IDs. Verify DB has refcount=1 for each.
-- **`test_refcount_decrement`**: Increment 3 packs, then decrement 1. Verify refcount=0 for the decremented pack, refcount=1 for the other two. `last_decremented` is set.
-- **`test_refcount_batch_update`**: Single API call with 100 increments and 50 decrements. Verify all applied atomically (all-or-nothing on the DB side).
-- **`test_refcount_idempotent_increment`**: Increment the same pack twice. Refcount = 2 (not an error, not 1 — legitimate for shared packs referenced by two VMs).
+- **`test_registry_round_trip`**: Serialize a registry with 100 pack UUIDs. Deserialize. Verify all UUIDs match.
+- **`test_registry_empty`**: Serialize/deserialize an empty registry. Verify count=0.
+- **`test_registry_large`**: Serialize a registry with 10,000 pack UUIDs (~160KB). Verify round-trip correctness and timing (<10ms).
+- **`test_registry_append`**: Create a registry with 50 packs. Append 5 more. Verify the result has 55 packs with correct IDs.
+- **`test_registry_invalid_magic`**: Attempt to deserialize data with wrong magic bytes. Verify error.
+- **`test_registry_compact`**: Create a registry with 100 packs. Compact with a set of 30 packs to remove. Verify result has 70 packs.
 
 ### Integration Tests — Lifecycle Events
 
-- **`test_flush_updates_refcounts`**: Write 50 blocks, flush (creates 2 packs). Verify refcount=1 for both packs in DB.
-- **`test_overwrite_decrements_old_pack`**: Write 25 blocks, flush (pack A). Overwrite all 25 blocks with new data, flush again (pack B). Verify: pack A refcount=0, pack B refcount=1. Pack A's `last_decremented` is set.
-- **`test_fork_increments_all_packs`**: VM-A has 5 packs (from previous flushes). Fork VM-A to VM-B. Verify all 5 packs now have refcount=2.
-- **`test_delete_decrements_all_packs`**: VM-A has 5 packs. Delete VM-A. Verify all 5 packs have refcount=0.
-- **`test_fork_then_delete_source`**: VM-A -> fork to VM-B -> delete VM-A. Shared packs have refcount=1 (VM-B still references them). Packs are NOT deleted.
-- **`test_fork_then_delete_both`**: VM-A -> fork to VM-B -> delete VM-A -> delete VM-B. All shared packs have refcount=0. After grace period, deletion worker removes them.
+- **`test_flush_updates_registry`**: Write 50 blocks, flush (creates 2 packs). Verify pack registry in S3 contains both pack IDs.
+- **`test_multiple_flushes_accumulate`**: Flush 3 times (creating 2 packs each). Verify registry contains all 6 pack IDs.
+- **`test_fork_creates_child_registry`**: VM-A has 5 packs. Fork VM-A to VM-B. Verify VM-B's registry contains all 5 pack IDs from VM-A's manifest.
+- **`test_fork_registries_independent`**: Fork VM-B from VM-A. Write new blocks to VM-B, flush. Verify VM-B's registry has VM-A's packs + VM-B's new packs. Verify VM-A's registry is unchanged.
+- **`test_delete_leaves_registry`**: Delete a VM. Verify its registry still exists in S3 (GC handles cleanup).
 
-### Integration Tests — Pack Deletion Worker
+### Integration Tests — GC Reconciliation
 
-- **`test_deletion_worker_respects_grace_period`**: Create a pack with refcount=0 and `last_decremented = now()`. Run deletion worker. Pack is NOT deleted (within grace period). Advance mock clock past 24 hours. Run again. Pack is deleted from S3 and DB.
-- **`test_deletion_worker_skips_live_packs`**: Pack A has refcount=0 (grace period expired). Pack B has refcount=1. Run deletion worker. Pack A deleted. Pack B untouched.
-- **`test_deletion_worker_caps_per_cycle`**: Create 500 packs with refcount=0 (all past grace period). Run one deletion cycle. Verify only 100 are deleted (cap per cycle). Run 4 more cycles — all 500 deleted.
-- **`test_deletion_worker_dry_run`**: Enable dry-run mode. Run deletion worker with expired refcount=0 packs. Verify packs still exist in S3. Verify log output lists what would be deleted.
-
-### Integration Tests — Reconciliation
-
-- **`test_reconciliation_finds_no_drift`**: Normal operation — flush, fork, delete. Run reconciliation. Verify zero discrepancies.
-- **`test_reconciliation_detects_missing_refcount`**: Delete a refcount row from DB manually (simulating a failed update). Run reconciliation. Verify it detects the pack is referenced by a manifest but has no refcount. Verify it corrects the refcount.
-- **`test_reconciliation_detects_orphaned_pack`**: Insert a pack in S3 that isn't referenced by any manifest and has no DB refcount. Run reconciliation. Verify it identifies the orphan and marks it for deletion.
-- **`test_reconciliation_detects_inflated_refcount`**: Set a pack's refcount to 5 when it's only referenced by 2 manifests. Run reconciliation. Verify it corrects the refcount to 2.
+- **`test_gc_finds_no_orphans`**: Normal operation — flush, fork. Run GC. Verify zero deletions.
+- **`test_gc_deletes_orphaned_packs`**: Write blocks, flush (packs A, B). Overwrite all blocks, flush again (packs C, D). Run GC past grace period. Verify packs A and B are deleted from S3. Verify packs C and D are untouched.
+- **`test_gc_respects_grace_period`**: Create orphaned packs. Run GC immediately. Verify packs are NOT deleted (within grace period). Advance time past grace period. Run GC again. Verify packs are deleted.
+- **`test_gc_respects_max_deletes`**: Create 500 orphaned packs (past grace period). Run GC with `--max-deletes 100`. Verify only 100 deleted. Run again — next 100 deleted.
+- **`test_gc_dry_run`**: Create orphaned packs past grace period. Run GC with `--dry-run`. Verify packs still exist. Verify output lists what would be deleted.
+- **`test_gc_fork_then_delete_source`**: VM-A has 5 packs. Fork to VM-B. Delete VM-A. Run GC. Verify packs are NOT deleted (VM-B's manifest still references them).
+- **`test_gc_fork_then_delete_both`**: VM-A → fork to VM-B → delete VM-A → delete VM-B. Run GC past grace period. Verify all packs are deleted.
+- **`test_gc_compacts_registries`**: Run GC that deletes orphaned packs. Verify the registries are compacted (dead pack IDs removed).
+- **`test_gc_deletes_empty_registries`**: Delete a VM. Run GC until all its packs are deleted. Verify the VM's registry is also deleted.
 
 ### Failure Handling Tests
 
-- **`test_refcount_api_retry_on_failure`**: Mock the control plane API to fail twice, then succeed. Verify the daemon retries and the refcount is eventually updated. Verify VM I/O is not blocked during retries.
-- **`test_refcount_api_total_failure`**: Mock the API to fail permanently. Verify the daemon logs an error after exhausting retries but continues operating. Packs become orphans — reconciliation would catch them later.
+- **`test_registry_put_failure`**: Simulate S3 PUT failure for registry after successful pack upload. Verify packs exist in S3 but are not in the registry. Verify they survive as harmless orphans.
+- **`test_gc_crash_recovery`**: Run GC partway through deletion, simulate crash. Run GC again. Verify it picks up where it left off (idempotent).
+- **`test_gc_manifest_parse_error`**: Corrupt one manifest in S3. Run GC. Verify it skips that VM, logs an alert, and processes all other VMs normally.
 
 ---
 
 ## Key Decisions
 
-- **HTTP API, not direct DB connection.** Daemon communicates with control plane via HTTP (see [Control Plane API](../GLIDEv2.md#control-plane-api)). Decouples infrastructure from data layer. Control plane handles authorization, rate limiting, transaction isolation.
-- **24-hour grace period.** Conservative. Could be shorter (1 hour) once we verify that refcount updates reliably complete within seconds. Start conservative, tighten later.
-- **No refcount for individual blocks, only packs.** A pack is the GC unit. Mixed-liveness packs (some dead blocks, some live) are kept whole until every block is unreferenced. Simpler than block-level GC, bounded storage waste (~$0.02/month per deleted parent VM).
+- **S3-only, no database.** Pack registries and manifests both live in S3. No Postgres, no control plane API for GC. Fewer moving parts, no state synchronization between S3 and a database.
+- **Manifests are the source of truth for liveness.** A pack is live if and only if some manifest references it. The registry is just an inventory of "packs that exist" — a fact, not a derived cache. This can never drift in a way that causes data loss.
+- **Append-only registry.** The registry only grows (until GC compacts it). No decrements, no delta tracking, no ordering dependencies. Crash-safe by construction.
+- **24-hour grace period.** Conservative. Protects against races where packs are created but the manifest or registry hasn't been updated yet. Can be shortened once we verify the window is reliably <1 minute.
+- **No per-block GC, only per-pack.** A pack is the GC unit. Mixed-liveness packs (some dead blocks, some live) are kept whole until every block is unreferenced. Bounded storage waste (~$0.02/month per deleted parent VM).
+- **GC reconciliation is the primary mechanism, not a safety net.** No real-time refcount tracking. Orphans accumulate between GC runs — bounded by run frequency (weekly) and VM churn rate. At typical churn, this is a few GB of orphaned packs per week. Negligible cost.
 
 ## Files Likely Touched
 
 | File | Change |
 |------|--------|
-| `src/nbd/gc.rs` | **New.** Refcount update client (HTTP calls to control plane API). |
-| `src/nbd/write_cache.rs` | **Modification.** Track pack delta during flush (new packs, dropped packs). |
-| `src/nbd/router.rs` | **Modification.** Wire refcount updates to flush/fork/delete lifecycle events. |
-| `src/cli/reconcile.rs` | **New.** Reconciliation CLI tool (`glidefs reconcile`). |
+| `src/nbd/pack_registry.rs` | **New.** Pack registry serialize/deserialize, append, compact. |
+| `src/nbd/write_cache/flush.rs` | **Modification.** Update pack registry after flush (append new pack IDs). |
+| `src/nbd/router.rs` | **Modification.** Create child registry on fork. |
+| `src/cli/gc.rs` | **New.** GC reconciliation CLI tool (`glidefs gc`). |

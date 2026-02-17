@@ -44,7 +44,7 @@ A storage layer for Boxes — Paraglide's microVMs. Provides fast boot, near-ins
 
 **Block map memory at scale.** A 100GB disk with 128KB chunks = ~800K entries per VM. At 17 bytes per entry (BLAKE3-128 hash + flags), that's ~13MB per VM in the dense case. With sparse representation (typical 10GB of actual written data), it's ~1.3MB per VM. At 100 VMs per host, block maps consume ~133MB total in practice — manageable. See the Block Map section for the full analysis.
 
-**Garbage collection is a real system.** Deleted VMs leave orphaned blocks in S3. Event-driven refcounts make GC O(1) per lifecycle event — no manifest scanning. A monthly reconciliation sweep catches any drift. See the Garbage Collection section.
+**Garbage collection is a real system.** Deleted VMs leave orphaned packs in S3. A per-VM pack registry tracks which packs exist; periodic reconciliation against manifests identifies and deletes orphans. No database, no refcounts — just S3. See the Garbage Collection section.
 
 **Cold cache on cross-host wake.** When a VM wakes on a different host, its SSD cache is empty. Reads hit S3 until the cache warms. Base image blocks help (likely warm from siblings), but tenant-specific hot data will be cold. This is a transient degradation, not a steady state.
 
@@ -83,17 +83,15 @@ graph TB
     subgraph S3["S3 — Portability Layer"]
         PACKS["packs/{prefix}/{pack-id}<br/>Content-addressed, LZ4, prefix-sharded"]
         MANIFESTS["manifests/{tenant}/{vm-id}<br/>Block maps + pack index"]
+        REGISTRIES["pack-registries/{tenant}/{vm-id}<br/>Append-only pack ID lists"]
     end
-
-    DB["Control Plane DB<br/>(pack refcounts)"]
 
     CACHE -->|"demand-driven flush<br/>(fork, sleep, promote, migrate)"| PACKS
     BR -->|"cache miss → lazy pull"| PACKS
     CACHE -.->|"continuous flush<br/>(production VMs only)"| PACKS
-    CACHE -.->|"refcount updates<br/>(transactional with manifest)"| DB
 ```
 
-**During active operation**, all I/O stays within the host box. S3 is only touched on cross-host transitions or for cache misses on blocks that haven't been loaded locally yet. Refcount updates to the control plane DB are piggybacked on manifest writes — not on the read/write hot path.
+**During active operation**, all I/O stays within the host box. S3 is only touched on cross-host transitions or for cache misses on blocks that haven't been loaded locally yet.
 
 ---
 
@@ -389,7 +387,7 @@ Whether triggered by a fork request, portable sleep, or the continuous flush tim
 7. Update host pack index: hash → (pack-id, offset, length)
 8. Clear dirty flags on flushed entries, move dirty blocks to clean cache
 9. Sync manifest to S3 (block map + pack index derived from host index)
-10. Update pack refcounts in control plane DB (transactional with manifest record update — see Garbage Collection)
+10. Update pack registry in S3 (append new pack IDs — see Garbage Collection)
 
 **Note:** The flush reads from the SSD cache, not the WAL. The WAL is for local crash recovery only (see Crash Recovery). Dirty tracking lives in the block map — each entry carries a flag indicating whether the block has been flushed to S3.
 
@@ -699,7 +697,7 @@ On a cache miss, fetch the entire pack and cache all 25 blocks. One cache miss w
 
 ### GC with Packs
 
-Pack-level refcounts tracked in the control plane DB. A pack is deleted when its refcount reaches 0 and it's older than the grace period. See the Garbage Collection section for the full design.
+Pack liveness is determined by manifest references. A per-VM pack registry in S3 tracks which packs exist (see Garbage Collection section). Periodic reconciliation compares registries against manifests and deletes orphaned packs.
 
 - **No compaction.** A pack with mixed liveness (some dead, some live blocks) is kept whole until every block is unreferenced.
 
@@ -715,6 +713,9 @@ packs/
 
 manifests/
   {tenant-id}/{vm-id}           ← per-tenant, per-VM
+
+pack-registries/
+  {tenant-id}/{vm-id}           ← append-only pack ID list per VM (for GC)
 ```
 
 One global block namespace. Content-addressing handles dedup naturally — same content → same hash → stored once regardless of which tenant wrote it. Manifests remain per-tenant for access control and GC reference tracking.
@@ -775,7 +776,7 @@ dirty_data < budget    → pure demand-driven, zero S3 traffic
 dirty_data ≥ budget    → flush oldest dirty blocks until under budget
 ```
 
-The budget is a per-VM setting, configured at export creation (`dirty_budget_gb`, default 5). The daemon checks on every write (O(1) — compare counter against threshold). Forced flushes are identical to normal flushes — same pack assembly, same refcount updates, same code path.
+The budget is a per-VM setting, configured at export creation (`dirty_budget_gb`, default 5). The daemon checks on every write (O(1) — compare counter against threshold). Forced flushes are identical to normal flushes — same pack assembly, same registry update, same code path.
 
 ### Clean Block Cache (S3-FIFO)
 
@@ -973,107 +974,74 @@ The VM's manifest starts as a copy of the base manifest. All entries point to bl
 
 ## Garbage Collection
 
-When VMs are deleted or blocks are overwritten, orphaned blocks (in packs) accumulate in S3.
+When VMs are deleted or blocks are overwritten, orphaned packs accumulate in S3.
 
-**Design principle: O(1) per lifecycle event, not O(N manifests).** The system must scale to millions of VMs without GC becoming a bottleneck. This means event-driven refcounts as the primary mechanism, not periodic scanning.
+**Design principle: manifests are the source of truth.** A pack is live if and only if some manifest references it. GC = find packs that no manifest references, delete them. No refcounts, no database — just S3.
 
-### Event-Driven Refcounts (Primary)
+**The problem:** You can't efficiently enumerate all packs in S3. S3 LIST on the `packs/` prefix is O(all packs) — too slow and expensive at scale. But you need to know which packs exist to find orphans.
 
-Every pack has a reference count in the control plane database. Refcount updates are transactional with manifest updates — they cannot drift.
+**The solution: per-VM pack registry.** An append-only S3 object per VM that records every pack ID created by or inherited by that VM. GC reads registries to enumerate packs, reads manifests to determine liveness, deletes the difference.
 
-```mermaid
-sequenceDiagram
-    participant D as NBD Daemon
-    participant S3 as S3
-    participant DB as Control Plane DB
+### Pack Registry
 
-    Note over D: S3 flush (fork, sleep, continuous)
-    D->>S3: PUT packs (new blocks)
-    D->>S3: PUT manifest
+Each VM has a pack registry at `pack-registries/{tenant}/{vm-id}`. It's a simple binary object: a list of pack UUIDs (16 bytes each) representing all packs that exist because of this VM.
 
-    D->>DB: BEGIN
-    Note over DB: Adjust pack_refcounts:<br/>increment new packs, decrement dropped
-    D->>DB: COMMIT
-
-    Note over DB: Refcount hits 0?<br/>→ enqueue pack for deletion<br/>→ delete after grace period
+```
+Pack Registry Format:
+  magic         [u8; 4]    = "GLPR"
+  count         u32        (number of pack IDs)
+  pack_ids      [Uuid; count]  (16 bytes each)
 ```
 
-**Lifecycle events and their cost:**
+For a 10GB VM with ~3,200 packs: 4 + 4 + 3,200 × 16 = **~51KB**. Trivial.
 
-| Event | Refcount operations | Cost |
+**Lifecycle operations:**
+
+| Event | Registry operation | Cost |
 |-------|-------------------|------|
-| Flush (continuous, ~5s) | Increment new packs, decrement overwritten (~2-5 packs) | O(1) |
-| Fork | Read pack list from S3 manifest, increment refcounts | O(packs in manifest) — one-time |
-| VM delete | Read pack list from S3 manifest, decrement refcounts | O(packs in manifest) — one-time |
-| Refcount → 0 | Enqueue pack for deletion after grace period | O(1) |
+| Flush | GET registry, append new pack IDs, PUT registry | O(1) S3 ops, ~51KB |
+| Fork | Create child registry = parent manifest's pack IDs | O(1) S3 ops, ~51KB |
+| VM delete | Leave registry in place (GC handles cleanup) | None |
 
-Steady-state operations (flush) touch a handful of rows per transaction. Lifecycle operations (fork, delete) are proportional to the VM's pack count (~3,200 for a 10GB VM) but happen once per VM lifetime. None scale with fleet size.
+**Fork handling:** When VM-B forks from VM-A, the child's registry starts with all pack IDs from the parent's manifest (already in hand during fork). This ensures every pack referenced by VM-B is tracked in VM-B's registry, independent of VM-A's lifecycle.
 
-### The Transaction
+**Crash safety:** The registry is append-only (modulo GC compaction). If a flush crashes after uploading packs but before updating the registry, the packs become untracked orphans — harmless. They waste storage until a periodic S3 LIST sweep catches them (see Safety Rails). The registry never contains false entries that could cause live pack deletion.
 
-Pack refcounts live in the control plane database. The full manifest (block map + pack index) lives in S3. The DB tracks pack refcounts only — no per-manifest pack lists. The S3 manifest is the source of truth for which packs a VM references.
+### GC Reconciliation (Primary Mechanism)
 
-```sql
--- Flush (daemon sends the delta: packs added, packs dropped)
-UPDATE pack_refcounts SET refcount = refcount + 1
-  WHERE pack_id = ANY($added);
-UPDATE pack_refcounts SET refcount = refcount - 1,
-  last_decremented = now()
-  WHERE pack_id = ANY($dropped);
+Run weekly, or on-demand after incidents. This is the primary GC mechanism, not a safety net.
 
--- Fork (pack list read from S3 manifest, already in hand)
-UPDATE pack_refcounts SET refcount = refcount + 1
-  WHERE pack_id = ANY($all_packs);
-
--- VM delete (pack list from S3 manifest — one GET)
-UPDATE pack_refcounts SET refcount = refcount - 1,
-  last_decremented = now()
-  WHERE pack_id = ANY($all_packs);
+```
+reconcile():
+  1. S3 LIST manifests/ prefix → list of all VM manifests
+  2. For each manifest: parse, extract unique pack IDs → live_packs set
+  3. S3 LIST pack-registries/ prefix → list of all registries
+  4. For each registry: parse, extract pack IDs → all_known_packs set
+  5. dead_packs = all_known_packs - live_packs
+  6. Filter: only delete packs first seen as dead > 24 hours ago (grace period)
+  7. S3 DELETE dead packs (batched, capped per cycle)
+  8. Compact registries: remove dead pack IDs, delete empty orphan registries
 ```
 
-For a continuous flush that wrote 2 new packs and overwrote blocks in 1 old pack: 3 refcount updates. For fork or delete: one S3 GET (manifest, ~1MB) + one bulk UPDATE (~3,200 rows). No join table, no 3.2B-row manifest_packs table at scale.
+**Performance at scale:**
 
-### Pack Deletion
+| Fleet size | Manifests to scan | Registry data | Wall time (~500 concurrent) |
+|-----------|------------------|---------------|---------------------------|
+| 1K VMs | 1K × ~5MB = 5GB | 1K × ~51KB = 51MB | ~1 minute |
+| 100K VMs | 100K × ~5MB = 500GB | 100K × ~51KB = 5GB | ~15 minutes |
+| 1M VMs | 1M × ~5MB = 5TB | 1M × ~51KB = 51GB | ~60 minutes |
 
-A background worker processes packs with refcount 0:
+Manifests dominate the data volume. Optimization: only the pack index section is needed for GC (~3.2MB of a ~5.2MB manifest). S3 range requests can skip the block map, cutting data volume by ~40%.
 
-```sql
-SELECT pack_id FROM pack_refcounts
-  WHERE refcount = 0
-  AND last_decremented < now() - interval '24 hours';
-```
-
-Index scan, O(dead packs), not O(all packs). Deletes the S3 objects. Runs continuously or on a short timer.
-
-### Reconciliation (Monthly Safety Net)
-
-The transactional refcounts should never drift. Reconciliation is a defense-in-depth measure, not a routine operation. Run monthly (or on-demand after incidents):
-
-1. Scan all manifests in S3, build live pack set
-2. Compare against pack_refcounts in DB
-3. Correct any drift (log discrepancies for investigation)
-4. Delete packs that are unreferenced in both S3 manifests and DB
-
-At 1M VMs this takes ~60 minutes. At 10M VMs, a few hours. Acceptable for a monthly job. Can be run incrementally (rotate through tenant subsets over a week) if needed.
+At 1M VMs weekly, this costs ~$2.50 in S3 GETs (1M GET requests at $0.0004/1K + data transfer). Negligible.
 
 ### Safety Rails
 
-- **Grace period (24 hours):** Packs with refcount 0 are not deleted until 24 hours after the last decrement. Protects against races: flush creates packs not yet referenced by a manifest, fork copies a manifest while blocks are in flight.
-- **Atomic refcount updates:** Refcount increments/decrements are applied in a single DB transaction per event. Flush sends only the delta (added/dropped packs). Fork and delete read the full pack list from the S3 manifest.
-- **Max deletions per cycle:** Cap the number of packs deleted per deletion worker cycle. Limits blast radius.
-- **Dry-run mode:** Log what would be deleted without deleting. Validate before enabling in production.
-- **Failure mode:** Always conservative. Transaction failure → no refcount change → orphans survive. Deletion worker crash → orphans survive until next cycle. Never deletes live data.
-
-### Scaling Properties
-
-| Fleet size | Steady-state GC cost | Lifecycle GC cost | Reconciliation |
-|-----------|---------------------|------------------|----------------|
-| 1K VMs | ~10 refcount updates/s | Negligible | Minutes |
-| 100K VMs | ~1K refcount updates/s | ~100 VM deletes/day | ~10 minutes |
-| 1M VMs | ~10K refcount updates/s | ~1K VM deletes/day | ~60 minutes monthly |
-| 10M VMs | ~100K refcount updates/s | ~10K VM deletes/day | Hours, incremental |
-
-The control plane DB (PostgreSQL) handles 100K simple updates/s on modest hardware. This is the same database the control plane already uses for VM metadata, tenant records, and scheduling.
+- **Grace period (24 hours).** Packs identified as dead are not deleted until they've been dead for 24 hours. Protects against races: flush creates packs, then crashes before updating the manifest or registry.
+- **Max deletions per cycle.** Cap at 10,000 packs per GC run. Limits blast radius of bugs. At ~3MB/pack, that's ~30GB — a few dollars of S3 storage at most.
+- **Dry-run mode.** Log what would be deleted without deleting. Run in dry-run first, verify behavior, then enable actual deletion.
+- **Orphan tolerance.** A missing registry entry means a pack can't be found by GC — it survives as an orphan. This is wasted storage, not data loss. Bounded by the number of flush crashes (rare). If orphan accumulation becomes measurable, a periodic S3 LIST sweep on the `packs/` prefix can catch them — but this is a fallback, not routine.
+- **Failure mode: always conservative.** GC crash → orphans survive until next run. Registry corruption → packs survive (can't be found to delete). Manifest parse error → skip that VM, log alert. Never deletes a pack that any manifest references.
 
 ---
 
@@ -1198,39 +1166,6 @@ A pack is a batch of LZ4-compressed blocks stored as a single S3 object. Key: `p
 
 **Typical pack:** 25 blocks × 128KB = 3.2MB uncompressed, ~1.6-2.1MB compressed. Index overhead: 16 + (25 × 24) = 616 bytes. Negligible.
 
-### Control Plane API
-
-The daemon communicates with the control plane for pack refcount management. The daemon never connects to the database directly — all access goes through the control plane HTTP API. This keeps the data layer decoupled from infrastructure and lets the control plane enforce authorization, rate limiting, and audit logging.
-
-```
-POST /api/internal/packs/refcounts
-Content-Type: application/json
-
-{
-  "increments": ["pack-id-1", "pack-id-2"],
-  "decrements": ["pack-id-3"]
-}
-
-→ 200 OK
-```
-
-**When called:**
-
-| Event | Request body | Frequency |
-|-------|-------------|-----------|
-| Flush (continuous) | increments: new packs, decrements: overwritten | Every ~5s (if dirty) |
-| Flush (demand-driven) | Same | On fork/sleep/promote/migrate |
-| Fork | increments: all packs in manifest | One-time per fork |
-| VM delete | decrements: all packs in manifest | One-time per delete |
-
-**Failure handling:** If the API call fails after packs have been uploaded to S3:
-- The daemon retries with exponential backoff (1s, 2s, 4s, max 30s).
-- Packs without refcounts are orphans — safe. The 24-hour GC grace period covers transient failures.
-- If retries are exhausted, log an error and continue. Monthly reconciliation catches the drift.
-- The daemon never blocks the VM's I/O path on a refcount update.
-
-**Bulk operations:** Fork and delete send the full pack list (up to ~3,200 entries for a 10GB VM). The API accepts batch updates in a single request. The control plane wraps the batch in a single DB transaction.
-
 ---
 
 ## Component Summary
@@ -1251,9 +1186,8 @@ Content-Type: application/json
 | **TRIM Handler** | Reclaim deleted blocks | Reset to zero-block hash. Metadata-only. Orphans cleaned by GC. |
 | **Compression** | LZ4 at S3 boundary | Hash raw → compress → pack → S3. ~1.5-2x ratio. |
 | **Base Image Pipeline** | Base image ingestion | Offline CLI pipeline (`glidefs bless`). Uploads to global block store. Deduped naturally. |
-| **Pack Refcounts** | Track pack liveness | Event-driven updates in control plane DB. O(1) per flush, O(P) per fork/delete. Pack lists read from S3 manifests — no join table. |
-| **Pack Deletion Worker** | Delete orphaned packs | Processes refcount-0 packs after 24h grace period. Index scan, continuous. |
-| **GC Reconciliation** | Correctness safety net | Monthly mark-and-sweep across all manifests. Corrects any drift. Incremental at scale. |
+| **Pack Registry** | Track which packs exist | Per-VM S3 object, append-only list of pack UUIDs. Updated on flush (~51KB PUT). Created on fork from parent manifest's pack IDs. |
+| **GC Reconciliation** | Delete orphaned packs | Weekly scan of manifests + registries. Manifests determine liveness, registries enumerate packs, difference is deleted. Primary GC mechanism. |
 | **cgroup v2 I/O** | Per-VM IOPS/throughput limits | Kernel-level, configured by control plane |
 | **Background Scrubber** | Cache integrity verification | Periodic re-hash of cached blocks, off hot path |
 
@@ -1303,7 +1237,7 @@ K = pack_size (blocks per pack, default 25)
 | **Host pack index update** | O(D') | — | No | DashMap inserts |
 | **Manifest serialization** | O(B) | O(B) | **Watch** | Must serialize full block map + derive pack index |
 | **Manifest S3 PUT** | O(1) | — | No | Single object |
-| **Refcount DB update** | O(Δ packs) | — | No | Only changed packs, ~2-5 for steady-state flush. No join table. |
+| **Pack registry update** | O(1) | O(P) | No | One S3 GET + PUT (~51KB). Append new pack IDs. |
 
 **Bottleneck found and fixed: dirty block collection.**
 
@@ -1318,15 +1252,14 @@ The doc said "scan block map for dirty entries" — that's O(B) per flush, scann
 | Operation | Time | Space | Bottleneck? | Notes |
 |-----------|------|-------|-------------|-------|
 | **Fork: S3 manifest copy** | O(B) | O(B) | No | Serialize + PUT. One-time per fork. |
-| **Fork: refcount increment** | O(P) | — | No | Pack list from S3 manifest (already in hand). One UPDATE, ~3,200 rows. |
+| **Fork: create child registry** | O(P) | O(P) | No | Write parent manifest's pack IDs to child's registry. One S3 PUT, ~51KB. |
 | **Fork: host overlay setup** | O(1) | O(1) | No | Arc clone + empty HashMap |
-| **VM delete: refcount decrement** | O(P) | — | No | Read pack list from S3 manifest (one GET), decrement refcounts. Async. |
-| **VM delete: local cleanup** | O(1) | — | No | Drop block map, release cache entries lazily |
+| **VM delete: local cleanup** | O(1) | — | No | Drop block map, release cache entries lazily. Registry left for GC. |
 | **Same-host wake** | O(B) | O(B) | No | Load block map from local file |
 | **Cross-host wake** | O(B) | O(B) | No | GET manifest from S3 + parse |
 | **Boot hot set prefetch** | O(H) | O(H) | No | H = hot set size, ~1,600 blocks. Parallel S3 GETs. |
 
-**Verdict: all O(per-VM), none O(fleet).** Fork and delete are proportional to the VM's pack count (~3,200), not to fleet size. Two SQL queries handle the DB updates regardless of whether the fleet has 1K or 10M VMs.
+**Verdict: all O(per-VM), none O(fleet).** Fork and delete are proportional to the VM's pack count (~3,200), not to fleet size. One S3 PUT handles the registry update regardless of whether the fleet has 1K or 10M VMs.
 
 ### Background Operations
 
@@ -1338,12 +1271,11 @@ The doc said "scan block map for dirty entries" — that's O(B) per flush, scann
 | **Fork overlay flattening** | O(B) | O(B) | No | Copy parent + apply overlay. Background. Rare. |
 | **Background scrubber** | O(cached blocks) | — | No | Amortized over hours/days. Off hot path. |
 | **Sequential read-ahead** | O(1) per read | O(V) | No | Ring buffer per VM for pattern detection |
-| **Pack deletion worker** | O(dead packs) | — | No | Index scan on refcount=0. Continuous. |
-| **Reconciliation** | O(N × B) | O(unique hashes) | **Known** | Monthly. Incremental at scale. |
+| **GC reconciliation** | O(N × P) | O(unique packs) | **Known** | Weekly. Scan manifests + registries. |
 
 **Watch: host pack index rebuild** is O(V × B). At 500 VMs × 80K entries = 40M entries, ~500ms. Triggered on VM arrive/depart. If VMs churn rapidly (10+ events/second), rebuilds could lag. Mitigation: debounce rebuilds (batch lifecycle events within a 1-second window) or use incremental updates (add on arrive, mark-and-sweep on depart).
 
-**Known: reconciliation** is O(N × B) — the one operation that scales with fleet size. Bounded to monthly cadence. At 1M VMs: ~60 minutes. At 10M VMs: hours, run incrementally over a week. This is a consistency check, not a bottleneck — event-driven refcounts handle steady-state GC at O(1).
+**Known: GC reconciliation** is O(N × P) — the one operation that scales with fleet size. Run weekly. At 1M VMs: ~60 minutes. At 10M VMs: hours, run incrementally over a week. This is the primary GC mechanism — no steady-state refcount tracking needed.
 
 ### Space Complexity (Per Host)
 
@@ -1363,12 +1295,11 @@ The doc said "scan block map for dirty entries" — that's O(B) per flush, scann
 
 | Operation | Time | Scales with | Bottleneck? |
 |-----------|------|------------|-------------|
-| **Refcount update (per flush)** | O(Δ packs) | Nothing — constant per flush | No |
-| **Refcount update (fork/delete)** | O(P) | Per-VM data | No |
-| **Pack deletion** | O(dead packs) | Churn rate | No |
+| **Registry update (per flush)** | O(1) | Nothing — one S3 PUT per flush | No |
+| **Registry create (fork)** | O(P) | Per-VM data | No |
 | **S3 PUTs (aggregate)** | O(fleet write rate / K) | Fleet write rate | Infra cost, not algorithmic |
 | **S3 GETs (aggregate)** | O(fleet cache misses) | Cache hit rate | Infra cost, not algorithmic |
-| **Reconciliation** | O(N × B) | Fleet size | Monthly. Incremental. |
+| **GC reconciliation** | O(N × P) | Fleet size | Weekly. ~60 min at 1M VMs. |
 
 ### Summary
 
@@ -1376,14 +1307,13 @@ The doc said "scan block map for dirty entries" — that's O(B) per flush, scann
 Hot path:          O(1) per read/write         ✓ no bottleneck
 Flush:             O(D) with dirty set         ✓ fixed (was O(B))
 Manifest sync:     O(B) per VM                 ~ bounded by disk size, infrequent
+Registry update:   O(1) per flush              ✓ one S3 PUT
 Fork/delete:       O(P) per VM                 ✓ independent of fleet size
-GC (steady-state): O(1) per flush event        ✓ no bottleneck
-GC (lifecycle):    O(P) per fork/delete         ✓ independent of fleet size
-GC (reconcile):    O(N × B) monthly            ~ known, incremental at scale
+GC (reconcile):    O(N × P) weekly             ~ ~60 min at 1M VMs
 Host operations:   O(V × B) on lifecycle        ~ bounded by host density
 ```
 
-**Nothing in the steady-state hot path or flush path scales with fleet size.** The only fleet-scale operation is monthly reconciliation, which is a safety net, not a routine operation. The system scales horizontally by adding hosts — each host is O(V × B) regardless of total fleet size.
+**Nothing in the steady-state hot path or flush path scales with fleet size.** The only fleet-scale operation is weekly GC reconciliation, which scans manifests and registries — O(N × P), not O(packs in S3). The system scales horizontally by adding hosts — each host is O(V × B) regardless of total fleet size.
 
 ---
 
@@ -1406,12 +1336,12 @@ Host operations:   O(V × B) on lifecycle        ~ bounded by host density
 1. **Memory cache sizing** — What's the right default for `memory_cache_gb`? Needs profiling under realistic load.
 2. **Continuous flush intervals** — Block flush at ~5s, manifest at ~60s is the starting point for production VMs. Adaptive flush adjusts based on dirty block count. Both base intervals tunable.
 3. **cgroup I/O limits by tier** — What are the actual IOPS/throughput numbers per tier?
-4. **GC grace period tuning** — 24 hours is conservative. Could be shorter if we can bound the max time between block creation and manifest update.
+4. **GC grace period tuning** — 24 hours is conservative. Could be shorter once we verify that flush → registry update reliably completes within seconds.
 5. **Sub-chunk dirty tracking** — Deferred until write amplification is a measured problem.
 6. ~~**Pinned dirty block pressure**~~ — **Resolved.** Per-VM dirty block budget (default 5GB) with forced partial flush. See Dirty Block Store section.
 7. **Pack size** — 25 blocks (3.2MB) matches v1. Profile to find the sweet spot between S3 ops and mixed-pack waste.
 8. **Demand-driven for production** — Should production default to demand-driven (flush on fork request) instead of continuous? Saves S3 traffic at the cost of 1-5 seconds of fork latency. Depends on preview creation frequency.
 9. **Fork overlay flattening threshold** — 50% divergence is the starting heuristic for flattening a fork overlay into a standalone block map. May need tuning based on read path overhead vs memory savings.
-10. ~~**manifest_packs table size**~~ — **Resolved.** Eliminated the table entirely. Pack lists are read from S3 manifests on fork/delete (one GET, ~1MB). Refcounts are the only DB state. No 3.2B-row join table at scale.
+10. ~~**manifest_packs table size**~~ — **Resolved.** No database state for GC at all. Pack registries live in S3 alongside manifests. Manifests are the source of truth for liveness.
 11. **Per-tenant KMS keys (future)** — If an enterprise customer requires customer-managed keys, add per-tenant encryption as an opt-in. Blocks for that tenant don't dedup cross-tenant. Additive change — no architectural rework needed.
-12. **Reconciliation scheduling at extreme scale** — At 10M+ VMs, full reconciliation takes hours. Incremental approach (rotate through tenant subsets) keeps individual runs bounded. Determine the right rotation period.
+12. **GC reconciliation scheduling at extreme scale** — At 10M+ VMs, full reconciliation takes hours. Incremental approach (rotate through tenant subsets weekly) keeps individual runs bounded. Determine the right rotation period and whether manifest range requests (skip block map, read only pack index) provide enough speedup.

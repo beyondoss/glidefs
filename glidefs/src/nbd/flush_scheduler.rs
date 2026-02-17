@@ -369,4 +369,145 @@ mod tests {
             }
         );
     }
+
+    // =========================================================================
+    // Runtime behavior tests
+    // =========================================================================
+
+    use crate::nbd::content_store::ContentStore;
+    use crate::nbd::pack_index::HostPackIndex;
+    use crate::nbd::state::Initializing;
+    use crate::nbd::write_cache::WriteCacheConfig;
+    use object_store::memory::InMemory;
+    use tempfile::TempDir;
+
+    fn test_scheduler_components() -> (
+        Arc<WriteCache<crate::nbd::state::Active>>,
+        Arc<ContentStore>,
+        Arc<HostPackIndex>,
+        Arc<Notify>,
+        watch::Receiver<FlushMode>,
+        watch::Sender<FlushMode>,
+        watch::Receiver<bool>,
+        watch::Sender<bool>,
+        Arc<ExportMetrics>,
+        TempDir,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "sched-test".to_string(),
+            device_size: 1024 * 1024,
+            block_size: 4096,
+            dirty_budget_bytes: 0,
+            flush_trigger: None,
+            wal_sync: false,
+        };
+
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let content_store = Arc::new(ContentStore::new(s3, "test"));
+        let pack_index = Arc::new(HostPackIndex::new());
+        let metrics = Arc::new(ExportMetrics::new());
+
+        let cache = WriteCache::<Initializing>::open(config).unwrap();
+        let cache = Arc::new(cache.skip_recovery_for_test());
+
+        let (mode_tx, mode_rx) = watch::channel(FlushMode::DemandDriven);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let flush_trigger = Arc::new(Notify::new());
+
+        (
+            cache, content_store, pack_index, flush_trigger, mode_rx, mode_tx,
+            shutdown_rx, shutdown_tx, metrics, temp_dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_demand_driven_shutdown() {
+        let (
+            cache, content_store, pack_index, flush_trigger, mode_rx, _mode_tx,
+            shutdown_rx, shutdown_tx, metrics, _temp,
+        ) = test_scheduler_components();
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(cache, content_store, pack_index, mode_rx, flush_trigger, shutdown_rx, metrics).await;
+        });
+
+        // Signal shutdown
+        shutdown_tx.send(true).unwrap();
+
+        // Scheduler should exit promptly
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("scheduler should exit within 2s")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_demand_driven_flush_trigger() {
+        let (
+            cache, content_store, pack_index, flush_trigger, mode_rx, _mode_tx,
+            shutdown_rx, shutdown_tx, metrics, _temp,
+        ) = test_scheduler_components();
+
+        // Write dirty data
+        cache.write(0, &[0xAA; 4096]).unwrap();
+        assert_eq!(cache.dirty_block_count(), 1);
+
+        let cache_check = Arc::clone(&cache);
+        let flush_trigger_clone = Arc::clone(&flush_trigger);
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(cache, content_store, pack_index, mode_rx, flush_trigger, shutdown_rx, metrics).await;
+        });
+
+        // Trigger a flush
+        flush_trigger_clone.notify_one();
+
+        // Wait for flush to complete
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if cache_check.dirty_block_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(cache_check.dirty_block_count(), 0, "flush trigger should have flushed dirty blocks");
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_mode_switch() {
+        let (
+            cache, content_store, pack_index, flush_trigger, mode_rx, mode_tx,
+            shutdown_rx, shutdown_tx, metrics, _temp,
+        ) = test_scheduler_components();
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(cache, content_store, pack_index, mode_rx, flush_trigger, shutdown_rx, metrics).await;
+        });
+
+        // Switch to continuous mode — scheduler should NOT exit
+        mode_tx
+            .send(FlushMode::Continuous {
+                pack_interval_secs: 1,
+                manifest_interval_secs: 5,
+            })
+            .unwrap();
+
+        // Give it time to process the mode change
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Scheduler should still be running (not exited from mode change)
+        assert!(!handle.is_finished(), "scheduler should still be running after mode switch");
+
+        // Switch back to demand-driven
+        mode_tx.send(FlushMode::DemandDriven).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!handle.is_finished(), "scheduler should still be running");
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
 }

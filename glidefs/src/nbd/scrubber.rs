@@ -4,6 +4,7 @@
 //! mismatch (bit rot, memory corruption), evicts the block from the clean cache.
 //! S3 is the authoritative source of truth; the next read will re-fetch.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,6 +21,23 @@ pub struct ScrubberConfig {
     pub blocks_per_second: u64,
 }
 
+/// Counters for scrubber observability via Prometheus.
+pub struct ScrubberMetrics {
+    /// Total blocks checked across all passes.
+    pub blocks_checked: AtomicU64,
+    /// Total corrupted blocks evicted across all passes.
+    pub blocks_evicted: AtomicU64,
+}
+
+impl ScrubberMetrics {
+    pub fn new() -> Self {
+        Self {
+            blocks_checked: AtomicU64::new(0),
+            blocks_evicted: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Run the background scrubber until cancelled.
 ///
 /// Iterates all known hashes from the pack index, checks if each is in the
@@ -29,6 +47,7 @@ pub async fn scrubber(
     clean_cache: Arc<dyn BlockCache>,
     pack_index: Arc<HostPackIndex>,
     config: ScrubberConfig,
+    metrics: Arc<ScrubberMetrics>,
     shutdown: CancellationToken,
 ) {
     if config.blocks_per_second == 0 {
@@ -59,6 +78,10 @@ pub async fn scrubber(
                 }
             }
         }
+
+        // Update cumulative counters
+        metrics.blocks_checked.fetch_add(checked, Ordering::Relaxed);
+        metrics.blocks_evicted.fetch_add(evicted, Ordering::Relaxed);
 
         if checked > 0 {
             tracing::info!(checked, evicted, "scrubber pass complete");
@@ -112,6 +135,8 @@ mod tests {
         let cache_clone = Arc::clone(&cache);
         let pi_clone = Arc::clone(&pack_index);
 
+        let metrics = Arc::new(ScrubberMetrics::new());
+        let metrics_clone = Arc::clone(&metrics);
         let handle = tokio::spawn(async move {
             scrubber(
                 cache_clone,
@@ -119,6 +144,7 @@ mod tests {
                 ScrubberConfig {
                     blocks_per_second: 10_000,
                 },
+                metrics_clone,
                 shutdown_clone,
             )
             .await;
@@ -133,6 +159,16 @@ mod tests {
         assert!(
             cache.get(&correct_hash).await.is_none(),
             "corrupted block should be evicted"
+        );
+
+        // Metrics should reflect the work done
+        assert!(
+            metrics.blocks_checked.load(Ordering::Relaxed) >= 1,
+            "should have checked at least 1 block"
+        );
+        assert!(
+            metrics.blocks_evicted.load(Ordering::Relaxed) >= 1,
+            "should have evicted at least 1 corrupted block"
         );
     }
 
@@ -172,6 +208,8 @@ mod tests {
         let cache_clone = Arc::clone(&cache);
         let pi_clone = Arc::clone(&pack_index);
 
+        let metrics = Arc::new(ScrubberMetrics::new());
+        let metrics_clone = Arc::clone(&metrics);
         let handle = tokio::spawn(async move {
             scrubber(
                 cache_clone,
@@ -179,6 +217,7 @@ mod tests {
                 ScrubberConfig {
                     blocks_per_second: 10_000,
                 },
+                metrics_clone,
                 shutdown_clone,
             )
             .await;
@@ -197,6 +236,17 @@ mod tests {
             cache.get(&hash2).await.is_some(),
             "valid block 2 should remain"
         );
+
+        // Metrics should show checks but no evictions
+        assert!(
+            metrics.blocks_checked.load(Ordering::Relaxed) >= 2,
+            "should have checked at least 2 blocks"
+        );
+        assert_eq!(
+            metrics.blocks_evicted.load(Ordering::Relaxed),
+            0,
+            "should not have evicted any valid blocks"
+        );
     }
 
     #[tokio::test]
@@ -206,12 +256,14 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         // Should return immediately when blocks_per_second = 0
+        let metrics = Arc::new(ScrubberMetrics::new());
         scrubber(
             cache,
             pack_index,
             ScrubberConfig {
                 blocks_per_second: 0,
             },
+            metrics,
             shutdown,
         )
         .await;
