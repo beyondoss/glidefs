@@ -107,14 +107,19 @@ impl WriteCache<Active> {
                     hash,
                     sequence: seq,
                 };
-                self.inner.wal.lock().unwrap().append(&wal_entry)?;
+                self.inner.wal.lock().append(&wal_entry)?;
 
                 // Dirty store insert (Mutex, uncontended)
-                self.inner.dirty_store.lock().unwrap().insert(hash, Bytes::copy_from_slice(&chunk_buf));
+                self.inner.dirty_store.lock().insert(hash, Bytes::copy_from_slice(&chunk_buf));
             }
 
-            // Flush WAL buffer
-            self.inner.wal.lock().unwrap().flush_buf()?;
+            // Flush WAL buffer (or fsync if wal_sync is enabled)
+            let mut wal = self.inner.wal.lock();
+            if self.inner.config.wal_sync {
+                wal.sync()?;
+            } else {
+                wal.flush_buf()?;
+            }
         }
 
         // Budget enforcement — signal flush scheduler if over budget
@@ -211,12 +216,17 @@ impl WriteCache<Active> {
                     hash: zero_hash,
                     sequence: seq,
                 };
-                self.inner.wal.lock().unwrap().append(&wal_entry)?;
+                self.inner.wal.lock().append(&wal_entry)?;
                 // No dirty store insert for zero blocks -- read path returns zeros
             }
 
-            // Flush WAL buffer
-            self.inner.wal.lock().unwrap().flush_buf()?;
+            // Flush WAL buffer (or fsync if wal_sync is enabled)
+            let mut wal = self.inner.wal.lock();
+            if self.inner.config.wal_sync {
+                wal.sync()?;
+            } else {
+                wal.flush_buf()?;
+            }
         }
 
         // If using a forked block map, check if overlay is large enough to flatten

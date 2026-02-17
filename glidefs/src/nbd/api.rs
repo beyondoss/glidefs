@@ -318,9 +318,20 @@ async fn handle_request(
             }
         }
 
-        // Health check
+        // Liveness check (process alive)
         (Method::GET, ["health"]) => {
             json_response(StatusCode::OK, &ApiResponse::success("healthy"))
+        }
+
+        // Readiness check (exports serving, cache writable)
+        (Method::GET, ["health", "ready"]) => {
+            let status = router.readiness_check().await;
+            let code = if status.ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            json_response(code, &status)
         }
 
         // GET /metrics - Prometheus metrics for all exports

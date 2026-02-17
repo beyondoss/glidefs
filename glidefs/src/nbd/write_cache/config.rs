@@ -30,6 +30,12 @@ pub struct WriteCacheConfig {
     /// Flush trigger notification. When dirty bytes exceed the budget,
     /// the write path calls `notify_one()` to wake the flush scheduler.
     pub flush_trigger: Option<Arc<Notify>>,
+
+    /// Whether to fsync the WAL after each write batch (default: false).
+    /// When true, calls sync() (fsync) instead of flush_buf() (OS buffer flush).
+    /// Adds ~10ms latency per write but guarantees durability on SSDs without
+    /// power-loss protection.
+    pub wal_sync: bool,
 }
 
 impl WriteCacheConfig {

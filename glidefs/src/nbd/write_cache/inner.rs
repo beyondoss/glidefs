@@ -3,7 +3,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -312,18 +313,18 @@ impl CacheInner {
     /// Get a block map entry (takes read lock, effectively zero overhead).
     #[inline]
     pub(super) fn block_map_get(&self, chunk_index: usize) -> (Blake3Hash, u64) {
-        self.block_map.read().expect("block_map lock poisoned").get(chunk_index)
+        self.block_map.read().get(chunk_index)
     }
 
     /// Set a block map entry (takes read lock — interior mutability handles the write).
     #[inline]
     pub(super) fn block_map_set(&self, chunk_index: usize, hash: Blake3Hash, seq: u64) {
-        self.block_map.read().expect("block_map lock poisoned").set(chunk_index, hash, seq)
+        self.block_map.read().set(chunk_index, hash, seq)
     }
 
     /// Snapshot the block map (takes read lock).
     pub(super) fn block_map_snapshot(&self) -> BlockMap {
-        self.block_map.read().expect("block_map lock poisoned").snapshot(&self.block_states)
+        self.block_map.read().snapshot(&self.block_states)
     }
 
     /// Count present blocks (for metrics/logging).

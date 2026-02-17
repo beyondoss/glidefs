@@ -5,13 +5,14 @@
 //! - Continuous: periodic pack flush (~5s) + manifest sync (~60s)
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Notify};
 use tracing::{error, info, warn};
 
 use crate::nbd::content_store::ContentStore;
+use crate::nbd::metrics::ExportMetrics;
 use crate::nbd::pack_index::HostPackIndex;
 use crate::nbd::state::Active;
 use crate::nbd::write_cache::WriteCache;
@@ -68,6 +69,7 @@ pub async fn flush_scheduler(
     mut mode_rx: watch::Receiver<FlushMode>,
     flush_trigger: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
+    metrics: Arc<ExportMetrics>,
 ) {
     info!("flush scheduler started");
 
@@ -84,6 +86,7 @@ pub async fn flush_scheduler(
                     &flush_trigger,
                     &mut mode_rx,
                     &mut shutdown,
+                    &metrics,
                 )
                 .await;
             }
@@ -104,6 +107,7 @@ pub async fn flush_scheduler(
                     &mut shutdown,
                     Duration::from_secs(pack_interval_secs),
                     Duration::from_secs(manifest_interval_secs),
+                    &metrics,
                 )
                 .await;
             }
@@ -131,6 +135,7 @@ async fn run_demand_driven(
     flush_trigger: &Arc<Notify>,
     mode_rx: &mut watch::Receiver<FlushMode>,
     shutdown: &mut watch::Receiver<bool>,
+    metrics: &ExportMetrics,
 ) {
     loop {
         tokio::select! {
@@ -150,7 +155,7 @@ async fn run_demand_driven(
 
             // Explicit flush trigger.
             () = flush_trigger.notified() => {
-                do_full_flush(cache, content_store, pack_index).await;
+                do_full_flush(cache, content_store, pack_index, metrics).await;
             }
         }
     }
@@ -170,6 +175,7 @@ async fn run_continuous(
     shutdown: &mut watch::Receiver<bool>,
     pack_dur: Duration,
     manifest_dur: Duration,
+    metrics: &ExportMetrics,
 ) {
     let mut pack_ticker = tokio::time::interval(pack_dur);
     let mut manifest_ticker = tokio::time::interval(manifest_dur);
@@ -201,7 +207,7 @@ async fn run_continuous(
 
             // Explicit flush trigger (budget exceeded, API call).
             () = flush_trigger.notified() => {
-                do_full_flush(cache, content_store, pack_index).await;
+                do_full_flush(cache, content_store, pack_index, metrics).await;
                 // A full flush includes a manifest sync, so reset cutpoint.
                 last_seq_cutpoint = 0;
                 pack_backoff = Duration::from_secs(1);
@@ -211,8 +217,10 @@ async fn run_continuous(
             // Periodic pack flush.
             _ = pack_ticker.tick() => {
                 if cache.dirty_block_count() > 0 {
+                    let start = Instant::now();
                     match cache.flush_packs(content_store, pack_index).await {
                         Ok((stats, seq_cutpoint)) => {
+                            metrics.record_s3_put_latency(start.elapsed());
                             if stats.packs_uploaded > 0 {
                                 info!(
                                     packs = stats.packs_uploaded,
@@ -226,6 +234,7 @@ async fn run_continuous(
                             pack_backoff = Duration::from_secs(1);
                         }
                         Err(e) => {
+                            metrics.record_flush_error();
                             warn!(error = %e, backoff_secs = pack_backoff.as_secs(), "periodic pack flush failed, backing off");
                             tokio::time::sleep(pack_backoff).await;
                             pack_backoff = (pack_backoff * 2).min(MAX_BACKOFF);
@@ -244,6 +253,7 @@ async fn run_continuous(
                             manifest_backoff = Duration::from_secs(1);
                         }
                         Err(e) => {
+                            metrics.record_flush_error();
                             warn!(error = %e, backoff_secs = manifest_backoff.as_secs(), "manifest sync failed, backing off");
                             tokio::time::sleep(manifest_backoff).await;
                             manifest_backoff = (manifest_backoff * 2).min(MAX_BACKOFF);
@@ -264,9 +274,12 @@ async fn do_full_flush(
     cache: &Arc<WriteCache<Active>>,
     content_store: &Arc<ContentStore>,
     pack_index: &Arc<HostPackIndex>,
+    metrics: &ExportMetrics,
 ) {
+    let start = Instant::now();
     match cache.flush_to_s3(content_store, pack_index).await {
         Ok(stats) => {
+            metrics.record_s3_put_latency(start.elapsed());
             if stats.packs_uploaded > 0 {
                 info!(
                     packs = stats.packs_uploaded,
@@ -277,6 +290,7 @@ async fn do_full_flush(
             }
         }
         Err(e) => {
+            metrics.record_flush_error();
             error!(error = %e, "full flush failed");
         }
     }

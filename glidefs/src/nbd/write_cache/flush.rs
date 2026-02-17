@@ -138,7 +138,6 @@ impl WriteCache<Active> {
                 .inner
                 .dirty_store
                 .lock()
-                .unwrap()
                 .get(&hash)
                 .cloned();
 
@@ -218,7 +217,6 @@ impl WriteCache<Active> {
                         self.inner
                             .dirty_store
                             .lock()
-                            .unwrap()
                             .remove(&snapshot_hash);
                     }
                 }
@@ -358,14 +356,14 @@ impl WriteCache<Active> {
     /// when the overlay exceeds 50% of total chunks. Takes a write lock briefly.
     pub(super) fn try_flatten_block_map(&self) {
         let needs_flatten = {
-            let bm = self.inner.block_map.read().expect("block_map lock poisoned");
+            let bm = self.inner.block_map.read();
             match &*bm {
                 BlockMapKind::Forked(f) => f.should_flatten(),
                 BlockMapKind::Full(_) => false,
             }
         };
         if needs_flatten {
-            let mut bm = self.inner.block_map.write().expect("block_map lock poisoned");
+            let mut bm = self.inner.block_map.write();
             // Re-check under write lock (another thread may have flattened)
             if let BlockMapKind::Forked(f) = &*bm {
                 if f.should_flatten() {

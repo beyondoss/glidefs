@@ -45,6 +45,32 @@ pub struct CacheConfig {
 pub struct StorageConfig {
     #[serde(deserialize_with = "deserialize_expandable_string")]
     pub url: String,
+    /// S3 connection timeout in seconds (default: 10).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub connect_timeout_secs: Option<u64>,
+    /// S3 request timeout in seconds (default: 300).
+    /// Set high to accommodate large pack uploads.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub request_timeout_secs: Option<u64>,
+}
+
+impl StorageConfig {
+    pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+    pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+
+    pub fn connect_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.connect_timeout_secs
+                .unwrap_or(Self::DEFAULT_CONNECT_TIMEOUT_SECS),
+        )
+    }
+
+    pub fn request_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.request_timeout_secs
+                .unwrap_or(Self::DEFAULT_REQUEST_TIMEOUT_SECS),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -118,6 +144,13 @@ pub struct NbdConfig {
     /// Periodically re-hashes cached blocks to detect silent corruption.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub scrubber_blocks_per_second: Option<u64>,
+
+    /// Whether to fsync the WAL after each write batch (default: false).
+    /// When false, the WAL uses OS buffer flush only (~20µs writes).
+    /// Set true on SSDs without power-loss protection to guarantee
+    /// WAL durability at the cost of ~10ms per write batch.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub wal_sync: Option<bool>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -204,6 +237,11 @@ impl NbdConfig {
     pub fn scrubber_blocks_per_second(&self) -> u64 {
         self.scrubber_blocks_per_second
             .unwrap_or(Self::DEFAULT_SCRUBBER_BPS)
+    }
+
+    /// Whether to fsync the WAL after each write batch (default: false).
+    pub fn wal_sync(&self) -> bool {
+        self.wal_sync.unwrap_or(false)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -360,7 +398,77 @@ impl Settings {
         let settings: Settings = toml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
+        settings.validate()?;
+
         Ok(settings)
+    }
+
+    /// Validate configuration values at startup. Fails fast on nonsensical values.
+    pub fn validate(&self) -> Result<()> {
+        // Cache validation
+        anyhow::ensure!(
+            self.cache.disk_size_gb > 0.0,
+            "cache.disk_size_gb must be > 0, got {}",
+            self.cache.disk_size_gb
+        );
+
+        // Storage timeout validation
+        if let Some(t) = self.storage.connect_timeout_secs {
+            anyhow::ensure!(t > 0, "storage.connect_timeout_secs must be > 0, got {}", t);
+        }
+        if let Some(t) = self.storage.request_timeout_secs {
+            anyhow::ensure!(t > 0, "storage.request_timeout_secs must be > 0, got {}", t);
+        }
+
+        // NBD validation
+        if let Some(nbd) = &self.servers.nbd {
+            if let Some(bs) = nbd.block_size {
+                anyhow::ensure!(
+                    bs.is_power_of_two() && bs >= 4096 && bs <= 1_048_576,
+                    "block_size must be a power of 2 between 4096 and 1048576, got {}",
+                    bs
+                );
+            }
+            if let Some(bpb) = nbd.blocks_per_batch {
+                anyhow::ensure!(bpb > 0, "blocks_per_batch must be > 0, got {}", bpb);
+            }
+            if let Some(db) = nbd.dirty_budget_gb {
+                anyhow::ensure!(db > 0.0, "dirty_budget_gb must be > 0, got {}", db);
+            }
+            if let Some(sd) = nbd.sync_delay_ms {
+                anyhow::ensure!(sd > 0, "sync_delay_ms must be > 0, got {}", sd);
+            }
+
+            // Export validation
+            let mut names = HashSet::new();
+            for export in &nbd.exports {
+                anyhow::ensure!(
+                    !export.name.is_empty(),
+                    "export name must not be empty"
+                );
+                anyhow::ensure!(
+                    names.insert(&export.name),
+                    "duplicate export name: '{}'",
+                    export.name
+                );
+                anyhow::ensure!(
+                    export.size_gb > 0.0,
+                    "export '{}': size_gb must be > 0, got {}",
+                    export.name,
+                    export.size_gb
+                );
+                if let Some(bs) = export.block_size {
+                    anyhow::ensure!(
+                        bs.is_power_of_two() && bs >= 4096 && bs <= 1_048_576,
+                        "export '{}': block_size must be a power of 2 between 4096 and 1048576, got {}",
+                        export.name,
+                        bs
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn cloud_provider_env_vars(&self) -> Vec<(String, String)> {
@@ -403,6 +511,8 @@ impl Settings {
             },
             storage: StorageConfig {
                 url: "s3://your-bucket/glidefs-data".to_string(),
+                connect_timeout_secs: None,
+                request_timeout_secs: None,
             },
             servers: ServerConfig {
                 nbd: Some(NbdConfig {
@@ -425,6 +535,7 @@ impl Settings {
                     device_size_gb: None,
                     dirty_budget_gb: None,
                     scrubber_blocks_per_second: None,
+                    wal_sync: None,
                 }),
             },
             aws: Some(AwsConfig(aws_config)),
@@ -578,5 +689,77 @@ secret_access_key = "${GLIDEFS_TEST_AWS_SECRET}"
         let aws = settings.aws.unwrap();
         assert_eq!(aws.0.get("access_key_id").unwrap(), "aws123");
         assert_eq!(aws.0.get("secret_access_key").unwrap(), "aws_secret");
+    }
+
+    #[test]
+    fn test_validation_rejects_bad_block_size() {
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+
+[servers.nbd]
+block_size = 7
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let result = Settings::from_file(temp_file.path().to_str().unwrap());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("block_size must be a power of 2"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_disk_size() {
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 0.0
+
+[storage]
+url = "s3://bucket/data"
+
+[servers]
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let result = Settings::from_file(temp_file.path().to_str().unwrap());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("disk_size_gb must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validation_rejects_duplicate_export_names() {
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+
+[servers.nbd]
+
+[[servers.nbd.exports]]
+name = "vol1"
+size_gb = 10.0
+
+[[servers.nbd.exports]]
+name = "vol1"
+size_gb = 20.0
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let result = Settings::from_file(temp_file.path().to_str().unwrap());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("duplicate export name"), "got: {err}");
     }
 }

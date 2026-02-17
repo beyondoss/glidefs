@@ -17,6 +17,7 @@ fn test_config(dir: &Path) -> WriteCacheConfig {
         block_size: 4096,         // 4KB for testing
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     }
 }
 
@@ -218,6 +219,7 @@ async fn test_batch_prefetch_single_batch_efficiency() {
         block_size: 4096,
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery(&s3).await.unwrap();
@@ -277,6 +279,7 @@ async fn test_batch_prefetch_cross_batch_efficiency() {
         block_size: 4096,
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery(&s3).await.unwrap();
@@ -325,6 +328,7 @@ async fn test_batch_prefetch_multi_block_read_span() {
         block_size: 4096,
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery(&s3).await.unwrap();
@@ -370,6 +374,7 @@ async fn test_batch_prefetch_with_local_dirty_blocks() {
         block_size: 4096,
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery(&s3).await.unwrap();
@@ -450,6 +455,7 @@ async fn test_prefetch_write_race_data_integrity() {
         block_size: 4096,
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     };
     let cache = Arc::new(
         WriteCache::<Initializing>::open(config)
@@ -551,6 +557,7 @@ async fn test_concurrent_write_and_prefetch_stress() {
             block_size: 4096,
             dirty_budget_bytes: 0,
             flush_trigger: None,
+            wal_sync: false,
         };
         let cache = Arc::new(
             WriteCache::<Initializing>::open(config)
@@ -629,6 +636,7 @@ impl V2Harness {
             block_size,
             dirty_budget_bytes: 0,
             flush_trigger: None,
+            wal_sync: false,
         };
         let s3 = test_s3();
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -666,7 +674,7 @@ impl V2Harness {
 
     /// Clear the dirty store (simulates blocks being evicted after flush).
     fn clear_dirty_store(&self) {
-        self.cache.inner.dirty_store.lock().unwrap().clear();
+        self.cache.inner.dirty_store.lock().clear();
     }
 
     /// Get the manifest from S3.
@@ -779,12 +787,12 @@ async fn test_flush_clears_dirty_state() {
         h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
     }
 
-    assert!(h.cache.inner.dirty_store.lock().unwrap().len() >= 3);
+    assert!(h.cache.inner.dirty_store.lock().len() >= 3);
 
     h.flush().await;
 
     assert_eq!(
-        h.cache.inner.dirty_store.lock().unwrap().len(), 0,
+        h.cache.inner.dirty_store.lock().len(), 0,
         "dirty store should be empty after flush"
     );
 
@@ -1114,6 +1122,7 @@ fn test_open_from_manifest_creates_clean_cache() {
         block_size,
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     };
 
     let cache = WriteCache::<Initializing>::open_from_manifest(
@@ -1177,6 +1186,7 @@ fn test_open_from_manifest_with_forked_overlay() {
         block_size,
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     };
 
     let cache = WriteCache::<Initializing>::open_from_manifest(
@@ -1188,7 +1198,7 @@ fn test_open_from_manifest_with_forked_overlay() {
 
     // Verify the block map is the Forked variant
     {
-        let bm = cache.inner.block_map.read().unwrap();
+        let bm = cache.inner.block_map.read();
         assert!(
             matches!(&*bm, BlockMapKind::Forked(_)),
             "block map should be Forked variant"
@@ -1237,6 +1247,7 @@ fn test_open_from_manifest_fork_writes_to_overlay() {
         block_size,
         dirty_budget_bytes: 0,
         flush_trigger: None,
+        wal_sync: false,
     };
 
     let cache = WriteCache::<Initializing>::open_from_manifest(
@@ -1252,7 +1263,7 @@ fn test_open_from_manifest_fork_writes_to_overlay() {
 
     // The overlay should have grown
     {
-        let bm = cache.inner.block_map.read().unwrap();
+        let bm = cache.inner.block_map.read();
         if let BlockMapKind::Forked(f) = &*bm {
             assert_eq!(
                 f.overlay_len(),

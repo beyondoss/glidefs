@@ -14,7 +14,8 @@ use super::state::Active;
 use super::write_cache::WriteCache;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Instant;
 
 /// NBD device descriptor used during transmission phase.
@@ -148,7 +149,7 @@ impl NBDBlockHandler {
         {
             let chunk_size = self.cache.block_size() as u64;
             let chunk_idx = offset / chunk_size;
-            if let Some(readahead_chunk) = self.readahead.lock().unwrap().record(chunk_idx) {
+            if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
                 let cache = Arc::clone(&self.cache);
                 let clean_cache = Arc::clone(&self.clean_cache);
                 let pack_index = Arc::clone(&self.pack_index);
@@ -297,6 +298,7 @@ mod tests {
             block_size: 4096,
             dirty_budget_bytes: 0,
             flush_trigger: None,
+            wal_sync: false,
         };
 
         // Create in-memory S3 store for tests

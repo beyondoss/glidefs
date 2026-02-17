@@ -1080,6 +1080,7 @@ dependencies = [
  "lz4_flex",
  "mimalloc",
  "object_store",
+ "parking_lot",
  "proptest",
  "rand 0.8.5",
  "serde",

@@ -21,6 +21,7 @@ use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use std::time::Duration;
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +166,8 @@ impl ObjectStoreScheme {
 pub fn parse_url_opts<I, K, V>(
     url: &Url,
     options: I,
+    connect_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
 ) -> Result<(Box<dyn ObjectStore>, Path), object_store::Error>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -174,6 +177,10 @@ where
     let (scheme, path) = ObjectStoreScheme::parse(url)?;
     let path = Path::parse(path)?;
 
+    let client_options = ClientOptions::default()
+        .with_connect_timeout(connect_timeout.unwrap_or(Duration::from_secs(10)))
+        .with_timeout(request_timeout.unwrap_or(Duration::from_secs(300)));
+
     let store: Box<dyn ObjectStore> = match scheme {
         ObjectStoreScheme::Local => Box::new(LocalFileSystem::new()),
         ObjectStoreScheme::Memory => Box::new(InMemory::new()),
@@ -181,7 +188,7 @@ where
             let builder = options.into_iter().fold(
                 object_store::aws::AmazonS3Builder::new()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(client_options),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -193,7 +200,7 @@ where
             let builder = options.into_iter().fold(
                 object_store::gcp::GoogleCloudStorageBuilder::new()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(client_options),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,
@@ -205,7 +212,7 @@ where
             let builder = options.into_iter().fold(
                 object_store::azure::MicrosoftAzureBuilder::new()
                     .with_url(url.to_string())
-                    .with_client_options(ClientOptions::default().with_timeout_disabled()),
+                    .with_client_options(client_options),
                 |builder, (key, value)| match key.as_ref().parse() {
                     Ok(k) => builder.with_config(k, value),
                     Err(_) => builder,

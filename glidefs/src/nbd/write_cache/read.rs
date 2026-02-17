@@ -83,7 +83,7 @@ impl WriteCache<Active> {
     /// Resolution order: block_map → dirty_store → clean_cache → S3 pack fetch.
     /// On S3 cache miss, the entire pack (~25 blocks) is fetched and all blocks
     /// are decompressed, verified, and inserted into the clean cache.
-    #[instrument(skip(self, clean_cache, pack_index, content_store, _metrics), fields(offset = offset, len = len))]
+    #[instrument(skip(self, clean_cache, pack_index, content_store, metrics), fields(offset = offset, len = len))]
     pub async fn read_v2(
         &self,
         offset: u64,
@@ -91,7 +91,7 @@ impl WriteCache<Active> {
         clean_cache: &dyn BlockCache,
         pack_index: &HostPackIndex,
         content_store: &ContentStore,
-        _metrics: &super::super::metrics::ExportMetrics,
+        metrics: &super::super::metrics::ExportMetrics,
     ) -> Result<Bytes, CacheError> {
         if offset + len as u64 > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
@@ -112,7 +112,7 @@ impl WriteCache<Active> {
 
         for chunk_idx in start_chunk..=end_chunk {
             let chunk_data = self
-                .resolve_chunk(chunk_idx as usize, clean_cache, pack_index, content_store)
+                .resolve_chunk(chunk_idx as usize, clean_cache, pack_index, content_store, Some(metrics))
                 .await?;
 
             // Slice out the portion of this chunk that overlaps the requested range.
@@ -156,7 +156,7 @@ impl WriteCache<Active> {
             return Ok(());
         }
         let _ = self
-            .resolve_chunk(chunk_index, clean_cache, pack_index, content_store)
+            .resolve_chunk(chunk_index, clean_cache, pack_index, content_store, None)
             .await;
         Ok(())
     }
@@ -196,6 +196,7 @@ impl WriteCache<Active> {
         clean_cache: &dyn BlockCache,
         pack_index: &HostPackIndex,
         content_store: &ContentStore,
+        metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<Bytes, CacheError> {
         let chunk_size = self.inner.config.block_size;
         let (hash, _seq) = self.inner.block_map_get(chunk_index);
@@ -206,7 +207,7 @@ impl WriteCache<Active> {
         }
 
         // Tier 1: dirty_store (in-memory, not yet flushed to S3).
-        if let Some(data) = self.inner.dirty_store.lock().unwrap().get(&hash) {
+        if let Some(data) = self.inner.dirty_store.lock().get(&hash) {
             return Ok(data.clone());
         }
 
@@ -218,7 +219,15 @@ impl WriteCache<Active> {
         // Tier 3: S3 pack fetch — find the pack, fetch it, ingest all blocks.
         let pack_loc = pack_index.get(&hash).ok_or(CacheError::BlockNotFound { hash })?;
 
-        let pack_data = content_store.get_pack(pack_loc.pack_id).await?;
+        let pack_data = match content_store.get_pack(pack_loc.pack_id).await {
+            Ok(data) => data,
+            Err(e) => {
+                if let Some(m) = metrics {
+                    m.record_s3_get_error();
+                }
+                return Err(e.into());
+            }
+        };
         let pack_idx = pack::parse_pack_index(&pack_data)
             .map_err(|e| CacheError::PackFormat(e.to_string()))?;
 

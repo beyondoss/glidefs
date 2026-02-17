@@ -64,6 +64,7 @@ blake3 = "1.8"
 lz4_flex = "0.12"
 crc32fast = "1.5"
 tempfile = "3.21"
+parking_lot = "0.12"
 
 [dev-dependencies]
 futures = "0.3"

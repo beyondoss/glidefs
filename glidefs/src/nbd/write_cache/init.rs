@@ -2,7 +2,8 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
+use parking_lot::{Mutex, RwLock};
 use tracing::{info, instrument, warn};
 
 use crate::nbd::block_map::{

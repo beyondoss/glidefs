@@ -73,6 +73,14 @@ pub struct ExportInfo {
     pub readonly: bool,
 }
 
+/// Readiness check result for health endpoint.
+#[derive(Debug, Serialize)]
+pub struct ReadinessStatus {
+    pub ready: bool,
+    pub exports_count: usize,
+    pub cache_writable: bool,
+}
+
 /// Response from a snapshot operation.
 #[derive(Debug, Serialize)]
 pub struct SnapshotResponse {
@@ -139,6 +147,8 @@ pub struct RouterConfig {
     pub auto_create_size_gb: Option<f64>,
     /// Shared block cache for decompressed block data
     pub clean_cache: Arc<dyn BlockCache>,
+    /// Whether to fsync the WAL after each write batch
+    pub wal_sync: bool,
 }
 
 /// Multi-tenant export router.
@@ -177,6 +187,9 @@ pub struct ExportRouter {
 
     /// Shared clean cache across all exports (content-addressed dedup)
     clean_cache: Arc<dyn BlockCache>,
+
+    /// Whether to fsync the WAL after each write batch
+    wal_sync: bool,
 }
 
 impl ExportRouter {
@@ -194,6 +207,7 @@ impl ExportRouter {
             auto_create_size_gb: config.auto_create_size_gb,
             pack_index: Arc::new(HostPackIndex::new()),
             clean_cache: config.clean_cache,
+            wal_sync: config.wal_sync,
         }
     }
 
@@ -373,6 +387,7 @@ impl ExportRouter {
             block_size,
             dirty_budget_bytes,
             flush_trigger: Some(Arc::clone(&flush_trigger)),
+            wal_sync: self.wal_sync,
         };
 
         let cache = if let Some(manifest_name) = manifest_name {
@@ -487,8 +502,9 @@ impl ExportRouter {
         let flush_pi = Arc::clone(&pack_index);
         let flush_trig = Arc::clone(&flush_trigger);
         let export_name = name.clone();
+        let flush_metrics = Arc::clone(&metrics);
         let flush_handle = spawn_named(&format!("flush-{}", name), async move {
-            flush_scheduler(flush_cache, flush_cs, flush_pi, flush_mode_rx, flush_trig, flush_shutdown_rx).await;
+            flush_scheduler(flush_cache, flush_cs, flush_pi, flush_mode_rx, flush_trig, flush_shutdown_rx, flush_metrics).await;
             info!("Flush scheduler for export '{}' stopped", export_name);
         });
 
@@ -577,6 +593,25 @@ impl ExportRouter {
     pub async fn list_export_names(&self) -> Vec<String> {
         let exports = self.exports.read().await;
         exports.keys().cloned().collect()
+    }
+
+    /// Check readiness: at least one export exists and cache directory is writable.
+    pub async fn readiness_check(&self) -> ReadinessStatus {
+        let exports = self.exports.read().await;
+        let exports_count = exports.len();
+
+        let cache_writable = {
+            let probe = self.cache_dir.join(".health-probe");
+            std::fs::write(&probe, b"ok")
+                .and_then(|_| std::fs::remove_file(&probe))
+                .is_ok()
+        };
+
+        ReadinessStatus {
+            ready: exports_count > 0 && cache_writable,
+            exports_count,
+            cache_writable,
+        }
     }
 
     /// Get metrics snapshot for an export.
@@ -866,6 +901,7 @@ impl ExportRouter {
             dirty_budget_gb: 5.0,
             auto_create_size_gb: None,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            wal_sync: false,
         })
     }
 }
@@ -905,6 +941,7 @@ mod tests {
             dirty_budget_gb: 5.0,
             auto_create_size_gb: None,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            wal_sync: false,
         })
     }
 

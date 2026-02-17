@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use super::block_map::Blake3Hash;
 
@@ -137,13 +137,13 @@ impl SimpleBlockCache {
 #[async_trait]
 impl BlockCache for SimpleBlockCache {
     async fn get(&self, hash: &Blake3Hash) -> Option<Bytes> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.map.get(hash).cloned()
     }
 
     fn insert(&self, hash: Blake3Hash, data: Bytes) {
         let data_len = data.len();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
 
         // Already present — skip.
         if inner.map.contains_key(&hash) {
@@ -166,7 +166,7 @@ impl BlockCache for SimpleBlockCache {
     }
 
     fn remove(&self, hash: &Blake3Hash) -> bool {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if let Some(evicted) = inner.map.remove(hash) {
             inner.current_bytes -= evicted.len();
             inner.order.retain(|h| h != hash);
@@ -238,7 +238,7 @@ mod tests {
         let got = cache.get(&hash).await.unwrap();
         assert_eq!(got, data, "second insert should be a no-op");
 
-        let inner = cache.inner.lock().unwrap();
+        let inner = cache.inner.lock();
         assert_eq!(inner.current_bytes, 4096);
     }
 
