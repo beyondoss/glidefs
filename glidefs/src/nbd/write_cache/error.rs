@@ -42,9 +42,6 @@ pub enum CacheError {
     #[error("LZ4 decompression failed: {0}")]
     DecompressFailed(String),
 
-    #[error("Dirty budget exceeded: write rate exceeds flush capacity")]
-    DirtyBudgetExceeded,
-
     #[error("Unsupported block size {0}: must not exceed {1} (ZERO_BLOCK_BYTES is compiled for this size)")]
     UnsupportedBlockSize(usize, usize),
 }

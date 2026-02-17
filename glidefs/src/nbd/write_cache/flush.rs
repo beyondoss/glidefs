@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 use crate::nbd::block_map::{
-    BlockMapKind, Blake3Hash, lz4_compress,
+    BlockMapKind, Blake3Hash, blake3_128, lz4_compress,
 };
 use crate::nbd::block_store::S3BlockStore;
 use crate::nbd::content_store::ContentStore;
@@ -113,7 +113,10 @@ impl WriteCache<Active> {
         let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
         let mut seen_hashes = std::collections::HashSet::new();
 
-        for &(_chunk_index, hash) in &snapshot {
+        let block_size = self.inner.config.block_size;
+        let mut chunk_buf = vec![0u8; block_size];
+
+        for &(chunk_index, hash) in &snapshot {
             stats.blocks_flushed += 1;
 
             // Skip zero blocks — read path returns zeros directly
@@ -134,22 +137,27 @@ impl WriteCache<Active> {
                 continue;
             }
 
-            // Get data from dirty store
-            let data = self
-                .inner
-                .dirty_store
-                .lock()
-                .get(&hash)
-                .cloned();
+            // Read block data from SSD and verify hash.
+            // A concurrent write may have changed the block since snapshot —
+            // hash mismatch means skip (block stays dirty for next flush).
+            let offset = chunk_index as u64 * block_size as u64;
+            let device_size = self.inner.config.device_size;
+            let valid_bytes = std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
+            if valid_bytes > 0 {
+                self.inner.data_file.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
+            }
+            if valid_bytes < block_size {
+                chunk_buf[valid_bytes..].fill(0);
+            }
 
-            let Some(data) = data else {
-                // Data missing from dirty store — could have been cleaned by a
-                // concurrent flush. Skip; it's already in S3.
+            let actual_hash = blake3_128(&chunk_buf);
+            if actual_hash != hash {
+                // Concurrent write changed this block — skip, it stays dirty.
                 stats.blocks_deduped += 1;
                 continue;
-            };
+            }
 
-            let compressed = lz4_compress(&data);
+            let compressed = lz4_compress(&chunk_buf[..]);
             to_upload.push((hash, compressed));
         }
 
@@ -179,17 +187,6 @@ impl WriteCache<Active> {
         }
 
         // 5. Clear dirty state for blocks whose hash hasn't changed.
-        //
-        // Track which hashes still have dirty references so we only remove
-        // from the dirty store when the last block referencing that hash is
-        // cleaned. This prevents premature eviction when two chunks share
-        // the same content hash.
-        let mut dirty_hash_refs: std::collections::HashMap<Blake3Hash, usize> =
-            std::collections::HashMap::new();
-        for &(_, hash) in &snapshot {
-            *dirty_hash_refs.entry(hash).or_insert(0) += 1;
-        }
-
         for &(chunk_index, snapshot_hash) in &snapshot {
             let (current_hash, _seq) = self.inner.block_map_get(chunk_index);
             if current_hash == snapshot_hash {
@@ -207,30 +204,9 @@ impl WriteCache<Active> {
                     self.inner
                         .dirty_block_count
                         .fetch_sub(1, Ordering::Relaxed);
-                    self.inner
-                        .dirty_bytes
-                        .fetch_sub(chunk_size as u64, Ordering::Relaxed);
-                }
-
-                // Decrement refcount for this hash
-                if let Some(count) = dirty_hash_refs.get_mut(&snapshot_hash) {
-                    *count -= 1;
-                    if *count == 0 {
-                        // Last block referencing this hash — safe to remove from dirty store
-                        self.inner
-                            .dirty_store
-                            .lock()
-                            .remove(&snapshot_hash);
-                    }
-                }
-            } else {
-                // Concurrent write produced a new hash — leave dirty for next flush.
-                // Also decrement refcount since this block no longer holds the old hash.
-                if let Some(count) = dirty_hash_refs.get_mut(&snapshot_hash) {
-                    *count -= 1;
-                    // Don't remove from dirty store — another block may still reference it
                 }
             }
+            // Concurrent write produced a new hash — leave dirty for next flush.
         }
 
         stats.new_pack_ids = new_pack_ids;
@@ -317,9 +293,17 @@ impl WriteCache<Active> {
         Ok(())
     }
 
-    /// Current dirty bytes outstanding (unflushed writes).
-    pub fn dirty_bytes(&self) -> u64 {
-        self.inner.dirty_bytes.load(Ordering::Relaxed)
+    /// Local checkpoint: persist block states + truncate WAL.
+    ///
+    /// Independent of S3 — keeps the WAL bounded in demand-driven mode
+    /// where S3 flushes may be infrequent. Should run every ~5s when
+    /// there are dirty blocks.
+    pub fn local_checkpoint(&self) -> Result<(), CacheError> {
+        let mut wal = self.inner.wal.lock();
+        self.inner.save_metadata()?;
+        wal.truncate()?;
+        debug!("local checkpoint complete");
+        Ok(())
     }
 
     /// Update the pack registry after a flush. Best-effort: warn on failure.

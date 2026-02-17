@@ -40,6 +40,7 @@ fn write_blocks(
     start: usize,
     count: usize,
     seed: u8,
+    clean_cache: &dyn glidefs::nbd::cache::BlockCache,
 ) {
     for i in 0..count {
         let offset = (start + i) * BLOCK_SIZE;
@@ -52,7 +53,7 @@ fn write_blocks(
         for b in 2..BLOCK_SIZE {
             data[b] = ((i + b) % 256) as u8;
         }
-        cache.write(offset as u64, &data).unwrap();
+        cache.write(offset as u64, &data, clean_cache).unwrap();
     }
 }
 
@@ -71,14 +72,14 @@ async fn get_registry(content_store: &ContentStore, name: &str) -> Option<PackRe
 async fn test_flush_updates_registry() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
     // No registry before any writes
     assert!(get_registry(&cs, "vm1").await.is_none());
 
     // Write 3 blocks and flush
-    write_blocks(&cache, 0, 3, 0);
+    write_blocks(&cache, 0, 3, 0, cc.as_ref());
     let stats = cache.flush_to_s3(&cs, &pi).await.unwrap();
     assert!(stats.packs_uploaded > 0, "should have uploaded packs");
 
@@ -102,14 +103,14 @@ async fn test_flush_updates_registry() {
 async fn test_multiple_flushes_accumulate() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
     let mut all_pack_ids: Vec<Uuid> = Vec::new();
 
     // 3 successive flushes with different blocks
     for round in 0..3 {
-        write_blocks(&cache, round * 5, 3, round as u8);
+        write_blocks(&cache, round * 5, 3, round as u8, cc.as_ref());
         let stats = cache.flush_to_s3(&cs, &pi).await.unwrap();
         all_pack_ids.extend_from_slice(&stats.new_pack_ids);
     }
@@ -134,11 +135,11 @@ async fn test_multiple_flushes_accumulate() {
 async fn test_fork_creates_child_registry() {
     let s3 = Arc::new(InMemory::new());
     let parent_dir = TempDir::new().unwrap();
-    let (parent_cache, parent_cs, parent_pi, _cc, _m) =
+    let (parent_cache, parent_cs, parent_pi, cc, _m) =
         create_v2_test_cache(&parent_dir, "parent", Arc::clone(&s3) as _);
 
     // Write and flush parent
-    write_blocks(&parent_cache, 0, 10, 0);
+    write_blocks(&parent_cache, 0, 10, 0, cc.as_ref());
     let parent_stats = parent_cache.flush_to_s3(&parent_cs, &parent_pi).await.unwrap();
     assert!(!parent_stats.new_pack_ids.is_empty());
 
@@ -184,11 +185,11 @@ async fn test_fork_creates_child_registry() {
 async fn test_fork_registries_independent() {
     let s3 = Arc::new(InMemory::new());
     let parent_dir = TempDir::new().unwrap();
-    let (parent_cache, parent_cs, parent_pi, _cc, _m) =
+    let (parent_cache, parent_cs, parent_pi, cc, _m) =
         create_v2_test_cache(&parent_dir, "parent", Arc::clone(&s3) as _);
 
     // Write and flush parent
-    write_blocks(&parent_cache, 0, 5, 0);
+    write_blocks(&parent_cache, 0, 5, 0, cc.as_ref());
     parent_cache.flush_to_s3(&parent_cs, &parent_pi).await.unwrap();
 
     // Read parent manifest for fork
@@ -216,13 +217,12 @@ async fn test_fork_registries_independent() {
         device_name: "child".to_string(),
         device_size: super::DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
     let child_cs = ContentStore::new(Arc::clone(&s3) as _, "test");
     let child_pi = glidefs::nbd::pack_index::HostPackIndex::new();
     child_pi.rebuild(&[manifest.clone()]);
+    let child_cc = glidefs::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     let child_cache = glidefs::nbd::write_cache::WriteCache::open_from_manifest(
         child_config,
@@ -232,7 +232,7 @@ async fn test_fork_registries_independent() {
     .unwrap();
 
     // Write new blocks to child and flush
-    write_blocks(&child_cache, 20, 5, 99);
+    write_blocks(&child_cache, 20, 5, 99, &child_cc);
     let child_stats = child_cache.flush_to_s3(&child_cs, &child_pi).await.unwrap();
 
     // Child registry should now contain parent packs + child's new packs
@@ -263,10 +263,10 @@ async fn test_fork_registries_independent() {
 async fn test_gc_finds_no_orphans() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
-    write_blocks(&cache, 0, 5, 0);
+    write_blocks(&cache, 0, 5, 0, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     let mut state = new_gc_state_for_test();
@@ -285,18 +285,18 @@ async fn test_gc_finds_no_orphans() {
 async fn test_gc_deletes_orphaned_packs() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
     // First flush: creates packs
-    write_blocks(&cache, 0, 5, 0);
+    write_blocks(&cache, 0, 5, 0, cc.as_ref());
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
     let first_packs = stats1.new_pack_ids.clone();
     assert!(!first_packs.is_empty());
 
     // Overwrite the same blocks with different data, flush again
     // This creates new packs; the old packs are now orphaned
-    write_blocks(&cache, 0, 5, 42);
+    write_blocks(&cache, 0, 5, 42, cc.as_ref());
     let stats2 = cache.flush_to_s3(&cs, &pi).await.unwrap();
     assert!(!stats2.new_pack_ids.is_empty());
 
@@ -329,13 +329,13 @@ async fn test_gc_deletes_orphaned_packs() {
 async fn test_gc_respects_grace_period() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
     // Create packs, overwrite with different data, flush to create orphans
-    write_blocks(&cache, 0, 3, 0);
+    write_blocks(&cache, 0, 3, 0, cc.as_ref());
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
-    write_blocks(&cache, 0, 3, 42);
+    write_blocks(&cache, 0, 3, 42, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     // GC with 24h grace period — dead packs just discovered, should NOT be deleted
@@ -392,15 +392,15 @@ async fn test_gc_respects_grace_period() {
 async fn test_gc_respects_max_deletes() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
     // Create orphans: write blocks, flush, overwrite with different data, flush
-    write_blocks(&cache, 0, 50, 0); // enough blocks to create multiple packs
+    write_blocks(&cache, 0, 50, 0, cc.as_ref()); // enough blocks to create multiple packs
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
     let orphan_count = stats1.new_pack_ids.len();
 
-    write_blocks(&cache, 0, 50, 42);
+    write_blocks(&cache, 0, 50, 42, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     // Inject old timestamps so all orphans are eligible
@@ -432,13 +432,13 @@ async fn test_gc_respects_max_deletes() {
 async fn test_gc_dry_run() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
     // Create orphans
-    write_blocks(&cache, 0, 5, 0);
+    write_blocks(&cache, 0, 5, 0, cc.as_ref());
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
-    write_blocks(&cache, 0, 5, 42);
+    write_blocks(&cache, 0, 5, 42, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     let mut state = new_gc_state_for_test();
@@ -465,11 +465,11 @@ async fn test_gc_dry_run() {
 async fn test_gc_fork_then_delete_source() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "parent", Arc::clone(&s3) as _);
 
     // Write and flush parent
-    write_blocks(&cache, 0, 5, 0);
+    write_blocks(&cache, 0, 5, 0, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     // Get parent manifest's pack IDs
@@ -520,15 +520,15 @@ async fn test_gc_fork_then_delete_source() {
 async fn test_gc_compacts_registries() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
     // Create orphans
-    write_blocks(&cache, 0, 5, 0);
+    write_blocks(&cache, 0, 5, 0, cc.as_ref());
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
     let old_packs = stats1.new_pack_ids.clone();
 
-    write_blocks(&cache, 0, 5, 42);
+    write_blocks(&cache, 0, 5, 42, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     let reg_before = get_registry(&cs, "vm1").await.unwrap();
@@ -572,11 +572,11 @@ async fn test_gc_compacts_registries() {
 async fn test_gc_manifest_parse_error() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, _cc, _m) =
+    let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm-good", Arc::clone(&s3) as _);
 
     // Create a valid VM with packs
-    write_blocks(&cache, 0, 3, 0);
+    write_blocks(&cache, 0, 3, 0, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     // Write a corrupt manifest for another "VM"

@@ -1,6 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Notify;
 
 use super::CacheError;
 
@@ -18,14 +16,6 @@ pub struct WriteCacheConfig {
 
     /// Block size in bytes
     pub block_size: usize,
-
-    /// Dirty byte budget (0 = no budget). When exceeded, the flush scheduler
-    /// is notified to perform a flush cycle.
-    pub dirty_budget_bytes: u64,
-
-    /// Flush trigger notification. When dirty bytes exceed the budget,
-    /// the write path calls `notify_one()` to wake the flush scheduler.
-    pub flush_trigger: Option<Arc<Notify>>,
 
     /// Whether to fsync the WAL after each write batch (default: false).
     /// When true, calls sync() (fsync) instead of flush_buf() (OS buffer flush).

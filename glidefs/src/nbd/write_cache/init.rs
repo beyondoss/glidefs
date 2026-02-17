@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -7,7 +6,7 @@ use parking_lot::{Mutex, RwLock};
 use tracing::{info, instrument, warn};
 
 use crate::nbd::block_map::{
-    AtomicBlockMap, Blake3Hash, BlockMap, BlockMapEntry, BlockMapKind, ForkedBlockMap,
+    AtomicBlockMap, BlockMap, BlockMapEntry, BlockMapKind, ForkedBlockMap,
     SequenceNumber, blake3_128, zero_block_hash,
 };
 use crate::nbd::manifest::Manifest;
@@ -39,7 +38,7 @@ impl WriteCache<Initializing> {
 
         // Load block states and presence (or create fresh)
         let num_blocks = config.num_blocks();
-        let (state_bytes, present_chunk_vals, dirty_count) = CacheInner::load_metadata(&config)?;
+        let (state_bytes, present_chunk_vals, mut dirty_count) = CacheInner::load_metadata(&config)?;
 
         // Convert to atomic types
         let block_states: Box<[AtomicU8]> = state_bytes
@@ -97,10 +96,9 @@ impl WriteCache<Initializing> {
             }
         };
 
-        // Apply WAL entries to block map and build dirty store.
-        // WAL stores metadata only — block data is re-read from the SSD cache file
+        // Apply WAL entries to block map.
+        // WAL stores metadata only — block data lives on the SSD cache file
         // (which was pwrite'd before the WAL entry was appended).
-        let mut dirty_store_map: HashMap<Blake3Hash, Bytes> = HashMap::new();
         let mut max_wal_seq = persisted_max_seq;
         let chunk_size_u64 = chunk_size as u64;
 
@@ -119,11 +117,6 @@ impl WriteCache<Initializing> {
             if valid_bytes > 0 {
                 if let Err(e) = data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset) {
                     warn!(chunk_index, error = %e, "WAL recovery: SSD read failed, skipping entry (block reverts to last checkpoint state)");
-                    // Don't mark dirty without data — that creates a block that
-                    // looks dirty but can never be flushed to S3. The persisted
-                    // block_map already has the last checkpointed state which is
-                    // consistent with S3. We lose this write, but that's the
-                    // safest option when SSD data is unreadable.
                     continue;
                 }
             }
@@ -134,8 +127,18 @@ impl WriteCache<Initializing> {
                 flags: BlockMapEntry::FLAG_DIRTY,
                 sequence: entry.sequence,
             });
-            dirty_store_map.insert(hash, Bytes::from(chunk_buf));
             max_wal_seq = max_wal_seq.max(entry.sequence);
+
+            // Synchronize block_states with WAL replay: mark as Dirty so
+            // that flush's snapshot (which reads flags from block_states) sees
+            // the correct dirty state.
+            if chunk_index < block_states.len() {
+                let old = block_states[chunk_index].load(Ordering::Relaxed);
+                if old != BlockState::Dirty as u8 {
+                    block_states[chunk_index].store(BlockState::Dirty as u8, Ordering::Relaxed);
+                    dirty_count += 1;
+                }
+            }
         }
 
         // Build AtomicBlockMap from the merged block map
@@ -154,8 +157,6 @@ impl WriteCache<Initializing> {
             }
         };
 
-        let dirty_bytes_count: u64 = dirty_store_map.len() as u64 * chunk_size as u64;
-        let flush_trigger = config.flush_trigger.clone();
         let block_size = config.block_size;
         let zbh = zero_block_hash(block_size);
         let zbb = Bytes::from(vec![0u8; block_size]);
@@ -168,13 +169,9 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
-            // v2 fields
             block_map: RwLock::new(BlockMapKind::Full(atomic_block_map)),
             sequence,
-            dirty_store: Mutex::new(dirty_store_map),
             wal: Mutex::new(wal),
-            dirty_bytes: AtomicU64::new(dirty_bytes_count),
-            flush_trigger,
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
@@ -243,7 +240,6 @@ impl WriteCache<Initializing> {
         let sequence = SequenceNumber::new(manifest.sequence);
         let wal = Wal::open(&config.wal_path())?;
         let export_name = config.device_name.clone();
-        let flush_trigger = config.flush_trigger.clone();
         let block_size = config.block_size;
         let zbh = zero_block_hash(block_size);
         let zbb = Bytes::from(vec![0u8; block_size]);
@@ -258,10 +254,7 @@ impl WriteCache<Initializing> {
             syncing_block_count: AtomicU64::new(0),
             block_map: RwLock::new(block_map_kind),
             sequence,
-            dirty_store: Mutex::new(HashMap::new()),
             wal: Mutex::new(wal),
-            dirty_bytes: AtomicU64::new(0),
-            flush_trigger,
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,

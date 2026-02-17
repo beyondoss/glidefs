@@ -14,8 +14,6 @@ fn test_config(dir: &Path) -> WriteCacheConfig {
         device_name: "test".to_string(),
         device_size: 1024 * 1024, // 1MB
         block_size: 4096,         // 4KB for testing
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     }
 }
@@ -38,9 +36,10 @@ async fn test_write_read() {
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
+    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Write some data
-    cache.write(0, b"hello world").unwrap();
+    cache.write(0, b"hello world", &clean_cache).unwrap();
 
     // Read it back
     let data = cache.read(0, 11).unwrap();
@@ -57,8 +56,9 @@ async fn test_flush() {
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
+    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
-    cache.write(0, b"data").unwrap();
+    cache.write(0, b"data", &clean_cache).unwrap();
     cache.flush().unwrap();
 
     // Data should still be readable
@@ -70,12 +70,13 @@ async fn test_flush() {
 async fn test_metadata_persistence() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path());
+    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Create cache and write data
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        cache.write(0, b"persistent").unwrap();
+        cache.write(0, b"persistent", &clean_cache).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -145,8 +146,6 @@ impl V2Harness {
             device_name: "test".to_string(),
             device_size,
             block_size,
-            dirty_budget_bytes: 0,
-            flush_trigger: None,
             wal_sync: false,
         };
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -182,11 +181,6 @@ impl V2Harness {
         result.unwrap()
     }
 
-    /// Clear the dirty store (simulates blocks being evicted after flush).
-    fn clear_dirty_store(&self) {
-        self.cache.inner.dirty_store.lock().clear();
-    }
-
     /// Get the manifest from S3.
     async fn manifest(&self) -> crate::nbd::manifest::Manifest {
         let bytes = self.content_store
@@ -204,7 +198,7 @@ async fn test_flush_end_to_end() {
 
     // Write 10 distinct blocks (each 4KB = block_size)
     for i in 0u8..10 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
     let stats = h.flush().await;
@@ -227,7 +221,7 @@ async fn test_flush_dedup_skips_existing() {
 
     // Write 5 blocks
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
     let stats1 = h.flush().await;
@@ -237,7 +231,7 @@ async fn test_flush_dedup_skips_existing() {
 
     // Write the same data again to new offsets — same content, new positions
     for i in 0u8..5 {
-        h.cache.write((i as u64 + 5) * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write((i as u64 + 5) * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
     let stats2 = h.flush().await;
@@ -252,7 +246,7 @@ async fn test_flush_partial_dedup() {
 
     // Write 10 blocks with unique data
     for i in 0u8..10 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
     let stats1 = h.flush().await;
@@ -261,10 +255,10 @@ async fn test_flush_partial_dedup() {
 
     // Write 10 more blocks: 5 with SAME data as before (dedup), 5 with NEW data
     for i in 0u8..5 {
-        h.cache.write((i as u64 + 10) * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write((i as u64 + 10) * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
     for i in 0u8..5 {
-        h.cache.write((i as u64 + 15) * 4096, &vec![i + 100; 4096]).unwrap();
+        h.cache.write((i as u64 + 15) * 4096, &vec![i + 100; 4096], &h.clean_cache).unwrap();
     }
 
     let stats2 = h.flush().await;
@@ -279,9 +273,9 @@ async fn test_flush_zero_blocks_skipped() {
     let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
 
     // Write one real block
-    h.cache.write(0, &vec![42u8; 128 * 1024]).unwrap();
+    h.cache.write(0, &vec![42u8; 128 * 1024], &h.clean_cache).unwrap();
     // Write a block of zeros — this should get ZERO_BLOCK_HASH
-    h.cache.write(128 * 1024, &vec![0u8; 128 * 1024]).unwrap();
+    h.cache.write(128 * 1024, &vec![0u8; 128 * 1024], &h.clean_cache).unwrap();
 
     let stats = h.flush().await;
     assert_eq!(stats.blocks_flushed, 2);
@@ -294,17 +288,10 @@ async fn test_flush_clears_dirty_state() {
     let h = V2Harness::new().await;
 
     for i in 0u8..3 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
-    assert!(h.cache.inner.dirty_store.lock().len() >= 3);
-
     h.flush().await;
-
-    assert_eq!(
-        h.cache.inner.dirty_store.lock().len(), 0,
-        "dirty store should be empty after flush"
-    );
 
     // A second flush should be a no-op
     let stats = h.flush().await;
@@ -315,11 +302,11 @@ async fn test_flush_clears_dirty_state() {
 async fn test_flush_concurrent_write_stays_dirty() {
     let h = V2Harness::new().await;
 
-    h.cache.write(0, &vec![1u8; 4096]).unwrap();
+    h.cache.write(0, &vec![1u8; 4096], &h.clean_cache).unwrap();
     h.flush().await;
 
     // Overwrite block 0 with different data
-    h.cache.write(0, &vec![2u8; 4096]).unwrap();
+    h.cache.write(0, &vec![2u8; 4096], &h.clean_cache).unwrap();
 
     let stats = h.flush().await;
     assert_eq!(stats.blocks_flushed, 1, "overwritten block should be flushed");
@@ -331,7 +318,7 @@ async fn test_flush_manifest_self_contained() {
 
     // Write 30 blocks (will produce 2 packs: 25 + 5)
     for i in 0u8..30 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
     let stats = h.flush().await;
@@ -357,10 +344,10 @@ async fn test_flush_manifest_self_contained() {
 // ====================================================================
 
 #[tokio::test]
-async fn test_v2_read_from_dirty_store() {
+async fn test_v2_read_recently_written_block() {
     let h = V2Harness::new().await;
     let data = vec![0xAAu8; 4096];
-    h.cache.write(0, &data).unwrap();
+    h.cache.write(0, &data, &h.clean_cache).unwrap();
 
     let got = h.read(0, 4096).await;
     assert_eq!(got.as_ref(), &data[..]);
@@ -380,7 +367,7 @@ async fn test_v2_read_trimmed_block() {
     let h = V2Harness::new().await;
 
     // Write a block, then zero it out.
-    h.cache.write(0, &vec![0xBBu8; 4096]).unwrap();
+    h.cache.write(0, &vec![0xBBu8; 4096], &h.clean_cache).unwrap();
     h.cache.zero_range(0, 4096).unwrap();
 
     let got = h.read(0, 4096).await;
@@ -391,7 +378,7 @@ async fn test_v2_read_trimmed_block() {
 async fn test_v2_read_sub_chunk() {
     let h = V2Harness::new().await;
     let data = vec![0xCCu8; 4096];
-    h.cache.write(0, &data).unwrap();
+    h.cache.write(0, &data, &h.clean_cache).unwrap();
 
     // Read 100 bytes from offset 1000 within the chunk.
     let got = h.read(1000, 100).await;
@@ -404,8 +391,8 @@ async fn test_v2_read_spans_chunks() {
     let h = V2Harness::new().await;
 
     // Write two distinct chunks.
-    h.cache.write(0, &vec![0x11u8; 4096]).unwrap();
-    h.cache.write(4096, &vec![0x22u8; 4096]).unwrap();
+    h.cache.write(0, &vec![0x11u8; 4096], &h.clean_cache).unwrap();
+    h.cache.write(4096, &vec![0x22u8; 4096], &h.clean_cache).unwrap();
 
     // Read across the chunk boundary: last 100 bytes of chunk 0 + first 100 of chunk 1.
     let got = h.read(3996, 200).await;
@@ -416,16 +403,23 @@ async fn test_v2_read_spans_chunks() {
 
 #[tokio::test]
 async fn test_v2_read_from_s3_pack() {
+    use crate::nbd::cache::BlockCache;
+
     let h = V2Harness::new().await;
 
-    // Write blocks, flush to S3, clear dirty store.
+    // Write blocks, flush to S3, clear clean_cache so reads go to S3.
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
     h.flush().await;
-    h.clear_dirty_store();
 
-    // Reads should now resolve through: block_map → (miss dirty) → (miss cache) → S3 pack.
+    // Clear clean_cache so reads must resolve through S3 packs.
+    for i in 0u8..5 {
+        let hash = crate::nbd::block_map::blake3_128(&vec![i + 1; 4096]);
+        h.clean_cache.remove(&hash);
+    }
+
+    // Reads should now resolve through: block_map → (miss cache) → S3 pack.
     for i in 0u8..5 {
         let got = h.read(i as u64 * 4096, 4096).await;
         assert!(
@@ -445,10 +439,15 @@ async fn test_v2_pack_prefetch_warms_siblings() {
 
     // Write 25 blocks (1 full pack).
     for i in 0u8..25 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
     h.flush().await;
-    h.clear_dirty_store();
+
+    // Clear clean_cache so prefetch has to fetch from S3.
+    for i in 0u8..25 {
+        let hash = crate::nbd::block_map::blake3_128(&vec![i + 1; 4096]);
+        h.clean_cache.remove(&hash);
+    }
 
     // Prefetch block 0 — fetches entire pack, caches all 25 blocks.
     h.cache
@@ -483,21 +482,28 @@ async fn test_v2_pack_prefetch_warms_siblings() {
 
 #[tokio::test]
 async fn test_v2_mixed_dirty_and_clean_reads() {
+    use crate::nbd::cache::BlockCache;
+
     let h = V2Harness::new().await;
 
-    // Write 5 blocks and flush to S3 (they'll become "clean" once evicted from dirty).
+    // Write 5 blocks and flush to S3 (they'll become "clean" once evicted from cache).
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
     h.flush().await;
-    h.clear_dirty_store();
+
+    // Clear clean_cache for flushed blocks so they must come from S3.
+    for i in 0u8..5 {
+        let hash = crate::nbd::block_map::blake3_128(&vec![i + 1; 4096]);
+        h.clean_cache.remove(&hash);
+    }
 
     // Write 5 more blocks (dirty, not flushed).
     for i in 5u8..10 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
-    // Read all 10 blocks. First 5 from S3, last 5 from dirty_store.
+    // Read all 10 blocks. First 5 from S3, last 5 from clean_cache/SSD.
     for i in 0u8..10 {
         let got = h.read(i as u64 * 4096, 4096).await;
         assert!(
@@ -543,7 +549,7 @@ async fn test_snapshot_returns_sequence_and_stats() {
 
     // Write 5 blocks
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
     let result: SnapshotResult = h.cache
@@ -567,7 +573,7 @@ async fn test_snapshot_clears_dirty_state() {
 
     // Write blocks and snapshot
     for i in 0u8..3 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
     let result1: SnapshotResult = h.cache
@@ -589,8 +595,8 @@ async fn test_snapshot_captures_concurrent_writes() {
     let h = V2Harness::new().await;
 
     // Write blocks at different times
-    h.cache.write(0, &vec![0xAA; 4096]).unwrap();
-    h.cache.write(4096, &vec![0xBB; 4096]).unwrap();
+    h.cache.write(0, &vec![0xAA; 4096], &h.clean_cache).unwrap();
+    h.cache.write(4096, &vec![0xBB; 4096], &h.clean_cache).unwrap();
 
     let result: SnapshotResult = h.cache
         .snapshot(&h.content_store, &h.pack_index)
@@ -599,7 +605,7 @@ async fn test_snapshot_captures_concurrent_writes() {
     assert_eq!(result.stats.blocks_flushed, 2);
 
     // Write more after snapshot
-    h.cache.write(8192, &vec![0xCC; 4096]).unwrap();
+    h.cache.write(8192, &vec![0xCC; 4096], &h.clean_cache).unwrap();
 
     // Manifest from first snapshot should have 2 blocks, not 3
     let manifest = h.manifest().await;
@@ -648,8 +654,6 @@ fn test_open_from_manifest_creates_clean_cache() {
         device_name: "test-manifest".to_string(),
         device_size,
         block_size,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
 
@@ -712,8 +716,6 @@ fn test_open_from_manifest_with_forked_overlay() {
         device_name: "test-forked".to_string(),
         device_size,
         block_size,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
 
@@ -773,8 +775,6 @@ fn test_open_from_manifest_fork_writes_to_overlay() {
         device_name: "test-fork-write".to_string(),
         device_size,
         block_size,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
 
@@ -787,7 +787,8 @@ fn test_open_from_manifest_fork_writes_to_overlay() {
 
     // Write new data to chunk 0 -- should go to the overlay
     let new_data = vec![0xAB; block_size];
-    cache.write(0, &new_data).unwrap();
+    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    cache.write(0, &new_data, &clean_cache).unwrap();
 
     // The overlay should have grown
     {
@@ -825,75 +826,6 @@ fn test_open_from_manifest_fork_writes_to_overlay() {
 }
 
 // ========================================================================
-// Dirty budget enforcement
-// ========================================================================
-
-#[tokio::test]
-async fn test_write_rejected_when_dirty_budget_exceeded() {
-    let dir = TempDir::new().unwrap();
-    let block_size = 4096;
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "test-budget".to_string(),
-        device_size: 1024 * 1024,
-        block_size,
-        // Budget = 1 block (4096). Hard cap = 2x = 8192.
-        // dirty_bytes check is strict `>`, so:
-        //   write 0: dirty_bytes=0, pass → becomes 4096
-        //   write 1: dirty_bytes=4096, pass → becomes 8192
-        //   write 2: dirty_bytes=8192, 8192 > 8192 false, pass → becomes 12288
-        //   write 3: dirty_bytes=12288, 12288 > 8192 true → rejected
-        dirty_budget_bytes: block_size as u64,
-        flush_trigger: None,
-        wal_sync: false,
-    };
-
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery().await.unwrap();
-
-    // First 3 blocks succeed (dirty_bytes <= hard_cap at check time)
-    cache.write(0, &vec![1u8; block_size]).unwrap();
-    cache.write(block_size as u64, &vec![2u8; block_size]).unwrap();
-    cache.write(2 * block_size as u64, &vec![3u8; block_size]).unwrap();
-
-    // Fourth block: dirty_bytes=12288 > hard_cap=8192 → rejected
-    let result = cache.write(3 * block_size as u64, &vec![4u8; block_size]);
-    assert!(
-        matches!(result, Err(CacheError::DirtyBudgetExceeded)),
-        "write past 2x budget should return DirtyBudgetExceeded, got: {:?}",
-        result
-    );
-
-    // First three blocks should still be readable
-    let data = cache.read(0, block_size).unwrap();
-    assert!(data.iter().all(|&b| b == 1));
-}
-
-#[tokio::test]
-async fn test_dirty_budget_zero_means_no_limit() {
-    let dir = TempDir::new().unwrap();
-    let block_size = 4096;
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "test-no-budget".to_string(),
-        device_size: 1024 * 1024,
-        block_size,
-        dirty_budget_bytes: 0, // no budget
-        flush_trigger: None,
-        wal_sync: false,
-    };
-
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.finish_recovery().await.unwrap();
-
-    // Should be able to write many blocks without rejection
-    for i in 0u64..50 {
-        cache.write(i * block_size as u64, &vec![i as u8; block_size]).unwrap();
-    }
-    assert_eq!(cache.dirty_block_count(), 50);
-}
-
-// ========================================================================
 // Recovery hash drift
 // ========================================================================
 
@@ -906,11 +838,10 @@ async fn test_recovery_detects_hash_drift() {
         device_name: "test-drift".to_string(),
         device_size: 1024 * 1024,
         block_size,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
 
+    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
     let original_data = vec![0xAAu8; block_size];
     let modified_data = vec![0xBBu8; block_size];
     let original_hash = blake3_128(&original_data);
@@ -919,7 +850,7 @@ async fn test_recovery_detects_hash_drift() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        cache.write(0, &original_data).unwrap();
+        cache.write(0, &original_data, &clean_cache).unwrap();
 
         // Verify block_map has original hash
         let (hash, _) = cache.inner.block_map_get(0);
@@ -967,7 +898,7 @@ async fn test_flush_updates_pack_registry() {
 
     // Write enough blocks to produce at least 1 pack
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
 
     let stats = h.flush().await;
@@ -1004,13 +935,13 @@ async fn test_multiple_flushes_accumulate_registry() {
 
     // First flush
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
     }
     let stats1 = h.flush().await;
 
     // Second flush with different data
     for i in 5u8..10 {
-        h.cache.write(i as u64 * 4096, &vec![i + 100; 4096]).unwrap();
+        h.cache.write(i as u64 * 4096, &vec![i + 100; 4096], &h.clean_cache).unwrap();
     }
     let stats2 = h.flush().await;
 
@@ -1033,4 +964,265 @@ async fn test_multiple_flushes_accumulate_registry() {
             pack_id
         );
     }
+}
+
+// ========================================================================
+// Concurrency tests
+// ========================================================================
+
+/// Truly concurrent flush + write: writers hammer blocks while a flush is in flight.
+///
+/// Proves the CAS loop in `transition_to_dirty` and `flush_dirty_inner` cooperate:
+/// blocks written during flush stay dirty for the next flush cycle.
+#[tokio::test]
+async fn test_concurrent_flush_and_writes() {
+    use std::sync::Arc;
+    use tokio::task::JoinSet;
+
+    let dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "conc-flush".to_string(),
+        device_size: 1024 * 1024,
+        block_size: 4096,
+        wal_sync: false,
+    };
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let content_store = Arc::new(crate::nbd::content_store::ContentStore::new(
+        Arc::clone(&object_store),
+        "test-conc",
+    ));
+    let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::new());
+    let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = Arc::new(cache.finish_recovery().await.unwrap());
+
+    // Seed some initial dirty blocks
+    for i in 0u8..10 {
+        cache.write(i as u64 * 4096, &vec![i + 1; 4096], clean_cache.as_ref()).unwrap();
+    }
+
+    let mut tasks = JoinSet::new();
+
+    // Spawn a flusher that runs multiple flush cycles
+    {
+        let cache = Arc::clone(&cache);
+        let cs = Arc::clone(&content_store);
+        let pi = Arc::clone(&pack_index);
+        tasks.spawn(async move {
+            for _ in 0..5 {
+                let _ = cache.flush_to_s3(&cs, &pi).await;
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    // Spawn concurrent writers that overwrite blocks during flush
+    for writer_id in 0..5u8 {
+        let cache = Arc::clone(&cache);
+        let clean_cache = Arc::clone(&clean_cache);
+        tasks.spawn(async move {
+            for round in 0..20u8 {
+                let block_idx = (writer_id as u64 * 2) % 10;
+                let data = vec![writer_id.wrapping_add(round).wrapping_add(100); 4096];
+                cache.write(block_idx * 4096, &data, clean_cache.as_ref()).unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+
+    // Final flush to capture any remaining dirty blocks
+    let _stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+
+    // After final flush, all blocks should be clean
+    assert_eq!(
+        cache.dirty_block_count(),
+        0,
+        "all blocks should be clean after final flush"
+    );
+
+    // Every block should be readable and consistent (all bytes the same)
+    for i in 0..10u64 {
+        let data = cache.read_local(i * 4096, 4096).unwrap();
+        let first = data[0];
+        assert!(
+            data.iter().all(|&b| b == first),
+            "block {} has torn data: first byte is {}, but not all bytes match",
+            i,
+            first
+        );
+    }
+}
+
+/// ForkedBlockMap: concurrent reads, writes, and flatten don't lose data.
+///
+/// Spawns tasks that read and write to the overlay while another task triggers
+/// flatten via enough writes to cross the 50% threshold.
+#[tokio::test]
+async fn test_forked_block_map_concurrent_flatten() {
+    use crate::nbd::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
+    use std::sync::Arc;
+    use tokio::task::JoinSet;
+
+    let dir = TempDir::new().unwrap();
+    let device_size: u64 = 256 * 4096; // 256 chunks
+    let block_size: usize = 4096;
+    let manifest = make_test_manifest(10, device_size, block_size as u32);
+
+    // Build parent from manifest
+    let mut parent_bm = BlockMap::new(device_size, block_size as u32);
+    for entry in &manifest.block_map {
+        parent_bm.set(
+            entry.chunk_index as usize,
+            BlockMapEntry {
+                hash: entry.hash,
+                flags: 0,
+                sequence: manifest.sequence,
+            },
+        );
+    }
+    let parent = Arc::new(parent_bm);
+
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "conc-fork".to_string(),
+        device_size,
+        block_size,
+        wal_sync: false,
+    };
+
+    let cache = WriteCache::<Initializing>::open_from_manifest(
+        config,
+        &manifest,
+        Some(Arc::clone(&parent)),
+    )
+    .unwrap();
+    let cache = Arc::new(cache);
+    let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+
+    // Verify it starts as Forked
+    {
+        let bm = cache.inner.block_map.read();
+        assert!(matches!(&*bm, BlockMapKind::Forked(_)));
+    }
+
+    let mut tasks = JoinSet::new();
+
+    // Spawn writers that write to enough chunks to trigger flatten (>50% = >128 chunks)
+    for writer_id in 0..4u8 {
+        let cache = Arc::clone(&cache);
+        let clean_cache = Arc::clone(&clean_cache);
+        tasks.spawn(async move {
+            let start = writer_id as u64 * 40 + 10; // avoid manifest's 0..9
+            for i in 0..40u64 {
+                let offset = (start + i) * 4096;
+                if offset + 4096 > device_size {
+                    break;
+                }
+                let data = vec![writer_id.wrapping_add(i as u8); 4096];
+                cache.write(offset, &data, clean_cache.as_ref()).unwrap();
+                if i % 5 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+    }
+
+    // Spawn readers that read parent-range chunks concurrently
+    for _ in 0..3 {
+        let cache = Arc::clone(&cache);
+        tasks.spawn(async move {
+            for i in 0..10u64 {
+                let (hash, seq) = cache.inner.block_map_get(i as usize);
+                // Should always get a valid hash (parent or overlay)
+                assert!(!hash.is_zero() || seq == 0, "unexpected zero hash at chunk {i}");
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+
+    // After enough writes the forked map should have been flattened to Full
+    {
+        let bm = cache.inner.block_map.read();
+        assert!(
+            matches!(&*bm, BlockMapKind::Full(_)),
+            "block map should have flattened after >128 overlay writes"
+        );
+    }
+
+    // Parent entries not overwritten should still be readable from the flattened map
+    for i in 0..10u64 {
+        let (hash, _) = cache.inner.block_map_get(i as usize);
+        // The writers started at chunk 10+, so chunks 0..9 should still have parent hashes
+        let expected = blake3_128(format!("block-{i}").as_bytes());
+        assert_eq!(
+            hash, expected,
+            "parent chunk {} should survive flatten",
+            i
+        );
+    }
+}
+
+// ========================================================================
+// Draining state machine
+// ========================================================================
+
+/// Verify the Active → Draining → finish lifecycle.
+///
+/// After shutdown(), metadata is persisted and the cache transitions to Draining.
+/// Draining.finish() completes the lifecycle.
+#[tokio::test]
+async fn test_draining_state_transition() {
+    let dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "drain-test".to_string(),
+        device_size: 1024 * 1024,
+        block_size: 4096,
+        wal_sync: false,
+    };
+
+    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+
+    // Write some data before draining
+    cache.write(0, &vec![0xAA; 4096], &clean_cache).unwrap();
+    cache.write(4096, &vec![0xBB; 4096], &clean_cache).unwrap();
+    assert_eq!(cache.dirty_block_count(), 2);
+
+    // Save the dirty count before shutdown
+    let dirty_before = cache.dirty_block_count();
+
+    // Transition to Draining via shutdown
+    let s3_store = crate::nbd::block_store::S3BlockStore::with_defaults(
+        Arc::new(InMemory::new()),
+        "drain-test",
+    );
+    let draining = cache.shutdown(&s3_store).await.unwrap();
+
+    // Draining state — finish() completes the lifecycle
+    draining.finish();
+
+    // Reopen and verify metadata was persisted by shutdown
+    let cache2 = WriteCache::<Initializing>::open(config).unwrap();
+    let reopened_dirty = cache2.inner.dirty_block_count.load(Ordering::Relaxed);
+    assert_eq!(
+        reopened_dirty, dirty_before,
+        "shutdown should persist metadata with dirty blocks"
+    );
+
+    // Data should be readable after reopen + recovery
+    let cache2 = cache2.finish_recovery().await.unwrap();
+    let data = cache2.read(0, 4096).unwrap();
+    assert_eq!(&data[..4], &[0xAA; 4]);
 }

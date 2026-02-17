@@ -24,7 +24,7 @@ async fn test_wake_from_different_node() {
 
     // === NODE A: Write data and flush to S3 ===
     let node_a_dir = TempDir::new().unwrap();
-    let (cache_a, content_store_a, pack_index_a, _clean_cache_a, _metrics_a) =
+    let (cache_a, content_store_a, pack_index_a, clean_cache_a, _metrics_a) =
         create_v2_test_cache(&node_a_dir, "vol1", Arc::clone(&s3) as _);
 
     // Write test pattern: blocks 0, 1, 5 with distinct data
@@ -32,9 +32,9 @@ async fn test_wake_from_different_node() {
     let block_1_data: Vec<u8> = (0..128 * 1024).map(|i| ((i + 100) % 256) as u8).collect();
     let block_5_data: Vec<u8> = (0..128 * 1024).map(|i| ((i + 200) % 256) as u8).collect();
 
-    cache_a.write(0, &block_0_data).unwrap();
-    cache_a.write(128 * 1024, &block_1_data).unwrap();
-    cache_a.write(5 * 128 * 1024, &block_5_data).unwrap();
+    cache_a.write(0, &block_0_data, clean_cache_a.as_ref()).unwrap();
+    cache_a.write(128 * 1024, &block_1_data, clean_cache_a.as_ref()).unwrap();
+    cache_a.write(5 * 128 * 1024, &block_5_data, clean_cache_a.as_ref()).unwrap();
 
     // Flush to S3 (simulates graceful shutdown)
     cache_a
@@ -135,12 +135,12 @@ async fn test_unwritten_blocks_return_zeros() {
 async fn test_cache_hit_on_second_read() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+    let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_v2_test_cache(&temp_dir, "vol1", Arc::clone(&s3) as _);
 
     // Write some data
     let data: Vec<u8> = (0..128 * 1024).map(|i| (i % 256) as u8).collect();
-    cache.write(0, &data).unwrap();
+    cache.write(0, &data, clean_cache.as_ref()).unwrap();
     cache
         .flush_to_s3(&content_store, &pack_index)
         .await
@@ -196,12 +196,12 @@ async fn test_batch_prefetch_optimization() {
 
     // Write blocks 0-9 (all in same batch)
     let writer_dir = TempDir::new().unwrap();
-    let (writer_cache, writer_content_store, writer_pack_index, _writer_clean_cache, _) =
+    let (writer_cache, writer_content_store, writer_pack_index, writer_clean_cache, _) =
         create_v2_test_cache(&writer_dir, "vol1", Arc::clone(&s3) as _);
 
     for i in 0..10u64 {
         let data: Vec<u8> = vec![i as u8; 128 * 1024];
-        writer_cache.write(i * 128 * 1024, &data).unwrap();
+        writer_cache.write(i * 128 * 1024, &data, writer_clean_cache.as_ref()).unwrap();
     }
     writer_cache
         .flush_to_s3(&writer_content_store, &writer_pack_index)

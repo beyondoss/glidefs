@@ -1,11 +1,8 @@
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::nbd::block_map::{BlockMap, BlockMapKind, Blake3Hash, SequenceNumber};
@@ -213,23 +210,9 @@ pub(crate) struct CacheInner {
     /// Lock-free AtomicU64.
     pub(super) sequence: SequenceNumber,
 
-    /// Dirty block data store: hash -> data.
-    /// Pinned in memory until flushed to S3 (Phase 2).
-    /// Mutex is effectively uncontended: single writer per export.
-    pub(super) dirty_store: Mutex<HashMap<Blake3Hash, Bytes>>,
-
     /// Write-ahead log for crash recovery.
     /// Mutex is effectively uncontended: single writer per export.
     pub(super) wal: Mutex<Wal>,
-
-    /// Total dirty bytes for budget enforcement.
-    /// Incremented when a block transitions Clean→Dirty or Syncing→Dirty.
-    /// Decremented in flush_dirty_inner when a block is successfully flushed.
-    pub(super) dirty_bytes: AtomicU64,
-
-    /// Flush trigger notification. When dirty bytes exceed the budget,
-    /// the write path calls `notify_one()` to wake the flush scheduler.
-    pub(super) flush_trigger: Option<Arc<Notify>>,
 
     /// Export name (used in WAL entries).
     pub(super) export_name: String,
@@ -270,12 +253,11 @@ impl CacheInner {
     /// CAS loop to transition a block to Dirty state (lock-free).
     ///
     /// Handles three source states:
-    /// - **Clean → Dirty**: increments dirty_block_count and dirty_bytes.
-    /// - **Syncing → Dirty**: decrements syncing_block_count, increments dirty_block_count and dirty_bytes.
+    /// - **Clean → Dirty**: increments dirty_block_count.
+    /// - **Syncing → Dirty**: decrements syncing_block_count, increments dirty_block_count.
     /// - **Dirty → Dirty**: no-op.
     #[inline]
     pub(super) fn transition_to_dirty(&self, idx: usize) {
-        let block_size = self.config.block_size as u64;
         loop {
             let current = self.block_states[idx].load(Ordering::Acquire);
 
@@ -294,7 +276,6 @@ impl CacheInner {
                     .is_ok()
                 {
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    self.dirty_bytes.fetch_add(block_size, Ordering::Relaxed);
                     break;
                 }
             } else if current == BlockState::Syncing as u8 {
@@ -309,7 +290,6 @@ impl CacheInner {
                 {
                     self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    self.dirty_bytes.fetch_add(block_size, Ordering::Relaxed);
                     break;
                 }
             } else {

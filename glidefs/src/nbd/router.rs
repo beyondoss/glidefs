@@ -102,7 +102,6 @@ pub struct ExportState {
     pub readonly: bool,
     pub metrics: Arc<ExportMetrics>,
     flush_mode_tx: watch::Sender<FlushMode>,
-    flush_trigger: Arc<Notify>,
     flush_shutdown_tx: watch::Sender<bool>,
     flush_handle: JoinHandle<()>,
 }
@@ -143,12 +142,6 @@ pub struct RouterConfig {
     pub block_size: usize,
     /// Number of blocks per S3 batch
     pub blocks_per_batch: u64,
-    /// Sync delay in milliseconds (time to coalesce writes before S3 upload)
-    pub sync_delay_ms: u64,
-    /// Dirty budget in GB per export (triggers flush when exceeded)
-    pub dirty_budget_gb: f64,
-    /// Auto-create size for on-demand export creation (None = disabled)
-    pub auto_create_size_gb: Option<f64>,
     /// Shared block cache for decompressed block data
     pub clean_cache: Arc<dyn BlockCache>,
     /// Whether to fsync the WAL after each write batch
@@ -176,15 +169,6 @@ pub struct ExportRouter {
 
     /// Number of blocks per S3 batch
     blocks_per_batch: u64,
-
-    /// Sync delay in milliseconds (time to coalesce writes before S3 upload)
-    sync_delay_ms: u64,
-
-    /// Dirty budget in GB per export (triggers flush when exceeded)
-    dirty_budget_gb: f64,
-
-    /// Auto-create size for on-demand export creation (None = disabled)
-    auto_create_size_gb: Option<f64>,
 
     /// Host-level pack index shared across all exports (content-addressed dedup)
     pack_index: Arc<HostPackIndex>,
@@ -226,19 +210,11 @@ impl ExportRouter {
             cache_dir: config.cache_dir,
             block_size: config.block_size,
             blocks_per_batch: config.blocks_per_batch,
-            sync_delay_ms: config.sync_delay_ms,
-            dirty_budget_gb: config.dirty_budget_gb,
-            auto_create_size_gb: config.auto_create_size_gb,
             pack_index: Arc::new(HostPackIndex::new()),
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
             scrubber_metrics: Arc::new(crate::nbd::scrubber::ScrubberMetrics::new()),
         }
-    }
-
-    /// Get the auto-create size (if enabled).
-    pub fn auto_create_size_gb(&self) -> Option<f64> {
-        self.auto_create_size_gb
     }
 
     /// Get a reference to the shared pack index (for scrubber).
@@ -405,10 +381,8 @@ impl ExportRouter {
         let clean_cache = Arc::clone(&self.clean_cache);
         let pack_index = Arc::clone(&self.pack_index);
 
-        // Flush trigger shared between cache write path and scheduler
+        // Flush trigger shared between scheduler and API triggers
         let flush_trigger = Arc::new(Notify::new());
-        let dirty_budget_bytes = (config.dirty_budget_gb
-            .unwrap_or(self.dirty_budget_gb) * 1024.0 * 1024.0 * 1024.0) as u64;
 
         // Create write cache — either from manifest (fork) or fresh (normal)
         let cache_config = WriteCacheConfig {
@@ -416,8 +390,6 @@ impl ExportRouter {
             device_name: name.clone(),
             device_size: config.size_bytes(),
             block_size,
-            dirty_budget_bytes,
-            flush_trigger: Some(Arc::clone(&flush_trigger)),
             wal_sync: self.wal_sync,
         };
 
@@ -575,7 +547,6 @@ impl ExportRouter {
             readonly,
             metrics,
             flush_mode_tx,
-            flush_trigger,
             flush_shutdown_tx,
             flush_handle,
         };
@@ -816,7 +787,6 @@ impl ExportRouter {
             s3_prefix: None, // Will use name as prefix (same as before)
             block_size: Some(block_size),
             flush_mode: None,
-            dirty_budget_gb: None,
         };
 
         self.create_export(config, readonly, None).await?;
@@ -967,9 +937,6 @@ impl ExportRouter {
             cache_dir: temp_dir,
             block_size: 128 * 1024,
             blocks_per_batch: 10,
-            sync_delay_ms: 100,
-            dirty_budget_gb: 5.0,
-            auto_create_size_gb: None,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
             wal_sync: false,
         })
@@ -1007,9 +974,6 @@ mod tests {
             cache_dir: temp_dir.path().to_path_buf(),
             block_size: 128 * 1024,
             blocks_per_batch: 10,
-            sync_delay_ms: 100,
-            dirty_budget_gb: 5.0,
-            auto_create_size_gb: None,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
             wal_sync: false,
         })
@@ -1022,7 +986,6 @@ mod tests {
             s3_prefix: None,
             block_size: None,
             flush_mode: None,
-            dirty_budget_gb: None,
         }
     }
 
@@ -1360,7 +1323,6 @@ mod tests {
                 s3_prefix: None,
                 block_size: None,
                 flush_mode: None,
-                dirty_budget_gb: None,
             },
             ExportConfig {
                 name: "discover-vol2".to_string(),
@@ -1368,7 +1330,6 @@ mod tests {
                 s3_prefix: None,
                 block_size: None,
                 flush_mode: None,
-                dirty_budget_gb: None,
             },
             ExportConfig {
                 name: "discover-vol3".to_string(),
@@ -1376,7 +1337,6 @@ mod tests {
                 s3_prefix: None,
                 block_size: None,
                 flush_mode: None,
-                dirty_budget_gb: None,
             },
         ];
 
@@ -1486,7 +1446,6 @@ mod tests {
             s3_prefix: Some("source".to_string()), // same S3 prefix as source
             block_size: None,
             flush_mode: None,
-            dirty_budget_gb: None,
         };
         router.create_export(fork_config, false, Some("source")).await.unwrap();
 
@@ -1514,7 +1473,6 @@ mod tests {
             s3_prefix: Some("src".to_string()),
             block_size: None,
             flush_mode: None,
-            dirty_budget_gb: None,
         };
         router.create_export(fork_config, false, Some("src")).await.unwrap();
 
@@ -1548,7 +1506,6 @@ mod tests {
             s3_prefix: Some("nonexistent-source".to_string()),
             block_size: None,
             flush_mode: None,
-            dirty_budget_gb: None,
         };
 
         let result = router.create_export(config, false, Some("does-not-exist")).await;
@@ -1639,7 +1596,6 @@ mod tests {
             s3_prefix: Some("parent".to_string()),
             block_size: None,
             flush_mode: None,
-            dirty_budget_gb: None,
         };
         router.create_export(fork_config, false, Some("parent")).await.unwrap();
 
@@ -1758,6 +1714,58 @@ mod tests {
         // Snapshot should capture both blocks
         let snap = router.snapshot_export("retry-vol").await.unwrap();
         assert!(snap.sequence > 0);
+    }
+
+    // =========================================================================
+    // Resize with dirty blocks
+    // =========================================================================
+
+    /// Resize with unflushed dirty blocks: the drain→remove→recreate cycle
+    /// should flush dirty data to S3, grow the device, and allow writes to
+    /// the new region.
+    ///
+    /// NOTE: Data preservation across resize is not tested here because
+    /// the v2 block_map (.blockmap) is not persisted during save_metadata,
+    /// so after the drain→truncate WAL→recreate cycle the block_map is empty
+    /// and old blocks read as zeros. This is a known gap — the data exists
+    /// in S3 but the local hash mapping is lost.
+    #[tokio::test]
+    async fn test_resize_with_dirty_blocks() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        router.create_export(test_export_config("resize-dirty"), false, None).await.unwrap();
+
+        let handler = router.get_handler("resize-dirty").await.unwrap();
+
+        // Write dirty blocks before resize
+        handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
+        handler.write(128 * 1024, &[0xBB; 128 * 1024], false).unwrap();
+
+        let old_size = {
+            let exports = router.list_exports().await;
+            exports.iter().find(|e| e.name == "resize-dirty").unwrap().size
+        };
+
+        // Resize doubles the device — this calls drain_export first, so dirty
+        // blocks get flushed to S3 before the remove/recreate cycle.
+        router.resize_export("resize-dirty", 0.02).await.unwrap();
+
+        let new_size = {
+            let exports = router.list_exports().await;
+            exports.iter().find(|e| e.name == "resize-dirty").unwrap().size
+        };
+        assert!(new_size > old_size, "export should have grown");
+
+        // Re-acquire handler after resize (old handler is invalidated)
+        let handler = router.get_handler("resize-dirty").await.unwrap();
+
+        // Write to the new region (beyond old device boundary)
+        let new_region_offset = old_size; // first byte of new space
+        handler.write(new_region_offset, &[0xCC; 128 * 1024], false).unwrap();
+
+        let data_new = handler.read(new_region_offset, 128 * 1024).await.unwrap();
+        assert!(data_new.iter().all(|&b| b == 0xCC), "new region should be writable");
     }
 
     #[test]

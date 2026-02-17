@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use tracing::{info, instrument, warn};
@@ -23,11 +22,9 @@ impl WriteCache<Recovering> {
 
     /// Recover from a previous session and transition to Active.
     ///
-    /// Ensures all dirty blocks have their data in the dirty_store (re-reading
-    /// from SSD if necessary). The flush scheduler will upload dirty blocks
-    /// via the v2 pack path once the cache is Active.
-    ///
-    /// This is purely local I/O — no network access required during recovery.
+    /// Verifies dirty block hashes against SSD data and corrects block_map
+    /// entries where the SSD state has drifted (e.g. due to writes that made
+    /// it to SSD but not to the WAL before crash). This is purely local I/O.
     #[instrument(skip(self))]
     pub async fn finish_recovery(self) -> Result<WriteCache<Active>, CacheError> {
         let dirty_count = self.inner.dirty_block_count.load(Ordering::Relaxed);
@@ -37,13 +34,10 @@ impl WriteCache<Recovering> {
         } else {
             info!(dirty_blocks = dirty_count, "starting recovery");
 
-            // Ensure all dirty blocks have data in the dirty_store.
-            // WAL replay (in init.rs) populates dirty_store for entries in the WAL,
-            // but blocks that were dirty when the block map was persisted — and whose
-            // WAL entries were subsequently truncated — need to be re-read from SSD.
-            let populated = self.populate_missing_dirty_blocks()?;
-            if populated > 0 {
-                info!(populated, "re-read dirty blocks from SSD into dirty_store");
+            // Verify dirty block hashes against SSD data and correct any drift.
+            let corrected = self.verify_dirty_block_hashes()?;
+            if corrected > 0 {
+                info!(corrected, "corrected dirty block hashes from SSD");
             }
 
             // Save metadata after recovery
@@ -57,14 +51,18 @@ impl WriteCache<Recovering> {
         })
     }
 
-    /// Ensure every dirty block has its data in the dirty_store.
+    /// Verify dirty block hashes against SSD data.
     ///
-    /// Returns the number of blocks that were re-read from SSD.
-    fn populate_missing_dirty_blocks(&self) -> Result<usize, CacheError> {
+    /// Re-reads each dirty block from SSD and re-hashes. If the hash doesn't
+    /// match the block_map entry (e.g. a write made it to SSD but the WAL
+    /// entry was lost), update the block_map with the correct hash.
+    ///
+    /// Returns the number of blocks whose hashes were corrected.
+    fn verify_dirty_block_hashes(&self) -> Result<usize, CacheError> {
         let block_size = self.inner.config.block_size;
         let device_size = self.inner.config.device_size;
         let zero_hash = self.inner.zero_block_hash;
-        let mut populated = 0;
+        let mut corrected = 0;
 
         for idx in 0..self.inner.num_blocks {
             let state = self.inner.block_states[idx].load(Ordering::Relaxed);
@@ -74,17 +72,12 @@ impl WriteCache<Recovering> {
 
             let (hash, _seq) = self.inner.block_map_get(idx);
 
-            // Zero-hash entries (empty or trimmed) don't need data in dirty_store
+            // Zero-hash entries don't need verification
             if hash.is_zero() || hash == zero_hash {
                 continue;
             }
 
-            // Already in dirty_store (populated by WAL replay)
-            if self.inner.dirty_store.lock().contains_key(&hash) {
-                continue;
-            }
-
-            // Re-read block from SSD and populate dirty_store
+            // Re-read block from SSD and verify hash
             let offset = idx as u64 * block_size as u64;
             let valid_bytes =
                 std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
@@ -97,26 +90,21 @@ impl WriteCache<Recovering> {
                     warn!(
                         chunk_index = idx,
                         error = %e,
-                        "recovery: failed to re-read block from SSD, leaving dirty for retry"
+                        "recovery: failed to read block from SSD, leaving dirty for retry"
                     );
                     continue;
                 }
             }
 
-            // Re-hash from SSD (authoritative) and update block map if hash drifted
             let actual_hash = blake3_128(&buf);
             if actual_hash != hash {
+                // SSD state drifted — update block_map with correct hash
                 let seq = self.inner.sequence.next();
                 self.inner.block_map_set(idx, actual_hash, seq);
+                corrected += 1;
             }
-
-            self.inner
-                .dirty_store
-                .lock()
-                .insert(actual_hash, Bytes::from(buf));
-            populated += 1;
         }
 
-        Ok(populated)
+        Ok(corrected)
     }
 }

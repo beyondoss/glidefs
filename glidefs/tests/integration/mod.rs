@@ -47,8 +47,6 @@ pub fn create_v2_test_cache(
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
 
@@ -100,8 +98,6 @@ pub async fn create_v2_cold_reader(
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
 

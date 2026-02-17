@@ -128,6 +128,10 @@ pub async fn flush_scheduler(
 // ---------------------------------------------------------------------------
 
 /// Wait for an explicit flush trigger, a mode change, or shutdown.
+///
+/// Runs a local checkpoint every 5s to keep the WAL bounded — independent
+/// of whether any S3 flush occurs. This is critical for demand-driven mode
+/// where S3 flushes may be very infrequent.
 async fn run_demand_driven(
     cache: &Arc<WriteCache<Active>>,
     content_store: &Arc<ContentStore>,
@@ -137,6 +141,9 @@ async fn run_demand_driven(
     shutdown: &mut watch::Receiver<bool>,
     metrics: &ExportMetrics,
 ) {
+    let mut checkpoint_ticker = tokio::time::interval(Duration::from_secs(5));
+    checkpoint_ticker.tick().await; // consume immediate first tick
+
     loop {
         tokio::select! {
             biased;
@@ -156,6 +163,15 @@ async fn run_demand_driven(
             // Explicit flush trigger.
             () = flush_trigger.notified() => {
                 do_full_flush(cache, content_store, pack_index, flush_trigger, metrics).await;
+            }
+
+            // Local checkpoint: persist block states + truncate WAL.
+            _ = checkpoint_ticker.tick() => {
+                if cache.dirty_block_count() > 0 {
+                    if let Err(e) = cache.local_checkpoint() {
+                        warn!(error = %e, "local checkpoint failed");
+                    }
+                }
             }
         }
     }
@@ -258,6 +274,10 @@ async fn run_continuous(
                             accumulated_pack_ids.extend_from_slice(&stats.new_pack_ids);
                             last_seq_cutpoint = seq_cutpoint;
                             pack_backoff = Duration::from_secs(1);
+                            // Local checkpoint between manifest syncs to keep WAL bounded.
+                            if let Err(e) = cache.local_checkpoint() {
+                                warn!(error = %e, "local checkpoint after pack flush failed");
+                            }
                         }
                         Err(e) => {
                             metrics.record_flush_error();
@@ -382,6 +402,7 @@ mod tests {
     // Runtime behavior tests
     // =========================================================================
 
+    use crate::nbd::cache::{BlockCache, SimpleBlockCache};
     use crate::nbd::content_store::ContentStore;
     use crate::nbd::pack_index::HostPackIndex;
     use crate::nbd::state::Initializing;
@@ -399,6 +420,7 @@ mod tests {
         watch::Receiver<bool>,
         watch::Sender<bool>,
         Arc<ExportMetrics>,
+        Arc<dyn BlockCache>,
         TempDir,
     ) {
         let temp_dir = TempDir::new().unwrap();
@@ -407,8 +429,6 @@ mod tests {
             device_name: "sched-test".to_string(),
             device_size: 1024 * 1024,
             block_size: 4096,
-            dirty_budget_bytes: 0,
-            flush_trigger: None,
             wal_sync: false,
         };
 
@@ -416,6 +436,7 @@ mod tests {
         let content_store = Arc::new(ContentStore::new(s3, "test"));
         let pack_index = Arc::new(HostPackIndex::new());
         let metrics = Arc::new(ExportMetrics::new());
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = Arc::new(cache.skip_recovery_for_test());
@@ -426,7 +447,7 @@ mod tests {
 
         (
             cache, content_store, pack_index, flush_trigger, mode_rx, mode_tx,
-            shutdown_rx, shutdown_tx, metrics, temp_dir,
+            shutdown_rx, shutdown_tx, metrics, clean_cache, temp_dir,
         )
     }
 
@@ -434,7 +455,7 @@ mod tests {
     async fn test_demand_driven_shutdown() {
         let (
             cache, content_store, pack_index, flush_trigger, mode_rx, _mode_tx,
-            shutdown_rx, shutdown_tx, metrics, _temp,
+            shutdown_rx, shutdown_tx, metrics, _clean_cache, _temp,
         ) = test_scheduler_components();
 
         let handle = tokio::spawn(async move {
@@ -455,11 +476,11 @@ mod tests {
     async fn test_demand_driven_flush_trigger() {
         let (
             cache, content_store, pack_index, flush_trigger, mode_rx, _mode_tx,
-            shutdown_rx, shutdown_tx, metrics, _temp,
+            shutdown_rx, shutdown_tx, metrics, clean_cache, _temp,
         ) = test_scheduler_components();
 
         // Write dirty data
-        cache.write(0, &[0xAA; 4096]).unwrap();
+        cache.write(0, &[0xAA; 4096], clean_cache.as_ref()).unwrap();
         assert_eq!(cache.dirty_block_count(), 1);
 
         let cache_check = Arc::clone(&cache);
@@ -489,7 +510,7 @@ mod tests {
     async fn test_mode_switch() {
         let (
             cache, content_store, pack_index, flush_trigger, mode_rx, mode_tx,
-            shutdown_rx, shutdown_tx, metrics, _temp,
+            shutdown_rx, shutdown_tx, metrics, _clean_cache, _temp,
         ) = test_scheduler_components();
 
         let handle = tokio::spawn(async move {
@@ -514,6 +535,66 @@ mod tests {
         mode_tx.send(FlushMode::DemandDriven).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!handle.is_finished(), "scheduler should still be running");
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_continuous_mode_periodic_flush() {
+        let (
+            cache, content_store, pack_index, flush_trigger, _mode_rx, _mode_tx,
+            _shutdown_rx, _shutdown_tx, metrics, clean_cache, _temp,
+        ) = test_scheduler_components();
+
+        // Write dirty data before spawning the scheduler.
+        cache.write(0, &[0xBB; 4096], clean_cache.as_ref()).unwrap();
+        assert_eq!(cache.dirty_block_count(), 1, "should have 1 dirty block");
+
+        // Keep references for assertions after scheduler is spawned.
+        let cache_check = Arc::clone(&cache);
+        let cs_check = Arc::clone(&content_store);
+
+        // Start directly in continuous mode with 1s intervals.
+        let (_, mode_rx) = watch::channel(FlushMode::Continuous {
+            pack_interval_secs: 1,
+            manifest_interval_secs: 1,
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache, content_store, pack_index, mode_rx,
+                flush_trigger, shutdown_rx, metrics,
+            )
+            .await;
+        });
+
+        // Wait for the periodic pack flush to fire (1s interval + processing time).
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if cache_check.dirty_block_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            cache_check.dirty_block_count(),
+            0,
+            "periodic pack flush should have flushed dirty blocks"
+        );
+
+        // Wait for the periodic manifest sync to fire.
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(Some(_)) = cs_check.get_manifest("sched-test").await {
+                break;
+            }
+        }
+        let manifest = cs_check.get_manifest("sched-test").await.unwrap();
+        assert!(
+            manifest.is_some(),
+            "periodic manifest sync should have uploaded the manifest"
+        );
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;

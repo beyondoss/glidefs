@@ -13,7 +13,7 @@ use super::{CacheError, WriteCache};
 impl WriteCache<Active> {
     /// Read blocks by content hash through tiered storage.
     ///
-    /// Resolution order per chunk: block_map → dirty_store → clean_cache → S3 range request.
+    /// Resolution order per chunk: block_map → clean_cache → S3 → SSD pread fallback.
     /// Chunks are resolved concurrently — a multi-block read that spans multiple packs
     /// fetches them in parallel rather than serially.
     #[instrument(skip(self, clean_cache, pack_index, content_store, metrics), fields(offset = offset, len = len))]
@@ -134,9 +134,9 @@ impl WriteCache<Active> {
     /// Resolve a single chunk through the tier hierarchy (hot path).
     ///
     /// 1. block_map lookup → if zero hash, return zeros
-    /// 2. dirty_store → in-memory dirty block (~100ns)
-    /// 3. clean_cache → previously fetched and decompressed block (~100ns)
-    /// 4. S3 range request → fetch only this block's compressed bytes, decompress
+    /// 2. clean_cache → bounded in-memory/SSD cache (~100ns mem, ~100μs SSD)
+    /// 3. S3 range request → fetch compressed bytes from pack
+    /// 4. SSD pread fallback → dirty block not yet in S3 (OS page cache: ~μs)
     async fn resolve_chunk(
         &self,
         chunk_index: usize,
@@ -152,41 +152,41 @@ impl WriteCache<Active> {
             return Ok(self.inner.zero_block_bytes.clone());
         }
 
-        // Tier 1: dirty_store (in-memory, not yet flushed to S3).
-        if let Some(data) = self.inner.dirty_store.lock().get(&hash) {
-            return Ok(data.clone());
-        }
-
-        // Tier 2: clean_cache (previously fetched from S3).
+        // Tier 1: clean_cache (recently written or previously fetched from S3).
         if let Some(data) = clean_cache.get(&hash).await {
             return Ok(data);
         }
 
-        // Tier 3: S3 range request — fetch only this block's compressed bytes.
-        let pack_loc = pack_index.get(&hash).ok_or(CacheError::BlockNotFound { hash })?;
-
-        let compressed = match content_store.get_block(pack_loc.pack_id, pack_loc.offset, pack_loc.comp_length).await {
-            Ok(data) => data,
-            Err(e) => {
-                if let Some(m) = metrics {
-                    m.record_s3_get_error();
+        // Tier 2: S3 range request (if block exists in a pack).
+        if let Some(pack_loc) = pack_index.get(&hash) {
+            let compressed = match content_store.get_block(pack_loc.pack_id, pack_loc.offset, pack_loc.comp_length).await {
+                Ok(data) => data,
+                Err(e) => {
+                    if let Some(m) = metrics {
+                        m.record_s3_get_error();
+                    }
+                    return Err(e.into());
                 }
-                return Err(e.into());
+            };
+
+            let decompressed = lz4_decompress(&compressed)
+                .map_err(|e| CacheError::DecompressFailed(e.to_string()))?;
+
+            let actual_hash = blake3_128(&decompressed);
+            if actual_hash != hash {
+                return Err(CacheError::HashMismatch {
+                    expected: format!("{:?}", hash),
+                });
             }
-        };
 
-        let decompressed = lz4_decompress(&compressed)
-            .map_err(|e| CacheError::DecompressFailed(e.to_string()))?;
-
-        let actual_hash = blake3_128(&decompressed);
-        if actual_hash != hash {
-            return Err(CacheError::HashMismatch {
-                expected: format!("{:?}", hash),
-            });
+            let data = Bytes::from(decompressed);
+            clean_cache.insert(hash, data.clone());
+            return Ok(data);
         }
 
-        let data = Bytes::from(decompressed);
-        clean_cache.insert(hash, data.clone());
+        // Tier 3: SSD pread fallback — block is locally dirty, not yet in S3.
+        // OS page cache makes this ~μs for recently written blocks.
+        let data = self.sync_read_local_block(chunk_index as u64)?;
         Ok(data)
     }
 

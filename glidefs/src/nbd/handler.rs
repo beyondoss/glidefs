@@ -191,7 +191,7 @@ impl NBDBlockHandler {
         }
 
         self.metrics.record_guest_write(data.len() as u64);
-        self.cache.write(offset, data)?;
+        self.cache.write(offset, data, self.clean_cache.as_ref())?;
 
         if fua {
             self.flush()?;
@@ -296,8 +296,6 @@ mod tests {
             device_name: "test".to_string(),
             device_size: 1024 * 1024, // 1MB
             block_size: 4096,
-            dirty_budget_bytes: 0,
-            flush_trigger: None,
             wal_sync: false,
         };
 

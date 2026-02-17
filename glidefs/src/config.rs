@@ -110,18 +110,6 @@ pub struct NbdConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub blocks_per_batch: Option<u64>,
 
-    /// Sync delay in milliseconds (default: 100ms)
-    /// Longer delays allow more writes to coalesce into fewer S3 operations.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub sync_delay_ms: Option<u64>,
-
-    /// Auto-create exports on first NBD connect (optional).
-    /// When set, if a client connects to an export that doesn't exist,
-    /// it will be created automatically with this size (in GB).
-    /// Useful for microVM orchestrators that create volumes on-demand.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub auto_create_size_gb: Option<f64>,
-
     /// Static exports loaded at startup
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exports: Vec<ExportConfig>,
@@ -134,11 +122,6 @@ pub struct NbdConfig {
     /// Size of the block device in gigabytes (DEPRECATED: use exports array instead)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub device_size_gb: Option<f64>,
-
-    /// Dirty budget in GB (default: 5GB). When an export's unflushed data
-    /// exceeds this threshold, the flush scheduler is triggered.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub dirty_budget_gb: Option<f64>,
 
     /// Background scrubber rate: blocks verified per second (default: 1000, 0 = disabled).
     /// Periodically re-hashes cached blocks to detect silent corruption.
@@ -177,9 +160,6 @@ pub struct ExportConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub flush_mode: Option<FlushMode>,
 
-    /// Dirty budget in GB for this export (default: inherit from global dirty_budget_gb).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub dirty_budget_gb: Option<f64>,
 }
 
 impl ExportConfig {
@@ -204,7 +184,6 @@ impl NbdConfig {
     pub const DEFAULT_BLOCKS_PER_BATCH: u64 = 25;
     pub const DEFAULT_DEVICE_SIZE_GB: f64 = 100.0;
     pub const DEFAULT_DEVICE_NAME: &'static str = "glidefs";
-    pub const DEFAULT_SYNC_DELAY_MS: u64 = 8000; // 8 seconds - testing PUT reduction
 
     pub fn block_size(&self) -> usize {
         self.block_size.unwrap_or(Self::DEFAULT_BLOCK_SIZE)
@@ -215,23 +194,7 @@ impl NbdConfig {
         self.blocks_per_batch.unwrap_or(Self::DEFAULT_BLOCKS_PER_BATCH)
     }
 
-    /// Get the sync delay in milliseconds.
-    pub fn sync_delay_ms(&self) -> u64 {
-        self.sync_delay_ms.unwrap_or(Self::DEFAULT_SYNC_DELAY_MS)
-    }
-
-    /// Get the auto-create size (if configured).
-    pub fn auto_create_size_gb(&self) -> Option<f64> {
-        self.auto_create_size_gb
-    }
-
-    pub const DEFAULT_DIRTY_BUDGET_GB: f64 = 5.0;
     pub const DEFAULT_SCRUBBER_BPS: u64 = 1000;
-
-    /// Get the dirty budget in GB (default: 5GB).
-    pub fn dirty_budget_gb(&self) -> f64 {
-        self.dirty_budget_gb.unwrap_or(Self::DEFAULT_DIRTY_BUDGET_GB)
-    }
 
     /// Get the scrubber rate in blocks per second (default: 1000, 0 = disabled).
     pub fn scrubber_blocks_per_second(&self) -> u64 {
@@ -258,7 +221,7 @@ impl NbdConfig {
                 s3_prefix: None,
                 block_size: None,
                 flush_mode: None,
-                dirty_budget_gb: None,
+
             }];
         }
 
@@ -269,7 +232,6 @@ impl NbdConfig {
             s3_prefix: None,
             block_size: None,
             flush_mode: None,
-            dirty_budget_gb: None,
         }]
     }
 }
@@ -432,13 +394,6 @@ impl Settings {
             if let Some(bpb) = nbd.blocks_per_batch {
                 anyhow::ensure!(bpb > 0, "blocks_per_batch must be > 0, got {}", bpb);
             }
-            if let Some(db) = nbd.dirty_budget_gb {
-                anyhow::ensure!(db > 0.0, "dirty_budget_gb must be > 0, got {}", db);
-            }
-            if let Some(sd) = nbd.sync_delay_ms {
-                anyhow::ensure!(sd > 0, "sync_delay_ms must be > 0, got {}", sd);
-            }
-
             // Export validation
             let mut names = HashSet::new();
             for export in &nbd.exports {
@@ -521,19 +476,17 @@ impl Settings {
                     api_address: Some(default_api_address()),
                     block_size: None,
                     blocks_per_batch: None,
-                    sync_delay_ms: None,
-                    auto_create_size_gb: None,
                     exports: vec![ExportConfig {
                         name: "default".to_string(),
                         size_gb: 100.0,
                         s3_prefix: None,
                         block_size: None,
                         flush_mode: None,
-                        dirty_budget_gb: None,
+        
                     }],
                     device_name: None,
                     device_size_gb: None,
-                    dirty_budget_gb: None,
+    
                     scrubber_blocks_per_second: None,
                     wal_sync: None,
                 }),

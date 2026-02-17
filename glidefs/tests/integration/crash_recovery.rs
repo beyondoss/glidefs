@@ -13,6 +13,7 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use tempfile::TempDir;
 
+use glidefs::nbd::cache::SimpleBlockCache;
 use glidefs::nbd::state::Initializing;
 use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
 
@@ -25,8 +26,6 @@ fn test_config(dir: &TempDir, name: &str) -> WriteCacheConfig {
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     }
 }
@@ -50,14 +49,15 @@ async fn test_metadata_atomicity() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
-        cache.write(0, &test_data).unwrap();
+        cache.write(0, &test_data, &clean_cache).unwrap();
         cache.save_metadata().unwrap();
 
-        cache.write(BLOCK_SIZE as u64, &test_data).unwrap();
+        cache.write(BLOCK_SIZE as u64, &test_data, &clean_cache).unwrap();
         cache.save_metadata().unwrap();
 
-        cache.write(2 * BLOCK_SIZE as u64, &test_data).unwrap();
+        cache.write(2 * BLOCK_SIZE as u64, &test_data, &clean_cache).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -105,7 +105,8 @@ async fn test_leftover_temp_file_ignored() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        cache.write(0, &test_data).unwrap();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        cache.write(0, &test_data, &clean_cache).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -143,7 +144,8 @@ async fn test_torn_write_temp_file() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        cache.write(0, &test_data).unwrap();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        cache.write(0, &test_data, &clean_cache).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -209,7 +211,8 @@ async fn test_corrupted_magic_bytes() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        cache.write(0, &vec![0xCC; BLOCK_SIZE]).unwrap();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        cache.write(0, &vec![0xCC; BLOCK_SIZE], &clean_cache).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -246,8 +249,6 @@ async fn test_device_size_shrink_rejected() {
         device_name: config.device_name.clone(),
         device_size: config.device_size / 2, // Halve the size
         block_size: config.block_size,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
 
@@ -278,7 +279,8 @@ async fn test_repeated_metadata_crash_cycles() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        cache.write(0, &test_data).unwrap();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        cache.write(0, &test_data, &clean_cache).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -368,8 +370,9 @@ async fn test_write_after_recovery_overwrites() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
-        cache.write(0, &old_data).unwrap();
+        cache.write(0, &old_data, &clean_cache).unwrap();
         cache.save_metadata().unwrap();
         // Crash without flushing to S3
     }
@@ -378,9 +381,10 @@ async fn test_write_after_recovery_overwrites() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Now write new data to the same block (overwrites recovered data)
-        cache.write(0, &new_data).unwrap();
+        cache.write(0, &new_data, &clean_cache).unwrap();
 
         // Flush to S3 via v2 pack path
         let content_store = glidefs::nbd::content_store::ContentStore::new(
@@ -407,5 +411,170 @@ async fn test_write_after_recovery_overwrites() {
             &new_data[..],
             "New data should overwrite old data in S3"
         );
+    }
+}
+
+// =============================================================================
+// WAL RECOVERY INTEGRATION TEST
+// =============================================================================
+
+/// Test: WAL recovery reconstructs block map when metadata was never saved.
+///
+/// Scenario: Write blocks (WAL entries written), crash before save_metadata().
+/// On reopen, finish_recovery() replays the WAL, re-reads blocks from SSD,
+/// and reconstructs the v2 block map. Data should then flush to S3 correctly.
+///
+/// Note: dirty_block_count() tracks the v1 block_states metadata, which is
+/// NOT updated by WAL replay. The v2 block_map (FLAG_DIRTY)
+/// is populated by WAL replay, so flush_to_s3 picks up the blocks correctly.
+#[tokio::test]
+async fn test_wal_recovery_without_metadata_save() {
+    let s3_backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let temp_dir = TempDir::new().unwrap();
+    let config = test_config(&temp_dir, "wal_recovery");
+
+    let block_0_data: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
+    let block_1_data: Vec<u8> = (0..BLOCK_SIZE).map(|i| ((i + 100) % 251) as u8).collect();
+
+    // Session 1: Write blocks but DO NOT save metadata — simulate crash
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+
+        cache.write(0, &block_0_data, &clean_cache).unwrap();
+        cache.write(BLOCK_SIZE as u64, &block_1_data, &clean_cache).unwrap();
+
+        assert_eq!(cache.dirty_block_count(), 2);
+
+        // Intentionally skip save_metadata() — WAL has entries, metadata does not.
+        // Drop cache to simulate crash.
+    }
+
+    // Session 2: Reopen with full recovery (WAL replay + SSD re-read)
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // Data should be readable from local SSD (pwrite'd before WAL append)
+        let data_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert_eq!(data_0.as_ref(), &block_0_data[..], "block 0 data after recovery");
+
+        let data_1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        assert_eq!(data_1.as_ref(), &block_1_data[..], "block 1 data after recovery");
+
+        // Flush to S3 — WAL-replayed blocks have FLAG_DIRTY in the v2 block map,
+        // so flush_dirty_inner picks them up even though v1 block_states says Clean.
+        let content_store = glidefs::nbd::content_store::ContentStore::new(
+            Arc::clone(&s3_backend),
+            "test",
+        );
+        let pack_index = glidefs::nbd::pack_index::HostPackIndex::new();
+        let stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+        assert!(stats.packs_uploaded > 0, "should upload recovered blocks");
+        assert_eq!(stats.blocks_flushed, 2, "should flush both WAL-recovered blocks");
+    }
+
+    // Session 3: Verify from a cold reader that the data made it to S3
+    {
+        let cold_dir = TempDir::new().unwrap();
+        let (cold_cache, content_store, pack_index, clean_cache, metrics) =
+            create_v2_cold_reader(&cold_dir, "wal_recovery", Arc::clone(&s3_backend)).await;
+
+        let data_0 = cold_cache
+            .read_v2(0, BLOCK_SIZE, clean_cache.as_ref(), &pack_index, &content_store, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(data_0.as_ref(), &block_0_data[..], "block 0 from S3 after WAL recovery");
+
+        let data_1 = cold_cache
+            .read_v2(BLOCK_SIZE as u64, BLOCK_SIZE, clean_cache.as_ref(), &pack_index, &content_store, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(data_1.as_ref(), &block_1_data[..], "block 1 from S3 after WAL recovery");
+    }
+}
+
+/// Test: WAL recovery with multiple crash cycles preserves all data.
+///
+/// Scenario: Write block 0 in session 1 (save metadata, crash),
+/// recover in session 2 and write block 1 (crash WITHOUT saving metadata),
+/// recover in session 3 — both blocks should be intact and flushable.
+///
+/// This exercises the append-only WAL across multiple sessions: session 1's
+/// entry persists through session 2's recovery (WAL is not truncated during
+/// finish_recovery), and session 2's new entry appends. Session 3 replays all.
+#[tokio::test]
+async fn test_wal_recovery_multiple_crash_cycles() {
+    let s3_backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let temp_dir = TempDir::new().unwrap();
+    let config = test_config(&temp_dir, "wal_multi_crash");
+
+    let data_session_1: Vec<u8> = vec![0xAA; BLOCK_SIZE];
+    let data_session_2: Vec<u8> = vec![0xBB; BLOCK_SIZE];
+
+    // Session 1: Write block 0, save metadata, crash
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        cache.write(0, &data_session_1, &clean_cache).unwrap();
+        cache.save_metadata().unwrap();
+        // Crash — .meta has block 0 dirty, WAL has block 0 entry
+    }
+
+    // Session 2: Recover, write block 1, crash WITHOUT saving metadata
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+
+        // Block 0 should be recovered from metadata (.meta says dirty)
+        assert!(cache.dirty_block_count() >= 1, "block 0 should be dirty from metadata");
+
+        // Write block 1 (new data) — appends to WAL
+        cache.write(BLOCK_SIZE as u64, &data_session_2, &clean_cache).unwrap();
+
+        // Crash without saving metadata — .meta still has only block 0 dirty
+    }
+
+    // Session 3: Full recovery — both blocks should be present
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // SSD data should be intact for both blocks
+        let read_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert_eq!(read_0.as_ref(), &data_session_1[..], "block 0 from session 1");
+
+        let read_1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        assert_eq!(read_1.as_ref(), &data_session_2[..], "block 1 from session 2");
+
+        // Both should flush to S3 — block 0 from metadata + WAL,
+        // block 1 from WAL only (both have FLAG_DIRTY in v2 block map).
+        let content_store = glidefs::nbd::content_store::ContentStore::new(
+            Arc::clone(&s3_backend),
+            "test",
+        );
+        let pack_index = glidefs::nbd::pack_index::HostPackIndex::new();
+        let stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+        assert_eq!(stats.blocks_flushed, 2, "both blocks should flush to S3");
+
+        // Verify from cold reader
+        let cold_dir = TempDir::new().unwrap();
+        let (cold_cache, cs, pi, cc, m) =
+            create_v2_cold_reader(&cold_dir, "wal_multi_crash", Arc::clone(&s3_backend)).await;
+
+        let s3_data_0 = cold_cache
+            .read_v2(0, BLOCK_SIZE, cc.as_ref(), &pi, &cs, &m)
+            .await
+            .unwrap();
+        assert_eq!(s3_data_0.as_ref(), &data_session_1[..], "block 0 in S3");
+
+        let s3_data_1 = cold_cache
+            .read_v2(BLOCK_SIZE as u64, BLOCK_SIZE, cc.as_ref(), &pi, &cs, &m)
+            .await
+            .unwrap();
+        assert_eq!(s3_data_1.as_ref(), &data_session_2[..], "block 1 in S3");
     }
 }

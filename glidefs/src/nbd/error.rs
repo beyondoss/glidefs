@@ -50,16 +50,8 @@ impl CommandError {
 
 impl From<CacheError> for CommandError {
     fn from(err: CacheError) -> Self {
-        match &err {
-            CacheError::DirtyBudgetExceeded => {
-                tracing::warn!("write rejected: dirty budget exceeded, flush cannot keep up");
-                CommandError::NoSpace
-            }
-            _ => {
-                tracing::warn!(error = %err, "cache error mapped to EIO");
-                CommandError::IoError
-            }
-        }
+        tracing::warn!(error = %err, "cache error mapped to EIO");
+        CommandError::IoError
     }
 }
 

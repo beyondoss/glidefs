@@ -151,7 +151,7 @@ WriteCache<Initializing>
          ▼
 WriteCache<Recovering>
          │
-         │  re-upload dirty blocks from crash
+         │  verify dirty block hashes against SSD
          ▼
 WriteCache<Active>
          │
@@ -304,15 +304,13 @@ url = "s3://my-bucket/vms"
 [servers.nbd]
 unix_socket = "/var/run/glidefs.sock"
 api_address = "127.0.0.1:8080"
-auto_create_size_gb = 500.0   # Auto-create exports on connect
+
 ```
 
 | Variable | Default | Why |
 |----------|---------|-----|
 | `block_size` | 128KB | Matches ZFS recordsize |
 | `blocks_per_batch` | 25 | 3.2MB per S3 object — balances PUT cost vs read amplification |
-| `sync_delay_ms` | 8000 | 8s coalescing window — fewer PUTs, larger dirty window |
-| `dirty_budget_gb` | 5.0 | Trigger flush when unflushed data exceeds this |
 | `scrubber_blocks_per_second` | 1000 | Background integrity verification rate (0 = disabled) |
 | `memory_size_gb` | 1.0 | Foyer in-memory cache for hot blocks |
 | `ssd_cache_size_gb` | 10.0 | Foyer SSD tier catches memory evictions |
@@ -321,7 +319,7 @@ auto_create_size_gb = 500.0   # Auto-create exports on connect
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
-| `DemandDriven` | Flush only on explicit trigger (budget exceeded, API call, shutdown) | Dev/preview VMs where some data loss on host death is acceptable |
+| `DemandDriven` | Flush only on explicit trigger (API call, drain, shutdown). Local checkpoint every 5s keeps WAL bounded. | Dev/preview VMs where some data loss on host death is acceptable |
 | `Continuous` | Periodic pack flush (~5s) + manifest sync (~60s) | Production VMs that need a small dirty window |
 
 Mode can be changed at runtime via `watch::Sender`. The scheduler re-reads the mode on each loop iteration. (`flush_scheduler.rs:74-119`)

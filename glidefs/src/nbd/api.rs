@@ -39,9 +39,6 @@ pub struct PutExportRequest {
     /// Flush mode for this export.
     #[serde(default)]
     pub flush_mode: Option<FlushMode>,
-    /// Dirty budget in GB for this export.
-    #[serde(default)]
-    pub dirty_budget_gb: Option<f64>,
 }
 
 /// Response for export info.
@@ -220,7 +217,6 @@ where
                         s3_prefix: put_req.s3_prefix,
                         block_size: put_req.block_size,
                         flush_mode: put_req.flush_mode,
-                        dirty_budget_gb: put_req.dirty_budget_gb,
                     };
 
                     match router.create_export(config, put_req.readonly, put_req.manifest_name.as_deref()).await {
@@ -491,9 +487,6 @@ mod tests {
             cache_dir: temp_dir.path().to_path_buf(),
             block_size: 128 * 1024,
             blocks_per_batch: 10,
-            sync_delay_ms: 100,
-            dirty_budget_gb: 5.0,
-            auto_create_size_gb: None,
             clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
             wal_sync: false,
         }))

@@ -170,8 +170,6 @@ fn create_test_cache(
         device_name: name.to_string(),
         device_size: 10 * 1024 * 1024, // 10MB
         block_size: BLOCK_SIZE,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
 
@@ -223,8 +221,6 @@ async fn create_reader_from_manifest(
         device_name: name.to_string(),
         device_size: 10 * 1024 * 1024,
         block_size: BLOCK_SIZE,
-        dirty_budget_bytes: 0,
-        flush_trigger: None,
         wal_sync: false,
     };
 
@@ -252,13 +248,13 @@ async fn create_reader_from_manifest(
 async fn test_s3_failure_during_sync_marks_blocks_dirty() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+    let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write some blocks
     for i in 0..5 {
         let data = vec![i as u8; BLOCK_SIZE];
-        cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
+        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
     }
 
     assert_eq!(cache.dirty_block_count(), 5, "Should have 5 dirty blocks");
@@ -307,11 +303,11 @@ async fn test_s3_failure_during_read_returns_error() {
 
     // First, write data to S3 successfully
     let writer_dir = TempDir::new().unwrap();
-    let (writer_cache, writer_content_store, writer_pack_index, _writer_clean_cache, _) =
+    let (writer_cache, writer_content_store, writer_pack_index, writer_clean_cache, _) =
         create_test_cache(&writer_dir, "vol1", Arc::clone(&s3));
 
     let data = vec![0xAB; BLOCK_SIZE];
-    writer_cache.write(0, &data).unwrap();
+    writer_cache.write(0, &data, writer_clean_cache.as_ref()).unwrap();
     writer_cache
         .flush_to_s3(&writer_content_store, &writer_pack_index)
         .await
@@ -368,12 +364,12 @@ async fn test_s3_failure_during_read_returns_error() {
 async fn test_write_during_sync_preserves_new_data() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+    let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write initial data and flush to S3
     let data_v1 = vec![0x11; BLOCK_SIZE];
-    cache.write(0, &data_v1).unwrap();
+    cache.write(0, &data_v1, clean_cache.as_ref()).unwrap();
     cache
         .flush_to_s3(&content_store, &pack_index)
         .await
@@ -381,7 +377,7 @@ async fn test_write_during_sync_preserves_new_data() {
 
     // Write new data to the same block
     let data_v2 = vec![0x22; BLOCK_SIZE];
-    cache.write(0, &data_v2).unwrap();
+    cache.write(0, &data_v2, clean_cache.as_ref()).unwrap();
 
     // Block should be dirty again with new data
     assert_eq!(cache.dirty_block_count(), 1);
@@ -432,7 +428,7 @@ async fn test_concurrent_writes_no_torn_reads() {
 
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, _content_store, _pack_index, _clean_cache, _metrics) =
+    let (cache, _content_store, _pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     let cache = Arc::new(cache);
@@ -444,12 +440,13 @@ async fn test_concurrent_writes_no_torn_reads() {
     for writer_id in 0..10u8 {
         let cache = Arc::clone(&cache);
         let write_count = Arc::clone(&write_count);
+        let clean_cache = Arc::clone(&clean_cache);
 
         tasks.spawn(async move {
             for _ in 0..100 {
                 // Each writer writes its ID as the pattern
                 let data = vec![writer_id; BLOCK_SIZE];
-                cache.write(0, &data).unwrap();
+                cache.write(0, &data, clean_cache.as_ref()).unwrap();
                 write_count.fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -494,13 +491,13 @@ async fn test_concurrent_writes_no_torn_reads() {
 async fn test_zero_blocks_not_synced_to_s3() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+    let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write zero blocks
     let zeros = vec![0u8; BLOCK_SIZE];
     for i in 0..10 {
-        cache.write(i as u64 * BLOCK_SIZE as u64, &zeros).unwrap();
+        cache.write(i as u64 * BLOCK_SIZE as u64, &zeros, clean_cache.as_ref()).unwrap();
     }
 
     // Flush to S3
@@ -524,7 +521,7 @@ async fn test_zero_blocks_not_synced_to_s3() {
 async fn test_mixed_zero_nonzero_batch() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+    let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write alternating zero and non-zero blocks
@@ -534,7 +531,7 @@ async fn test_mixed_zero_nonzero_batch() {
         } else {
             vec![0xAB; BLOCK_SIZE] // Non-zero block
         };
-        cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
+        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
     }
 
     // Flush
@@ -580,7 +577,7 @@ async fn test_mixed_zero_nonzero_batch() {
 async fn test_data_integrity_after_failure_recovery() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+    let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write known pattern
@@ -588,7 +585,7 @@ async fn test_data_integrity_after_failure_recovery() {
     for i in 0..20u8 {
         let data: Vec<u8> = (0..BLOCK_SIZE).map(|j| i.wrapping_add(j as u8)).collect();
         expected_data.push(data.clone());
-        cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
+        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
     }
 
     // Enable S3 failures and attempt flush
@@ -645,13 +642,13 @@ async fn test_data_integrity_after_failure_recovery() {
 async fn test_concurrent_drain_safety() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, _clean_cache, _metrics) =
+    let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
     // Write data
     for i in 0..10 {
         let data = vec![i as u8; BLOCK_SIZE];
-        cache.write(i as u64 * BLOCK_SIZE as u64, &data).unwrap();
+        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
     }
 
     // Wrap in Arc for sharing across tasks (ContentStore and HostPackIndex
@@ -698,5 +695,91 @@ async fn test_concurrent_drain_safety() {
 
         let expected = vec![i as u8; BLOCK_SIZE];
         assert_eq!(data.as_ref(), &expected[..], "Block {} corrupted", i);
+    }
+}
+
+// =============================================================================
+// PARTIAL PACK UPLOAD FAILURE
+// =============================================================================
+
+/// Test: Partial pack upload failure preserves all dirty blocks for retry.
+///
+/// When a multi-pack flush fails partway through (e.g., pack 1 of 3 uploads,
+/// pack 2 fails), all dirty flags must be preserved so the next flush retries
+/// the entire batch. Uses `fail_after_puts` which is wired into FailingObjectStore
+/// but was previously unused.
+#[tokio::test]
+async fn test_partial_pack_upload_preserves_dirty() {
+    let s3 = Arc::new(FailingObjectStore::new());
+    let temp_dir = TempDir::new().unwrap();
+    let (cache, content_store, pack_index, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+
+    // Write enough blocks for multiple packs (25 blocks per pack, so 60 blocks = 2-3 packs)
+    for i in 0..60u8 {
+        let data: Vec<u8> = (0..BLOCK_SIZE).map(|j| i.wrapping_add(j as u8)).collect();
+        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
+    }
+
+    let dirty_before = cache.dirty_block_count();
+    assert_eq!(dirty_before, 60, "should have 60 dirty blocks");
+
+    // Fail after 2 PUTs (first pack upload succeeds, second fails)
+    s3.set_fail_after_puts(2);
+
+    // Flush should fail — some packs uploaded, but not all
+    let result = cache.flush_to_s3(&content_store, &pack_index).await;
+    assert!(result.is_err(), "flush should fail on partial pack upload");
+
+    // All blocks should still be dirty (flush_dirty_inner returns Err before
+    // the CAS-clear step, so no dirty flags are cleared)
+    assert_eq!(
+        cache.dirty_block_count(),
+        dirty_before,
+        "all blocks should remain dirty after partial failure"
+    );
+
+    // Reset failure state and retry — should succeed
+    s3.set_fail_after_puts(0);
+    s3.set_fail_puts(false);
+
+    let stats = cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        cache.dirty_block_count(),
+        0,
+        "all blocks should be clean after successful retry"
+    );
+    assert!(stats.packs_uploaded > 0, "retry should upload packs");
+
+    // Verify data integrity from a cold reader
+    drop(cache);
+    let reader_dir = TempDir::new().unwrap();
+    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+        create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
+
+    for i in 0..60u8 {
+        let data = reader_cache
+            .read_v2(
+                i as u64 * BLOCK_SIZE as u64,
+                BLOCK_SIZE,
+                reader_clean_cache.as_ref(),
+                &reader_pack_index,
+                &reader_content_store,
+                &reader_metrics,
+            )
+            .await
+            .unwrap();
+
+        let expected: Vec<u8> = (0..BLOCK_SIZE).map(|j| i.wrapping_add(j as u8)).collect();
+        assert_eq!(
+            data.as_ref(),
+            &expected[..],
+            "Block {} data mismatch after partial failure recovery",
+            i
+        );
     }
 }

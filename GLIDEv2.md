@@ -346,26 +346,23 @@ Cache misses that hit S3 are primarily during initial boot (base image blocks) a
 
 ## Write Path
 
-Writes are acked after hitting the local WAL and cache. S3 upload happens on demand (or in the background for continuous-flush VMs).
+Writes are acked after hitting the local SSD and WAL. S3 upload happens on demand (or in the background for continuous-flush VMs).
 
 ```mermaid
 sequenceDiagram
     participant VM as MicroVM
     participant NBD as NBD Device
     participant D as NBD Daemon
+    participant SC as SSD Cache File
     participant WAL as WAL (local SSD)
-    participant MC as Memory Cache
-    participant SC as SSD Cache
     participant M as Block Map
 
     VM->>NBD: write(offset, data)
     NBD->>D: NBD_CMD_WRITE
     D->>D: blake3_128(raw data) → blake3:def456
-    D->>WAL: append(offset, blake3:def456, raw data)
-    D->>MC: store blake3:def456 (raw)
-    D->>SC: store blake3:def456 (raw)
+    D->>SC: pwrite(offset, raw data)
+    D->>WAL: append(offset, blake3:def456)
     D->>M: update offset → blake3:def456 + dirty flag
-    D->>D: dirty_set.insert(offset)
     D-->>NBD: ack
     NBD-->>VM: success
 
@@ -595,7 +592,7 @@ The snapshot operation:
 4. Write the manifest at sequence N to S3. Return the ETag to the caller.
 5. Clear dirty flags for flushed entries. Unpin their SSD cache entries.
 
-The source VM **keeps writing during the flush**. Concurrent writes get sequence > N and update the live block map, but don't touch the snapshot. Block data for the snapshot is safe in SSD cache — content-addressing means new writes create new cache entries (new hash → new key), they don't overwrite the old ones.
+The source VM **keeps writing during the flush**. Concurrent writes get sequence > N and update the live block map, but don't touch the snapshot. Block data for the snapshot is read from the SSD cache file by position and **verified by hash** — if a concurrent write overwrote the same chunk on SSD, the hash won't match the snapshot entry, and the block is skipped (it's re-dirtied and will be caught by the next flush). Hash verification, not content-addressing, is what makes positional SSD reads safe during concurrent writes.
 
 The source VM is **never paused**. The only cost is the time to upload dirty data. For a steady-state production VM, that's a handful of blocks. For a demand-driven VM that's been active for hours, it's proportional to total unique dirty blocks.
 
@@ -603,17 +600,21 @@ The source VM is **never paused**. The only cost is the time to upload dirty dat
 
 The snapshot mechanism runs concurrently with the VM's write path. Here's why it's safe:
 
-**Key invariant:** The dirty store is keyed by *content hash*, not by *block offset*. A concurrent write to the same offset creates a *new* entry (different data → different hash → different key). It never overwrites the entry the snapshot flush is reading.
+**Key invariant:** The flush path reads block data from the SSD cache file by position (pread at `chunk_index × chunk_size`) and verifies the content hash matches the snapshot entry. A concurrent write to the same chunk index overwrites the SSD file at that position, but the hash verification detects this — the flush skips the block (it's been re-dirtied with a new hash and will be captured by the next flush).
 
 ```
-Snapshot captured: [(offset=42, hash=abc), (offset=17, hash=bbb)]
-Snapshot flush reading dirty_store[abc]...
+Snapshot captured at seq N: [(offset=42, hash=abc), (offset=17, hash=bbb)]
+Flush reads SSD at offset 42, hashes it → abc ✓ → include in pack
 
 Meanwhile, VM writes to offset 42:
+  → pwrite(new_data) at offset 42    ← overwrites SSD at same position
   → blake3(new_data) = hash:xyz
-  → dirty_store[xyz] = new_data     ← NEW key, does not touch dirty_store[abc]
   → block_map[42] = (xyz, dirty, seq=N+1)
-  → dirty_store[abc] still exists, still readable ✓
+
+If flush reads AFTER the concurrent write:
+  → pread(offset 42) → new_data
+  → blake3(new_data) = xyz ≠ abc     ← hash mismatch, skip this block
+  → block 42 stays dirty (seq=N+1), caught by next flush ✓
 ```
 
 **Dirty set capture.** The snapshot needs a consistent set of `(offset, hash)` pairs at sequence ≤ N. Two approaches:
@@ -624,9 +625,9 @@ Meanwhile, VM writes to offset 42:
 
 Start with (1). Switch to (2) if needed.
 
-**Dirty store cleanup after flush.** After the snapshot flush uploads blocks to S3:
-- For each `(offset, hash)` in the snapshot: check if `block_map[offset]` still has the same hash. If yes, clear the dirty flag and remove the offset from the dirty set. If no (a concurrent write changed it), leave it dirty — the new data will be captured by the next snapshot.
-- For each unique hash in the snapshot: move data from dirty store to clean cache. The hash may still be referenced by *other* offsets (dedup), so only remove from dirty store when no block map entry references it. A simple refcount on dirty store entries handles this.
+**Cleanup after flush.** After the snapshot flush uploads blocks to S3:
+- For each `(offset, hash)` in the snapshot: check if `block_map[offset]` still has the same hash. If yes, clear the dirty flag. If no (a concurrent write changed it), leave it dirty — the new data will be captured by the next snapshot.
+- Flushed blocks are now in S3 and resolvable via the pack index. They enter the clean cache naturally on next read (S3 fetch → cache insert).
 
 ### Race Conditions
 
@@ -638,7 +639,7 @@ Start with (1). Switch to (2) if needed.
 
 **Fork of a fork:** Same operation. Copy the manifest. Blocks are shared transitively. GC sees all manifests, keeps all referenced blocks.
 
-**Consistent fork + concurrent writes:** The sequence cut is atomic. The snapshot captures dirty entries at sequence ≤ N. Writes after the cut get sequence > N, update the live block map but not the snapshot. The flush reads block data from SSD cache by hash — content-addressing guarantees concurrent writes don't overwrite snapshot data. The manifest at sequence N is internally consistent.
+**Consistent fork + concurrent writes:** The sequence cut is atomic. The snapshot captures dirty entries at sequence ≤ N. Writes after the cut get sequence > N, update the live block map but not the snapshot. The flush reads block data from the SSD cache file by position and verifies the content hash — concurrent writes are detected by hash mismatch and skipped. The manifest at sequence N is internally consistent.
 
 ### Self-Containment Property
 
@@ -758,25 +759,17 @@ graph LR
 
 Dirty blocks and clean blocks are managed separately. Dirty blocks are pinned (not evictable). Clean blocks use a two-tier S3-FIFO cache.
 
-### Dirty Block Store
+### Dirty Blocks
 
-Blocks not yet flushed to S3 are stored in a pinned hash map — not in the eviction cache. The WAL is truncated every ~5s, so after truncation the dirty store is the only local copy. Evicting a dirty block means data loss.
+Dirty blocks (not yet flushed to S3) live on the SSD cache file — the same pwrite that services the write path. The block map tracks which blocks are dirty. No separate in-memory dirty block store is needed.
 
-```
-Write path:  hash block → dirty_store[hash] = data
-S3 flush:    dirty_store.remove(hash) → insert into clean cache
-```
+**Read path for dirty blocks:** The SSD cache file is the source of truth. Recently written blocks hit the OS page cache (~microseconds, no disk I/O). Cold dirty blocks read from SSD (~100μs). Both are fast — there is no need to duplicate block data in an in-memory hash map.
 
-Dirty blocks are served directly from the dirty store on read (~100ns, in-memory). When flushed to S3, they move to the clean cache and become evictable.
+**Flush path for dirty blocks:** The flush reads dirty block data from the SSD cache file by position (`pread` at `chunk_index × chunk_size`), verifies the content hash, compresses, and uploads. Hash verification handles concurrent writes safely (see Snapshot Concurrency Model).
 
-**Dirty block budget.** Each VM has a configurable dirty data budget (default: 5GB). When dirty data exceeds the budget, the daemon flushes the oldest dirty blocks to S3 until back under budget — even in demand-driven mode. This bounds memory/SSD consumption, bounds migration latency (at most `budget` bytes to flush), and keeps demand-driven as the default without risking unbounded growth.
+**Local checkpoint (every ~5s).** The block map is persisted to local SSD and the WAL is truncated. This is a local-only operation — no S3 involved. It bounds WAL size to ~5 seconds of writes regardless of flush mode. In demand-driven mode, the WAL stays small even when S3 flushes are hours apart.
 
-```
-dirty_data < budget    → pure demand-driven, zero S3 traffic
-dirty_data ≥ budget    → flush oldest dirty blocks until under budget
-```
-
-The budget is a per-VM setting, configured at export creation (`dirty_budget_gb`, default 5). The daemon checks on every write (O(1) — compare counter against threshold). Forced flushes are identical to normal flushes — same pack assembly, same registry update, same code path.
+**Dirty block budget.** Each VM has a configurable dirty data budget (default: 5GB). The budget bounds migration latency (at most `budget` bytes to flush on migrate/snapshot). In demand-driven mode, exceeding the budget triggers an S3 flush to keep the dirty set manageable. The budget is a per-VM setting, configured at export creation (`dirty_budget_gb`, default 5).
 
 ### Clean Block Cache (S3-FIFO)
 
@@ -849,7 +842,7 @@ For production VMs: continuous flush bounds the loss to seconds.
 ### WAL Properties
 
 - Append-only file on local SSD. Sequential writes only — fast and predictable.
-- Each entry: `(export-name, offset, blake3_128_hash, raw_chunk_data)`. Self-contained for replay.
+- Each entry: `(export-name, chunk_index, blake3_128_hash, sequence)`. Metadata only — block data lives on the SSD cache file. On recovery, block data is re-read from SSD and re-hashed.
 - **The WAL is for local crash recovery only.** It bridges the gap between the last locally-persisted block map and the crash point. It is NOT the source of data for S3 flushes — that's the SSD cache + dirty flags in the block map.
 - Truncated after each local block map persistence (every ~5 seconds). Once the block map is persisted and block data is in the SSD cache, the WAL entries are redundant.
 - **WAL size is bounded by local persist interval, not S3 flush interval.** This is critical for demand-driven mode, where S3 flushes may be hours apart. The WAL doesn't accumulate across that window.
@@ -913,9 +906,9 @@ graph TB
 One path. No source tags, no routing:
 
 ```
-1. Dirty store     → hit? serve it  (~100ns, in-memory)
-2. Memory cache    → hit? serve it  (~100ns)
-3. SSD cache       → hit? serve it  (~100μs)
+1. Memory cache    → hit? serve it  (~100ns)
+2. SSD cache file  → dirty block? pread, serve it  (~μs from page cache, ~100μs from SSD)
+3. SSD cache       → clean block previously fetched? serve it  (~100μs)
 4. S3              → packs/{prefix}/{pack-id}  (10-50ms)
 ```
 
@@ -1177,7 +1170,7 @@ A pack is a batch of LZ4-compressed blocks stored as a single S3 object. Key: `p
 | **Flush Scheduler** | Controls when blocks go to S3 | Demand-driven (default) or continuous (production). Per-VM policy. |
 | **WAL** | Local crash recovery (bridges last ~5s before local persist) | Append-only on local SSD, sequence-numbered, truncated on persist |
 | **Block Map** | Ordered array of (hash, flags) per VM | 17 bytes/entry. Fork overlay for shared parents. Persisted locally (fast) + S3 (on flush). Sparse for unwritten regions. |
-| **Dirty Block Store** | Pinned storage for unflushed blocks | HashMap, no eviction. Blocks move to clean cache on S3 flush. |
+| **SSD Cache File** | Local storage for all written blocks | pwrite on write path, pread on read/flush path. OS page cache provides ~μs reads for hot blocks. Dirty blocks served from here — no separate in-memory store. |
 | **Dirty Set** | Track dirty block offsets | HashSet\<u64\>. O(1) insert on write, O(D) drain on flush. Avoids O(B) block map scan. |
 | **Memory Cache** | In-memory S3-FIFO, hot blocks | Configurable size, ~100ns reads, evicts to SSD tier. foyer library. |
 | **SSD Cache** | SSD-backed S3-FIFO, warm blocks | ~100μs reads, stores uncompressed, verified on ingestion. foyer library. |
@@ -1211,14 +1204,14 @@ K = pack_size (blocks per pack, default 25)
 | Operation | Time | Space | Bottleneck? | Notes |
 |-----------|------|-------|-------------|-------|
 | **Read: block map lookup** | O(1) | — | No | Array index or overlay HashMap + parent fallback |
-| **Read: dirty store check** | O(1) | — | No | HashMap lookup |
 | **Read: memory cache lookup** | O(1) | — | No | DashMap (foyer) |
-| **Read: SSD cache lookup** | O(1) | — | No | foyer |
+| **Read: SSD cache file (dirty)** | O(128KB) | — | No | pread + hash verify. Page cache for recent writes (~μs) |
+| **Read: SSD cache lookup (clean)** | O(1) | — | No | foyer |
 | **Read: S3 fetch (cache miss)** | O(K) | O(K) | No | Fetch 1 pack, decompress + cache 25 blocks |
 | **Read: BLAKE3 verify** | O(128KB) | — | No | ~5μs, constant |
 | **Write: BLAKE3 hash** | O(128KB) | — | No | ~5μs, constant |
 | **Write: WAL append** | O(128KB) | — | No | Sequential, ~20μs |
-| **Write: cache insert** | O(1) | O(128KB) | No | Dirty store + memory cache |
+| **Write: SSD pwrite** | O(128KB) | — | No | Positional write to cache file, ~20μs |
 | **Write: block map update** | O(1) | — | No | Array index or overlay insert |
 | **Write: dirty set insert** | O(1) | — | No | Track dirty offsets for flush |
 
@@ -1231,7 +1224,7 @@ K = pack_size (blocks per pack, default 25)
 | **Collect dirty blocks** | O(D) | O(D) | **Fixed** | Dirty set, not block map scan (see below) |
 | **Host pack index dedup** | O(D) | — | No | D lookups in DashMap, O(1) each |
 | **Read from SSD cache** | O(D') | — | No | D' = blocks after dedup, D' ≤ D |
-| **BLAKE3 hash (if re-verify)** | O(D' × 128KB) | — | No | Optional integrity check |
+| **BLAKE3 hash + verify** | O(D' × 128KB) | — | No | Hash verify on SSD read, detects concurrent writes |
 | **LZ4 compress** | O(D' × 128KB) | O(D' × 128KB) | No | ~1GB/s, negligible |
 | **S3 PUT (packs)** | O(D'/K) | — | No | Network-bound, not CPU |
 | **Host pack index update** | O(D') | — | No | DashMap inserts |
@@ -1282,14 +1275,14 @@ The doc said "scan block map for dirty entries" — that's O(B) per flush, scann
 | Structure | Size | Bounded by | Growth pattern |
 |-----------|------|-----------|---------------|
 | **Block maps** | O(V × B) | VM count × disk size | Static per VM. Fork overlay reduces by ~95%. |
-| **Dirty block store** | O(Σ dirty blocks) | Per-VM budget (default 5GB) | Bounded. Forced partial flush at budget. |
+| **SSD cache file** | O(device_size) per VM | Pre-allocated | Positional. No growth — fixed at device size. Dirty blocks live here. |
 | **Memory cache** | Configured | `memory_cache_gb` setting | Fixed. Eviction handles pressure. |
 | **SSD cache** | Configured | Available SSD | Fixed. Eviction handles pressure. |
 | **WAL** | O(write_rate × 5s) | Persist interval | Truncated every ~5s. ~1.4GB worst case. |
 | **Host pack index** | O(unique blocks on host) | VM count × data per VM | Rebuilt on lifecycle events. |
 | **Sequential detector** | O(V) | VM count | Ring buffer per VM. Negligible. |
 
-**Dirty block store is bounded.** Each VM has a dirty block budget (default 5GB). When exceeded, the daemon flushes the oldest dirty blocks to S3 — even in demand-driven mode. At 50 VMs, worst-case aggregate dirty data is 50 × 5GB = 250GB, well within SSD capacity on a 2TB NVMe host.
+**No in-memory dirty block accumulation.** Dirty block data lives on the SSD cache file only. Memory usage for dirty tracking is O(dirty count × 25 bytes) in the block map — metadata only. The dirty budget bounds migration latency (flush cost), not memory.
 
 ### Fleet-Level Operations
 

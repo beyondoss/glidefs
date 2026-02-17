@@ -15,7 +15,6 @@ use super::error::{NBDError, Result};
 use super::handler::{NBDBlockHandler, NBDDevice};
 use super::protocol::*;
 use super::router::ExportRouter;
-use crate::config::ExportConfig;
 use bytes::{Bytes, BytesMut};
 use deku::prelude::*;
 use std::net::SocketAddr;
@@ -452,51 +451,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         debug!("GO option for export: '{}'", export_name);
 
-        // Look up handler, auto-create if enabled and not found
+        // Look up handler
         let handler = match self.router.get_handler(&export_name).await {
             Some(h) => h,
             None => {
-                // Check if auto-create is enabled
-                if let Some(size_gb) = self.router.auto_create_size_gb() {
-                    info!(
-                        "Auto-creating export '{}' with size {}GB",
-                        export_name, size_gb
-                    );
-                    let config = ExportConfig {
-                        name: export_name.clone(),
-                        size_gb,
-                        s3_prefix: None,
-                        block_size: None,
-                        flush_mode: None,
-                        dirty_budget_gb: None,
-                    };
-
-                    if let Err(e) = self.router.create_export(config, false, None).await {
-                        warn!("Failed to auto-create export '{}': {}", export_name, e);
-                        self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
-                            .await?;
-                        self.writer.flush().await?;
-                        return Err(NBDError::DeviceNotFound(name_bytes.to_vec()));
-                    }
-
-                    // Now get the handler
-                    match self.router.get_handler(&export_name).await {
-                        Some(h) => h,
-                        None => {
-                            warn!("Export '{}' not found after auto-create", export_name);
-                            self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
-                                .await?;
-                            self.writer.flush().await?;
-                            return Err(NBDError::DeviceNotFound(name_bytes.to_vec()));
-                        }
-                    }
-                } else {
-                    warn!("Export '{}' not found", export_name);
-                    self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
-                        .await?;
-                    self.writer.flush().await?;
-                    return Err(NBDError::DeviceNotFound(name_bytes.to_vec()));
-                }
+                warn!("Export '{}' not found", export_name);
+                self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
+                    .await?;
+                self.writer.flush().await?;
+                return Err(NBDError::DeviceNotFound(name_bytes.to_vec()));
             }
         };
 

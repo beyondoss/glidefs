@@ -1,8 +1,8 @@
 use bytes::Bytes;
-use std::sync::atomic::Ordering;
 use tracing::{debug, instrument};
 
 use crate::nbd::block_map::blake3_128;
+use crate::nbd::cache::BlockCache;
 use crate::nbd::state::Active;
 use crate::nbd::wal::WalEntryRef;
 
@@ -20,8 +20,8 @@ impl WriteCache<Active> {
     /// - Clean → Dirty: increment dirty_count, push to queue, notify
     /// - Syncing → Dirty: decrement syncing_count, increment dirty_count, push to queue, notify
     /// - Dirty → Dirty: no-op
-    #[instrument(skip(self, data), fields(offset = offset, len = data.len()))]
-    pub fn write(&self, offset: u64, data: &[u8]) -> Result<(), CacheError> {
+    #[instrument(skip(self, data, clean_cache), fields(offset = offset, len = data.len()))]
+    pub fn write(&self, offset: u64, data: &[u8], clean_cache: &dyn BlockCache) -> Result<(), CacheError> {
         if offset + data.len() as u64 > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
                 offset + data.len() as u64,
@@ -31,16 +31,6 @@ impl WriteCache<Active> {
 
         if data.is_empty() {
             return Ok(());
-        }
-
-        // Backpressure: reject writes when dirty bytes exceed 2x the flush budget.
-        // The budget trigger wakes the flush scheduler, but this hard cap prevents
-        // unbounded dirty_store memory growth if flushes can't keep up with write rate.
-        if self.inner.config.dirty_budget_bytes > 0 {
-            let hard_cap = self.inner.config.dirty_budget_bytes.saturating_mul(2);
-            if self.inner.dirty_bytes.load(Ordering::Relaxed) > hard_cap {
-                return Err(CacheError::DirtyBudgetExceeded);
-            }
         }
 
         // Calculate affected blocks
@@ -119,8 +109,9 @@ impl WriteCache<Active> {
                 };
                 self.inner.wal.lock().append(&wal_entry)?;
 
-                // Dirty store insert (Mutex, uncontended)
-                self.inner.dirty_store.lock().insert(hash, Bytes::copy_from_slice(&chunk_buf));
+                // Insert into bounded clean cache for write-then-read performance.
+                // Evictable — SSD pread fallback catches misses.
+                clean_cache.insert(hash, Bytes::copy_from_slice(&chunk_buf));
             }
 
             // Flush WAL buffer (or fsync if wal_sync is enabled)
@@ -129,16 +120,6 @@ impl WriteCache<Active> {
                 wal.sync()?;
             } else {
                 wal.flush_buf()?;
-            }
-        }
-
-        // Budget enforcement — signal flush scheduler if over budget
-        if let Some(ref trigger) = self.inner.flush_trigger {
-            if self.inner.config.dirty_budget_bytes > 0 {
-                let current = self.inner.dirty_bytes.load(Ordering::Relaxed);
-                if current > self.inner.config.dirty_budget_bytes {
-                    trigger.notify_one();
-                }
             }
         }
 

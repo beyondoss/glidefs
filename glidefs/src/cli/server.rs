@@ -71,15 +71,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("NBD server configuration is required"))?;
 
-    // Create the export router
-    let auto_create_size_gb = nbd_config.auto_create_size_gb();
-    if let Some(size_gb) = auto_create_size_gb {
-        info!(
-            "Auto-create enabled: exports will be created on first NBD connect ({}GB default)",
-            size_gb
-        );
-    }
-
     // Shared clean block cache — foyer HybridCache with memory + SSD tiers
     let memory_bytes =
         (settings.cache.memory_size_gb.unwrap_or(1.0) * 1024.0 * 1024.0 * 1024.0) as usize;
@@ -108,9 +99,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         cache_dir,
         block_size: nbd_config.block_size(),
         blocks_per_batch: nbd_config.blocks_per_batch(),
-        sync_delay_ms: nbd_config.sync_delay_ms(),
-        dirty_budget_gb: nbd_config.dirty_budget_gb(),
-        auto_create_size_gb,
         clean_cache,
         wal_sync: nbd_config.wal_sync(),
     }));
@@ -142,9 +130,9 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     // Load static exports from config (can add new exports or override discovered ones)
     let exports = nbd_config.get_exports();
-    if exports.is_empty() && auto_create_size_gb.is_none() && discovered_count == 0 {
+    if exports.is_empty() && discovered_count == 0 {
         return Err(anyhow::anyhow!(
-            "No exports configured or discovered. Add exports to your config file, enable auto_create_size_gb, or use the API to create them."
+            "No exports configured or discovered. Add exports to your config file or use the API to create them."
         ));
     }
 
