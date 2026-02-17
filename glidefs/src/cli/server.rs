@@ -97,17 +97,17 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         .context("Failed to open foyer clean cache")?,
     );
 
-    let router = Arc::new(ExportRouter::new(
-        Arc::clone(&object_store),
+    let router = Arc::new(ExportRouter::new(crate::nbd::router::RouterConfig {
+        object_store: Arc::clone(&object_store),
         db_path,
         cache_dir,
-        nbd_config.block_size(),
-        nbd_config.blocks_per_batch(),
-        nbd_config.sync_delay_ms(),
-        nbd_config.dirty_budget_gb(),
+        block_size: nbd_config.block_size(),
+        blocks_per_batch: nbd_config.blocks_per_batch(),
+        sync_delay_ms: nbd_config.sync_delay_ms(),
+        dirty_budget_gb: nbd_config.dirty_budget_gb(),
         auto_create_size_gb,
         clean_cache,
-    ));
+    }));
 
     // Discover exports from S3 (recovers exports created via API)
     info!("Discovering exports from S3...");

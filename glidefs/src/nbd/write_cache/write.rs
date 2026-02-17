@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use tracing::{debug, instrument};
 
 use crate::nbd::block_map::{blake3_128, ZERO_BLOCK_HASH};
-use crate::nbd::state::{Active, BlockState};
+use crate::nbd::state::Active;
 use crate::nbd::wal::WalEntryRef;
 
 use super::{CacheError, WriteCache};
@@ -63,58 +63,7 @@ impl WriteCache<Active> {
             if idx >= self.inner.num_blocks {
                 continue;
             }
-
-            // Block is already present (set above)
-
-            // CAS loop for state transition
-            loop {
-                let current = self.inner.block_states[idx].load(Ordering::Acquire);
-
-                if current == BlockState::Dirty as u8 {
-                    // Already dirty, nothing to do (already in queue)
-                    break;
-                }
-
-                if current == BlockState::Clean as u8 {
-                    // Clean → Dirty
-                    if self.inner.block_states[idx]
-                        .compare_exchange(
-                            current,
-                            BlockState::Dirty as u8,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        self.inner.dirty_bytes.fetch_add(block_size as u64, Ordering::Relaxed);
-
-                        break;
-                    }
-                    // CAS failed, retry
-                } else if current == BlockState::Syncing as u8 {
-                    // Syncing → Dirty (write during sync)
-                    if self.inner.block_states[idx]
-                        .compare_exchange(
-                            current,
-                            BlockState::Dirty as u8,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-                        self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        self.inner.dirty_bytes.fetch_add(block_size as u64, Ordering::Relaxed);
-
-                        break;
-                    }
-                    // CAS failed, retry
-                } else {
-                    // Unknown state, just break
-                    break;
-                }
-            }
+            self.inner.transition_to_dirty(idx);
         }
 
         // === v2: content-addressed updates ===
@@ -311,53 +260,8 @@ impl WriteCache<Active> {
             if idx >= self.inner.num_blocks {
                 continue;
             }
-
-            // Mark as present (atomic OR)
             self.inner.set_present(idx);
-
-            // CAS loop for state transition (same as write())
-            loop {
-                let current = self.inner.block_states[idx].load(Ordering::Acquire);
-
-                if current == BlockState::Dirty as u8 {
-                    break;
-                }
-
-                if current == BlockState::Clean as u8 {
-                    if self.inner.block_states[idx]
-                        .compare_exchange(
-                            current,
-                            BlockState::Dirty as u8,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        self.inner.dirty_bytes.fetch_add(self.inner.config.block_size as u64, Ordering::Relaxed);
-
-                        break;
-                    }
-                } else if current == BlockState::Syncing as u8 {
-                    if self.inner.block_states[idx]
-                        .compare_exchange(
-                            current,
-                            BlockState::Dirty as u8,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        self.inner.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-                        self.inner.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        self.inner.dirty_bytes.fetch_add(self.inner.config.block_size as u64, Ordering::Relaxed);
-
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
+            self.inner.transition_to_dirty(idx);
         }
     }
 }

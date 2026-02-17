@@ -119,6 +119,28 @@ impl ExportState {
     }
 }
 
+/// Configuration for the export router.
+pub struct RouterConfig {
+    /// S3/MinIO/etc backend
+    pub object_store: Arc<dyn ObjectStore>,
+    /// Base S3 path prefix
+    pub db_path: String,
+    /// Local cache directory
+    pub cache_dir: PathBuf,
+    /// Block size in bytes for all exports (default, can be overridden per-export)
+    pub block_size: usize,
+    /// Number of blocks per S3 batch
+    pub blocks_per_batch: u64,
+    /// Sync delay in milliseconds (time to coalesce writes before S3 upload)
+    pub sync_delay_ms: u64,
+    /// Dirty budget in GB per export (triggers flush when exceeded)
+    pub dirty_budget_gb: f64,
+    /// Auto-create size for on-demand export creation (None = disabled)
+    pub auto_create_size_gb: Option<f64>,
+    /// Shared block cache for decompressed block data
+    pub clean_cache: Arc<dyn BlockCache>,
+}
+
 /// Multi-tenant export router.
 ///
 /// Manages multiple NBD exports, each with independent storage and caching.
@@ -159,39 +181,19 @@ pub struct ExportRouter {
 
 impl ExportRouter {
     /// Create a new export router.
-    ///
-    /// # Arguments
-    /// * `object_store` - S3/MinIO/etc backend
-    /// * `db_path` - Base path prefix in object store
-    /// * `cache_dir` - Local directory for write cache
-    /// * `block_size` - Block size in bytes
-    /// * `blocks_per_batch` - Number of blocks per S3 batch object
-    /// * `sync_delay_ms` - Delay before syncing writes to S3
-    /// * `auto_create_size_gb` - Size for auto-created exports (None = disabled)
-    /// * `clean_cache` - Shared block cache for decompressed block data
-    pub fn new(
-        object_store: Arc<dyn ObjectStore>,
-        db_path: String,
-        cache_dir: PathBuf,
-        block_size: usize,
-        blocks_per_batch: u64,
-        sync_delay_ms: u64,
-        dirty_budget_gb: f64,
-        auto_create_size_gb: Option<f64>,
-        clean_cache: Arc<dyn BlockCache>,
-    ) -> Self {
+    pub fn new(config: RouterConfig) -> Self {
         Self {
             exports: RwLock::new(HashMap::new()),
-            object_store,
-            db_path,
-            cache_dir,
-            block_size,
-            blocks_per_batch,
-            sync_delay_ms,
-            dirty_budget_gb,
-            auto_create_size_gb,
+            object_store: config.object_store,
+            db_path: config.db_path,
+            cache_dir: config.cache_dir,
+            block_size: config.block_size,
+            blocks_per_batch: config.blocks_per_batch,
+            sync_delay_ms: config.sync_delay_ms,
+            dirty_budget_gb: config.dirty_budget_gb,
+            auto_create_size_gb: config.auto_create_size_gb,
             pack_index: Arc::new(HostPackIndex::new()),
-            clean_cache,
+            clean_cache: config.clean_cache,
         }
     }
 
@@ -854,17 +856,17 @@ impl ExportRouter {
         let temp_dir = std::env::temp_dir().join(format!("glidefs-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).expect("Failed to create test cache dir");
 
-        Self::new(
-            s3,
-            "test".to_string(),
-            temp_dir,
-            128 * 1024, // 128KB blocks
-            10,         // 10 blocks per batch
-            100,        // 100ms sync delay
-            5.0,        // 5GB dirty budget
-            None,       // No auto-create in tests
-            Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
-        )
+        Self::new(RouterConfig {
+            object_store: s3,
+            db_path: "test".to_string(),
+            cache_dir: temp_dir,
+            block_size: 128 * 1024,
+            blocks_per_batch: 10,
+            sync_delay_ms: 100,
+            dirty_budget_gb: 5.0,
+            auto_create_size_gb: None,
+            clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+        })
     }
 }
 
@@ -893,17 +895,17 @@ mod tests {
 
     fn create_test_router(temp_dir: &TempDir) -> ExportRouter {
         let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        ExportRouter::new(
-            s3,
-            "test".to_string(),
-            temp_dir.path().to_path_buf(),
-            128 * 1024, // 128KB blocks
-            10,         // 10 blocks per batch
-            100,        // 100ms sync delay
-            5.0,        // 5GB dirty budget
-            None,       // No auto-create in tests
-            Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
-        )
+        ExportRouter::new(RouterConfig {
+            object_store: s3,
+            db_path: "test".to_string(),
+            cache_dir: temp_dir.path().to_path_buf(),
+            block_size: 128 * 1024,
+            blocks_per_batch: 10,
+            sync_delay_ms: 100,
+            dirty_budget_gb: 5.0,
+            auto_create_size_gb: None,
+            clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+        })
     }
 
     fn test_export_config(name: &str) -> ExportConfig {

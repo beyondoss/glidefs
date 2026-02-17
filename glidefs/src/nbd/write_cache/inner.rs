@@ -258,6 +258,57 @@ impl CacheInner {
         self.present_chunks[chunk_idx].fetch_or(1u64 << bit_idx, Ordering::Release);
     }
 
+    /// CAS loop to transition a block to Dirty state (lock-free).
+    ///
+    /// Handles three source states:
+    /// - **Clean → Dirty**: increments dirty_block_count and dirty_bytes.
+    /// - **Syncing → Dirty**: decrements syncing_block_count, increments dirty_block_count and dirty_bytes.
+    /// - **Dirty → Dirty**: no-op.
+    #[inline]
+    pub(super) fn transition_to_dirty(&self, idx: usize) {
+        let block_size = self.config.block_size as u64;
+        loop {
+            let current = self.block_states[idx].load(Ordering::Acquire);
+
+            if current == BlockState::Dirty as u8 {
+                break;
+            }
+
+            if current == BlockState::Clean as u8 {
+                if self.block_states[idx]
+                    .compare_exchange(
+                        current,
+                        BlockState::Dirty as u8,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    self.dirty_bytes.fetch_add(block_size, Ordering::Relaxed);
+                    break;
+                }
+            } else if current == BlockState::Syncing as u8 {
+                if self.block_states[idx]
+                    .compare_exchange(
+                        current,
+                        BlockState::Dirty as u8,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    self.dirty_bytes.fetch_add(block_size, Ordering::Relaxed);
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Get a block map entry (takes read lock, effectively zero overhead).
     #[inline]
     pub(super) fn block_map_get(&self, chunk_index: usize) -> (Blake3Hash, u64) {

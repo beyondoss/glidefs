@@ -110,6 +110,7 @@ impl WriteCache<Active> {
         // 3. Dedup check + compress new blocks
         let zero_hash = *ZERO_BLOCK_HASH;
         let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
+        let mut seen_hashes = std::collections::HashSet::new();
 
         for &(_chunk_index, hash) in &snapshot {
             stats.blocks_flushed += 1;
@@ -122,6 +123,12 @@ impl WriteCache<Active> {
 
             // Skip blocks already in the host pack index (cross-VM dedup)
             if host_pack_index.contains(&hash) {
+                stats.blocks_deduped += 1;
+                continue;
+            }
+
+            // Skip duplicate hashes within this flush batch
+            if !seen_hashes.insert(hash) {
                 stats.blocks_deduped += 1;
                 continue;
             }
@@ -169,7 +176,18 @@ impl WriteCache<Active> {
             }
         }
 
-        // 5. Clear dirty state for blocks whose hash hasn't changed
+        // 5. Clear dirty state for blocks whose hash hasn't changed.
+        //
+        // Track which hashes still have dirty references so we only remove
+        // from the dirty store when the last block referencing that hash is
+        // cleaned. This prevents premature eviction when two chunks share
+        // the same content hash.
+        let mut dirty_hash_refs: std::collections::HashMap<Blake3Hash, usize> =
+            std::collections::HashMap::new();
+        for &(_, hash) in &snapshot {
+            *dirty_hash_refs.entry(hash).or_insert(0) += 1;
+        }
+
         for &(chunk_index, snapshot_hash) in &snapshot {
             let (current_hash, _seq) = self.inner.block_map_get(chunk_index);
             if current_hash == snapshot_hash {
@@ -187,18 +205,31 @@ impl WriteCache<Active> {
                     self.inner
                         .dirty_block_count
                         .fetch_sub(1, Ordering::Relaxed);
+                    self.inner
+                        .dirty_bytes
+                        .fetch_sub(chunk_size as u64, Ordering::Relaxed);
                 }
-                // Remove from dirty store (keyed by hash, so safe)
-                self.inner
-                    .dirty_store
-                    .lock()
-                    .unwrap()
-                    .remove(&snapshot_hash);
-                self.inner
-                    .dirty_bytes
-                    .fetch_sub(chunk_size as u64, Ordering::Relaxed);
+
+                // Decrement refcount for this hash
+                if let Some(count) = dirty_hash_refs.get_mut(&snapshot_hash) {
+                    *count -= 1;
+                    if *count == 0 {
+                        // Last block referencing this hash — safe to remove from dirty store
+                        self.inner
+                            .dirty_store
+                            .lock()
+                            .unwrap()
+                            .remove(&snapshot_hash);
+                    }
+                }
+            } else {
+                // Concurrent write produced a new hash — leave dirty for next flush.
+                // Also decrement refcount since this block no longer holds the old hash.
+                if let Some(count) = dirty_hash_refs.get_mut(&snapshot_hash) {
+                    *count -= 1;
+                    // Don't remove from dirty store — another block may still reference it
+                }
             }
-            // else: concurrent write produced a new hash — leave dirty for next flush
         }
 
         info!(

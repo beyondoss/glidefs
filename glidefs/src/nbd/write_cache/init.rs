@@ -26,6 +26,8 @@ impl WriteCache<Initializing> {
     /// * `config` - Cache configuration
     #[instrument(skip(config), fields(device = %config.device_name))]
     pub fn open(config: WriteCacheConfig) -> Result<WriteCache<Recovering>, CacheError> {
+        config.validate()?;
+
         // Ensure cache directory exists
         std::fs::create_dir_all(&config.cache_dir)?;
 
@@ -196,6 +198,7 @@ impl WriteCache<Initializing> {
         manifest: &Manifest,
         parent_block_map: Option<Arc<BlockMap>>,
     ) -> Result<WriteCache<Active>, CacheError> {
+        config.validate()?;
         std::fs::create_dir_all(&config.cache_dir)?;
 
         let data_file = super::inner::SyncFile::open(&config.data_path(), true, config.device_size)?;
