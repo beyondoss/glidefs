@@ -180,10 +180,16 @@ const HASH_PAGE_MASK: usize = HASH_PAGE_SIZE - 1;
 ///
 /// AoS layout keeps all fields for one chunk in the same cache line, which is
 /// better for the SeqLock pattern (version + data are read together).
+///
+/// The `crc32` field stores a CRC32 checksum of the block's SSD data, computed
+/// at checkpoint time (background, every ~5s) for dirty blocks. It is verified
+/// at flush time before BLAKE3 to detect SSD corruption before it gets
+/// laundered into S3. The field is independent of the SeqLock — it uses plain
+/// atomic loads/stores and is cleared to 0 on every write.
 #[repr(C)]
 struct HashEntry {
     version: AtomicU32,
-    _pad: u32,
+    crc32: AtomicU32,
     hash_lo: AtomicU64,
     hash_hi: AtomicU64,
     sequence: AtomicU64,

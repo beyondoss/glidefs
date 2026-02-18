@@ -246,13 +246,18 @@ impl ExportRouter {
             None
         };
 
+        let pack_index = Arc::new(
+            HostPackIndex::open(config.cache_dir.join("pack_index.redb"))
+                .expect("failed to open pack_index.redb"),
+        );
+
         Self {
             exports: RwLock::new(HashMap::new()),
             object_store: config.object_store,
             db_path: config.db_path,
             cache_dir: config.cache_dir,
             block_size: config.block_size,
-            pack_index: Arc::new(HostPackIndex::new()),
+            pack_index,
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
             scrubber_metrics: Arc::new(crate::nbd::scrubber::ScrubberMetrics::new()),
@@ -567,16 +572,14 @@ impl ExportRouter {
                 .map_err(|e| RouterError::Manifest(format!("invalid manifest: {}", e)))?;
 
             // Populate pack index from manifest entries
-            for entry in &manifest.pack_index {
-                pack_index.insert(
-                    entry.hash,
-                    PackLocation {
-                        pack_id: entry.pack_id,
-                        offset: entry.offset,
-                        comp_length: entry.comp_length,
-                    },
-                );
-            }
+            let batch: Vec<_> = manifest.pack_index.iter().map(|entry| {
+                (entry.hash, PackLocation {
+                    pack_id: entry.pack_id,
+                    offset: entry.offset,
+                    comp_length: entry.comp_length,
+                })
+            }).collect();
+            pack_index.insert_batch(&batch);
 
             info!(
                 "Loaded manifest '{}': {} block entries, {} pack entries, seq={}",

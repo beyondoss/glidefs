@@ -47,8 +47,8 @@ WriteCache ──► AtomicBlockMap lookup
               │           └─ miss ▼
               │
               ├── Tier 3: S3 pack fetch                       50-300ms
-              │           ├─ HostPackIndex lookup (hash → pack location)
-              │           ├─ ContentStore::get_block() (S3 range GET)
+              │           ├─ HostPackIndex lookup (redb, hash → pack location)
+              │           ├─ ContentStore::get_block() (S3 range GET, semaphore-gated)
               │           ├─ LZ4 decompress
               │           ├─ Verify BLAKE3 hash
               │           ├─ Insert into CleanCache
@@ -80,10 +80,10 @@ Batch into packs (25 blocks × 128KB = ~3.2MB)
     │
     ├──► LZ4 compress each block
     ├──► Assemble pack (GLPK header + index + data)
-    └──► ContentStore::put_pack() ──► S3 PUT (concurrent via try_join_all)
+    └──► ContentStore::put_pack() ──► S3 PUT (concurrent, semaphore-gated)
               │
               ▼
-        HostPackIndex.insert(hash → pack location)
+        HostPackIndex.insert_batch(hash → pack location)
               │
               ▼
         CAS-clear Dirty flags (only if sequence unchanged since snapshot)
@@ -101,7 +101,7 @@ Batch into packs (25 blocks × 128KB = ~3.2MB)
 | Pack | S3 object containing up to 25 LZ4-compressed blocks with a self-describing index | Not a single block per S3 object |
 | Manifest | Binary snapshot of an export's block map + pack index, stored in S3 | Not a log — it's a point-in-time image |
 | Block Map | Per-chunk metadata: BLAKE3-128 hash, dirty flag, sequence number | Not the data itself |
-| Pack Index | Host-level hash→pack location mapping for content-addressed lookups. Pruned on export removal to bound memory to active exports. | Not per-export — shared across all exports on a host |
+| Pack Index | Host-level hash→pack location mapping for content-addressed lookups. Backed by redb (disk-resident, not RAM). Pruned on export removal to bound size to active exports. | Not per-export — shared across all exports on a host |
 | Drain | Flush all dirty blocks to S3 so the export can be stopped or migrated | Not a delete — S3 data is preserved |
 | Clean Cache | Read-through Foyer HybridCache (memory + SSD tiers) for blocks fetched from S3 | Not the write cache (dirty blocks on local SSD) |
 | Circuit Breaker | Lock-free S3 failure detector that fast-fails requests during outages | Not a retry mechanism — it prevents retries |
@@ -496,13 +496,19 @@ None of this work is needed until flush time. With deferred hashing, the write p
 
 The read path distinguishes ZERO-placeholder from never-written using the **state map**: ZERO hash + state != NotPresent = deferred hash (SSD pread), ZERO hash + NotPresent = never written (return zeros).
 
-### Why the HostPackIndex is not persisted
+### Why redb for the HostPackIndex?
 
-The `HostPackIndex` (DashMap mapping BLAKE3 hash → S3 pack location) is an in-memory structure that starts **empty** on process restart. It is not rebuilt from manifests.
+The `HostPackIndex` maps BLAKE3 hash → S3 pack location. It's the cross-export dedup index — shared across all exports on a host. Every `get()` is followed by a 5-50ms S3 fetch, so microsecond lookup latency from an embedded database is fine.
 
-On cold start, `discover_exports()` scans S3 for `export.json` files, then each export is created with `manifest_name: None` — the normal `WriteCache::open()` path. This loads the block map (with hashes) and state map from local `.meta`/`.blockmap` files and replays the WAL. The pack index is not populated.
+Previously this was an in-memory `DashMap` that grew unbounded with total unique blocks across all VMs. For 5,000 VMs with 100K unique blocks each, that's 500M entries × ~56 bytes = ~28GB of RAM just for the dedup index. Moving to redb puts this on disk where it belongs.
 
-**Why this is safe**: the read tier resolution has a fallback chain:
+**Why redb specifically**: (1) already in our stack elsewhere, (2) embedded — no server to manage, (3) supports concurrent read transactions with single writer, (4) mmap-based — OS page cache handles hot entries transparently.
+
+**Durability**: `Durability::None` — the pack index is derived data, rebuildable from S3 manifests via `rebuild()`. No fsync overhead.
+
+**Batch inserts**: `insert_batch()` groups entries into a single write transaction. Flush, fork, and bless all produce entries in batches — one transaction per batch instead of per-entry.
+
+**On cold start**: the redb file persists at `{cache_dir}/pack_index.redb`. If present, entries survive restart — no need to rebuild from manifests. If the file is deleted or corrupted, the index starts empty and repopulates lazily as the flush scheduler runs. The read path has a fallback chain that handles missing entries:
 
 ```
 block_map_get(hash)
@@ -510,17 +516,13 @@ block_map_get(hash)
   ├─ ZERO + not present → return zeros
   ├─ zero_block_hash    → return zeros
   ├─ clean_cache hit    → return cached
-  ├─ pack_index hit     → S3 range GET  ← empty after restart
+  ├─ pack_index hit     → S3 range GET  ← redb lookup (~µs)
   └─ SSD pread fallback → local block   ← catches everything else
 ```
 
-After flush, blocks transition `DIRTY → CLEAN` but **remain on the SSD data file** — blocks are never evicted from their slot. So after restart, CLEAN blocks with known hashes but no pack_index entry fall through to Tier 3 (SSD pread), which is actually *faster* (~µs) than an S3 fetch (~50ms).
+After flush, blocks transition `DIRTY → CLEAN` but **remain on the SSD data file** — blocks are never evicted from their slot. So CLEAN blocks with known hashes but no pack_index entry fall through to Tier 4 (SSD pread), which is actually *faster* (~µs) than an S3 fetch (~50ms).
 
-The pack index repopulates lazily as the flush scheduler runs and uploads new packs via `pack_index.insert()`. Previously-flushed CLEAN blocks that are never re-dirtied never re-enter the index — they serve reads from local SSD indefinitely.
-
-**Cold-start cost at 2,000 VMs**: one S3 LIST call, then per-export local I/O to load `.meta` + `.blockmap` + WAL replay + `finish_recovery()` (re-hash dirty blocks). With ~100 dirty blocks per export at 128KB, that's ~25GB of I/O — bounded by NVMe throughput, not S3. No manifest scan, no index rebuild.
-
-**Known gap**: see "SSD failure after flush" in Failure Modes below.
+**Required for fork correctness**: forked exports have blocks that exist only in S3 (inherited from the parent). These blocks have no local SSD data — the pread fallback would return zeros, causing silent data corruption. The pack index entry is the only path to the S3 pack. This is why `prune_unreferenced()` must be careful: it only prunes entries not referenced by any active export's manifest.
 
 Sequence numbers replace hashes as the race detection token in flush. There is a narrow TOCTOU window between checking the sequence and doing the CAS (nanoseconds), identical to the previous hash-based approach and self-healing.
 
@@ -566,6 +568,21 @@ We considered `RwLock` but rejected it: even uncontended lock/unlock has ~25ns o
 
 **C11 memory ordering**: The writer stores data fields with `Release` ordering, not `Relaxed`. Under the C11 model (which matters on ARM/Graviton), a `Relaxed` data store can be observed by a reader via a `Relaxed` load without establishing any happens-before relationship — the reader's subsequent `Relaxed` v2 load might miss the writer's version change entirely, producing a torn read. With `Release` data stores, the reader's `Acquire` fence (between data loads and v2 load) synchronizes-with the observed Release, making the writer's odd version visible to v2 and forcing a retry. Loom tests exhaustively verify this property. SeqLock is single-writer by design; concurrent writers break the version parity invariant.
 
+### S3 Concurrency Limits
+
+With 5,000 VMs on a single host, unbounded S3 concurrency is a problem. Each export's flush can upload multiple packs concurrently, and each cache miss triggers an S3 GET. In the worst case: 5,000 VMs × 25 packs = 125K concurrent uploads, or 5,000 × 256 in-flight NBD reads = 1.28M concurrent GETs.
+
+Two host-level `tokio::Semaphore`s bound this — one for uploads (background flush), one for downloads (read path). The semaphores live on `ExportRouter` and are shared (via `Arc`) to every `ContentStore` instance. This is a global gate, not per-export.
+
+| Semaphore | Default | Rationale |
+|-----------|---------|-----------|
+| `max_s3_uploads` | 128 | Background flush is not latency-sensitive; caps inflight PUTs |
+| `max_s3_downloads` | 512 | Read path is latency-sensitive (NBD client waiting); higher limit |
+
+Set to 0 for unlimited (tests use this). Permit is acquired before the S3 call and held for the duration of the request. For streaming downloads (`get_pack_stream`), the permit is held until the stream is fully consumed.
+
+(`content_store.rs`, `router.rs`, `config.rs`)
+
 ### SSD Backpressure
 
 The local SSD is the one resource without explicit bounds — every other critical resource has backpressure (memory: page budget, S3: circuit breaker, Foyer: size limits). With 2000 sparse cache files on a 100GB SSD, physical space can be exhausted. A background capacity monitor polls `statvfs` every 5 seconds and takes escalating action:
@@ -600,7 +617,7 @@ The 5µs write path is never touched — the monitor only adjusts background flu
 | `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
 | `nbd/state.rs` | `BlockState` enum + sealed typestate markers (`Initializing`, `Active`, etc.) |
 | `nbd/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
-| `nbd/pack_index.rs` | `HostPackIndex`: `DashMap<Blake3Hash, PackLocation>` for cross-export dedup |
+| `nbd/pack_index.rs` | `HostPackIndex`: redb-backed `Blake3Hash → PackLocation` index for cross-export dedup |
 | `nbd/pack_registry.rs` | Per-export pack ID tracking for garbage collection |
 | `nbd/capacity_monitor.rs` | SSD capacity monitor: `statvfs` polling, flush backpressure escalation/recovery |
 | `nbd/content_store.rs` | S3 PUT/GET for packs and manifests via `object_store` crate |
@@ -642,6 +659,8 @@ url = "s3://my-bucket/vms"    # Also: gs://, az://, file://, memory://
 [servers.nbd]
 unix_socket = "/var/run/glidefs.sock"
 api_address = "127.0.0.1:8080"
+max_s3_uploads = 128             # Global S3 PUT concurrency (0 = unlimited)
+max_s3_downloads = 512            # Global S3 GET concurrency (0 = unlimited)
 
 [[servers.nbd.exports]]
 name = "vm-prod-1"
@@ -666,6 +685,8 @@ Supported storage backends: **Amazon S3** (`s3://`), **Google Cloud Storage** (`
 | `connect_timeout_secs` | 10 | S3 connection timeout |
 | `request_timeout_secs` | 300 | S3 request timeout (large packs take time) |
 | `shutdown_timeout_secs` | 30 | Grace period for drain on SIGTERM |
+| `max_s3_uploads` | 128 | Global S3 PUT concurrency limit (0 = unlimited) |
+| `max_s3_downloads` | 512 | Global S3 GET concurrency limit (0 = unlimited) |
 | `wal_sync` | false | fsync WAL per batch; true = slower but crash-safe metadata |
 
 ## Flush Modes
@@ -702,7 +723,7 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 |-----------|-------------------|-----------------|--------|-------|
 | `AtomicBlockMap` directory | ~512 KB | 4 KB per 128 blocks written | — | 32 bytes/entry × 128 entries/page |
 | `SparseStateMap` directory | ~16 KB | 4 KB per 4096 blocks written | — | 1 byte/entry × 4096 entries/page |
-| `HostPackIndex` | — | — | ~56 bytes/unique hash | DashMap, pruned on export removal |
+| `HostPackIndex` | — | — | ~40 bytes/unique hash (on disk) | redb, disk-resident, pruned on export removal |
 | `CleanCache` (memory) | — | — | `memory_size_gb` | Configured, default 1GB |
 | `CleanCache` (SSD) | — | — | `ssd_cache_size_gb` | Configured, default 10GB |
 
@@ -733,13 +754,13 @@ Each export's page tables share an `Arc<AtomicUsize>` budget counter. Page alloc
 | S3 sustained outage | Circuit breaker opens | Reads from local SSD continue; writes accumulate locally; breaker probes S3 every 30s |
 | Metadata budget exhaustion | `ENOSPC` to guest | Guest sees write failure; existing data intact; flush frees budget by clearing dirty blocks |
 | Local SSD full | `ENOSPC` to guest (NBD_ENOSPC, not EIO) | Capacity monitor escalates flush → Continuous(2s/10s); dirty blocks drain to S3, freeing physical space |
-| SSD failure after flush | **Data loss for CLEAN blocks** | Blocks in CLEAN state have known hashes in the block map but the pack index is empty (not persisted) and the SSD data is gone. Tier 3 pread returns errors or garbage — no fallback to S3 because the hash→pack location mapping is lost. Recreate VM from base image or last manifest. **Mitigation**: the risk window is narrow (SSD must fail between last flush and next restart), and the workload is ephemeral VMs. A future fix could attempt manifest-based pack index reconstruction on Tier 3 read failure. |
+| SSD failure after flush | **Data loss for CLEAN blocks without pack index entries** | Blocks in CLEAN state have known hashes in the block map. If the pack index (redb on SSD) is also lost, the hash→pack location mapping is gone — no fallback to S3. Recreate VM from base image or last manifest. **Mitigation**: pack index entries for previously-flushed blocks persist in redb across restarts, so the risk window is limited to entries not yet committed. For forked exports, all entries are populated on fork creation. |
 
 ## Testing
 
 | Suite | Command | Count | What It Covers |
 |-------|---------|-------|----------------|
-| Unit | `cargo test --features test-utils --lib` | ~307 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables |
+| Unit | `cargo test --features test-utils --lib` | ~315 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables |
 | Integration | `cargo test --features test-utils --test integration` | ~46 | Crash recovery, concurrent writes, flush consistency (no Docker) |
 | Docker | `cargo test --features docker-tests --test docker_integration` | ~9 | Real S3 via MinIO (testcontainers-rs), end-to-end pack upload/download |
 | Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free algorithms (AtomicBlockMap, SeqLock) |

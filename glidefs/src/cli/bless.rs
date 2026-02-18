@@ -49,7 +49,9 @@ pub async fn run_bless(
     info!(image = %image_path.display(), name = %name, chunk_size, "starting bless");
 
     // --- Load existing base manifests for cross-image dedup ---
-    let pack_index = HostPackIndex::new();
+    let pack_index_dir = tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
+    let pack_index = HostPackIndex::open(pack_index_dir.path().join("pack_index.redb"))
+        .context("Failed to open pack index")?;
     let base_names = content_store.list_base_manifests().await?;
     if !base_names.is_empty() {
         info!(count = base_names.len(), "loading existing base manifests for dedup");
@@ -225,16 +227,14 @@ async fn upload_pack(
         .await
         .context("Failed to upload pack")?;
 
-    for entry in &index_entries {
-        pack_index.insert(
-            entry.hash,
-            PackLocation {
-                pack_id,
-                offset: entry.offset,
-                comp_length: entry.comp_length,
-            },
-        );
-    }
+    let pi_entries: Vec<_> = index_entries.iter().map(|entry| {
+        (entry.hash, PackLocation {
+            pack_id,
+            offset: entry.offset,
+            comp_length: entry.comp_length,
+        })
+    }).collect();
+    pack_index.insert_batch(&pi_entries);
 
     stats.packs_uploaded += 1;
     stats.bytes_uploaded += pack_size;
@@ -272,7 +272,9 @@ mod tests {
         image_data: &[u8],
         chunk_size: u32,
     ) -> Result<BlessStats> {
-        let pack_index = HostPackIndex::new();
+        let pack_index_dir = tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
+        let pack_index = HostPackIndex::open(pack_index_dir.path().join("pack_index.redb"))
+            .context("Failed to open pack index")?;
 
         // Load existing base manifests for dedup
         let base_names = content_store.list_base_manifests().await?;

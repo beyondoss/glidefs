@@ -150,7 +150,7 @@ impl V2Harness {
         };
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = crate::nbd::content_store::ContentStore::new(object_store, "test-bucket");
-        let pack_index = crate::nbd::pack_index::HostPackIndex::new();
+        let pack_index = crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap();
         let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
@@ -994,7 +994,7 @@ async fn test_concurrent_flush_and_writes() {
         Arc::clone(&object_store),
         "test-conc",
     ));
-    let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::new());
+    let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap());
     let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
@@ -1263,7 +1263,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
         Arc::clone(&object_store),
         "test-converge",
     ));
-    let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::new());
+    let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap());
     let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();

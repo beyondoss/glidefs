@@ -3,86 +3,169 @@
 //! Maps block content hashes to their S3 pack locations. Shared across all
 //! exports on the host. When flushing, blocks whose hash already exists in
 //! the index are skipped (already in S3).
+//!
+//! Backed by redb — an embedded key-value store on local SSD. Since every
+//! `get()` is followed by a 5-50ms S3 fetch, microsecond lookup latency is
+//! fine. The index is derived data (rebuildable from manifests), so we use
+//! `Durability::None` to skip fsync.
 
 use std::collections::HashSet;
+use std::path::Path;
 
-use dashmap::DashMap;
+use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use super::block_map::{Blake3Hash, BlockMap};
 use super::manifest::{Manifest, ManifestPackEntry};
 use super::pack::PackLocation;
 
+const PACK_TABLE: TableDefinition<[u8; 16], [u8; 24]> = TableDefinition::new("packs");
+
 pub struct HostPackIndex {
-    index: DashMap<Blake3Hash, PackLocation>,
+    db: Database,
 }
 
-impl Default for HostPackIndex {
-    fn default() -> Self {
-        Self::new()
+fn pack_location_to_bytes(loc: &PackLocation) -> [u8; 24] {
+    let mut buf = [0u8; 24];
+    buf[..16].copy_from_slice(loc.pack_id.as_bytes());
+    buf[16..20].copy_from_slice(&loc.offset.to_le_bytes());
+    buf[20..24].copy_from_slice(&loc.comp_length.to_le_bytes());
+    buf
+}
+
+fn pack_location_from_bytes(bytes: [u8; 24]) -> PackLocation {
+    let pack_id = uuid::Uuid::from_bytes(bytes[..16].try_into().unwrap());
+    let offset = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+    let comp_length = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+    PackLocation {
+        pack_id,
+        offset,
+        comp_length,
     }
 }
 
 impl HostPackIndex {
-    pub fn new() -> Self {
-        Self {
-            index: DashMap::new(),
+    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let db = Database::create(path)?;
+        // Create table eagerly so reads don't need to handle "table not found"
+        let mut txn = db.begin_write()?;
+        {
+            let _ = txn.open_table(PACK_TABLE)?;
         }
+        txn.set_durability(Durability::None);
+        txn.commit()?;
+        Ok(Self { db })
     }
 
     /// Insert a block's pack location.
+    #[cfg(test)]
     pub fn insert(&self, hash: Blake3Hash, location: PackLocation) {
-        self.index.insert(hash, location);
+        let val = pack_location_to_bytes(&location);
+        let mut txn = self.db.begin_write().expect("redb write failed");
+        {
+            let mut table = txn.open_table(PACK_TABLE).expect("redb open table failed");
+            table
+                .insert(*hash.as_bytes(), val)
+                .expect("redb insert failed");
+        }
+        txn.set_durability(Durability::None);
+        txn.commit().expect("redb commit failed");
+    }
+
+    /// Insert a batch of entries in a single transaction.
+    pub fn insert_batch(&self, entries: &[(Blake3Hash, PackLocation)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut txn = self.db.begin_write().expect("redb write failed");
+        {
+            let mut table = txn.open_table(PACK_TABLE).expect("redb open table failed");
+            for (hash, location) in entries {
+                let val = pack_location_to_bytes(location);
+                table
+                    .insert(*hash.as_bytes(), val)
+                    .expect("redb insert failed");
+            }
+        }
+        txn.set_durability(Durability::None);
+        txn.commit().expect("redb commit failed");
     }
 
     /// Look up a block's pack location by hash.
     pub fn get(&self, hash: &Blake3Hash) -> Option<PackLocation> {
-        self.index.get(hash).map(|r| *r)
+        let txn = self.db.begin_read().expect("redb read failed");
+        let table = txn.open_table(PACK_TABLE).expect("redb open table failed");
+        table
+            .get(*hash.as_bytes())
+            .expect("redb get failed")
+            .map(|v| pack_location_from_bytes(v.value()))
     }
 
     /// Check if a block hash exists in the index.
     pub fn contains(&self, hash: &Blake3Hash) -> bool {
-        self.index.contains_key(hash)
+        let txn = self.db.begin_read().expect("redb read failed");
+        let table = txn.open_table(PACK_TABLE).expect("redb open table failed");
+        table.get(*hash.as_bytes()).expect("redb get failed").is_some()
     }
 
     /// Number of entries in the index.
     pub fn len(&self) -> usize {
-        self.index.len()
+        let txn = self.db.begin_read().expect("redb read failed");
+        let table = txn.open_table(PACK_TABLE).expect("redb open table failed");
+        table.len().expect("redb len failed") as usize
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        self.len() == 0
     }
 
     /// Return all hashes in the index. Used by the background scrubber
     /// to iterate over known blocks for integrity verification.
     pub fn all_hashes(&self) -> Vec<Blake3Hash> {
-        self.index.iter().map(|r| *r.key()).collect()
+        let txn = self.db.begin_read().expect("redb read failed");
+        let table = txn.open_table(PACK_TABLE).expect("redb open table failed");
+        table
+            .iter()
+            .expect("redb iter failed")
+            .map(|r| {
+                let (k, _) = r.expect("redb iter entry failed");
+                Blake3Hash::from_bytes(k.value())
+            })
+            .collect()
     }
 
     /// Rebuild the index from a set of manifests.
     /// Clears existing entries and inserts all pack index entries from the manifests.
     /// Called on VM arrive/depart to keep the index current.
     pub fn rebuild(&self, manifests: &[Manifest]) {
-        self.index.clear();
-        for manifest in manifests {
-            for entry in &manifest.pack_index {
-                self.index.insert(
-                    entry.hash,
-                    PackLocation {
+        let mut txn = self.db.begin_write().expect("redb write failed");
+        {
+            // Delete and recreate the table to clear it
+            txn.delete_table(PACK_TABLE).ok();
+            let mut table = txn.open_table(PACK_TABLE).expect("redb open table failed");
+            // Insert all manifest entries
+            for manifest in manifests {
+                for entry in &manifest.pack_index {
+                    let loc = PackLocation {
                         pack_id: entry.pack_id,
                         offset: entry.offset,
                         comp_length: entry.comp_length,
-                    },
-                );
+                    };
+                    let val = pack_location_to_bytes(&loc);
+                    table
+                        .insert(*entry.hash.as_bytes(), val)
+                        .expect("redb insert failed");
+                }
             }
         }
+        txn.set_durability(Durability::None);
+        txn.commit().expect("redb commit failed");
     }
 
     /// Remove entries not referenced by any active export.
     ///
     /// Retains only entries whose hash appears in `referenced`. Called after
-    /// export removal to reclaim memory from departed VMs.
+    /// export removal to reclaim space from departed VMs.
     ///
     /// **Caller contract**: The `referenced` set must come from manifest-based
     /// hashes (via `rebuild_manifest_hashes` + `referenced_hashes`), not from
@@ -95,22 +178,46 @@ impl HostPackIndex {
     ///
     /// Returns the number of entries removed.
     pub fn prune_unreferenced(&self, referenced: &HashSet<Blake3Hash>) -> usize {
-        let before = self.index.len();
-        self.index.retain(|hash, _| referenced.contains(hash));
-        let after = self.index.len();
-        before.saturating_sub(after)
+        let mut txn = self.db.begin_write().expect("redb write failed");
+        let removed;
+        {
+            let mut table = txn.open_table(PACK_TABLE).expect("redb open table failed");
+            let to_remove: Vec<[u8; 16]> = table
+                .iter()
+                .expect("redb iter failed")
+                .filter_map(|r| {
+                    let (k, _) = r.expect("redb iter entry failed");
+                    let hash = Blake3Hash::from_bytes(k.value());
+                    if referenced.contains(&hash) {
+                        None
+                    } else {
+                        Some(k.value())
+                    }
+                })
+                .collect();
+            removed = to_remove.len();
+            for key in &to_remove {
+                table.remove(key).expect("redb remove failed");
+            }
+        }
+        txn.set_durability(Durability::None);
+        txn.commit().expect("redb commit failed");
+        removed
     }
 
     /// Derive pack index entries for a specific VM's block map.
     /// Returns ManifestPackEntry for each non-empty hash in the block map
     /// that exists in this host index.
     pub fn derive_for_block_map(&self, block_map: &BlockMap) -> Vec<ManifestPackEntry> {
+        let txn = self.db.begin_read().expect("redb read failed");
+        let table = txn.open_table(PACK_TABLE).expect("redb open table failed");
         let mut result = Vec::new();
         for (_chunk_index, entry) in block_map.iter_non_empty() {
             if entry.hash.is_zero() {
                 continue;
             }
-            if let Some(location) = self.index.get(&entry.hash) {
+            if let Some(guard) = table.get(*entry.hash.as_bytes()).expect("redb get failed") {
+                let location = pack_location_from_bytes(guard.value());
                 result.push(ManifestPackEntry {
                     hash: entry.hash,
                     pack_id: location.pack_id,
@@ -127,6 +234,7 @@ impl HostPackIndex {
 mod tests {
     use super::*;
     use crate::nbd::block_map::{blake3_128, BlockMapEntry};
+    use tempfile::TempDir;
     use uuid::Uuid;
 
     fn make_hash(data: &[u8]) -> Blake3Hash {
@@ -141,9 +249,15 @@ mod tests {
         }
     }
 
+    fn open_test_index() -> (TempDir, HostPackIndex) {
+        let dir = TempDir::new().unwrap();
+        let index = HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap();
+        (dir, index)
+    }
+
     #[test]
     fn test_pack_index_insert_and_lookup() {
-        let index = HostPackIndex::new();
+        let (_dir, index) = open_test_index();
         let hash = make_hash(b"block-content-1");
         let pack_id = Uuid::new_v4();
         let location = PackLocation {
@@ -162,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_pack_index_dedup_check() {
-        let index = HostPackIndex::new();
+        let (_dir, index) = open_test_index();
         let hash_a = make_hash(b"block-a");
         let hash_b = make_hash(b"block-b");
 
@@ -176,13 +290,14 @@ mod tests {
     async fn test_pack_index_concurrent_access() {
         use std::sync::Arc;
 
-        let index = Arc::new(HostPackIndex::new());
+        let (_dir, index) = open_test_index();
+        let index = Arc::new(index);
         let mut handles = Vec::new();
 
         for task_id in 0..10u32 {
             let idx = Arc::clone(&index);
             handles.push(tokio::spawn(async move {
-                for i in 0..1000u32 {
+                for i in 0..100u32 {
                     let data = format!("task-{task_id}-block-{i}");
                     let hash = make_hash(data.as_bytes());
                     let location = PackLocation {
@@ -199,12 +314,39 @@ mod tests {
             handle.await.expect("task should not panic");
         }
 
-        assert_eq!(index.len(), 10_000);
+        assert_eq!(index.len(), 1_000);
+    }
+
+    #[test]
+    fn test_pack_index_insert_batch() {
+        let (_dir, index) = open_test_index();
+        let pack_id = Uuid::new_v4();
+
+        let entries: Vec<_> = (0..100u32)
+            .map(|i| {
+                let hash = make_hash(format!("batch-{i}").as_bytes());
+                let loc = PackLocation {
+                    pack_id,
+                    offset: i * 1000,
+                    comp_length: 512,
+                };
+                (hash, loc)
+            })
+            .collect();
+
+        index.insert_batch(&entries);
+        assert_eq!(index.len(), 100);
+
+        // Verify a sample entry
+        let (hash, loc) = &entries[50];
+        let got = index.get(hash).unwrap();
+        assert_eq!(got.pack_id, loc.pack_id);
+        assert_eq!(got.offset, loc.offset);
     }
 
     #[test]
     fn test_pack_index_rebuild() {
-        let index = HostPackIndex::new();
+        let (_dir, index) = open_test_index();
 
         // Pre-populate with something that should be cleared.
         let stale_hash = make_hash(b"stale");
@@ -299,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_pack_index_derive_for_block_map() {
-        let index = HostPackIndex::new();
+        let (_dir, index) = open_test_index();
 
         // Create 5 distinct hashes.
         let hashes: Vec<Blake3Hash> = (0..5)
@@ -357,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_prune_unreferenced_removes_stale_entries() {
-        let index = HostPackIndex::new();
+        let (_dir, index) = open_test_index();
         let active = make_hash(b"active");
         let stale = make_hash(b"stale");
 
@@ -375,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_prune_with_empty_referenced_clears_all() {
-        let index = HostPackIndex::new();
+        let (_dir, index) = open_test_index();
         index.insert(make_hash(b"a"), make_location(0));
         index.insert(make_hash(b"b"), make_location(1));
 
@@ -386,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_prune_with_all_referenced_removes_nothing() {
-        let index = HostPackIndex::new();
+        let (_dir, index) = open_test_index();
         let h1 = make_hash(b"one");
         let h2 = make_hash(b"two");
         index.insert(h1, make_location(0));

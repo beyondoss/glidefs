@@ -217,21 +217,23 @@ impl WriteCache<Active> {
         futures::future::try_join_all(upload_futs).await?;
 
         // Register in host pack index for future dedup
+        let mut batch_entries = Vec::new();
         for (pack_id, pack_size, index_entries) in &pack_meta {
             stats.packs_uploaded += 1;
             stats.bytes_uploaded += *pack_size;
             stats.new_pack_ids.push(*pack_id);
             for entry in index_entries {
-                host_pack_index.insert(
+                batch_entries.push((
                     entry.hash,
                     PackLocation {
                         pack_id: *pack_id,
                         offset: entry.offset,
                         comp_length: entry.comp_length,
                     },
-                );
+                ));
             }
         }
+        host_pack_index.insert_batch(&batch_entries);
 
         // 5. Set real hashes in block_map + clear dirty flags.
         //    Sequence number serves as version token: if a concurrent write

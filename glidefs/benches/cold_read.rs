@@ -50,7 +50,7 @@ impl ReadBenchHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3_backend), "bench");
-        let pack_index = HostPackIndex::new();
+        let pack_index = HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
         let metrics = ExportMetrics::new();
 
         let cache = WriteCache::open(config).expect("Failed to open cache");

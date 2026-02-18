@@ -108,12 +108,14 @@ mod tests {
     use crate::nbd::cache::SimpleBlockCache;
     use crate::nbd::pack::PackLocation;
     use bytes::Bytes;
+    use tempfile::TempDir;
     use uuid::Uuid;
 
     #[tokio::test]
     async fn test_scrubber_detects_corruption() {
+        let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::new());
+        let pack_index = Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
 
         // Insert a valid block
         let data = Bytes::from(vec![0xAA; 4096]);
@@ -180,8 +182,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_scrubber_leaves_valid_blocks() {
+        let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::new());
+        let pack_index = Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
 
         // Insert valid blocks
         let data1 = Bytes::from(vec![0xAA; 4096]);
@@ -257,8 +260,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_scrubber_shutdown_during_inter_pass_sleep() {
+        let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::new());
+        let pack_index = Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
 
         // Insert a single valid block so the scrubber completes one pass quickly
         let data = Bytes::from(vec![0xCC; 4096]);
@@ -315,8 +319,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_scrubber_disabled_when_zero() {
+        let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::new());
+        let pack_index = Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
         let shutdown = CancellationToken::new();
 
         // Should return immediately when blocks_per_second = 0

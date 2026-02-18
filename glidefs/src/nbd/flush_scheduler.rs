@@ -444,7 +444,7 @@ mod tests {
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = Arc::new(ContentStore::new(s3, "test"));
-        let pack_index = Arc::new(HostPackIndex::new());
+        let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         let metrics = Arc::new(ExportMetrics::new());
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 

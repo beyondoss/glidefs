@@ -306,7 +306,7 @@ mod tests {
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
         let clean_cache: Arc<dyn BlockCache> =
             Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::new());
+        let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
 
         // Create metrics for this handler
         let metrics = Arc::new(ExportMetrics::new());

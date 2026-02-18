@@ -52,7 +52,7 @@ pub fn create_v2_test_cache(
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(s3, "test");
-    let pack_index = HostPackIndex::new();
+    let pack_index = HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
@@ -90,7 +90,7 @@ pub async fn create_v2_cold_reader(
         Manifest::deserialize(&manifest_bytes).expect("manifest deserialization failed");
 
     // Rebuild pack_index from manifest
-    let pack_index = HostPackIndex::new();
+    let pack_index = HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
     pack_index.rebuild(std::slice::from_ref(&manifest));
 
     let config = WriteCacheConfig {
