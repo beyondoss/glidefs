@@ -17,6 +17,8 @@ NBDServer ──► ExportRouter ──► NBDBlockHandler ──► WriteCache<
                                        pwrite()   block_map_set  transition_to_dirty
                                       (local SSD)  (ZERO, seq)    (CAS on SparseStateMap)
                                                         │
+                                                   clear_crc32(0)
+                                                        │
                                                    WAL append(ZERO, seq)
                                                         │
                                                     return OK     ◄── ~5µs
@@ -397,6 +399,64 @@ Per-export append-only list of pack UUIDs, stored in S3 at `pack-registries/{nam
 
 Written by the flush path after uploading packs. Inherited by forks (the fork's registry starts with the parent's pack IDs). Compacted by GC after dead packs are deleted. (`pack_registry.rs`)
 
+## Data Integrity
+
+Every layer has a verification mechanism. The goal: corruption is detected before it reaches the guest or S3.
+
+### Verification Chain
+
+| Layer | What's Protected | Hash/Check | When Verified | On Failure |
+|-------|-----------------|------------|---------------|------------|
+| S3 packs | Block data in transit/at rest | BLAKE3-128 | Read path: after S3 fetch + LZ4 decompress | `HashMismatch` error → re-fetch from S3 |
+| Clean cache (Foyer) | Cached blocks on SSD/memory | BLAKE3-128 | Background scrubber re-hashes against content address | Evict from cache → next read re-fetches from S3 |
+| Manifest | Block map + pack index snapshot | CRC32 trailer | On deserialization (load from S3) | Reject manifest, return error |
+| WAL entries | Per-entry metadata | CRC32 trailer | On replay (crash recovery) | Stop replay at first corrupt entry, discard torn tail |
+| Dirty blocks (SSD) | Block data between write and flush | CRC32 in `HashEntry` | Flush time: before BLAKE3 computation | Skip block (stays dirty), do NOT launder to S3 |
+
+### Dirty Block CRC32
+
+Dirty blocks sit on local SSD between guest writes and S3 flush — potentially for seconds (continuous mode) or indefinitely (demand-driven). During this window, SSD bit rot or firmware bugs could silently corrupt the data. Without verification, the flush path would compute BLAKE3 over corrupted data, producing a valid-looking but wrong hash, and upload it to S3 — permanently laundering the corruption.
+
+The `crc32` field in `HashEntry` (repurposed from `_pad`) catches this:
+
+```
+Write path (~5µs):
+    pwrite(data) → block_map_set(ZERO, seq) → clear_crc32(0)
+                                                     │
+                                              AtomicU32 store, negligible
+
+Checkpoint (background, every ~5s):
+    for each dirty block where crc32 == 0:
+        seq_before = block_map_get(idx).seq
+        data = pread(block from SSD)
+        seq_after = block_map_get(idx).seq
+        if seq_before != seq_after → skip (concurrent write)
+        crc32 = crc32fast::hash(data)
+        CAS(0, crc32)                        ← only store if still 0
+
+Flush (background):
+    for each dirty block:
+        data = pread(block from SSD)
+        stored_crc = get_crc32(idx)
+        if stored_crc != 0:
+            computed_crc = crc32fast::hash(data)
+            if computed_crc != stored_crc:
+                if seq changed → concurrent write, skip (CAS failure)
+                else → SSD corruption detected, skip block
+        hash = blake3_128(data)              ← only reached if CRC32 passes
+        ... pack, upload, clear dirty
+```
+
+Each dirty block gets CRC32 computed **once** (at first checkpoint after write) and verified **once** (at flush before BLAKE3). No redundant hashing. Not on the read or write hot paths.
+
+### What Is NOT Verified
+
+| Gap | Why Acceptable |
+|-----|---------------|
+| Dirty block reads (guest reads dirty data from SSD) | Read path returns raw pread data — no checksum. The guest sees whatever is on disk. If SSD corrupts a dirty block and the guest reads it before checkpoint, the guest gets corrupt data. Mitigation: checkpoint runs every ~5s, so the window is small. Adding CRC32 verification on the read path would cause false positives from concurrent write races (write changes data between CRC32 compute and pread). |
+| SSD data file between flush cycles | Once a block is flushed (Dirty → Clean), its CRC32 is cleared. The block remains on SSD but is only served as a fallback — reads prefer the clean cache or S3. If the SSD corrupts a clean block, the scrubber catches it in the clean cache; if the block isn't in the clean cache, the next read fetches from S3. |
+| redb pack index | Derived data — rebuildable from S3 manifests. If corrupted, `rebuild()` repopulates from scratch. |
+
 ## CLI Commands
 
 | Command | Purpose |
@@ -609,12 +669,12 @@ The 5µs write path is never touched — the monitor only adjusts background flu
 | `nbd/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, `SparseStateMap` integration, metadata persistence |
 | `nbd/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
 | `nbd/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → S3 → SSD fallback) |
-| `nbd/write_cache/flush.rs` | Dirty block scan, pack assembly, S3 upload, manifest sync |
+| `nbd/write_cache/flush.rs` | Dirty block scan, CRC32 checkpoint compute + flush verify, pack assembly, S3 upload, manifest sync |
 | `nbd/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading |
 | `nbd/write_cache/recovery.rs` | WAL replay, dirty block verification after crash |
 | `nbd/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
 | `nbd/write_cache/error.rs` | `CacheError` type |
-| `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
+| `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock + per-entry CRC32), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
 | `nbd/state.rs` | `BlockState` enum + sealed typestate markers (`Initializing`, `Active`, etc.) |
 | `nbd/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
 | `nbd/pack_index.rs` | `HostPackIndex`: redb-backed `Blake3Hash → PackLocation` index for cross-export dedup |
@@ -710,7 +770,7 @@ AtomicBlockMap (hash + sequence storage)
 │   ├── [0] → HashPage { entries: [HashEntry; 128] }  4096 bytes
 │   ├── [1] → null  (unwritten — zero cost)
 │   └── ...
-│   HashEntry: 32 bytes (#[repr(C)]): version(u32) + _pad(u32) + hash_lo(u64) + hash_hi(u64) + seq(u64)
+│   HashEntry: 32 bytes (#[repr(C)]): version(u32) + crc32(u32) + hash_lo(u64) + hash_hi(u64) + seq(u64)
 
 SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 ├── directory: Box<[AtomicPtr<StatePage>]>    16 KB  (2048 entries for 8M blocks)
@@ -760,7 +820,7 @@ Each export's page tables share an `Arc<AtomicUsize>` budget counter. Page alloc
 
 | Suite | Command | Count | What It Covers |
 |-------|---------|-------|----------------|
-| Unit | `cargo test --features test-utils --lib` | ~315 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables |
+| Unit | `cargo test --features test-utils --lib` | ~320 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables, CRC32 integrity |
 | Integration | `cargo test --features test-utils --test integration` | ~46 | Crash recovery, concurrent writes, flush consistency (no Docker) |
 | Docker | `cargo test --features docker-tests --test docker_integration` | ~9 | Real S3 via MinIO (testcontainers-rs), end-to-end pack upload/download |
 | Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free algorithms (AtomicBlockMap, SeqLock) |

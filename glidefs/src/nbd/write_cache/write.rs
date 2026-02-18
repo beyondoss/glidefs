@@ -79,6 +79,9 @@ impl WriteCache<Active> {
                 let seq = self.inner.sequence.next();
                 // Placeholder hash — flush reads SSD and computes the real hash.
                 self.inner.block_map_set(idx, Blake3Hash::ZERO, seq)?;
+                // Clear CRC32: data changed, old checksum is stale.
+                // Next checkpoint will recompute from fresh SSD data.
+                self.inner.block_map_clear_crc32(idx);
 
                 let wal_entry = WalEntryRef {
                     name: &self.inner.export_name,
@@ -173,6 +176,7 @@ impl WriteCache<Active> {
 
                 let seq = self.inner.sequence.next();
                 self.inner.block_map_set(idx, zero_hash, seq)?;
+                self.inner.block_map_clear_crc32(idx);
 
                 let wal_entry = WalEntryRef {
                     name: &self.inner.export_name,

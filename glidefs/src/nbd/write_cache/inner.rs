@@ -320,6 +320,26 @@ impl CacheInner {
         self.block_map.read().snapshot(&self.state_map)
     }
 
+    // -- CRC32 dirty-block integrity ------------------------------------------
+
+    /// Load the CRC32 checksum for a chunk (takes read lock).
+    #[inline]
+    pub(super) fn block_map_get_crc32(&self, chunk_index: usize) -> u32 {
+        self.block_map.read().get_crc32(chunk_index)
+    }
+
+    /// Clear the CRC32 checksum for a chunk (takes read lock).
+    #[inline]
+    pub(super) fn block_map_clear_crc32(&self, chunk_index: usize) {
+        self.block_map.read().clear_crc32(chunk_index)
+    }
+
+    /// CAS the CRC32 checksum (takes read lock).
+    #[inline]
+    pub(super) fn block_map_cas_crc32(&self, chunk_index: usize, expected: u32, new: u32) -> Result<u32, u32> {
+        self.block_map.read().cas_crc32(chunk_index, expected, new)
+    }
+
     /// Count present blocks (for metrics/logging).
     #[allow(dead_code)]
     pub(super) fn count_present(&self) -> usize {

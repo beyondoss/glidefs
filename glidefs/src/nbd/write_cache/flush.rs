@@ -171,6 +171,29 @@ impl WriteCache<Active> {
                 chunk_buf[valid_bytes..].fill(0);
             }
 
+            // Verify CRC32 if available (detects SSD corruption before BLAKE3).
+            let stored_crc = self.inner.block_map_get_crc32(chunk_index);
+            if stored_crc != 0 {
+                let computed_crc = crc32fast::hash(&chunk_buf);
+                if computed_crc != stored_crc {
+                    // Check if a concurrent write invalidated the CRC32.
+                    let (_, current_seq) = self.inner.block_map_get(chunk_index);
+                    if current_seq != snapshot_seq {
+                        // Concurrent write — stale CRC32, block will be retried.
+                        stats.blocks_cas_failed += 1;
+                        continue;
+                    }
+                    warn!(
+                        chunk_index,
+                        stored_crc,
+                        computed_crc,
+                        "CRC32 mismatch — SSD corruption detected, skipping block to prevent S3 laundering"
+                    );
+                    stats.blocks_corrupted += 1;
+                    continue;
+                }
+            }
+
             let hash = blake3_128(&chunk_buf);
             computed.push((chunk_index, snapshot_seq, hash));
 
@@ -262,6 +285,7 @@ impl WriteCache<Active> {
             blocks_flushed = stats.blocks_flushed,
             blocks_deduped = stats.blocks_deduped,
             blocks_cas_failed = stats.blocks_cas_failed,
+            blocks_corrupted = stats.blocks_corrupted,
             packs_uploaded = stats.packs_uploaded,
             bytes_uploaded = stats.bytes_uploaded,
             "flush dirty inner complete"
@@ -344,12 +368,14 @@ impl WriteCache<Active> {
         Ok(())
     }
 
-    /// Local checkpoint: persist block states + truncate WAL.
+    /// Local checkpoint: compute CRC32s for dirty blocks, persist state, truncate WAL.
     ///
     /// Independent of S3 — keeps the WAL bounded in demand-driven mode
     /// where S3 flushes may be infrequent. Should run every ~5s when
     /// there are dirty blocks.
     pub fn local_checkpoint(&self) -> Result<(), CacheError> {
+        // Compute CRC32 for dirty blocks that don't have one yet.
+        self.compute_dirty_crc32s();
         // Block map outside lock (safe: clean blocks don't change).
         self.inner.persist_block_map()?;
         // Fast save + truncate under lock.
@@ -358,6 +384,62 @@ impl WriteCache<Active> {
         wal.truncate()?;
         debug!("local checkpoint complete");
         Ok(())
+    }
+
+    /// Compute CRC32 checksums for dirty blocks that don't have one yet.
+    ///
+    /// Reads each block from SSD and computes CRC32. Uses a sequence-number
+    /// guard to avoid storing stale checksums when a concurrent write changes
+    /// the block data during the read.
+    fn compute_dirty_crc32s(&self) {
+        let block_size = self.inner.config.block_size;
+        let device_size = self.inner.config.device_size;
+        let mut buf = vec![0u8; block_size];
+        let mut computed = 0u64;
+
+        for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
+            // Only compute for blocks without a CRC32.
+            if self.inner.block_map_get_crc32(idx) != 0 {
+                continue;
+            }
+
+            // Seq guard: capture sequence before and after reading data.
+            let (_, seq_before) = self.inner.block_map_get(idx);
+
+            let offset = idx as u64 * block_size as u64;
+            let valid_bytes =
+                std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
+            if valid_bytes == 0 {
+                continue;
+            }
+
+            if let Err(e) = self.inner.data_file.read_exact_at(&mut buf[..valid_bytes], offset) {
+                warn!(
+                    chunk_index = idx,
+                    error = %e,
+                    "failed to read block for CRC32 computation"
+                );
+                continue;
+            }
+            if valid_bytes < block_size {
+                buf[valid_bytes..].fill(0);
+            }
+
+            let (_, seq_after) = self.inner.block_map_get(idx);
+            if seq_before != seq_after {
+                // Concurrent write changed this block — skip.
+                continue;
+            }
+
+            let crc = crc32fast::hash(&buf);
+            // CAS: only store if still 0 (write may have cleared it).
+            let _ = self.inner.block_map_cas_crc32(idx, 0, crc);
+            computed += 1;
+        }
+
+        if computed > 0 {
+            debug!(computed, "computed CRC32 checksums for dirty blocks");
+        }
     }
 
     /// Update the pack registry after a flush. Best-effort: warn on failure.

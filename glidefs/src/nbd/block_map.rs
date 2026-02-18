@@ -490,6 +490,47 @@ impl AtomicBlockMap {
         Ok(())
     }
 
+    // -- CRC32 dirty-block integrity ------------------------------------------
+
+    /// Load the CRC32 checksum for a chunk.
+    /// Returns 0 if the page is unallocated or the checksum hasn't been computed.
+    #[inline]
+    pub fn get_crc32(&self, chunk_index: usize) -> u32 {
+        let (page_idx, entry_idx) = Self::split_index(chunk_index);
+        match self.load_page(page_idx) {
+            Some(page) => page.entries[entry_idx].crc32.load(Ordering::Relaxed),
+            None => 0,
+        }
+    }
+
+    /// Clear the CRC32 checksum for a chunk (set to 0).
+    /// Called from the write path when block data changes.
+    #[inline]
+    pub fn clear_crc32(&self, chunk_index: usize) {
+        let (page_idx, entry_idx) = Self::split_index(chunk_index);
+        if let Some(page) = self.load_page(page_idx) {
+            page.entries[entry_idx].crc32.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// CAS the CRC32 checksum: store `new` only if the current value is `expected`.
+    /// Used by checkpoint to avoid overwriting a value cleared by a concurrent write.
+    #[inline]
+    pub fn cas_crc32(&self, chunk_index: usize, expected: u32, new: u32) -> Result<u32, u32> {
+        let (page_idx, entry_idx) = Self::split_index(chunk_index);
+        match self.load_page(page_idx) {
+            Some(page) => page.entries[entry_idx].crc32.compare_exchange(
+                expected,
+                new,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ),
+            None => {
+                if expected == 0 { Ok(0) } else { Err(0) }
+            }
+        }
+    }
+
     /// Produce a `BlockMap` snapshot by combining atomic hash/sequence data
     /// with flags from the external `SparseStateMap`.
     ///
@@ -1291,6 +1332,26 @@ impl ForkedBlockMap {
         }
     }
 
+    // -- CRC32 operations (delegated to overlay) --------------------------------
+
+    /// Load the CRC32 checksum for a chunk (overlay only).
+    #[inline]
+    pub fn get_crc32(&self, chunk_index: usize) -> u32 {
+        self.overlay.get_crc32(chunk_index)
+    }
+
+    /// Clear the CRC32 checksum for a chunk (overlay only).
+    #[inline]
+    pub fn clear_crc32(&self, chunk_index: usize) {
+        self.overlay.clear_crc32(chunk_index)
+    }
+
+    /// CAS the CRC32 checksum (overlay only).
+    #[inline]
+    pub fn cas_crc32(&self, chunk_index: usize, expected: u32, new: u32) -> Result<u32, u32> {
+        self.overlay.cas_crc32(chunk_index, expected, new)
+    }
+
     /// Number of unique entries written to the overlay.
     #[cfg(test)]
     #[inline]
@@ -1395,6 +1456,35 @@ impl BlockMapKind {
         match self {
             BlockMapKind::Full(m) => m.snapshot(state_map),
             BlockMapKind::Forked(m) => m.snapshot(state_map),
+        }
+    }
+
+    // -- CRC32 dirty-block integrity ------------------------------------------
+
+    /// Load the CRC32 checksum for a chunk.
+    #[inline]
+    pub fn get_crc32(&self, chunk_index: usize) -> u32 {
+        match self {
+            BlockMapKind::Full(m) => m.get_crc32(chunk_index),
+            BlockMapKind::Forked(m) => m.get_crc32(chunk_index),
+        }
+    }
+
+    /// Clear the CRC32 checksum for a chunk.
+    #[inline]
+    pub fn clear_crc32(&self, chunk_index: usize) {
+        match self {
+            BlockMapKind::Full(m) => m.clear_crc32(chunk_index),
+            BlockMapKind::Forked(m) => m.clear_crc32(chunk_index),
+        }
+    }
+
+    /// CAS the CRC32 checksum.
+    #[inline]
+    pub fn cas_crc32(&self, chunk_index: usize, expected: u32, new: u32) -> Result<u32, u32> {
+        match self {
+            BlockMapKind::Full(m) => m.cas_crc32(chunk_index, expected, new),
+            BlockMapKind::Forked(m) => m.cas_crc32(chunk_index, expected, new),
         }
     }
 
@@ -2158,5 +2248,101 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(forked.overlay_len(), 1000);
+    }
+
+    // ========================================================================
+    // CRC32 dirty-block integrity tests
+    // ========================================================================
+
+    #[test]
+    fn test_crc32_default_is_zero() {
+        let abm = AtomicBlockMap::new(1024 * 1024, 4096);
+        // Unallocated page returns 0.
+        assert_eq!(abm.get_crc32(0), 0);
+        // Allocate page via set, crc32 should still be 0.
+        abm.set(0, blake3_128(b"data"), 1).unwrap();
+        assert_eq!(abm.get_crc32(0), 0);
+    }
+
+    #[test]
+    fn test_crc32_cas_and_clear() {
+        let abm = AtomicBlockMap::new(1024 * 1024, 4096);
+        abm.set(42, blake3_128(b"x"), 1).unwrap();
+
+        // CAS from 0 to a known value.
+        let crc_val = crc32fast::hash(b"hello");
+        assert!(abm.cas_crc32(42, 0, crc_val).is_ok());
+        assert_eq!(abm.get_crc32(42), crc_val);
+
+        // CAS from wrong expected value should fail.
+        assert!(abm.cas_crc32(42, 0, 999).is_err());
+        assert_eq!(abm.get_crc32(42), crc_val);
+
+        // Clear resets to 0.
+        abm.clear_crc32(42);
+        assert_eq!(abm.get_crc32(42), 0);
+    }
+
+    #[test]
+    fn test_crc32_independent_of_seqlock() {
+        let abm = AtomicBlockMap::new(1024 * 1024, 4096);
+        abm.set(10, blake3_128(b"v1"), 1).unwrap();
+
+        // Set a CRC32 value.
+        let _ = abm.cas_crc32(10, 0, 12345);
+        assert_eq!(abm.get_crc32(10), 12345);
+
+        // Overwrite hash via SeqLock — CRC32 should be untouched.
+        abm.set(10, blake3_128(b"v2"), 2).unwrap();
+        assert_eq!(abm.get_crc32(10), 12345);
+
+        // Hash data changed correctly.
+        let (hash, seq) = abm.get(10);
+        assert_eq!(hash, blake3_128(b"v2"));
+        assert_eq!(seq, 2);
+    }
+
+    #[test]
+    fn test_crc32_forked_uses_overlay() {
+        let parent = Arc::new(BlockMap::new(100 * 4096, 4096));
+        let forked = ForkedBlockMap::new(parent);
+
+        // Unallocated overlay returns 0.
+        assert_eq!(forked.get_crc32(0), 0);
+
+        // Write to overlay to allocate the page.
+        forked.set(0, blake3_128(b"fork"), 1).unwrap();
+
+        // CAS and read.
+        let _ = forked.cas_crc32(0, 0, 42);
+        assert_eq!(forked.get_crc32(0), 42);
+
+        // Clear.
+        forked.clear_crc32(0);
+        assert_eq!(forked.get_crc32(0), 0);
+    }
+
+    #[test]
+    fn test_crc32_block_map_kind_dispatch() {
+        // Full variant.
+        let full = AtomicBlockMap::new(1024 * 1024, 4096);
+        full.set(5, blake3_128(b"d"), 1).unwrap();
+        let kind_full = BlockMapKind::Full(full);
+
+        assert_eq!(kind_full.get_crc32(5), 0);
+        let _ = kind_full.cas_crc32(5, 0, 77);
+        assert_eq!(kind_full.get_crc32(5), 77);
+        kind_full.clear_crc32(5);
+        assert_eq!(kind_full.get_crc32(5), 0);
+
+        // Forked variant.
+        let parent = Arc::new(BlockMap::new(100 * 4096, 4096));
+        let forked = ForkedBlockMap::new(parent);
+        forked.set(0, blake3_128(b"f"), 1).unwrap();
+        let kind_forked = BlockMapKind::Forked(forked);
+
+        assert_eq!(kind_forked.get_crc32(0), 0);
+        let _ = kind_forked.cas_crc32(0, 0, 88);
+        assert_eq!(kind_forked.get_crc32(0), 88);
     }
 }
