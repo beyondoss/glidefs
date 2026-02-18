@@ -147,8 +147,17 @@ impl WriteCache<Active> {
     ) -> Result<Bytes, CacheError> {
         let (hash, _seq) = self.inner.block_map_get(chunk_index);
 
-        // Never written or trimmed → zeros.
-        if hash.is_zero() || hash == self.inner.zero_block_hash {
+        // ZERO hash on a present block means the hash is deferred (not yet
+        // computed). Read directly from SSD — the data is there.
+        if hash.is_zero() {
+            if self.inner.is_present(chunk_index) {
+                return self.sync_read_local_block(chunk_index as u64);
+            }
+            return Ok(self.inner.zero_block_bytes.clone());
+        }
+
+        // Explicit zero-range → zeros.
+        if hash == self.inner.zero_block_hash {
             return Ok(self.inner.zero_block_bytes.clone());
         }
 

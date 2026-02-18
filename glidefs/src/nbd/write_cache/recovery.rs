@@ -72,8 +72,9 @@ impl WriteCache<Recovering> {
 
             let (hash, _seq) = self.inner.block_map_get(idx);
 
-            // Zero-hash entries don't need verification
-            if hash.is_zero() || hash == zero_hash {
+            // Zero-block hash entries are known content — no verification needed.
+            // But ZERO sentinel (deferred hash) must be computed from SSD.
+            if hash == zero_hash {
                 continue;
             }
 

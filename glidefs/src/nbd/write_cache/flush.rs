@@ -96,26 +96,21 @@ impl WriteCache<Active> {
         // 1. Capture sequence cut point
         let seq_cutpoint = self.inner.sequence.current();
 
-        // 2. Targeted dirty scan: check block_states first (cheap byte load),
-        //    then read block_map only for dirty blocks (SeqLock read).
-        //    For a 10GB device with 1000 dirty blocks: 81,920 byte reads +
-        //    1,000 SeqLock reads, vs 81,920 SeqLock reads for a full snapshot.
-        let snapshot: Vec<(usize, Blake3Hash)> = {
+        // 2. Targeted dirty scan: collect dirty block indices with their
+        //    snapshot sequence number (used for concurrent-write detection).
+        //    Hashes are computed lazily from SSD in step 3.
+        let snapshot: Vec<(usize, u64)> = {
             let mut dirty = Vec::new();
             for (idx, state) in self.inner.block_states.iter().enumerate() {
                 if state.load(Ordering::Acquire) != BlockState::Dirty as u8 {
                     continue;
                 }
-                let (hash, seq) = self.inner.block_map_get(idx);
-                // Skip never-written entries (zero sentinel)
-                if hash.is_zero() {
-                    continue;
-                }
+                let (_hash, seq) = self.inner.block_map_get(idx);
                 // Skip entries written after our cutpoint
                 if seq > seq_cutpoint {
                     continue;
                 }
-                dirty.push((idx, hash));
+                dirty.push((idx, seq));
             }
             dirty
         };
@@ -127,16 +122,32 @@ impl WriteCache<Active> {
 
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
 
-        // 3. Dedup check + compress new blocks
+        // 3. Read each dirty block from SSD, compute hash, dedup, compress.
         let zero_hash = self.inner.zero_block_hash;
         let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
         let mut seen_hashes = std::collections::HashSet::new();
+        // Track (chunk_index, snapshot_seq, computed_hash) for step 5.
+        let mut computed: Vec<(usize, u64, Blake3Hash)> = Vec::new();
 
         let block_size = self.inner.config.block_size;
         let mut chunk_buf = vec![0u8; block_size];
 
-        for &(chunk_index, hash) in &snapshot {
+        for &(chunk_index, snapshot_seq) in &snapshot {
             stats.blocks_flushed += 1;
+
+            // Read block data from SSD and compute content hash.
+            let offset = chunk_index as u64 * block_size as u64;
+            let device_size = self.inner.config.device_size;
+            let valid_bytes = std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
+            if valid_bytes > 0 {
+                self.inner.data_file.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
+            }
+            if valid_bytes < block_size {
+                chunk_buf[valid_bytes..].fill(0);
+            }
+
+            let hash = blake3_128(&chunk_buf);
+            computed.push((chunk_index, snapshot_seq, hash));
 
             // Skip zero blocks — read path returns zeros directly
             if hash == zero_hash {
@@ -152,26 +163,6 @@ impl WriteCache<Active> {
 
             // Skip duplicate hashes within this flush batch
             if !seen_hashes.insert(hash) {
-                stats.blocks_deduped += 1;
-                continue;
-            }
-
-            // Read block data from SSD and verify hash.
-            // A concurrent write may have changed the block since snapshot —
-            // hash mismatch means skip (block stays dirty for next flush).
-            let offset = chunk_index as u64 * block_size as u64;
-            let device_size = self.inner.config.device_size;
-            let valid_bytes = std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
-            if valid_bytes > 0 {
-                self.inner.data_file.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
-            }
-            if valid_bytes < block_size {
-                chunk_buf[valid_bytes..].fill(0);
-            }
-
-            let actual_hash = blake3_128(&chunk_buf);
-            if actual_hash != hash {
-                // Concurrent write changed this block — skip, it stays dirty.
                 stats.blocks_deduped += 1;
                 continue;
             }
@@ -217,27 +208,31 @@ impl WriteCache<Active> {
             }
         }
 
-        // 5. Clear dirty state for blocks whose hash hasn't changed.
-        for &(chunk_index, snapshot_hash) in &snapshot {
-            let (current_hash, _seq) = self.inner.block_map_get(chunk_index);
-            if current_hash == snapshot_hash {
-                // Hash unchanged since snapshot — safe to clear dirty flag.
-                // CAS Dirty → Clean on the block_states AtomicU8.
-                if self.inner.block_states[chunk_index]
-                    .compare_exchange(
-                        BlockState::Dirty as u8,
-                        BlockState::Clean as u8,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    self.inner
-                        .dirty_block_count
-                        .fetch_sub(1, Ordering::Relaxed);
-                }
+        // 5. Set real hashes in block_map + clear dirty flags.
+        //    Sequence number serves as version token: if a concurrent write
+        //    changed the sequence, leave the block dirty for the next flush.
+        for &(chunk_index, snapshot_seq, actual_hash) in &computed {
+            let (_hash, current_seq) = self.inner.block_map_get(chunk_index);
+            if current_seq != snapshot_seq {
+                // Concurrent write changed this block — leave dirty.
+                continue;
             }
-            // Concurrent write produced a new hash — leave dirty for next flush.
+            // Replace ZERO placeholder with real content hash.
+            self.inner.block_map_set(chunk_index, actual_hash, snapshot_seq);
+            // CAS Dirty → Clean on the block_states AtomicU8.
+            if self.inner.block_states[chunk_index]
+                .compare_exchange(
+                    BlockState::Dirty as u8,
+                    BlockState::Clean as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.inner
+                    .dirty_block_count
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
         }
 
         info!(

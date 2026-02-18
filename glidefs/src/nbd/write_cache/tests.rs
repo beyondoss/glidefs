@@ -804,15 +804,16 @@ fn test_open_from_manifest_fork_writes_to_overlay() {
         }
     }
 
-    // The written chunk should have a new hash (not the parent's hash)
+    // With deferred hashing, the written chunk has ZERO placeholder hash.
+    // The real hash is computed at flush time.
     let (hash, seq) = cache.inner.block_map_get(0);
-    let parent_hash = blake3_128("block-0".as_bytes());
-    assert_ne!(hash, parent_hash, "hash should differ from parent after write");
+    assert!(hash.is_zero(), "write() should set ZERO placeholder hash");
     assert!(seq > 42, "sequence should be beyond the manifest sequence");
 
     // Parent's entry at chunk 0 should be unchanged
     let parent_entry = parent.get(0);
-    assert_eq!(parent_entry.hash, parent_hash, "parent must be unmodified");
+    let expected_parent_hash = blake3_128("block-0".as_bytes());
+    assert_eq!(parent_entry.hash, expected_parent_hash, "parent must be unmodified");
     assert_eq!(parent_entry.sequence, 42, "parent sequence must be unmodified");
 
     // Chunk 1 should still read from parent (not in overlay)
@@ -852,9 +853,10 @@ async fn test_recovery_detects_hash_drift() {
         let cache = cache.finish_recovery().await.unwrap();
         cache.write(0, &original_data, &clean_cache).unwrap();
 
-        // Verify block_map has original hash
+        // With deferred hashing, write() sets ZERO placeholder in block_map.
+        // The real hash is computed at flush-to-S3 time.
         let (hash, _) = cache.inner.block_map_get(0);
-        assert_eq!(hash, original_hash);
+        assert!(hash.is_zero(), "write() should set ZERO placeholder hash");
 
         // Persist both v1 metadata (block states) and v2 block map file
         cache.save_metadata().unwrap();

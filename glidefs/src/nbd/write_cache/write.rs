@@ -1,22 +1,11 @@
-use std::cell::Cell;
-
-use bytes::Bytes;
 use tracing::{debug, instrument};
 
-use crate::nbd::block_map::blake3_128;
+use crate::nbd::block_map::Blake3Hash;
 use crate::nbd::cache::BlockCache;
 use crate::nbd::state::Active;
 use crate::nbd::wal::WalEntryRef;
 
 use super::{CacheError, WriteCache};
-
-thread_local! {
-    /// Reusable buffer for block hashing on the write path.
-    /// Avoids a 128KB allocation per write() call. On error (early return),
-    /// the buffer is lost and re-allocated on next use — acceptable since
-    /// error paths are rare.
-    static CHUNK_BUF: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
-}
 
 impl WriteCache<Active> {
     /// Write data to the cache.
@@ -30,8 +19,11 @@ impl WriteCache<Active> {
     /// - Clean → Dirty: increment dirty_count, push to queue, notify
     /// - Syncing → Dirty: decrement syncing_count, increment dirty_count, push to queue, notify
     /// - Dirty → Dirty: no-op
-    #[instrument(skip(self, data, clean_cache), fields(offset = offset, len = data.len()))]
-    pub fn write(&self, offset: u64, data: &[u8], clean_cache: &dyn BlockCache) -> Result<(), CacheError> {
+    /// Hash computation is deferred to flush-to-S3 time. The write path only
+    /// does: pwrite → mark dirty → WAL append. This keeps the hot path to
+    /// ~10-15µs instead of ~90µs (no 128KB pread, no blake3, no cache insert).
+    #[instrument(skip(self, data, _clean_cache), fields(offset = offset, len = data.len()))]
+    pub fn write(&self, offset: u64, data: &[u8], _clean_cache: &dyn BlockCache) -> Result<(), CacheError> {
         if offset + data.len() as u64 > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
                 offset + data.len() as u64,
@@ -76,66 +68,34 @@ impl WriteCache<Active> {
             self.inner.transition_to_dirty(idx);
         }
 
-        // === v2: content-addressed updates ===
-        // For each affected chunk, read the full chunk from SSD, hash it,
-        // and update block map + WAL + dirty store.
+        // Record dirty blocks in WAL + block map with placeholder hash.
+        // Real hash is computed at flush-to-S3 time from SSD data.
         {
-            let block_size = self.inner.config.block_size;
-            let device_size = self.inner.config.device_size;
-
-            // Reuse thread-local buffer instead of allocating 128KB per write call.
-            let mut chunk_buf = CHUNK_BUF.take();
-            chunk_buf.resize(block_size, 0);
-
             for block in start_block..=end_block {
                 let idx = block as usize;
                 if idx >= self.inner.num_blocks {
                     continue;
                 }
-
-                // Read the full chunk from SSD (to get correct merged data for sub-chunk writes)
-                let chunk_offset = block * block_size as u64;
-                let valid_bytes = std::cmp::min(block_size as u64, device_size.saturating_sub(chunk_offset)) as usize;
-                if valid_bytes > 0 {
-                    self.inner.data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset)?;
-                }
-                if valid_bytes < block_size {
-                    chunk_buf[valid_bytes..].fill(0);
-                }
-
-                let hash = blake3_128(&chunk_buf);
                 let seq = self.inner.sequence.next();
+                // Placeholder hash — flush reads SSD and computes the real hash.
+                self.inner.block_map_set(idx, Blake3Hash::ZERO, seq);
 
-                // Update atomic block map (lock-free)
-                self.inner.block_map_set(idx, hash, seq);
-
-                // WAL append — metadata only (Mutex, uncontended).
-                // Block data lives on SSD; recovery re-reads from there.
                 let wal_entry = WalEntryRef {
                     name: &self.inner.export_name,
                     chunk_index: block,
-                    hash,
+                    hash: Blake3Hash::ZERO,
                     sequence: seq,
                 };
                 self.inner.wal.lock().append(&wal_entry)?;
-
-                // Insert into bounded clean cache for write-then-read performance.
-                // Evictable — SSD pread fallback catches misses.
-                clean_cache.insert(hash, Bytes::copy_from_slice(&chunk_buf));
             }
 
             // Flush WAL buffer (or fsync if wal_sync is enabled)
-            {
-                let mut wal = self.inner.wal.lock();
-                if self.inner.config.wal_sync {
-                    wal.sync()?;
-                } else {
-                    wal.flush_buf()?;
-                }
+            let mut wal = self.inner.wal.lock();
+            if self.inner.config.wal_sync {
+                wal.sync()?;
+            } else {
+                wal.flush_buf()?;
             }
-
-            // Return buffer to thread-local pool for reuse
-            CHUNK_BUF.set(chunk_buf);
         }
 
         // If using a forked block map, check if overlay is large enough to flatten
@@ -197,7 +157,8 @@ impl WriteCache<Active> {
         // Mark affected blocks as dirty and present
         self.mark_range_dirty_and_present(offset, len);
 
-        // === v2: content-addressed updates for zeroed chunks ===
+        // Record dirty blocks in WAL + block map.
+        // zero_range uses the precomputed zero_block_hash since we know the content.
         {
             let block_size = self.inner.config.block_size as u64;
             let start_block = offset / block_size;
@@ -211,11 +172,8 @@ impl WriteCache<Active> {
                 }
 
                 let seq = self.inner.sequence.next();
-
-                // Update atomic block map with zero-block hash
                 self.inner.block_map_set(idx, zero_hash, seq);
 
-                // WAL entry for zero range
                 let wal_entry = WalEntryRef {
                     name: &self.inner.export_name,
                     chunk_index: block,
@@ -223,10 +181,8 @@ impl WriteCache<Active> {
                     sequence: seq,
                 };
                 self.inner.wal.lock().append(&wal_entry)?;
-                // No dirty store insert for zero blocks -- read path returns zeros
             }
 
-            // Flush WAL buffer (or fsync if wal_sync is enabled)
             let mut wal = self.inner.wal.lock();
             if self.inner.config.wal_sync {
                 wal.sync()?;
