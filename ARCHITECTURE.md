@@ -461,6 +461,21 @@ We considered `RwLock` but rejected it: even uncontended lock/unlock has ~25ns o
 
 **C11 memory ordering**: The writer stores data fields with `Release` ordering, not `Relaxed`. Under the C11 model (which matters on ARM/Graviton), a `Relaxed` data store can be observed by a reader via a `Relaxed` load without establishing any happens-before relationship — the reader's subsequent `Relaxed` v2 load might miss the writer's version change entirely, producing a torn read. With `Release` data stores, the reader's `Acquire` fence (between data loads and v2 load) synchronizes-with the observed Release, making the writer's odd version visible to v2 and forcing a retry. Loom tests exhaustively verify this property. SeqLock is single-writer by design; concurrent writers break the version parity invariant.
 
+### SSD Backpressure
+
+The local SSD is the one resource without explicit bounds — every other critical resource has backpressure (memory: page budget, S3: circuit breaker, Foyer: size limits). With 2000 sparse cache files on a 100GB SSD, physical space can be exhausted. A background capacity monitor polls `statvfs` every 5 seconds and takes escalating action:
+
+| SSD Utilization | Action |
+|---|---|
+| < 80% | Normal — no intervention |
+| ≥ 80% | Warn — log + `glidefs_ssd_utilization_ratio` gauge for alerting |
+| ≥ 90% | Escalate — switch flush modes to Continuous(2s/10s) across all exports |
+| < 80% (recovery) | Restore original flush modes |
+
+The 5µs write path is never touched — the monitor only adjusts background flush aggressiveness via the existing `watch::channel<FlushMode>` that each export's flush scheduler already monitors.
+
+**Why not hole-punch clean blocks?** `fallocate(PUNCH_HOLE)` on CLEAN block regions would reclaim physical SSD space, but it races with `pwrite` at the kernel level. A concurrent guest write could land data via pwrite, then the punch deallocates it — silent data corruption. No userspace CAS ordering prevents this because both are kernel syscalls on the same inode. The escalated flush is the real backpressure: it converts dirty blocks to clean blocks faster, and clean blocks don't contribute to ENOSPC pressure.
+
 ## Package Structure
 
 | File | Purpose |
@@ -482,6 +497,7 @@ We considered `RwLock` but rejected it: even uncontended lock/unlock has ~25ns o
 | `nbd/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
 | `nbd/pack_index.rs` | `HostPackIndex`: `DashMap<Blake3Hash, PackLocation>` for cross-export dedup |
 | `nbd/pack_registry.rs` | Per-export pack ID tracking for garbage collection |
+| `nbd/capacity_monitor.rs` | SSD capacity monitor: `statvfs` polling, flush backpressure escalation/recovery |
 | `nbd/content_store.rs` | S3 PUT/GET for packs and manifests via `object_store` crate |
 | `nbd/manifest.rs` | Binary manifest serialization/deserialization (GLDE format) |
 | `nbd/flush_scheduler.rs` | `DemandDriven` or `Continuous` flush modes with `tokio::select!` |
@@ -592,6 +608,7 @@ Each export's page tables share an `Arc<AtomicUsize>` budget counter. Page alloc
 | Process crash mid-S3-sync | Orphaned packs in S3 | Harmless: packs are immutable, GC can clean up unreferenced packs |
 | S3 sustained outage | Circuit breaker opens | Reads from local SSD continue; writes accumulate locally; breaker probes S3 every 30s |
 | Metadata budget exhaustion | `ENOSPC` to guest | Guest sees write failure; existing data intact; flush frees budget by clearing dirty blocks |
+| Local SSD full | `ENOSPC` to guest (NBD_ENOSPC, not EIO) | Capacity monitor escalates flush → Continuous(2s/10s); dirty blocks drain to S3, freeing physical space |
 
 ## Testing
 
