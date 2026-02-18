@@ -192,6 +192,7 @@ impl WriteCache<Active> {
             if actual_hash != hash {
                 return Err(CacheError::HashMismatch {
                     expected: format!("{:?}", hash),
+                    actual: format!("{:?}", actual_hash),
                 });
             }
 
@@ -279,6 +280,7 @@ impl WriteCache<Active> {
                 if actual_hash != entry.hash {
                     return Err(CacheError::HashMismatch {
                         expected: format!("{:?}", entry.hash),
+                        actual: format!("{:?}", actual_hash),
                     });
                 }
 
@@ -310,6 +312,7 @@ impl WriteCache<Active> {
                 if actual_hash != entry.hash {
                     return Err(CacheError::HashMismatch {
                         expected: format!("{:?}", entry.hash),
+                        actual: format!("{:?}", actual_hash),
                     });
                 }
 

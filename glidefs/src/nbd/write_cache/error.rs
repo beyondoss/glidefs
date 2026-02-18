@@ -26,8 +26,8 @@ pub enum CacheError {
     #[error("Content store error: {0}")]
     ContentStore(#[from] ContentStoreError),
 
-    #[error("Block hash mismatch: expected {expected}")]
-    HashMismatch { expected: String },
+    #[error("Block hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
 
     #[error("Block not found in any tier: {hash:?}")]
     BlockNotFound { hash: Blake3Hash },

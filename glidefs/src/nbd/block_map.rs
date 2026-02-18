@@ -16,7 +16,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use dashmap::DashMap;
+
 
 // ============================================================================
 // Blake3Hash -- 16-byte truncated content hash
@@ -190,17 +190,6 @@ struct HashEntry {
 }
 // 32 bytes per entry. Two entries per 64-byte cache line.
 
-impl HashEntry {
-    const fn new() -> Self {
-        HashEntry {
-            version: AtomicU32::new(0),
-            _pad: 0,
-            hash_lo: AtomicU64::new(0),
-            hash_hi: AtomicU64::new(0),
-            sequence: AtomicU64::new(0),
-        }
-    }
-}
 
 /// A page of 128 hash entries (4096 bytes = one OS page).
 #[repr(C, align(4096))]
@@ -362,7 +351,6 @@ impl AtomicBlockMap {
     // -- Public API -----------------------------------------------------------
 
     /// Allocate a new block map with all entries zeroed (no pages allocated).
-    #[cfg(test)]
     pub fn new(device_size: u64, chunk_size: u32) -> Self {
         let num_chunks = device_size.div_ceil(chunk_size as u64) as usize;
         let num_pages = num_chunks.div_ceil(HASH_PAGE_SIZE);
@@ -1183,15 +1171,20 @@ pub fn lz4_decompress(
 /// Overlay block map for forked VMs.
 ///
 /// Shares the parent's data via `Arc<BlockMap>` and stores only divergent
-/// entries in a concurrent `DashMap`. Reads check the overlay first and fall
-/// back to the parent. Writes always go to the overlay, never touching the
-/// parent.
+/// entries in a sparse `AtomicBlockMap`. Reads check the overlay first and
+/// fall back to the parent. Writes always go to the overlay, never touching
+/// the parent.
+///
+/// The overlay uses the same page-table infrastructure as the `Full` variant,
+/// giving genuinely lock-free reads and writes (SeqLock per entry, no shard
+/// locks). Pages are allocated on first write to each 128-entry region.
 ///
 /// This allows many forks to share the same parent memory footprint, paying
 /// only for the entries they actually modify.
 pub struct ForkedBlockMap {
     parent: Arc<BlockMap>,
-    overlay: DashMap<usize, (Blake3Hash, u64)>,
+    overlay: AtomicBlockMap,
+    overlay_count: AtomicUsize,
     num_chunks: usize,
     chunk_size: u32,
     device_size: u64,
@@ -1205,7 +1198,8 @@ impl ForkedBlockMap {
         let device_size = parent.device_size();
         ForkedBlockMap {
             parent,
-            overlay: DashMap::new(),
+            overlay: AtomicBlockMap::new(device_size, chunk_size),
+            overlay_count: AtomicUsize::new(0),
             num_chunks,
             chunk_size,
             device_size,
@@ -1213,19 +1207,43 @@ impl ForkedBlockMap {
     }
 
     /// Read: check overlay first, fall back to parent.
+    ///
+    /// The overlay returns `(ZERO, 0)` for entries that were never written by
+    /// this fork. Since `SequenceNumber` starts at 1, `seq == 0` reliably
+    /// distinguishes "not in overlay" from "fork wrote ZERO placeholder".
     #[inline]
     pub fn get(&self, chunk_index: usize) -> (Blake3Hash, u64) {
-        if let Some(entry) = self.overlay.get(&chunk_index) {
-            return *entry;
+        let (hash, seq) = self.overlay.get(chunk_index);
+        if hash.is_zero() && seq == 0 {
+            let entry = self.parent.get(chunk_index);
+            (entry.hash, entry.sequence)
+        } else {
+            (hash, seq)
         }
-        let entry = self.parent.get(chunk_index);
-        (entry.hash, entry.sequence)
     }
 
     /// Write: inserts into overlay (never touches parent).
+    ///
+    /// Returns `Err(MetadataLimitExceeded)` if the overlay's memory budget
+    /// is exhausted (page allocation failed).
     #[inline]
-    pub fn set(&self, chunk_index: usize, hash: Blake3Hash, sequence: u64) {
-        self.overlay.insert(chunk_index, (hash, sequence));
+    pub fn set(
+        &self,
+        chunk_index: usize,
+        hash: Blake3Hash,
+        sequence: u64,
+    ) -> Result<(), MetadataLimitExceeded> {
+        // Track unique overlay entries for should_flatten() heuristic.
+        // Check before write: if the slot was empty, this is a new entry.
+        let (old_hash, old_seq) = self.overlay.get(chunk_index);
+        let was_empty = old_hash.is_zero() && old_seq == 0;
+
+        self.overlay.set(chunk_index, hash, sequence)?;
+
+        if was_empty {
+            self.overlay_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Produce a `BlockMap` snapshot merging parent + overlay + external flags.
@@ -1236,19 +1254,19 @@ impl ForkedBlockMap {
         let mut entries = Vec::with_capacity(self.num_chunks);
         for i in 0..self.num_chunks {
             let flag = state_map.get(i);
-            if let Some(ov) = self.overlay.get(&i) {
-                let (hash, sequence) = *ov;
-                entries.push(BlockMapEntry {
-                    hash,
-                    flags: flag,
-                    sequence,
-                });
-            } else {
+            let (hash, seq) = self.overlay.get(i);
+            if hash.is_zero() && seq == 0 {
                 let parent_entry = self.parent.get(i);
                 entries.push(BlockMapEntry {
                     hash: parent_entry.hash,
                     flags: flag,
                     sequence: parent_entry.sequence,
+                });
+            } else {
+                entries.push(BlockMapEntry {
+                    hash,
+                    flags: flag,
+                    sequence: seq,
                 });
             }
         }
@@ -1259,17 +1277,17 @@ impl ForkedBlockMap {
         }
     }
 
-    /// Number of entries in the overlay.
+    /// Number of unique entries written to the overlay.
     #[cfg(test)]
     #[inline]
     pub fn overlay_len(&self) -> usize {
-        self.overlay.len()
+        self.overlay_count.load(Ordering::Relaxed)
     }
 
     /// True when the overlay exceeds 50% of parent entries -- should flatten.
     #[inline]
     pub fn should_flatten(&self) -> bool {
-        self.overlay.len() > self.num_chunks / 2
+        self.overlay_count.load(Ordering::Relaxed) > self.num_chunks / 2
     }
 
     /// Merge parent + overlay into a full `AtomicBlockMap`.
@@ -1280,19 +1298,19 @@ impl ForkedBlockMap {
     pub fn flatten(&self) -> AtomicBlockMap {
         let mut entries = Vec::with_capacity(self.num_chunks);
         for i in 0..self.num_chunks {
-            if let Some(ov) = self.overlay.get(&i) {
-                let (hash, sequence) = *ov;
-                entries.push(BlockMapEntry {
-                    hash,
-                    flags: 0,
-                    sequence,
-                });
-            } else {
+            let (hash, seq) = self.overlay.get(i);
+            if hash.is_zero() && seq == 0 {
                 let parent_entry = self.parent.get(i);
                 entries.push(BlockMapEntry {
                     hash: parent_entry.hash,
                     flags: 0,
                     sequence: parent_entry.sequence,
+                });
+            } else {
+                entries.push(BlockMapEntry {
+                    hash,
+                    flags: 0,
+                    sequence: seq,
                 });
             }
         }
@@ -1344,8 +1362,7 @@ impl BlockMapKind {
 
     /// Write hash and sequence for a chunk.
     ///
-    /// Returns `Err(MetadataLimitExceeded)` if the memory budget is exhausted
-    /// (only possible for `Full` maps with a budget set).
+    /// Returns `Err(MetadataLimitExceeded)` if the memory budget is exhausted.
     #[inline]
     pub fn set(
         &self,
@@ -1355,10 +1372,7 @@ impl BlockMapKind {
     ) -> Result<(), MetadataLimitExceeded> {
         match self {
             BlockMapKind::Full(m) => m.set(chunk_index, hash, sequence),
-            BlockMapKind::Forked(m) => {
-                m.set(chunk_index, hash, sequence);
-                Ok(())
-            }
+            BlockMapKind::Forked(m) => m.set(chunk_index, hash, sequence),
         }
     }
 
@@ -1982,7 +1996,7 @@ mod tests {
 
         let forked = ForkedBlockMap::new(Arc::clone(&parent));
         let new_hash = blake3_128(b"diverged");
-        forked.set(42, new_hash, 2);
+        forked.set(42, new_hash, 2).unwrap();
 
         // Fork reads new data
         let (hash, seq) = forked.get(42);
@@ -2015,11 +2029,13 @@ mod tests {
 
         // Write to indices 40..60 (overlap 40..50 with parent, new 50..60)
         for i in 40..60 {
-            forked.set(
-                i,
-                blake3_128(format!("fork-{i}").as_bytes()),
-                100 + i as u64,
-            );
+            forked
+                .set(
+                    i,
+                    blake3_128(format!("fork-{i}").as_bytes()),
+                    100 + i as u64,
+                )
+                .unwrap();
         }
 
         let state_map = SparseStateMap::new(100);
@@ -2063,11 +2079,13 @@ mod tests {
 
         // Write >50 overlay entries (triggers should_flatten)
         for i in 0..60 {
-            forked.set(
-                i,
-                blake3_128(format!("f-{i}").as_bytes()),
-                200 + i as u64,
-            );
+            forked
+                .set(
+                    i,
+                    blake3_128(format!("f-{i}").as_bytes()),
+                    200 + i as u64,
+                )
+                .unwrap();
         }
         assert!(forked.should_flatten());
 
@@ -2117,7 +2135,7 @@ mod tests {
                     let idx = (task_id as usize * 100) + i;
                     let hash =
                         blake3_128(format!("t{task_id}-{i}").as_bytes());
-                    f.set(idx, hash, (task_id as u64) * 1000 + i as u64);
+                    f.set(idx, hash, (task_id as u64) * 1000 + i as u64).unwrap();
                     let _ = f.get(idx);
                 }
             }));

@@ -27,9 +27,17 @@ pub enum ContentStoreError {
 
 /// Returns true for errors that indicate S3 connectivity failure (network,
 /// timeout, 5xx). NotFound, Precondition, etc. are valid S3 responses and
-/// prove the backend is reachable.
+/// prove the backend is reachable — everything else is assumed to be a
+/// connectivity problem.
 fn is_connectivity_error(e: &object_store::Error) -> bool {
-    matches!(e, object_store::Error::Generic { .. })
+    !matches!(
+        e,
+        object_store::Error::NotFound { .. }
+            | object_store::Error::AlreadyExists { .. }
+            | object_store::Error::Precondition { .. }
+            | object_store::Error::NotModified { .. }
+            | object_store::Error::NotSupported { .. }
+    )
 }
 
 pub struct ContentStore {

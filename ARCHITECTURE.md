@@ -198,22 +198,25 @@ BlockMapKind
     └── Forked(ForkedBlockMap)     ← freshly forked VMs
 ```
 
-`ForkedBlockMap` holds a shared reference to the parent and a sparse overlay of diverged entries:
+`ForkedBlockMap` holds a shared reference to the parent and a sparse `AtomicBlockMap` overlay of diverged entries:
 
 ```
 ForkedBlockMap
-    parent:   Arc<BlockMap>                    ← shared, immutable
-    overlay:  DashMap<usize, (Blake3Hash, u64)> ← only modified entries
+    parent:   Arc<BlockMap>       ← shared, immutable
+    overlay:  AtomicBlockMap      ← sparse page table, lock-free (SeqLock)
 
 Read(chunk_index):
-    overlay[chunk_index]  →  hit? return it
-                          →  miss? parent[chunk_index]
+    overlay.get(chunk_index)
+        → (ZERO, 0)?  parent[chunk_index]     ← not in overlay, fall through
+        → (hash, seq)? return it               ← fork has written here
 
 Write(chunk_index, hash, seq):
-    overlay.insert(chunk_index, (hash, seq))   ← never touches parent
+    overlay.set(chunk_index, hash, seq)        ← never touches parent
 ```
 
-180 forks with ~1% divergence: 10 × 1.3MB (parents) + 180 × ~13KB (overlays) = ~15MB instead of ~260MB.
+The overlay distinguishes "not written by fork" from "wrote ZERO placeholder" using the sequence number: `SequenceNumber` starts at 1, so `(ZERO hash, seq=0)` = not in overlay, `(ZERO hash, seq>0)` = fork wrote deferred-hash placeholder.
+
+180 forks with ~1% divergence: 10 × 1.3MB (parents) + 180 × ~540KB (overlay directory + pages) = ~98MB. More than a DashMap overlay (~4MB) but genuinely lock-free — no shard locks on the write hot path.
 
 ### Auto-Flatten
 
