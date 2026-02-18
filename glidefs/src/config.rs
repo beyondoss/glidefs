@@ -139,6 +139,16 @@ pub struct NbdConfig {
     /// exits with a warning. Set higher for large caches with many dirty blocks.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub shutdown_timeout_secs: Option<u64>,
+
+    /// Max concurrent S3 pack uploads across all exports (default: 128, 0 = unlimited).
+    /// Bounds host-level S3 upload concurrency to prevent connection exhaustion.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_s3_uploads: Option<usize>,
+
+    /// Max concurrent S3 pack downloads across all exports (default: 512, 0 = unlimited).
+    /// Bounds host-level S3 read concurrency on the NBD read path.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_s3_downloads: Option<usize>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -214,6 +224,22 @@ impl NbdConfig {
             self.shutdown_timeout_secs
                 .unwrap_or(Self::DEFAULT_SHUTDOWN_TIMEOUT_SECS),
         )
+    }
+
+    pub const DEFAULT_MAX_S3_UPLOADS: usize = 128;
+
+    /// Max concurrent S3 pack uploads across all exports (default: 128, 0 = unlimited).
+    pub fn max_s3_uploads(&self) -> usize {
+        self.max_s3_uploads
+            .unwrap_or(Self::DEFAULT_MAX_S3_UPLOADS)
+    }
+
+    pub const DEFAULT_MAX_S3_DOWNLOADS: usize = 512;
+
+    /// Max concurrent S3 pack downloads across all exports (default: 512, 0 = unlimited).
+    pub fn max_s3_downloads(&self) -> usize {
+        self.max_s3_downloads
+            .unwrap_or(Self::DEFAULT_MAX_S3_DOWNLOADS)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -499,6 +525,8 @@ impl Settings {
                     scrubber_blocks_per_second: None,
                     wal_sync: None,
                     shutdown_timeout_secs: None,
+                    max_s3_uploads: None,
+                    max_s3_downloads: None,
                 }),
             },
             aws: Some(AwsConfig(aws_config)),

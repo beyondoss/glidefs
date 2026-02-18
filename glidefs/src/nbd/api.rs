@@ -530,6 +530,8 @@ mod tests {
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
             wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
         }))
     }
 

@@ -9,6 +9,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
@@ -44,6 +45,10 @@ pub struct ContentStore {
     object_store: Arc<dyn ObjectStore>,
     base_path: String,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
+    /// Global S3 upload concurrency limit shared across all exports (background flush).
+    upload_semaphore: Option<Arc<Semaphore>>,
+    /// Global S3 download concurrency limit shared across all exports (read path).
+    download_semaphore: Option<Arc<Semaphore>>,
 }
 
 impl ContentStore {
@@ -52,12 +57,26 @@ impl ContentStore {
             object_store,
             base_path: base_path.trim_end_matches('/').to_string(),
             circuit_breaker: None,
+            upload_semaphore: None,
+            download_semaphore: None,
         }
     }
 
     /// Attach a shared circuit breaker for S3 calls.
     pub fn with_circuit_breaker(mut self, cb: Arc<CircuitBreaker>) -> Self {
         self.circuit_breaker = Some(cb);
+        self
+    }
+
+    /// Attach a shared semaphore to limit concurrent S3 uploads across all exports.
+    pub fn with_upload_semaphore(mut self, sem: Arc<Semaphore>) -> Self {
+        self.upload_semaphore = Some(sem);
+        self
+    }
+
+    /// Attach a shared semaphore to limit concurrent S3 downloads across all exports.
+    pub fn with_download_semaphore(mut self, sem: Arc<Semaphore>) -> Self {
+        self.download_semaphore = Some(sem);
         self
     }
 
@@ -83,9 +102,16 @@ impl ContentStore {
     }
 
     /// Upload a pack to S3.
+    ///
+    /// If an upload semaphore is attached, acquires a permit before uploading
+    /// to bound global S3 upload concurrency across all exports.
     #[instrument(skip(self, data), fields(pack_id = %pack_id, size = data.len()))]
     pub async fn put_pack(&self, pack_id: Uuid, data: Vec<u8>) -> Result<(), ContentStoreError> {
         self.check_circuit()?;
+        let _permit = match &self.upload_semaphore {
+            Some(sem) => Some(sem.acquire().await.expect("upload semaphore closed")),
+            None => None,
+        };
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
@@ -113,7 +139,8 @@ impl ContentStore {
     /// Fetch a single compressed block from a pack via S3 range request.
     ///
     /// Returns only the compressed bytes at `[offset..offset+comp_length]` —
-    /// typically ~100KB vs ~3MB for the full pack.
+    /// typically ~100KB vs ~3MB for the full pack. If a download semaphore is
+    /// attached, acquires a permit to bound global S3 read concurrency.
     #[instrument(skip(self), fields(pack_id = %pack_id, offset, comp_length))]
     pub async fn get_block(
         &self,
@@ -122,6 +149,10 @@ impl ContentStore {
         comp_length: u32,
     ) -> Result<bytes::Bytes, ContentStoreError> {
         self.check_circuit()?;
+        let _permit = match &self.download_semaphore {
+            Some(sem) => Some(sem.acquire().await.expect("download semaphore closed")),
+            None => None,
+        };
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
         let start = offset as u64;
@@ -136,6 +167,9 @@ impl ContentStore {
     /// Returns a stream of `Bytes` chunks. The caller can parse the header/index
     /// from early chunks and decompress blocks incrementally as data arrives,
     /// avoiding buffering the full ~3MB pack in memory.
+    ///
+    /// If a download semaphore is attached, a permit is held for the duration of
+    /// the stream (dropped when the returned stream is dropped).
     #[instrument(skip(self), fields(pack_id = %pack_id))]
     pub async fn get_pack_stream(
         &self,
@@ -145,12 +179,19 @@ impl ContentStore {
         ContentStoreError,
     > {
         self.check_circuit()?;
+        let permit = match &self.download_semaphore {
+            Some(sem) => Some(sem.acquire().await.expect("download semaphore closed")),
+            None => None,
+        };
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
         let result = self.object_store.get(&path).await;
         self.record_s3_result(&result);
         let response = result?;
-        let stream = response.into_stream().map(|r| r.map_err(ContentStoreError::from));
+        let stream = response.into_stream().map(move |r| {
+            let _permit = &permit; // hold permit until stream is consumed/dropped
+            r.map_err(ContentStoreError::from)
+        });
         Ok(Box::pin(stream))
     }
 

@@ -155,6 +155,10 @@ pub struct RouterConfig {
     pub clean_cache: Arc<dyn BlockCache>,
     /// Whether to fsync the WAL after each write batch
     pub wal_sync: bool,
+    /// Max concurrent S3 pack uploads across all exports (0 = unlimited).
+    pub max_s3_uploads: usize,
+    /// Max concurrent S3 pack downloads across all exports (0 = unlimited).
+    pub max_s3_downloads: usize,
 }
 
 /// Multi-tenant export router.
@@ -191,6 +195,12 @@ pub struct ExportRouter {
     /// Shared S3 circuit breaker: opens after 5 consecutive failures, probes after 30s.
     s3_circuit_breaker: Arc<CircuitBreaker>,
 
+    /// Global S3 upload concurrency limit (None = unlimited).
+    upload_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+
+    /// Global S3 download concurrency limit (None = unlimited).
+    download_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+
     /// Original flush modes saved before backpressure override.
     /// Empty when no backpressure is active.
     backpressure_saved_modes: parking_lot::Mutex<HashMap<String, FlushMode>>,
@@ -225,6 +235,17 @@ impl ExportRouter {
                 .half_open_permits(3),
         ));
 
+        let upload_semaphore = if config.max_s3_uploads > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(config.max_s3_uploads)))
+        } else {
+            None
+        };
+        let download_semaphore = if config.max_s3_downloads > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(config.max_s3_downloads)))
+        } else {
+            None
+        };
+
         Self {
             exports: RwLock::new(HashMap::new()),
             object_store: config.object_store,
@@ -236,6 +257,8 @@ impl ExportRouter {
             wal_sync: config.wal_sync,
             scrubber_metrics: Arc::new(crate::nbd::scrubber::ScrubberMetrics::new()),
             s3_circuit_breaker,
+            upload_semaphore,
+            download_semaphore,
             backpressure_saved_modes: parking_lot::Mutex::new(HashMap::new()),
             ssd_utilization: AtomicU64::new(0f64.to_bits()),
         }
@@ -506,11 +529,16 @@ impl ExportRouter {
 
         let s3_prefix = format!("{}/nbd/{}", self.db_path, config.s3_prefix());
 
-        // Content-addressed pack storage with circuit breaker
-        let content_store = Arc::new(
-            ContentStore::new(Arc::clone(&self.object_store), &s3_prefix)
-                .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker)),
-        );
+        // Content-addressed pack storage with circuit breaker + concurrency limits
+        let mut cs = ContentStore::new(Arc::clone(&self.object_store), &s3_prefix)
+            .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker));
+        if let Some(sem) = &self.upload_semaphore {
+            cs = cs.with_upload_semaphore(Arc::clone(sem));
+        }
+        if let Some(sem) = &self.download_semaphore {
+            cs = cs.with_download_semaphore(Arc::clone(sem));
+        }
+        let content_store = Arc::new(cs);
         let clean_cache = Arc::clone(&self.clean_cache);
         let pack_index = Arc::clone(&self.pack_index);
 
@@ -1086,9 +1114,10 @@ impl ExportRouter {
             db_path: "test".to_string(),
             cache_dir: temp_dir,
             block_size: 128 * 1024,
-
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
             wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
         })
     }
 }
@@ -1123,9 +1152,10 @@ mod tests {
             db_path: "test".to_string(),
             cache_dir: temp_dir.path().to_path_buf(),
             block_size: 128 * 1024,
-
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
             wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
         })
     }
 
