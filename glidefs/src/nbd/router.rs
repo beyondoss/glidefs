@@ -67,6 +67,9 @@ pub enum RouterError {
     #[error("Content store error: {0}")]
     ContentStore(#[from] crate::nbd::content_store::ContentStoreError),
 
+    #[error("Pack index error: {0}")]
+    PackIndex(#[from] crate::nbd::pack_index::PackIndexError),
+
     #[error("Manifest error: {0}")]
     Manifest(String),
 }
@@ -288,10 +291,16 @@ impl ExportRouter {
         let exports = self.exports.read().await;
         if exports.is_empty() {
             // No active exports — clear everything.
-            let removed = self.pack_index.len();
-            if removed > 0 {
-                self.pack_index.rebuild(&[]);
-                info!(removed, "pruned all pack index entries (no active exports)");
+            match self.pack_index.len() {
+                Ok(removed) if removed > 0 => {
+                    if let Err(e) = self.pack_index.rebuild(&[]) {
+                        warn!("Failed to clear pack index: {e}");
+                        return;
+                    }
+                    info!(removed, "pruned all pack index entries (no active exports)");
+                }
+                Err(e) => warn!("Failed to read pack index length: {e}"),
+                _ => {}
             }
             return;
         }
@@ -299,7 +308,10 @@ impl ExportRouter {
         // Force manifest-hash rebuild on all remaining exports to capture
         // everything flushed up to this moment. No S3 round-trip.
         for state in exports.values() {
-            state.cache.rebuild_manifest_hashes(&self.pack_index);
+            if let Err(e) = state.cache.rebuild_manifest_hashes(&self.pack_index) {
+                warn!("Failed to rebuild manifest hashes: {e}");
+                return;
+            }
         }
 
         // Union of all manifest-referenced hashes across active exports.
@@ -309,13 +321,13 @@ impl ExportRouter {
         }
         drop(exports);
 
-        let removed = self.pack_index.prune_unreferenced(&referenced);
-        if removed > 0 {
-            info!(
-                removed,
-                remaining = self.pack_index.len(),
-                "pruned unreferenced pack index entries"
-            );
+        match self.pack_index.prune_unreferenced(&referenced) {
+            Ok(removed) if removed > 0 => {
+                let remaining = self.pack_index.len().unwrap_or(0);
+                info!(removed, remaining, "pruned unreferenced pack index entries");
+            }
+            Err(e) => warn!("Failed to prune pack index: {e}"),
+            _ => {}
         }
     }
 
@@ -579,7 +591,7 @@ impl ExportRouter {
                     comp_length: entry.comp_length,
                 })
             }).collect();
-            pack_index.insert_batch(&batch);
+            pack_index.insert_batch(&batch)?;
 
             info!(
                 "Loaded manifest '{}': {} block entries, {} pack entries, seq={}",
@@ -1065,16 +1077,28 @@ impl ExportRouter {
             warn!("Flush scheduler for '{}' panicked: {}", name, e);
         }
 
-        // 3. V2 drain: flush remaining dirty data
+        // 3. V2 drain: flush remaining dirty data.
+        //    Continue on errors (may be transient S3 failures) instead of
+        //    breaking — matches the public ExportState::drain() behavior.
+        let mut drain_done = false;
         for _ in 0..MAX_DRAIN_ITERATIONS {
             match cache.flush_to_s3(&content_store, &pack_index).await {
-                Ok(stats) if stats.blocks_flushed == 0 => break,
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("Failed to drain export '{}': {}", name, e);
+                Ok(stats) if stats.blocks_flushed == 0 => {
+                    drain_done = true;
                     break;
                 }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Drain error for '{}' (retrying): {}", name, e);
+                }
             }
+        }
+        if !drain_done {
+            warn!(
+                "Teardown drain for '{}' incomplete, {} dirty blocks remain",
+                name,
+                cache.dirty_block_count()
+            );
         }
 
         // 4. Drop the handler (releases its Arc clone)

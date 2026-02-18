@@ -214,7 +214,7 @@ async fn create_reader_from_manifest(
 
     // Rebuild pack_index from manifest
     let pack_index = HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
-    pack_index.rebuild(std::slice::from_ref(&manifest));
+    pack_index.rebuild(std::slice::from_ref(&manifest)).unwrap();
 
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),

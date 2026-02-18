@@ -65,9 +65,9 @@ pub async fn run_bless(
                 }
             }
         }
-        pack_index.rebuild(&manifests);
+        pack_index.rebuild(&manifests)?;
         info!(
-            entries = pack_index.len(),
+            entries = pack_index.len()?,
             "dedup index loaded from {} manifest(s)",
             manifests.len()
         );
@@ -111,7 +111,7 @@ pub async fn run_bless(
         });
 
         // Dedup: skip if already in pack index (from prior base images)
-        if pack_index.contains(&hash) {
+        if pack_index.contains(&hash)? {
             stats.deduped_chunks += 1;
             continue;
         }
@@ -145,7 +145,7 @@ pub async fn run_bless(
         );
     }
 
-    let pack_entries = pack_index.derive_for_block_map(&block_map);
+    let pack_entries = pack_index.derive_for_block_map(&block_map)?;
 
     // Collect hot set chunk indices before block_entries is moved into the manifest
     let hot_set_chunks: Vec<u64> = block_entries.iter().map(|e| e.chunk_index).collect();
@@ -234,7 +234,7 @@ async fn upload_pack(
             comp_length: entry.comp_length,
         })
     }).collect();
-    pack_index.insert_batch(&pi_entries);
+    pack_index.insert_batch(&pi_entries)?;
 
     stats.packs_uploaded += 1;
     stats.bytes_uploaded += pack_size;
@@ -288,7 +288,7 @@ mod tests {
                     manifests.push(m);
                 }
             }
-            pack_index.rebuild(&manifests);
+            pack_index.rebuild(&manifests)?;
         }
 
         let device_size = image_data.len() as u64;
@@ -318,7 +318,7 @@ mod tests {
                 flags: 0,
             });
 
-            if pack_index.contains(&hash) {
+            if pack_index.contains(&hash)? {
                 stats.deduped_chunks += 1;
                 continue;
             }
@@ -349,7 +349,7 @@ mod tests {
             );
         }
 
-        let pack_entries = pack_index.derive_for_block_map(&block_map);
+        let pack_entries = pack_index.derive_for_block_map(&block_map)?;
 
         // Collect hot set chunk indices before block_entries is moved into the manifest
         let hot_set_chunks: Vec<u64> = block_entries.iter().map(|e| e.chunk_index).collect();

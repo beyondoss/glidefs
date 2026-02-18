@@ -63,7 +63,14 @@ pub async fn scrubber(
     let interval = Duration::from_micros(1_000_000 / config.blocks_per_second);
 
     loop {
-        let hashes = pack_index.all_hashes();
+        let hashes = match pack_index.all_hashes() {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("scrubber: failed to read pack index: {e}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+        };
         let mut ticker = tokio::time::interval(interval);
         let mut checked = 0u64;
         let mut evicted = 0u64;

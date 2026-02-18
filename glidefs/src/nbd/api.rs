@@ -419,7 +419,7 @@ where
             // Host-level pack index size (content-addressed dedup entries)
             {
                 use std::fmt::Write;
-                let entries = router.pack_index().len();
+                let entries = router.pack_index().len().unwrap_or(0);
                 writeln!(output, "# HELP glidefs_pack_index_entries Number of entries in the host-level pack index").unwrap();
                 writeln!(output, "# TYPE glidefs_pack_index_entries gauge").unwrap();
                 writeln!(output, "glidefs_pack_index_entries {entries}").unwrap();

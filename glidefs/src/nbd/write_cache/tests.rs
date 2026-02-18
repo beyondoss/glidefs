@@ -212,7 +212,7 @@ async fn test_flush_end_to_end() {
     assert_eq!(manifest.chunk_size, 4096);
     assert_eq!(manifest.block_map.len(), 10);
     assert!(!manifest.pack_index.is_empty());
-    assert!(h.pack_index.len() >= 10);
+    assert!(h.pack_index.len().unwrap() >= 10);
 }
 
 #[tokio::test]
@@ -1350,7 +1350,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
         // Verify pack_index has the right hash
         if !expected_hash.is_zero() {
             assert!(
-                pack_index.get(&expected_hash).is_some(),
+                pack_index.get(&expected_hash).unwrap().is_some(),
                 "block {} hash {:?} missing from pack_index after convergence",
                 block_idx,
                 expected_hash,
@@ -1424,15 +1424,15 @@ async fn test_prune_stale_snapshot_loses_entries_regression() {
 
     let new_hashes: Vec<_> = (5u8..8).map(|i| blake3_128(&vec![i + 1; 4096])).collect();
     for hash in &new_hashes {
-        assert!(h.pack_index.get(hash).is_some(), "hash in pack_index before prune");
+        assert!(h.pack_index.get(hash).unwrap().is_some(), "hash in pack_index before prune");
     }
 
     // Prune with stale snapshot → loses the freshly-flushed entries
-    let removed = h.pack_index.prune_unreferenced(&stale_referenced);
+    let removed = h.pack_index.prune_unreferenced(&stale_referenced).unwrap();
     assert!(removed >= 3, "stale prune should remove at least 3 entries");
 
     for hash in &new_hashes {
-        assert!(h.pack_index.get(hash).is_none(), "stale prune loses entries");
+        assert!(h.pack_index.get(hash).unwrap().is_none(), "stale prune loses entries");
     }
 
     // Reads still work via SSD fallback
@@ -1471,24 +1471,24 @@ async fn test_rebuild_manifest_hashes_prevents_prune_loss() {
 
     let all_hashes: Vec<_> = (0u8..8).map(|i| blake3_128(&vec![i + 1; 4096])).collect();
     for hash in &all_hashes {
-        assert!(h.pack_index.get(hash).is_some(), "all hashes in pack_index before prune");
+        assert!(h.pack_index.get(hash).unwrap().is_some(), "all hashes in pack_index before prune");
     }
 
     // The fix: rebuild manifest hashes before pruning (what prune_pack_index does)
-    h.cache.rebuild_manifest_hashes(&h.pack_index);
+    h.cache.rebuild_manifest_hashes(&h.pack_index).unwrap();
     let referenced = h.cache.referenced_hashes();
 
     // All 8 hashes should be in the referenced set
     assert!(referenced.len() >= 8, "rebuild should capture all 8 hashes, got {}", referenced.len());
 
     // Prune with manifest-based referenced set → nothing removed
-    let removed = h.pack_index.prune_unreferenced(&referenced);
+    let removed = h.pack_index.prune_unreferenced(&referenced).unwrap();
     assert_eq!(removed, 0, "rebuild_manifest_hashes should prevent any pruning");
 
     // All entries still present
     for (i, hash) in all_hashes.iter().enumerate() {
         assert!(
-            h.pack_index.get(hash).is_some(),
+            h.pack_index.get(hash).unwrap().is_some(),
             "block {} hash should survive prune with manifest-based referenced set",
             i,
         );
@@ -1499,4 +1499,290 @@ async fn test_rebuild_manifest_hashes_prevents_prune_loss() {
         let data = h.read(i as u64 * 4096, 4096).await;
         assert!(data.iter().all(|&b| b == i + 1), "block {} readable", i);
     }
+}
+
+/// CRC32 mismatch at flush time: block is skipped, CRC32 is cleared,
+/// next checkpoint recomputes, next flush succeeds.
+#[tokio::test]
+async fn test_crc32_mismatch_skips_block_then_heals() {
+    let h = V2Harness::new().await;
+
+    // Write a block.
+    let original_data = vec![0xABu8; 4096];
+    h.cache.write(0, &original_data, &h.clean_cache).unwrap();
+    assert_eq!(h.cache.dirty_block_count(), 1);
+
+    // Run local checkpoint — computes CRC32 for the dirty block.
+    h.cache.local_checkpoint().unwrap();
+
+    // Verify CRC32 was computed (non-zero).
+    let inner = h.cache.inner();
+    let crc_after_checkpoint = inner.block_map_get_crc32(0);
+    assert_ne!(crc_after_checkpoint, 0, "checkpoint should have computed CRC32");
+
+    // Corrupt the block on SSD (simulate bit rot after checkpoint).
+    let corrupted_data = vec![0xFFu8; 4096];
+    inner.data_file.write_all_at(&corrupted_data, 0).unwrap();
+
+    // Flush should detect CRC32 mismatch and skip the block.
+    let (stats, _seq) = h.cache
+        .flush_packs(&h.content_store, &h.pack_index)
+        .await
+        .unwrap();
+    assert_eq!(stats.blocks_corrupted, 1, "should detect 1 corrupted block");
+    assert_eq!(stats.packs_uploaded, 0, "corrupted block should not be uploaded");
+    assert_eq!(h.cache.dirty_block_count(), 1, "block should remain dirty");
+
+    // CRC32 should have been cleared so next checkpoint can recompute.
+    let crc_after_flush = inner.block_map_get_crc32(0);
+    assert_eq!(crc_after_flush, 0, "CRC32 should be cleared after mismatch");
+
+    // Next checkpoint recomputes CRC32 from the (still corrupted) SSD data.
+    h.cache.local_checkpoint().unwrap();
+    let crc_recomputed = inner.block_map_get_crc32(0);
+    assert_ne!(crc_recomputed, 0, "checkpoint should recompute CRC32");
+    assert_ne!(crc_recomputed, crc_after_checkpoint, "new CRC32 should differ (different data)");
+
+    // Next flush succeeds — CRC32 now matches the (corrupted) SSD data.
+    // This is the inherent limitation of deferred checksumming: if corruption
+    // is persistent, the next checkpoint captures the corrupted state.
+    let (stats2, _seq) = h.cache
+        .flush_packs(&h.content_store, &h.pack_index)
+        .await
+        .unwrap();
+    assert_eq!(stats2.blocks_corrupted, 0, "no mismatch on second flush");
+    assert_eq!(stats2.blocks_flushed, 1);
+}
+
+/// CRC32 is cleared on new writes, so stale checksums don't cause false positives.
+#[tokio::test]
+async fn test_crc32_cleared_on_write() {
+    let h = V2Harness::new().await;
+
+    // Write, checkpoint (compute CRC32).
+    h.cache.write(0, &vec![0xAAu8; 4096], &h.clean_cache).unwrap();
+    h.cache.local_checkpoint().unwrap();
+
+    let inner = h.cache.inner();
+    assert_ne!(inner.block_map_get_crc32(0), 0);
+
+    // Write new data to the same block — CRC32 should be cleared.
+    h.cache.write(0, &vec![0xBBu8; 4096], &h.clean_cache).unwrap();
+    assert_eq!(inner.block_map_get_crc32(0), 0, "write should clear CRC32");
+
+    // Flush without a checkpoint in between — CRC32 is 0, verification skipped.
+    let (stats, _) = h.cache
+        .flush_packs(&h.content_store, &h.pack_index)
+        .await
+        .unwrap();
+    assert_eq!(stats.blocks_corrupted, 0);
+    assert_eq!(stats.blocks_flushed, 1);
+}
+
+/// Partial corruption: multiple dirty blocks, only some corrupted.
+/// Flush should upload the good blocks and skip the bad ones.
+#[tokio::test]
+async fn test_crc32_partial_corruption_flushes_good_blocks() {
+    let h = V2Harness::new().await;
+
+    // Write 5 distinct blocks.
+    for i in 0u8..5 {
+        h.cache.write(i as u64 * 4096, &vec![i + 10; 4096], &h.clean_cache).unwrap();
+    }
+    assert_eq!(h.cache.dirty_block_count(), 5);
+
+    // Checkpoint — computes CRC32 for all 5 dirty blocks.
+    h.cache.local_checkpoint().unwrap();
+
+    let inner = h.cache.inner();
+    for i in 0..5 {
+        assert_ne!(inner.block_map_get_crc32(i), 0, "block {i} should have CRC32");
+    }
+
+    // Corrupt blocks 1 and 3 on SSD (leave 0, 2, 4 intact).
+    inner.data_file.write_all_at(&vec![0xFFu8; 4096], 4096).unwrap();
+    inner.data_file.write_all_at(&vec![0xFEu8; 4096], 3 * 4096).unwrap();
+
+    // Flush: should upload 3 good blocks, skip 2 corrupted.
+    let (stats, _) = h.cache
+        .flush_packs(&h.content_store, &h.pack_index)
+        .await
+        .unwrap();
+    assert_eq!(stats.blocks_corrupted, 2, "blocks 1 and 3 corrupted");
+    assert_eq!(stats.blocks_flushed, 5, "all 5 scanned");
+    assert_eq!(stats.packs_uploaded, 1, "3 good blocks → 1 pack");
+
+    // Good blocks (0, 2, 4) should be clean now; corrupted (1, 3) still dirty.
+    assert_eq!(h.cache.dirty_block_count(), 2, "corrupted blocks remain dirty");
+
+    // CRC32 cleared on corrupted blocks so next checkpoint recomputes.
+    assert_eq!(inner.block_map_get_crc32(1), 0);
+    assert_eq!(inner.block_map_get_crc32(3), 0);
+
+    // Heal: checkpoint recomputes CRC32 from (still corrupted) SSD data.
+    h.cache.local_checkpoint().unwrap();
+    assert_ne!(inner.block_map_get_crc32(1), 0);
+    assert_ne!(inner.block_map_get_crc32(3), 0);
+
+    // Second flush succeeds for the remaining 2 blocks.
+    let (stats2, _) = h.cache
+        .flush_packs(&h.content_store, &h.pack_index)
+        .await
+        .unwrap();
+    assert_eq!(stats2.blocks_corrupted, 0);
+    assert_eq!(stats2.blocks_flushed, 2);
+    assert_eq!(h.cache.dirty_block_count(), 0, "all blocks clean after heal");
+}
+
+/// CRC32 verified correctly on the happy path: checkpoint computes CRC32,
+/// flush verifies it matches, block is uploaded normally.
+///
+/// Also verifies the full CRC32 lifecycle across multiple cycles: write →
+/// checkpoint → flush → write more → checkpoint → flush. CRC32 must be
+/// properly cleared after flush (block transitions to CLEAN) and fresh
+/// writes get new CRC32s.
+#[tokio::test]
+async fn test_crc32_happy_path_multi_cycle() {
+    let h = V2Harness::new().await;
+
+    // Cycle 1: write 3 blocks, checkpoint (computes CRC32), flush.
+    for i in 0u8..3 {
+        h.cache.write(i as u64 * 4096, &vec![i + 10; 4096], &h.clean_cache).unwrap();
+    }
+    h.cache.local_checkpoint().unwrap();
+
+    let inner = h.cache.inner();
+    for i in 0..3 {
+        assert_ne!(inner.block_map_get_crc32(i), 0, "cycle 1: block {i} should have CRC32");
+    }
+
+    let (stats1, _) = h.cache
+        .flush_packs(&h.content_store, &h.pack_index)
+        .await
+        .unwrap();
+    assert_eq!(stats1.blocks_corrupted, 0, "cycle 1: no corruption");
+    assert_eq!(stats1.blocks_flushed, 3);
+    assert_eq!(stats1.packs_uploaded, 1);
+    assert_eq!(h.cache.dirty_block_count(), 0, "cycle 1: all clean");
+
+    // Cycle 2: write 2 new blocks + overwrite 1 existing block.
+    h.cache.write(3 * 4096, &vec![0xDD; 4096], &h.clean_cache).unwrap();
+    h.cache.write(4 * 4096, &vec![0xEE; 4096], &h.clean_cache).unwrap();
+    h.cache.write(0, &vec![0xFF; 4096], &h.clean_cache).unwrap(); // overwrite block 0
+
+    assert_eq!(h.cache.dirty_block_count(), 3);
+
+    // Block 0's CRC32 should be cleared by the overwrite.
+    assert_eq!(inner.block_map_get_crc32(0), 0, "overwrite should clear CRC32");
+
+    h.cache.local_checkpoint().unwrap();
+
+    for idx in [0, 3, 4] {
+        assert_ne!(inner.block_map_get_crc32(idx), 0, "cycle 2: block {idx} should have CRC32");
+    }
+
+    let (stats2, _) = h.cache
+        .flush_packs(&h.content_store, &h.pack_index)
+        .await
+        .unwrap();
+    assert_eq!(stats2.blocks_corrupted, 0, "cycle 2: no corruption");
+    assert_eq!(stats2.blocks_flushed, 3);
+    assert_eq!(h.cache.dirty_block_count(), 0, "cycle 2: all clean");
+}
+
+/// Concurrent writes during flush with CRC32 enabled must never produce
+/// false corruption reports.
+///
+/// When a write lands during flush, the CRC32 from a prior checkpoint
+/// won't match the new SSD data. The seq-number check in the CRC32
+/// mismatch branch disambiguates: if seq changed → CAS failure (retry),
+/// not corruption. This test verifies that invariant under stress.
+///
+/// The assertion: across all flush cycles with concurrent writers,
+/// `blocks_corrupted` is always 0. Any CRC32 mismatch from concurrent
+/// writes is classified as `blocks_cas_failed`.
+#[tokio::test]
+async fn test_crc32_concurrent_writes_never_false_corruption() {
+    use std::sync::Arc;
+    use tokio::task::JoinSet;
+
+    let dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "crc32-conc".to_string(),
+        device_size: 1024 * 1024,
+        block_size: 4096,
+        wal_sync: false,
+    };
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let content_store = Arc::new(crate::nbd::content_store::ContentStore::new(
+        Arc::clone(&object_store),
+        "test-crc32-conc",
+    ));
+    let pack_index = Arc::new(
+        crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap(),
+    );
+    let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = Arc::new(cache.finish_recovery().await.unwrap());
+
+    // Seed blocks with initial data + checkpoint to arm CRC32.
+    for i in 0u8..10 {
+        cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], clean_cache.as_ref())
+            .unwrap();
+    }
+    cache.local_checkpoint().unwrap();
+
+    let mut tasks = JoinSet::new();
+
+    // Flusher: interleaves checkpoints and flush_packs to keep CRC32 active.
+    let total_corrupted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let cache = Arc::clone(&cache);
+        let cs = Arc::clone(&content_store);
+        let pi = Arc::clone(&pack_index);
+        let corrupted = Arc::clone(&total_corrupted);
+        tasks.spawn(async move {
+            for _ in 0..10 {
+                cache.local_checkpoint().unwrap();
+                let (stats, _) = cache.flush_packs(&cs, &pi).await.unwrap();
+                corrupted.fetch_add(stats.blocks_corrupted as u64, std::sync::atomic::Ordering::Relaxed);
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    // Concurrent writers hammering the same blocks during flush.
+    for writer_id in 0..5u8 {
+        let cache = Arc::clone(&cache);
+        let clean_cache = Arc::clone(&clean_cache);
+        tasks.spawn(async move {
+            for round in 0..30u8 {
+                let block_idx = (writer_id as u64 * 2) % 10;
+                let fill = writer_id.wrapping_add(round).wrapping_add(100);
+                cache
+                    .write(block_idx * 4096, &vec![fill; 4096], clean_cache.as_ref())
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+
+    assert_eq!(
+        total_corrupted.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "concurrent writes must never be misclassified as SSD corruption"
+    );
+
+    // Final quiesced flush to verify convergence.
+    cache.local_checkpoint().unwrap();
+    let stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+    assert_eq!(stats.blocks_corrupted, 0);
+    assert_eq!(cache.dirty_block_count(), 0);
 }

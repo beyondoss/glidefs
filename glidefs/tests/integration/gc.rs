@@ -221,7 +221,7 @@ async fn test_fork_registries_independent() {
     };
     let child_cs = ContentStore::new(Arc::clone(&s3) as _, "test");
     let child_pi = glidefs::nbd::pack_index::HostPackIndex::open(child_dir.path().join("pack_index.redb")).unwrap();
-    child_pi.rebuild(std::slice::from_ref(&manifest));
+    child_pi.rebuild(std::slice::from_ref(&manifest)).unwrap();
     let child_cc = glidefs::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     let child_cache = glidefs::nbd::write_cache::WriteCache::open_from_manifest(

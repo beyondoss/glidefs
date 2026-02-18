@@ -170,7 +170,7 @@ impl WriteCache<Active> {
         }
 
         // Tier 2: S3 range request (if block exists in a pack).
-        if let Some(pack_loc) = pack_index.get(&hash) {
+        if let Some(pack_loc) = pack_index.get(&hash)? {
             if let Some(m) = metrics {
                 m.record_cache_miss();
             }
@@ -227,7 +227,7 @@ impl WriteCache<Active> {
     ) -> Result<Bytes, CacheError> {
         use futures::StreamExt;
 
-        let pack_loc = pack_index.get(target_hash).ok_or(CacheError::BlockNotFound { hash: *target_hash })?;
+        let pack_loc = pack_index.get(target_hash)?.ok_or(CacheError::BlockNotFound { hash: *target_hash })?;
 
         let mut stream = match content_store.get_pack_stream(pack_loc.pack_id).await {
             Ok(s) => s,
