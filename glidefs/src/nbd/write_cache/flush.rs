@@ -111,13 +111,12 @@ fn compute_flush_batch(
             let hash = blake3_128(&chunk_buf);
 
             // Zero block or already in pack index → deduped, no upload needed.
-            let compressed = if hash == zero_hash {
-                None
-            } else if host_pack_index.contains(&hash)? {
-                None
-            } else {
-                Some(lz4_compress(&chunk_buf[..]))
-            };
+            let compressed =
+                if hash == zero_hash || host_pack_index.contains(&hash)? {
+                    None
+                } else {
+                    Some(lz4_compress(&chunk_buf[..]))
+                };
 
             Ok(BlockResult::Computed {
                 chunk_index,
