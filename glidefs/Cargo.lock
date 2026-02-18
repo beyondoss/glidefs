@@ -1260,6 +1260,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rand 0.8.5",
+ "rayon",
  "redb",
  "serde",
  "serde_json",

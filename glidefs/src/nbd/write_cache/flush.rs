@@ -29,87 +29,151 @@ struct FlushBatch {
     stats: FlushStats,
 }
 
+/// Per-block result from the parallel compute phase.
+enum BlockResult {
+    /// Successfully computed hash; may include compressed data for upload.
+    Computed {
+        chunk_index: usize,
+        snapshot_seq: u64,
+        hash: Blake3Hash,
+        /// `Some(compressed)` if block is new (not zero, not in pack index).
+        /// `None` if deduped (zero block or already in pack index).
+        compressed: Option<Vec<u8>>,
+    },
+    /// Block skipped due to CRC mismatch or concurrent write.
+    Skipped {
+        cas_failed: bool,
+        corrupted: bool,
+    },
+}
+
 /// CPU-heavy flush computation: read blocks from SSD, verify CRC32, hash, compress, dedup.
 ///
 /// Runs on a blocking thread via `spawn_blocking` to avoid starving the async runtime.
-/// All operations are synchronous: pread (~100μs), crc32, blake3 (~15μs), lz4 (~120μs).
+/// Phase 1 (rayon parallel): pread + crc32 + blake3 + pack-index check + lz4 per block.
+/// Phase 2 (sequential): within-batch dedup via seen_hashes (cheap hash-set insertions).
 fn compute_flush_batch(
     inner: &CacheInner,
     snapshot: &[(usize, u64)],
     host_pack_index: &HostPackIndex,
     zero_hash: Blake3Hash,
 ) -> Result<FlushBatch, CacheError> {
-    let mut stats = FlushStats::default();
+    use rayon::prelude::*;
+
     let block_size = inner.config.block_size;
     let device_size = inner.config.device_size;
-    let mut chunk_buf = vec![0u8; block_size];
+
+    // Phase 1: parallel per-block compute (pread + crc32 + blake3 + pack-index + lz4).
+    // Each rayon task allocates its own read buffer; peak memory = num_threads × block_size.
+    let per_block: Vec<Result<BlockResult, CacheError>> = snapshot
+        .par_iter()
+        .map(|&(chunk_index, snapshot_seq)| {
+            let mut chunk_buf = vec![0u8; block_size];
+
+            let offset = chunk_index as u64 * block_size as u64;
+            let valid_bytes =
+                std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
+            if valid_bytes > 0 {
+                inner
+                    .data_file
+                    .read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
+            }
+            if valid_bytes < block_size {
+                chunk_buf[valid_bytes..].fill(0);
+            }
+
+            // Verify CRC32 if available (detects SSD corruption before BLAKE3).
+            let stored_crc = inner.block_map_get_crc32(chunk_index);
+            if stored_crc != 0 {
+                let computed_crc = crc32fast::hash(&chunk_buf);
+                if computed_crc != stored_crc {
+                    let (_, current_seq) = inner.block_map_get(chunk_index);
+                    if current_seq != snapshot_seq {
+                        return Ok(BlockResult::Skipped {
+                            cas_failed: true,
+                            corrupted: false,
+                        });
+                    }
+                    warn!(
+                        chunk_index,
+                        stored_crc,
+                        computed_crc,
+                        "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
+                    );
+                    inner.block_map_clear_crc32(chunk_index);
+                    return Ok(BlockResult::Skipped {
+                        cas_failed: false,
+                        corrupted: true,
+                    });
+                }
+            }
+
+            let hash = blake3_128(&chunk_buf);
+
+            // Zero block or already in pack index → deduped, no upload needed.
+            let compressed = if hash == zero_hash {
+                None
+            } else if host_pack_index.contains(&hash)? {
+                None
+            } else {
+                Some(lz4_compress(&chunk_buf[..]))
+            };
+
+            Ok(BlockResult::Computed {
+                chunk_index,
+                snapshot_seq,
+                hash,
+                compressed,
+            })
+        })
+        .collect();
+
+    // Phase 2: sequential aggregation — within-batch dedup + stats.
+    let mut stats = FlushStats::default();
     let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
     let mut seen_hashes = std::collections::HashSet::new();
     let mut computed: Vec<(usize, u64, Blake3Hash)> = Vec::new();
 
-    for &(chunk_index, snapshot_seq) in snapshot {
-        stats.blocks_flushed += 1;
-
-        // Read block data from SSD and compute content hash.
-        let offset = chunk_index as u64 * block_size as u64;
-        let valid_bytes =
-            std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
-        if valid_bytes > 0 {
-            inner
-                .data_file
-                .read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
-        }
-        if valid_bytes < block_size {
-            chunk_buf[valid_bytes..].fill(0);
-        }
-
-        // Verify CRC32 if available (detects SSD corruption before BLAKE3).
-        let stored_crc = inner.block_map_get_crc32(chunk_index);
-        if stored_crc != 0 {
-            let computed_crc = crc32fast::hash(&chunk_buf);
-            if computed_crc != stored_crc {
-                // Check if a concurrent write invalidated the CRC32.
-                let (_, current_seq) = inner.block_map_get(chunk_index);
-                if current_seq != snapshot_seq {
-                    // Concurrent write — stale CRC32, block will be retried.
+    for result in per_block {
+        let result = result?;
+        match result {
+            BlockResult::Skipped {
+                cas_failed,
+                corrupted,
+            } => {
+                stats.blocks_flushed += 1;
+                if cas_failed {
                     stats.blocks_cas_failed += 1;
-                    continue;
                 }
-                warn!(
-                    chunk_index,
-                    stored_crc,
-                    computed_crc,
-                    "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
-                );
-                inner.block_map_clear_crc32(chunk_index);
-                stats.blocks_corrupted += 1;
-                continue;
+                if corrupted {
+                    stats.blocks_corrupted += 1;
+                }
+            }
+            BlockResult::Computed {
+                chunk_index,
+                snapshot_seq,
+                hash,
+                compressed,
+            } => {
+                stats.blocks_flushed += 1;
+                computed.push((chunk_index, snapshot_seq, hash));
+
+                match compressed {
+                    None => {
+                        // Zero block or already in pack index.
+                        stats.blocks_deduped += 1;
+                    }
+                    Some(data) => {
+                        // Within-batch dedup: skip if we've already seen this hash.
+                        if !seen_hashes.insert(hash) {
+                            stats.blocks_deduped += 1;
+                        } else {
+                            to_upload.push((hash, data));
+                        }
+                    }
+                }
             }
         }
-
-        let hash = blake3_128(&chunk_buf);
-        computed.push((chunk_index, snapshot_seq, hash));
-
-        // Skip zero blocks — read path returns zeros directly
-        if hash == zero_hash {
-            stats.blocks_deduped += 1;
-            continue;
-        }
-
-        // Skip blocks already in the host pack index (cross-VM dedup)
-        if host_pack_index.contains(&hash)? {
-            stats.blocks_deduped += 1;
-            continue;
-        }
-
-        // Skip duplicate hashes within this flush batch
-        if !seen_hashes.insert(hash) {
-            stats.blocks_deduped += 1;
-            continue;
-        }
-
-        let compressed = lz4_compress(&chunk_buf[..]);
-        to_upload.push((hash, compressed));
     }
 
     Ok(FlushBatch {

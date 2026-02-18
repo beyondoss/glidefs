@@ -66,6 +66,7 @@ redb = "2"
 blake3 = "1.8"
 lz4_flex = "0.12"
 crc32fast = "1.5"
+rayon = "1.11"
 tempfile = "3.21"
 parking_lot = "0.12"
 chrono = { version = "0.4.43", features = ["serde"] }
