@@ -470,7 +470,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 
 ### Why write-behind instead of write-through?
 
-S3 PUT latency is 50-200ms. ZFS issues FLUSH after every snapshot. Write-through would make snapshots take 5-15 seconds instead of <100ms.
+S3 PUT latency is 50-200ms. Write-through would make snapshots take 5-15 seconds instead of <100ms.
 
 Write-behind trades durability for latency: data between the last FLUSH and the next S3 sync is at risk if the host dies. This is acceptable because:
 
@@ -543,14 +543,6 @@ Matches ZFS default recordsize. Analysis in `BLOCK_SIZE_ANALYSIS.md` shows 128KB
 ### Why typestate instead of runtime state checks?
 
 Compile-time prevention of invalid operations. You literally cannot call `write()` on a `WriteCache<Recovering>` — the method doesn't exist for that type parameter. No runtime cost, no forgotten state checks.
-
-### Why no block-level compression?
-
-1. ZFS handles compression at its layer — double-compression wastes CPU
-2. Would break the fixed block size assumption (compressed blocks vary in size)
-3. Content addressing relies on consistent hashing — compressing before hashing would prevent dedup across compression changes
-
-LZ4 compression is applied *inside packs* for S3 storage efficiency, not at the block device layer.
 
 ### Why a lock-free circuit breaker?
 
