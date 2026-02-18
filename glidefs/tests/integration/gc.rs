@@ -50,8 +50,8 @@ fn write_blocks(
         let mut data = vec![0u8; BLOCK_SIZE];
         data[0] = seed;
         data[1] = (start + i) as u8;
-        for b in 2..BLOCK_SIZE {
-            data[b] = ((i + b) % 256) as u8;
+        for (b, byte) in data.iter_mut().enumerate().take(BLOCK_SIZE).skip(2) {
+            *byte = ((i + b) % 256) as u8;
         }
         cache.write(offset as u64, &data, clean_cache).unwrap();
     }
@@ -221,7 +221,7 @@ async fn test_fork_registries_independent() {
     };
     let child_cs = ContentStore::new(Arc::clone(&s3) as _, "test");
     let child_pi = glidefs::nbd::pack_index::HostPackIndex::new();
-    child_pi.rebuild(&[manifest.clone()]);
+    child_pi.rebuild(std::slice::from_ref(&manifest));
     let child_cc = glidefs::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     let child_cache = glidefs::nbd::write_cache::WriteCache::open_from_manifest(
@@ -398,7 +398,7 @@ async fn test_gc_respects_max_deletes() {
     // Create orphans: write blocks, flush, overwrite with different data, flush
     write_blocks(&cache, 0, 50, 0, cc.as_ref()); // enough blocks to create multiple packs
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
-    let orphan_count = stats1.new_pack_ids.len();
+    let _orphan_count = stats1.new_pack_ids.len();
 
     write_blocks(&cache, 0, 50, 42, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
@@ -488,7 +488,7 @@ async fn test_gc_fork_then_delete_source() {
     // Delete parent manifest (simulate VM deletion)
     // We need to delete via object_store directly
     let parent_manifest_key =
-        object_store::path::Path::from(format!("test/manifests/parent"));
+        object_store::path::Path::from("test/manifests/parent".to_string());
     s3.delete(&parent_manifest_key).await.unwrap();
 
     // Also delete parent registry

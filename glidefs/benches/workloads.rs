@@ -316,8 +316,8 @@ fn bench_mixed_iops_during_flush(c: &mut Criterion) {
     for (label, read_ratio) in [("70r_30w", 0.7f64), ("50r_50w", 0.5)] {
         group.bench_function(label, |b| {
             b.to_async(&rt).iter_custom(|iters| {
-                let read_ratio = read_ratio;
                 async move {
+                    let read_ratio = read_ratio;
                     let harness = Arc::new(TestHarness::new());
                     let max_block = 200u64;
 

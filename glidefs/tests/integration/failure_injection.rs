@@ -214,7 +214,7 @@ async fn create_reader_from_manifest(
 
     // Rebuild pack_index from manifest
     let pack_index = HostPackIndex::new();
-    pack_index.rebuild(&[manifest.clone()]);
+    pack_index.rebuild(std::slice::from_ref(&manifest));
 
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
