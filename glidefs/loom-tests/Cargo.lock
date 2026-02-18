@@ -49,6 +49,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "glidefs-loom-tests"
+version = "0.0.0"
+dependencies = [
+ "loom",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -251,11 +258,4 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
-]
-
-[[package]]
-name = "zerofs-loom-tests"
-version = "0.0.0"
-dependencies = [
- "loom",
 ]

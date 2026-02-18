@@ -421,9 +421,10 @@ impl AtomicBlockMap {
             let lo = entry.hash_lo.load(Ordering::Relaxed);
             let hi = entry.hash_hi.load(Ordering::Relaxed);
             let seq = entry.sequence.load(Ordering::Relaxed);
-            // Acquire fence: ensures all data loads above complete before the
-            // v2 check below. Without this, ARM could reorder data loads after
-            // the v2 load, causing torn reads even when v1 == v2.
+            // Acquire fence: if any Relaxed data load above observed a writer's
+            // Release store, this fence synchronizes-with that Release —
+            // making the writer's odd version visible to the v2 load below,
+            // which forces a retry and prevents torn reads under C11.
             std::sync::atomic::fence(Ordering::Acquire);
             let v2 = entry.version.load(Ordering::Relaxed);
             if v1 == v2 {
@@ -457,9 +458,15 @@ impl AtomicBlockMap {
         // the subsequent data stores cannot be reordered before this increment
         // on weakly-ordered architectures (ARM/Graviton).
         entry.version.fetch_add(1, Ordering::AcqRel);
-        entry.hash_lo.store(lo, Ordering::Relaxed);
-        entry.hash_hi.store(hi, Ordering::Relaxed);
-        entry.sequence.store(sequence, Ordering::Relaxed);
+        // Release on data stores: if a reader's Relaxed load observes one of
+        // these values, the reader's Acquire fence synchronizes-with this
+        // Release, making the odd version (above) visible to the reader's v2
+        // check — which forces a retry.  Without Release here, a C11 Relaxed
+        // load can see new data while a subsequent Relaxed v2 load still sees
+        // the old (even) version, producing a torn read.
+        entry.hash_lo.store(lo, Ordering::Release);
+        entry.hash_hi.store(hi, Ordering::Release);
+        entry.sequence.store(sequence, Ordering::Release);
         // Increment version to even (signals write complete). Release ensures
         // all data stores above are visible before the version goes even.
         entry.version.fetch_add(1, Ordering::Release);

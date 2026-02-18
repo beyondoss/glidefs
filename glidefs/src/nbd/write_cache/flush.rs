@@ -49,19 +49,31 @@ impl WriteCache<Active> {
         self.inner.config.block_size
     }
 
-    /// Collect all non-zero hashes referenced by this cache's block map.
+    /// Return the cached manifest pack hashes.
     ///
-    /// Used by pack index pruning to determine which entries are still needed.
-    /// Iterates every chunk slot, so cost is O(num_blocks).
+    /// These are the hashes from the most recent manifest build (either from
+    /// `upload_manifest` or `rebuild_manifest_hashes`). Used by pack index
+    /// pruning — the manifest is the durable reference, not the live block_map
+    /// which has ZERO placeholders for in-flight flushes.
     pub fn referenced_hashes(&self) -> std::collections::HashSet<Blake3Hash> {
-        let mut hashes = std::collections::HashSet::new();
-        for idx in 0..self.inner.num_blocks {
-            let (hash, _seq) = self.inner.block_map_get(idx);
-            if !hash.is_zero() {
-                hashes.insert(hash);
-            }
-        }
-        hashes
+        self.inner.manifest_pack_hashes.lock().clone()
+    }
+
+    /// Force-rebuild the cached manifest pack hashes from current state.
+    ///
+    /// Snapshots the block map and derives pack hashes via `derive_for_block_map`,
+    /// capturing everything flushed up to this moment. No S3 round-trip.
+    ///
+    /// Called by `prune_pack_index` immediately before pruning to close the
+    /// timing window between the last manifest upload and the prune call.
+    pub fn rebuild_manifest_hashes(&self, host_pack_index: &HostPackIndex) {
+        let snap = self.inner.block_map_snapshot();
+        let hashes = host_pack_index
+            .derive_for_block_map(&snap)
+            .into_iter()
+            .map(|e| e.hash)
+            .collect();
+        *self.inner.manifest_pack_hashes.lock() = hashes;
     }
 
     /// Save metadata to disk.
@@ -285,6 +297,10 @@ impl WriteCache<Active> {
             block_map: block_map_entries,
             pack_index: pack_entries,
         };
+
+        // Cache the manifest's pack hashes for pack index pruning.
+        *self.inner.manifest_pack_hashes.lock() =
+            manifest.pack_index.iter().map(|e| e.hash).collect();
 
         let etag = content_store
             .put_manifest(&self.inner.export_name, manifest.serialize())

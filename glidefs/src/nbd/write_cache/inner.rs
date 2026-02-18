@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+use std::collections::HashSet;
+
 use crate::nbd::block_map::{
     BlockMap, BlockMapKind, Blake3Hash, MetadataLimitExceeded, SequenceNumber,
     SparseBlockState, SparseStateMap,
@@ -223,6 +225,15 @@ pub(crate) struct CacheInner {
     /// Pre-computed zero-block bytes for this export's block_size.
     /// Avoids a heap allocation on every sparse read.
     pub(super) zero_block_bytes: Bytes,
+
+    /// Cached set of hashes from the most recent manifest build.
+    ///
+    /// Updated on every `upload_manifest()` and on-demand via
+    /// `rebuild_manifest_hashes()`. Used by pack index pruning to
+    /// determine which entries are still needed — the manifest is the
+    /// durable reference, not the live block_map (which has ZERO
+    /// placeholders for in-flight flushes).
+    pub(super) manifest_pack_hashes: Mutex<HashSet<Blake3Hash>>,
 }
 
 impl CacheInner {

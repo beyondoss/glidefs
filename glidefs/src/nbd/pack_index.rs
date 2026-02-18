@@ -84,11 +84,14 @@ impl HostPackIndex {
     /// Retains only entries whose hash appears in `referenced`. Called after
     /// export removal to reclaim memory from departed VMs.
     ///
-    /// **Race note**: If a flush is in-flight, a block may have been uploaded
-    /// and inserted here but the block map still holds ZERO (the CAS back to
-    /// the real hash hasn't landed). Such entries get pruned. This is harmless:
-    /// the block exists on local SSD, so reads fall back to tier 3, and the
-    /// next flush cycle re-uploads it.
+    /// **Caller contract**: The `referenced` set must come from manifest-based
+    /// hashes (via `rebuild_manifest_hashes` + `referenced_hashes`), not from
+    /// a raw block_map scan. The block_map has ZERO placeholders for in-flight
+    /// flushes, which would cause freshly-uploaded entries to be pruned.
+    ///
+    /// `prune_pack_index` in the router forces a manifest-hash rebuild on all
+    /// remaining exports immediately before calling this, which captures
+    /// everything flushed up to that moment.
     ///
     /// Returns the number of entries removed.
     pub fn prune_unreferenced(&self, referenced: &HashSet<Blake3Hash>) -> usize {

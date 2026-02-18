@@ -238,9 +238,14 @@ impl ExportRouter {
 
     /// Prune pack index entries not referenced by any active export.
     ///
-    /// Collects all non-zero hashes from every active export's block map,
-    /// then removes pack index entries that aren't in the set. Cost is
-    /// O(total_blocks + pack_index_entries), runs only on export removal.
+    /// Prune pack index entries not referenced by any active export.
+    ///
+    /// Forces a manifest-hash rebuild on all remaining exports first to
+    /// capture everything flushed up to this moment, then prunes. This
+    /// closes the timing window where a flush inserts into the pack index
+    /// but the block_map still holds ZERO (deferred hash).
+    ///
+    /// Cost: O(present_blocks + pack_index_entries). Runs only on export removal.
     async fn prune_pack_index(&self) {
         let exports = self.exports.read().await;
         if exports.is_empty() {
@@ -253,7 +258,13 @@ impl ExportRouter {
             return;
         }
 
-        // Union of all referenced hashes across active exports.
+        // Force manifest-hash rebuild on all remaining exports to capture
+        // everything flushed up to this moment. No S3 round-trip.
+        for state in exports.values() {
+            state.cache.rebuild_manifest_hashes(&self.pack_index);
+        }
+
+        // Union of all manifest-referenced hashes across active exports.
         let mut referenced = std::collections::HashSet::new();
         for state in exports.values() {
             referenced.extend(state.cache.referenced_hashes());

@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -162,6 +163,7 @@ impl WriteCache<Initializing> {
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
+            manifest_pack_hashes: Mutex::new(HashSet::new()),
         });
 
         info!(
@@ -221,6 +223,8 @@ impl WriteCache<Initializing> {
         let zbh = zero_block_hash(block_size);
         let zbb = Bytes::from(vec![0u8; block_size]);
 
+        let manifest_hashes = manifest.pack_index.iter().map(|e| e.hash).collect();
+
         let inner = Arc::new(CacheInner {
             config,
             data_file,
@@ -234,6 +238,7 @@ impl WriteCache<Initializing> {
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
+            manifest_pack_hashes: Mutex::new(manifest_hashes),
         });
 
         info!("cache opened from manifest, directly Active");
