@@ -260,7 +260,7 @@ impl WriteCache<Active> {
             compute_flush_batch(&inner, &snapshot, &pack_index_clone, zero_hash)
         })
         .await
-        .map_err(|e| CacheError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
+        .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
 
         let mut stats = batch.stats;
 

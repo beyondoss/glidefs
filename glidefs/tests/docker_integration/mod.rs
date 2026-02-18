@@ -112,6 +112,8 @@ impl TestServer {
             block_size: 128 * 1024,
             clean_cache,
             wal_sync: false,
+            max_s3_uploads: 128,
+            max_s3_downloads: 512,
         }));
 
         // Pre-bind to get a random port, then release for the server

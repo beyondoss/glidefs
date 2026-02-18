@@ -38,7 +38,7 @@ const DEVICE_SIZE_MB: u64 = 256; // 256MB test device
 struct TestHarness {
     cache: WriteCache<Active>,
     content_store: ContentStore,
-    pack_index: HostPackIndex,
+    pack_index: Arc<HostPackIndex>,
     clean_cache: Arc<dyn BlockCache>,
     metrics: Arc<ExportMetrics>,
     #[allow(dead_code)]
@@ -60,7 +60,7 @@ impl TestHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3), "bench");
-        let pack_index = HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
+        let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         let cache = WriteCache::open(config).expect("Failed to open cache");

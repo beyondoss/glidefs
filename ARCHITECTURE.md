@@ -71,17 +71,15 @@ FlushScheduler
 Scan SparseStateMap for Dirty pages (skip unallocated pages)
     │
     ▼
-For each dirty block:
+For each dirty block (via spawn_blocking — off async runtime):
     ├── Record (chunk_index, sequence) at snapshot time
     ├── Skip: zero_block_hash entries, blocks already in HostPackIndex
-    ├── Read block data from SSD → compute BLAKE3-128 hash (deferred from write)
+    ├── Read block data from SSD → CRC32 verify → BLAKE3-128 hash → LZ4 compress
     └── Dedup check against HostPackIndex
     │
     ▼
-Batch into packs (25 blocks × 128KB = ~3.2MB)
+Assemble packs (25 blocks × 128KB = ~3.2MB, async)
     │
-    ├──► LZ4 compress each block
-    ├──► Assemble pack (GLPK header + index + data)
     └──► ContentStore::put_pack() ──► S3 PUT (concurrent, semaphore-gated)
               │
               ▼
@@ -252,8 +250,6 @@ When the overlay exceeds 50% of the parent's entries, the fork has diverged enou
 
 - **Lock-free state transitions**: State ops (`set_present`, `transition_to_dirty`) use direct CAS on `AtomicU8` — no RwLock. Co-locating state inside `AtomicBlockMap` would force every state transition through the block map's read lock.
 - **Independent per-fork state**: Each fork has its own `SparseStateMap` while sharing the parent's hash data through `Arc<BlockMap>`. The parent never needs mutation.
-- **Shared memory budget**: Both `AtomicBlockMap` and `SparseStateMap` share an `Arc<AtomicUsize>` page budget. When exhausted, writes fail with ENOSPC propagated to the NBD client.
-
 Created via `open_from_manifest()` when a parent block map is provided. (`block_map.rs:SparseStateMap`, `write_cache/init.rs:open_from_manifest`)
 
 ## Device Lifecycle (Typestate)
@@ -645,16 +641,21 @@ Set to 0 for unlimited (tests use this). Permit is acquired before the S3 call a
 
 ### SSD Backpressure
 
-The local SSD is the one resource without explicit bounds — every other critical resource has backpressure (memory: page budget, S3: circuit breaker, Foyer: size limits). With 2000 sparse cache files on a 100GB SSD, physical space can be exhausted. A background capacity monitor polls `statvfs` every 5 seconds and takes escalating action:
+With 2000 sparse cache files on a 100GB SSD, physical space can be exhausted. Two mechanisms provide SSD backpressure:
+
+**1. Write rejection at 95%**: The NBD write handler checks SSD utilization before each write. If SSD > 95% and the write targets blocks not yet present on SSD (would allocate new space), it rejects with `ENOSPC`. Overwrites to already-present blocks are allowed — a VM doing in-place database updates keeps working. (`handler.rs:WRITE_REJECT_THRESHOLD`)
+
+**2. Flush escalation**: A background capacity monitor polls `statvfs` every 5 seconds and takes escalating action:
 
 | SSD Utilization | Action |
 |---|---|
 | < 80% | Normal — no intervention |
 | ≥ 80% | Warn — log + `glidefs_ssd_utilization_ratio` gauge for alerting |
 | ≥ 90% | Escalate — switch flush modes to Continuous(2s/10s) across all exports |
+| ≥ 95% | Reject — new-block writes return ENOSPC (per-write check in handler) |
 | < 80% (recovery) | Restore original flush modes |
 
-The 5µs write path is never touched — the monitor only adjusts background flush aggressiveness via the existing `watch::channel<FlushMode>` that each export's flush scheduler already monitors.
+The flush escalation adjusts background flush aggressiveness via the existing `watch::channel<FlushMode>` that each export's flush scheduler already monitors.
 
 **Why not hole-punch clean blocks?** `fallocate(PUNCH_HOLE)` on CLEAN block regions would reclaim physical SSD space, but it races with `pwrite` at the kernel level. A concurrent guest write could land data via pwrite, then the punch deallocates it — silent data corruption. No userspace CAS ordering prevents this because both are kernel syscalls on the same inode. The escalated flush is the real backpressure: it converts dirty blocks to clean blocks faster, and clean blocks don't contribute to ENOSPC pressure.
 
@@ -663,13 +664,13 @@ The 5µs write path is never touched — the monitor only adjusts background flu
 | File | Purpose |
 |------|---------|
 | `nbd/server.rs` | TCP/Unix socket listener, NBD protocol negotiation, concurrent request dispatch |
-| `nbd/router.rs` | Multi-tenant export manager: create, delete, drain, promote, resize |
-| `nbd/handler.rs` | Thin wrapper dispatching NBD commands (read/write/flush) to WriteCache |
+| `nbd/router.rs` | Multi-tenant export manager: create, delete, drain (concurrent, 16-wide), promote, resize |
+| `nbd/handler.rs` | NBD command dispatch (read/write/flush) with SSD write rejection at 95% |
 | `nbd/write_cache/mod.rs` | `WriteCache<S>` typestate wrapper, `FlushStats`, `SnapshotResult` |
 | `nbd/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, `SparseStateMap` integration, metadata persistence |
 | `nbd/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
 | `nbd/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → S3 → SSD fallback) |
-| `nbd/write_cache/flush.rs` | Dirty block scan, CRC32 checkpoint compute + flush verify, pack assembly, S3 upload, manifest sync |
+| `nbd/write_cache/flush.rs` | Dirty block scan, CRC32 checkpoint compute + flush verify (spawn_blocking), pack assembly, S3 upload, manifest sync |
 | `nbd/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading |
 | `nbd/write_cache/recovery.rs` | WAL replay, dirty block verification after crash |
 | `nbd/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
@@ -795,10 +796,6 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 | 2,000 empty exports | ~1 GB |
 | 2,000 exports, 1% written | ~10 GB |
 
-### Memory Budget
-
-Each export's page tables share an `Arc<AtomicUsize>` budget counter. Page allocation decrements the budget; when exhausted, writes return `MetadataLimitExceeded` → NBD ENOSPC. This prevents a runaway guest from consuming memory budgeted for other VMs. (`block_map.rs:ensure_page`)
-
 ## Failure Modes
 
 | Failure | Impact | Recovery |
@@ -812,8 +809,7 @@ Each export's page tables share an `Arc<AtomicUsize>` budget counter. Page alloc
 | Process crash mid-WAL-write | Torn WAL entry | CRC32 detects; replay stops at corruption, discards torn tail |
 | Process crash mid-S3-sync | Orphaned packs in S3 | Harmless: packs are immutable, GC can clean up unreferenced packs |
 | S3 sustained outage | Circuit breaker opens | Reads from local SSD continue; writes accumulate locally; breaker probes S3 every 30s |
-| Metadata budget exhaustion | `ENOSPC` to guest | Guest sees write failure; existing data intact; flush frees budget by clearing dirty blocks |
-| Local SSD full | `ENOSPC` to guest (NBD_ENOSPC, not EIO) | Capacity monitor escalates flush → Continuous(2s/10s); dirty blocks drain to S3, freeing physical space |
+| Local SSD full | `ENOSPC` to guest (NBD_ENOSPC, not EIO) | Write handler rejects new-block writes at >95% SSD utilization; capacity monitor escalates flush → Continuous(2s/10s); dirty blocks drain to S3, freeing physical space. Overwrites to already-present blocks are still allowed. |
 | SSD failure after flush | **Data loss for CLEAN blocks without pack index entries** | Blocks in CLEAN state have known hashes in the block map. If the pack index (redb on SSD) is also lost, the hash→pack location mapping is gone — no fallback to S3. Recreate VM from base image or last manifest. **Mitigation**: pack index entries for previously-flushed blocks persist in redb across restarts, so the risk window is limited to entries not yet committed. For forked exports, all entries are populated on fork creation. |
 
 ## Testing

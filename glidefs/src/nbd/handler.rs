@@ -72,6 +72,7 @@ impl NBDBlockHandler {
     /// * `device_size` - Size of the block device in bytes
     /// * `readonly` - Whether this export rejects writes
     /// * `metrics` - Shared metrics for tracking I/O statistics
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cache: Arc<WriteCache<Active>>,
         content_store: Arc<ContentStore>,
