@@ -310,7 +310,7 @@ impl CacheInner {
     }
 
     /// Count present blocks (for metrics/logging).
-    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code)]
     pub(super) fn count_present(&self) -> usize {
         self.state_map.count_present()
     }

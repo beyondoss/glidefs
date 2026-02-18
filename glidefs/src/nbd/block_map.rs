@@ -384,11 +384,13 @@ impl AtomicBlockMap {
     }
 
     /// Number of currently allocated pages.
+    #[allow(dead_code)]
     pub fn allocated_pages(&self) -> u64 {
         self.allocated_pages.load(Ordering::Relaxed)
     }
 
     /// Estimated memory usage in bytes (directory + allocated pages).
+    #[allow(dead_code)]
     pub fn memory_usage(&self) -> usize {
         let directory_bytes = self.num_pages * size_of::<AtomicPtr<HashPage>>();
         let page_bytes =
@@ -581,6 +583,7 @@ impl AtomicBlockMap {
     }
 
     /// Set the shared memory budget (call before sharing the map).
+    #[allow(dead_code)]
     pub fn set_budget(&mut self, budget: Arc<AtomicUsize>) {
         self.budget = Some(budget);
     }
@@ -688,28 +691,33 @@ impl SparseStateMap {
     }
 
     /// Set the shared memory budget.
+    #[allow(dead_code)]
     pub fn set_budget(&mut self, budget: Arc<AtomicUsize>) {
         self.budget = Some(budget);
     }
 
     /// Number of entries (total block count).
+    #[allow(dead_code)]
     #[inline]
     pub fn len(&self) -> usize {
         self.num_entries
     }
 
     /// Returns true if the state map has no entries.
+    #[allow(dead_code)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.num_entries == 0
     }
 
     /// Number of currently allocated pages.
+    #[allow(dead_code)]
     pub fn allocated_pages(&self) -> u64 {
         self.allocated_pages.load(Ordering::Relaxed)
     }
 
     /// Estimated memory usage in bytes.
+    #[allow(dead_code)]
     pub fn memory_usage(&self) -> usize {
         let dir_bytes = self.num_pages * size_of::<AtomicPtr<StatePage>>();
         let page_bytes =
@@ -915,6 +923,7 @@ impl SparseStateMap {
 
     /// Load state for a block, returning the `AtomicU8` reference if the page
     /// exists. Used by snapshot to read flags without allocating.
+    #[allow(dead_code)]
     #[inline]
     pub fn load_atomic(&self, idx: usize) -> Option<&AtomicU8> {
         let (page_idx, entry_idx) = Self::split_index(idx);

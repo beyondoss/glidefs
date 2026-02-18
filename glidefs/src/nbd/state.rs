@@ -51,6 +51,7 @@ impl BlockState {
 
     /// Convert from u8 for deserialization.
     /// Unknown values default to Dirty (conservative - will re-sync).
+    #[allow(dead_code)]
     pub fn from_u8(value: u8) -> Self {
         match value {
             0 => BlockState::Clean,
