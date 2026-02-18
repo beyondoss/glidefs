@@ -49,7 +49,8 @@ impl CommandError {
 }
 
 impl From<CacheError> for CommandError {
-    fn from(_: CacheError) -> Self {
+    fn from(err: CacheError) -> Self {
+        tracing::warn!(error = %err, "cache error mapped to EIO");
         CommandError::IoError
     }
 }

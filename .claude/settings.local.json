@@ -33,7 +33,29 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:matklad.github.io)",
       "Bash(RUSTFLAGS=\"--cfg loom\" cargo test:*)",
-      "Bash(cargo +nightly fuzz:*)"
+      "Bash(cargo +nightly fuzz:*)",
+      "WebFetch(domain:fly.io)",
+      "Bash(git -C /Users/jared/Code/Apps/paraglidehq/glidefs log --oneline)",
+      "Bash(python3:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:crates.io)",
+      "WebFetch(domain:lib.rs)",
+      "WebFetch(domain:foyer-rs.github.io)",
+      "Bash(ls:*)",
+      "Bash(cargo metadata:*)",
+      "Bash(gsed:*)",
+      "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/scripts/gen_dedup_images.sh:*)",
+      "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/glidefs/target/release/dedup_measure:*)",
+      "Bash(cargo run:*)",
+      "Bash(bash scripts/gen_dedup_images.sh /tmp/glidefs-dedup-test)",
+      "Bash(xargs:*)",
+      "Bash(docker run:*)",
+      "Skill(audit-impl)",
+      "Bash(echo:*)",
+      "Bash(cargo tree:*)",
+      "Bash(cargo add:*)",
+      "Bash(RUST_LOG=glidefs=debug cargo test:*)",
+      "Bash(rustfmt --check:*)"
     ]
   }
 }

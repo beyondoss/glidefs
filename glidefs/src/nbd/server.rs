@@ -15,7 +15,6 @@ use super::error::{NBDError, Result};
 use super::handler::{NBDBlockHandler, NBDDevice};
 use super::protocol::*;
 use super::router::ExportRouter;
-use crate::config::ExportConfig;
 use bytes::{Bytes, BytesMut};
 use deku::prelude::*;
 use std::net::SocketAddr;
@@ -30,6 +29,11 @@ use tracing::{debug, error, info, warn};
 /// Maximum number of in-flight requests before backpressure kicks in.
 /// This limits memory usage while allowing high concurrency.
 const MAX_INFLIGHT_REQUESTS: usize = 256;
+
+/// Maximum option data size during NBD negotiation (64KB).
+/// NBD option data (export names, info requests) is small; anything larger
+/// is either a bug or a malicious client trying to OOM the server.
+const MAX_OPTION_DATA_LEN: u32 = 64 * 1024;
 
 /// Response to be sent back to the client.
 /// Sent through a channel from handler tasks to the writer task.
@@ -332,6 +336,11 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         &mut self,
         length: u32,
     ) -> Result<(NBDDevice, Arc<NBDBlockHandler>)> {
+        if length > MAX_OPTION_DATA_LEN {
+            return Err(NBDError::Protocol(format!(
+                "export name length {length} exceeds maximum {MAX_OPTION_DATA_LEN}"
+            )));
+        }
         let mut name_buf = vec![0u8; length as usize];
         self.reader.read_exact(&mut name_buf).await?;
 
@@ -442,49 +451,15 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
 
         debug!("GO option for export: '{}'", export_name);
 
-        // Look up handler, auto-create if enabled and not found
+        // Look up handler
         let handler = match self.router.get_handler(&export_name).await {
             Some(h) => h,
             None => {
-                // Check if auto-create is enabled
-                if let Some(size_gb) = self.router.auto_create_size_gb() {
-                    info!(
-                        "Auto-creating export '{}' with size {}GB",
-                        export_name, size_gb
-                    );
-                    let config = ExportConfig {
-                        name: export_name.clone(),
-                        size_gb,
-                        s3_prefix: None,
-                        block_size: None,
-                    };
-
-                    if let Err(e) = self.router.create_export(config, false).await {
-                        warn!("Failed to auto-create export '{}': {}", export_name, e);
-                        self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
-                            .await?;
-                        self.writer.flush().await?;
-                        return Err(NBDError::DeviceNotFound(name_bytes.to_vec()));
-                    }
-
-                    // Now get the handler
-                    match self.router.get_handler(&export_name).await {
-                        Some(h) => h,
-                        None => {
-                            warn!("Export '{}' not found after auto-create", export_name);
-                            self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
-                                .await?;
-                            self.writer.flush().await?;
-                            return Err(NBDError::DeviceNotFound(name_bytes.to_vec()));
-                        }
-                    }
-                } else {
-                    warn!("Export '{}' not found", export_name);
-                    self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
-                        .await?;
-                    self.writer.flush().await?;
-                    return Err(NBDError::DeviceNotFound(name_bytes.to_vec()));
-                }
+                warn!("Export '{}' not found", export_name);
+                self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_UNKNOWN, &[])
+                    .await?;
+                self.writer.flush().await?;
+                return Err(NBDError::DeviceNotFound(name_bytes.to_vec()));
             }
         };
 
@@ -518,12 +493,22 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     }
 
     async fn read_option_data(&mut self, length: u32) -> Result<Vec<u8>> {
+        if length > MAX_OPTION_DATA_LEN {
+            return Err(NBDError::Protocol(format!(
+                "option data length {length} exceeds maximum {MAX_OPTION_DATA_LEN}"
+            )));
+        }
         let mut data = vec![0u8; length as usize];
         self.reader.read_exact(&mut data).await?;
         Ok(data)
     }
 
     async fn drain_option_data(&mut self, length: u32) -> Result<()> {
+        if length > MAX_OPTION_DATA_LEN {
+            return Err(NBDError::Protocol(format!(
+                "option data length {length} exceeds maximum {MAX_OPTION_DATA_LEN}"
+            )));
+        }
         if length > 0 {
             let mut buf = vec![0u8; length as usize];
             self.reader.read_exact(&mut buf).await?;
@@ -658,7 +643,11 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                             Ok(data) => Response::Simple { cookie, error: NBD_SUCCESS, data },
                             Err(ref e) => {
                                 error!(offset, length, error = ?e, "NBD read failed");
-                                Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() }
+                                // Send zeros on read error — many NBD clients (including
+                                // the Linux kernel module) expect `length` bytes of data
+                                // in every read reply, even on error.
+                                let zeros = Bytes::from(vec![0u8; length as usize]);
+                                Response::Simple { cookie, error: e.to_errno(), data: zeros }
                             }
                         };
                         let _ = tx.send(response).await;

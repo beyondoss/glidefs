@@ -4,11 +4,12 @@
 //! Used by orchestrators for microVM scale-to-zero and live migration.
 
 use crate::config::ExportConfig;
+use crate::nbd::flush_scheduler::FlushMode;
 use crate::nbd::metrics::prometheus_header;
 use crate::nbd::router::{ExportRouter, RouterError};
+use url::form_urlencoded;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -19,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Request to create or update an export (PUT /api/exports/{name}).
 /// Name comes from URL path, not body.
@@ -32,6 +33,12 @@ pub struct PutExportRequest {
     pub readonly: bool,
     #[serde(default)]
     pub block_size: Option<usize>,
+    /// If set, fork this export from the named S3 manifest.
+    #[serde(default)]
+    pub manifest_name: Option<String>,
+    /// Flush mode for this export.
+    #[serde(default)]
+    pub flush_mode: Option<FlushMode>,
 }
 
 /// Response for export info.
@@ -40,6 +47,7 @@ pub struct ExportInfoResponse {
     pub name: String,
     pub size_bytes: u64,
     pub readonly: bool,
+    pub flush_mode: Option<FlushMode>,
 }
 
 /// Response for list exports.
@@ -91,30 +99,48 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     json_response(status, &ApiResponse::error(message))
 }
 
+/// Check if an export name is valid: 1-128 chars, alphanumeric/hyphen/underscore/dot,
+/// starting with an alphanumeric character.
+fn is_valid_export_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    first.is_ascii_alphanumeric()
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
 /// Handle API requests.
-async fn handle_request(
+async fn handle_request<B>(
     router: Arc<ExportRouter>,
-    req: Request<Incoming>,
-) -> Result<Response<BoxBody>, Infallible> {
+    req: Request<B>,
+) -> Result<Response<BoxBody>, Infallible>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: std::fmt::Display,
+{
+    let start = std::time::Instant::now();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-    let response = match (method, path_parts.as_slice()) {
+    let response = match (method.clone(), path_parts.as_slice()) {
         // GET /api/exports - List all exports
         (Method::GET, ["api", "exports"]) => {
             let exports = router.list_exports().await;
-            let response = ListExportsResponse {
-                exports: exports
-                    .into_iter()
-                    .map(|e| ExportInfoResponse {
-                        name: e.name,
-                        size_bytes: e.size,
-                        readonly: e.readonly,
-                    })
-                    .collect(),
-            };
-            json_response(StatusCode::OK, &response)
+            let mut responses = Vec::new();
+            for e in exports {
+                let flush_mode = router.get_flush_mode(&e.name).await;
+                responses.push(ExportInfoResponse {
+                    name: e.name,
+                    size_bytes: e.size,
+                    readonly: e.readonly,
+                    flush_mode,
+                });
+            }
+            json_response(StatusCode::OK, &ListExportsResponse { exports: responses })
         }
 
         // PUT /api/exports/{name} - Create or resize export (idempotent)
@@ -124,6 +150,13 @@ async fn handle_request(
         // - Export exists, requested size larger → grow it
         // - Export exists, requested size same/smaller → no-op (success)
         (Method::PUT, ["api", "exports", name]) => {
+            if !is_valid_export_name(name) {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}': must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric", name),
+                ));
+            }
+
             let body = match req.collect().await {
                 Ok(b) => b.to_bytes(),
                 Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
@@ -138,6 +171,13 @@ async fn handle_request(
                     ))
                 }
             };
+
+            if !put_req.size_gb.is_finite() || put_req.size_gb <= 0.0 || put_req.size_gb > 16384.0 {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid size_gb {}: must be between 0 and 16384", put_req.size_gb),
+                ));
+            }
 
             // Check if export already exists
             let existing = router
@@ -177,9 +217,10 @@ async fn handle_request(
                         size_gb: put_req.size_gb,
                         s3_prefix: put_req.s3_prefix,
                         block_size: put_req.block_size,
+                        flush_mode: put_req.flush_mode,
                     };
 
-                    match router.create_export(config, put_req.readonly).await {
+                    match router.create_export(config, put_req.readonly, put_req.manifest_name.as_deref()).await {
                         Ok(()) => json_response(
                             StatusCode::CREATED,
                             &ApiResponse::success(format!("Export '{}' created", name)),
@@ -192,6 +233,7 @@ async fn handle_request(
 
         // GET /api/exports/{name} - Get export info
         (Method::GET, ["api", "exports", name]) => {
+            let flush_mode = router.get_flush_mode(name).await;
             let exports = router.list_exports().await;
             match exports.into_iter().find(|e| e.name == *name) {
                 Some(export) => json_response(
@@ -200,9 +242,42 @@ async fn handle_request(
                         name: export.name,
                         size_bytes: export.size,
                         readonly: export.readonly,
+                        flush_mode,
                     },
                 ),
                 None => error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name)),
+            }
+        }
+
+        // POST /api/exports/{name}/flush-mode - Set flush mode
+        (Method::POST, ["api", "exports", name, "flush-mode"]) => {
+            let body = match req.collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+
+            let mode: FlushMode = match serde_json::from_slice(&body) {
+                Ok(m) => m,
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid JSON: {}", e),
+                    ))
+                }
+            };
+
+            match router.set_flush_mode(name, mode).await {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    &ApiResponse::success(format!("Flush mode updated for '{}'", name)),
+                ),
+                Err(RouterError::ExportNotFound(name)) => {
+                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
 
@@ -215,6 +290,23 @@ async fn handle_request(
                 ),
                 Err(RouterError::ExportNotFound(name)) => {
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // POST /api/exports/{name}/snapshot - Snapshot export to S3 manifest
+        (Method::POST, ["api", "exports", name, "snapshot"]) => {
+            match router.snapshot_export(name).await {
+                Ok(result) => json_response(StatusCode::OK, &result),
+                Err(RouterError::ExportNotFound(name)) => {
+                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
                 }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -229,6 +321,9 @@ async fn handle_request(
                 ),
                 Err(RouterError::ExportNotFound(name)) => {
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
+                }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
                 }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -248,7 +343,10 @@ async fn handle_request(
             let purge = req
                 .uri()
                 .query()
-                .map(|q| q.contains("purge=true"))
+                .map(|q| {
+                    form_urlencoded::parse(q.as_bytes())
+                        .any(|(k, v)| k == "purge" && v == "true")
+                })
                 .unwrap_or(false);
 
             match router.remove_export(name, purge).await {
@@ -259,13 +357,27 @@ async fn handle_request(
                 Err(RouterError::ExportNotFound(name)) => {
                     error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
                 }
+                Err(RouterError::InvalidExportName(_)) => {
+                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
+                }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
 
-        // Health check
+        // Liveness check (process alive)
         (Method::GET, ["health"]) => {
             json_response(StatusCode::OK, &ApiResponse::success("healthy"))
+        }
+
+        // Readiness check (exports serving, cache writable)
+        (Method::GET, ["health", "ready"]) => {
+            let status = router.readiness_check().await;
+            let code = if status.ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            json_response(code, &status)
         }
 
         // GET /metrics - Prometheus metrics for all exports
@@ -277,6 +389,33 @@ async fn handle_request(
                     output.push_str(&snapshot.to_prometheus(&name));
                 }
             }
+            // Global scrubber metrics
+            {
+                use std::sync::atomic::Ordering;
+                let sm = router.scrubber_metrics();
+                let checked = sm.blocks_checked.load(Ordering::Relaxed);
+                let evicted = sm.blocks_evicted.load(Ordering::Relaxed);
+                use std::fmt::Write;
+                writeln!(output, "# HELP glidefs_scrubber_blocks_checked_total Blocks verified by background scrubber").unwrap();
+                writeln!(output, "# TYPE glidefs_scrubber_blocks_checked_total counter").unwrap();
+                writeln!(output, "glidefs_scrubber_blocks_checked_total {checked}").unwrap();
+                writeln!(output, "# HELP glidefs_scrubber_blocks_evicted_total Corrupted blocks evicted by scrubber").unwrap();
+                writeln!(output, "# TYPE glidefs_scrubber_blocks_evicted_total counter").unwrap();
+                writeln!(output, "glidefs_scrubber_blocks_evicted_total {evicted}").unwrap();
+            }
+            // S3 circuit breaker state (0=closed, 1=open, 2=half-open)
+            {
+                use crate::circuit_breaker::CircuitState;
+                use std::fmt::Write;
+                let cb_value = match router.s3_circuit_state() {
+                    CircuitState::Closed { .. } => 0,
+                    CircuitState::Open => 1,
+                    CircuitState::HalfOpen { .. } => 2,
+                };
+                writeln!(output, "# HELP glidefs_s3_circuit_breaker_state S3 circuit breaker state (0=closed, 1=open, 2=half-open)").unwrap();
+                writeln!(output, "# TYPE glidefs_s3_circuit_breaker_state gauge").unwrap();
+                writeln!(output, "glidefs_s3_circuit_breaker_state {cb_value}").unwrap();
+            }
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -287,6 +426,14 @@ async fn handle_request(
         // 404 for everything else
         _ => error_response(StatusCode::NOT_FOUND, "Not found"),
     };
+
+    let status = response.status().as_u16();
+    let elapsed_us = start.elapsed().as_micros();
+    if status >= 500 {
+        warn!(method = %method, path = %path, status, elapsed_us, "API request");
+    } else {
+        info!(method = %method, path = %path, status, elapsed_us, "API request");
+    }
 
     Ok(response)
 }
@@ -346,12 +493,449 @@ impl ApiServer {
     }
 }
 
-// Note: API endpoint tests are covered via the router tests and integration tests.
-// The handle_request function is a thin routing layer over ExportRouter methods.
-// Testing the full HTTP stack with hyper's Incoming type requires complex setup.
-// See tests/integration/ for end-to-end HTTP API tests.
-//
-// The core API functionality is tested through:
-// - router.rs unit tests (create_export, drain_export, promote_export, etc.)
-// - integration tests (multi-node scenarios)
-// - GitHub Actions workflows (full HTTP API with real server)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nbd::cache::SimpleBlockCache;
+    use crate::nbd::router::RouterConfig;
+    use tempfile::TempDir;
+
+    fn create_test_router(temp_dir: &TempDir) -> Arc<ExportRouter> {
+        let s3: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        Arc::new(ExportRouter::new(RouterConfig {
+            object_store: s3,
+            db_path: "test".to_string(),
+            cache_dir: temp_dir.path().to_path_buf(),
+            block_size: 128 * 1024,
+            clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+            wal_sync: false,
+        }))
+    }
+
+    /// Helper to make a request and get the response.
+    async fn request(
+        router: &Arc<ExportRouter>,
+        method: Method,
+        uri: &str,
+        body: Option<&str>,
+    ) -> Response<BoxBody> {
+        let body_bytes = body.unwrap_or("").to_string();
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Full::new(Bytes::from(body_bytes)))
+            .unwrap();
+        handle_request(Arc::clone(router), req).await.unwrap()
+    }
+
+    // =========================================================================
+    // is_valid_export_name tests
+    // =========================================================================
+
+    #[test]
+    fn test_valid_export_names() {
+        assert!(is_valid_export_name("vol1"));
+        assert!(is_valid_export_name("my-vol"));
+        assert!(is_valid_export_name("test.img"));
+        assert!(is_valid_export_name("a"));
+        assert!(is_valid_export_name("A123"));
+        assert!(is_valid_export_name("vol_1"));
+    }
+
+    #[test]
+    fn test_invalid_export_names() {
+        assert!(!is_valid_export_name(""));
+        assert!(!is_valid_export_name("-dash-start"));
+        assert!(!is_valid_export_name(".dot-start"));
+        assert!(!is_valid_export_name("_underscore-start"));
+        assert!(!is_valid_export_name(&"x".repeat(129)));
+        assert!(!is_valid_export_name("has/slash"));
+        assert!(!is_valid_export_name("has space"));
+        assert!(!is_valid_export_name("has@symbol"));
+    }
+
+    #[test]
+    fn test_path_traversal_rejected() {
+        // Dots are allowed within names but ".." sequences should be examined
+        assert!(!is_valid_export_name(".."));
+        assert!(!is_valid_export_name("../escape"));
+        // Note: ".." starts with a dot, which is not alphanumeric, so it's rejected
+        // by the first-char check. "a.." is technically valid per current rules.
+        assert!(is_valid_export_name("a..b")); // dots allowed mid-name
+    }
+
+    #[test]
+    fn test_max_length_boundary() {
+        assert!(is_valid_export_name(&"a".repeat(128)));
+        assert!(!is_valid_export_name(&"a".repeat(129)));
+    }
+
+    // =========================================================================
+    // HTTP handler tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(&router, Method::GET, "/health", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_readiness_endpoint() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(&router, Method::GET, "/health/ready", None).await;
+        // May be OK or SERVICE_UNAVAILABLE depending on state
+        assert!(
+            resp.status() == StatusCode::OK
+                || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_route_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(&router, Method::GET, "/nonexistent", None).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_put_creates_export() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_put_existing_export_is_noop() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        // Create
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        // Same PUT again — should be OK (idempotent)
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_existing_export() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(&router, Method::GET, "/api/exports/vol1", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_export_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(&router, Method::GET, "/api/exports/nope", None).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_list_exports() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(&router, Method::GET, "/api/exports", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_delete_export() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(&router, Method::DELETE, "/api/exports/vol1", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_delete_with_purge() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::DELETE,
+            "/api/exports/vol1?purge=true",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_drain_missing_export_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/nope/drain",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_export_name_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/-bad-name",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_size_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": -1.0}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some("not json"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_endpoint() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(&router, Method::GET, "/metrics", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // =========================================================================
+    // Drain / Promote / Snapshot / Flush-mode endpoint tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_drain_export_success() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/drain",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_promote_export_success() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        // Create a readonly export
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "readonly": true}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/promote",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_promote_nonexistent_export_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/nope/promote",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_export_success() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/snapshot",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_nonexistent_export_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/nope/snapshot",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_flush_mode_set_success() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/flush-mode",
+            Some(r#"{"mode":"continuous","pack_interval_secs":10,"manifest_interval_secs":60}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_flush_mode_nonexistent_export_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/nope/flush-mode",
+            Some(r#"{"mode":"demand_driven"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_flush_mode_invalid_json_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/flush-mode",
+            Some("not json"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}

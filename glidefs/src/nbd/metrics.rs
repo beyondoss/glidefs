@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::Duration;
 
 /// Sample rate for latency histograms: record 1 in N operations.
@@ -52,6 +52,15 @@ pub struct ExportMetrics {
     /// Cache misses (reads that required S3 fetch)
     pub cache_misses: AtomicU64,
 
+    /// Failed S3 PUT operations (pack uploads)
+    pub s3_put_errors: AtomicU64,
+
+    /// Failed S3 GET operations (pack fetches)
+    pub s3_get_errors: AtomicU64,
+
+    /// Failed flush cycles (pack flush or manifest sync)
+    pub flush_errors: AtomicU64,
+
     /// Counter for latency sampling (reduces histogram mutex contention)
     latency_sample_counter: AtomicU64,
 
@@ -66,6 +75,8 @@ pub struct ExportMetrics {
     file_read_latencies: Mutex<LatencyHistogram>,
     /// Local file write latencies (microseconds) - sampled 1:64
     file_write_latencies: Mutex<LatencyHistogram>,
+    /// S3 PUT latencies (microseconds) - sampled 1:64
+    s3_put_latencies: Mutex<LatencyHistogram>,
 }
 
 /// Simple histogram for latency tracking.
@@ -122,6 +133,8 @@ impl LatencyHistogram {
             avg_us: self.avg_us(),
             min_us: self.min_us,
             max_us: self.max_us,
+            sum_us: self.sum_us,
+            buckets: self.buckets,
             p50_bucket: self.percentile_bucket(50),
             p99_bucket: self.percentile_bucket(99),
         }
@@ -151,8 +164,49 @@ pub struct LatencySnapshot {
     pub avg_us: f64,
     pub min_us: u64,
     pub max_us: u64,
+    pub sum_us: u64,
+    /// Raw bucket counts: [<100us, <1ms, <10ms, <100ms, <1s, >=1s]
+    pub buckets: [u64; 6],
     pub p50_bucket: &'static str,
     pub p99_bucket: &'static str,
+}
+
+/// Prometheus `le` boundaries in seconds matching our bucket layout.
+const HISTOGRAM_LE: [&str; 5] = ["0.0001", "0.001", "0.01", "0.1", "1"];
+
+impl LatencySnapshot {
+    /// Emit Prometheus histogram text lines for this latency.
+    ///
+    /// `metric_name` should already include the `_seconds` suffix.
+    /// `label` is the pre-formatted label string like `export="vol1"`.
+    pub fn write_prometheus(&self, out: &mut String, metric_name: &str, label: &str) {
+        use std::fmt::Write;
+        if self.count == 0 {
+            return;
+        }
+        // Cumulative buckets
+        let mut cumulative = 0u64;
+        for (i, le) in HISTOGRAM_LE.iter().enumerate() {
+            cumulative += self.buckets[i];
+            let _ = writeln!(
+                out,
+                "{metric_name}_bucket{{{label},le=\"{le}\"}} {cumulative}"
+            );
+        }
+        // +Inf bucket (total count)
+        cumulative += self.buckets[5];
+        let _ = writeln!(
+            out,
+            "{metric_name}_bucket{{{label},le=\"+Inf\"}} {cumulative}"
+        );
+        // Sum in seconds
+        let _ = writeln!(
+            out,
+            "{metric_name}_sum{{{label}}} {:.6}",
+            self.sum_us as f64 / 1_000_000.0
+        );
+        let _ = writeln!(out, "{metric_name}_count{{{label}}} {}", self.count);
+    }
 }
 
 impl Default for ExportMetrics {
@@ -169,12 +223,16 @@ impl Default for ExportMetrics {
             s3_read_ops: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            s3_put_errors: AtomicU64::new(0),
+            s3_get_errors: AtomicU64::new(0),
+            flush_errors: AtomicU64::new(0),
             latency_sample_counter: AtomicU64::new(0),
             read_latencies: Mutex::new(LatencyHistogram::default()),
             write_latencies: Mutex::new(LatencyHistogram::default()),
             s3_fetch_latencies: Mutex::new(LatencyHistogram::default()),
             file_read_latencies: Mutex::new(LatencyHistogram::default()),
             file_write_latencies: Mutex::new(LatencyHistogram::default()),
+            s3_put_latencies: Mutex::new(LatencyHistogram::default()),
         }
     }
 }
@@ -198,40 +256,34 @@ impl ExportMetrics {
     /// Record read operation latency (sampled to reduce mutex contention).
     #[inline]
     pub fn record_read_latency(&self, duration: Duration) {
-        if self.should_sample()
-            && let Ok(mut hist) = self.read_latencies.lock()
-        {
-            hist.record(duration);
+        if self.should_sample() {
+            self.read_latencies.lock().record(duration);
         }
     }
 
     /// Record write operation latency (sampled to reduce mutex contention).
     #[inline]
     pub fn record_write_latency(&self, duration: Duration) {
-        if self.should_sample()
-            && let Ok(mut hist) = self.write_latencies.lock()
-        {
-            hist.record(duration);
+        if self.should_sample() {
+            self.write_latencies.lock().record(duration);
         }
     }
 
     /// Record S3 fetch latency (sampled to reduce mutex contention).
+    #[allow(dead_code)]
     #[inline]
     pub fn record_s3_fetch_latency(&self, duration: Duration) {
-        if self.should_sample()
-            && let Ok(mut hist) = self.s3_fetch_latencies.lock()
-        {
-            hist.record(duration);
+        if self.should_sample() {
+            self.s3_fetch_latencies.lock().record(duration);
         }
     }
 
     /// Record local file read latency (sampled to reduce mutex contention).
+    #[allow(dead_code)]
     #[inline]
     pub fn record_file_read_latency(&self, duration: Duration) {
-        if self.should_sample()
-            && let Ok(mut hist) = self.file_read_latencies.lock()
-        {
-            hist.record(duration);
+        if self.should_sample() {
+            self.file_read_latencies.lock().record(duration);
         }
     }
 
@@ -239,10 +291,8 @@ impl ExportMetrics {
     #[inline]
     #[allow(dead_code)] // Available for future instrumentation
     pub fn record_file_write_latency(&self, duration: Duration) {
-        if self.should_sample()
-            && let Ok(mut hist) = self.file_write_latencies.lock()
-        {
-            hist.record(duration);
+        if self.should_sample() {
+            self.file_write_latencies.lock().record(duration);
         }
     }
 
@@ -261,7 +311,9 @@ impl ExportMetrics {
     }
 
     /// Record an S3 batch write operation.
+    /// NOTE: Legacy S3BlockStore was the only caller. Kept for metrics API completeness.
     #[inline]
+    #[allow(dead_code)]
     pub fn record_batch_write(&self, bytes: u64) {
         self.s3_bytes_written.fetch_add(bytes, Ordering::Relaxed);
         self.batches_written.fetch_add(1, Ordering::Relaxed);
@@ -275,6 +327,7 @@ impl ExportMetrics {
     }
 
     /// Record an S3 read operation.
+    #[allow(dead_code)]
     #[inline]
     pub fn record_s3_read(&self, bytes: u64) {
         self.s3_bytes_read.fetch_add(bytes, Ordering::Relaxed);
@@ -282,15 +335,44 @@ impl ExportMetrics {
     }
 
     /// Record a cache hit.
+    #[allow(dead_code)]
     #[inline]
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a cache miss.
+    #[allow(dead_code)]
     #[inline]
     pub fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a failed S3 PUT operation.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn record_s3_put_error(&self) {
+        self.s3_put_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a failed S3 GET operation.
+    #[inline]
+    pub fn record_s3_get_error(&self) {
+        self.s3_get_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a failed flush cycle.
+    #[inline]
+    pub fn record_flush_error(&self) {
+        self.flush_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record S3 PUT latency (sampled to reduce mutex contention).
+    #[inline]
+    pub fn record_s3_put_latency(&self, duration: Duration) {
+        if self.should_sample() {
+            self.s3_put_latencies.lock().record(duration);
+        }
     }
 
     /// Get a snapshot of current metrics.
@@ -324,11 +406,12 @@ impl ExportMetrics {
         };
 
         // Get latency snapshots
-        let read_latency = self.read_latencies.lock().ok().map(|h| h.snapshot());
-        let write_latency = self.write_latencies.lock().ok().map(|h| h.snapshot());
-        let s3_fetch_latency = self.s3_fetch_latencies.lock().ok().map(|h| h.snapshot());
-        let file_read_latency = self.file_read_latencies.lock().ok().map(|h| h.snapshot());
-        let file_write_latency = self.file_write_latencies.lock().ok().map(|h| h.snapshot());
+        let read_latency = Some(self.read_latencies.lock().snapshot());
+        let write_latency = Some(self.write_latencies.lock().snapshot());
+        let s3_fetch_latency = Some(self.s3_fetch_latencies.lock().snapshot());
+        let file_read_latency = Some(self.file_read_latencies.lock().snapshot());
+        let file_write_latency = Some(self.file_write_latencies.lock().snapshot());
+        let s3_put_latency = Some(self.s3_put_latencies.lock().snapshot());
 
         MetricsSnapshot {
             guest_bytes_written,
@@ -342,6 +425,9 @@ impl ExportMetrics {
             s3_read_ops: self.s3_read_ops.load(Ordering::Relaxed),
             cache_hits,
             cache_misses,
+            s3_put_errors: self.s3_put_errors.load(Ordering::Relaxed),
+            s3_get_errors: self.s3_get_errors.load(Ordering::Relaxed),
+            flush_errors: self.flush_errors.load(Ordering::Relaxed),
             dirty_blocks: None,
             syncing_blocks: None,
             write_amplification,
@@ -352,6 +438,7 @@ impl ExportMetrics {
             s3_fetch_latency,
             file_read_latency,
             file_write_latency,
+            s3_put_latency,
         }
     }
 }
@@ -371,6 +458,9 @@ pub struct MetricsSnapshot {
     pub s3_read_ops: u64,
     pub cache_hits: u64,
     pub cache_misses: u64,
+    pub s3_put_errors: u64,
+    pub s3_get_errors: u64,
+    pub flush_errors: u64,
 
     // Cache state (populated by router)
     /// Number of dirty blocks waiting to be synced to S3
@@ -409,6 +499,9 @@ pub struct MetricsSnapshot {
     /// Local file write latencies
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_write_latency: Option<LatencySnapshot>,
+    /// S3 PUT latencies
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_put_latency: Option<LatencySnapshot>,
 }
 
 impl MetricsSnapshot {
@@ -428,66 +521,59 @@ impl MetricsSnapshot {
         let label = format!("export=\"{}\"", export_name);
 
         // Guest I/O counters
-        writeln!(out, "glidefs_guest_bytes_written{{{label}}} {}", self.guest_bytes_written).unwrap();
-        writeln!(out, "glidefs_guest_write_ops{{{label}}} {}", self.guest_write_ops).unwrap();
-        writeln!(out, "glidefs_guest_bytes_read{{{label}}} {}", self.guest_bytes_read).unwrap();
-        writeln!(out, "glidefs_guest_read_ops{{{label}}} {}", self.guest_read_ops).unwrap();
+        let _ = writeln!(out, "glidefs_guest_bytes_written_total{{{label}}} {}", self.guest_bytes_written);
+        let _ = writeln!(out, "glidefs_guest_write_ops_total{{{label}}} {}", self.guest_write_ops);
+        let _ = writeln!(out, "glidefs_guest_bytes_read_total{{{label}}} {}", self.guest_bytes_read);
+        let _ = writeln!(out, "glidefs_guest_read_ops_total{{{label}}} {}", self.guest_read_ops);
 
         // S3 I/O counters
-        writeln!(out, "glidefs_s3_bytes_written{{{label}}} {}", self.s3_bytes_written).unwrap();
-        writeln!(out, "glidefs_s3_write_ops{{{label}}} {}", self.s3_write_ops).unwrap();
-        writeln!(out, "glidefs_s3_batches_written{{{label}}} {}", self.batches_written).unwrap();
-        writeln!(out, "glidefs_s3_bytes_read{{{label}}} {}", self.s3_bytes_read).unwrap();
-        writeln!(out, "glidefs_s3_read_ops{{{label}}} {}", self.s3_read_ops).unwrap();
+        let _ = writeln!(out, "glidefs_s3_bytes_written_total{{{label}}} {}", self.s3_bytes_written);
+        let _ = writeln!(out, "glidefs_s3_write_ops_total{{{label}}} {}", self.s3_write_ops);
+        let _ = writeln!(out, "glidefs_s3_batches_written_total{{{label}}} {}", self.batches_written);
+        let _ = writeln!(out, "glidefs_s3_bytes_read_total{{{label}}} {}", self.s3_bytes_read);
+        let _ = writeln!(out, "glidefs_s3_read_ops_total{{{label}}} {}", self.s3_read_ops);
 
         // Cache counters
-        writeln!(out, "glidefs_cache_hits{{{label}}} {}", self.cache_hits).unwrap();
-        writeln!(out, "glidefs_cache_misses{{{label}}} {}", self.cache_misses).unwrap();
+        let _ = writeln!(out, "glidefs_cache_hits_total{{{label}}} {}", self.cache_hits);
+        let _ = writeln!(out, "glidefs_cache_misses_total{{{label}}} {}", self.cache_misses);
+
+        // Error counters
+        let _ = writeln!(out, "glidefs_s3_put_errors_total{{{label}}} {}", self.s3_put_errors);
+        let _ = writeln!(out, "glidefs_s3_get_errors_total{{{label}}} {}", self.s3_get_errors);
+        let _ = writeln!(out, "glidefs_flush_errors_total{{{label}}} {}", self.flush_errors);
 
         // Cache state (gauges)
         if let Some(dirty) = self.dirty_blocks {
-            writeln!(out, "glidefs_dirty_blocks{{{label}}} {dirty}").unwrap();
+            let _ = writeln!(out, "glidefs_dirty_blocks{{{label}}} {dirty}");
         }
         if let Some(syncing) = self.syncing_blocks {
-            writeln!(out, "glidefs_syncing_blocks{{{label}}} {syncing}").unwrap();
+            let _ = writeln!(out, "glidefs_syncing_blocks{{{label}}} {syncing}");
         }
 
         // Derived metrics (gauges)
-        writeln!(out, "glidefs_write_amplification{{{label}}} {:.6}", self.write_amplification).unwrap();
-        writeln!(out, "glidefs_coalesce_ratio{{{label}}} {:.6}", self.coalesce_ratio).unwrap();
-        writeln!(out, "glidefs_cache_hit_rate{{{label}}} {:.6}", self.cache_hit_rate).unwrap();
+        let _ = writeln!(out, "glidefs_write_amplification{{{label}}} {:.6}", self.write_amplification);
+        let _ = writeln!(out, "glidefs_coalesce_ratio{{{label}}} {:.6}", self.coalesce_ratio);
+        let _ = writeln!(out, "glidefs_cache_hit_rate{{{label}}} {:.6}", self.cache_hit_rate);
 
-        // Latency metrics
-        if let Some(ref lat) = self.read_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_read_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_read_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_read_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
-        if let Some(ref lat) = self.write_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_write_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_write_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_write_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
-        if let Some(ref lat) = self.s3_fetch_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_s3_fetch_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_s3_fetch_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_s3_fetch_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
-        if let Some(ref lat) = self.file_read_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_file_read_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_file_read_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_file_read_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
-        if let Some(ref lat) = self.file_write_latency
-            && lat.count > 0 {
-                writeln!(out, "glidefs_file_write_latency_avg_us{{{label}}} {:.2}", lat.avg_us).unwrap();
-                writeln!(out, "glidefs_file_write_latency_max_us{{{label}}} {}", lat.max_us).unwrap();
-                writeln!(out, "glidefs_file_write_latency_count{{{label}}} {}", lat.count).unwrap();
-            }
+        // Latency histograms (Prometheus histogram format)
+        if let Some(ref lat) = self.read_latency {
+            lat.write_prometheus(&mut out, "glidefs_read_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.write_latency {
+            lat.write_prometheus(&mut out, "glidefs_write_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.s3_fetch_latency {
+            lat.write_prometheus(&mut out, "glidefs_s3_fetch_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.file_read_latency {
+            lat.write_prometheus(&mut out, "glidefs_file_read_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.file_write_latency {
+            lat.write_prometheus(&mut out, "glidefs_file_write_latency_seconds", &label);
+        }
+        if let Some(ref lat) = self.s3_put_latency {
+            lat.write_prometheus(&mut out, "glidefs_s3_put_latency_seconds", &label);
+        }
 
         out
     }
@@ -521,34 +607,39 @@ impl MetricsSnapshot {
                 eprintln!("  File Write: {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
                     lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
             }
+        if let Some(ref lat) = self.s3_put_latency
+            && lat.count > 0 {
+                eprintln!("  S3 PUT:     {:>8.0}us avg, {:>8}us max, {} ops (p50: {}, p99: {})",
+                    lat.avg_us, lat.max_us, lat.count, lat.p50_bucket, lat.p99_bucket);
+            }
     }
 }
 
 /// Generate Prometheus metrics header (TYPE and HELP lines).
 /// Call once before iterating exports.
 pub fn prometheus_header() -> &'static str {
-    r#"# HELP glidefs_guest_bytes_written Total bytes written by guest
-# TYPE glidefs_guest_bytes_written counter
-# HELP glidefs_guest_write_ops Total NBD write commands from guest
-# TYPE glidefs_guest_write_ops counter
-# HELP glidefs_guest_bytes_read Total bytes read by guest
-# TYPE glidefs_guest_bytes_read counter
-# HELP glidefs_guest_read_ops Total NBD read commands from guest
-# TYPE glidefs_guest_read_ops counter
-# HELP glidefs_s3_bytes_written Total bytes written to S3
-# TYPE glidefs_s3_bytes_written counter
-# HELP glidefs_s3_write_ops Total blocks written to S3
-# TYPE glidefs_s3_write_ops counter
-# HELP glidefs_s3_batches_written Total S3 batch objects written
-# TYPE glidefs_s3_batches_written counter
-# HELP glidefs_s3_bytes_read Total bytes read from S3
-# TYPE glidefs_s3_bytes_read counter
-# HELP glidefs_s3_read_ops Total S3 read operations
-# TYPE glidefs_s3_read_ops counter
-# HELP glidefs_cache_hits Cache hits (reads served from local cache)
-# TYPE glidefs_cache_hits counter
-# HELP glidefs_cache_misses Cache misses (reads requiring S3 fetch)
-# TYPE glidefs_cache_misses counter
+    r#"# HELP glidefs_guest_bytes_written_total Total bytes written by guest
+# TYPE glidefs_guest_bytes_written_total counter
+# HELP glidefs_guest_write_ops_total Total NBD write commands from guest
+# TYPE glidefs_guest_write_ops_total counter
+# HELP glidefs_guest_bytes_read_total Total bytes read by guest
+# TYPE glidefs_guest_bytes_read_total counter
+# HELP glidefs_guest_read_ops_total Total NBD read commands from guest
+# TYPE glidefs_guest_read_ops_total counter
+# HELP glidefs_s3_bytes_written_total Total bytes written to S3
+# TYPE glidefs_s3_bytes_written_total counter
+# HELP glidefs_s3_write_ops_total Total blocks written to S3
+# TYPE glidefs_s3_write_ops_total counter
+# HELP glidefs_s3_batches_written_total Total S3 batch objects written
+# TYPE glidefs_s3_batches_written_total counter
+# HELP glidefs_s3_bytes_read_total Total bytes read from S3
+# TYPE glidefs_s3_bytes_read_total counter
+# HELP glidefs_s3_read_ops_total Total S3 read operations
+# TYPE glidefs_s3_read_ops_total counter
+# HELP glidefs_cache_hits_total Cache hits (reads served from local cache)
+# TYPE glidefs_cache_hits_total counter
+# HELP glidefs_cache_misses_total Cache misses (reads requiring S3 fetch)
+# TYPE glidefs_cache_misses_total counter
 # HELP glidefs_dirty_blocks Blocks waiting to sync to S3
 # TYPE glidefs_dirty_blocks gauge
 # HELP glidefs_syncing_blocks Blocks currently syncing to S3
@@ -559,6 +650,24 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_coalesce_ratio gauge
 # HELP glidefs_cache_hit_rate Fraction of reads served from cache
 # TYPE glidefs_cache_hit_rate gauge
+# HELP glidefs_s3_put_errors_total Failed S3 PUT operations
+# TYPE glidefs_s3_put_errors_total counter
+# HELP glidefs_s3_get_errors_total Failed S3 GET operations
+# TYPE glidefs_s3_get_errors_total counter
+# HELP glidefs_flush_errors_total Failed flush cycles
+# TYPE glidefs_flush_errors_total counter
+# HELP glidefs_read_latency_seconds NBD read operation latency
+# TYPE glidefs_read_latency_seconds histogram
+# HELP glidefs_write_latency_seconds NBD write operation latency
+# TYPE glidefs_write_latency_seconds histogram
+# HELP glidefs_s3_fetch_latency_seconds S3 block fetch latency
+# TYPE glidefs_s3_fetch_latency_seconds histogram
+# HELP glidefs_file_read_latency_seconds Local file read latency
+# TYPE glidefs_file_read_latency_seconds histogram
+# HELP glidefs_file_write_latency_seconds Local file write latency
+# TYPE glidefs_file_write_latency_seconds histogram
+# HELP glidefs_s3_put_latency_seconds S3 pack upload latency
+# TYPE glidefs_s3_put_latency_seconds histogram
 "#
 }
 

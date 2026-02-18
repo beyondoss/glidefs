@@ -4,14 +4,18 @@
 //! - `NBDBlockHandler`: Thin handler that uses WriteCache for all I/O
 //! - `NBDDevice`: Device descriptor used during NBD transmission phase
 
-use super::block_store::S3BlockStore;
+use super::cache::BlockCache;
+use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
 use super::metrics::ExportMetrics;
+use super::pack_index::HostPackIndex;
+use super::readahead::SequentialDetector;
 use super::state::Active;
 use super::write_cache::WriteCache;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use parking_lot::Mutex;
 use std::time::Instant;
 
 /// NBD device descriptor used during transmission phase.
@@ -33,8 +37,14 @@ pub struct NBDBlockHandler {
     /// The write-behind cache (must be in Active state)
     cache: Arc<WriteCache<Active>>,
 
-    /// S3 block store for read-through caching
-    s3_store: Arc<S3BlockStore>,
+    /// Content-addressed S3 store for v2 pack reads
+    content_store: Arc<ContentStore>,
+
+    /// v2 clean block cache (decompressed blocks from S3 packs)
+    clean_cache: Arc<dyn BlockCache>,
+
+    /// Host-level pack index for hash→pack location lookup
+    pack_index: Arc<HostPackIndex>,
 
     /// Device size in bytes (atomic for live resize)
     device_size: AtomicU64,
@@ -45,6 +55,9 @@ pub struct NBDBlockHandler {
 
     /// I/O metrics for this export
     metrics: Arc<ExportMetrics>,
+
+    /// Sequential read-ahead detector
+    readahead: Mutex<SequentialDetector>,
 }
 
 impl NBDBlockHandler {
@@ -52,23 +65,27 @@ impl NBDBlockHandler {
     ///
     /// # Arguments
     /// * `cache` - Write-behind cache in Active state
-    /// * `s3_store` - S3 block store for read-through caching
     /// * `device_size` - Size of the block device in bytes
     /// * `readonly` - Whether this export rejects writes
     /// * `metrics` - Shared metrics for tracking I/O statistics
     pub fn new(
         cache: Arc<WriteCache<Active>>,
-        s3_store: Arc<S3BlockStore>,
+        content_store: Arc<ContentStore>,
+        clean_cache: Arc<dyn BlockCache>,
+        pack_index: Arc<HostPackIndex>,
         device_size: u64,
         readonly: bool,
         metrics: Arc<ExportMetrics>,
     ) -> Self {
         Self {
             cache,
-            s3_store,
+            content_store,
+            clean_cache,
+            pack_index,
             device_size: AtomicU64::new(device_size),
             readonly: AtomicBool::new(readonly),
             metrics,
+            readahead: Mutex::new(SequentialDetector::new()),
         }
     }
 
@@ -118,8 +135,37 @@ impl NBDBlockHandler {
 
         let data = self
             .cache
-            .read_with_fetch(offset, length as usize, &self.s3_store, &self.metrics)
+            .read_v2(
+                offset,
+                length as usize,
+                self.clean_cache.as_ref(),
+                &self.pack_index,
+                &self.content_store,
+                &self.metrics,
+            )
             .await?;
+
+        // Sequential read-ahead: detect patterns and prefetch next pack
+        {
+            let chunk_size = self.cache.block_size() as u64;
+            let chunk_idx = offset / chunk_size;
+            if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
+                let cache = Arc::clone(&self.cache);
+                let clean_cache = Arc::clone(&self.clean_cache);
+                let pack_index = Arc::clone(&self.pack_index);
+                let content_store = Arc::clone(&self.content_store);
+                tokio::spawn(async move {
+                    let _ = cache
+                        .prefetch_chunk(
+                            readahead_chunk as usize,
+                            clean_cache.as_ref(),
+                            &pack_index,
+                            &content_store,
+                        )
+                        .await;
+                });
+            }
+        }
 
         self.metrics.record_read_latency(start.elapsed());
         Ok(data)
@@ -145,7 +191,7 @@ impl NBDBlockHandler {
         }
 
         self.metrics.record_guest_write(data.len() as u64);
-        self.cache.write(offset, data)?;
+        self.cache.write(offset, data, self.clean_cache.as_ref())?;
 
         if fua {
             self.flush()?;
@@ -234,6 +280,7 @@ impl NBDBlockHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nbd::cache::SimpleBlockCache;
     use crate::nbd::write_cache::WriteCacheConfig;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
@@ -249,11 +296,17 @@ mod tests {
             device_name: "test".to_string(),
             device_size: 1024 * 1024, // 1MB
             block_size: 4096,
+            wal_sync: false,
         };
 
         // Create in-memory S3 store for tests
-        let object_store = Arc::new(InMemory::new());
-        let s3_store = Arc::new(S3BlockStore::new(object_store, "test", 4096));
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+
+        // v2 read path components
+        let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
+        let clean_cache: Arc<dyn BlockCache> =
+            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index = Arc::new(HostPackIndex::new());
 
         // Create metrics for this handler
         let metrics = Arc::new(ExportMetrics::new());
@@ -264,7 +317,9 @@ mod tests {
         let cache = cache.skip_recovery_for_test();
         let handler = NBDBlockHandler::new(
             Arc::new(cache),
-            s3_store,
+            content_store,
+            clean_cache,
+            pack_index,
             1024 * 1024,
             readonly,
             metrics,

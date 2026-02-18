@@ -1,14 +1,24 @@
 pub mod api;
-pub mod block_store;
+pub mod block_map;
+pub mod cache;
 pub mod error;
+pub mod flush_scheduler;
 pub mod handler;
-pub mod lease;
+pub mod content_store;
+pub mod manifest;
+pub mod pack;
+pub mod pack_index;
+pub mod pack_registry;
+pub mod readahead;
+pub mod scrubber;
+
 pub mod metrics;
 pub mod protocol;
 pub mod router;
 pub mod server;
 pub mod state;
 pub mod sync;
+pub mod wal;
 pub mod write_cache;
 
 // Re-export protocol types for fuzzing
@@ -19,8 +29,6 @@ pub use protocol::{
 };
 
 // Re-exports for library API
-#[allow(unused_imports)]
-pub use block_store::S3BlockStore;
 #[allow(unused_imports)]
 pub use metrics::{ExportMetrics, MetricsSnapshot};
 #[allow(unused_imports)]

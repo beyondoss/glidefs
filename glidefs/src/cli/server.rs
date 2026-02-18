@@ -1,6 +1,6 @@
-use crate::bucket_identity;
 use crate::config::Settings;
 use crate::nbd::api::ApiServer;
+use crate::nbd::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
 use crate::nbd::router::ExportRouter;
 use crate::nbd::server::NBDServer;
 use crate::parse_object_store::parse_url_opts;
@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn run_server(config_path: PathBuf) -> Result<()> {
     use tracing_subscriber::EnvFilter;
@@ -42,7 +42,12 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     let url = settings.storage.url.clone();
     let env_vars = settings.cloud_provider_env_vars();
 
-    let (object_store, path_from_url) = parse_url_opts(&url.parse()?, env_vars.into_iter())?;
+    let (object_store, path_from_url) = parse_url_opts(
+        &url.parse()?,
+        env_vars.into_iter(),
+        Some(settings.storage.connect_timeout()),
+        Some(settings.storage.request_timeout()),
+    )?;
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
 
     let db_path = path_from_url.to_string();
@@ -50,15 +55,8 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     info!("Starting GlideFS NBD server with {} backend", object_store);
     info!("Storage path: {}", db_path);
 
-    info!("Checking bucket identity...");
-    let bucket = bucket_identity::BucketIdentity::get_or_create(&object_store, &db_path).await?;
-
-    let cache_dir = settings.cache.dir.join(bucket.cache_directory_name());
-    info!(
-        "Bucket ID: {}, Cache directory: {}",
-        bucket.id(),
-        cache_dir.display()
-    );
+    let cache_dir = settings.cache.dir.clone();
+    info!("Cache directory: {}", cache_dir.display());
 
     // Create cache directory if it doesn't exist
     std::fs::create_dir_all(&cache_dir)?;
@@ -73,30 +71,36 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("NBD server configuration is required"))?;
 
-    // Generate a unique node ID for lease coordination
-    // UUID ensures uniqueness even across restarts
-    let node_id = format!("node-{}", uuid::Uuid::new_v4().as_simple());
-    info!("Node ID for lease coordination: {}", node_id);
+    // Shared clean block cache — foyer HybridCache with memory + SSD tiers
+    let memory_bytes =
+        (settings.cache.memory_size_gb.unwrap_or(1.0) * 1024.0 * 1024.0 * 1024.0) as usize;
+    let ssd_bytes =
+        (settings.cache.ssd_cache_size_gb.unwrap_or(10.0) * 1024.0 * 1024.0 * 1024.0) as usize;
+    let foyer_dir = cache_dir.join("foyer");
+    info!(
+        "Opening clean cache: {}MB memory, {}GB SSD at {}",
+        memory_bytes / (1024 * 1024),
+        ssd_bytes / (1024 * 1024 * 1024),
+        foyer_dir.display(),
+    );
+    let clean_cache: Arc<dyn BlockCache> = Arc::new(
+        FoyerBlockCache::open(FoyerCacheConfig {
+            memory_bytes,
+            ssd_bytes,
+            ssd_dir: foyer_dir,
+        })
+        .await
+        .context("Failed to open foyer clean cache")?,
+    );
 
-    // Create the export router
-    let auto_create_size_gb = nbd_config.auto_create_size_gb();
-    if let Some(size_gb) = auto_create_size_gb {
-        info!(
-            "Auto-create enabled: exports will be created on first NBD connect ({}GB default)",
-            size_gb
-        );
-    }
-
-    let router = Arc::new(ExportRouter::new(
-        Arc::clone(&object_store),
+    let router = Arc::new(ExportRouter::new(crate::nbd::router::RouterConfig {
+        object_store: Arc::clone(&object_store),
         db_path,
         cache_dir,
-        nbd_config.block_size(),
-        nbd_config.blocks_per_batch(),
-        nbd_config.sync_delay_ms(),
-        auto_create_size_gb,
-        node_id,
-    ));
+        block_size: nbd_config.block_size(),
+        clean_cache,
+        wal_sync: nbd_config.wal_sync(),
+    }));
 
     // Discover exports from S3 (recovers exports created via API)
     info!("Discovering exports from S3...");
@@ -108,7 +112,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                     "Discovered export '{}' ({}GB) from S3",
                     config.name, config.size_gb
                 );
-                if let Err(e) = router.create_export(config.clone(), false).await {
+                if let Err(e) = router.create_export(config.clone(), false, None).await {
                     tracing::warn!("Failed to restore export '{}': {}", config.name, e);
                 } else {
                     discovered_count += 1;
@@ -125,9 +129,9 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     // Load static exports from config (can add new exports or override discovered ones)
     let exports = nbd_config.get_exports();
-    if exports.is_empty() && auto_create_size_gb.is_none() && discovered_count == 0 {
+    if exports.is_empty() && discovered_count == 0 {
         return Err(anyhow::anyhow!(
-            "No exports configured or discovered. Add exports to your config file, enable auto_create_size_gb, or use the API to create them."
+            "No exports configured or discovered. Add exports to your config file or use the API to create them."
         ));
     }
 
@@ -137,12 +141,29 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             export_config.name, export_config.size_gb
         );
         router
-            .create_export(export_config.clone(), false)
+            .create_export(export_config.clone(), false, None)
             .await
             .with_context(|| format!("Failed to create export '{}'", export_config.name))?;
     }
 
     let mut handles = Vec::new();
+
+    // Start background scrubber (integrity verification)
+    {
+        use crate::nbd::scrubber::{scrubber, ScrubberConfig};
+        let bps = nbd_config.scrubber_blocks_per_second();
+        if bps > 0 {
+            info!("Starting background scrubber ({} blocks/sec)", bps);
+            let cc = Arc::clone(router.clean_cache());
+            let pi = Arc::clone(router.pack_index());
+            let sm = Arc::clone(router.scrubber_metrics());
+            let shutdown_clone = shutdown.clone();
+            handles.push(spawn_named("scrubber", async move {
+                scrubber(cc, pi, ScrubberConfig { blocks_per_second: bps }, sm, shutdown_clone).await;
+                Ok(())
+            }));
+        }
+    }
 
     // Start NBD TCP servers
     if let Some(addresses) = &nbd_config.addresses {
@@ -209,27 +230,41 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             }
             _ = sigusr1.recv() => {
                 info!("Received SIGUSR1, draining all exports to S3...");
-                if let Err(e) = router.drain_all().await {
-                    tracing::error!("Drain failed: {}", e);
-                } else {
+                let failed = router.drain_all().await;
+                if failed.is_empty() {
                     info!("Drain complete - all exports synced to S3");
+                } else {
+                    tracing::error!(failed = ?failed, "Drain incomplete - {} export(s) failed", failed.len());
                 }
             }
         }
     }
 
+    let shutdown_timeout = nbd_config.shutdown_timeout();
     info!("Cancelling all servers...");
     shutdown.cancel();
 
-    info!("Waiting for servers to exit...");
-    for handle in handles {
-        let _ = handle.await;
-    }
+    match tokio::time::timeout(shutdown_timeout, async {
+        info!("Waiting for servers to exit...");
+        for handle in handles {
+            let _ = handle.await;
+        }
 
-    // Graceful shutdown: drain all exports
-    info!("Final drain before shutdown...");
-    if let Err(e) = router.shutdown().await {
-        tracing::error!("Shutdown drain failed: {}", e);
+        // Graceful shutdown: drain all exports
+        info!("Final drain before shutdown...");
+        if let Err(e) = router.shutdown().await {
+            tracing::error!("Shutdown drain failed: {}", e);
+        }
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(_) => {
+            warn!(
+                "Shutdown timed out after {}s, exiting with possible dirty blocks",
+                shutdown_timeout.as_secs()
+            );
+        }
     }
 
     info!("Shutdown complete");
