@@ -345,7 +345,7 @@ mod tests {
     fn test_pack_incompressible_data() {
         let chunk_size: u32 = 4096;
         // Pseudo-random data that LZ4 cannot compress.
-        let data: Vec<u8> = (0..chunk_size as u32)
+        let data: Vec<u8> = (0..chunk_size)
             .map(|i| {
                 ((i.wrapping_mul(2654435761).wrapping_shr(16)) & 0xFF) as u8
             })

@@ -29,6 +29,12 @@ pub struct ScrubberMetrics {
     pub blocks_evicted: AtomicU64,
 }
 
+impl Default for ScrubberMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScrubberMetrics {
     pub fn new() -> Self {
         Self {

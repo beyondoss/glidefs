@@ -280,10 +280,10 @@ mod tests {
             let mut manifests = Vec::new();
             for base_name in &base_names {
                 let key = format!("bases/{}", base_name);
-                if let Some(data) = content_store.get_manifest(&key).await? {
-                    if let Ok(m) = Manifest::deserialize(&data) {
-                        manifests.push(m);
-                    }
+                if let Some(data) = content_store.get_manifest(&key).await?
+                    && let Ok(m) = Manifest::deserialize(&data)
+                {
+                    manifests.push(m);
                 }
             }
             pack_index.rebuild(&manifests);

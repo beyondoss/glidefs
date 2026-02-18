@@ -74,4 +74,4 @@ jobs:
       - name: Build benchmarks
         run: cargo build --features test-utils --benches
       - name: Run benchmarks
-        run: cargo bench --features test-utils --benches -- --noplot
+        run: cargo bench --features test-utils --benches

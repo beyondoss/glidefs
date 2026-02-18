@@ -98,7 +98,7 @@ impl ContentStore {
         let result = self.object_store.get(&path).await;
         self.record_s3_result(&result);
         let response = result?;
-        let bytes = response.bytes().await.map_err(object_store::Error::from)?;
+        let bytes = response.bytes().await?;
         Ok(bytes.to_vec())
     }
 
@@ -177,7 +177,7 @@ impl ContentStore {
         self.record_s3_result(&result);
         match result {
             Ok(response) => {
-                let bytes = response.bytes().await.map_err(object_store::Error::from)?;
+                let bytes = response.bytes().await?;
                 Ok(Some(bytes.to_vec()))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -225,7 +225,7 @@ impl ContentStore {
         self.record_s3_result(&result);
         match result {
             Ok(response) => {
-                let bytes = response.bytes().await.map_err(object_store::Error::from)?;
+                let bytes = response.bytes().await?;
                 Ok(Some(bytes.to_vec()))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -266,7 +266,7 @@ impl ContentStore {
         self.record_s3_result(&result);
         match result {
             Ok(response) => {
-                let bytes = response.bytes().await.map_err(object_store::Error::from)?;
+                let bytes = response.bytes().await?;
                 Ok(Some(bytes.to_vec()))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),

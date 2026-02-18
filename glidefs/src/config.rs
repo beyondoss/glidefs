@@ -402,7 +402,7 @@ impl Settings {
         if let Some(nbd) = &self.servers.nbd {
             if let Some(bs) = nbd.block_size {
                 anyhow::ensure!(
-                    bs.is_power_of_two() && bs >= 4096 && bs <= 1_048_576,
+                    bs.is_power_of_two() && (4096..=1_048_576).contains(&bs),
                     "block_size must be a power of 2 between 4096 and 1048576, got {}",
                     bs
                 );
@@ -433,7 +433,7 @@ impl Settings {
                 );
                 if let Some(bs) = export.block_size {
                     anyhow::ensure!(
-                        bs.is_power_of_two() && bs >= 4096 && bs <= 1_048_576,
+                        bs.is_power_of_two() && (4096..=1_048_576).contains(&bs),
                         "export '{}': block_size must be a power of 2 between 4096 and 1048576, got {}",
                         export.name,
                         bs

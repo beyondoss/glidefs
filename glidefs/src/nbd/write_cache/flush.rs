@@ -448,12 +448,12 @@ impl WriteCache<Active> {
         if needs_flatten {
             let mut bm = self.inner.block_map.write();
             // Re-check under write lock (another thread may have flattened)
-            if let BlockMapKind::Forked(f) = &*bm {
-                if f.should_flatten() {
-                    let full = f.flatten();
-                    *bm = BlockMapKind::Full(full);
-                    info!("flattened forked block map");
-                }
+            if let BlockMapKind::Forked(f) = &*bm
+                && f.should_flatten()
+            {
+                let full = f.flatten();
+                *bm = BlockMapKind::Full(full);
+                info!("flattened forked block map");
             }
         }
     }

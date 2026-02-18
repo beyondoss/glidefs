@@ -63,11 +63,11 @@ impl GcState {
 
     fn is_eligible(&self, pack_id: &Uuid, grace_period: Duration) -> bool {
         let key = pack_id.to_string();
-        if let Some(ts_str) = self.dead_packs.get(&key) {
-            if let Ok(ts) = ts_str.parse::<DateTime<Utc>>() {
-                let age = Utc::now().signed_duration_since(ts);
-                return age.to_std().unwrap_or(Duration::ZERO) >= grace_period;
-            }
+        if let Some(ts_str) = self.dead_packs.get(&key)
+            && let Ok(ts) = ts_str.parse::<DateTime<Utc>>()
+        {
+            let age = Utc::now().signed_duration_since(ts);
+            return age.to_std().unwrap_or(Duration::ZERO) >= grace_period;
         }
         false
     }
@@ -409,21 +409,15 @@ async fn reconcile_prefix(
                 // For registries not compacted (no deleted packs this run), check separately.
                 if deleted_set.is_empty() {
                     // No packs were deleted this run, so check if registry is already empty
-                    match content_store.get_registry(name).await {
-                        Ok(Some(data)) => {
-                            if let Ok(reg) = PackRegistry::deserialize(&data) {
-                                if reg.is_empty() {
-                                    if let Err(e) =
-                                        content_store.delete_registry(name).await
-                                    {
-                                        warn!(registry = %name, error = %e, "failed to delete empty orphan registry");
-                                    } else {
-                                        stats.registries_deleted += 1;
-                                    }
-                                }
-                            }
+                    if let Ok(Some(data)) = content_store.get_registry(name).await
+                        && let Ok(reg) = PackRegistry::deserialize(&data)
+                        && reg.is_empty()
+                    {
+                        if let Err(e) = content_store.delete_registry(name).await {
+                            warn!(registry = %name, error = %e, "failed to delete empty orphan registry");
+                        } else {
+                            stats.registries_deleted += 1;
                         }
-                        _ => {}
                     }
                 }
             }

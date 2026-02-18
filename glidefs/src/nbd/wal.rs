@@ -49,6 +49,7 @@ impl Wal {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .append(false)

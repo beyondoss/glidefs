@@ -279,9 +279,9 @@ impl AtomicBlockMap {
     /// with flags from the external `block_states` array.
     pub fn snapshot(&self, flags: &[AtomicU8]) -> BlockMap {
         let mut entries = Vec::with_capacity(self.num_chunks);
-        for i in 0..self.num_chunks {
+        for (i, flag_atomic) in flags.iter().enumerate().take(self.num_chunks) {
             let (hash, sequence) = self.get(i);
-            let flag = flags[i].load(Ordering::Acquire);
+            let flag = flag_atomic.load(Ordering::Acquire);
             entries.push(BlockMapEntry {
                 hash,
                 flags: flag,
@@ -362,7 +362,6 @@ impl BlockMap {
     }
 
     /// Returns true if there are no chunk slots.
-    #[cfg(test)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -624,8 +623,8 @@ impl ForkedBlockMap {
     /// ordering.
     pub fn snapshot(&self, flags: &[AtomicU8]) -> BlockMap {
         let mut entries = Vec::with_capacity(self.num_chunks);
-        for i in 0..self.num_chunks {
-            let flag = flags[i].load(Ordering::Acquire);
+        for (i, flag_atomic) in flags.iter().enumerate().take(self.num_chunks) {
+            let flag = flag_atomic.load(Ordering::Acquire);
             if let Some(ov) = self.overlay.get(&i) {
                 let (hash, sequence) = *ov;
                 entries.push(BlockMapEntry {

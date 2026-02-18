@@ -23,6 +23,12 @@ pub struct PackRegistry {
     pub pack_ids: Vec<Uuid>,
 }
 
+impl Default for PackRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PackRegistry {
     pub fn new() -> Self {
         Self {

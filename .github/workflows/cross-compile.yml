@@ -72,6 +72,11 @@ jobs:
       - name: Build with cross (Linux)
         if: matrix.platform == 'linux'
         working-directory: glidefs
+        env:
+          # io-uring (transitive dep via foyer) only ships prebuilt bindings for
+          # x86_64/aarch64. This flag tells it to use those bindings on other
+          # architectures where the io_uring ABI is identical.
+          RUSTFLAGS: '--cfg=io_uring_skip_arch_check'
         run: |
           cross build --profile ci --target ${{ matrix.target }}
 

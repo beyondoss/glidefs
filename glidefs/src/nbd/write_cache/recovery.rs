@@ -83,17 +83,16 @@ impl WriteCache<Recovering> {
                 std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
 
             let mut buf = vec![0u8; block_size];
-            if valid_bytes > 0 {
-                if let Err(e) =
+            if valid_bytes > 0
+                && let Err(e) =
                     self.inner.data_file.read_exact_at(&mut buf[..valid_bytes], offset)
-                {
-                    warn!(
-                        chunk_index = idx,
-                        error = %e,
-                        "recovery: failed to read block from SSD, leaving dirty for retry"
-                    );
-                    continue;
-                }
+            {
+                warn!(
+                    chunk_index = idx,
+                    error = %e,
+                    "recovery: failed to read block from SSD, leaving dirty for retry"
+                );
+                continue;
             }
 
             let actual_hash = blake3_128(&buf);

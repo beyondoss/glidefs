@@ -114,11 +114,11 @@ impl WriteCache<Initializing> {
             let chunk_offset = entry.chunk_index * chunk_size_u64;
             let valid_bytes = std::cmp::min(chunk_size_u64, config.device_size.saturating_sub(chunk_offset)) as usize;
             let mut chunk_buf = vec![0u8; chunk_size as usize];
-            if valid_bytes > 0 {
-                if let Err(e) = data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset) {
-                    warn!(chunk_index, error = %e, "WAL recovery: SSD read failed, skipping entry (block reverts to last checkpoint state)");
-                    continue;
-                }
+            if valid_bytes > 0
+                && let Err(e) = data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset)
+            {
+                warn!(chunk_index, error = %e, "WAL recovery: SSD read failed, skipping entry (block reverts to last checkpoint state)");
+                continue;
             }
 
             let hash = blake3_128(&chunk_buf);

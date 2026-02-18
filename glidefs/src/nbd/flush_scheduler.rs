@@ -22,10 +22,11 @@ use crate::nbd::write_cache::WriteCache;
 // ---------------------------------------------------------------------------
 
 /// Controls how dirty blocks are flushed to S3 for an export.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum FlushMode {
     /// Flush only when explicitly triggered (budget exceeded, API call).
+    #[default]
     DemandDriven,
     /// Periodic flush with separate pack and manifest intervals.
     Continuous {
@@ -46,11 +47,6 @@ fn default_manifest_interval_secs() -> u64 {
     60
 }
 
-impl Default for FlushMode {
-    fn default() -> Self {
-        FlushMode::DemandDriven
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Scheduler
@@ -167,10 +163,10 @@ async fn run_demand_driven(
 
             // Local checkpoint: persist block states + truncate WAL.
             _ = checkpoint_ticker.tick() => {
-                if cache.dirty_block_count() > 0 {
-                    if let Err(e) = cache.local_checkpoint() {
-                        warn!(error = %e, "local checkpoint failed");
-                    }
+                if cache.dirty_block_count() > 0
+                    && let Err(e) = cache.local_checkpoint()
+                {
+                    warn!(error = %e, "local checkpoint failed");
                 }
             }
         }
@@ -182,6 +178,7 @@ async fn run_demand_driven(
 // ---------------------------------------------------------------------------
 
 /// Periodic pack flush + manifest sync with optional explicit triggers.
+#[allow(clippy::too_many_arguments)]
 async fn run_continuous(
     cache: &Arc<WriteCache<Active>>,
     content_store: &Arc<ContentStore>,
@@ -410,6 +407,7 @@ mod tests {
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
+    #[allow(clippy::type_complexity)]
     fn test_scheduler_components() -> (
         Arc<WriteCache<crate::nbd::state::Active>>,
         Arc<ContentStore>,

@@ -14,6 +14,12 @@ pub struct HostPackIndex {
     index: DashMap<Blake3Hash, PackLocation>,
 }
 
+impl Default for HostPackIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HostPackIndex {
     pub fn new() -> Self {
         Self {
