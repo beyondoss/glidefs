@@ -115,6 +115,7 @@ impl BlockMapEntry {
     }
 
     /// Returns true if this block has unflushed local data.
+    #[cfg(test)]
     #[inline]
     pub fn is_dirty(&self) -> bool {
         self.flags & Self::FLAG_DIRTY != 0

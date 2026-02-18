@@ -75,8 +75,15 @@ impl WriteCache<Active> {
         })
     }
 
-    /// Shared inner logic for flush/snapshot: snapshot dirty entries, dedup,
+    /// Shared inner logic for flush/snapshot: collect dirty entries, dedup,
     /// compress, pack upload, CAS-clear dirty flags.
+    ///
+    /// Optimizations vs naive approach:
+    /// - **Targeted dirty scan**: reads `block_states` (cheap byte loads) then
+    ///   only reads block_map entries for dirty blocks. Cost is O(dirty_count)
+    ///   SeqLock reads instead of O(device_size).
+    /// - **Concurrent S3 uploads**: packs are uploaded in parallel via
+    ///   `try_join_all` instead of sequentially.
     ///
     /// Returns (stats, seq_cutpoint) on success.
     async fn flush_dirty_inner(
@@ -90,16 +97,28 @@ impl WriteCache<Active> {
         // 1. Capture sequence cut point
         let seq_cutpoint = self.inner.sequence.current();
 
-        // 2. Snapshot dirty entries: non-empty, dirty, sequence <= cutpoint
+        // 2. Targeted dirty scan: check block_states first (cheap byte load),
+        //    then read block_map only for dirty blocks (SeqLock read).
+        //    For a 10GB device with 1000 dirty blocks: 81,920 byte reads +
+        //    1,000 SeqLock reads, vs 81,920 SeqLock reads for a full snapshot.
         let snapshot: Vec<(usize, Blake3Hash)> = {
-            let block_map_snap = self.inner.block_map_snapshot();
-            block_map_snap
-                .iter_non_empty()
-                .filter(|(_, entry)| {
-                    entry.is_dirty() && entry.sequence <= seq_cutpoint
-                })
-                .map(|(idx, entry)| (idx, entry.hash))
-                .collect()
+            let mut dirty = Vec::new();
+            for (idx, state) in self.inner.block_states.iter().enumerate() {
+                if state.load(Ordering::Acquire) != BlockState::Dirty as u8 {
+                    continue;
+                }
+                let (hash, seq) = self.inner.block_map_get(idx);
+                // Skip never-written entries (zero sentinel)
+                if hash.is_zero() {
+                    continue;
+                }
+                // Skip entries written after our cutpoint
+                if seq > seq_cutpoint {
+                    continue;
+                }
+                dirty.push((idx, hash));
+            }
+            dirty
         };
 
         if snapshot.is_empty() {
@@ -162,24 +181,36 @@ impl WriteCache<Active> {
             to_upload.push((hash, compressed));
         }
 
-        // 4. Assemble packs and upload
-        let mut new_pack_ids = Vec::new();
+        // 4. Assemble packs then upload concurrently.
+        //    Separate assembly from upload so we can fire all S3 PUTs at once.
+        let mut pack_meta: Vec<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>)> = Vec::new();
+        let mut upload_pairs: Vec<(uuid::Uuid, Vec<u8>)> = Vec::new();
+
         for chunk in to_upload.chunks(BLOCKS_PER_PACK) {
             let pack_id = uuid::Uuid::new_v4();
-            new_pack_ids.push(pack_id);
             let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size);
             let pack_size = pack_bytes.len() as u64;
+            pack_meta.push((pack_id, pack_size, index_entries));
+            upload_pairs.push((pack_id, pack_bytes));
+        }
 
-            content_store.put_pack(pack_id, pack_bytes).await?;
+        // Upload all packs concurrently
+        let upload_futs: Vec<_> = upload_pairs
+            .into_iter()
+            .map(|(id, bytes)| content_store.put_pack(id, bytes))
+            .collect();
+        futures::future::try_join_all(upload_futs).await?;
+
+        // Register in host pack index for future dedup
+        for (pack_id, pack_size, index_entries) in &pack_meta {
             stats.packs_uploaded += 1;
-            stats.bytes_uploaded += pack_size;
-
-            // Register in host pack index for future dedup
-            for entry in &index_entries {
+            stats.bytes_uploaded += *pack_size;
+            stats.new_pack_ids.push(*pack_id);
+            for entry in index_entries {
                 host_pack_index.insert(
                     entry.hash,
                     PackLocation {
-                        pack_id,
+                        pack_id: *pack_id,
                         offset: entry.offset,
                         comp_length: entry.comp_length,
                     },
@@ -209,8 +240,6 @@ impl WriteCache<Active> {
             }
             // Concurrent write produced a new hash — leave dirty for next flush.
         }
-
-        stats.new_pack_ids = new_pack_ids;
 
         info!(
             blocks_flushed = stats.blocks_flushed,
@@ -285,11 +314,10 @@ impl WriteCache<Active> {
         seq_cutpoint: u64,
     ) -> Result<(), CacheError> {
         self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
-        // Checkpoint: persist block states then truncate the WAL.
-        // Hold the WAL lock across both operations so no writes can append
-        // entries between save_metadata and truncation.
+        // Checkpoint: block map outside lock, fast save + truncate under lock.
+        self.inner.persist_block_map()?;
         let mut wal = self.inner.wal.lock();
-        self.inner.save_metadata()?;
+        self.inner.save_block_states()?;
         wal.truncate()?;
         Ok(())
     }
@@ -300,8 +328,11 @@ impl WriteCache<Active> {
     /// where S3 flushes may be infrequent. Should run every ~5s when
     /// there are dirty blocks.
     pub fn local_checkpoint(&self) -> Result<(), CacheError> {
+        // Block map outside lock (safe: clean blocks don't change).
+        self.inner.persist_block_map()?;
+        // Fast save + truncate under lock.
         let mut wal = self.inner.wal.lock();
-        self.inner.save_metadata()?;
+        self.inner.save_block_states()?;
         wal.truncate()?;
         debug!("local checkpoint complete");
         Ok(())
@@ -351,13 +382,14 @@ impl WriteCache<Active> {
     /// Flush dirty blocks to S3 as content-addressed packs + manifest.
     ///
     /// This is the v2 flush path:
-    /// 1. Snapshot dirty block map entries up to the current sequence
+    /// 1. Scan block_states for dirty blocks (targeted, not full-device snapshot)
     /// 2. Dedup against the host pack index (blocks already in S3)
     /// 3. LZ4-compress new blocks and assemble into 25-block packs
-    /// 4. Upload packs to S3
+    /// 4. Upload packs to S3 concurrently
     /// 5. Clear dirty flags (with concurrent-write safety)
     /// 6. Upload a self-contained manifest
     /// 7. Update pack registry (best-effort)
+    /// 8. Checkpoint: persist block map (outside lock) + block states (under lock) + truncate WAL
     #[instrument(skip(self, content_store, host_pack_index))]
     pub async fn flush_to_s3(
         &self,
@@ -367,9 +399,11 @@ impl WriteCache<Active> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
         self.update_registry(content_store, &stats.new_pack_ids).await;
-        // Checkpoint: persist block states then truncate the WAL.
+        // Checkpoint: persist block map outside the lock (safe for clean blocks),
+        // then hold the WAL lock only for fast block-states save + truncate.
+        self.inner.persist_block_map()?;
         let mut wal = self.inner.wal.lock();
-        self.inner.save_metadata()?;
+        self.inner.save_block_states()?;
         wal.truncate()?;
         Ok(stats)
     }
@@ -387,9 +421,10 @@ impl WriteCache<Active> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         let manifest_etag = self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
         self.update_registry(content_store, &stats.new_pack_ids).await;
-        // Checkpoint: persist block states then truncate the WAL.
+        // Checkpoint: block map outside lock, fast save + truncate under lock.
+        self.inner.persist_block_map()?;
         let mut wal = self.inner.wal.lock();
-        self.inner.save_metadata()?;
+        self.inner.save_block_states()?;
         wal.truncate()?;
         Ok(SnapshotResult {
             manifest_etag,

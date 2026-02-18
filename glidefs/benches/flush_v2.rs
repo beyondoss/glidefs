@@ -12,7 +12,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use object_store::ObjectStore;
 use tempfile::TempDir;
 
-use glidefs::nbd::block_store::S3BlockStore;
+use glidefs::nbd::cache::{BlockCache, SimpleBlockCache};
 use glidefs::nbd::content_store::ContentStore;
 use glidefs::nbd::pack_index::HostPackIndex;
 use glidefs::nbd::state::Active;
@@ -24,6 +24,7 @@ struct V2BenchHarness {
     cache: WriteCache<Active>,
     content_store: ContentStore,
     pack_index: HostPackIndex,
+    clean_cache: Arc<dyn BlockCache>,
     #[allow(dead_code)]
     temp_dir: TempDir,
 }
@@ -38,10 +39,12 @@ impl V2BenchHarness {
             device_name: "bench".to_string(),
             device_size: device_size_mb * 1024 * 1024,
             block_size: BLOCK_SIZE,
+            wal_sync: false,
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3_backend), "bench");
         let pack_index = HostPackIndex::new();
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         let cache = WriteCache::open(config).expect("Failed to open cache");
         let cache = cache.skip_recovery_for_test();
@@ -50,6 +53,7 @@ impl V2BenchHarness {
             cache,
             content_store,
             pack_index,
+            clean_cache,
             temp_dir,
         }
     }
@@ -83,11 +87,14 @@ fn bench_v2_flush_latency(c: &mut Criterion) {
                             let data: Vec<u8> = (0..BLOCK_SIZE)
                                 .map(|j| ((i as usize * 31 + j * 7) % 256) as u8)
                                 .collect();
-                            h.cache.write(i * BLOCK_SIZE as u64, &data).unwrap();
+                            h.cache
+                                .write(i * BLOCK_SIZE as u64, &data, h.clean_cache.as_ref())
+                                .unwrap();
                         }
 
                         let start = std::time::Instant::now();
-                        let _stats = h.cache
+                        let _stats = h
+                            .cache
                             .flush_to_s3(&h.content_store, &h.pack_index)
                             .await
                             .unwrap();
@@ -124,11 +131,16 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
 
                 for i in 0..dirty_blocks {
                     let data = vec![(i % 256) as u8; BLOCK_SIZE];
-                    h.cache.write(i * BLOCK_SIZE as u64, &data).unwrap();
+                    h.cache
+                        .write(i * BLOCK_SIZE as u64, &data, h.clean_cache.as_ref())
+                        .unwrap();
                 }
 
                 let start = std::time::Instant::now();
-                h.cache.flush_to_s3(&h.content_store, &h.pack_index).await.unwrap();
+                h.cache
+                    .flush_to_s3(&h.content_store, &h.pack_index)
+                    .await
+                    .unwrap();
                 total += start.elapsed();
             }
 
@@ -147,18 +159,32 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                 // First: write and flush to populate pack index
                 for i in 0..dirty_blocks {
                     let data = vec![(i % 256) as u8; BLOCK_SIZE];
-                    h.cache.write(i * BLOCK_SIZE as u64, &data).unwrap();
+                    h.cache
+                        .write(i * BLOCK_SIZE as u64, &data, h.clean_cache.as_ref())
+                        .unwrap();
                 }
-                h.cache.flush_to_s3(&h.content_store, &h.pack_index).await.unwrap();
+                h.cache
+                    .flush_to_s3(&h.content_store, &h.pack_index)
+                    .await
+                    .unwrap();
 
                 // Second: write same content to different offsets
                 for i in 0..dirty_blocks {
                     let data = vec![(i % 256) as u8; BLOCK_SIZE];
-                    h.cache.write((i + dirty_blocks) * BLOCK_SIZE as u64, &data).unwrap();
+                    h.cache
+                        .write(
+                            (i + dirty_blocks) * BLOCK_SIZE as u64,
+                            &data,
+                            h.clean_cache.as_ref(),
+                        )
+                        .unwrap();
                 }
 
                 let start = std::time::Instant::now();
-                h.cache.flush_to_s3(&h.content_store, &h.pack_index).await.unwrap();
+                h.cache
+                    .flush_to_s3(&h.content_store, &h.pack_index)
+                    .await
+                    .unwrap();
                 total += start.elapsed();
             }
 
@@ -169,79 +195,5 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: v1 drain vs v2 flush comparison.
-///
-/// Direct comparison on the same workload to show the overhead (or savings)
-/// of content-addressing + pack assembly vs positional batch upload.
-fn bench_v1_drain_vs_v2_flush(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let mut group = c.benchmark_group("v1_drain_vs_v2_flush");
-    group.sample_size(10);
-
-    let dirty_blocks = 50u64;
-    group.throughput(Throughput::Bytes(dirty_blocks * BLOCK_SIZE as u64));
-
-    // v1: drain_for_snapshot (positional batch upload)
-    group.bench_function("v1_drain_50_blocks", |b| {
-        b.to_async(&rt).iter_custom(|iters| async move {
-            let mut total = Duration::ZERO;
-
-            for _ in 0..iters {
-                let temp_dir = TempDir::new().unwrap();
-                let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-                let config = WriteCacheConfig {
-                    cache_dir: temp_dir.path().to_path_buf(),
-                    device_name: "bench".to_string(),
-                    device_size: 256 * 1024 * 1024,
-                    block_size: BLOCK_SIZE,
-                };
-                let s3_store = Arc::new(S3BlockStore::new(Arc::clone(&s3), "bench", BLOCK_SIZE));
-                let cache = WriteCache::open(config).unwrap();
-                let cache = cache.skip_recovery_for_test();
-
-                for i in 0..dirty_blocks {
-                    let data = vec![(i % 256) as u8; BLOCK_SIZE];
-                    cache.write(i * BLOCK_SIZE as u64, &data).unwrap();
-                }
-
-                let start = std::time::Instant::now();
-                cache.drain_for_snapshot(&s3_store).await.unwrap();
-                total += start.elapsed();
-            }
-
-            total
-        });
-    });
-
-    // v2: flush_to_s3 (content-addressed pack upload)
-    group.bench_function("v2_flush_50_blocks", |b| {
-        b.to_async(&rt).iter_custom(|iters| async move {
-            let mut total = Duration::ZERO;
-
-            for _ in 0..iters {
-                let h = V2BenchHarness::new(256);
-
-                for i in 0..dirty_blocks {
-                    let data = vec![(i % 256) as u8; BLOCK_SIZE];
-                    h.cache.write(i * BLOCK_SIZE as u64, &data).unwrap();
-                }
-
-                let start = std::time::Instant::now();
-                h.cache.flush_to_s3(&h.content_store, &h.pack_index).await.unwrap();
-                total += start.elapsed();
-            }
-
-            total
-        });
-    });
-
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_v2_flush_latency,
-    bench_v2_dedup_speedup,
-    bench_v1_drain_vs_v2_flush,
-);
+criterion_group!(benches, bench_v2_flush_latency, bench_v2_dedup_speedup,);
 criterion_main!(benches);

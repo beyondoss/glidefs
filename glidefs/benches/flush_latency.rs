@@ -1,38 +1,63 @@
 //! Benchmark proving flush() is local SSD only.
 //!
 //! This benchmark demonstrates that flush() latency is O(1) with respect to
-//! dirty block count, proving that ZFS snapshot/clone operations complete
-//! in ~10ms instead of 8-15 seconds.
+//! dirty block count, proving that flush completes in ~10ms instead of the
+//! 50-300ms an S3 roundtrip would cost.
 //!
-//! Run with: `cargo bench --features test-utils`
+//! Run with: `cargo bench --features test-utils --bench flush_latency`
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use object_store::ObjectStore;
 use tempfile::TempDir;
 
-use glidefs::nbd::block_store::S3BlockStore;
+use glidefs::nbd::cache::{BlockCache, SimpleBlockCache};
+use glidefs::nbd::content_store::ContentStore;
+use glidefs::nbd::pack_index::HostPackIndex;
 use glidefs::nbd::state::Active;
 use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
 
-/// Create a test cache with in-memory S3.
-fn setup_cache(temp_dir: &TempDir, device_size_mb: u64) -> (WriteCache<Active>, Arc<S3BlockStore>) {
-    let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 
-    let config = WriteCacheConfig {
-        cache_dir: temp_dir.path().to_path_buf(),
-        device_name: "bench".to_string(),
-        device_size: device_size_mb * 1024 * 1024,
-        block_size: 128 * 1024,
-    };
+struct BenchHarness {
+    cache: WriteCache<Active>,
+    content_store: ContentStore,
+    pack_index: HostPackIndex,
+    clean_cache: Arc<dyn BlockCache>,
+    #[allow(dead_code)]
+    temp_dir: TempDir,
+}
 
-    let s3_store = Arc::new(S3BlockStore::new(Arc::clone(&s3), "bench", 128 * 1024));
+impl BenchHarness {
+    fn new(device_size_mb: u64) -> Self {
+        let temp_dir = TempDir::new().unwrap();
+        let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
 
-    let cache = WriteCache::open(config).expect("Failed to open cache");
-    let cache = cache.skip_recovery_for_test();
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "bench".to_string(),
+            device_size: device_size_mb * 1024 * 1024,
+            block_size: BLOCK_SIZE,
+            wal_sync: false,
+        };
 
-    (cache, s3_store)
+        let content_store = ContentStore::new(Arc::clone(&s3), "bench");
+        let pack_index = HostPackIndex::new();
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+        let cache = WriteCache::open(config).expect("Failed to open cache");
+        let cache = cache.skip_recovery_for_test();
+
+        Self {
+            cache,
+            content_store,
+            pack_index,
+            clean_cache,
+            temp_dir,
+        }
+    }
 }
 
 /// Benchmark: flush() latency is constant regardless of dirty block count.
@@ -51,18 +76,19 @@ fn bench_flush_is_local_only(c: &mut Criterion) {
             BenchmarkId::new("local_flush", dirty_blocks),
             &dirty_blocks,
             |b, &blocks| {
-                let temp_dir = TempDir::new().unwrap();
-                let (cache, _s3) = setup_cache(&temp_dir, 100); // 100MB device
+                let h = BenchHarness::new(100); // 100MB device
 
                 // Write `blocks` worth of data (these become dirty)
-                let data = vec![42u8; 128 * 1024]; // 128KB block
+                let data = vec![42u8; BLOCK_SIZE];
                 for i in 0..blocks {
-                    cache.write(i * 128 * 1024, &data).unwrap();
+                    h.cache
+                        .write(i * BLOCK_SIZE as u64, &data, h.clean_cache.as_ref())
+                        .unwrap();
                 }
 
                 // Benchmark flush - should be ~constant time
                 b.iter(|| {
-                    cache.flush().unwrap();
+                    h.cache.flush().unwrap();
                 });
             },
         );
@@ -71,48 +97,53 @@ fn bench_flush_is_local_only(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: Compare local flush vs drain to S3.
+/// Benchmark: Compare local flush vs flush to S3.
 ///
 /// This shows the difference between:
 /// - flush(): Local SSD sync (~10ms)
-/// - drain_for_snapshot(): Full S3 sync (100ms+ depending on data volume)
-fn bench_flush_vs_drain(c: &mut Criterion) {
+/// - flush_to_s3(): Full S3 sync (100ms+ depending on data volume)
+fn bench_flush_vs_s3(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let mut group = c.benchmark_group("flush_vs_drain");
+    let mut group = c.benchmark_group("flush_vs_s3");
 
     let dirty_blocks = 50u64;
 
     // Local flush benchmark
     group.bench_function("local_flush_50_blocks", |b| {
-        let temp_dir = TempDir::new().unwrap();
-        let (cache, _s3) = setup_cache(&temp_dir, 100);
+        let h = BenchHarness::new(100);
 
-        let data = vec![42u8; 128 * 1024];
+        let data = vec![42u8; BLOCK_SIZE];
         for i in 0..dirty_blocks {
-            cache.write(i * 128 * 1024, &data).unwrap();
+            h.cache
+                .write(i * BLOCK_SIZE as u64, &data, h.clean_cache.as_ref())
+                .unwrap();
         }
 
         b.iter(|| {
-            cache.flush().unwrap();
+            h.cache.flush().unwrap();
         });
     });
 
-    // S3 drain benchmark (what write-through would cost)
-    group.bench_function("drain_to_s3_50_blocks", |b| {
+    // S3 flush benchmark (what write-through would cost)
+    group.bench_function("s3_flush_50_blocks", |b| {
         b.to_async(&rt).iter_custom(|iters| async move {
-            let mut total = std::time::Duration::ZERO;
+            let mut total = Duration::ZERO;
 
             for _ in 0..iters {
-                let temp_dir = TempDir::new().unwrap();
-                let (cache, s3) = setup_cache(&temp_dir, 100);
+                let h = BenchHarness::new(100);
 
-                let data = vec![42u8; 128 * 1024];
+                let data = vec![42u8; BLOCK_SIZE];
                 for i in 0..dirty_blocks {
-                    cache.write(i * 128 * 1024, &data).unwrap();
+                    h.cache
+                        .write(i * BLOCK_SIZE as u64, &data, h.clean_cache.as_ref())
+                        .unwrap();
                 }
 
                 let start = std::time::Instant::now();
-                cache.drain_for_snapshot(&s3).await.unwrap();
+                h.cache
+                    .flush_to_s3(&h.content_store, &h.pack_index)
+                    .await
+                    .unwrap();
                 total += start.elapsed();
             }
 
@@ -129,17 +160,18 @@ fn bench_flush_vs_drain(c: &mut Criterion) {
 fn bench_write_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_throughput");
 
-    let block_size = 128 * 1024usize;
+    let block_size = BLOCK_SIZE;
     group.throughput(Throughput::Bytes(block_size as u64));
 
     group.bench_function("sequential_128kb_writes", |b| {
-        let temp_dir = TempDir::new().unwrap();
-        let (cache, _s3) = setup_cache(&temp_dir, 100);
+        let h = BenchHarness::new(100);
         let data = vec![42u8; block_size];
         let mut offset = 0u64;
 
         b.iter(|| {
-            cache.write(offset, &data).unwrap();
+            h.cache
+                .write(offset, &data, h.clean_cache.as_ref())
+                .unwrap();
             offset = (offset + block_size as u64) % (100 * 1024 * 1024);
         });
     });
@@ -150,7 +182,7 @@ fn bench_write_throughput(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_flush_is_local_only,
-    bench_flush_vs_drain,
+    bench_flush_vs_s3,
     bench_write_throughput
 );
 criterion_main!(benches);

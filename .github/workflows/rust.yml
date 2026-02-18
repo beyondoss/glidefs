@@ -38,6 +38,18 @@ jobs:
       - name: Run all tests
         run: cargo test --features test-utils --verbose
 
+  docker-integration:
+    name: Docker Integration Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: glidefs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run docker integration tests
+        run: cargo test --features docker-tests --test docker_integration --verbose
+
   loom:
     name: Loom Concurrency Tests
     runs-on: ubuntu-latest
@@ -61,7 +73,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build benchmarks
         run: cargo build --features test-utils --benches
-      - name: Run flush latency benchmarks
-        run: cargo bench --features test-utils --bench flush_latency -- --noplot
-      - name: Run all workload benchmarks
-        run: cargo bench --features test-utils --bench workloads -- --noplot
+      - name: Run benchmarks
+        run: cargo bench --features test-utils --benches -- --noplot

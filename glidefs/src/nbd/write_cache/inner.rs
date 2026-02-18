@@ -324,11 +324,12 @@ impl CacheInner {
             .sum()
     }
 
-    /// Persist block states and presence to metadata file.
+    /// Persist block states and presence to metadata file (fast path).
     ///
-    /// Uses atomic write pattern: write to temp file, fsync, then rename.
-    /// This ensures metadata is never corrupted if we crash mid-write.
-    pub(super) fn save_metadata(&self) -> Result<(), CacheError> {
+    /// Writes only block_states + present_chunks. Does NOT persist the block
+    /// map — call `persist_block_map()` separately (outside the WAL lock) for
+    /// that. Uses atomic write pattern: temp file → fsync → rename.
+    pub(super) fn save_block_states(&self) -> Result<(), CacheError> {
         let path = self.config.metadata_path();
         let tmp_path = path.with_extension("meta.tmp");
 
@@ -376,24 +377,39 @@ impl CacheInner {
         // Atomic rename (POSIX guarantees this is atomic)
         std::fs::rename(&tmp_path, &path)?;
 
-        // Persist the v2 block map (content hashes) alongside metadata.
-        // This ensures clean blocks (flushed to S3, WAL truncated) retain
-        // their hash-to-chunk mapping across daemon restarts.
+        let present_count = self.count_present();
+        debug!(
+            path = %path.display(),
+            blocks = self.num_blocks,
+            present = present_count,
+            "saved block states (atomic)"
+        );
+        Ok(())
+    }
+
+    /// Persist the v2 block map (content hashes) to disk.
+    ///
+    /// Safe to call outside the WAL lock: the block map file only needs to be
+    /// accurate for clean blocks (which don't change), and dirty blocks are
+    /// re-hashed from SSD during crash recovery regardless.
+    pub(super) fn persist_block_map(&self) -> Result<(), CacheError> {
         let block_map_path = self.config.block_map_path();
         let bm_snapshot = self.block_map_snapshot();
         if let Err(e) = bm_snapshot.persist_to_file(&block_map_path) {
             warn!(error = %e, "failed to persist block map");
             return Err(CacheError::Io(e));
         }
-
-        let present_count = self.count_present();
-        debug!(
-            path = %path.display(),
-            blocks = self.num_blocks,
-            present = present_count,
-            "saved cache metadata (atomic)"
-        );
         Ok(())
+    }
+
+    /// Persist block states, presence, and block map.
+    ///
+    /// Convenience method that calls both `save_block_states` and
+    /// `persist_block_map`. Used by callers that don't need to split
+    /// these operations around a WAL lock.
+    pub(super) fn save_metadata(&self) -> Result<(), CacheError> {
+        self.save_block_states()?;
+        self.persist_block_map()
     }
 
     /// Load block states and presence from metadata file.
