@@ -4,7 +4,7 @@ High-performance NBD server that turns S3 into fast block storage for microVMs, 
 
 ## Data Flow
 
-### Write Path (~20µs)
+### Write Path (~5µs)
 
 ```
 Guest VM
@@ -14,13 +14,17 @@ NBDServer ──► ExportRouter ──► NBDBlockHandler ──► WriteCache<
                                                         │
                                             ┌───────────┼───────────┐
                                             ▼           ▼           ▼
-                                      BLAKE3-128    pwrite()    AtomicBlockMap
-                                       (hash)     (local SSD)   (Dirty flag)
+                                       pwrite()   block_map_set  transition_to_dirty
+                                      (local SSD)  (ZERO, seq)    (CAS on AtomicU8)
                                                         │
-                                                   WAL append
+                                                   WAL append(ZERO, seq)
                                                         │
-                                                    return OK     ◄── ~20µs
+                                                    return OK     ◄── ~5µs
 ```
+
+Hash computation is **deferred to flush time**. The write path stores `Blake3Hash::ZERO`
+as a placeholder — it never reads back from SSD, never hashes, never touches the clean
+cache. See [Deferred Hashing](#deferred-hashing).
 
 ### Read Path (tiered, ~100ns to ~300ms)
 
@@ -30,7 +34,9 @@ Guest VM
     ▼
 WriteCache ──► AtomicBlockMap lookup
                       │
-              ┌── zero hash? ──► return zeroes immediately (~0)
+              ┌── ZERO hash + present? ──► SSD pread   (dirty, hash deferred)
+              ├── ZERO hash + !present? ──► return zeros (never written)
+              ├── zero_block_hash? ──► return zeros          (trimmed)
               │
               ├── Tier 1: CleanCache memory (Foyer)           ~100ns
               │           ├─ hit → return
@@ -64,10 +70,10 @@ Scan block_states[] for Dirty flags (cheap atomic loads)
     │
     ▼
 For each dirty block:
-    ├── Read block_map entry (SeqLock)
-    ├── Skip: zero blocks, blocks already in HostPackIndex, duplicates
-    ├── Read block data from SSD, verify hash
-    └── If hash changed since scan → skip (concurrent write)
+    ├── Record (chunk_index, sequence) at snapshot time
+    ├── Skip: zero_block_hash entries, blocks already in HostPackIndex
+    ├── Read block data from SSD → compute BLAKE3-128 hash (deferred from write)
+    └── Dedup check against HostPackIndex
     │
     ▼
 Batch into packs (25 blocks × 128KB = ~3.2MB)
@@ -80,7 +86,7 @@ Batch into packs (25 blocks × 128KB = ~3.2MB)
         HostPackIndex.insert(hash → pack location)
               │
               ▼
-        CAS-clear Dirty flags (only unchanged blocks)
+        CAS-clear Dirty flags (only if sequence unchanged since snapshot)
               │
               ▼
         Upload manifest to S3 (point-in-time snapshot)
@@ -112,11 +118,11 @@ The write path avoids all locks. Three techniques make this possible:
 
 2. **Atomic block map** (SeqLock): `AtomicBlockMap` stores per-block metadata in parallel arrays of `AtomicU64` (hash halves, sequence) with per-entry `AtomicU32` version counters. Readers spin-retry if the version is odd (writer in progress). Near-zero contention: each chunk has its own version counter. (`block_map.rs:AtomicBlockMap`)
 
-3. **Sequence numbers**: A monotonic `AtomicU64` counter provides snapshot consistency. Each write bumps the sequence; flush captures the sequence at snapshot time and only uploads blocks written before the cutpoint. (`block_map.rs:SequenceNumber`)
+3. **Sequence numbers**: A monotonic `AtomicU64` counter provides snapshot consistency and race detection. Each write bumps the sequence; flush captures the sequence at snapshot time and only clears dirty flags on blocks whose sequence hasn't changed (no concurrent write). (`block_map.rs:SequenceNumber`)
 
 ### Content Addressing
 
-Every block is identified by its BLAKE3-128 hash (16 bytes, truncated from 256-bit). This enables:
+Every block is identified by its BLAKE3-128 hash (16 bytes, truncated from 256-bit), computed at flush time (not on the write path). This enables:
 
 - **Cross-export deduplication**: Identical blocks across all exports on a host resolve to the same hash in `HostPackIndex` — only stored once in S3. Ten identical 10GB VMs use ~10GB of S3, not 100GB.
 - **Integrity verification**: Read path verifies hash after S3 fetch and LZ4 decompression. Background scrubber re-hashes cached blocks to detect bit rot.
@@ -171,7 +177,7 @@ Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N 
 
 | From | Event | To | Notes |
 |------|-------|----|-------|
-| Clean | Guest write | Dirty | Hash computed, data written to SSD, WAL appended |
+| Clean | Guest write | Dirty | Data written to SSD, ZERO placeholder in block_map, WAL appended |
 | Dirty | Sync worker claims | Syncing | CAS on AtomicU8 flag |
 | Syncing | S3 PUT success | Clean | Block is durable in S3 |
 | Syncing | S3 PUT failure | Dirty | Conservative: re-sync next cycle |
@@ -332,6 +338,25 @@ Write-behind trades durability for latency: data between the last FLUSH and the 
 3. The workload (microVMs) is ephemeral — VMs can be recreated from base images
 4. Production VMs use continuous flush mode to minimize the window
 
+### Why defer hashing to flush time?
+
+The previous design computed BLAKE3 on every write. For a 4KB write to a 128KB block:
+
+| Operation | Cost |
+|-----------|------|
+| pread 128KB from SSD | ~15-25µs |
+| blake3(128KB) | ~20-30µs |
+| Bytes::copy_from_slice(128KB) into clean cache | ~5-10µs |
+| **Total overhead** | **~50-65µs** |
+
+None of this work is needed until flush time. With deferred hashing, the write path is ~5µs for 4KB random writes (just pwrite + atomics + WAL). The hash computation moves to the flush path, which already reads every dirty block from SSD to build packs — so the work happens exactly once.
+
+**Write coalescing is free**: write the same block 100 times before flush, hash it once. Previously: 100 hashes, 99 thrown away.
+
+The read path distinguishes ZERO-placeholder from never-written using the **present bitmap**: ZERO + present = deferred hash (SSD pread), ZERO + !present = never written (return zeros).
+
+Sequence numbers replace hashes as the race detection token in flush. There is a narrow TOCTOU window between checking the sequence and doing the CAS (nanoseconds), identical to the previous hash-based approach and self-healing.
+
 ### Why content-addressed packs instead of per-block S3 objects?
 
 Per-block storage means one S3 PUT per 128KB write. At 28K IOPS, that's 28K PUTs/second — prohibitively expensive ($0.14/hour in S3 API costs alone).
@@ -381,7 +406,7 @@ We considered `RwLock` but rejected it: even uncontended lock/unlock has ~25ns o
 | `nbd/handler.rs` | Thin wrapper dispatching NBD commands (read/write/flush) to WriteCache |
 | `nbd/write_cache/mod.rs` | `WriteCache<S>` typestate wrapper, `FlushStats`, `SnapshotResult` |
 | `nbd/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, atomic block states, presence bitmap |
-| `nbd/write_cache/write.rs` | Write path: pwrite + BLAKE3 hash + block map update + WAL |
+| `nbd/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
 | `nbd/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → S3 → SSD fallback) |
 | `nbd/write_cache/flush.rs` | Dirty block scan, pack assembly, S3 upload, manifest sync |
 | `nbd/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading |
