@@ -9,7 +9,7 @@ Built for microVM storage at [Paraglide](https://paraglide.sh).
 Guests see a block device over NBD. Writes go to local SSD immediately. A background scheduler packs dirty blocks, compresses with LZ4, and uploads to S3. Reads serve from local cache; misses pull from S3, verify BLAKE3 hashes, and cache locally.
 
 ```
-Write path:  Guest → NBD → local SSD pwrite() → return OK     ~20µs
+Write path:  Guest → NBD → local SSD pwrite() → return OK      ~5µs
 Read path:   Guest → NBD → local cache hit → return data       ~500µs
              Guest → NBD → cache miss → S3 GET → LZ4 → verify → cache → return   50-300ms
 ```

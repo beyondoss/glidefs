@@ -259,6 +259,7 @@ async fn run_continuous(
                     match cache.flush_packs(content_store, pack_index).await {
                         Ok((stats, seq_cutpoint)) => {
                             metrics.record_s3_put_latency(start.elapsed());
+                            metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
                             if stats.packs_uploaded > 0 {
                                 info!(
                                     packs = stats.packs_uploaded,
@@ -332,6 +333,7 @@ async fn do_full_flush(
     match cache.flush_to_s3(content_store, pack_index).await {
         Ok(stats) => {
             metrics.record_s3_put_latency(start.elapsed());
+            metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
             if stats.packs_uploaded > 0 {
                 info!(
                     packs = stats.packs_uploaded,

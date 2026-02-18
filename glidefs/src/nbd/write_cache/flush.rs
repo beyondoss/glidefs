@@ -215,6 +215,7 @@ impl WriteCache<Active> {
             let (_hash, current_seq) = self.inner.block_map_get(chunk_index);
             if current_seq != snapshot_seq {
                 // Concurrent write changed this block — leave dirty.
+                stats.blocks_cas_failed += 1;
                 continue;
             }
             // Replace ZERO placeholder with real content hash.
@@ -238,6 +239,7 @@ impl WriteCache<Active> {
         info!(
             blocks_flushed = stats.blocks_flushed,
             blocks_deduped = stats.blocks_deduped,
+            blocks_cas_failed = stats.blocks_cas_failed,
             packs_uploaded = stats.packs_uploaded,
             bytes_uploaded = stats.bytes_uploaded,
             "flush dirty inner complete"

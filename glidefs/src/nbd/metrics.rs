@@ -61,6 +61,9 @@ pub struct ExportMetrics {
     /// Failed flush cycles (pack flush or manifest sync)
     pub flush_errors: AtomicU64,
 
+    /// Blocks left dirty per flush due to concurrent-write CAS failures
+    pub flush_blocks_cas_failed: AtomicU64,
+
     /// Counter for latency sampling (reduces histogram mutex contention)
     latency_sample_counter: AtomicU64,
 
@@ -226,6 +229,7 @@ impl Default for ExportMetrics {
             s3_put_errors: AtomicU64::new(0),
             s3_get_errors: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
+            flush_blocks_cas_failed: AtomicU64::new(0),
             latency_sample_counter: AtomicU64::new(0),
             read_latencies: Mutex::new(LatencyHistogram::default()),
             write_latencies: Mutex::new(LatencyHistogram::default()),
@@ -270,7 +274,6 @@ impl ExportMetrics {
     }
 
     /// Record S3 fetch latency (sampled to reduce mutex contention).
-    #[allow(dead_code)]
     #[inline]
     pub fn record_s3_fetch_latency(&self, duration: Duration) {
         if self.should_sample() {
@@ -327,7 +330,6 @@ impl ExportMetrics {
     }
 
     /// Record an S3 read operation.
-    #[allow(dead_code)]
     #[inline]
     pub fn record_s3_read(&self, bytes: u64) {
         self.s3_bytes_read.fetch_add(bytes, Ordering::Relaxed);
@@ -335,14 +337,12 @@ impl ExportMetrics {
     }
 
     /// Record a cache hit.
-    #[allow(dead_code)]
     #[inline]
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a cache miss.
-    #[allow(dead_code)]
     #[inline]
     pub fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
@@ -365,6 +365,15 @@ impl ExportMetrics {
     #[inline]
     pub fn record_flush_error(&self) {
         self.flush_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record blocks left dirty due to concurrent-write CAS failure during flush.
+    #[inline]
+    pub fn record_flush_blocks_cas_failed(&self, count: usize) {
+        if count > 0 {
+            self.flush_blocks_cas_failed
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
     }
 
     /// Record S3 PUT latency (sampled to reduce mutex contention).
@@ -428,6 +437,7 @@ impl ExportMetrics {
             s3_put_errors: self.s3_put_errors.load(Ordering::Relaxed),
             s3_get_errors: self.s3_get_errors.load(Ordering::Relaxed),
             flush_errors: self.flush_errors.load(Ordering::Relaxed),
+            flush_blocks_cas_failed: self.flush_blocks_cas_failed.load(Ordering::Relaxed),
             dirty_blocks: None,
             syncing_blocks: None,
             write_amplification,
@@ -461,6 +471,7 @@ pub struct MetricsSnapshot {
     pub s3_put_errors: u64,
     pub s3_get_errors: u64,
     pub flush_errors: u64,
+    pub flush_blocks_cas_failed: u64,
 
     // Cache state (populated by router)
     /// Number of dirty blocks waiting to be synced to S3
@@ -541,6 +552,7 @@ impl MetricsSnapshot {
         let _ = writeln!(out, "glidefs_s3_put_errors_total{{{label}}} {}", self.s3_put_errors);
         let _ = writeln!(out, "glidefs_s3_get_errors_total{{{label}}} {}", self.s3_get_errors);
         let _ = writeln!(out, "glidefs_flush_errors_total{{{label}}} {}", self.flush_errors);
+        let _ = writeln!(out, "glidefs_flush_blocks_cas_failed_total{{{label}}} {}", self.flush_blocks_cas_failed);
 
         // Cache state (gauges)
         if let Some(dirty) = self.dirty_blocks {
@@ -656,6 +668,8 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_s3_get_errors_total counter
 # HELP glidefs_flush_errors_total Failed flush cycles
 # TYPE glidefs_flush_errors_total counter
+# HELP glidefs_flush_blocks_cas_failed_total Blocks left dirty per flush due to concurrent-write CAS failures
+# TYPE glidefs_flush_blocks_cas_failed_total counter
 # HELP glidefs_read_latency_seconds NBD read operation latency
 # TYPE glidefs_read_latency_seconds histogram
 # HELP glidefs_write_latency_seconds NBD write operation latency

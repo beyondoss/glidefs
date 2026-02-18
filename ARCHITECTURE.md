@@ -309,8 +309,14 @@ Per-export Prometheus metrics exposed at `/metrics`. Latency histograms are samp
 |--------|------|-------------------|
 | `glidefs_guest_write_ops_total` | Counter | Guest write IOPS |
 | `glidefs_guest_bytes_written_total` | Counter | Guest write throughput |
+| `glidefs_guest_read_ops_total` | Counter | Guest read IOPS |
+| `glidefs_guest_bytes_read_total` | Counter | Guest read throughput |
 | `glidefs_s3_batches_written_total` | Counter | Pack upload rate |
-| `glidefs_cache_hit_rate` | Gauge | Read cache effectiveness |
+| `glidefs_s3_bytes_read_total` | Counter | Bytes fetched from S3 (compressed, on cache miss) |
+| `glidefs_s3_read_ops_total` | Counter | S3 GET operations (individual block fetches) |
+| `glidefs_cache_hits_total` | Counter | Reads served from CleanCache (Foyer memory/SSD) |
+| `glidefs_cache_misses_total` | Counter | Reads that required S3 fetch |
+| `glidefs_cache_hit_rate` | Gauge | `cache_hits / (hits + misses)` — read cache effectiveness |
 | `glidefs_write_amplification` | Gauge | S3 bytes / guest bytes (should be ~1.0) |
 | `glidefs_coalesce_ratio` | Gauge | Guest writes per S3 batch (higher = better batching) |
 | `glidefs_dirty_blocks` | Gauge | Blocks waiting for S3 sync |
@@ -322,6 +328,7 @@ Per-export Prometheus metrics exposed at `/metrics`. Latency histograms are samp
 | `glidefs_s3_put_errors_total` | Counter | S3 upload failures |
 | `glidefs_s3_get_errors_total` | Counter | S3 fetch failures |
 | `glidefs_flush_errors_total` | Counter | Failed flush cycles |
+| `glidefs_flush_blocks_cas_failed_total` | Counter | Blocks left dirty per flush due to concurrent writes (flush starvation indicator) |
 
 Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 
