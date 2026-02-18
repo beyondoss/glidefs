@@ -236,6 +236,40 @@ impl ExportRouter {
         &self.pack_index
     }
 
+    /// Prune pack index entries not referenced by any active export.
+    ///
+    /// Collects all non-zero hashes from every active export's block map,
+    /// then removes pack index entries that aren't in the set. Cost is
+    /// O(total_blocks + pack_index_entries), runs only on export removal.
+    async fn prune_pack_index(&self) {
+        let exports = self.exports.read().await;
+        if exports.is_empty() {
+            // No active exports — clear everything.
+            let removed = self.pack_index.len();
+            if removed > 0 {
+                self.pack_index.rebuild(&[]);
+                info!(removed, "pruned all pack index entries (no active exports)");
+            }
+            return;
+        }
+
+        // Union of all referenced hashes across active exports.
+        let mut referenced = std::collections::HashSet::new();
+        for state in exports.values() {
+            referenced.extend(state.cache.referenced_hashes());
+        }
+        drop(exports);
+
+        let removed = self.pack_index.prune_unreferenced(&referenced);
+        if removed > 0 {
+            info!(
+                removed,
+                remaining = self.pack_index.len(),
+                "pruned unreferenced pack index entries"
+            );
+        }
+    }
+
     /// Get a reference to the shared clean cache (for scrubber).
     pub fn clean_cache(&self) -> &Arc<dyn BlockCache> {
         &self.clean_cache
@@ -849,6 +883,11 @@ impl ExportRouter {
 
         info!("Removing export '{}'...", name);
         Self::teardown_export(name, state).await;
+
+        // Prune pack index entries no longer referenced by any active export.
+        // Must run after teardown (which drops the removed export's cache) so
+        // that only remaining exports contribute to the referenced set.
+        self.prune_pack_index().await;
 
         if purge {
             let cache_file = self.cache_dir.join(format!("{}.cache", name));

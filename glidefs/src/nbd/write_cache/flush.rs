@@ -4,14 +4,14 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 use crate::nbd::block_map::{
-    BlockMapKind, Blake3Hash, blake3_128, lz4_compress,
+    BlockMapKind, Blake3Hash, SparseBlockState, blake3_128, lz4_compress,
 };
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::manifest::{Manifest, ManifestBlockEntry};
 use crate::nbd::pack::{self, PackLocation, BLOCKS_PER_PACK};
 use crate::nbd::pack_index::HostPackIndex;
 use crate::nbd::pack_registry::PackRegistry;
-use crate::nbd::state::{Active, BlockState, Draining};
+use crate::nbd::state::{Active, Draining};
 
 use super::inner::CacheInner;
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
@@ -47,6 +47,21 @@ impl WriteCache<Active> {
     /// Get the block size.
     pub fn block_size(&self) -> usize {
         self.inner.config.block_size
+    }
+
+    /// Collect all non-zero hashes referenced by this cache's block map.
+    ///
+    /// Used by pack index pruning to determine which entries are still needed.
+    /// Iterates every chunk slot, so cost is O(num_blocks).
+    pub fn referenced_hashes(&self) -> std::collections::HashSet<Blake3Hash> {
+        let mut hashes = std::collections::HashSet::new();
+        for idx in 0..self.inner.num_blocks {
+            let (hash, _seq) = self.inner.block_map_get(idx);
+            if !hash.is_zero() {
+                hashes.insert(hash);
+            }
+        }
+        hashes
     }
 
     /// Save metadata to disk.
@@ -99,12 +114,10 @@ impl WriteCache<Active> {
         // 2. Targeted dirty scan: collect dirty block indices with their
         //    snapshot sequence number (used for concurrent-write detection).
         //    Hashes are computed lazily from SSD in step 3.
+        //    Uses SparseStateMap::iter_with_state for O(allocated_pages) scan.
         let snapshot: Vec<(usize, u64)> = {
             let mut dirty = Vec::new();
-            for (idx, state) in self.inner.block_states.iter().enumerate() {
-                if state.load(Ordering::Acquire) != BlockState::Dirty as u8 {
-                    continue;
-                }
+            for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
                 let (_hash, seq) = self.inner.block_map_get(idx);
                 // Skip entries written after our cutpoint
                 if seq > seq_cutpoint {
@@ -219,15 +232,10 @@ impl WriteCache<Active> {
                 continue;
             }
             // Replace ZERO placeholder with real content hash.
-            self.inner.block_map_set(chunk_index, actual_hash, snapshot_seq);
-            // CAS Dirty → Clean on the block_states AtomicU8.
-            if self.inner.block_states[chunk_index]
-                .compare_exchange(
-                    BlockState::Dirty as u8,
-                    BlockState::Clean as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+            self.inner.block_map_set(chunk_index, actual_hash, snapshot_seq)?;
+            // CAS Dirty(2) -> Clean(1) on the state map.
+            if self.inner.state_map
+                .cas(chunk_index, SparseBlockState::DIRTY, SparseBlockState::CLEAN)
                 .is_ok()
             {
                 self.inner

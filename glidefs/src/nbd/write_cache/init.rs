@@ -1,16 +1,16 @@
 use bytes::Bytes;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 use tracing::{info, instrument, warn};
 
 use crate::nbd::block_map::{
     AtomicBlockMap, BlockMap, BlockMapEntry, BlockMapKind, ForkedBlockMap,
-    SequenceNumber, blake3_128, zero_block_hash,
+    SequenceNumber, SparseBlockState, SparseStateMap, blake3_128, zero_block_hash,
 };
 use crate::nbd::manifest::Manifest;
-use crate::nbd::state::{Active, BlockState, Initializing, Recovering};
+use crate::nbd::state::{Active, Initializing, Recovering};
 use crate::nbd::wal::Wal;
 
 use super::inner::CacheInner;
@@ -36,27 +36,10 @@ impl WriteCache<Initializing> {
         let data_path = config.data_path();
         let data_file = super::inner::SyncFile::open(&data_path, true, config.device_size)?;
 
-        // Load block states and presence (or create fresh)
+        // Load block states (or create fresh)
         let num_blocks = config.num_blocks();
-        let (state_bytes, present_chunk_vals, mut dirty_count) = CacheInner::load_metadata(&config)?;
-
-        // Convert to atomic types
-        let block_states: Box<[AtomicU8]> = state_bytes
-            .into_iter()
-            .map(AtomicU8::new)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let present_chunks: Box<[AtomicU64]> = present_chunk_vals
-            .into_iter()
-            .map(AtomicU64::new)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let present_count: usize = present_chunks
-            .iter()
-            .map(|c| c.load(Ordering::Relaxed).count_ones() as usize)
-            .sum();
+        let (state_map, mut dirty_count) = CacheInner::load_metadata(&config)?;
+        let present_count = state_map.count_present();
 
         // === v2 initialization ===
         let block_map_path = config.block_map_path();
@@ -129,13 +112,18 @@ impl WriteCache<Initializing> {
             });
             max_wal_seq = max_wal_seq.max(entry.sequence);
 
-            // Synchronize block_states with WAL replay: mark as Dirty so
-            // that flush's snapshot (which reads flags from block_states) sees
-            // the correct dirty state.
-            if chunk_index < block_states.len() {
-                let old = block_states[chunk_index].load(Ordering::Relaxed);
-                if old != BlockState::Dirty as u8 {
-                    block_states[chunk_index].store(BlockState::Dirty as u8, Ordering::Relaxed);
+            // Synchronize state_map with WAL replay: mark as Dirty so
+            // that flush's targeted scan sees the correct dirty state.
+            if chunk_index < num_blocks {
+                let old = state_map.get(chunk_index);
+                if old != SparseBlockState::DIRTY {
+                    // Ensure block is present first (allocates page if needed)
+                    let _ = state_map.set_present(chunk_index);
+                    // Transition to Dirty from whatever current state is
+                    let current = state_map.get(chunk_index);
+                    if current != SparseBlockState::DIRTY {
+                        let _ = state_map.cas(chunk_index, current, SparseBlockState::DIRTY);
+                    }
                     dirty_count += 1;
                 }
             }
@@ -164,8 +152,7 @@ impl WriteCache<Initializing> {
         let inner = Arc::new(CacheInner {
             config,
             data_file,
-            block_states,
-            present_chunks,
+            state_map,
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
@@ -205,19 +192,9 @@ impl WriteCache<Initializing> {
         let data_file = super::inner::SyncFile::open(&config.data_path(), true, config.device_size)?;
 
         let num_blocks = config.num_blocks();
-        let num_chunks = num_blocks.div_ceil(64);
 
-        // Fresh block states: all Clean (data is in S3, not local)
-        let block_states: Box<[AtomicU8]> = (0..num_blocks)
-            .map(|_| AtomicU8::new(BlockState::Clean as u8))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        // Fresh presence bitmap: nothing present locally
-        let present_chunks: Box<[AtomicU64]> = (0..num_chunks)
-            .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        // Fresh state map: all NOT_PRESENT (data is in S3, not local)
+        let state_map = SparseStateMap::new(num_blocks);
 
         // Build BlockMapKind from manifest or parent
         let block_map_kind = if let Some(parent) = parent_block_map {
@@ -247,8 +224,7 @@ impl WriteCache<Initializing> {
         let inner = Arc::new(CacheInner {
             config,
             data_file,
-            block_states,
-            present_chunks,
+            state_map,
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
             syncing_block_count: AtomicU64::new(0),

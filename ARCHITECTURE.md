@@ -15,7 +15,7 @@ NBDServer ──► ExportRouter ──► NBDBlockHandler ──► WriteCache<
                                             ┌───────────┼───────────┐
                                             ▼           ▼           ▼
                                        pwrite()   block_map_set  transition_to_dirty
-                                      (local SSD)  (ZERO, seq)    (CAS on AtomicU8)
+                                      (local SSD)  (ZERO, seq)    (CAS on SparseStateMap)
                                                         │
                                                    WAL append(ZERO, seq)
                                                         │
@@ -34,8 +34,8 @@ Guest VM
     ▼
 WriteCache ──► AtomicBlockMap lookup
                       │
-              ┌── ZERO hash + present? ──► SSD pread   (dirty, hash deferred)
-              ├── ZERO hash + !present? ──► return zeros (never written)
+              ┌── ZERO hash + state≠0? ──► SSD pread   (dirty, hash deferred)
+              ├── ZERO hash + state=0? ──► return zeros (never written, NotPresent)
               ├── zero_block_hash? ──► return zeros          (trimmed)
               │
               ├── Tier 1: CleanCache memory (Foyer)           ~100ns
@@ -66,7 +66,7 @@ Multi-chunk reads fan out with `futures::future::try_join_all()`. Sequential acc
 FlushScheduler
     │
     ▼
-Scan block_states[] for Dirty flags (cheap atomic loads)
+Scan SparseStateMap for Dirty pages (skip unallocated pages)
     │
     ▼
 For each dirty block:
@@ -101,7 +101,7 @@ Batch into packs (25 blocks × 128KB = ~3.2MB)
 | Pack | S3 object containing up to 25 LZ4-compressed blocks with a self-describing index | Not a single block per S3 object |
 | Manifest | Binary snapshot of an export's block map + pack index, stored in S3 | Not a log — it's a point-in-time image |
 | Block Map | Per-chunk metadata: BLAKE3-128 hash, dirty flag, sequence number | Not the data itself |
-| Pack Index | Host-level hash→pack location mapping for content-addressed lookups | Not per-export — shared across all exports on a host |
+| Pack Index | Host-level hash→pack location mapping for content-addressed lookups. Pruned on export removal to bound memory to active exports. | Not per-export — shared across all exports on a host |
 | Drain | Flush all dirty blocks to S3 so the export can be stopped or migrated | Not a delete — S3 data is preserved |
 | Clean Cache | Read-through Foyer HybridCache (memory + SSD tiers) for blocks fetched from S3 | Not the write cache (dirty blocks on local SSD) |
 | Circuit Breaker | Lock-free S3 failure detector that fast-fails requests during outages | Not a retry mechanism — it prevents retries |
@@ -116,7 +116,7 @@ The write path avoids all locks. Three techniques make this possible:
 
 1. **Positional I/O** (`pread`/`pwrite`): The `SyncFile` wrapper uses POSIX positional I/O, which is atomic per-syscall and doesn't use the file position pointer. No locking needed for concurrent block reads and writes. (`write_cache/inner.rs:SyncFile`)
 
-2. **Atomic block map** (SeqLock): `AtomicBlockMap` stores per-block metadata in parallel arrays of `AtomicU64` (hash halves, sequence) with per-entry `AtomicU32` version counters. Readers spin-retry if the version is odd (writer in progress). Near-zero contention: each chunk has its own version counter. (`block_map.rs:AtomicBlockMap`)
+2. **Atomic block map** (SeqLock + page table): `AtomicBlockMap` stores per-block metadata in a two-level page table. A directory of `AtomicPtr<HashPage>` points to 4KB pages, each holding 128 `HashEntry` structs (version + hash + sequence). Pages are allocated on first write via CAS — empty exports use ~530KB. Each entry uses a per-entry `AtomicU32` version counter (SeqLock); readers spin-retry if the version is odd. (`block_map.rs:AtomicBlockMap`)
 
 3. **Sequence numbers**: A monotonic `AtomicU64` counter provides snapshot consistency and race detection. Each write bumps the sequence; flush captures the sequence at snapshot time and only clears dirty flags on blocks whose sequence hasn't changed (no concurrent write). (`block_map.rs:SequenceNumber`)
 
@@ -160,30 +160,74 @@ Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N 
 
 ## Block State Machine
 
+Stored in `SparseStateMap` — a sparse page table of `AtomicU8` values, lock-free, outside the block map's `RwLock`. Encoding: `NotPresent=0, Clean=1, Dirty=2, Syncing=3`. NotPresent=0 means unallocated pages are implicitly "never written" with no memory cost.
+
 ```
-     ┌──────── write during sync ─────────┐
-     │                                    │
-     ▼                                    │
-  Clean ───[write]───► Dirty ───[sync start]───► Syncing
-     ▲                                              │
-     │                                              │
-     └───────────── upload success ─────────────────┘
-                                                    │
-                        upload failure ─────────────┘
-                             │
-                             ▼
-                           Dirty (retry next cycle)
+NotPresent ───[write]───► Dirty ───[sync start]───► Syncing
+                            ▲           │                │
+                            │    write during sync ──────┤
+                            │                            │
+                          Clean ◄── upload success ──────┘
+                            │                            │
+                            └──[write]──► Dirty    upload failure
+                                                         │
+                                                         ▼
+                                                   Dirty (retry)
 ```
 
-| From | Event | To | Notes |
-|------|-------|----|-------|
-| Clean | Guest write | Dirty | Data written to SSD, ZERO placeholder in block_map, WAL appended |
-| Dirty | Sync worker claims | Syncing | CAS on AtomicU8 flag |
-| Syncing | S3 PUT success | Clean | Block is durable in S3 |
-| Syncing | S3 PUT failure | Dirty | Conservative: re-sync next cycle |
-| Syncing | Guest write during sync | Dirty | New data overwrites; block needs re-sync |
+| From | Event | To | Encoding | Notes |
+|------|-------|----|----------|-------|
+| NotPresent | Guest write | Dirty | 0 → 2 | Page allocated on first touch, SSD pwrite, WAL appended |
+| Clean | Guest write | Dirty | 1 → 2 | Block already on SSD, re-dirtied |
+| Dirty | Sync worker claims | Syncing | 2 → 3 | CAS on SparseStateMap entry |
+| Syncing | S3 PUT success | Clean | 3 → 1 | Block is durable in S3 |
+| Syncing | S3 PUT failure | Dirty | 3 → 2 | Conservative: re-sync next cycle |
+| Syncing | Guest write during sync | Dirty | 3 → 2 | New data overwrites; block needs re-sync |
 
-Unknown states (e.g., from corruption) default to Dirty — conservative, will re-sync. (`state.rs:54`)
+Presence is derived: `is_present = state != 0`. This eliminates the separate `present_chunks` bitmap. (`block_map.rs:SparseStateMap`)
+
+## Fork Overlay (BlockMapKind)
+
+Forking a VM copies the block map — but a fork is 99% identical to its parent until it diverges. With 180 preview VMs forked from 10 production VMs, full copies waste memory: 180 nearly-identical arrays.
+
+`BlockMapKind` dispatches between two runtime representations:
+
+```
+BlockMapKind
+    ├── Full(AtomicBlockMap)       ← normal VMs, or flattened forks
+    └── Forked(ForkedBlockMap)     ← freshly forked VMs
+```
+
+`ForkedBlockMap` holds a shared reference to the parent and a sparse overlay of diverged entries:
+
+```
+ForkedBlockMap
+    parent:   Arc<BlockMap>                    ← shared, immutable
+    overlay:  DashMap<usize, (Blake3Hash, u64)> ← only modified entries
+
+Read(chunk_index):
+    overlay[chunk_index]  →  hit? return it
+                          →  miss? parent[chunk_index]
+
+Write(chunk_index, hash, seq):
+    overlay.insert(chunk_index, (hash, seq))   ← never touches parent
+```
+
+180 forks with ~1% divergence: 10 × 1.3MB (parents) + 180 × ~13KB (overlays) = ~15MB instead of ~260MB.
+
+### Auto-Flatten
+
+When the overlay exceeds 50% of the parent's entries, the fork has diverged enough that overlay lookup overhead isn't worth the memory savings. `try_flatten_block_map()` merges parent + overlay into a full `AtomicBlockMap`, replacing the `Forked` variant with `Full`. Double-checked under write lock to prevent TOCTOU races. Called from the write and zero_range paths. (`write_cache/flush.rs`)
+
+### State Is Separate
+
+`SparseStateMap` (dirty/syncing/clean/not-present) lives outside `BlockMapKind` in `CacheInner`, using the same sparse page-table pattern as `AtomicBlockMap` but with 4096 `AtomicU8` entries per page. This separation is deliberate:
+
+- **Lock-free state transitions**: State ops (`set_present`, `transition_to_dirty`) use direct CAS on `AtomicU8` — no RwLock. Co-locating state inside `AtomicBlockMap` would force every state transition through the block map's read lock.
+- **Independent per-fork state**: Each fork has its own `SparseStateMap` while sharing the parent's hash data through `Arc<BlockMap>`. The parent never needs mutation.
+- **Shared memory budget**: Both `AtomicBlockMap` and `SparseStateMap` share an `Arc<AtomicUsize>` page budget. When exhausted, writes fail with ENOSPC propagated to the NBD client.
+
+Created via `open_from_manifest()` when a parent block map is provided. (`block_map.rs:SparseStateMap`, `write_cache/init.rs:open_from_manifest`)
 
 ## Device Lifecycle (Typestate)
 
@@ -360,7 +404,7 @@ None of this work is needed until flush time. With deferred hashing, the write p
 
 **Write coalescing is free**: write the same block 100 times before flush, hash it once. Previously: 100 hashes, 99 thrown away.
 
-The read path distinguishes ZERO-placeholder from never-written using the **present bitmap**: ZERO + present = deferred hash (SSD pread), ZERO + !present = never written (return zeros).
+The read path distinguishes ZERO-placeholder from never-written using the **state map**: ZERO hash + state != NotPresent = deferred hash (SSD pread), ZERO hash + NotPresent = never written (return zeros).
 
 Sequence numbers replace hashes as the race detection token in flush. There is a narrow TOCTOU window between checking the sequence and doing the CAS (nanoseconds), identical to the previous hash-based approach and self-healing.
 
@@ -398,6 +442,14 @@ S3 outages shouldn't cascade into mutex contention on the hot path. All circuit 
 
 We use a consecutive-failure policy (not windowed) by default because S3 outages tend to be total, not partial.
 
+### Why sparse page tables instead of dense arrays?
+
+Dense arrays pre-allocate for all blocks: a 1TB export with 128KB blocks has 8M entries. `AtomicBlockMap` alone cost ~224MB per export — at 2,000 VMs per compute node, that's 448GB just for hash metadata. Impossible.
+
+Sparse page tables allocate on first write. The directory (one pointer per page) costs ~530KB. Each 4KB page covers 128 hash entries or 4096 state entries. An empty export: ~530KB. A 1%-written export: ~5MB. The cost is one extra pointer dereference on the hot path — a branch that predicts correctly almost every time and is noise next to the SSD pwrite that follows it.
+
+We considered co-locating state into `HashEntry` (add `state: AtomicU8`, bump to 40 bytes, 102 entries/page). Rejected because state transitions (`set_present`, `transition_to_dirty`) are lock-free today — direct CAS on `AtomicU8`. `AtomicBlockMap` is behind a `RwLock` (for fork-overlay swaps). Co-locating would force every state transition through a read lock. Two separate sparse structures preserve lock-free state transitions while achieving the same memory savings.
+
 ### Why SeqLock instead of RwLock for the block map?
 
 Each block's metadata (hash + sequence) spans multiple `AtomicU64`s. A torn read (seeing half-old, half-new) would produce a wrong hash. SeqLock solves this with per-entry version counters — readers spin-retry if the version changed during read. Cost: near-zero, because writes to a specific chunk are rare relative to reads, and each chunk has its own version counter.
@@ -412,7 +464,7 @@ We considered `RwLock` but rejected it: even uncontended lock/unlock has ~25ns o
 | `nbd/router.rs` | Multi-tenant export manager: create, delete, drain, promote, resize |
 | `nbd/handler.rs` | Thin wrapper dispatching NBD commands (read/write/flush) to WriteCache |
 | `nbd/write_cache/mod.rs` | `WriteCache<S>` typestate wrapper, `FlushStats`, `SnapshotResult` |
-| `nbd/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, atomic block states, presence bitmap |
+| `nbd/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, `SparseStateMap` integration, metadata persistence |
 | `nbd/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
 | `nbd/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → S3 → SSD fallback) |
 | `nbd/write_cache/flush.rs` | Dirty block scan, pack assembly, S3 upload, manifest sync |
@@ -420,7 +472,7 @@ We considered `RwLock` but rejected it: even uncontended lock/unlock has ~25ns o
 | `nbd/write_cache/recovery.rs` | WAL replay, dirty block verification after crash |
 | `nbd/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
 | `nbd/write_cache/error.rs` | `CacheError` type |
-| `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (SeqLock), `SequenceNumber`, LZ4 helpers |
+| `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
 | `nbd/state.rs` | `BlockState` enum + sealed typestate markers (`Initializing`, `Active`, etc.) |
 | `nbd/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
 | `nbd/pack_index.rs` | `HostPackIndex`: `DashMap<Blake3Hash, PackLocation>` for cross-export dedup |
@@ -482,16 +534,44 @@ Mode can be changed at runtime via `watch::Sender`. The scheduler re-reads the m
 
 ## Memory Overhead
 
-| Component | Per-Export | Shared | Formula |
-|-----------|-----------|--------|---------|
-| `AtomicBlockMap` | ~28 bytes/block | — | `(u32 + u64 + u64 + u64) × num_blocks` |
-| `block_states` | 1 byte/block | — | `num_blocks` bytes |
-| `present_chunks` | 1 bit/block | — | `num_blocks / 8` bytes |
-| `HostPackIndex` | — | ~56 bytes/unique hash | DashMap entry overhead |
-| `CleanCache` (memory) | — | `memory_size_gb` | Configured, default 1GB |
-| `CleanCache` (SSD) | — | `ssd_cache_size_gb` | Configured, default 10GB |
+Both `AtomicBlockMap` and `SparseStateMap` use sparse page tables — pages are allocated on first write, not upfront. An empty export costs only its directory arrays (~530KB). Memory grows proportionally to blocks actually written.
 
-Example: 1TB export with 128KB blocks = 8M blocks. Per-export overhead: ~232MB (mostly AtomicBlockMap).
+Previously, three dense arrays were pre-allocated for all 8M blocks regardless of usage: `AtomicBlockMap` (4 parallel arrays of AtomicU64/AtomicU32 = ~224MB), `block_states` (1 byte × 8M = 8MB), and `present_chunks` (1 bit × 8M = 1MB) — **~233MB per export**. At 2,000 VMs: 466GB. The sparse page tables replace all three with allocate-on-write directories: **~530KB per empty export** — a 450× reduction.
+
+```
+AtomicBlockMap (hash + sequence storage)
+├── directory: Box<[AtomicPtr<HashPage>]>    512 KB  (65536 entries for 8M blocks)
+│   ├── [0] → HashPage { entries: [HashEntry; 128] }  4096 bytes
+│   ├── [1] → null  (unwritten — zero cost)
+│   └── ...
+│   HashEntry: 32 bytes (#[repr(C)]): version(u32) + _pad(u32) + hash_lo(u64) + hash_hi(u64) + seq(u64)
+
+SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
+├── directory: Box<[AtomicPtr<StatePage>]>    16 KB  (2048 entries for 8M blocks)
+│   ├── [0] → StatePage { states: [AtomicU8; 4096] }  4096 bytes
+│   ├── [1] → null  (unwritten — zero cost)
+│   └── ...
+```
+
+| Component | Per-Export (fixed) | Per-Written-Page | Shared | Notes |
+|-----------|-------------------|-----------------|--------|-------|
+| `AtomicBlockMap` directory | ~512 KB | 4 KB per 128 blocks written | — | 32 bytes/entry × 128 entries/page |
+| `SparseStateMap` directory | ~16 KB | 4 KB per 4096 blocks written | — | 1 byte/entry × 4096 entries/page |
+| `HostPackIndex` | — | — | ~56 bytes/unique hash | DashMap, pruned on export removal |
+| `CleanCache` (memory) | — | — | `memory_size_gb` | Configured, default 1GB |
+| `CleanCache` (SSD) | — | — | `ssd_cache_size_gb` | Configured, default 10GB |
+
+| Scenario (1TB/128KB = 8M blocks) | Memory |
+|---|---|
+| Empty export | ~530 KB |
+| 1% written (84K blocks) | ~5 MB |
+| 100% written | ~260 MB |
+| 2,000 empty exports | ~1 GB |
+| 2,000 exports, 1% written | ~10 GB |
+
+### Memory Budget
+
+Each export's page tables share an `Arc<AtomicUsize>` budget counter. Page allocation decrements the budget; when exhausted, writes return `MetadataLimitExceeded` → NBD ENOSPC. This prevents a runaway guest from consuming memory budgeted for other VMs. (`block_map.rs:ensure_page`)
 
 ## Failure Modes
 
@@ -506,12 +586,13 @@ Example: 1TB export with 128KB blocks = 8M blocks. Per-export overhead: ~232MB (
 | Process crash mid-WAL-write | Torn WAL entry | CRC32 detects; replay stops at corruption, discards torn tail |
 | Process crash mid-S3-sync | Orphaned packs in S3 | Harmless: packs are immutable, GC can clean up unreferenced packs |
 | S3 sustained outage | Circuit breaker opens | Reads from local SSD continue; writes accumulate locally; breaker probes S3 every 30s |
+| Metadata budget exhaustion | `ENOSPC` to guest | Guest sees write failure; existing data intact; flush frees budget by clearing dirty blocks |
 
 ## Testing
 
 | Suite | Command | Count | What It Covers |
 |-------|---------|-------|----------------|
-| Unit | `cargo test --features test-utils --lib` | ~304 | Lock-free atomics, wire format round-trips, state transitions |
+| Unit | `cargo test --features test-utils --lib` | ~307 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables |
 | Integration | `cargo test --features test-utils --test integration` | ~46 | Crash recovery, concurrent writes, flush consistency (no Docker) |
 | Docker | `cargo test --features docker-tests --test docker_integration` | ~9 | Real S3 via MinIO (testcontainers-rs), end-to-end pack upload/download |
 | Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free algorithms (AtomicBlockMap, SeqLock) |

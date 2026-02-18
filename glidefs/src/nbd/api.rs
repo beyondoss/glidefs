@@ -416,6 +416,14 @@ where
                 writeln!(output, "# TYPE glidefs_s3_circuit_breaker_state gauge").unwrap();
                 writeln!(output, "glidefs_s3_circuit_breaker_state {cb_value}").unwrap();
             }
+            // Host-level pack index size (content-addressed dedup entries)
+            {
+                use std::fmt::Write;
+                let entries = router.pack_index().len();
+                writeln!(output, "# HELP glidefs_pack_index_entries Number of entries in the host-level pack index").unwrap();
+                writeln!(output, "# TYPE glidefs_pack_index_entries gauge").unwrap();
+                writeln!(output, "glidefs_pack_index_entries {entries}").unwrap();
+            }
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

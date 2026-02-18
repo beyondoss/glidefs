@@ -52,7 +52,7 @@ impl WriteCache<Active> {
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
-                self.inner.set_present(idx);
+                self.inner.set_present(idx)?;
             }
         }
 
@@ -78,7 +78,7 @@ impl WriteCache<Active> {
                 }
                 let seq = self.inner.sequence.next();
                 // Placeholder hash — flush reads SSD and computes the real hash.
-                self.inner.block_map_set(idx, Blake3Hash::ZERO, seq);
+                self.inner.block_map_set(idx, Blake3Hash::ZERO, seq)?;
 
                 let wal_entry = WalEntryRef {
                     name: &self.inner.export_name,
@@ -172,7 +172,7 @@ impl WriteCache<Active> {
                 }
 
                 let seq = self.inner.sequence.next();
-                self.inner.block_map_set(idx, zero_hash, seq);
+                self.inner.block_map_set(idx, zero_hash, seq)?;
 
                 let wal_entry = WalEntryRef {
                     name: &self.inner.export_name,
@@ -232,7 +232,9 @@ impl WriteCache<Active> {
             if idx >= self.inner.num_blocks {
                 continue;
             }
-            self.inner.set_present(idx);
+            // Ignore budget errors for mark_range_dirty_and_present
+            // (the block should already be present from the write path).
+            let _ = self.inner.set_present(idx);
             self.inner.transition_to_dirty(idx);
         }
     }

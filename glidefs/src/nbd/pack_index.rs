@@ -4,6 +4,8 @@
 //! exports on the host. When flushing, blocks whose hash already exists in
 //! the index are skipped (already in S3).
 
+use std::collections::HashSet;
+
 use dashmap::DashMap;
 
 use super::block_map::{Blake3Hash, BlockMap};
@@ -75,6 +77,25 @@ impl HostPackIndex {
                 );
             }
         }
+    }
+
+    /// Remove entries not referenced by any active export.
+    ///
+    /// Retains only entries whose hash appears in `referenced`. Called after
+    /// export removal to reclaim memory from departed VMs.
+    ///
+    /// **Race note**: If a flush is in-flight, a block may have been uploaded
+    /// and inserted here but the block map still holds ZERO (the CAS back to
+    /// the real hash hasn't landed). Such entries get pruned. This is harmless:
+    /// the block exists on local SSD, so reads fall back to tier 3, and the
+    /// next flush cycle re-uploads it.
+    ///
+    /// Returns the number of entries removed.
+    pub fn prune_unreferenced(&self, referenced: &HashSet<Blake3Hash>) -> usize {
+        let before = self.index.len();
+        self.index.retain(|hash, _| referenced.contains(hash));
+        let after = self.index.len();
+        before.saturating_sub(after)
     }
 
     /// Derive pack index entries for a specific VM's block map.
@@ -329,5 +350,48 @@ mod tests {
         let derived_hashes: Vec<Blake3Hash> = derived.iter().map(|e| e.hash).collect();
         assert!(!derived_hashes.contains(&hashes[3]));
         assert!(!derived_hashes.contains(&hashes[4]));
+    }
+
+    #[test]
+    fn test_prune_unreferenced_removes_stale_entries() {
+        let index = HostPackIndex::new();
+        let active = make_hash(b"active");
+        let stale = make_hash(b"stale");
+
+        index.insert(active, make_location(0));
+        index.insert(stale, make_location(100));
+        assert_eq!(index.len(), 2);
+
+        let referenced: HashSet<Blake3Hash> = [active].into_iter().collect();
+        let removed = index.prune_unreferenced(&referenced);
+
+        assert_eq!(removed, 1);
+        assert!(index.contains(&active));
+        assert!(!index.contains(&stale));
+    }
+
+    #[test]
+    fn test_prune_with_empty_referenced_clears_all() {
+        let index = HostPackIndex::new();
+        index.insert(make_hash(b"a"), make_location(0));
+        index.insert(make_hash(b"b"), make_location(1));
+
+        let removed = index.prune_unreferenced(&HashSet::new());
+        assert_eq!(removed, 2);
+        assert_eq!(index.len(), 0);
+    }
+
+    #[test]
+    fn test_prune_with_all_referenced_removes_nothing() {
+        let index = HostPackIndex::new();
+        let h1 = make_hash(b"one");
+        let h2 = make_hash(b"two");
+        index.insert(h1, make_location(0));
+        index.insert(h2, make_location(1));
+
+        let referenced: HashSet<Blake3Hash> = [h1, h2].into_iter().collect();
+        let removed = index.prune_unreferenced(&referenced);
+        assert_eq!(removed, 0);
+        assert_eq!(index.len(), 2);
     }
 }
