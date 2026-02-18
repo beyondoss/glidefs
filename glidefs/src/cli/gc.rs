@@ -457,6 +457,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
 // ---------------------------------------------------------------------------
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 /// Run GC reconciliation on a single content store prefix.
 /// Exposed for integration testing.
 pub async fn reconcile_prefix_for_test(
@@ -480,12 +481,14 @@ pub async fn reconcile_prefix_for_test(
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 /// Create a new empty GC state for testing.
 pub fn new_gc_state_for_test() -> GcState {
     GcState::default()
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 /// Inject a dead pack into GC state with a specific timestamp for testing.
 pub fn inject_dead_pack_for_test(state: &mut GcState, pack_id: &Uuid, timestamp: DateTime<Utc>) {
     state
@@ -494,6 +497,7 @@ pub fn inject_dead_pack_for_test(state: &mut GcState, pack_id: &Uuid, timestamp:
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 /// Test report from reconciliation.
 pub struct GcTestReport {
     stats: GcStats,
@@ -501,6 +505,7 @@ pub struct GcTestReport {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 impl GcTestReport {
     pub fn manifests_scanned(&self) -> usize {
         self.stats.manifests_scanned

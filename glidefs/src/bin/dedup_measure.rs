@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use lz4_flex;
+
 
 
 #[derive(Parser)]
@@ -607,7 +607,7 @@ fn main() {
                     1.0
                 };
                 let extrap_overlay_lz4 = (o.overlay_lz4 as f64 * scale) as usize;
-                println!("    {} → {}:", "base", o.fork_name);
+                println!("    base → {}:", o.fork_name);
                 println!("      changed: {}, new: {}, deleted: {}, overlay entries: {}",
                     o.changed_blocks, o.new_blocks, o.deleted_blocks, o.overlay_entries);
                 println!("      overlay raw: {}, overlay lz4: {}, 10GB extrap lz4: {}",

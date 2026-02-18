@@ -94,6 +94,7 @@ impl PackRegistry {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code)]
     pub fn pack_id_set(&self) -> HashSet<Uuid> {
         self.pack_ids.iter().copied().collect()
     }

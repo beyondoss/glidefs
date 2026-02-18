@@ -110,7 +110,6 @@ impl TestServer {
             db_path: db_path.to_string(),
             cache_dir: cache_dir.path().to_path_buf(),
             block_size: 128 * 1024,
-            blocks_per_batch: 10,
             clean_cache,
             wal_sync: false,
         }));

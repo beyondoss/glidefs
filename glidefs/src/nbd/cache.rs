@@ -108,6 +108,7 @@ impl BlockCache for FoyerBlockCache {
 // ============================================================================
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 /// Bounded in-memory block cache backed by a HashMap.
 ///
 /// FIFO eviction, Mutex-based. Used in tests that don't need foyer's
@@ -118,6 +119,7 @@ pub struct SimpleBlockCache {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 struct SimpleCacheInner {
     map: HashMap<Blake3Hash, Bytes>,
     /// Insertion-order keys for FIFO eviction.
@@ -126,6 +128,7 @@ struct SimpleCacheInner {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)]
 impl SimpleBlockCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {

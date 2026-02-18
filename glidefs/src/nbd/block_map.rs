@@ -363,6 +363,7 @@ impl BlockMap {
 
     /// Returns true if there are no chunk slots.
     #[inline]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -696,6 +697,7 @@ impl ForkedBlockMap {
     /// Total number of chunk slots (same as parent).
     #[cfg(test)]
     #[inline]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.num_chunks
     }
@@ -703,6 +705,7 @@ impl ForkedBlockMap {
     /// Returns true if there are no chunk slots.
     #[cfg(test)]
     #[inline]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.num_chunks == 0
     }
@@ -749,6 +752,7 @@ impl BlockMapKind {
     /// Number of chunk slots.
     #[cfg(test)]
     #[inline]
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         match self {
             BlockMapKind::Full(m) => m.len(),
@@ -759,6 +763,7 @@ impl BlockMapKind {
     /// Returns true if there are no chunk slots.
     #[cfg(test)]
     #[inline]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

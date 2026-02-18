@@ -15,8 +15,8 @@ async fn test_live_migration_readonly_fork_promote() {
     server_a.create_export("vm1", 0.01).await;
 
     let mut client_a = NbdClient::connect(server_a.addr, "vm1").await.unwrap();
-    client_a.write(0 * BLOCK_SIZE as u64, &vec![0xAA; BLOCK_SIZE]).await.unwrap();
-    client_a.write(1 * BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE]).await.unwrap();
+    client_a.write(0, &vec![0xAA; BLOCK_SIZE]).await.unwrap();
+    client_a.write(BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE]).await.unwrap();
     client_a.write(2 * BLOCK_SIZE as u64, &vec![0xCC; BLOCK_SIZE]).await.unwrap();
     client_a.write(3 * BLOCK_SIZE as u64, &vec![0xDD; BLOCK_SIZE]).await.unwrap();
     client_a.flush().await.unwrap();
@@ -96,8 +96,8 @@ async fn test_migration_survives_cold_wake() {
     server_a.create_export("vm1", 0.01).await;
 
     let mut client_a = NbdClient::connect(server_a.addr, "vm1").await.unwrap();
-    client_a.write(0 * BLOCK_SIZE as u64, &vec![0xAA; BLOCK_SIZE]).await.unwrap();
-    client_a.write(1 * BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE]).await.unwrap();
+    client_a.write(0, &vec![0xAA; BLOCK_SIZE]).await.unwrap();
+    client_a.write(BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE]).await.unwrap();
     client_a.flush().await.unwrap();
     client_a.disconnect().await.unwrap();
 

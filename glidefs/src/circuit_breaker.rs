@@ -511,6 +511,7 @@ impl CircuitBreaker {
 
     /// Force the circuit to a specific state (for testing/admin).
     #[cfg(any(test, loom, feature = "test-utils"))]
+    #[allow(dead_code)]
     pub fn force_state(&self, new_state: CircuitState) {
         let now = self.now_secs();
         let packed = match new_state {
