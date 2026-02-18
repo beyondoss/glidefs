@@ -165,6 +165,18 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Start SSD capacity monitor (backpressure)
+    {
+        use crate::nbd::capacity_monitor::{capacity_monitor, CapacityConfig};
+        info!("Starting SSD capacity monitor");
+        let router_clone = Arc::clone(&router);
+        let shutdown_clone = shutdown.clone();
+        handles.push(spawn_named("capacity-monitor", async move {
+            capacity_monitor(router_clone, CapacityConfig::default(), shutdown_clone).await;
+            Ok(())
+        }));
+    }
+
     // Start NBD TCP servers
     if let Some(addresses) = &nbd_config.addresses {
         for addr in addresses {

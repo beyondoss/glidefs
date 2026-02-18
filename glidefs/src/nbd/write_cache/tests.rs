@@ -1224,3 +1224,279 @@ async fn test_draining_state_transition() {
     let data = cache2.read(0, 4096).unwrap();
     assert_eq!(&data[..4], &[0xAA; 4]);
 }
+
+// ========================================================================
+// Targeted concurrency race tests
+// ========================================================================
+
+/// Concurrent flush + write: verify S3 content correctness after convergence.
+///
+/// The existing `test_concurrent_flush_and_writes` verifies no torn data on
+/// local SSD, but doesn't check that S3 packs and the manifest converge to
+/// the correct final state. This test exercises the compound-check interleaving:
+///
+///   Flush snapshots (block_idx, old_seq), a concurrent write lands (pwrite +
+///   block_map_set(ZERO, new_seq)), flush reads SSD (may get new data with old
+///   seq), hash check in step 5 either catches the mismatch or the system
+///   self-heals via re-flush.
+///
+/// After convergence (final quiesced flush), we verify:
+/// 1. Every non-zero hash in the manifest has a matching pack_index entry
+/// 2. Reading every block through the S3 path returns the correct final data
+/// 3. The pack_index maps the correct hash for every block
+#[tokio::test]
+async fn test_concurrent_flush_write_s3_convergence() {
+    use crate::nbd::block_map::blake3_128;
+    use std::sync::Arc;
+    use tokio::task::JoinSet;
+
+    let dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "s3-converge".to_string(),
+        device_size: 1024 * 1024,
+        block_size: 4096,
+        wal_sync: false,
+    };
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let content_store = Arc::new(crate::nbd::content_store::ContentStore::new(
+        Arc::clone(&object_store),
+        "test-converge",
+    ));
+    let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::new());
+    let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = Arc::new(cache.finish_recovery().await.unwrap());
+
+    // Seed blocks with initial data
+    for i in 0u8..10 {
+        cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], clean_cache.as_ref())
+            .unwrap();
+    }
+
+    let mut tasks = JoinSet::new();
+
+    // Flusher: runs flush cycles concurrently with writers
+    {
+        let cache = Arc::clone(&cache);
+        let cs = Arc::clone(&content_store);
+        let pi = Arc::clone(&pack_index);
+        tasks.spawn(async move {
+            for _ in 0..5 {
+                let _ = cache.flush_to_s3(&cs, &pi).await;
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    // Writers: each repeatedly overwrites a block with new data.
+    // Final value is deterministic: writer_id * 10 + 9 (last round).
+    for writer_id in 0..5u8 {
+        let cache = Arc::clone(&cache);
+        let clean_cache = Arc::clone(&clean_cache);
+        tasks.spawn(async move {
+            let block_idx = writer_id as u64 * 2; // blocks 0,2,4,6,8
+            for round in 0..10u8 {
+                let fill = writer_id * 10 + round;
+                cache
+                    .write(block_idx * 4096, &vec![fill; 4096], clean_cache.as_ref())
+                    .unwrap();
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.unwrap();
+    }
+
+    // Quiesced final flush — no concurrent writes
+    let _stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+    assert_eq!(cache.dirty_block_count(), 0, "all blocks clean after final flush");
+
+    // Verify manifest is self-contained: every non-zero block_map hash has a
+    // pack_index entry. A broken compound check would leave orphan hashes.
+    let manifest_bytes = content_store
+        .get_manifest("s3-converge")
+        .await
+        .unwrap()
+        .expect("manifest should exist");
+    let manifest = crate::nbd::manifest::Manifest::deserialize(&manifest_bytes).unwrap();
+    let pack_hashes: std::collections::HashSet<_> =
+        manifest.pack_index.iter().map(|e| e.hash).collect();
+
+    for bm_entry in &manifest.block_map {
+        if !bm_entry.hash.is_zero() {
+            assert!(
+                pack_hashes.contains(&bm_entry.hash),
+                "block map hash {:?} at chunk {} has no pack_index entry — \
+                 compound check may have committed a stale hash",
+                bm_entry.hash,
+                bm_entry.chunk_index,
+            );
+        }
+    }
+
+    // Verify reads through S3 return the correct final data.
+    // Use a fresh clean_cache to force resolution through S3 packs.
+    let verify_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let metrics = crate::nbd::metrics::ExportMetrics::new();
+    for block_idx in 0u64..10 {
+        let final_ssd = cache.read_local(block_idx * 4096, 4096).unwrap();
+        let expected_hash = blake3_128(&final_ssd);
+
+        // Verify pack_index has the right hash
+        if !expected_hash.is_zero() {
+            assert!(
+                pack_index.get(&expected_hash).is_some(),
+                "block {} hash {:?} missing from pack_index after convergence",
+                block_idx,
+                expected_hash,
+            );
+        }
+
+        // Read through full S3 path
+        let s3_data = cache
+            .read_v2(
+                block_idx * 4096,
+                4096,
+                &verify_cache,
+                &pack_index,
+                &content_store,
+                &metrics,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            &s3_data[..],
+            &final_ssd[..],
+            "block {} S3 read doesn't match SSD — flush may have committed \
+             a hash for stale data",
+            block_idx,
+        );
+    }
+}
+
+/// Regression guard: pruning with a stale block_map snapshot loses entries.
+///
+/// Reproduces the old race deterministically:
+///   1. Write blocks 0-4, flush → Clean, hashes in pack_index
+///   2. Write blocks 5-7 → Dirty, block_map has ZERO placeholder hash
+///   3. Snapshot the referenced set (blocks 5-7 have ZERO → excluded)
+///   4. Flush → uploads blocks 5-7, inserts hashes, CAS → Clean
+///   5. Prune with stale snapshot → removes freshly-inserted entries
+///
+/// This is the bug that `rebuild_manifest_hashes` fixes. Keeping this test
+/// as a regression guard: if the prune caller forgets the rebuild step,
+/// entries are lost.
+#[tokio::test]
+async fn test_prune_stale_snapshot_loses_entries_regression() {
+    use crate::nbd::block_map::blake3_128;
+    use std::collections::HashSet;
+
+    let h = V2Harness::new().await;
+
+    // Write and flush 5 blocks
+    for i in 0u8..5 {
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+    }
+    h.flush().await;
+
+    // Write 3 more (dirty, ZERO hash in block_map)
+    for i in 5u8..8 {
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+    }
+
+    // Stale snapshot: blocks 5-7 contribute nothing (ZERO hash)
+    let snapshot = h.cache.inner.block_map_snapshot();
+    let stale_referenced: HashSet<_> = snapshot
+        .iter_non_empty()
+        .filter(|(_, e)| !e.hash.is_zero())
+        .map(|(_, e)| e.hash)
+        .collect();
+    assert_eq!(stale_referenced.len(), 5);
+
+    // Flush blocks 5-7 → pack_index now has their hashes
+    h.flush().await;
+
+    let new_hashes: Vec<_> = (5u8..8).map(|i| blake3_128(&vec![i + 1; 4096])).collect();
+    for hash in &new_hashes {
+        assert!(h.pack_index.get(hash).is_some(), "hash in pack_index before prune");
+    }
+
+    // Prune with stale snapshot → loses the freshly-flushed entries
+    let removed = h.pack_index.prune_unreferenced(&stale_referenced);
+    assert!(removed >= 3, "stale prune should remove at least 3 entries");
+
+    for hash in &new_hashes {
+        assert!(h.pack_index.get(hash).is_none(), "stale prune loses entries");
+    }
+
+    // Reads still work via SSD fallback
+    for i in 5u8..8 {
+        let data = h.read(i as u64 * 4096, 4096).await;
+        assert!(data.iter().all(|&b| b == i + 1), "block {} readable via SSD fallback", i);
+    }
+}
+
+/// Verify that `rebuild_manifest_hashes` before prune prevents entry loss.
+///
+/// Same scenario as the regression test above, but uses the fixed path:
+/// after flushing blocks 5-7, `rebuild_manifest_hashes` captures their
+/// hashes from the current block_map + pack_index intersection. Prune
+/// with this set retains all entries.
+#[tokio::test]
+async fn test_rebuild_manifest_hashes_prevents_prune_loss() {
+    use crate::nbd::block_map::blake3_128;
+
+    let h = V2Harness::new().await;
+
+    // Write and flush 5 blocks
+    for i in 0u8..5 {
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+    }
+    h.flush().await;
+
+    // Write 3 more (dirty, ZERO hash in block_map)
+    for i in 5u8..8 {
+        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+    }
+
+    // Flush blocks 5-7 → pack_index now has their hashes
+    h.flush().await;
+    assert_eq!(h.cache.dirty_block_count(), 0);
+
+    let all_hashes: Vec<_> = (0u8..8).map(|i| blake3_128(&vec![i + 1; 4096])).collect();
+    for hash in &all_hashes {
+        assert!(h.pack_index.get(hash).is_some(), "all hashes in pack_index before prune");
+    }
+
+    // The fix: rebuild manifest hashes before pruning (what prune_pack_index does)
+    h.cache.rebuild_manifest_hashes(&h.pack_index);
+    let referenced = h.cache.referenced_hashes();
+
+    // All 8 hashes should be in the referenced set
+    assert!(referenced.len() >= 8, "rebuild should capture all 8 hashes, got {}", referenced.len());
+
+    // Prune with manifest-based referenced set → nothing removed
+    let removed = h.pack_index.prune_unreferenced(&referenced);
+    assert_eq!(removed, 0, "rebuild_manifest_hashes should prevent any pruning");
+
+    // All entries still present
+    for (i, hash) in all_hashes.iter().enumerate() {
+        assert!(
+            h.pack_index.get(hash).is_some(),
+            "block {} hash should survive prune with manifest-based referenced set",
+            i,
+        );
+    }
+
+    // Reads work through S3 path (not just SSD fallback)
+    for i in 0u8..8 {
+        let data = h.read(i as u64 * 4096, 4096).await;
+        assert!(data.iter().all(|&b| b == i + 1), "block {} readable", i);
+    }
+}

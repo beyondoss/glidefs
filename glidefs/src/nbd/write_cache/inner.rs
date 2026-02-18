@@ -1,11 +1,16 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::nbd::block_map::{BlockMap, BlockMapKind, Blake3Hash, SequenceNumber};
+use std::collections::HashSet;
+
+use crate::nbd::block_map::{
+    BlockMap, BlockMapKind, Blake3Hash, MetadataLimitExceeded, SequenceNumber,
+    SparseBlockState, SparseStateMap,
+};
 use crate::nbd::state::BlockState;
 use crate::nbd::wal::Wal;
 
@@ -16,8 +21,8 @@ use bytes::Bytes;
 
 /// Magic bytes for cache metadata file
 pub(super) const METADATA_MAGIC: &[u8; 8] = b"ZFSCACHE";
-/// Version 3: present_blocks as packed bits (8x smaller than v2)
-pub(super) const METADATA_VERSION: u32 = 3;
+/// Version 4: sparse state map (only non-zero entries persisted)
+pub(super) const METADATA_VERSION: u32 = 4;
 
 /// A file handle safe for concurrent positional I/O.
 ///
@@ -180,14 +185,10 @@ pub(crate) struct CacheInner {
     /// Uses positional I/O (pread/pwrite) which is lock-free and thread-safe
     pub(super) data_file: SyncFile,
 
-    /// Block states (indexed by block number) - LOCK-FREE
-    /// Uses AtomicU8 with CAS for state transitions
-    pub(super) block_states: Box<[AtomicU8]>,
-
-    /// Presence bitmap as atomic u64 chunks - LOCK-FREE
-    /// Each chunk covers 64 blocks. Uses atomic OR to set bits.
-    /// Chunk index = block_num / 64, bit index = block_num % 64
-    pub(super) present_chunks: Box<[AtomicU64]>,
+    /// Sparse block state map - LOCK-FREE
+    /// Combines block state and presence into a single sparse page table.
+    /// State encoding: 0=NotPresent, 1=Clean, 2=Dirty, 3=Syncing
+    pub(super) state_map: SparseStateMap,
 
     /// Number of blocks (for bounds checking)
     pub(super) num_blocks: usize,
@@ -224,6 +225,15 @@ pub(crate) struct CacheInner {
     /// Pre-computed zero-block bytes for this export's block_size.
     /// Avoids a heap allocation on every sparse read.
     pub(super) zero_block_bytes: Bytes,
+
+    /// Cached set of hashes from the most recent manifest build.
+    ///
+    /// Updated on every `upload_manifest()` and on-demand via
+    /// `rebuild_manifest_hashes()`. Used by pack index pruning to
+    /// determine which entries are still needed — the manifest is the
+    /// durable reference, not the live block_map (which has ZERO
+    /// placeholders for in-flight flushes).
+    pub(super) manifest_pack_hashes: Mutex<HashSet<Blake3Hash>>,
 }
 
 impl CacheInner {
@@ -234,59 +244,45 @@ impl CacheInner {
         if block_num >= self.num_blocks {
             return false;
         }
-        let chunk_idx = block_num / 64;
-        let bit_idx = block_num % 64;
-        let chunk = self.present_chunks[chunk_idx].load(Ordering::Acquire);
-        (chunk & (1u64 << bit_idx)) != 0
+        self.state_map.is_present(block_num)
     }
 
-    /// Mark block as present (lock-free atomic OR).
+    /// Mark block as present (lock-free CAS NOT_PRESENT -> CLEAN).
+    /// Returns `Err(MetadataLimitExceeded)` if the page budget is exhausted.
     #[inline]
-    pub(super) fn set_present(&self, block_num: usize) {
+    pub(super) fn set_present(&self, block_num: usize) -> Result<(), MetadataLimitExceeded> {
         if block_num >= self.num_blocks {
-            return;
+            return Ok(());
         }
-        let chunk_idx = block_num / 64;
-        let bit_idx = block_num % 64;
-        self.present_chunks[chunk_idx].fetch_or(1u64 << bit_idx, Ordering::Release);
+        self.state_map.set_present(block_num)
     }
 
     /// CAS loop to transition a block to Dirty state (lock-free).
     ///
-    /// Handles three source states:
-    /// - **Clean → Dirty**: increments dirty_block_count.
-    /// - **Syncing → Dirty**: decrements syncing_block_count, increments dirty_block_count.
-    /// - **Dirty → Dirty**: no-op.
+    /// Handles three source states (sparse encoding):
+    /// - **Clean(1) -> Dirty(2)**: increments dirty_block_count.
+    /// - **Syncing(3) -> Dirty(2)**: decrements syncing_block_count, increments dirty_block_count.
+    /// - **Dirty(2) -> Dirty(2)**: no-op.
     #[inline]
     pub(super) fn transition_to_dirty(&self, idx: usize) {
         loop {
-            let current = self.block_states[idx].load(Ordering::Acquire);
+            let current = self.state_map.get(idx);
 
-            if current == BlockState::Dirty as u8 {
+            if current == SparseBlockState::DIRTY {
                 break;
             }
 
-            if current == BlockState::Clean as u8 {
-                if self.block_states[idx]
-                    .compare_exchange(
-                        current,
-                        BlockState::Dirty as u8,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
+            if current == SparseBlockState::CLEAN {
+                if self.state_map
+                    .cas(idx, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
                     .is_ok()
                 {
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
-            } else if current == BlockState::Syncing as u8 {
-                if self.block_states[idx]
-                    .compare_exchange(
-                        current,
-                        BlockState::Dirty as u8,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
+            } else if current == SparseBlockState::SYNCING {
+                if self.state_map
+                    .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
                     .is_ok()
                 {
                     self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
@@ -306,29 +302,36 @@ impl CacheInner {
     }
 
     /// Set a block map entry (takes read lock — interior mutability handles the write).
+    ///
+    /// Returns `Err(MetadataLimitExceeded)` if the page-table memory budget is
+    /// exhausted (only when a budget is configured).
     #[inline]
-    pub(super) fn block_map_set(&self, chunk_index: usize, hash: Blake3Hash, seq: u64) {
+    pub(super) fn block_map_set(
+        &self,
+        chunk_index: usize,
+        hash: Blake3Hash,
+        seq: u64,
+    ) -> Result<(), crate::nbd::block_map::MetadataLimitExceeded> {
         self.block_map.read().set(chunk_index, hash, seq)
     }
 
     /// Snapshot the block map (takes read lock).
     pub(super) fn block_map_snapshot(&self) -> BlockMap {
-        self.block_map.read().snapshot(&self.block_states)
+        self.block_map.read().snapshot(&self.state_map)
     }
 
     /// Count present blocks (for metrics/logging).
+    #[allow(dead_code)]
     pub(super) fn count_present(&self) -> usize {
-        self.present_chunks
-            .iter()
-            .map(|chunk| chunk.load(Ordering::Relaxed).count_ones() as usize)
-            .sum()
+        self.state_map.count_present()
     }
 
-    /// Persist block states and presence to metadata file (fast path).
+    /// Persist block states to metadata file (fast path).
     ///
-    /// Writes only block_states + present_chunks. Does NOT persist the block
-    /// map — call `persist_block_map()` separately (outside the WAL lock) for
-    /// that. Uses atomic write pattern: temp file → fsync → rename.
+    /// v4 sparse format: only writes entries with non-zero state (present blocks).
+    /// Does NOT persist the block map -- call `persist_block_map()` separately
+    /// (outside the WAL lock) for that. Uses atomic write pattern: temp file ->
+    /// fsync -> rename.
     pub(super) fn save_block_states(&self) -> Result<(), CacheError> {
         let path = self.config.metadata_path();
         let tmp_path = path.with_extension("meta.tmp");
@@ -347,28 +350,21 @@ impl CacheInner {
         file.write_all(&(self.config.block_size as u64).to_le_bytes())?;
         file.write_all(&(self.num_blocks as u64).to_le_bytes())?;
 
-        // Write block states (1 byte per block) - snapshot atomic values
-        let state_bytes: Vec<u8> = self
-            .block_states
-            .iter()
-            .map(|s| s.load(Ordering::Relaxed))
-            .collect();
-        file.write_all(&state_bytes)?;
-
-        // Write presence bitmap as packed bits (1 bit per block)
-        // Convert atomic u64 chunks back to packed bytes
-        let mut present_bytes = vec![0u8; self.num_blocks.div_ceil(8)];
-        for (chunk_idx, chunk) in self.present_chunks.iter().enumerate() {
-            let chunk_val = chunk.load(Ordering::Relaxed);
-            let base_byte = chunk_idx * 8;
-            for byte_offset in 0..8 {
-                let byte_idx = base_byte + byte_offset;
-                if byte_idx < present_bytes.len() {
-                    present_bytes[byte_idx] = ((chunk_val >> (byte_offset * 8)) & 0xFF) as u8;
-                }
+        // v4 sparse format: collect (index, state) pairs for non-zero entries
+        let mut sparse_entries: Vec<(u32, u8)> = Vec::new();
+        for idx in 0..self.num_blocks {
+            let state = self.state_map.get(idx);
+            if state != SparseBlockState::NOT_PRESENT {
+                sparse_entries.push((idx as u32, state));
             }
         }
-        file.write_all(&present_bytes)?;
+
+        // Write entry count then entries: index(u32 LE) + state(u8) = 5 bytes each
+        file.write_all(&(sparse_entries.len() as u64).to_le_bytes())?;
+        for &(idx, state) in &sparse_entries {
+            file.write_all(&idx.to_le_bytes())?;
+            file.write_all(&[state])?;
+        }
 
         // Fsync temp file to ensure data is on disk
         file.sync_all()?;
@@ -377,7 +373,7 @@ impl CacheInner {
         // Atomic rename (POSIX guarantees this is atomic)
         std::fs::rename(&tmp_path, &path)?;
 
-        let present_count = self.count_present();
+        let present_count = sparse_entries.len();
         debug!(
             path = %path.display(),
             blocks = self.num_blocks,
@@ -414,25 +410,20 @@ impl CacheInner {
 
     /// Load block states and presence from metadata file.
     ///
-    /// Returns (state_bytes, present_chunks, dirty_count) where:
-    /// - state_bytes: Raw u8 values for block states (Syncing converted to Dirty)
-    /// - present_chunks: Atomic u64 chunks for presence bitmap
-    /// - dirty_count: Number of dirty blocks (for counter initialization)
+    /// Returns `(SparseStateMap, dirty_count)`. Handles legacy v1/v2/v3 formats
+    /// by converting the old encoding (Clean=0, Dirty=1, Syncing=2) plus
+    /// separate presence bitmap into the new sparse encoding (NotPresent=0,
+    /// Clean=1, Dirty=2, Syncing=3).
     pub(super) fn load_metadata(
         config: &WriteCacheConfig,
-    ) -> Result<(Vec<u8>, Vec<u64>, usize), CacheError> {
+    ) -> Result<(SparseStateMap, usize), CacheError> {
         let path = config.metadata_path();
         let num_blocks = config.num_blocks();
-        let num_chunks = num_blocks.div_ceil(64);
 
         if !path.exists() {
-            // No metadata file - all blocks are clean and NOT present
+            // No metadata file -- all blocks are NOT_PRESENT
             debug!(path = %path.display(), "no metadata file, starting fresh");
-            return Ok((
-                vec![BlockState::Clean as u8; num_blocks],
-                vec![0u64; num_chunks],
-                0,
-            ));
+            return Ok((SparseStateMap::new(num_blocks), 0));
         }
 
         let mut file = File::open(&path)?;
@@ -480,97 +471,120 @@ impl CacheInner {
             );
         }
 
-        // Read block states
-        let mut state_bytes = vec![0u8; stored_num_blocks];
-        file.read_exact(&mut state_bytes)?;
-
-        // Convert Syncing to Dirty (conservative for crash recovery)
+        let state_map = SparseStateMap::new(num_blocks);
         let mut dirty_count = 0;
-        for state in &mut state_bytes {
-            let parsed = BlockState::from_u8(*state);
-            // Syncing blocks had in-flight uploads that may have failed
-            if parsed == BlockState::Syncing {
-                *state = BlockState::Dirty as u8;
+
+        if version >= 4 {
+            // v4: sparse format -- entry_count(u64) + entries of index(u32) + state(u8)
+            let mut count_buf = [0u8; 8];
+            file.read_exact(&mut count_buf)?;
+            let entry_count = u64::from_le_bytes(count_buf) as usize;
+
+            let mut entry_buf = [0u8; 5]; // u32 index + u8 state
+            for _ in 0..entry_count {
+                file.read_exact(&mut entry_buf)?;
+                let idx = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap()) as usize;
+                let mut state = entry_buf[4];
+
+                if idx >= num_blocks {
+                    continue; // skip out-of-bounds (shrink safety)
+                }
+
+                // Convert Syncing -> Dirty (conservative for crash recovery)
+                if state == SparseBlockState::SYNCING {
+                    state = SparseBlockState::DIRTY;
+                }
+                if state == SparseBlockState::DIRTY {
+                    dirty_count += 1;
+                }
+
+                // Populate state_map: first set_present (0->1), then CAS to target state
+                // Ignore budget errors during load (no budget set yet).
+                let _ = state_map.set_present(idx);
+                if state != SparseBlockState::CLEAN {
+                    let _ = state_map.cas(idx, SparseBlockState::CLEAN, state);
+                }
             }
-            if *state == BlockState::Dirty as u8 {
-                dirty_count += 1;
+        } else {
+            // Legacy v1/v2/v3: dense block_states + presence bitmap
+            // Old encoding: Clean=0, Dirty=1, Syncing=2
+            let mut old_state_bytes = vec![0u8; stored_num_blocks];
+            file.read_exact(&mut old_state_bytes)?;
+
+            // Convert Syncing(2) -> Dirty(1) in old encoding
+            for state in &mut old_state_bytes {
+                if *state == BlockState::Syncing as u8 {
+                    *state = BlockState::Dirty as u8;
+                }
+                if *state == BlockState::Dirty as u8 {
+                    dirty_count += 1;
+                }
+            }
+
+            // Read presence bitmap (varies by version)
+            let present: Vec<bool> = if version >= 3 {
+                // Version 3: packed bits (1 bit per block)
+                let num_bytes = stored_num_blocks.div_ceil(8);
+                let mut present_bytes = vec![0u8; num_bytes];
+                file.read_exact(&mut present_bytes)?;
+
+                (0..stored_num_blocks)
+                    .map(|i| {
+                        let byte_idx = i / 8;
+                        let bit_idx = i % 8;
+                        present_bytes[byte_idx] & (1 << bit_idx) != 0
+                    })
+                    .collect()
+            } else if version >= 2 {
+                // Version 2: 1 byte per block
+                let mut present_bytes = vec![0u8; stored_num_blocks];
+                file.read_exact(&mut present_bytes)?;
+                present_bytes.iter().map(|&b| b != 0).collect()
+            } else {
+                // Version 1: dirty blocks are present, clean blocks are NOT
+                old_state_bytes
+                    .iter()
+                    .map(|&s| s == BlockState::Dirty as u8)
+                    .collect()
+            };
+
+            // Convert old encoding to new sparse encoding and populate state_map
+            for (idx, &old_state) in old_state_bytes.iter().enumerate() {
+                let is_present = present.get(idx).copied().unwrap_or(false);
+                if !is_present && old_state == BlockState::Clean as u8 {
+                    // Not present + clean in old encoding -> NOT_PRESENT (0) in new
+                    continue;
+                }
+                // Block is present (or dirty/syncing which implies present)
+                let new_state = match old_state {
+                    x if x == BlockState::Clean as u8 => SparseBlockState::CLEAN,
+                    x if x == BlockState::Dirty as u8 => SparseBlockState::DIRTY,
+                    _ => SparseBlockState::DIRTY, // conservative
+                };
+                let _ = state_map.set_present(idx);
+                if new_state != SparseBlockState::CLEAN {
+                    let _ = state_map.cas(idx, SparseBlockState::CLEAN, new_state);
+                }
             }
         }
 
-        // Read presence bitmap and convert to u64 chunks
-        let present_chunks: Vec<u64> = if version >= 3 {
-            // Version 3: packed bits (1 bit per block)
-            let num_bytes = stored_num_blocks.div_ceil(8);
-            let mut present_bytes = vec![0u8; num_bytes];
-            file.read_exact(&mut present_bytes)?;
-
-            // Convert packed bytes to u64 chunks
-            let mut chunks = vec![0u64; num_chunks];
-            for (chunk_idx, chunk) in chunks.iter_mut().enumerate() {
-                let base_byte = chunk_idx * 8;
-                for byte_offset in 0..8 {
-                    let byte_idx = base_byte + byte_offset;
-                    if byte_idx < present_bytes.len() {
-                        *chunk |= (present_bytes[byte_idx] as u64) << (byte_offset * 8);
-                    }
-                }
-            }
-            chunks
-        } else if version >= 2 {
-            // Version 2: 1 byte per block (legacy)
-            let mut present_bytes = vec![0u8; stored_num_blocks];
-            file.read_exact(&mut present_bytes)?;
-
-            // Convert to u64 chunks
-            let mut chunks = vec![0u64; num_chunks];
-            for (block_num, &present) in present_bytes.iter().enumerate() {
-                if present != 0 {
-                    let chunk_idx = block_num / 64;
-                    let bit_idx = block_num % 64;
-                    chunks[chunk_idx] |= 1u64 << bit_idx;
-                }
-            }
-            chunks
-        } else {
-            // Version 1 compatibility: dirty blocks are present, clean blocks are NOT
-            let mut chunks = vec![0u64; num_chunks];
-            for (block_num, &state) in state_bytes.iter().enumerate() {
-                if state == BlockState::Dirty as u8 {
-                    let chunk_idx = block_num / 64;
-                    let bit_idx = block_num % 64;
-                    chunks[chunk_idx] |= 1u64 << bit_idx;
-                }
-            }
-            chunks
-        };
-
-        // If growing, extend arrays with clean/not-present values
-        let (state_bytes, present_chunks) = if is_growing {
-            let mut extended_states = state_bytes;
-            extended_states.resize(num_blocks, BlockState::Clean as u8);
-
-            let mut extended_chunks = present_chunks;
-            extended_chunks.resize(num_chunks, 0u64);
-
+        if is_growing {
             info!(
                 old_blocks = stored_num_blocks,
                 new_blocks = num_blocks,
-                "Extended arrays for resize"
+                "Growing device (new blocks are NOT_PRESENT)"
             );
-            (extended_states, extended_chunks)
-        } else {
-            (state_bytes, present_chunks)
-        };
+        }
 
-        let present_count: usize = present_chunks.iter().map(|c| c.count_ones() as usize).sum();
+        let present_count = state_map.count_present();
         info!(
             path = %path.display(),
-            blocks = state_bytes.len(),
+            blocks = num_blocks,
             dirty = dirty_count,
             present = present_count,
             "loaded cache metadata"
         );
 
-        Ok((state_bytes, present_chunks, dirty_count))
+        Ok((state_map, dirty_count))
     }
 }

@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use tracing::{info, instrument, warn};
 
-use crate::nbd::block_map::blake3_128;
-use crate::nbd::state::{Active, BlockState, Recovering};
+use crate::nbd::block_map::{SparseBlockState, blake3_128};
+use crate::nbd::state::{Active, Recovering};
 
 use super::{CacheError, WriteCache};
 
@@ -64,11 +64,7 @@ impl WriteCache<Recovering> {
         let zero_hash = self.inner.zero_block_hash;
         let mut corrected = 0;
 
-        for idx in 0..self.inner.num_blocks {
-            let state = self.inner.block_states[idx].load(Ordering::Relaxed);
-            if state != BlockState::Dirty as u8 {
-                continue;
-            }
+        for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
 
             let (hash, _seq) = self.inner.block_map_get(idx);
 
@@ -100,7 +96,7 @@ impl WriteCache<Recovering> {
             if actual_hash != hash {
                 // SSD state drifted — update block_map with correct hash
                 let seq = self.inner.sequence.next();
-                self.inner.block_map_set(idx, actual_hash, seq);
+                self.inner.block_map_set(idx, actual_hash, seq)?;
                 corrected += 1;
             }
         }

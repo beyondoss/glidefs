@@ -416,6 +416,26 @@ where
                 writeln!(output, "# TYPE glidefs_s3_circuit_breaker_state gauge").unwrap();
                 writeln!(output, "glidefs_s3_circuit_breaker_state {cb_value}").unwrap();
             }
+            // Host-level pack index size (content-addressed dedup entries)
+            {
+                use std::fmt::Write;
+                let entries = router.pack_index().len();
+                writeln!(output, "# HELP glidefs_pack_index_entries Number of entries in the host-level pack index").unwrap();
+                writeln!(output, "# TYPE glidefs_pack_index_entries gauge").unwrap();
+                writeln!(output, "glidefs_pack_index_entries {entries}").unwrap();
+            }
+            // SSD capacity backpressure
+            {
+                use std::fmt::Write;
+                let utilization = router.ssd_utilization();
+                let bp_active = if router.backpressure_active() { 1 } else { 0 };
+                writeln!(output, "# HELP glidefs_ssd_utilization_ratio Fraction of local SSD capacity used").unwrap();
+                writeln!(output, "# TYPE glidefs_ssd_utilization_ratio gauge").unwrap();
+                writeln!(output, "glidefs_ssd_utilization_ratio {utilization:.6}").unwrap();
+                writeln!(output, "# HELP glidefs_ssd_backpressure_active Whether flush backpressure is active (0=no, 1=yes)").unwrap();
+                writeln!(output, "# TYPE glidefs_ssd_backpressure_active gauge").unwrap();
+                writeln!(output, "glidefs_ssd_backpressure_active {bp_active}").unwrap();
+            }
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rand::Rng;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Notify};
 use tracing::{error, info, warn};
@@ -137,8 +139,11 @@ async fn run_demand_driven(
     shutdown: &mut watch::Receiver<bool>,
     metrics: &ExportMetrics,
 ) {
-    let mut checkpoint_ticker = tokio::time::interval(Duration::from_secs(5));
-    checkpoint_ticker.tick().await; // consume immediate first tick
+    // Jitter the checkpoint start so 1000 exports don't all checkpoint at the same instant.
+    let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..5000));
+    let checkpoint_interval = Duration::from_secs(5);
+    let mut checkpoint_ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + jitter, checkpoint_interval);
 
     loop {
         tokio::select! {
@@ -190,12 +195,17 @@ async fn run_continuous(
     manifest_dur: Duration,
     metrics: &ExportMetrics,
 ) {
-    let mut pack_ticker = tokio::time::interval(pack_dur);
-    let mut manifest_ticker = tokio::time::interval(manifest_dur);
-
-    // Consume the immediate first tick so we don't fire right away.
-    pack_ticker.tick().await;
-    manifest_ticker.tick().await;
+    // Jitter the start times so 1000 exports don't all flush at the same instant.
+    let (pack_jitter, manifest_jitter) = {
+        let mut rng = rand::thread_rng();
+        (
+            Duration::from_millis(rng.gen_range(0..pack_dur.as_millis() as u64)),
+            Duration::from_millis(rng.gen_range(0..manifest_dur.as_millis() as u64)),
+        )
+    };
+    let now = tokio::time::Instant::now();
+    let mut pack_ticker = tokio::time::interval_at(now + pack_jitter, pack_dur);
+    let mut manifest_ticker = tokio::time::interval_at(now + manifest_jitter, manifest_dur);
 
     let mut last_seq_cutpoint: u64 = 0;
     let mut accumulated_pack_ids: Vec<uuid::Uuid> = Vec::new();
@@ -259,6 +269,7 @@ async fn run_continuous(
                     match cache.flush_packs(content_store, pack_index).await {
                         Ok((stats, seq_cutpoint)) => {
                             metrics.record_s3_put_latency(start.elapsed());
+                            metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
                             if stats.packs_uploaded > 0 {
                                 info!(
                                     packs = stats.packs_uploaded,
@@ -332,6 +343,7 @@ async fn do_full_flush(
     match cache.flush_to_s3(content_store, pack_index).await {
         Ok(stats) => {
             metrics.record_s3_put_latency(start.elapsed());
+            metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
             if stats.packs_uploaded > 0 {
                 info!(
                     packs = stats.packs_uploaded,

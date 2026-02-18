@@ -163,11 +163,18 @@ impl WriteCache<Active> {
 
         // Tier 1: clean_cache (recently written or previously fetched from S3).
         if let Some(data) = clean_cache.get(&hash).await {
+            if let Some(m) = metrics {
+                m.record_cache_hit();
+            }
             return Ok(data);
         }
 
         // Tier 2: S3 range request (if block exists in a pack).
         if let Some(pack_loc) = pack_index.get(&hash) {
+            if let Some(m) = metrics {
+                m.record_cache_miss();
+            }
+            let fetch_start = std::time::Instant::now();
             let compressed = match content_store.get_block(pack_loc.pack_id, pack_loc.offset, pack_loc.comp_length).await {
                 Ok(data) => data,
                 Err(e) => {
@@ -185,7 +192,13 @@ impl WriteCache<Active> {
             if actual_hash != hash {
                 return Err(CacheError::HashMismatch {
                     expected: format!("{:?}", hash),
+                    actual: format!("{:?}", actual_hash),
                 });
+            }
+
+            if let Some(m) = metrics {
+                m.record_s3_read(compressed.len() as u64);
+                m.record_s3_fetch_latency(fetch_start.elapsed());
             }
 
             let data = Bytes::from(decompressed);
@@ -267,6 +280,7 @@ impl WriteCache<Active> {
                 if actual_hash != entry.hash {
                     return Err(CacheError::HashMismatch {
                         expected: format!("{:?}", entry.hash),
+                        actual: format!("{:?}", actual_hash),
                     });
                 }
 
@@ -298,6 +312,7 @@ impl WriteCache<Active> {
                 if actual_hash != entry.hash {
                     return Err(CacheError::HashMismatch {
                         expected: format!("{:?}", entry.hash),
+                        actual: format!("{:?}", actual_hash),
                     });
                 }
 

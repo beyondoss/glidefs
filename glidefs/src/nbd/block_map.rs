@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Read, Write as IoWrite};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use dashmap::DashMap;
+
 
 // ============================================================================
 // Blake3Hash -- 16-byte truncated content hash
@@ -154,59 +155,253 @@ impl fmt::Debug for BlockMapEntry {
 }
 
 // ============================================================================
-// AtomicBlockMap -- lock-free runtime block map
+// AtomicBlockMap -- lock-free runtime block map (sparse page table)
 // ============================================================================
 
-/// Lock-free runtime block map using atomic arrays with SeqLock protection.
+/// Error returned when an export's metadata memory budget is exhausted.
+#[derive(Debug, Clone)]
+pub struct MetadataLimitExceeded;
+
+impl fmt::Display for MetadataLimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "metadata memory budget exhausted")
+    }
+}
+
+impl std::error::Error for MetadataLimitExceeded {}
+
+// -- Page-table constants and types ------------------------------------------
+
+const HASH_PAGE_BITS: usize = 7;
+const HASH_PAGE_SIZE: usize = 1 << HASH_PAGE_BITS; // 128 entries per page
+const HASH_PAGE_MASK: usize = HASH_PAGE_SIZE - 1;
+
+/// Per-chunk entry within a hash page.
+///
+/// AoS layout keeps all fields for one chunk in the same cache line, which is
+/// better for the SeqLock pattern (version + data are read together).
+#[repr(C)]
+struct HashEntry {
+    version: AtomicU32,
+    _pad: u32,
+    hash_lo: AtomicU64,
+    hash_hi: AtomicU64,
+    sequence: AtomicU64,
+}
+// 32 bytes per entry. Two entries per 64-byte cache line.
+
+impl HashEntry {
+    /// Read hash and sequence with SeqLock protection.
+    ///
+    /// Spins until a consistent snapshot is obtained (version is even and
+    /// unchanged across the read). Memory ordering rationale:
+    ///
+    /// - `Acquire` on v1: synchronizes with the writer's final `Release`
+    ///   increment, ensuring we see all prior data stores if the version is even.
+    /// - `Relaxed` on data loads: sufficient because the trailing `Acquire`
+    ///   fence handles the case where a Relaxed load observes a writer's
+    ///   `Release` store — the fence synchronizes-with that Release, making
+    ///   the writer's odd version visible to the v2 check, forcing a retry.
+    /// - `Relaxed` on v2: the preceding `Acquire` fence ensures visibility.
+    #[inline]
+    fn read(&self) -> (Blake3Hash, u64) {
+        loop {
+            let v1 = self.version.load(Ordering::Acquire);
+            if v1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let lo = self.hash_lo.load(Ordering::Relaxed);
+            let hi = self.hash_hi.load(Ordering::Relaxed);
+            let seq = self.sequence.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let v2 = self.version.load(Ordering::Relaxed);
+            if v1 == v2 {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&lo.to_le_bytes());
+                bytes[8..].copy_from_slice(&hi.to_le_bytes());
+                return (Blake3Hash(bytes), seq);
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// A page of 128 hash entries (4096 bytes = one OS page).
+#[repr(C, align(4096))]
+struct HashPage {
+    entries: [HashEntry; HASH_PAGE_SIZE],
+}
+
+impl HashPage {
+    fn new_boxed() -> Box<Self> {
+        // SAFETY: All-zeros is valid for HashPage because AtomicU32::new(0),
+        // AtomicU64::new(0), and u32 = 0 are all represented as zero bytes
+        // with #[repr(C)] layout.
+        unsafe { Box::new_zeroed().assume_init() }
+    }
+}
+
+/// Lock-free runtime block map using a two-level page table with SeqLock
+/// protection.
+///
+/// Instead of pre-allocating dense arrays for all chunks (224 MB for a 1TB
+/// device), the page table only allocates 4 KB pages on first write to a
+/// chunk range. An empty export costs only the directory (~512 KB for 1TB).
 ///
 /// Each chunk's 16-byte hash is stored as two `AtomicU64` values (lo and hi
 /// halves), guarded by a per-entry `AtomicU32` version counter (SeqLock).
 /// Writers increment the version to odd before updating, then to even after.
 /// Readers spin-retry if the version is odd or changed between reads.
-/// This guarantees readers always see a consistent (hash, sequence) triple
-/// with no torn reads.
 ///
-/// The flags byte is NOT stored here — it lives in v1's
-/// `block_states: Box<[AtomicU8]>` in `CacheInner`.
+/// The flags byte is NOT stored here — it lives in the `SparseStateMap`
+/// on `CacheInner`.
 pub struct AtomicBlockMap {
-    versions: Box<[AtomicU32]>,
-    hash_lo: Box<[AtomicU64]>,
-    hash_hi: Box<[AtomicU64]>,
-    sequences: Box<[AtomicU64]>,
+    /// Level-1 directory: one AtomicPtr per page slot.
+    /// Null means the page is not allocated (all entries are zero).
+    directory: Box<[AtomicPtr<HashPage>]>,
+    num_pages: usize,
     num_chunks: usize,
     chunk_size: u32,
     device_size: u64,
+    /// Number of allocated pages (for memory tracking).
+    allocated_pages: AtomicU64,
+    /// Optional shared memory budget. Each page allocation decrements this;
+    /// when exhausted, writes fail with `MetadataLimitExceeded`.
+    budget: Option<Arc<AtomicUsize>>,
+}
+
+// SAFETY: All non-null pointers in the directory are valid Box<HashPage>
+// allocations owned by this AtomicBlockMap. Pages are heap-allocated, never
+// freed or moved during the map's lifetime (only in Drop). Directory slots
+// transition null → valid exactly once (CAS). AtomicPtr itself is Send+Sync.
+unsafe impl Send for AtomicBlockMap {}
+unsafe impl Sync for AtomicBlockMap {}
+
+impl Drop for AtomicBlockMap {
+    fn drop(&mut self) {
+        for slot in self.directory.iter() {
+            let ptr = slot.load(Ordering::Relaxed);
+            if !ptr.is_null() {
+                // SAFETY: Each non-null pointer was created by Box::into_raw
+                // and is exclusively owned by this AtomicBlockMap. We have
+                // &mut self so no concurrent access is possible.
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        }
+    }
 }
 
 impl AtomicBlockMap {
-    /// Allocate a new block map with all entries zeroed.
-    #[cfg(test)]
+    // -- Index decomposition --------------------------------------------------
+
+    #[inline(always)]
+    fn split_index(chunk_index: usize) -> (usize, usize) {
+        (chunk_index >> HASH_PAGE_BITS, chunk_index & HASH_PAGE_MASK)
+    }
+
+    // -- Page access helpers --------------------------------------------------
+
+    /// Load the page pointer for a given page index.
+    /// Returns `None` if the page has not been allocated.
+    #[inline]
+    fn load_page(&self, page_idx: usize) -> Option<&HashPage> {
+        let ptr = self.directory[page_idx].load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: Non-null pointers in the directory are valid Box<HashPage>
+            // allocations that live for the lifetime of this AtomicBlockMap.
+            Some(unsafe { &*ptr })
+        }
+    }
+
+    /// Ensure a page exists for the given page index, allocating if needed.
+    #[inline]
+    fn ensure_page(&self, page_idx: usize) -> Result<&HashPage, MetadataLimitExceeded> {
+        let ptr = self.directory[page_idx].load(Ordering::Acquire);
+        if !ptr.is_null() {
+            // SAFETY: same as load_page
+            return Ok(unsafe { &*ptr });
+        }
+        self.allocate_page(page_idx)
+    }
+
+    /// Cold path: allocate a new page and CAS it into the directory.
+    #[cold]
+    fn allocate_page(&self, page_idx: usize) -> Result<&HashPage, MetadataLimitExceeded> {
+        // Check budget before allocating.
+        if let Some(ref budget) = self.budget {
+            let page_bytes = size_of::<HashPage>();
+            // Try to reserve space. If the budget is exhausted, fail.
+            let mut current = budget.load(Ordering::Relaxed);
+            loop {
+                if current < page_bytes {
+                    return Err(MetadataLimitExceeded);
+                }
+                match budget.compare_exchange_weak(
+                    current,
+                    current - page_bytes,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+
+        let new_page = HashPage::new_boxed();
+        let new_ptr = Box::into_raw(new_page);
+
+        match self.directory[page_idx].compare_exchange(
+            ptr::null_mut(),
+            new_ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.allocated_pages.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: We just stored this pointer; it's valid.
+                Ok(unsafe { &*new_ptr })
+            }
+            Err(existing) => {
+                // Another thread beat us — free our allocation.
+                // SAFETY: new_ptr was just allocated by Box::into_raw and
+                // never shared (the CAS failed).
+                unsafe {
+                    drop(Box::from_raw(new_ptr));
+                }
+                // Refund the budget.
+                if let Some(ref budget) = self.budget {
+                    budget.fetch_add(size_of::<HashPage>(), Ordering::Relaxed);
+                }
+                // SAFETY: existing is a valid pointer stored by the winner.
+                Ok(unsafe { &*existing })
+            }
+        }
+    }
+
+    // -- Public API -----------------------------------------------------------
+
+    /// Allocate a new block map with all entries zeroed (no pages allocated).
     pub fn new(device_size: u64, chunk_size: u32) -> Self {
         let num_chunks = device_size.div_ceil(chunk_size as u64) as usize;
-        let versions = (0..num_chunks)
-            .map(|_| AtomicU32::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let hash_lo = (0..num_chunks)
-            .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let hash_hi = (0..num_chunks)
-            .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let sequences = (0..num_chunks)
-            .map(|_| AtomicU64::new(0))
+        let num_pages = num_chunks.div_ceil(HASH_PAGE_SIZE);
+        let directory = (0..num_pages)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         AtomicBlockMap {
-            versions,
-            hash_lo,
-            hash_hi,
-            sequences,
+            directory,
+            num_pages,
             num_chunks,
             chunk_size,
             device_size,
+            allocated_pages: AtomicU64::new(0),
+            budget: None,
         }
     }
 
@@ -224,70 +419,108 @@ impl AtomicBlockMap {
         self.num_chunks == 0
     }
 
+    /// Number of currently allocated pages.
+    #[allow(dead_code)]
+    pub fn allocated_pages(&self) -> u64 {
+        self.allocated_pages.load(Ordering::Relaxed)
+    }
+
+    /// Estimated memory usage in bytes (directory + allocated pages).
+    #[allow(dead_code)]
+    pub fn memory_usage(&self) -> usize {
+        let directory_bytes = self.num_pages * size_of::<AtomicPtr<HashPage>>();
+        let page_bytes =
+            self.allocated_pages.load(Ordering::Relaxed) as usize * size_of::<HashPage>();
+        directory_bytes + page_bytes
+    }
+
     /// Load the hash and sequence for a chunk (lock-free, SeqLock-protected).
     ///
-    /// Spin-retries if the writer is mid-update (version is odd) or if the
-    /// version changed between reading the hash halves. In practice, contention
-    /// is near-zero because each chunk has its own version counter and writes
-    /// are sub-microsecond.
+    /// Returns `(Blake3Hash::ZERO, 0)` for chunks whose page has not been
+    /// allocated (i.e., never written). The null-page branch is well-predicted
+    /// since pages, once allocated, are never freed.
     #[inline]
     pub fn get(&self, chunk_index: usize) -> (Blake3Hash, u64) {
-        loop {
-            let v1 = self.versions[chunk_index].load(Ordering::Acquire);
-            if v1 & 1 != 0 {
-                // Writer in progress — spin.
-                std::hint::spin_loop();
-                continue;
-            }
-            let lo = self.hash_lo[chunk_index].load(Ordering::Relaxed);
-            let hi = self.hash_hi[chunk_index].load(Ordering::Relaxed);
-            let seq = self.sequences[chunk_index].load(Ordering::Relaxed);
-            // Acquire fence: ensures all data loads above complete before the
-            // v2 check below. Without this, ARM could reorder data loads after
-            // the v2 load, causing torn reads even when v1 == v2.
-            std::sync::atomic::fence(Ordering::Acquire);
-            let v2 = self.versions[chunk_index].load(Ordering::Relaxed);
-            if v1 == v2 {
-                let mut bytes = [0u8; 16];
-                bytes[..8].copy_from_slice(&lo.to_le_bytes());
-                bytes[8..].copy_from_slice(&hi.to_le_bytes());
-                return (Blake3Hash(bytes), seq);
-            }
-            // Version changed — retry.
-            std::hint::spin_loop();
-        }
+        let (page_idx, entry_idx) = Self::split_index(chunk_index);
+        let page = match self.load_page(page_idx) {
+            Some(p) => p,
+            None => return (Blake3Hash::ZERO, 0),
+        };
+        page.entries[entry_idx].read()
     }
 
     /// Store the hash and sequence for a chunk (lock-free, SeqLock-protected).
+    ///
+    /// Allocates the page on first write to a chunk range. Returns
+    /// `Err(MetadataLimitExceeded)` if the memory budget is exhausted.
     #[inline]
-    pub fn set(&self, chunk_index: usize, hash: Blake3Hash, sequence: u64) {
+    pub fn set(
+        &self,
+        chunk_index: usize,
+        hash: Blake3Hash,
+        sequence: u64,
+    ) -> Result<(), MetadataLimitExceeded> {
+        let (page_idx, entry_idx) = Self::split_index(chunk_index);
+        let page = self.ensure_page(page_idx)?;
+        let entry = &page.entries[entry_idx];
         let lo = u64::from_le_bytes(hash.0[..8].try_into().unwrap());
         let hi = u64::from_le_bytes(hash.0[8..].try_into().unwrap());
         // Increment version to odd (signals write in progress). AcqRel ensures
         // the subsequent data stores cannot be reordered before this increment
         // on weakly-ordered architectures (ARM/Graviton).
-        self.versions[chunk_index].fetch_add(1, Ordering::AcqRel);
-        self.hash_lo[chunk_index].store(lo, Ordering::Relaxed);
-        self.hash_hi[chunk_index].store(hi, Ordering::Relaxed);
-        self.sequences[chunk_index].store(sequence, Ordering::Relaxed);
+        entry.version.fetch_add(1, Ordering::AcqRel);
+        // Release on data stores: if a reader's Relaxed load observes one of
+        // these values, the reader's Acquire fence synchronizes-with this
+        // Release, making the odd version (above) visible to the reader's v2
+        // check — which forces a retry.  Without Release here, a C11 Relaxed
+        // load can see new data while a subsequent Relaxed v2 load still sees
+        // the old (even) version, producing a torn read.
+        entry.hash_lo.store(lo, Ordering::Release);
+        entry.hash_hi.store(hi, Ordering::Release);
+        entry.sequence.store(sequence, Ordering::Release);
         // Increment version to even (signals write complete). Release ensures
         // all data stores above are visible before the version goes even.
-        self.versions[chunk_index].fetch_add(1, Ordering::Release);
+        entry.version.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     /// Produce a `BlockMap` snapshot by combining atomic hash/sequence data
-    /// with flags from the external `block_states` array.
-    pub fn snapshot(&self, flags: &[AtomicU8]) -> BlockMap {
+    /// with flags from the external `SparseStateMap`.
+    ///
+    /// Iterates page-by-page, skipping null pages efficiently.
+    pub fn snapshot(&self, state_map: &SparseStateMap) -> BlockMap {
         let mut entries = Vec::with_capacity(self.num_chunks);
-        for (i, flag_atomic) in flags.iter().enumerate().take(self.num_chunks) {
-            let (hash, sequence) = self.get(i);
-            let flag = flag_atomic.load(Ordering::Acquire);
-            entries.push(BlockMapEntry {
-                hash,
-                flags: flag,
-                sequence,
-            });
+        let mut chunk_i = 0;
+
+        for page_idx in 0..self.num_pages {
+            let page_end = std::cmp::min((page_idx + 1) << HASH_PAGE_BITS, self.num_chunks);
+            let count = page_end - chunk_i;
+
+            if let Some(page) = self.load_page(page_idx) {
+                for entry_idx in 0..count {
+                    let (hash, sequence) = page.entries[entry_idx].read();
+                    let flag = state_map.get(chunk_i);
+                    entries.push(BlockMapEntry {
+                        hash,
+                        flags: flag,
+                        sequence,
+                    });
+                    chunk_i += 1;
+                }
+            } else {
+                // Null page — all entries are empty.
+                for _ in 0..count {
+                    let flag = state_map.get(chunk_i);
+                    entries.push(BlockMapEntry {
+                        hash: Blake3Hash::ZERO,
+                        flags: flag,
+                        sequence: 0,
+                    });
+                    chunk_i += 1;
+                }
+            }
         }
+
         BlockMap {
             entries,
             chunk_size: self.chunk_size,
@@ -296,31 +529,405 @@ impl AtomicBlockMap {
     }
 
     /// Construct from a deserialized `BlockMap`.
+    ///
+    /// Single-threaded (called during init). Only allocates pages for non-empty
+    /// entries, preserving sparsity from the manifest.
     pub fn from_block_map(bm: &BlockMap) -> Self {
         let num_chunks = bm.entries.len();
-        let mut ver_vec = Vec::with_capacity(num_chunks);
-        let mut lo_vec = Vec::with_capacity(num_chunks);
-        let mut hi_vec = Vec::with_capacity(num_chunks);
-        let mut seq_vec = Vec::with_capacity(num_chunks);
+        let num_pages = num_chunks.div_ceil(HASH_PAGE_SIZE);
+        let directory: Box<[AtomicPtr<HashPage>]> = (0..num_pages)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut allocated = 0u64;
 
-        for entry in &bm.entries {
+        for (idx, entry) in bm.entries.iter().enumerate() {
+            if entry.is_empty() {
+                continue;
+            }
+            let (page_idx, entry_idx) = Self::split_index(idx);
+
+            // Allocate page if needed (single-threaded, no CAS required).
+            let page_ptr = directory[page_idx].load(Ordering::Relaxed);
+            let page_ptr = if page_ptr.is_null() {
+                let new_page = Box::into_raw(HashPage::new_boxed());
+                directory[page_idx].store(new_page, Ordering::Relaxed);
+                allocated += 1;
+                new_page
+            } else {
+                page_ptr
+            };
+
+            // SAFETY: page_ptr is a valid allocation we just created or loaded.
+            let page = unsafe { &*page_ptr };
             let lo = u64::from_le_bytes(entry.hash.0[..8].try_into().unwrap());
             let hi = u64::from_le_bytes(entry.hash.0[8..].try_into().unwrap());
-            ver_vec.push(AtomicU32::new(0));
-            lo_vec.push(AtomicU64::new(lo));
-            hi_vec.push(AtomicU64::new(hi));
-            seq_vec.push(AtomicU64::new(entry.sequence));
+            page.entries[entry_idx].hash_lo.store(lo, Ordering::Relaxed);
+            page.entries[entry_idx].hash_hi.store(hi, Ordering::Relaxed);
+            page.entries[entry_idx]
+                .sequence
+                .store(entry.sequence, Ordering::Relaxed);
+            // version stays 0 (even = consistent)
         }
 
         AtomicBlockMap {
-            versions: ver_vec.into_boxed_slice(),
-            hash_lo: lo_vec.into_boxed_slice(),
-            hash_hi: hi_vec.into_boxed_slice(),
-            sequences: seq_vec.into_boxed_slice(),
+            directory,
+            num_pages,
             num_chunks,
             chunk_size: bm.chunk_size,
             device_size: bm.device_size,
+            allocated_pages: AtomicU64::new(allocated),
+            budget: None,
         }
+    }
+
+    /// Set the shared memory budget (call before sharing the map).
+    #[allow(dead_code)]
+    pub fn set_budget(&mut self, budget: Arc<AtomicUsize>) {
+        self.budget = Some(budget);
+    }
+}
+
+// ============================================================================
+// SparseStateMap -- lock-free sparse block state tracking
+// ============================================================================
+
+/// Block state constants for the sparse state map.
+///
+/// Encoding is shifted by 1 from the legacy `BlockState` so that the natural
+/// zero-initialized default (unallocated pages) represents "not present".
+/// Block state constants for the sparse state map.
+///
+/// Encoding is shifted by 1 from the legacy `BlockState` so that the natural
+/// zero-initialized default (unallocated pages) represents "not present".
+pub struct SparseBlockState;
+
+impl SparseBlockState {
+    /// Block has never been written to the local SSD.
+    pub const NOT_PRESENT: u8 = 0;
+    /// Block is present on SSD and synced to S3.
+    pub const CLEAN: u8 = 1;
+    /// Block is present on SSD and needs to be flushed to S3.
+    pub const DIRTY: u8 = 2;
+    /// Block is present on SSD and an upload is in progress.
+    pub const SYNCING: u8 = 3;
+}
+
+const STATE_PAGE_BITS: usize = 12;
+const STATE_PAGE_SIZE: usize = 1 << STATE_PAGE_BITS; // 4096 entries per page
+const STATE_PAGE_MASK: usize = STATE_PAGE_SIZE - 1;
+
+/// A page of 4096 block state entries (4096 bytes = one OS page).
+#[repr(C, align(4096))]
+struct StatePage {
+    states: [AtomicU8; STATE_PAGE_SIZE],
+}
+
+impl StatePage {
+    fn new_boxed() -> Box<Self> {
+        // SAFETY: All-zeros is valid for StatePage because AtomicU8::new(0) is
+        // represented as a zero byte with #[repr(C)] layout.
+        unsafe { Box::new_zeroed().assume_init() }
+    }
+}
+
+/// Sparse block state map using a two-level page table.
+///
+/// Replaces the dense `block_states: Box<[AtomicU8]>` and `present_chunks:
+/// Box<[AtomicU64]>` arrays. Only allocates 4 KB pages on first write to a
+/// block range. Unallocated pages implicitly contain `NOT_PRESENT` (0) for
+/// all entries.
+///
+/// State encoding folds presence into the state byte:
+/// - `0` = NotPresent (never written to SSD)
+/// - `1` = Clean (present on SSD, synced to S3)
+/// - `2` = Dirty (present on SSD, needs flush)
+/// - `3` = Syncing (present on SSD, upload in progress)
+///
+/// This eliminates the need for a separate presence bitmap.
+pub struct SparseStateMap {
+    directory: Box<[AtomicPtr<StatePage>]>,
+    num_pages: usize,
+    num_entries: usize,
+    allocated_pages: AtomicU64,
+    budget: Option<Arc<AtomicUsize>>,
+}
+
+// SAFETY: Same invariants as AtomicBlockMap — pages are heap-allocated, never
+// freed during the map's lifetime (only in Drop), and directory slots transition
+// null → valid exactly once (CAS).
+unsafe impl Send for SparseStateMap {}
+unsafe impl Sync for SparseStateMap {}
+
+impl Drop for SparseStateMap {
+    fn drop(&mut self) {
+        for slot in self.directory.iter() {
+            let ptr = slot.load(Ordering::Relaxed);
+            if !ptr.is_null() {
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        }
+    }
+}
+
+impl SparseStateMap {
+    /// Create a new sparse state map with no pages allocated.
+    pub fn new(num_entries: usize) -> Self {
+        let num_pages = num_entries.div_ceil(STATE_PAGE_SIZE);
+        let directory = (0..num_pages)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        SparseStateMap {
+            directory,
+            num_pages,
+            num_entries,
+            allocated_pages: AtomicU64::new(0),
+            budget: None,
+        }
+    }
+
+    /// Set the shared memory budget.
+    #[allow(dead_code)]
+    pub fn set_budget(&mut self, budget: Arc<AtomicUsize>) {
+        self.budget = Some(budget);
+    }
+
+    /// Number of entries (total block count).
+    #[allow(dead_code)]
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.num_entries
+    }
+
+    /// Returns true if the state map has no entries.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.num_entries == 0
+    }
+
+    /// Number of currently allocated pages.
+    #[allow(dead_code)]
+    pub fn allocated_pages(&self) -> u64 {
+        self.allocated_pages.load(Ordering::Relaxed)
+    }
+
+    /// Estimated memory usage in bytes.
+    #[allow(dead_code)]
+    pub fn memory_usage(&self) -> usize {
+        let dir_bytes = self.num_pages * size_of::<AtomicPtr<StatePage>>();
+        let page_bytes =
+            self.allocated_pages.load(Ordering::Relaxed) as usize * size_of::<StatePage>();
+        dir_bytes + page_bytes
+    }
+
+    // -- Page access helpers --------------------------------------------------
+
+    #[inline(always)]
+    fn split_index(idx: usize) -> (usize, usize) {
+        (idx >> STATE_PAGE_BITS, idx & STATE_PAGE_MASK)
+    }
+
+    #[inline]
+    fn load_page(&self, page_idx: usize) -> Option<&StatePage> {
+        let ptr = self.directory[page_idx].load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { &*ptr })
+        }
+    }
+
+    #[inline]
+    fn ensure_page(&self, page_idx: usize) -> Result<&StatePage, MetadataLimitExceeded> {
+        let ptr = self.directory[page_idx].load(Ordering::Acquire);
+        if !ptr.is_null() {
+            return Ok(unsafe { &*ptr });
+        }
+        self.allocate_page(page_idx)
+    }
+
+    #[cold]
+    fn allocate_page(&self, page_idx: usize) -> Result<&StatePage, MetadataLimitExceeded> {
+        if let Some(ref budget) = self.budget {
+            let page_bytes = size_of::<StatePage>();
+            let mut current = budget.load(Ordering::Relaxed);
+            loop {
+                if current < page_bytes {
+                    return Err(MetadataLimitExceeded);
+                }
+                match budget.compare_exchange_weak(
+                    current,
+                    current - page_bytes,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+
+        let new_page = StatePage::new_boxed();
+        let new_ptr = Box::into_raw(new_page);
+
+        match self.directory[page_idx].compare_exchange(
+            ptr::null_mut(),
+            new_ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.allocated_pages.fetch_add(1, Ordering::Relaxed);
+                Ok(unsafe { &*new_ptr })
+            }
+            Err(existing) => {
+                unsafe {
+                    drop(Box::from_raw(new_ptr));
+                }
+                if let Some(ref budget) = self.budget {
+                    budget.fetch_add(size_of::<StatePage>(), Ordering::Relaxed);
+                }
+                Ok(unsafe { &*existing })
+            }
+        }
+    }
+
+    // -- State operations -----------------------------------------------------
+
+    /// Load the state for a block. Returns `NOT_PRESENT` (0) if the page is
+    /// not allocated.
+    #[inline]
+    pub fn get(&self, idx: usize) -> u8 {
+        let (page_idx, entry_idx) = Self::split_index(idx);
+        match self.load_page(page_idx) {
+            Some(page) => page.states[entry_idx].load(Ordering::Acquire),
+            None => SparseBlockState::NOT_PRESENT,
+        }
+    }
+
+    /// Check if a block is present on the local SSD (state != NOT_PRESENT).
+    #[inline]
+    pub fn is_present(&self, idx: usize) -> bool {
+        self.get(idx) != SparseBlockState::NOT_PRESENT
+    }
+
+    /// Mark a block as present (CAS NOT_PRESENT → CLEAN).
+    ///
+    /// Idempotent: no-op if the block is already present.
+    /// Allocates the page if needed.
+    #[inline]
+    pub fn set_present(&self, idx: usize) -> Result<(), MetadataLimitExceeded> {
+        let (page_idx, entry_idx) = Self::split_index(idx);
+        let page = self.ensure_page(page_idx)?;
+        // Only transition NOT_PRESENT → CLEAN. If already present, no-op.
+        let _ = page.states[entry_idx].compare_exchange(
+            SparseBlockState::NOT_PRESENT,
+            SparseBlockState::CLEAN,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        Ok(())
+    }
+
+    /// Compare-and-swap the state for a block.
+    ///
+    /// Returns `Ok(old)` on success, `Err(actual)` on failure.
+    /// Allocates the page if needed (only when `new != NOT_PRESENT`).
+    #[inline]
+    pub fn cas(&self, idx: usize, expected: u8, new: u8) -> Result<u8, u8> {
+        let (page_idx, entry_idx) = Self::split_index(idx);
+        // For transitions to NOT_PRESENT, the page might not exist.
+        let page = if new == SparseBlockState::NOT_PRESENT {
+            match self.load_page(page_idx) {
+                Some(p) => p,
+                None => {
+                    // Page doesn't exist, so current state is NOT_PRESENT.
+                    return if expected == SparseBlockState::NOT_PRESENT {
+                        Ok(SparseBlockState::NOT_PRESENT)
+                    } else {
+                        Err(SparseBlockState::NOT_PRESENT)
+                    };
+                }
+            }
+        } else {
+            // Page allocation can't fail here because we only enforce budget
+            // on set_present (the first write). Subsequent state transitions
+            // hit already-allocated pages.
+            match self.load_page(page_idx) {
+                Some(p) => p,
+                None => {
+                    // Page doesn't exist → current is NOT_PRESENT.
+                    return Err(SparseBlockState::NOT_PRESENT);
+                }
+            }
+        };
+        match page.states[entry_idx].compare_exchange(
+            expected,
+            new,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(expected),
+            Err(actual) => Err(actual),
+        }
+    }
+
+    /// Iterate over all allocated pages, yielding `(block_index, state)` for
+    /// entries matching the given `target_state`.
+    ///
+    /// Only visits allocated pages — O(allocated_pages × PAGE_SIZE), not
+    /// O(total_blocks). This is a major win for sparse exports.
+    pub fn iter_with_state(&self, target_state: u8) -> impl Iterator<Item = usize> + '_ {
+        (0..self.num_pages).flat_map(move |page_idx| {
+            let page = self.load_page(page_idx);
+            let page_start = page_idx << STATE_PAGE_BITS;
+            let page_end = std::cmp::min(page_start + STATE_PAGE_SIZE, self.num_entries);
+            let count = page_end - page_start;
+
+            (0..count).filter_map(move |entry_idx| {
+                let page = page?;
+                let state = page.states[entry_idx].load(Ordering::Acquire);
+                if state == target_state {
+                    Some(page_start + entry_idx)
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    /// Count blocks with a non-zero state (present blocks).
+    pub fn count_present(&self) -> usize {
+        let mut count = 0;
+        for page_idx in 0..self.num_pages {
+            if let Some(page) = self.load_page(page_idx) {
+                let page_end =
+                    std::cmp::min((page_idx + 1) << STATE_PAGE_BITS, self.num_entries);
+                let page_start = page_idx << STATE_PAGE_BITS;
+                for entry_idx in 0..(page_end - page_start) {
+                    if page.states[entry_idx].load(Ordering::Relaxed)
+                        != SparseBlockState::NOT_PRESENT
+                    {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    /// Load state for a block, returning the `AtomicU8` reference if the page
+    /// exists. Used by snapshot to read flags without allocating.
+    #[allow(dead_code)]
+    #[inline]
+    pub fn load_atomic(&self, idx: usize) -> Option<&AtomicU8> {
+        let (page_idx, entry_idx) = Self::split_index(idx);
+        self.load_page(page_idx)
+            .map(|page| &page.states[entry_idx])
     }
 }
 
@@ -572,15 +1179,20 @@ pub fn lz4_decompress(
 /// Overlay block map for forked VMs.
 ///
 /// Shares the parent's data via `Arc<BlockMap>` and stores only divergent
-/// entries in a concurrent `DashMap`. Reads check the overlay first and fall
-/// back to the parent. Writes always go to the overlay, never touching the
-/// parent.
+/// entries in a sparse `AtomicBlockMap`. Reads check the overlay first and
+/// fall back to the parent. Writes always go to the overlay, never touching
+/// the parent.
+///
+/// The overlay uses the same page-table infrastructure as the `Full` variant,
+/// giving genuinely lock-free reads and writes (SeqLock per entry, no shard
+/// locks). Pages are allocated on first write to each 128-entry region.
 ///
 /// This allows many forks to share the same parent memory footprint, paying
 /// only for the entries they actually modify.
 pub struct ForkedBlockMap {
     parent: Arc<BlockMap>,
-    overlay: DashMap<usize, (Blake3Hash, u64)>,
+    overlay: AtomicBlockMap,
+    overlay_count: AtomicUsize,
     num_chunks: usize,
     chunk_size: u32,
     device_size: u64,
@@ -594,7 +1206,8 @@ impl ForkedBlockMap {
         let device_size = parent.device_size();
         ForkedBlockMap {
             parent,
-            overlay: DashMap::new(),
+            overlay: AtomicBlockMap::new(device_size, chunk_size),
+            overlay_count: AtomicUsize::new(0),
             num_chunks,
             chunk_size,
             device_size,
@@ -602,43 +1215,66 @@ impl ForkedBlockMap {
     }
 
     /// Read: check overlay first, fall back to parent.
+    ///
+    /// The overlay returns `(ZERO, 0)` for entries that were never written by
+    /// this fork. Since `SequenceNumber` starts at 1, `seq == 0` reliably
+    /// distinguishes "not in overlay" from "fork wrote ZERO placeholder".
     #[inline]
     pub fn get(&self, chunk_index: usize) -> (Blake3Hash, u64) {
-        if let Some(entry) = self.overlay.get(&chunk_index) {
-            return *entry;
+        let (hash, seq) = self.overlay.get(chunk_index);
+        if hash.is_zero() && seq == 0 {
+            let entry = self.parent.get(chunk_index);
+            (entry.hash, entry.sequence)
+        } else {
+            (hash, seq)
         }
-        let entry = self.parent.get(chunk_index);
-        (entry.hash, entry.sequence)
     }
 
     /// Write: inserts into overlay (never touches parent).
+    ///
+    /// Returns `Err(MetadataLimitExceeded)` if the overlay's memory budget
+    /// is exhausted (page allocation failed).
     #[inline]
-    pub fn set(&self, chunk_index: usize, hash: Blake3Hash, sequence: u64) {
-        self.overlay.insert(chunk_index, (hash, sequence));
+    pub fn set(
+        &self,
+        chunk_index: usize,
+        hash: Blake3Hash,
+        sequence: u64,
+    ) -> Result<(), MetadataLimitExceeded> {
+        // Track unique overlay entries for should_flatten() heuristic.
+        // Check before write: if the slot was empty, this is a new entry.
+        let (old_hash, old_seq) = self.overlay.get(chunk_index);
+        let was_empty = old_hash.is_zero() && old_seq == 0;
+
+        self.overlay.set(chunk_index, hash, sequence)?;
+
+        if was_empty {
+            self.overlay_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Produce a `BlockMap` snapshot merging parent + overlay + external flags.
     ///
     /// For each chunk slot, the overlay entry takes precedence over the parent.
-    /// Flags are loaded from the external `block_states` array with `Acquire`
-    /// ordering.
-    pub fn snapshot(&self, flags: &[AtomicU8]) -> BlockMap {
+    /// Flags are loaded from the external `SparseStateMap`.
+    pub fn snapshot(&self, state_map: &SparseStateMap) -> BlockMap {
         let mut entries = Vec::with_capacity(self.num_chunks);
-        for (i, flag_atomic) in flags.iter().enumerate().take(self.num_chunks) {
-            let flag = flag_atomic.load(Ordering::Acquire);
-            if let Some(ov) = self.overlay.get(&i) {
-                let (hash, sequence) = *ov;
-                entries.push(BlockMapEntry {
-                    hash,
-                    flags: flag,
-                    sequence,
-                });
-            } else {
+        for i in 0..self.num_chunks {
+            let flag = state_map.get(i);
+            let (hash, seq) = self.overlay.get(i);
+            if hash.is_zero() && seq == 0 {
                 let parent_entry = self.parent.get(i);
                 entries.push(BlockMapEntry {
                     hash: parent_entry.hash,
                     flags: flag,
                     sequence: parent_entry.sequence,
+                });
+            } else {
+                entries.push(BlockMapEntry {
+                    hash,
+                    flags: flag,
+                    sequence: seq,
                 });
             }
         }
@@ -649,17 +1285,17 @@ impl ForkedBlockMap {
         }
     }
 
-    /// Number of entries in the overlay.
+    /// Number of unique entries written to the overlay.
     #[cfg(test)]
     #[inline]
     pub fn overlay_len(&self) -> usize {
-        self.overlay.len()
+        self.overlay_count.load(Ordering::Relaxed)
     }
 
     /// True when the overlay exceeds 50% of parent entries -- should flatten.
     #[inline]
     pub fn should_flatten(&self) -> bool {
-        self.overlay.len() > self.num_chunks / 2
+        self.overlay_count.load(Ordering::Relaxed) > self.num_chunks / 2
     }
 
     /// Merge parent + overlay into a full `AtomicBlockMap`.
@@ -670,19 +1306,19 @@ impl ForkedBlockMap {
     pub fn flatten(&self) -> AtomicBlockMap {
         let mut entries = Vec::with_capacity(self.num_chunks);
         for i in 0..self.num_chunks {
-            if let Some(ov) = self.overlay.get(&i) {
-                let (hash, sequence) = *ov;
-                entries.push(BlockMapEntry {
-                    hash,
-                    flags: 0,
-                    sequence,
-                });
-            } else {
+            let (hash, seq) = self.overlay.get(i);
+            if hash.is_zero() && seq == 0 {
                 let parent_entry = self.parent.get(i);
                 entries.push(BlockMapEntry {
                     hash: parent_entry.hash,
                     flags: 0,
                     sequence: parent_entry.sequence,
+                });
+            } else {
+                entries.push(BlockMapEntry {
+                    hash,
+                    flags: 0,
+                    sequence: seq,
                 });
             }
         }
@@ -733,19 +1369,26 @@ impl BlockMapKind {
     }
 
     /// Write hash and sequence for a chunk.
+    ///
+    /// Returns `Err(MetadataLimitExceeded)` if the memory budget is exhausted.
     #[inline]
-    pub fn set(&self, chunk_index: usize, hash: Blake3Hash, sequence: u64) {
+    pub fn set(
+        &self,
+        chunk_index: usize,
+        hash: Blake3Hash,
+        sequence: u64,
+    ) -> Result<(), MetadataLimitExceeded> {
         match self {
             BlockMapKind::Full(m) => m.set(chunk_index, hash, sequence),
             BlockMapKind::Forked(m) => m.set(chunk_index, hash, sequence),
         }
     }
 
-    /// Produce a `BlockMap` snapshot with external flags.
-    pub fn snapshot(&self, flags: &[AtomicU8]) -> BlockMap {
+    /// Produce a `BlockMap` snapshot with external state flags.
+    pub fn snapshot(&self, state_map: &SparseStateMap) -> BlockMap {
         match self {
-            BlockMapKind::Full(m) => m.snapshot(flags),
-            BlockMapKind::Forked(m) => m.snapshot(flags),
+            BlockMapKind::Full(m) => m.snapshot(state_map),
+            BlockMapKind::Forked(m) => m.snapshot(state_map),
         }
     }
 
@@ -1124,7 +1767,7 @@ mod tests {
         let abm = AtomicBlockMap::new(1024 * 1024, 4096);
         let hash = blake3_128(b"atomic test");
 
-        abm.set(42, hash, 7);
+        abm.set(42, hash, 7).unwrap();
         let (got_hash, got_seq) = abm.get(42);
         assert_eq!(got_hash, hash);
         assert_eq!(got_seq, 7);
@@ -1144,8 +1787,8 @@ mod tests {
         let h1 = blake3_128(b"first");
         let h2 = blake3_128(b"second");
 
-        abm.set(10, h1, 1);
-        abm.set(10, h2, 2);
+        abm.set(10, h1, 1).unwrap();
+        abm.set(10, h2, 2).unwrap();
 
         let (got_hash, got_seq) = abm.get(10);
         assert_eq!(got_hash, h2);
@@ -1160,26 +1803,27 @@ mod tests {
         // Set a few entries
         let h1 = blake3_128(b"chunk-0");
         let h2 = blake3_128(b"chunk-50");
-        abm.set(0, h1, 1);
-        abm.set(50, h2, 2);
+        abm.set(0, h1, 1).unwrap();
+        abm.set(50, h2, 2).unwrap();
 
-        // Create flags array (simulating CacheInner's block_states)
-        let flags: Vec<AtomicU8> =
-            (0..num_chunks).map(|_| AtomicU8::new(0)).collect();
-        flags[0].store(BlockMapEntry::FLAG_DIRTY, Ordering::Release);
+        // Create SparseStateMap (simulating CacheInner's state_map)
+        let state_map = SparseStateMap::new(num_chunks);
+        // Mark chunk 0 as dirty (SparseBlockState::DIRTY = 2)
+        state_map.set_present(0).unwrap();
+        let _ = state_map.cas(0, SparseBlockState::CLEAN, SparseBlockState::DIRTY);
 
-        let snapshot = abm.snapshot(&flags);
+        let snapshot = abm.snapshot(&state_map);
         assert_eq!(snapshot.len(), num_chunks);
 
         let e0 = snapshot.get(0);
         assert_eq!(e0.hash, h1);
         assert_eq!(e0.sequence, 1);
-        assert!(e0.is_dirty());
+        assert_eq!(e0.flags, SparseBlockState::DIRTY);
 
         let e50 = snapshot.get(50);
         assert_eq!(e50.hash, h2);
         assert_eq!(e50.sequence, 2);
-        assert!(!e50.is_dirty());
+        assert_eq!(e50.flags, SparseBlockState::NOT_PRESENT);
 
         // Unset entry should be empty
         assert!(snapshot.get(100).is_empty());
@@ -1220,18 +1864,23 @@ mod tests {
         assert_eq!(got_s2, 20);
 
         // Round-trip: AtomicBlockMap -> snapshot -> compare
-        let flags: Vec<AtomicU8> = (0..bm.len())
-            .map(|i| AtomicU8::new(bm.get(i).flags))
-            .collect();
-        let snap = abm.snapshot(&flags);
+        // Entry 0 was dirty in the original block map -> set state to DIRTY
+        let state_map = SparseStateMap::new(bm.len());
+        // Mark entry 0 as present and dirty
+        state_map.set_present(0).unwrap();
+        let _ = state_map.cas(0, SparseBlockState::CLEAN, SparseBlockState::DIRTY);
+        // Mark entry 99 as present and clean (flags=0 in original -> CLEAN in sparse)
+        state_map.set_present(99).unwrap();
+
+        let snap = abm.snapshot(&state_map);
 
         assert_eq!(snap.get(0).hash, h1);
         assert_eq!(snap.get(0).sequence, 10);
-        assert!(snap.get(0).is_dirty());
+        assert_eq!(snap.get(0).flags, SparseBlockState::DIRTY);
 
         assert_eq!(snap.get(99).hash, h2);
         assert_eq!(snap.get(99).sequence, 20);
-        assert!(!snap.get(99).is_dirty());
+        assert_eq!(snap.get(99).flags, SparseBlockState::CLEAN);
     }
 
     #[test]
@@ -1355,7 +2004,7 @@ mod tests {
 
         let forked = ForkedBlockMap::new(Arc::clone(&parent));
         let new_hash = blake3_128(b"diverged");
-        forked.set(42, new_hash, 2);
+        forked.set(42, new_hash, 2).unwrap();
 
         // Fork reads new data
         let (hash, seq) = forked.get(42);
@@ -1388,16 +2037,17 @@ mod tests {
 
         // Write to indices 40..60 (overlap 40..50 with parent, new 50..60)
         for i in 40..60 {
-            forked.set(
-                i,
-                blake3_128(format!("fork-{i}").as_bytes()),
-                100 + i as u64,
-            );
+            forked
+                .set(
+                    i,
+                    blake3_128(format!("fork-{i}").as_bytes()),
+                    100 + i as u64,
+                )
+                .unwrap();
         }
 
-        let flags: Vec<AtomicU8> =
-            (0..100).map(|_| AtomicU8::new(0)).collect();
-        let snap = forked.snapshot(&flags);
+        let state_map = SparseStateMap::new(100);
+        let snap = forked.snapshot(&state_map);
 
         // Indices 0..40: parent data
         for i in 0..40 {
@@ -1437,11 +2087,13 @@ mod tests {
 
         // Write >50 overlay entries (triggers should_flatten)
         for i in 0..60 {
-            forked.set(
-                i,
-                blake3_128(format!("f-{i}").as_bytes()),
-                200 + i as u64,
-            );
+            forked
+                .set(
+                    i,
+                    blake3_128(format!("f-{i}").as_bytes()),
+                    200 + i as u64,
+                )
+                .unwrap();
         }
         assert!(forked.should_flatten());
 
@@ -1491,7 +2143,7 @@ mod tests {
                     let idx = (task_id as usize * 100) + i;
                     let hash =
                         blake3_128(format!("t{task_id}-{i}").as_bytes());
-                    f.set(idx, hash, (task_id as u64) * 1000 + i as u64);
+                    f.set(idx, hash, (task_id as u64) * 1000 + i as u64).unwrap();
                     let _ = f.get(idx);
                 }
             }));

@@ -24,6 +24,7 @@ use object_store::ObjectStore;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -189,6 +190,13 @@ pub struct ExportRouter {
 
     /// Shared S3 circuit breaker: opens after 5 consecutive failures, probes after 30s.
     s3_circuit_breaker: Arc<CircuitBreaker>,
+
+    /// Original flush modes saved before backpressure override.
+    /// Empty when no backpressure is active.
+    backpressure_saved_modes: parking_lot::Mutex<HashMap<String, FlushMode>>,
+
+    /// SSD utilization ratio (0.0–1.0), updated by capacity monitor.
+    ssd_utilization: AtomicU64, // f64 bits via to_bits()/from_bits()
 }
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
@@ -228,12 +236,59 @@ impl ExportRouter {
             wal_sync: config.wal_sync,
             scrubber_metrics: Arc::new(crate::nbd::scrubber::ScrubberMetrics::new()),
             s3_circuit_breaker,
+            backpressure_saved_modes: parking_lot::Mutex::new(HashMap::new()),
+            ssd_utilization: AtomicU64::new(0f64.to_bits()),
         }
     }
 
     /// Get a reference to the shared pack index (for scrubber).
     pub fn pack_index(&self) -> &Arc<HostPackIndex> {
         &self.pack_index
+    }
+
+    /// Prune pack index entries not referenced by any active export.
+    ///
+    /// Prune pack index entries not referenced by any active export.
+    ///
+    /// Forces a manifest-hash rebuild on all remaining exports first to
+    /// capture everything flushed up to this moment, then prunes. This
+    /// closes the timing window where a flush inserts into the pack index
+    /// but the block_map still holds ZERO (deferred hash).
+    ///
+    /// Cost: O(present_blocks + pack_index_entries). Runs only on export removal.
+    async fn prune_pack_index(&self) {
+        let exports = self.exports.read().await;
+        if exports.is_empty() {
+            // No active exports — clear everything.
+            let removed = self.pack_index.len();
+            if removed > 0 {
+                self.pack_index.rebuild(&[]);
+                info!(removed, "pruned all pack index entries (no active exports)");
+            }
+            return;
+        }
+
+        // Force manifest-hash rebuild on all remaining exports to capture
+        // everything flushed up to this moment. No S3 round-trip.
+        for state in exports.values() {
+            state.cache.rebuild_manifest_hashes(&self.pack_index);
+        }
+
+        // Union of all manifest-referenced hashes across active exports.
+        let mut referenced = std::collections::HashSet::new();
+        for state in exports.values() {
+            referenced.extend(state.cache.referenced_hashes());
+        }
+        drop(exports);
+
+        let removed = self.pack_index.prune_unreferenced(&referenced);
+        if removed > 0 {
+            info!(
+                removed,
+                remaining = self.pack_index.len(),
+                "pruned unreferenced pack index entries"
+            );
+        }
     }
 
     /// Get a reference to the shared clean cache (for scrubber).
@@ -249,6 +304,71 @@ impl ExportRouter {
     /// Get the current S3 circuit breaker state for observability.
     pub fn s3_circuit_state(&self) -> CircuitState {
         self.s3_circuit_breaker.state()
+    }
+
+    /// Get the cache directory path (for capacity monitor `statvfs`).
+    pub fn cache_dir(&self) -> &std::path::Path {
+        &self.cache_dir
+    }
+
+    /// Get the current SSD utilization ratio (for Prometheus metrics).
+    pub fn ssd_utilization(&self) -> f64 {
+        f64::from_bits(self.ssd_utilization.load(Ordering::Relaxed))
+    }
+
+    /// Set the SSD utilization ratio (called by capacity monitor).
+    pub fn set_ssd_utilization(&self, ratio: f64) {
+        self.ssd_utilization.store(ratio.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Returns true if flush backpressure is currently active.
+    pub fn backpressure_active(&self) -> bool {
+        !self.backpressure_saved_modes.lock().is_empty()
+    }
+
+    /// Escalate flush modes under SSD pressure.
+    ///
+    /// Saves each export's current flush mode (idempotent — only saves once),
+    /// then switches DemandDriven → Continuous(2s/10s) and shortens existing
+    /// Continuous intervals to min(current, 2s/10s).
+    pub async fn escalate_flush_modes(&self) {
+        let exports = self.exports.read().await;
+        let mut saved = self.backpressure_saved_modes.lock();
+
+        for (name, state) in exports.iter() {
+            let current = state.flush_mode();
+            // Only save if not already saved (idempotent across repeated calls)
+            saved.entry(name.clone()).or_insert(current.clone());
+
+            let escalated = match &current {
+                FlushMode::DemandDriven => FlushMode::Continuous {
+                    pack_interval_secs: 2,
+                    manifest_interval_secs: 10,
+                },
+                FlushMode::Continuous {
+                    pack_interval_secs,
+                    manifest_interval_secs,
+                } => FlushMode::Continuous {
+                    pack_interval_secs: (*pack_interval_secs).min(2),
+                    manifest_interval_secs: (*manifest_interval_secs).min(10),
+                },
+            };
+            let _ = state.flush_mode_tx.send(escalated);
+        }
+    }
+
+    /// Restore original flush modes after SSD pressure subsides.
+    pub async fn restore_flush_modes(&self) {
+        let exports = self.exports.read().await;
+        let mut saved = self.backpressure_saved_modes.lock();
+
+        for (name, state) in exports.iter() {
+            if let Some(original) = saved.remove(name.as_str()) {
+                let _ = state.flush_mode_tx.send(original);
+            }
+        }
+        // Clear any stale entries for exports that were removed during backpressure
+        saved.clear();
     }
 
     // =========================================================================
@@ -849,6 +969,11 @@ impl ExportRouter {
 
         info!("Removing export '{}'...", name);
         Self::teardown_export(name, state).await;
+
+        // Prune pack index entries no longer referenced by any active export.
+        // Must run after teardown (which drops the removed export's cache) so
+        // that only remaining exports contribute to the referenced set.
+        self.prune_pack_index().await;
 
         if purge {
             let cache_file = self.cache_dir.join(format!("{}.cache", name));

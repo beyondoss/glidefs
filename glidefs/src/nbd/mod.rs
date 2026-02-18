@@ -1,6 +1,7 @@
 pub mod api;
 pub mod block_map;
 pub mod cache;
+pub mod capacity_monitor;
 pub mod error;
 pub mod flush_scheduler;
 pub mod handler;

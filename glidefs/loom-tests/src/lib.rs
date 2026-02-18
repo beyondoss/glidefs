@@ -17,7 +17,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use loom::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use loom::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use loom::sync::Mutex;
 use loom::thread;
 use std::collections::VecDeque;
@@ -455,5 +455,138 @@ fn test_presence_bitmap_race() {
 
         // Bit must be set
         assert_ne!(present.load(Ordering::Relaxed) & bit_mask, 0);
+    });
+}
+
+// ============================================================================
+// SeqLock tests — AtomicBlockMap read/write protocol
+// ============================================================================
+//
+// Mirrors the SeqLock protocol in block_map.rs AtomicBlockMap::get()/set().
+// The SeqLock stores (hash_lo, hash_hi, sequence) behind a version counter.
+// Writers increment version to odd, write data, increment to even.
+// Readers spin-retry if version is odd or changed between read start/end.
+//
+// The critical invariant: a reader must never observe a torn read — it must
+// see either the complete old value or the complete new value, never a mix.
+// Getting the memory orderings wrong on ARM allows data loads to leak outside
+// the version-check window, producing a "consistent" version but garbage data.
+
+/// Minimal SeqLock entry matching the block_map.rs protocol.
+struct SeqLockEntry {
+    version: AtomicU32,
+    hash_lo: AtomicU64,
+    hash_hi: AtomicU64,
+    sequence: AtomicU64,
+}
+
+impl SeqLockEntry {
+    fn new(lo: u64, hi: u64, seq: u64) -> Self {
+        SeqLockEntry {
+            version: AtomicU32::new(0),
+            hash_lo: AtomicU64::new(lo),
+            hash_hi: AtomicU64::new(hi),
+            sequence: AtomicU64::new(seq),
+        }
+    }
+
+    /// Reader — mirrors AtomicBlockMap::get() exactly.
+    fn read(&self) -> (u64, u64, u64) {
+        loop {
+            let v1 = self.version.load(Ordering::Acquire);
+            if v1 & 1 != 0 {
+                loom::thread::yield_now();
+                continue;
+            }
+            let lo = self.hash_lo.load(Ordering::Relaxed);
+            let hi = self.hash_hi.load(Ordering::Relaxed);
+            let seq = self.sequence.load(Ordering::Relaxed);
+            loom::sync::atomic::fence(Ordering::Acquire);
+            let v2 = self.version.load(Ordering::Relaxed);
+            if v1 == v2 {
+                return (lo, hi, seq);
+            }
+            loom::thread::yield_now();
+        }
+    }
+
+    /// Writer — mirrors AtomicBlockMap::set() exactly.
+    fn write(&self, lo: u64, hi: u64, seq: u64) {
+        self.version.fetch_add(1, Ordering::AcqRel);
+        self.hash_lo.store(lo, Ordering::Release);
+        self.hash_hi.store(hi, Ordering::Release);
+        self.sequence.store(seq, Ordering::Release);
+        self.version.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// One writer, one reader. Reader must see either the old value or the new
+/// value — never a mix of fields from different writes.
+#[test]
+fn test_seqlock_no_torn_read() {
+    loom::model(|| {
+        // Initial: (0xAAAA, 0xBBBB, 1)
+        let entry = Arc::new(SeqLockEntry::new(0xAAAA, 0xBBBB, 1));
+
+        let writer = Arc::clone(&entry);
+        let reader = Arc::clone(&entry);
+
+        // Writer overwrites with (0xCCCC, 0xDDDD, 2)
+        let t_write = thread::spawn(move || {
+            writer.write(0xCCCC, 0xDDDD, 2);
+        });
+
+        // Reader reads concurrently
+        let t_read = thread::spawn(move || reader.read());
+
+        t_write.join().unwrap();
+        let (lo, hi, seq) = t_read.join().unwrap();
+
+        // Must be one of the two complete values — no mixing.
+        let is_old = lo == 0xAAAA && hi == 0xBBBB && seq == 1;
+        let is_new = lo == 0xCCCC && hi == 0xDDDD && seq == 2;
+        assert!(
+            is_old || is_new,
+            "Torn read detected! lo=0x{lo:X}, hi=0x{hi:X}, seq={seq}. \
+             Expected (0xAAAA, 0xBBBB, 1) or (0xCCCC, 0xDDDD, 2)"
+        );
+    });
+}
+
+// NOTE: No concurrent multi-writer test — SeqLock is single-writer by design.
+// Two concurrent writers both increment the version counter, breaking the
+// "odd = write in progress" invariant (A→1, B→2 makes it even mid-write).
+// In production, writes to the same chunk are serialized by the write-cache
+// lock, so concurrent writers to the same SeqLock entry never happen.
+
+/// Writer overwrites same entry twice, reader must see one of three complete
+/// snapshots (initial, first write, second write). Tests that back-to-back
+/// writes don't create a window where a partial first write is visible.
+#[test]
+fn test_seqlock_double_write() {
+    loom::model(|| {
+        let entry = Arc::new(SeqLockEntry::new(0x1111, 0x2222, 1));
+
+        let writer = Arc::clone(&entry);
+        let reader = Arc::clone(&entry);
+
+        let t_write = thread::spawn(move || {
+            writer.write(0xAAAA, 0xBBBB, 2);
+            writer.write(0xCCCC, 0xDDDD, 3);
+        });
+
+        let t_read = thread::spawn(move || reader.read());
+
+        t_write.join().unwrap();
+        let (lo, hi, seq) = t_read.join().unwrap();
+
+        let is_initial = lo == 0x1111 && hi == 0x2222 && seq == 1;
+        let is_first = lo == 0xAAAA && hi == 0xBBBB && seq == 2;
+        let is_second = lo == 0xCCCC && hi == 0xDDDD && seq == 3;
+        assert!(
+            is_initial || is_first || is_second,
+            "Torn read detected! lo=0x{lo:X}, hi=0x{hi:X}, seq={seq}. \
+             Expected one of: (0x1111,0x2222,1), (0xAAAA,0xBBBB,2), (0xCCCC,0xDDDD,3)"
+        );
     });
 }

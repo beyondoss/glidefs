@@ -41,6 +41,9 @@ pub struct FlushStats {
     pub blocks_flushed: usize,
     /// Blocks skipped (already in S3 or zero blocks).
     pub blocks_deduped: usize,
+    /// Blocks left dirty because a concurrent write changed their sequence
+    /// during the flush cycle (CAS failure on the sequence-number check).
+    pub blocks_cas_failed: usize,
     /// Number of pack objects uploaded.
     pub packs_uploaded: usize,
     /// Total bytes uploaded to S3.

@@ -4,14 +4,14 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 use crate::nbd::block_map::{
-    BlockMapKind, Blake3Hash, blake3_128, lz4_compress,
+    BlockMapKind, Blake3Hash, SparseBlockState, blake3_128, lz4_compress,
 };
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::manifest::{Manifest, ManifestBlockEntry};
 use crate::nbd::pack::{self, PackLocation, BLOCKS_PER_PACK};
 use crate::nbd::pack_index::HostPackIndex;
 use crate::nbd::pack_registry::PackRegistry;
-use crate::nbd::state::{Active, BlockState, Draining};
+use crate::nbd::state::{Active, Draining};
 
 use super::inner::CacheInner;
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
@@ -47,6 +47,33 @@ impl WriteCache<Active> {
     /// Get the block size.
     pub fn block_size(&self) -> usize {
         self.inner.config.block_size
+    }
+
+    /// Return the cached manifest pack hashes.
+    ///
+    /// These are the hashes from the most recent manifest build (either from
+    /// `upload_manifest` or `rebuild_manifest_hashes`). Used by pack index
+    /// pruning — the manifest is the durable reference, not the live block_map
+    /// which has ZERO placeholders for in-flight flushes.
+    pub fn referenced_hashes(&self) -> std::collections::HashSet<Blake3Hash> {
+        self.inner.manifest_pack_hashes.lock().clone()
+    }
+
+    /// Force-rebuild the cached manifest pack hashes from current state.
+    ///
+    /// Snapshots the block map and derives pack hashes via `derive_for_block_map`,
+    /// capturing everything flushed up to this moment. No S3 round-trip.
+    ///
+    /// Called by `prune_pack_index` immediately before pruning to close the
+    /// timing window between the last manifest upload and the prune call.
+    pub fn rebuild_manifest_hashes(&self, host_pack_index: &HostPackIndex) {
+        let snap = self.inner.block_map_snapshot();
+        let hashes = host_pack_index
+            .derive_for_block_map(&snap)
+            .into_iter()
+            .map(|e| e.hash)
+            .collect();
+        *self.inner.manifest_pack_hashes.lock() = hashes;
     }
 
     /// Save metadata to disk.
@@ -99,12 +126,10 @@ impl WriteCache<Active> {
         // 2. Targeted dirty scan: collect dirty block indices with their
         //    snapshot sequence number (used for concurrent-write detection).
         //    Hashes are computed lazily from SSD in step 3.
+        //    Uses SparseStateMap::iter_with_state for O(allocated_pages) scan.
         let snapshot: Vec<(usize, u64)> = {
             let mut dirty = Vec::new();
-            for (idx, state) in self.inner.block_states.iter().enumerate() {
-                if state.load(Ordering::Acquire) != BlockState::Dirty as u8 {
-                    continue;
-                }
+            for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
                 let (_hash, seq) = self.inner.block_map_get(idx);
                 // Skip entries written after our cutpoint
                 if seq > seq_cutpoint {
@@ -215,18 +240,14 @@ impl WriteCache<Active> {
             let (_hash, current_seq) = self.inner.block_map_get(chunk_index);
             if current_seq != snapshot_seq {
                 // Concurrent write changed this block — leave dirty.
+                stats.blocks_cas_failed += 1;
                 continue;
             }
             // Replace ZERO placeholder with real content hash.
-            self.inner.block_map_set(chunk_index, actual_hash, snapshot_seq);
-            // CAS Dirty → Clean on the block_states AtomicU8.
-            if self.inner.block_states[chunk_index]
-                .compare_exchange(
-                    BlockState::Dirty as u8,
-                    BlockState::Clean as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+            self.inner.block_map_set(chunk_index, actual_hash, snapshot_seq)?;
+            // CAS Dirty(2) -> Clean(1) on the state map.
+            if self.inner.state_map
+                .cas(chunk_index, SparseBlockState::DIRTY, SparseBlockState::CLEAN)
                 .is_ok()
             {
                 self.inner
@@ -238,6 +259,7 @@ impl WriteCache<Active> {
         info!(
             blocks_flushed = stats.blocks_flushed,
             blocks_deduped = stats.blocks_deduped,
+            blocks_cas_failed = stats.blocks_cas_failed,
             packs_uploaded = stats.packs_uploaded,
             bytes_uploaded = stats.bytes_uploaded,
             "flush dirty inner complete"
@@ -275,6 +297,10 @@ impl WriteCache<Active> {
             block_map: block_map_entries,
             pack_index: pack_entries,
         };
+
+        // Cache the manifest's pack hashes for pack index pruning.
+        *self.inner.manifest_pack_hashes.lock() =
+            manifest.pack_index.iter().map(|e| e.hash).collect();
 
         let etag = content_store
             .put_manifest(&self.inner.export_name, manifest.serialize())
