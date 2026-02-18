@@ -188,27 +188,24 @@ impl LatencySnapshot {
         let mut cumulative = 0u64;
         for (i, le) in HISTOGRAM_LE.iter().enumerate() {
             cumulative += self.buckets[i];
-            writeln!(
+            let _ = writeln!(
                 out,
                 "{metric_name}_bucket{{{label},le=\"{le}\"}} {cumulative}"
-            )
-            .unwrap();
+            );
         }
         // +Inf bucket (total count)
         cumulative += self.buckets[5];
-        writeln!(
+        let _ = writeln!(
             out,
             "{metric_name}_bucket{{{label},le=\"+Inf\"}} {cumulative}"
-        )
-        .unwrap();
+        );
         // Sum in seconds
-        writeln!(
+        let _ = writeln!(
             out,
             "{metric_name}_sum{{{label}}} {:.6}",
             self.sum_us as f64 / 1_000_000.0
-        )
-        .unwrap();
-        writeln!(out, "{metric_name}_count{{{label}}} {}", self.count).unwrap();
+        );
+        let _ = writeln!(out, "{metric_name}_count{{{label}}} {}", self.count);
     }
 }
 
@@ -314,7 +311,9 @@ impl ExportMetrics {
     }
 
     /// Record an S3 batch write operation.
+    /// NOTE: Legacy S3BlockStore was the only caller. Kept for metrics API completeness.
     #[inline]
+    #[allow(dead_code)]
     pub fn record_batch_write(&self, bytes: u64) {
         self.s3_bytes_written.fetch_add(bytes, Ordering::Relaxed);
         self.batches_written.fetch_add(1, Ordering::Relaxed);
@@ -522,39 +521,39 @@ impl MetricsSnapshot {
         let label = format!("export=\"{}\"", export_name);
 
         // Guest I/O counters
-        writeln!(out, "glidefs_guest_bytes_written_total{{{label}}} {}", self.guest_bytes_written).unwrap();
-        writeln!(out, "glidefs_guest_write_ops_total{{{label}}} {}", self.guest_write_ops).unwrap();
-        writeln!(out, "glidefs_guest_bytes_read_total{{{label}}} {}", self.guest_bytes_read).unwrap();
-        writeln!(out, "glidefs_guest_read_ops_total{{{label}}} {}", self.guest_read_ops).unwrap();
+        let _ = writeln!(out, "glidefs_guest_bytes_written_total{{{label}}} {}", self.guest_bytes_written);
+        let _ = writeln!(out, "glidefs_guest_write_ops_total{{{label}}} {}", self.guest_write_ops);
+        let _ = writeln!(out, "glidefs_guest_bytes_read_total{{{label}}} {}", self.guest_bytes_read);
+        let _ = writeln!(out, "glidefs_guest_read_ops_total{{{label}}} {}", self.guest_read_ops);
 
         // S3 I/O counters
-        writeln!(out, "glidefs_s3_bytes_written_total{{{label}}} {}", self.s3_bytes_written).unwrap();
-        writeln!(out, "glidefs_s3_write_ops_total{{{label}}} {}", self.s3_write_ops).unwrap();
-        writeln!(out, "glidefs_s3_batches_written_total{{{label}}} {}", self.batches_written).unwrap();
-        writeln!(out, "glidefs_s3_bytes_read_total{{{label}}} {}", self.s3_bytes_read).unwrap();
-        writeln!(out, "glidefs_s3_read_ops_total{{{label}}} {}", self.s3_read_ops).unwrap();
+        let _ = writeln!(out, "glidefs_s3_bytes_written_total{{{label}}} {}", self.s3_bytes_written);
+        let _ = writeln!(out, "glidefs_s3_write_ops_total{{{label}}} {}", self.s3_write_ops);
+        let _ = writeln!(out, "glidefs_s3_batches_written_total{{{label}}} {}", self.batches_written);
+        let _ = writeln!(out, "glidefs_s3_bytes_read_total{{{label}}} {}", self.s3_bytes_read);
+        let _ = writeln!(out, "glidefs_s3_read_ops_total{{{label}}} {}", self.s3_read_ops);
 
         // Cache counters
-        writeln!(out, "glidefs_cache_hits_total{{{label}}} {}", self.cache_hits).unwrap();
-        writeln!(out, "glidefs_cache_misses_total{{{label}}} {}", self.cache_misses).unwrap();
+        let _ = writeln!(out, "glidefs_cache_hits_total{{{label}}} {}", self.cache_hits);
+        let _ = writeln!(out, "glidefs_cache_misses_total{{{label}}} {}", self.cache_misses);
 
         // Error counters
-        writeln!(out, "glidefs_s3_put_errors_total{{{label}}} {}", self.s3_put_errors).unwrap();
-        writeln!(out, "glidefs_s3_get_errors_total{{{label}}} {}", self.s3_get_errors).unwrap();
-        writeln!(out, "glidefs_flush_errors_total{{{label}}} {}", self.flush_errors).unwrap();
+        let _ = writeln!(out, "glidefs_s3_put_errors_total{{{label}}} {}", self.s3_put_errors);
+        let _ = writeln!(out, "glidefs_s3_get_errors_total{{{label}}} {}", self.s3_get_errors);
+        let _ = writeln!(out, "glidefs_flush_errors_total{{{label}}} {}", self.flush_errors);
 
         // Cache state (gauges)
         if let Some(dirty) = self.dirty_blocks {
-            writeln!(out, "glidefs_dirty_blocks{{{label}}} {dirty}").unwrap();
+            let _ = writeln!(out, "glidefs_dirty_blocks{{{label}}} {dirty}");
         }
         if let Some(syncing) = self.syncing_blocks {
-            writeln!(out, "glidefs_syncing_blocks{{{label}}} {syncing}").unwrap();
+            let _ = writeln!(out, "glidefs_syncing_blocks{{{label}}} {syncing}");
         }
 
         // Derived metrics (gauges)
-        writeln!(out, "glidefs_write_amplification{{{label}}} {:.6}", self.write_amplification).unwrap();
-        writeln!(out, "glidefs_coalesce_ratio{{{label}}} {:.6}", self.coalesce_ratio).unwrap();
-        writeln!(out, "glidefs_cache_hit_rate{{{label}}} {:.6}", self.cache_hit_rate).unwrap();
+        let _ = writeln!(out, "glidefs_write_amplification{{{label}}} {:.6}", self.write_amplification);
+        let _ = writeln!(out, "glidefs_coalesce_ratio{{{label}}} {:.6}", self.coalesce_ratio);
+        let _ = writeln!(out, "glidefs_cache_hit_rate{{{label}}} {:.6}", self.cache_hit_rate);
 
         // Latency histograms (Prometheus histogram format)
         if let Some(ref lat) = self.read_latency {

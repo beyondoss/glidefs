@@ -5,7 +5,6 @@
 
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 use crate::config::ExportConfig;
-use crate::nbd::block_store::S3BlockStore;
 use crate::nbd::cache::BlockCache;
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::flush_scheduler::{flush_scheduler, FlushMode};
@@ -99,7 +98,6 @@ pub struct SnapshotResponse {
 pub struct ExportState {
     pub handler: Arc<NBDBlockHandler>,
     pub cache: Arc<WriteCache<Active>>,
-    pub s3_store: Arc<S3BlockStore>,
     pub content_store: Arc<ContentStore>,
     pub pack_index: Arc<HostPackIndex>,
     pub readonly: bool,
@@ -152,8 +150,6 @@ pub struct RouterConfig {
     pub cache_dir: PathBuf,
     /// Block size in bytes for all exports (default, can be overridden per-export)
     pub block_size: usize,
-    /// Number of blocks per S3 batch
-    pub blocks_per_batch: u64,
     /// Shared block cache for decompressed block data
     pub clean_cache: Arc<dyn BlockCache>,
     /// Whether to fsync the WAL after each write batch
@@ -178,9 +174,6 @@ pub struct ExportRouter {
 
     /// Block size for all exports (default, can be overridden per-export)
     block_size: usize,
-
-    /// Number of blocks per S3 batch
-    blocks_per_batch: u64,
 
     /// Host-level pack index shared across all exports (content-addressed dedup)
     pack_index: Arc<HostPackIndex>,
@@ -230,7 +223,6 @@ impl ExportRouter {
             db_path: config.db_path,
             cache_dir: config.cache_dir,
             block_size: config.block_size,
-            blocks_per_batch: config.blocks_per_batch,
             pack_index: Arc::new(HostPackIndex::new()),
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
@@ -392,15 +384,9 @@ impl ExportRouter {
         // Use per-export block size if specified, otherwise use global default
         let block_size = config.block_size_or(self.block_size);
 
-        // Create S3 block store for this export
         let s3_prefix = format!("{}/nbd/{}", self.db_path, config.s3_prefix());
-        let s3_store = Arc::new(
-            S3BlockStore::new(Arc::clone(&self.object_store), s3_prefix.clone(), block_size)
-                .with_blocks_per_batch(self.blocks_per_batch)
-                .with_metrics(Arc::clone(&metrics)),
-        );
 
-        // v2 read path components (shared pack_index from router)
+        // Content-addressed pack storage with circuit breaker
         let content_store = Arc::new(
             ContentStore::new(Arc::clone(&self.object_store), &s3_prefix)
                 .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker)),
@@ -568,7 +554,6 @@ impl ExportRouter {
         let state = ExportState {
             handler,
             cache,
-            s3_store,
             content_store,
             pack_index,
             readonly,
@@ -909,7 +894,6 @@ impl ExportRouter {
         let ExportState {
             handler,
             cache,
-            s3_store,
             content_store,
             pack_index,
             flush_shutdown_tx,
@@ -943,7 +927,7 @@ impl ExportRouter {
         // 5. Unwrap the Arc and transition through Draining state
         match Arc::try_unwrap(cache) {
             Ok(cache) => {
-                match cache.shutdown(&s3_store).await {
+                match cache.shutdown().await {
                     Ok(draining) => {
                         draining.finish();
                         info!("Export '{}' torn down cleanly", name);
@@ -977,7 +961,7 @@ impl ExportRouter {
             db_path: "test".to_string(),
             cache_dir: temp_dir,
             block_size: 128 * 1024,
-            blocks_per_batch: 10,
+
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
             wal_sync: false,
         })
@@ -1014,7 +998,7 @@ mod tests {
             db_path: "test".to_string(),
             cache_dir: temp_dir.path().to_path_buf(),
             block_size: 128 * 1024,
-            blocks_per_batch: 10,
+
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
             wal_sync: false,
         })

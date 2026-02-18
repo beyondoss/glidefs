@@ -400,6 +400,7 @@ We considered `RwLock` but rejected it: even uncontended lock/unlock has ~25ns o
 | `nbd/cache.rs` | `BlockCache` trait + `FoyerBlockCache` (memory + SSD hybrid) |
 | `nbd/readahead.rs` | Sequential read detector: 3+ consecutive chunks triggers pack prefetch |
 | `nbd/scrubber.rs` | Background corruption detection: re-hash cached blocks, evict on mismatch |
+| `nbd/sync.rs` | Loom/std compatibility shim: re-exports atomics for exhaustive interleaving tests |
 | `nbd/metrics.rs` | Per-export Prometheus-compatible telemetry with sampled latency histograms |
 | `nbd/protocol.rs` | NBD wire format: handshake options, transmission commands, reply serialization |
 | `nbd/api.rs` | HTTP REST API for export CRUD, drain, promote, metrics |
@@ -430,7 +431,6 @@ api_address = "127.0.0.1:8080"
 | Variable | Default | Why |
 |----------|---------|-----|
 | `block_size` | 128KB | Matches ZFS recordsize |
-| `blocks_per_batch` | 25 | 3.2MB per S3 object — balances PUT cost vs read amplification |
 | `scrubber_blocks_per_second` | 1000 | Background integrity rate; 0 = disabled |
 | `memory_size_gb` | 1.0 | Foyer in-memory cache for hot blocks |
 | `ssd_cache_size_gb` | 10.0 | Foyer SSD tier catches memory evictions |
@@ -479,7 +479,7 @@ Example: 1TB export with 128KB blocks = 8M blocks. Per-export overhead: ~232MB (
 
 | Suite | Command | Count | What It Covers |
 |-------|---------|-------|----------------|
-| Unit | `cargo test --features test-utils --lib` | ~262 | Lock-free atomics, wire format round-trips, state transitions |
+| Unit | `cargo test --features test-utils --lib` | ~304 | Lock-free atomics, wire format round-trips, state transitions |
 | Integration | `cargo test --features test-utils --test integration` | ~46 | Crash recovery, concurrent writes, flush consistency (no Docker) |
 | Docker | `cargo test --features docker-tests --test docker_integration` | ~9 | Real S3 via MinIO (testcontainers-rs), end-to-end pack upload/download |
 | Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free algorithms (AtomicBlockMap, SeqLock) |

@@ -98,7 +98,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         db_path,
         cache_dir,
         block_size: nbd_config.block_size(),
-        blocks_per_batch: nbd_config.blocks_per_batch(),
         clean_cache,
         wal_sync: nbd_config.wal_sync(),
     }));

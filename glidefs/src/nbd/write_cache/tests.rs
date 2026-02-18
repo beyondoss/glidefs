@@ -1204,11 +1204,7 @@ async fn test_draining_state_transition() {
     let dirty_before = cache.dirty_block_count();
 
     // Transition to Draining via shutdown
-    let s3_store = crate::nbd::block_store::S3BlockStore::with_defaults(
-        Arc::new(InMemory::new()),
-        "drain-test",
-    );
-    let draining = cache.shutdown(&s3_store).await.unwrap();
+    let draining = cache.shutdown().await.unwrap();
 
     // Draining state — finish() completes the lifecycle
     draining.finish();

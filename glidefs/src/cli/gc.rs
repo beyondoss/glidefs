@@ -6,7 +6,7 @@
 //! a grace period.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ pub struct GcState {
 }
 
 impl GcState {
-    fn load(path: &PathBuf) -> Result<Self> {
+    fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(data) => Ok(serde_json::from_str(&data)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -40,9 +40,14 @@ impl GcState {
         }
     }
 
-    fn save(&self, path: &PathBuf) -> Result<()> {
+    fn save(&self, path: &Path) -> Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let tmp = tempfile::NamedTempFile::new_in(dir)
+            .with_context(|| format!("failed to create temp file in {}", dir.display()))?;
+        std::fs::write(tmp.path(), &json)?;
+        tmp.persist(path)
+            .with_context(|| format!("failed to atomically rename GC state to {}", path.display()))?;
         Ok(())
     }
 

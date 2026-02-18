@@ -1,6 +1,5 @@
 pub mod api;
 pub mod block_map;
-pub mod block_store;
 pub mod cache;
 pub mod error;
 pub mod flush_scheduler;
@@ -30,8 +29,6 @@ pub use protocol::{
 };
 
 // Re-exports for library API
-#[allow(unused_imports)]
-pub use block_store::S3BlockStore;
 #[allow(unused_imports)]
 pub use metrics::{ExportMetrics, MetricsSnapshot};
 #[allow(unused_imports)]

@@ -1,7 +1,6 @@
 use thiserror::Error;
 
 use crate::nbd::block_map::Blake3Hash;
-use crate::nbd::block_store::BlockStoreError;
 use crate::nbd::content_store::ContentStoreError;
 
 /// Errors that can occur during cache operations.
@@ -17,9 +16,6 @@ pub enum CacheError {
     #[allow(dead_code)]
     #[error("Cache is shutting down")]
     ShuttingDown,
-
-    #[error("Block store error: {0}")]
-    BlockStore(#[from] BlockStoreError),
 
     #[error("Invalid cache metadata")]
     InvalidMetadata,

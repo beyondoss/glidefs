@@ -6,7 +6,6 @@ use tracing::{debug, info, instrument, warn};
 use crate::nbd::block_map::{
     BlockMapKind, Blake3Hash, blake3_128, lz4_compress,
 };
-use crate::nbd::block_store::S3BlockStore;
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::manifest::{Manifest, ManifestBlockEntry};
 use crate::nbd::pack::{self, PackLocation, BLOCKS_PER_PACK};
@@ -61,8 +60,8 @@ impl WriteCache<Active> {
     /// The v2 flush scheduler is responsible for ensuring dirty blocks are
     /// flushed to S3 before shutdown. This method only persists local metadata
     /// and transitions the cache state.
-    #[instrument(skip(self, _s3))]
-    pub async fn shutdown(self, _s3: &S3BlockStore) -> Result<WriteCache<Draining>, CacheError> {
+    #[instrument(skip(self))]
+    pub async fn shutdown(self) -> Result<WriteCache<Draining>, CacheError> {
         info!("starting graceful shutdown");
 
         // Save final metadata

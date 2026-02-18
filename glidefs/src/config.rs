@@ -104,9 +104,8 @@ pub struct NbdConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block_size: Option<usize>,
 
-    /// Number of blocks per S3 batch (default: 100).
-    /// Batching groups consecutive blocks into single S3 objects to reduce PUT costs.
-    /// 100 blocks × 128KB = 12.8MB per batch, reducing PUTs by ~10x.
+    /// DEPRECATED: Was used by the legacy S3BlockStore batch path.
+    /// Kept for backward compatibility with existing config files (deny_unknown_fields).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub blocks_per_batch: Option<u64>,
 
@@ -187,17 +186,11 @@ impl ExportConfig {
 
 impl NbdConfig {
     pub const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
-    pub const DEFAULT_BLOCKS_PER_BATCH: u64 = 25;
     pub const DEFAULT_DEVICE_SIZE_GB: f64 = 100.0;
     pub const DEFAULT_DEVICE_NAME: &'static str = "glidefs";
 
     pub fn block_size(&self) -> usize {
         self.block_size.unwrap_or(Self::DEFAULT_BLOCK_SIZE)
-    }
-
-    /// Get the number of blocks per S3 batch.
-    pub fn blocks_per_batch(&self) -> u64 {
-        self.blocks_per_batch.unwrap_or(Self::DEFAULT_BLOCKS_PER_BATCH)
     }
 
     pub const DEFAULT_SCRUBBER_BPS: u64 = 1000;
@@ -406,9 +399,6 @@ impl Settings {
                     "block_size must be a power of 2 between 4096 and 1048576, got {}",
                     bs
                 );
-            }
-            if let Some(bpb) = nbd.blocks_per_batch {
-                anyhow::ensure!(bpb > 0, "blocks_per_batch must be > 0, got {}", bpb);
             }
             if let Some(t) = nbd.shutdown_timeout_secs {
                 anyhow::ensure!(t > 0, "shutdown_timeout_secs must be > 0, got {}", t);

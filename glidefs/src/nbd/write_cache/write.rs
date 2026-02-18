@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use bytes::Bytes;
 use tracing::{debug, instrument};
 
@@ -7,6 +9,14 @@ use crate::nbd::state::Active;
 use crate::nbd::wal::WalEntryRef;
 
 use super::{CacheError, WriteCache};
+
+thread_local! {
+    /// Reusable buffer for block hashing on the write path.
+    /// Avoids a 128KB allocation per write() call. On error (early return),
+    /// the buffer is lost and re-allocated on next use — acceptable since
+    /// error paths are rare.
+    static CHUNK_BUF: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+}
 
 impl WriteCache<Active> {
     /// Write data to the cache.
@@ -69,13 +79,13 @@ impl WriteCache<Active> {
         // === v2: content-addressed updates ===
         // For each affected chunk, read the full chunk from SSD, hash it,
         // and update block map + WAL + dirty store.
-        //
-        // The chunk buffer is allocated once and reused across blocks to
-        // avoid a 128KB allocation per block on the hot path.
         {
             let block_size = self.inner.config.block_size;
             let device_size = self.inner.config.device_size;
-            let mut chunk_buf = vec![0u8; block_size];
+
+            // Reuse thread-local buffer instead of allocating 128KB per write call.
+            let mut chunk_buf = CHUNK_BUF.take();
+            chunk_buf.resize(block_size, 0);
 
             for block in start_block..=end_block {
                 let idx = block as usize;
@@ -115,12 +125,17 @@ impl WriteCache<Active> {
             }
 
             // Flush WAL buffer (or fsync if wal_sync is enabled)
-            let mut wal = self.inner.wal.lock();
-            if self.inner.config.wal_sync {
-                wal.sync()?;
-            } else {
-                wal.flush_buf()?;
+            {
+                let mut wal = self.inner.wal.lock();
+                if self.inner.config.wal_sync {
+                    wal.sync()?;
+                } else {
+                    wal.flush_buf()?;
+                }
             }
+
+            // Return buffer to thread-local pool for reuse
+            CHUNK_BUF.set(chunk_buf);
         }
 
         // If using a forked block map, check if overlay is large enough to flatten

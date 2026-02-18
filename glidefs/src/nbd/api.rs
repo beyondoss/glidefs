@@ -508,7 +508,6 @@ mod tests {
             db_path: "test".to_string(),
             cache_dir: temp_dir.path().to_path_buf(),
             block_size: 128 * 1024,
-            blocks_per_batch: 10,
             clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
             wal_sync: false,
         }))
