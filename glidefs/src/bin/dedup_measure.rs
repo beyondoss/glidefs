@@ -421,7 +421,7 @@ fn measure_fork_overlays(
 // Display
 // ---------------------------------------------------------------------------
 
-fn human(bytes: usize) -> String {
+fn human(bytes: u64) -> String {
     if bytes >= 1 << 30 {
         format!("{:.1}GB", bytes as f64 / (1 << 30) as f64)
     } else if bytes >= 1 << 20 {
@@ -479,7 +479,7 @@ fn main() {
         } else {
             0.0
         };
-        let bmap = 10usize * 1024 * 1024 * 1024 / r.block_size * 17;
+        let bmap = 10u64 * 1024 * 1024 * 1024 / r.block_size as u64 * 17;
         let lz4_ratio = if r.compressed_bytes > 0 {
             r.raw_bytes as f64 / r.compressed_bytes as f64
         } else {
