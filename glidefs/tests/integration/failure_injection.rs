@@ -161,7 +161,7 @@ fn create_test_cache(
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    HostPackIndex,
+    Arc<HostPackIndex>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
 ) {
@@ -175,7 +175,7 @@ fn create_test_cache(
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
-    let pack_index = HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
+    let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
@@ -197,7 +197,7 @@ async fn create_reader_from_manifest(
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    HostPackIndex,
+    Arc<HostPackIndex>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
 ) {
@@ -213,7 +213,7 @@ async fn create_reader_from_manifest(
         Manifest::deserialize(&manifest_bytes).expect("manifest deserialization failed");
 
     // Rebuild pack_index from manifest
-    let pack_index = HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
+    let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
     pack_index.rebuild(std::slice::from_ref(&manifest)).unwrap();
 
     let config = WriteCacheConfig {
@@ -651,11 +651,10 @@ async fn test_concurrent_drain_safety() {
         cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
     }
 
-    // Wrap in Arc for sharing across tasks (ContentStore and HostPackIndex
-    // don't implement Clone, but flush_to_s3 takes &self references)
+    // Wrap in Arc for sharing across tasks (ContentStore doesn't implement
+    // Clone, but flush_to_s3 takes &self references)
     let cache = Arc::new(cache);
     let content_store = Arc::new(content_store);
-    let pack_index = Arc::new(pack_index);
 
     let mut handles = vec![];
     for _ in 0..3 {

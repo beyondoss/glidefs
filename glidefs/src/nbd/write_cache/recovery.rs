@@ -96,7 +96,7 @@ impl WriteCache<Recovering> {
             if actual_hash != hash {
                 // SSD state drifted — update block_map with correct hash
                 let seq = self.inner.sequence.next();
-                self.inner.block_map_set(idx, actual_hash, seq)?;
+                self.inner.block_map_set(idx, actual_hash, seq);
                 corrected += 1;
             }
         }

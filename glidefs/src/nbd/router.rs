@@ -209,7 +209,8 @@ pub struct ExportRouter {
     backpressure_saved_modes: parking_lot::Mutex<HashMap<String, FlushMode>>,
 
     /// SSD utilization ratio (0.0–1.0), updated by capacity monitor.
-    ssd_utilization: AtomicU64, // f64 bits via to_bits()/from_bits()
+    /// Shared with NBDBlockHandler instances for write rejection at high utilization.
+    ssd_utilization: Arc<AtomicU64>, // f64 bits via to_bits()/from_bits()
 }
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
@@ -268,7 +269,7 @@ impl ExportRouter {
             upload_semaphore,
             download_semaphore,
             backpressure_saved_modes: parking_lot::Mutex::new(HashMap::new()),
-            ssd_utilization: AtomicU64::new(0f64.to_bits()),
+            ssd_utilization: Arc::new(AtomicU64::new(0f64.to_bits())),
         }
     }
 
@@ -696,6 +697,7 @@ impl ExportRouter {
             config.size_bytes(),
             readonly,
             Arc::clone(&metrics),
+            Arc::clone(&self.ssd_utilization),
         ));
 
         // Start flush scheduler for this export
@@ -863,15 +865,27 @@ impl ExportRouter {
     }
 
     /// Drain all exports. Returns (name, error) pairs for any that failed.
-    pub async fn drain_all(&self) -> Vec<(String, RouterError)> {
+    pub async fn drain_all(self: &Arc<Self>) -> Vec<(String, RouterError)> {
+        use futures::stream;
+
         let names = self.list_export_names().await;
-        let mut failed = Vec::new();
-        for name in names {
-            if let Err(e) = self.drain_export(&name).await {
-                warn!(export = %name, error = %e, "failed to drain export");
-                failed.push((name, e));
-            }
-        }
+        let failed: Vec<_> = stream::iter(names)
+            .map(|name| {
+                let this = Arc::clone(self);
+                async move {
+                    match this.drain_export(&name).await {
+                        Ok(()) => None,
+                        Err(e) => {
+                            warn!(export = %name, error = %e, "failed to drain export");
+                            Some((name, e))
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(16)
+            .filter_map(|x| async { x })
+            .collect()
+            .await;
         failed
     }
 

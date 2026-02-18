@@ -391,7 +391,7 @@ async fn test_write_after_recovery_overwrites() {
             Arc::clone(&s3_backend),
             "test",
         );
-        let pack_index = glidefs::nbd::pack_index::HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
+        let pack_index = Arc::new(glidefs::nbd::pack_index::HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
     }
 
@@ -469,7 +469,7 @@ async fn test_wal_recovery_without_metadata_save() {
             Arc::clone(&s3_backend),
             "test",
         );
-        let pack_index = glidefs::nbd::pack_index::HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
+        let pack_index = Arc::new(glidefs::nbd::pack_index::HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         let stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
         assert!(stats.packs_uploaded > 0, "should upload recovered blocks");
         assert_eq!(stats.blocks_flushed, 2, "should flush both WAL-recovered blocks");
@@ -556,7 +556,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
             Arc::clone(&s3_backend),
             "test",
         );
-        let pack_index = glidefs::nbd::pack_index::HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap();
+        let pack_index = Arc::new(glidefs::nbd::pack_index::HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         let stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
         assert_eq!(stats.blocks_flushed, 2, "both blocks should flush to S3");
 

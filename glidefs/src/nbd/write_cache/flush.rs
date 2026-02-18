@@ -16,6 +16,109 @@ use crate::nbd::state::{Active, Draining};
 use super::inner::CacheInner;
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
 
+/// Result of CPU-heavy flush computation (pread + crc32 + blake3 + lz4).
+///
+/// Produced by `compute_flush_batch` on a blocking thread, consumed by
+/// the async portion of `flush_dirty_inner` for S3 uploads.
+struct FlushBatch {
+    /// Compressed blocks ready for S3 upload: (hash, compressed_bytes).
+    to_upload: Vec<(Blake3Hash, Vec<u8>)>,
+    /// Computed hashes for CAS-clearing dirty flags: (chunk_index, snapshot_seq, hash).
+    computed: Vec<(usize, u64, Blake3Hash)>,
+    /// Partial statistics from the computation phase.
+    stats: FlushStats,
+}
+
+/// CPU-heavy flush computation: read blocks from SSD, verify CRC32, hash, compress, dedup.
+///
+/// Runs on a blocking thread via `spawn_blocking` to avoid starving the async runtime.
+/// All operations are synchronous: pread (~100μs), crc32, blake3 (~15μs), lz4 (~120μs).
+fn compute_flush_batch(
+    inner: &CacheInner,
+    snapshot: &[(usize, u64)],
+    host_pack_index: &HostPackIndex,
+    zero_hash: Blake3Hash,
+) -> Result<FlushBatch, CacheError> {
+    let mut stats = FlushStats::default();
+    let block_size = inner.config.block_size;
+    let device_size = inner.config.device_size;
+    let mut chunk_buf = vec![0u8; block_size];
+    let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
+    let mut seen_hashes = std::collections::HashSet::new();
+    let mut computed: Vec<(usize, u64, Blake3Hash)> = Vec::new();
+
+    for &(chunk_index, snapshot_seq) in snapshot {
+        stats.blocks_flushed += 1;
+
+        // Read block data from SSD and compute content hash.
+        let offset = chunk_index as u64 * block_size as u64;
+        let valid_bytes =
+            std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
+        if valid_bytes > 0 {
+            inner
+                .data_file
+                .read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
+        }
+        if valid_bytes < block_size {
+            chunk_buf[valid_bytes..].fill(0);
+        }
+
+        // Verify CRC32 if available (detects SSD corruption before BLAKE3).
+        let stored_crc = inner.block_map_get_crc32(chunk_index);
+        if stored_crc != 0 {
+            let computed_crc = crc32fast::hash(&chunk_buf);
+            if computed_crc != stored_crc {
+                // Check if a concurrent write invalidated the CRC32.
+                let (_, current_seq) = inner.block_map_get(chunk_index);
+                if current_seq != snapshot_seq {
+                    // Concurrent write — stale CRC32, block will be retried.
+                    stats.blocks_cas_failed += 1;
+                    continue;
+                }
+                warn!(
+                    chunk_index,
+                    stored_crc,
+                    computed_crc,
+                    "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
+                );
+                inner.block_map_clear_crc32(chunk_index);
+                stats.blocks_corrupted += 1;
+                continue;
+            }
+        }
+
+        let hash = blake3_128(&chunk_buf);
+        computed.push((chunk_index, snapshot_seq, hash));
+
+        // Skip zero blocks — read path returns zeros directly
+        if hash == zero_hash {
+            stats.blocks_deduped += 1;
+            continue;
+        }
+
+        // Skip blocks already in the host pack index (cross-VM dedup)
+        if host_pack_index.contains(&hash)? {
+            stats.blocks_deduped += 1;
+            continue;
+        }
+
+        // Skip duplicate hashes within this flush batch
+        if !seen_hashes.insert(hash) {
+            stats.blocks_deduped += 1;
+            continue;
+        }
+
+        let compressed = lz4_compress(&chunk_buf[..]);
+        to_upload.push((hash, compressed));
+    }
+
+    Ok(FlushBatch {
+        to_upload,
+        computed,
+        stats,
+    })
+}
+
 impl WriteCache<Active> {
     /// Flush the local cache file.
     ///
@@ -116,9 +219,8 @@ impl WriteCache<Active> {
     async fn flush_dirty_inner(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &HostPackIndex,
+        host_pack_index: &Arc<HostPackIndex>,
     ) -> Result<(FlushStats, u64), CacheError> {
-        let mut stats = FlushStats::default();
         let chunk_size = self.inner.config.block_size as u32;
 
         // 1. Capture sequence cut point
@@ -143,97 +245,31 @@ impl WriteCache<Active> {
 
         if snapshot.is_empty() {
             debug!("flush: no dirty blocks to flush");
-            return Ok((stats, seq_cutpoint));
+            return Ok((FlushStats::default(), seq_cutpoint));
         }
 
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
 
-        // 3. Read each dirty block from SSD, compute hash, dedup, compress.
+        // 3. Offload CPU-heavy work (pread + crc32 + blake3 + lz4) to blocking thread pool.
+        //    This prevents flush computation from starving the async runtime under
+        //    high tenant count (~240μs/block × thousands of blocks = seconds of CPU).
         let zero_hash = self.inner.zero_block_hash;
-        let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
-        let mut seen_hashes = std::collections::HashSet::new();
-        // Track (chunk_index, snapshot_seq, computed_hash) for step 5.
-        let mut computed: Vec<(usize, u64, Blake3Hash)> = Vec::new();
+        let inner = Arc::clone(&self.inner);
+        let pack_index_clone = Arc::clone(host_pack_index);
+        let batch = crate::task::spawn_blocking_named("flush-compute", move || {
+            compute_flush_batch(&inner, &snapshot, &pack_index_clone, zero_hash)
+        })
+        .await
+        .map_err(|e| CacheError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))??;
 
-        let block_size = self.inner.config.block_size;
-        let mut chunk_buf = vec![0u8; block_size];
-
-        for &(chunk_index, snapshot_seq) in &snapshot {
-            stats.blocks_flushed += 1;
-
-            // Read block data from SSD and compute content hash.
-            let offset = chunk_index as u64 * block_size as u64;
-            let device_size = self.inner.config.device_size;
-            let valid_bytes = std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
-            if valid_bytes > 0 {
-                self.inner.data_file.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
-            }
-            if valid_bytes < block_size {
-                chunk_buf[valid_bytes..].fill(0);
-            }
-
-            // Verify CRC32 if available (detects SSD corruption before BLAKE3).
-            let stored_crc = self.inner.block_map_get_crc32(chunk_index);
-            if stored_crc != 0 {
-                let computed_crc = crc32fast::hash(&chunk_buf);
-                if computed_crc != stored_crc {
-                    // Check if a concurrent write invalidated the CRC32.
-                    let (_, current_seq) = self.inner.block_map_get(chunk_index);
-                    if current_seq != snapshot_seq {
-                        // Concurrent write — stale CRC32, block will be retried.
-                        stats.blocks_cas_failed += 1;
-                        continue;
-                    }
-                    warn!(
-                        chunk_index,
-                        stored_crc,
-                        computed_crc,
-                        "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
-                    );
-                    // Clear CRC32 so the next checkpoint recomputes from a fresh read.
-                    // If the corruption is transient (bad read at checkpoint time), the
-                    // next cycle will produce a correct CRC32 and flush succeeds.
-                    // If the corruption is persistent (bit rot), the next checkpoint
-                    // will store CRC32 of the corrupted data — but that's the same
-                    // outcome as corruption before the first checkpoint (inherent
-                    // limitation of deferred checksumming).
-                    self.inner.block_map_clear_crc32(chunk_index);
-                    stats.blocks_corrupted += 1;
-                    continue;
-                }
-            }
-
-            let hash = blake3_128(&chunk_buf);
-            computed.push((chunk_index, snapshot_seq, hash));
-
-            // Skip zero blocks — read path returns zeros directly
-            if hash == zero_hash {
-                stats.blocks_deduped += 1;
-                continue;
-            }
-
-            // Skip blocks already in the host pack index (cross-VM dedup)
-            if host_pack_index.contains(&hash)? {
-                stats.blocks_deduped += 1;
-                continue;
-            }
-
-            // Skip duplicate hashes within this flush batch
-            if !seen_hashes.insert(hash) {
-                stats.blocks_deduped += 1;
-                continue;
-            }
-
-            let compressed = lz4_compress(&chunk_buf[..]);
-            to_upload.push((hash, compressed));
-        }
+        let mut stats = batch.stats;
 
         // 4. Assemble packs then upload concurrently.
         //    Separate assembly from upload so we can fire all S3 PUTs at once.
         let mut pack_meta: Vec<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>)> = Vec::new();
         let mut upload_pairs: Vec<(uuid::Uuid, Vec<u8>)> = Vec::new();
 
-        for chunk in to_upload.chunks(BLOCKS_PER_PACK) {
+        for chunk in batch.to_upload.chunks(BLOCKS_PER_PACK) {
             let pack_id = uuid::Uuid::new_v4();
             let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size);
             let pack_size = pack_bytes.len() as u64;
@@ -270,7 +306,7 @@ impl WriteCache<Active> {
         // 5. Set real hashes in block_map + clear dirty flags.
         //    Sequence number serves as version token: if a concurrent write
         //    changed the sequence, leave the block dirty for the next flush.
-        for &(chunk_index, snapshot_seq, actual_hash) in &computed {
+        for &(chunk_index, snapshot_seq, actual_hash) in &batch.computed {
             let (_hash, current_seq) = self.inner.block_map_get(chunk_index);
             if current_seq != snapshot_seq {
                 // Concurrent write changed this block — leave dirty.
@@ -278,7 +314,7 @@ impl WriteCache<Active> {
                 continue;
             }
             // Replace ZERO placeholder with real content hash.
-            self.inner.block_map_set(chunk_index, actual_hash, snapshot_seq)?;
+            self.inner.block_map_set(chunk_index, actual_hash, snapshot_seq);
             // CAS Dirty(2) -> Clean(1) on the state map.
             if self.inner.state_map
                 .cas(chunk_index, SparseBlockState::DIRTY, SparseBlockState::CLEAN)
@@ -352,7 +388,7 @@ impl WriteCache<Active> {
     pub async fn flush_packs(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &HostPackIndex,
+        host_pack_index: &Arc<HostPackIndex>,
     ) -> Result<(FlushStats, u64), CacheError> {
         self.flush_dirty_inner(content_store, host_pack_index).await
     }
@@ -365,7 +401,7 @@ impl WriteCache<Active> {
     pub async fn sync_manifest(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &HostPackIndex,
+        host_pack_index: &Arc<HostPackIndex>,
         seq_cutpoint: u64,
     ) -> Result<(), CacheError> {
         self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
@@ -507,7 +543,7 @@ impl WriteCache<Active> {
     pub async fn flush_to_s3(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &HostPackIndex,
+        host_pack_index: &Arc<HostPackIndex>,
     ) -> Result<FlushStats, CacheError> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
@@ -529,7 +565,7 @@ impl WriteCache<Active> {
     pub async fn snapshot(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &HostPackIndex,
+        host_pack_index: &Arc<HostPackIndex>,
     ) -> Result<SnapshotResult, CacheError> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         let manifest_etag = self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;

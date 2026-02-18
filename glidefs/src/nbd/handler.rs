@@ -58,6 +58,10 @@ pub struct NBDBlockHandler {
 
     /// Sequential read-ahead detector
     readahead: Mutex<SequentialDetector>,
+
+    /// SSD utilization ratio shared from ExportRouter.
+    /// Used to reject writes to new blocks when SSD > 95%.
+    ssd_utilization: Arc<AtomicU64>,
 }
 
 impl NBDBlockHandler {
@@ -76,6 +80,7 @@ impl NBDBlockHandler {
         device_size: u64,
         readonly: bool,
         metrics: Arc<ExportMetrics>,
+        ssd_utilization: Arc<AtomicU64>,
     ) -> Self {
         Self {
             cache,
@@ -86,6 +91,7 @@ impl NBDBlockHandler {
             readonly: AtomicBool::new(readonly),
             metrics,
             readahead: Mutex::new(SequentialDetector::new()),
+            ssd_utilization,
         }
     }
 
@@ -174,7 +180,8 @@ impl NBDBlockHandler {
     /// Write data to the cache.
     ///
     /// Writes go to local SSD immediately. S3 sync happens in background.
-    /// Returns error if the export is readonly.
+    /// Returns error if the export is readonly or SSD is near-full and
+    /// the write touches blocks not yet present on SSD.
     pub fn write(&self, offset: u64, data: &[u8], fua: bool) -> CommandResult<()> {
         let start = Instant::now();
 
@@ -188,6 +195,14 @@ impl NBDBlockHandler {
 
         if data.is_empty() {
             return Ok(());
+        }
+
+        // Reject writes to new blocks when SSD is near-full.
+        // Overwrites to already-present blocks are allowed (no new SSD space).
+        const WRITE_REJECT_THRESHOLD: f64 = 0.95;
+        let util = f64::from_bits(self.ssd_utilization.load(Ordering::Relaxed));
+        if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, data.len()) {
+            return Err(CommandError::NoSpace);
         }
 
         self.metrics.record_guest_write(data.len() as u64);
@@ -323,6 +338,7 @@ mod tests {
             1024 * 1024,
             readonly,
             metrics,
+            Arc::new(AtomicU64::new(0f64.to_bits())),
         );
 
         (handler, temp_dir)

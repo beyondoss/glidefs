@@ -25,7 +25,6 @@ where
         .expect("failed to spawn task")
 }
 
-#[allow(dead_code)]
 pub fn spawn_blocking_named<T, F>(name: &str, f: F) -> JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,

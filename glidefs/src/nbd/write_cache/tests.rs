@@ -126,7 +126,7 @@ fn test_is_zero_block() {
 struct V2Harness {
     cache: WriteCache<Active>,
     content_store: crate::nbd::content_store::ContentStore,
-    pack_index: crate::nbd::pack_index::HostPackIndex,
+    pack_index: Arc<crate::nbd::pack_index::HostPackIndex>,
     clean_cache: crate::nbd::cache::SimpleBlockCache,
     #[allow(dead_code)]
     dir: TempDir,
@@ -150,7 +150,7 @@ impl V2Harness {
         };
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = crate::nbd::content_store::ContentStore::new(object_store, "test-bucket");
-        let pack_index = crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap();
+        let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap());
         let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery().await.unwrap();

@@ -119,7 +119,7 @@ impl WriteCache<Initializing> {
                 let old = state_map.get(chunk_index);
                 if old != SparseBlockState::DIRTY {
                     // Ensure block is present first (allocates page if needed)
-                    let _ = state_map.set_present(chunk_index);
+                    state_map.set_present(chunk_index);
                     // Transition to Dirty from whatever current state is
                     let current = state_map.get(chunk_index);
                     if current != SparseBlockState::DIRTY {
