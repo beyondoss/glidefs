@@ -105,6 +105,28 @@ Batch into packs (25 blocks × 128KB = ~3.2MB)
 | Drain | Flush all dirty blocks to S3 so the export can be stopped or migrated | Not a delete — S3 data is preserved |
 | Clean Cache | Read-through Foyer HybridCache (memory + SSD tiers) for blocks fetched from S3 | Not the write cache (dirty blocks on local SSD) |
 | Circuit Breaker | Lock-free S3 failure detector that fast-fails requests during outages | Not a retry mechanism — it prevents retries |
+| Pack Registry | Per-export append-only list of pack IDs created by or inherited by that export | Not a pack index — no hash mappings, just UUIDs for GC enumeration |
+| Hot Set | List of non-zero chunk indices for a base image, used to prefetch blocks on fork boot | Not a cache — it's a prefetch hint |
+| Bless | CLI command that converts a raw disk image into a content-addressed base image in S3 | Not a runtime operation — offline image preparation |
+
+## S3 Object Layout
+
+```
+{db_path}/
+├── nbd/{export_name}/
+│   ├── export.json                          ← Export definition (name, size_gb, s3_prefix)
+│   ├── manifests/
+│   │   ├── {export_name}                    ← Current manifest snapshot (GLDE format)
+│   │   └── bases/
+│   │       ├── {image_name}                 ← Base image manifest (from bless)
+│   │       └── {image_name}.hot-set         ← Boot hot set (chunk indices)
+│   ├── packs/
+│   │   └── {first-2-hex-of-uuid}/{uuid}     ← Content-addressed packs (GLPK format)
+│   └── pack-registries/
+│       └── {export_name}                    ← Pack ID list for GC (GLPR format)
+```
+
+Packs use 256-way prefix sharding (`packs/ab/{uuid}`) to avoid S3 LIST performance degradation. Manifests are atomic overwrites — the latest is always consistent. Pack registries are append-only and compacted by GC.
 
 ## Core Mechanism: Write-Behind Cache
 
@@ -333,6 +355,63 @@ Ring buffer (4 entries) tracks recent chunk accesses. When 3+ consecutive chunks
 
 This hides S3 latency for sequential workloads — the next pack is already being fetched while the current one is being served. (`readahead.rs`)
 
+### Boot Hot Set Prefetch
+
+When a fork is created from a base image manifest, the router checks S3 for a corresponding `.hot-set` file — a list of chunk indices that contain non-zero data. If found, a background task prefetches those chunks into the CleanCache before the VM reads them, hiding S3 latency during boot.
+
+The hot set is created by `glidefs bless` and covers every non-zero block in the base image. For a typical 2GB Ubuntu image on a 10GB device, the hot set is ~16K chunk indices (~128KB file). (`router.rs:create_export`, `manifest.rs:serialize_hot_set`)
+
+### Garbage Collection (`glidefs gc`)
+
+Orphaned packs accumulate in S3 when exports are deleted or blocks are overwritten and flushed. The GC command reconciles pack registries (what packs exist) against manifests (what packs are live) and deletes the difference.
+
+```
+For each S3 prefix:
+    1. List all manifests → extract live pack IDs
+    2. List all pack registries → extract known pack IDs
+    3. dead = known - live
+    4. Mark newly dead packs with timestamp in GC state file
+    5. Revive packs that reappeared in live set
+    6. Delete packs dead longer than grace period
+    7. Compact registries (remove deleted pack IDs)
+    8. Delete empty registries for exports with no manifest
+```
+
+**Grace period**: Dead packs are not deleted immediately. GC records the first-seen-dead timestamp in a local JSON state file (`gc-state.json`). Packs are only eligible for deletion after the grace period (default 24h). This prevents races where a flush creates a pack and uploads it to a registry, but the manifest hasn't been uploaded yet — without the grace period, GC would see the pack as dead and delete it.
+
+**Safety controls**: `--dry-run` reports without deleting. `--max-deletes` caps deletions per run. Corrupt manifests are skipped (not fatal). (`cli/gc.rs`)
+
+#### Pack Registry Format (`GLPR`)
+
+Per-export append-only list of pack UUIDs, stored in S3 at `pack-registries/{name}`.
+
+```
+┌──────────────── Pack Registry ─────────────────┐
+│ Header (8 bytes)                                │
+│   magic: "GLPR"  count: u32 LE                  │
+├─────────────────────────────────────────────────┤
+│ Pack IDs (16 bytes × count)                     │
+│   [uuid:16][uuid:16]...                         │
+└─────────────────────────────────────────────────┘
+```
+
+Written by the flush path after uploading packs. Inherited by forks (the fork's registry starts with the parent's pack IDs). Compacted by GC after dead packs are deleted. (`pack_registry.rs`)
+
+## CLI Commands
+
+| Command | Purpose |
+|---------|---------|
+| `glidefs init [path]` | Generate a default `glidefs.toml` config file |
+| `glidefs run -c glidefs.toml` | Start the NBD server with HTTP management API |
+| `glidefs bless --image disk.raw --name ubuntu-22.04 -c glidefs.toml` | Convert a raw disk image into a content-addressed base image in S3 |
+| `glidefs gc -c glidefs.toml [--dry-run] [--grace-period 24h]` | Delete orphaned packs in S3 |
+
+### Bless Pipeline
+
+`glidefs bless` reads a raw disk image sequentially, hashes each chunk, deduplicates against existing base manifests in S3, compresses unique blocks into packs, and uploads them. Output: a manifest at `manifests/bases/{name}` and a hot set at `manifests/bases/{name}.hot-set`.
+
+Cross-image dedup: if blessing `ubuntu-22.04-node20-v3` after `ubuntu-22.04-node20-v2`, shared chunks (kernel, base packages) are detected via the pack index and skipped — only delta blocks are uploaded. (`cli/bless.rs`)
+
 ## Management API
 
 HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
@@ -347,6 +426,14 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 | `/api/exports/{name}/promote` | `POST` | Toggle readonly flag |
 | `/api/exports/{name}/metrics` | `GET` | Per-export metrics snapshot (JSON) |
 | `/metrics` | `GET` | Prometheus scrape endpoint (all exports) |
+
+### Export Persistence & Discovery
+
+Export definitions are saved to S3 as `{db_path}/nbd/{name}/export.json` on creation. On startup, `discover_exports()` lists all `export.json` files under the `nbd/` prefix and recreates exports from their definitions + S3 manifests. This enables stateless restarts — a new node can resume serving any export by reading its definition and manifest from S3. (`router.rs:save_export`, `router.rs:discover_exports`)
+
+### Storage Compatibility
+
+On startup, GlideFS verifies that the S3-compatible backend supports conditional writes (`PutMode::Create`). This is required for future fencing support (preventing split-brain when two nodes claim the same export). Backends that don't support this (some MinIO versions, some S3-compatible proxies) are rejected with a clear error. (`storage_compatibility.rs`)
 
 ## Observability
 
@@ -408,6 +495,32 @@ None of this work is needed until flush time. With deferred hashing, the write p
 **Write coalescing is free**: write the same block 100 times before flush, hash it once. Previously: 100 hashes, 99 thrown away.
 
 The read path distinguishes ZERO-placeholder from never-written using the **state map**: ZERO hash + state != NotPresent = deferred hash (SSD pread), ZERO hash + NotPresent = never written (return zeros).
+
+### Why the HostPackIndex is not persisted
+
+The `HostPackIndex` (DashMap mapping BLAKE3 hash → S3 pack location) is an in-memory structure that starts **empty** on process restart. It is not rebuilt from manifests.
+
+On cold start, `discover_exports()` scans S3 for `export.json` files, then each export is created with `manifest_name: None` — the normal `WriteCache::open()` path. This loads the block map (with hashes) and state map from local `.meta`/`.blockmap` files and replays the WAL. The pack index is not populated.
+
+**Why this is safe**: the read tier resolution has a fallback chain:
+
+```
+block_map_get(hash)
+  ├─ ZERO + present     → SSD pread (deferred dirty block)
+  ├─ ZERO + not present → return zeros
+  ├─ zero_block_hash    → return zeros
+  ├─ clean_cache hit    → return cached
+  ├─ pack_index hit     → S3 range GET  ← empty after restart
+  └─ SSD pread fallback → local block   ← catches everything else
+```
+
+After flush, blocks transition `DIRTY → CLEAN` but **remain on the SSD data file** — blocks are never evicted from their slot. So after restart, CLEAN blocks with known hashes but no pack_index entry fall through to Tier 3 (SSD pread), which is actually *faster* (~µs) than an S3 fetch (~50ms).
+
+The pack index repopulates lazily as the flush scheduler runs and uploads new packs via `pack_index.insert()`. Previously-flushed CLEAN blocks that are never re-dirtied never re-enter the index — they serve reads from local SSD indefinitely.
+
+**Cold-start cost at 2,000 VMs**: one S3 LIST call, then per-export local I/O to load `.meta` + `.blockmap` + WAL replay + `finish_recovery()` (re-hash dirty blocks). With ~100 dirty blocks per export at 128KB, that's ~25GB of I/O — bounded by NVMe throughput, not S3. No manifest scan, no index rebuild.
+
+**Known gap**: see "SSD failure after flush" in Failure Modes below.
 
 Sequence numbers replace hashes as the race detection token in flush. There is a narrow TOCTOU window between checking the sequence and doing the CAS (nanoseconds), identical to the previous hash-based approach and self-healing.
 
@@ -512,8 +625,14 @@ The 5µs write path is never touched — the monitor only adjusts background flu
 | `nbd/error.rs` | Error types: `NBDError`, `CommandError`, `RouterError` |
 | `circuit_breaker.rs` | Lock-free S3 circuit breaker (single AtomicU64, CAS transitions) |
 | `config.rs` | TOML configuration parsing with environment variable expansion |
+| `storage_compatibility.rs` | S3 conditional write check (`PutMode::Create`) for fencing support |
+| `parse_object_store.rs` | Vendored URL → ObjectStore factory (S3, GCS, Azure, local, memory) |
+| `task.rs` | Named Tokio task spawning helpers for debuggability |
+| `deku_bytes.rs` | `Bytes` adapter for deku binary protocol parsing (NBD wire format) |
 | `cli/server.rs` | `glidefs run`: wire up config → router → server → API |
 | `cli/bless.rs` | `glidefs bless`: create golden images from local directories |
+| `cli/gc.rs` | `glidefs gc`: orphaned pack garbage collection with grace period |
+| `loom-tests/src/lib.rs` | Exhaustive concurrency tests for lock-free CAS state machine |
 
 ## Configuration
 
@@ -526,12 +645,25 @@ memory_size_gb = 1.0          # Foyer memory tier
 ssd_cache_size_gb = 10.0      # Foyer SSD tier
 
 [storage]
-url = "s3://my-bucket/vms"
+url = "s3://my-bucket/vms"    # Also: gs://, az://, file://, memory://
 
 [servers.nbd]
 unix_socket = "/var/run/glidefs.sock"
 api_address = "127.0.0.1:8080"
+
+[[servers.nbd.exports]]
+name = "vm-prod-1"
+size_gb = 100.0
+flush_mode = { Continuous = { pack_interval_secs = 5, manifest_interval_secs = 60 } }
+
+# Cloud credentials (all values support ${ENV_VAR} expansion)
+[aws]
+access_key_id = "${AWS_ACCESS_KEY_ID}"
+secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+region = "us-east-1"
 ```
+
+Supported storage backends: **Amazon S3** (`s3://`), **Google Cloud Storage** (`gs://`), **Azure Blob** (`az://`, `abfs://`), **local filesystem** (`file://`), **in-memory** (`memory://`). All config values support `${ENV_VAR}` expansion via `shellexpand`. (`config.rs`, `parse_object_store.rs`)
 
 | Variable | Default | Why |
 |----------|---------|-----|
@@ -609,6 +741,7 @@ Each export's page tables share an `Arc<AtomicUsize>` budget counter. Page alloc
 | S3 sustained outage | Circuit breaker opens | Reads from local SSD continue; writes accumulate locally; breaker probes S3 every 30s |
 | Metadata budget exhaustion | `ENOSPC` to guest | Guest sees write failure; existing data intact; flush frees budget by clearing dirty blocks |
 | Local SSD full | `ENOSPC` to guest (NBD_ENOSPC, not EIO) | Capacity monitor escalates flush → Continuous(2s/10s); dirty blocks drain to S3, freeing physical space |
+| SSD failure after flush | **Data loss for CLEAN blocks** | Blocks in CLEAN state have known hashes in the block map but the pack index is empty (not persisted) and the SSD data is gone. Tier 3 pread returns errors or garbage — no fallback to S3 because the hash→pack location mapping is lost. Recreate VM from base image or last manifest. **Mitigation**: the risk window is narrow (SSD must fail between last flush and next restart), and the workload is ephemeral VMs. A future fix could attempt manifest-based pack index reconstruction on Tier 3 read failure. |
 
 ## Testing
 
