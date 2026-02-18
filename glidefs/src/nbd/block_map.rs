@@ -190,6 +190,42 @@ struct HashEntry {
 }
 // 32 bytes per entry. Two entries per 64-byte cache line.
 
+impl HashEntry {
+    /// Read hash and sequence with SeqLock protection.
+    ///
+    /// Spins until a consistent snapshot is obtained (version is even and
+    /// unchanged across the read). Memory ordering rationale:
+    ///
+    /// - `Acquire` on v1: synchronizes with the writer's final `Release`
+    ///   increment, ensuring we see all prior data stores if the version is even.
+    /// - `Relaxed` on data loads: sufficient because the trailing `Acquire`
+    ///   fence handles the case where a Relaxed load observes a writer's
+    ///   `Release` store — the fence synchronizes-with that Release, making
+    ///   the writer's odd version visible to the v2 check, forcing a retry.
+    /// - `Relaxed` on v2: the preceding `Acquire` fence ensures visibility.
+    #[inline]
+    fn read(&self) -> (Blake3Hash, u64) {
+        loop {
+            let v1 = self.version.load(Ordering::Acquire);
+            if v1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let lo = self.hash_lo.load(Ordering::Relaxed);
+            let hi = self.hash_hi.load(Ordering::Relaxed);
+            let seq = self.sequence.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let v2 = self.version.load(Ordering::Relaxed);
+            if v1 == v2 {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&lo.to_le_bytes());
+                bytes[8..].copy_from_slice(&hi.to_le_bytes());
+                return (Blake3Hash(bytes), seq);
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
 
 /// A page of 128 hash entries (4096 bytes = one OS page).
 #[repr(C, align(4096))]
@@ -410,32 +446,7 @@ impl AtomicBlockMap {
             Some(p) => p,
             None => return (Blake3Hash::ZERO, 0),
         };
-        let entry = &page.entries[entry_idx];
-        loop {
-            let v1 = entry.version.load(Ordering::Acquire);
-            if v1 & 1 != 0 {
-                // Writer in progress — spin.
-                std::hint::spin_loop();
-                continue;
-            }
-            let lo = entry.hash_lo.load(Ordering::Relaxed);
-            let hi = entry.hash_hi.load(Ordering::Relaxed);
-            let seq = entry.sequence.load(Ordering::Relaxed);
-            // Acquire fence: if any Relaxed data load above observed a writer's
-            // Release store, this fence synchronizes-with that Release —
-            // making the writer's odd version visible to the v2 load below,
-            // which forces a retry and prevents torn reads under C11.
-            std::sync::atomic::fence(Ordering::Acquire);
-            let v2 = entry.version.load(Ordering::Relaxed);
-            if v1 == v2 {
-                let mut bytes = [0u8; 16];
-                bytes[..8].copy_from_slice(&lo.to_le_bytes());
-                bytes[8..].copy_from_slice(&hi.to_le_bytes());
-                return (Blake3Hash(bytes), seq);
-            }
-            // Version changed — retry.
-            std::hint::spin_loop();
-        }
+        page.entries[entry_idx].read()
     }
 
     /// Store the hash and sequence for a chunk (lock-free, SeqLock-protected).
@@ -487,26 +498,7 @@ impl AtomicBlockMap {
 
             if let Some(page) = self.load_page(page_idx) {
                 for entry_idx in 0..count {
-                    let e = &page.entries[entry_idx];
-                    let (hash, sequence) = loop {
-                        let v1 = e.version.load(Ordering::Acquire);
-                        if v1 & 1 != 0 {
-                            std::hint::spin_loop();
-                            continue;
-                        }
-                        let lo = e.hash_lo.load(Ordering::Relaxed);
-                        let hi = e.hash_hi.load(Ordering::Relaxed);
-                        let seq = e.sequence.load(Ordering::Relaxed);
-                        std::sync::atomic::fence(Ordering::Acquire);
-                        let v2 = e.version.load(Ordering::Relaxed);
-                        if v1 == v2 {
-                            let mut bytes = [0u8; 16];
-                            bytes[..8].copy_from_slice(&lo.to_le_bytes());
-                            bytes[8..].copy_from_slice(&hi.to_le_bytes());
-                            break (Blake3Hash(bytes), seq);
-                        }
-                        std::hint::spin_loop();
-                    };
+                    let (hash, sequence) = page.entries[entry_idx].read();
                     let flag = state_map.get(chunk_i);
                     entries.push(BlockMapEntry {
                         hash,
