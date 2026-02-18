@@ -31,6 +31,7 @@ const DEVICE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
 /// Shared v2 test harness: creates a WriteCache with ContentStore + HostPackIndex + SimpleBlockCache.
 ///
 /// Returns all components needed for the v2 flush/read API.
+#[allow(clippy::type_complexity)]
 pub fn create_v2_test_cache(
     temp_dir: &TempDir,
     name: &str,

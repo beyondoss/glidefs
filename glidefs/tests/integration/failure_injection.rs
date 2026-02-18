@@ -154,6 +154,7 @@ impl ObjectStore for FailingObjectStore {
 }
 
 /// Helper to create a writer cache with the failing object store.
+#[allow(clippy::type_complexity)]
 fn create_test_cache(
     temp_dir: &TempDir,
     name: &str,
