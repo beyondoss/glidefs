@@ -113,6 +113,10 @@ harness = false
 name = "dedup_measure"
 path = "src/bin/dedup_measure.rs"
 
+[[bin]]
+name = "pack_size_measure"
+path = "src/bin/pack_size_measure.rs"
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"

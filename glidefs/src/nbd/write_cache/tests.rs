@@ -316,13 +316,13 @@ async fn test_flush_concurrent_write_stays_dirty() {
 async fn test_flush_manifest_self_contained() {
     let h = V2Harness::new().await;
 
-    // Write 30 blocks (will produce 2 packs: 25 + 5)
-    for i in 0u8..30 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+    // Write 130 blocks (will produce 2 packs: 100 + 30)
+    for i in 0u16..130 {
+        h.cache.write(i as u64 * 4096, &vec![(i + 1) as u8; 4096], &h.clean_cache).unwrap();
     }
 
     let stats = h.flush().await;
-    assert_eq!(stats.packs_uploaded, 2, "should produce 2 packs (25+5)");
+    assert_eq!(stats.packs_uploaded, 2, "should produce 2 packs (100+30)");
 
     let manifest = h.manifest().await;
     let pack_hashes: std::collections::HashSet<_> =

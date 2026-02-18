@@ -57,7 +57,8 @@
       "Bash(RUST_LOG=glidefs=debug cargo test:*)",
       "Bash(rustfmt --check:*)",
       "Bash(git -C /tmp/zerofs log --oneline -5)",
-      "Bash(git -C /tmp/zerofs remote -v)"
+      "Bash(git -C /tmp/zerofs remote -v)",
+      "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/glidefs/target/release/pack_size_measure:*)"
     ]
   }
 }
