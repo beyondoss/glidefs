@@ -42,6 +42,7 @@ pub enum CacheError {
     #[error("LZ4 decompression failed: {0}")]
     DecompressFailed(String),
 
+    #[allow(dead_code)]
     #[error("Unsupported block size {0}: must not exceed {1} (ZERO_BLOCK_BYTES is compiled for this size)")]
     UnsupportedBlockSize(usize, usize),
 }

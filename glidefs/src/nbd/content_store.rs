@@ -89,6 +89,7 @@ impl ContentStore {
     }
 
     /// Download a pack from S3 (buffered).
+    #[allow(dead_code)]
     #[instrument(skip(self), fields(pack_id = %pack_id))]
     pub async fn get_pack(&self, pack_id: Uuid) -> Result<Vec<u8>, ContentStoreError> {
         self.check_circuit()?;
@@ -350,11 +351,13 @@ impl ContentStore {
     }
 
     /// Get a reference to the underlying object store.
+    #[allow(dead_code)]
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> {
         &self.object_store
     }
 
     /// Get the base path.
+    #[allow(dead_code)]
     pub fn base_path(&self) -> &str {
         &self.base_path
     }
@@ -422,6 +425,85 @@ mod tests {
             result.is_none(),
             "missing manifest should return Ok(None)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_blocks_when_open() {
+        use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, FailurePolicy};
+        use std::time::Duration;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_policy: FailurePolicy::Consecutive { threshold: 1 },
+            reset_timeout: Duration::from_secs(300), // long timeout so CB stays open
+            half_open_permits: 1,
+        }));
+
+        let store = ContentStore::new(object_store, "test-bucket").with_circuit_breaker(Arc::clone(&cb));
+
+        // Force the circuit breaker open by recording a failure
+        cb.record_failure();
+
+        // All operations should fail with CircuitOpen
+        let err = store.put_pack(Uuid::new_v4(), vec![1, 2, 3]).await.unwrap_err();
+        assert!(matches!(err, ContentStoreError::CircuitOpen), "put_pack should fail: {err}");
+
+        let err = store.get_pack(Uuid::new_v4()).await.unwrap_err();
+        assert!(matches!(err, ContentStoreError::CircuitOpen), "get_pack should fail: {err}");
+
+        let err = store.get_manifest("test").await.unwrap_err();
+        assert!(matches!(err, ContentStoreError::CircuitOpen), "get_manifest should fail: {err}");
+
+        let err = store.put_manifest("test", vec![1]).await.unwrap_err();
+        assert!(matches!(err, ContentStoreError::CircuitOpen), "put_manifest should fail: {err}");
+
+        let err = store.get_block(Uuid::new_v4(), 0, 10).await.unwrap_err();
+        assert!(matches!(err, ContentStoreError::CircuitOpen), "get_block should fail: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_records_success_on_ok() {
+        use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState, FailurePolicy};
+        use std::time::Duration;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_policy: FailurePolicy::Consecutive { threshold: 3 },
+            reset_timeout: Duration::from_secs(1),
+            half_open_permits: 1,
+        }));
+
+        let store = ContentStore::new(object_store, "test-bucket").with_circuit_breaker(Arc::clone(&cb));
+
+        // Successful operation should record success
+        let pack_id = Uuid::new_v4();
+        store.put_pack(pack_id, vec![1, 2, 3]).await.unwrap();
+        store.get_pack(pack_id).await.unwrap();
+
+        // CB should still be closed
+        assert!(matches!(cb.state(), CircuitState::Closed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_not_found_counts_as_success() {
+        use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState, FailurePolicy};
+        use std::time::Duration;
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cb = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_policy: FailurePolicy::Consecutive { threshold: 2 },
+            reset_timeout: Duration::from_secs(1),
+            half_open_permits: 1,
+        }));
+
+        let store = ContentStore::new(object_store, "test-bucket").with_circuit_breaker(Arc::clone(&cb));
+
+        // Getting a missing manifest returns Ok(None), not an error
+        let result = store.get_manifest("nonexistent").await.unwrap();
+        assert!(result.is_none());
+
+        // CB should still be closed (NotFound is not a connectivity failure)
+        assert!(matches!(cb.state(), CircuitState::Closed { .. }));
     }
 
     #[tokio::test]

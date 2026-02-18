@@ -23,6 +23,7 @@ use super::block_map::Blake3Hash;
 pub struct WalEntry {
     pub name: String,
     pub chunk_index: u64,
+    #[allow(dead_code)]
     pub hash: Blake3Hash,
     pub sequence: u64,
 }
@@ -123,6 +124,7 @@ impl Wal {
     }
 
     /// Current logical size of the WAL in bytes.
+    #[cfg(test)]
     pub fn size(&self) -> u64 {
         self.offset
     }
@@ -400,6 +402,64 @@ mod tests {
         assert_eq!(entries[0].chunk_index, 42);
         assert_eq!(entries[0].sequence, 1);
         assert_eq!(entries[0].hash, blake3_128(&[]));
+    }
+
+    #[test]
+    fn test_wal_first_entry_corrupted() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        // Write 3 entries
+        {
+            let mut wal = Wal::open(&wal_path).unwrap();
+            for i in 1..=3u64 {
+                append_test_entry(&mut wal, i, &[i as u8; 64]);
+            }
+            wal.flush_buf().unwrap();
+        }
+
+        // Corrupt the CRC of entry 1 (the very first entry)
+        {
+            // Entry 1: name_len(2) + "test-export"(11) + chunk_index(8) + hash(16) + seq(8) + crc(4) = 49
+            let entry_1_end = 2 + 11 + 8 + 16 + 8 + 4;
+            let crc_offset = entry_1_end - 4;
+            let mut file = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+            file.seek(SeekFrom::Start(crc_offset as u64)).unwrap();
+            let mut crc_bytes = [0u8; 4];
+            file.read_exact(&mut crc_bytes).unwrap();
+            crc_bytes[0] ^= 0xFF; // flip bits
+            file.seek(SeekFrom::Start(crc_offset as u64)).unwrap();
+            file.write_all(&crc_bytes).unwrap();
+            file.flush().unwrap();
+        }
+
+        // Replay should recover zero entries — corruption at entry 0 means everything is lost
+        let entries = Wal::replay(&wal_path, 0).unwrap();
+        assert_eq!(entries.len(), 0, "corrupted first entry should yield zero recovered entries");
+    }
+
+    #[test]
+    fn test_wal_all_entries_corrupted() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("test.wal");
+
+        {
+            let mut wal = Wal::open(&wal_path).unwrap();
+            for i in 1..=3u64 {
+                append_test_entry(&mut wal, i, &[i as u8; 64]);
+            }
+            wal.flush_buf().unwrap();
+        }
+
+        // Overwrite entire file with garbage
+        {
+            let len = std::fs::metadata(&wal_path).unwrap().len() as usize;
+            let garbage = vec![0xDE; len];
+            std::fs::write(&wal_path, &garbage).unwrap();
+        }
+
+        let entries = Wal::replay(&wal_path, 0).unwrap();
+        assert!(entries.is_empty(), "fully corrupted WAL should yield empty replay");
     }
 
     #[test]

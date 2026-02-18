@@ -76,6 +76,7 @@ struct Results {
     deduped_compressed_bytes: usize,
 }
 
+#[allow(dead_code)]
 struct ImageStats {
     name: String,
     total: usize,
@@ -209,6 +210,7 @@ fn cross_image_sets(
 // Block map compression analysis
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 struct BlockMapStats {
     image_name: String,
     image_size: u64,
@@ -298,6 +300,7 @@ fn measure_block_maps(images: &[PathBuf], block_size: usize) -> Vec<BlockMapStat
 }
 
 // Measure post-fork overlay: blocks that differ between base and forked images
+#[allow(dead_code)]
 struct ForkOverlayStats {
     fork_name: String,
     block_size: usize,

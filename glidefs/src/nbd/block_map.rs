@@ -121,12 +121,14 @@ impl BlockMapEntry {
     }
 
     /// Mark this block as dirty (unflushed).
+    #[cfg(test)]
     #[inline]
     pub fn set_dirty(&mut self) {
         self.flags |= Self::FLAG_DIRTY;
     }
 
     /// Clear the dirty flag (block has been flushed to S3).
+    #[cfg(test)]
     #[inline]
     pub fn clear_dirty(&mut self) {
         self.flags &= !Self::FLAG_DIRTY;
@@ -177,6 +179,7 @@ pub struct AtomicBlockMap {
 
 impl AtomicBlockMap {
     /// Allocate a new block map with all entries zeroed.
+    #[cfg(test)]
     pub fn new(device_size: u64, chunk_size: u32) -> Self {
         let num_chunks = device_size.div_ceil(chunk_size as u64) as usize;
         let versions = (0..num_chunks)
@@ -207,12 +210,14 @@ impl AtomicBlockMap {
     }
 
     /// Number of chunk slots.
+    #[cfg(test)]
     #[inline]
     pub fn len(&self) -> usize {
         self.num_chunks
     }
 
     /// Returns true if there are no chunk slots.
+    #[cfg(test)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.num_chunks == 0
@@ -356,6 +361,7 @@ impl BlockMap {
     }
 
     /// Returns true if there are no chunk slots.
+    #[cfg(test)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -643,6 +649,7 @@ impl ForkedBlockMap {
     }
 
     /// Number of entries in the overlay.
+    #[cfg(test)]
     #[inline]
     pub fn overlay_len(&self) -> usize {
         self.overlay.len()
@@ -687,12 +694,14 @@ impl ForkedBlockMap {
     }
 
     /// Total number of chunk slots (same as parent).
+    #[cfg(test)]
     #[inline]
     pub fn len(&self) -> usize {
         self.num_chunks
     }
 
     /// Returns true if there are no chunk slots.
+    #[cfg(test)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.num_chunks == 0
@@ -738,6 +747,7 @@ impl BlockMapKind {
     }
 
     /// Number of chunk slots.
+    #[cfg(test)]
     #[inline]
     pub fn len(&self) -> usize {
         match self {
@@ -747,6 +757,7 @@ impl BlockMapKind {
     }
 
     /// Returns true if there are no chunk slots.
+    #[cfg(test)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0

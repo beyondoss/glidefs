@@ -10,8 +10,10 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(any(test, feature = "test-utils"))]
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+#[cfg(any(test, feature = "test-utils"))]
 use parking_lot::Mutex;
 
 use super::block_map::Blake3Hash;
@@ -105,6 +107,7 @@ impl BlockCache for FoyerBlockCache {
 // SimpleBlockCache — test-only in-memory cache
 // ============================================================================
 
+#[cfg(any(test, feature = "test-utils"))]
 /// Bounded in-memory block cache backed by a HashMap.
 ///
 /// FIFO eviction, Mutex-based. Used in tests that don't need foyer's
@@ -114,6 +117,7 @@ pub struct SimpleBlockCache {
     max_bytes: usize,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 struct SimpleCacheInner {
     map: HashMap<Blake3Hash, Bytes>,
     /// Insertion-order keys for FIFO eviction.
@@ -121,6 +125,7 @@ struct SimpleCacheInner {
     current_bytes: usize,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl SimpleBlockCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
@@ -134,6 +139,7 @@ impl SimpleBlockCache {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait]
 impl BlockCache for SimpleBlockCache {
     async fn get(&self, hash: &Blake3Hash) -> Option<Bytes> {

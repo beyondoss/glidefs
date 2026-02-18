@@ -14,10 +14,10 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 **What this enables:**
 
-- **Auto-checkpoint**: Agent watches /repo, triggers checkpoints on change. No git add, no git commit. Invisible save points.
+- **Auto-checkpoint**: Agent watches /app, triggers checkpoints on change. No git add, no git commit. Invisible save points.
 - **File-level diff**: Compare two checkpoints, see exactly which files changed and what changed in each one.
 - **Stacked merge**: Promote a checkpoint to production without overwriting concurrent changes.
-- **Selective restore**: Replace /repo from a checkpoint without touching the rest of the filesystem (OS, runtime, caches stay warm).
+- **Selective restore**: Replace /app from a checkpoint without touching the rest of the filesystem (OS, runtime, caches stay warm).
 - **Branching**: Fork a VM (Glide v2), keep working independently, diff branches against their common ancestor.
 
 **What this does NOT replace:** Glide v2 handles all block-level operations — snapshot, fork, sleep/wake, S3 portability, cache, compression, migration. This layer adds file-level awareness on top. If the agent isn't running, glidefs works fine — you just don't get file-level diff, merge, or auto-checkpoints.
@@ -38,7 +38,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 **No second storage system.** File blobs live in S3 alongside Glide v2 block data. Same bucket, same tenant isolation, same encryption. One more prefix, not one more system.
 
-**Acceptable storage duplication.** File content in `/repo` exists twice in S3 — once inside Glide v2 block packs (as ext4 blocks), once in the blob store (as individual files). This is the cost of file-level visibility without parsing ext4 from raw blocks. The overhead is small: `/repo` is typically 200MB-2GB out of a 10-20GB block device, so blob duplication adds 2-10% to total storage. With content-addressed dedup across forks, the marginal cost per additional VM is near zero. The alternative — mounting `/repo` via virtio-fs backed by the blob store directly — eliminates duplication but adds filesystem-serving complexity and degrades write performance for I/O-heavy operations (npm install, builds). Not a worthwhile trade.
+**Acceptable storage duplication.** File content in `/app` exists twice in S3 — once inside Glide v2 block packs (as ext4 blocks), once in the blob store (as individual files). This is the cost of file-level visibility without parsing ext4 from raw blocks. The overhead is small: `/app` is typically 200MB-2GB out of a 10-20GB block device, so blob duplication adds 2-10% to total storage. With content-addressed dedup across forks, the marginal cost per additional VM is near zero. The alternative — mounting `/app` via virtio-fs backed by the blob store directly — eliminates duplication but adds filesystem-serving complexity and degrades write performance for I/O-heavy operations (npm install, builds). Not a worthwhile trade.
 
 ---
 
@@ -50,9 +50,9 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 **Agent re-apply requires the agent.** When both sides modify the same file, stacked merge delegates to the AI agent to re-apply its change on the new base. If the agent is unavailable (offline, timed out), the promotion blocks until the agent is ready. Fallback for human developers: show a unified diff for manual resolution. This is the exception — most promotions have no overlapping files and complete without agent involvement.
 
-**No atomic multi-file restore.** Individual files are atomically replaced (write to temp, fsync, rename). But the restore as a whole is not atomic across files. A crash mid-restore leaves /repo in a mixed state. Mitigation: re-trigger restore (idempotent — same inputs, same result). For promotion, the VM isn't serving traffic until build succeeds, so partial state during restore is never user-visible.
+**No atomic multi-file restore.** Individual files are atomically replaced (write to temp, fsync, rename). But the restore as a whole is not atomic across files. A crash mid-restore leaves /app in a mixed state. Mitigation: re-trigger restore (idempotent — same inputs, same result). For promotion, the VM isn't serving traffic until build succeeds, so partial state during restore is never user-visible.
 
-**Flat manifests don't scale past ~500K files.** At ~5-10K source files (typical), manifest comparison is microseconds. At 500K files (large monorepo), it's milliseconds — still fine. If someone has millions of source files in /repo, add Merkle trees then. No one will.
+**Flat manifests don't scale past ~500K files.** At ~5-10K source files (typical), manifest comparison is microseconds. At 500K files (large monorepo), it's milliseconds — still fine. If someone has millions of source files in /app, add Merkle trees then. No one will.
 
 ---
 
@@ -65,8 +65,8 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 │  ┌───────────────────────────┐   ┌──────────────────────────┐│
 │  │  User workload            │   │  glidefs-agent           ││
 │  │  (app, build, AI agent)   │   │                          ││
-│  │                           │   │  • fanotify on /repo     ││
-│  │  reads/writes /repo       │   │  • file walk + hash      ││
+│  │                           │   │  • fanotify on /app     ││
+│  │  reads/writes /app       │   │  • file walk + hash      ││
 │  │  normally                 │   │  • file write (restore)  ││
 │  └───────────────────────────┘   │  • vsock connection      ││
 │           │                      └─────────────┬────────────┘│
@@ -122,7 +122,7 @@ A thin file-level layer on top of Glide v2 that gives Boxes version control sema
 
 ## File Manifest
 
-The manifest is a flat map of every file in the checkpointed directory (default: `/repo`).
+The manifest is a flat map of every file in the checkpointed directory (default: `/app`).
 
 ```json
 {
@@ -142,7 +142,7 @@ The manifest is a flat map of every file in the checkpointed directory (default:
 
 | Field    | Description                                                             |
 | -------- | ----------------------------------------------------------------------- |
-| **path** | Relative to checkpoint root (/repo). Forward slashes, no leading slash. |
+| **path** | Relative to checkpoint root (/app). Forward slashes, no leading slash. |
 | **hash** | BLAKE3-128 of raw file content. 16 bytes, hex-encoded.                  |
 | **size** | File size in bytes.                                                     |
 | **mode** | Permission bits (0777 mask, octal string).                              |
@@ -154,7 +154,7 @@ The manifest is a flat map of every file in the checkpointed directory (default:
 - Extended attributes, ACLs — defer until needed.
 - Empty directories — like git, only track files. A directory exists if it contains files.
 
-**Symlinks:** Recorded as a special entry. The hash is BLAKE3-128 of the symlink target path (not the target's content). Symlinks are never followed during walk — prevents infinite loops and inclusion of content outside /repo. Broken symlinks (target doesn't exist) are recorded normally — the target path is the content, existence doesn't matter. Symlinks pointing outside `/repo` are recorded as-is — the target path is stored verbatim. On restore, the symlink is recreated with the same target. If that target doesn't exist on the new VM, the symlink is broken — same as it would be in git.
+**Symlinks:** Recorded as a special entry. The hash is BLAKE3-128 of the symlink target path (not the target's content). Symlinks are never followed during walk — prevents infinite loops and inclusion of content outside /app. Broken symlinks (target doesn't exist) are recorded normally — the target path is the content, existence doesn't matter. Symlinks pointing outside `/app` are recorded as-is — the target path is stored verbatim. On restore, the symlink is recreated with the same target. If that target doesn't exist on the new VM, the symlink is broken — same as it would be in git.
 
 ### Hash Choice: BLAKE3-128
 
@@ -167,9 +167,9 @@ Same hash as Glide v2 block addressing. 128-bit truncation of BLAKE3.
 
 ### Why Flat (Not a Merkle Tree)
 
-A Merkle tree gives O(changes) diff by skipping shared subtrees. But /repo typically has ~5-10K source files (after `.checkpointignore` excludes deps/build output). Comparing two flat manifests by hash is microseconds. The Merkle tree adds tree objects, recursive hashing, tree deduplication, and tree-aware GC — real implementation complexity — for a performance improvement that doesn't matter at this scale.
+A Merkle tree gives O(changes) diff by skipping shared subtrees. But /app typically has ~5-10K source files (after `.checkpointignore` excludes deps/build output). Comparing two flat manifests by hash is microseconds. The Merkle tree adds tree objects, recursive hashing, tree deduplication, and tree-aware GC — real implementation complexity — for a performance improvement that doesn't matter at this scale.
 
-If /repo grows to millions of files, add Merkle trees then. The manifest format can evolve without changing the agent protocol or the checkpoint model.
+If /app grows to millions of files, add Merkle trees then. The manifest format can evolve without changing the agent protocol or the checkpoint model.
 
 ### Manifest Size
 
@@ -302,7 +302,7 @@ MessagePack for the payload — compact binary, fast to encode/decode, libraries
 | Type | Name             | Payload                                                                | Description                              |
 | ---- | ---------------- | ---------------------------------------------------------------------- | ---------------------------------------- |
 | 0x92 | CHECKPOINT_DONE  | `{ manifest_hash, total_files, new_blobs, elapsed_ms, upload_errors }` | Checkpoint complete (after S3 upload)    |
-| 0x96 | FILE_CHANGED     | `{ }`                                                                  | Notification: something changed in /repo |
+| 0x96 | FILE_CHANGED     | `{ }`                                                                  | Notification: something changed in /app |
 | 0x97 | PONG             | `{ uptime_ms }`                                                        | Health response                          |
 | 0x98 | CHECKPOINT_READY | `{ new_blob_hashes, total_files }`                                     | Files hashed, ready for upload URLs      |
 | 0x99 | WRITE_PLAN_DONE  | `{ written, deleted, errors }`                                         | Write plan execution complete            |
@@ -317,7 +317,7 @@ glidefs (host)            control plane              glidefs-agent (guest)      
      ├────────────────────────────────────────────────────►│                       │
      │                                                     │                       │
      │                                                     │ 1. Load mtime index   │
-     │                                                     │ 2. Walk /repo         │
+     │                                                     │ 2. Walk /app         │
      │                                                     │ 3. Hash changed files │
      │                                                     │                       │
      │       CHECKPOINT_READY { new_blob_hashes, total }   │                       │
@@ -349,7 +349,7 @@ glidefs (host)            control plane              glidefs-agent (guest)      
 glidefs (host)                          glidefs-agent (guest)          S3
      │                                       │                          │
      │  WRITE_PLAN {                         │                          │
-     │    working_dir: "/repo",              │                          │
+     │    working_dir: "/app",              │                          │
      │    downloads: [                       │                          │
      │      { url, path, mode, hash }, ...   │                          │
      │    ],                                 │                          │
@@ -377,7 +377,7 @@ The control plane computes a write plan (what to download, what to delete) and i
 ```
 glidefs-agent (guest)                   glidefs (host)
      │                                       │
-     │ (fanotify: FAN_CLOSE_WRITE in /repo)  │
+     │ (fanotify: FAN_CLOSE_WRITE in /app)  │
      │                                       │
      │  FILE_CHANGED { }                     │
      ├──────────────────────────────────────►│
@@ -410,13 +410,13 @@ Between checkpoints, fanotify `FAN_CLOSE_WRITE` events accumulate a dirty set of
 
 1. For each path in the dirty set: read file, hash it, update index entry
 2. For paths NOT in the dirty set: reuse cached hash from the index (no stat, no read, no hash)
-3. Walk /repo for the full manifest (all paths), but only hash dirty paths
+3. Walk /app for the full manifest (all paths), but only hash dirty paths
 
 **On checkpoint (fallback — full walk):**
 
 Used on first checkpoint or after agent restart (dirty set lost):
 
-1. Walk /repo (respecting .gitignore + .checkpointignore)
+1. Walk /app (respecting .gitignore + .checkpointignore)
 2. For each file, `stat()` to get (mtime, size, inode)
 3. If all three match index entry → reuse cached hash (no read, no hash)
 4. If any differ or entry missing → read file, hash it, update index entry
@@ -437,7 +437,7 @@ File-level checkpoints store what git tracks. The boundary between the two layer
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  All files in /repo                                                  │
+│  All files in /app                                                  │
 │                                                                      │
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │  Checkpointed (stored in manifest + blob store)               │  │
@@ -530,7 +530,7 @@ sequenceDiagram
     Note over GFS: 1. Glide v2 snapshot (instant)<br/>Save point exists NOW.
 
     GFS->>AGT: CHECKPOINT { parent_manifest_hash, working_dir }
-    Note over AGT: Walk /repo with mtime index<br/>Hash changed files only
+    Note over AGT: Walk /app with mtime index<br/>Hash changed files only
 
     AGT-->>GFS: CHECKPOINT_READY { new_blob_hashes, total_files }
 
@@ -641,7 +641,7 @@ Timeline:
   T4: Agent B wants to promote
 
   Without merge:
-    Fork P1 + replace /repo with B's final checkpoint → A's changes are lost.
+    Fork P1 + replace /app with B's final checkpoint → A's changes are lost.
 
   With stacked merge:
     Decompose B's work into individual changesets (one per auto-checkpoint).
@@ -844,7 +844,7 @@ This is the common case for solo developers or sequential promotions. Stacked me
 
 ## Restore
 
-Replacing /repo on a VM with a checkpoint's file state.
+Replacing /app on a VM with a checkpoint's file state.
 
 ### Full Restore (Rollback)
 
@@ -860,9 +860,9 @@ Used when restoring to a completely different checkpoint (e.g., rollback to yest
 
 ### Selective Restore (Promotion)
 
-For promotion: fork production (Glide v2, full block device), then restore /repo from the checkpoint or merge result. OS, runtime, system packages, and caches from production remain untouched.
+For promotion: fork production (Glide v2, full block device), then restore /app from the checkpoint or merge result. OS, runtime, system packages, and caches from production remain untouched.
 
-This is the default behavior — the manifest only covers /repo, so restore naturally only affects /repo.
+This is the default behavior — the manifest only covers /app, so restore naturally only affects /app.
 
 ### Restore vs Block-Level Restore
 
@@ -870,7 +870,7 @@ Both options exist and serve different purposes:
 
 |                    | File-level restore (this doc)    | Block-level restore (Glide v2)  |
 | ------------------ | -------------------------------- | ------------------------------- |
-| **Scope**          | /repo only                       | Entire block device             |
+| **Scope**          | /app only                       | Entire block device             |
 | **Use case**       | Promotion, selective rollback    | Full VM rollback to exact state |
 | **OS/runtime**     | Untouched (from production fork) | Restored to snapshot state      |
 | **Speed**          | Proportional to changed files    | Instant (swap block map)        |
@@ -883,10 +883,10 @@ Both options exist and serve different purposes:
 ### Agent Side (File Watching)
 
 ```
-1. Set up fanotify on /repo filesystem
+1. Set up fanotify on /app filesystem
    Single mark: FAN_CLOSE_WRITE | FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO
    FAN_UNLIMITED_QUEUE — never overflows (requires CAP_SYS_ADMIN, agent has it)
-   Filter events to /repo prefix in userspace, respect .gitignore + .checkpointignore
+   Filter events to /app prefix in userspace, respect .gitignore + .checkpointignore
 
 2. On any event:
    Buffer for 500ms (coalesce rapid edits)
@@ -963,7 +963,7 @@ The agent process dies or becomes unresponsive.
 
 ### Mid-Restore Crash
 
-1. Some files written to /repo, some not → /repo in partial state
+1. Some files written to /app, some not → /app in partial state
 2. Each file write is atomic (temp → fsync → rename), so no individual file is corrupt
 3. Recovery: re-trigger the same restore (idempotent — same manifest, same result)
 4. For promotion: the VM isn't serving traffic until build succeeds, so partial state during restore is never user-visible
@@ -985,7 +985,7 @@ The agent listens on vsock port 10842. vsock is host↔guest only — zero netwo
 
 The agent enforces:
 
-- **Path confinement.** Only reads/writes under the configured checkpoint root (/repo). Requests for paths outside (e.g., `../../etc/shadow`) are rejected. Path traversal is normalized before checking.
+- **Path confinement.** Only reads/writes under the configured checkpoint root (/app). Requests for paths outside (e.g., `../../etc/shadow`) are rejected. Path traversal is normalized before checking.
 - **No shell execution.** The agent reads files, writes files, and walks directories. It never executes commands, interprets arguments as shell, or spawns processes.
 - **S3 via presigned URLs only.** The agent uploads/downloads blobs to/from S3 using presigned URLs provided by the host. No AWS credentials are stored or accessible in the guest. URLs are scoped to specific keys and expire after minutes. The agent cannot list, delete, or access any S3 objects beyond the URLs it receives.
 
@@ -1117,8 +1117,8 @@ A single static binary (`glidefs-agent`) baked into the base image. No runtime d
 
 The agent does:
 
-- Watch /repo for file changes (fanotify)
-- Walk /repo, hash files, build manifest
+- Watch /app for file changes (fanotify)
+- Walk /app, hash files, build manifest
 - Upload blobs + manifest to S3 via presigned PUT URLs (checkpoint)
 - Download blobs from S3 via presigned GET URLs and write files atomically (write plan)
 - Maintain mtime index for incremental hashing
@@ -1147,7 +1147,7 @@ It reads files, hashes files, writes files, and reports changes. The host tells 
 
 ### File Ownership
 
-The agent needs vsock access (typically requires root or a specific group). But files in `/repo` should be owned by the workload user, not root. The agent handles this by:
+The agent needs vsock access (typically requires root or a specific group). But files in `/app` should be owned by the workload user, not root. The agent handles this by:
 
 1. Starting as root (for vsock bind)
 2. Reading a configured `repo_uid`/`repo_gid` (default: 1000/1000 — standard first non-root user)
@@ -1159,7 +1159,7 @@ The manifest records `mode` (permission bits) but not `uid`/`gid`. Ownership is 
 ### Startup
 
 ```
-1. Parse config: checkpoint root (default: /repo), vsock port (default: 10842),
+1. Parse config: checkpoint root (default: /app), vsock port (default: 10842),
    repo_uid (default: 1000), repo_gid (default: 1000)
 2. Load mtime index from /var/lib/glidefs-agent/index.bin (or start fresh)
 3. Set up fanotify mark on filesystem (single mark, filters to checkpoint root)
@@ -1202,7 +1202,7 @@ On SIGTERM:
 Systematic analysis of every operation. Variables:
 
 ```
-F = total_source_files (source files in /repo after .checkpointignore, typical ~5-10K)
+F = total_source_files (source files in /app after .checkpointignore, typical ~5-10K)
 C = changed_files (files changed since last checkpoint, typical ~100)
 M = manifest_entries (= F, one per file)
 B = blobs_to_upload (= C or less, after dedup)
@@ -1227,9 +1227,9 @@ N = checkpoints_in_DAG (per export)
 | **S3 manifest upload**                 | O(1)                 | —                | No          | Single object, ~3MB compressed                          |
 | **DB checkpoint record**               | O(1)                 | —                | No          | One INSERT into checkpoint DAG                          |
 
-**Path cache makes manifest build O(C).** The agent maintains an in-memory path list, updated incrementally by fanotify CREATE/DELETE events. On checkpoint, the agent starts from the cached list rather than walking /repo. Full stat walk only happens on cold start (agent restart or post-restore). This is not an optimization — it's the difference between the most frequent operation being O(C) and O(F).
+**Path cache makes manifest build O(C).** The agent maintains an in-memory path list, updated incrementally by fanotify CREATE/DELETE events. On checkpoint, the agent starts from the cached list rather than walking /app. Full stat walk only happens on cold start (agent restart or post-restore). This is not an optimization — it's the difference between the most frequent operation being O(C) and O(F).
 
-Without the path cache, every checkpoint requires a full stat walk of /repo to enumerate all source file paths for the self-contained manifest. At ~5-10K source files that's fast, but unnecessary. The fanotify watcher is already running; feeding CREATE/DELETE events into a path set is trivial additional work that eliminates the walk entirely for the steady-state case.
+Without the path cache, every checkpoint requires a full stat walk of /app to enumerate all source file paths for the self-contained manifest. At ~5-10K source files that's fast, but unnecessary. The fanotify watcher is already running; feeding CREATE/DELETE events into a path set is trivial additional work that eliminates the walk entirely for the steady-state case.
 
 ### Diff (Control Plane)
 
@@ -1329,7 +1329,7 @@ Blob GC:                O(1) per event with refcounts (same pattern as Glide v2)
 | --------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `git add` + `git commit`    | Auto-checkpoint (invisible)     | No ceremony. Agent doesn't need to understand git. Save points just happen.                                                                                                |
 | `git branch`                | Fork VM (Glide v2)              | A branch is a full running environment, not just a pointer to a commit.                                                                                                    |
-| `git diff`                  | Checkpoint diff (control plane) | Same output, but diffing environments — includes deps, build output, everything in /repo.                                                                                  |
+| `git diff`                  | Checkpoint diff (control plane) | Same output, but diffing environments — includes deps, build output, everything in /app.                                                                                  |
 | `git merge`                 | Stacked merge on promote        | Decomposes work into small changesets (auto-checkpoints), applies file-by-file. Overlapping files resolved by AI agent re-applying intent — no line-level merge artifacts. |
 | `git push` + CI/CD pipeline | Promote checkpoint              | No artifact upload, no CI runner, no separate deploy. The checkpoint IS the deployable.                                                                                    |
 | `git stash`                 | Checkpoint + restore            | Named save points in the DAG, not a fragile stack.                                                                                                                         |
@@ -1343,7 +1343,7 @@ Blob GC:                O(1) per event with refcounts (same pattern as Glide v2)
 
 2. **Checkpoint during active write** — Agent hashes a file while the workload is writing to it. Could read a partially-written file. Mitigation: hash, stat, compare mtime. If mtime changed during hash, re-hash. Unlikely in practice — agent workflows write a file and move on.
 
-3. **Base image file manifests** — Can the bless pipeline (Glide v2) pre-compute file manifests for base images? Would make the first checkpoint of a fresh VM skip hashing base OS files. Useful but not required — base OS files are outside /repo and not checkpointed anyway.
+3. **Base image file manifests** — Can the bless pipeline (Glide v2) pre-compute file manifests for base images? Would make the first checkpoint of a fresh VM skip hashing base OS files. Useful but not required — base OS files are outside /app and not checkpointed anyway.
 
 4. **Diff for binary files** — Currently "binary file changed (size delta)." Could generate image diffs for common formats (PNG, JPG), or show hex diffs, or nothing. This is a frontend concern — the diff engine just reports the hash change.
 

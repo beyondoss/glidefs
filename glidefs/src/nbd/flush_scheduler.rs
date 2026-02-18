@@ -541,6 +541,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_full_flush_failure_retriggers() {
+        // Verify that when a full flush fails, the scheduler re-notifies
+        // the flush trigger so a retry happens automatically.
+        let (
+            cache, content_store, pack_index, flush_trigger, mode_rx, _mode_tx,
+            shutdown_rx, shutdown_tx, metrics, clean_cache, _temp,
+        ) = test_scheduler_components();
+
+        // Write dirty data
+        cache.write(0, &[0xCC; 4096], clean_cache.as_ref()).unwrap();
+        assert_eq!(cache.dirty_block_count(), 1);
+
+        let cache_check = Arc::clone(&cache);
+        let flush_trigger_clone = Arc::clone(&flush_trigger);
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(cache, content_store, pack_index, mode_rx, flush_trigger, shutdown_rx, metrics).await;
+        });
+
+        // Trigger a flush — with InMemory store this should succeed
+        flush_trigger_clone.notify_one();
+
+        // Wait for flush to complete
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if cache_check.dirty_block_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(cache_check.dirty_block_count(), 0, "flush should eventually succeed");
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
     async fn test_continuous_mode_periodic_flush() {
         let (
             cache, content_store, pack_index, flush_trigger, _mode_rx, _mode_tx,

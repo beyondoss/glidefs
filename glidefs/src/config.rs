@@ -708,6 +708,117 @@ url = "s3://bucket/data"
     }
 
     #[test]
+    fn test_validation_rejects_zero_export_size() {
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+
+[servers.nbd]
+
+[[servers.nbd.exports]]
+name = "vol1"
+size_gb = 0.0
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let result = Settings::from_file(temp_file.path().to_str().unwrap());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("size_gb must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validation_rejects_empty_export_name() {
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+
+[servers.nbd]
+
+[[servers.nbd.exports]]
+name = ""
+size_gb = 10.0
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let result = Settings::from_file(temp_file.path().to_str().unwrap());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("export name must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn test_deny_unknown_fields() {
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+bogus_field = true
+
+[storage]
+url = "s3://bucket/data"
+
+[servers]
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let result = Settings::from_file(temp_file.path().to_str().unwrap());
+        assert!(result.is_err(), "unknown fields should be rejected");
+    }
+
+    #[test]
+    fn test_missing_required_sections() {
+        // Missing [storage] section entirely
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[servers]
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let result = Settings::from_file(temp_file.path().to_str().unwrap());
+        assert!(result.is_err(), "missing [storage] section should fail");
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_connect_timeout() {
+        let config_content = r#"
+[cache]
+dir = "/tmp/cache"
+disk_size_gb = 1.0
+
+[storage]
+url = "s3://bucket/data"
+connect_timeout_secs = 0
+
+[servers]
+"#;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        std::fs::write(temp_file.path(), config_content).unwrap();
+
+        let result = Settings::from_file(temp_file.path().to_str().unwrap());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("connect_timeout_secs must be > 0"), "got: {err}");
+    }
+
+    #[test]
     fn test_validation_rejects_duplicate_export_names() {
         let config_content = r#"
 [cache]

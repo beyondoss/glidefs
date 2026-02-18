@@ -239,7 +239,7 @@ sequenceDiagram
 
     Note over CP: 3. Start new VM, restore checkpoint, build
     CP->>DST: create export vm-new
-    Note over DST: Fork has production's warm filesystem.<br/>Restore checkpoint overwrites /repo.<br/>Build runs locally — zero S3 during build.
+    Note over DST: Fork has production's warm filesystem.<br/>Restore checkpoint overwrites /app.<br/>Build runs locally — zero S3 during build.
 
     Note over CP: 4. Build completes → vm-new becomes production
     Note over DST: Enable continuous flush mode.<br/>This VM is now the fork source.

@@ -44,6 +44,7 @@ pub struct PackLocation {
 
 /// A parsed pack header and block index (metadata only, no decompressed data).
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PackIndex {
     pub block_count: u16,
     pub chunk_size: u32,
@@ -378,6 +379,84 @@ mod tests {
             "key must contain the full UUID"
         );
         assert_eq!(key, "packs/a7/a7550e84-00e2-9b41-d4a7-16446655440a");
+    }
+
+    #[test]
+    fn test_parse_invalid_magic() {
+        let data = vec![0u8; 4096];
+        let hash = blake3_128(&data);
+        let compressed = lz4_compress(&data);
+        let (mut pack_bytes, _) = assemble_pack(&[(hash, compressed)], 4096);
+
+        // Corrupt magic bytes
+        pack_bytes[0..4].copy_from_slice(b"NOPE");
+        let err = parse_pack_index(&pack_bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("magic"), "error: {err}");
+    }
+
+    #[test]
+    fn test_parse_unsupported_version() {
+        let data = vec![0u8; 4096];
+        let hash = blake3_128(&data);
+        let compressed = lz4_compress(&data);
+        let (mut pack_bytes, _) = assemble_pack(&[(hash, compressed)], 4096);
+
+        // Set version to 99
+        pack_bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
+        let err = parse_pack_index(&pack_bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("version"), "error: {err}");
+    }
+
+    #[test]
+    fn test_parse_truncated_header() {
+        // Less than PACK_HEADER_SIZE bytes
+        let err = parse_pack_index(&[0u8; 8]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too small for header"), "error: {err}");
+    }
+
+    #[test]
+    fn test_parse_truncated_index() {
+        let data = vec![0u8; 4096];
+        let hash = blake3_128(&data);
+        let compressed = lz4_compress(&data);
+        let (pack_bytes, _) = assemble_pack(&[(hash, compressed)], 4096);
+
+        // Truncate after header but before the full index entry
+        let truncated = &pack_bytes[..PACK_HEADER_SIZE + 10];
+        let err = parse_pack_index(truncated).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too small for index"), "error: {err}");
+    }
+
+    #[test]
+    fn test_extract_block_out_of_bounds() {
+        let data = vec![42u8; 4096];
+        let hash = blake3_128(&data);
+        let compressed = lz4_compress(&data);
+        let (pack_bytes, entries) = assemble_pack(&[(hash, compressed)], 4096);
+
+        // Valid extraction works
+        assert!(extract_block(&pack_bytes, entries[0].offset, entries[0].comp_length).is_some());
+
+        // Offset past end of pack
+        assert!(extract_block(&pack_bytes, pack_bytes.len() as u32, 1).is_none());
+
+        // comp_length extends past end
+        assert!(extract_block(&pack_bytes, entries[0].offset, pack_bytes.len() as u32).is_none());
+
+        // u32 overflow in offset + comp_length
+        assert!(extract_block(&pack_bytes, u32::MAX, 1).is_none());
+    }
+
+    #[test]
+    fn test_decompress_invalid_lz4_data() {
+        // Corrupt LZ4 data should return Err, not panic
+        let garbage = vec![0xFF, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00];
+        let result = lz4_decompress(&garbage);
+        assert!(result.is_err(), "invalid LZ4 data should return Err");
     }
 
     #[test]

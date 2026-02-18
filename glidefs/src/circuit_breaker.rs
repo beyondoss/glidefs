@@ -84,6 +84,7 @@ pub enum FailurePolicy {
     },
     /// N failures within the window opens the circuit.
     /// Failures older than the window are forgotten.
+    #[allow(dead_code)]
     Windowed {
         /// Number of failures within the window before opening.
         threshold: u32,
@@ -129,6 +130,7 @@ impl CircuitBreakerConfig {
     }
 
     /// Create a config with windowed failure detection.
+    #[allow(dead_code)]
     pub fn windowed(threshold: u32, window: Duration) -> Self {
         Self {
             failure_policy: FailurePolicy::Windowed { threshold, window },
@@ -500,6 +502,7 @@ impl CircuitBreaker {
     }
 
     /// Reset the circuit breaker to closed state.
+    #[allow(dead_code)]
     pub fn reset(&self) {
         self.window_start.store(0, Ordering::Release);
         let packed = Self::pack(STATE_CLOSED, 0, 0, self.now_secs());

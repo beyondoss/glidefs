@@ -19,6 +19,7 @@ pub struct BatchData {
     /// The batch contents (exactly `batch_size` bytes)
     pub data: Vec<u8>,
     /// ETag from S3 for conditional PUT (None if batch was newly created)
+    #[allow(dead_code)]
     pub etag: Option<String>,
 }
 
@@ -110,6 +111,7 @@ impl S3BlockStore {
     }
 
     /// Get the number of blocks per batch.
+    #[allow(dead_code)]
     #[inline]
     pub fn blocks_per_batch(&self) -> u64 {
         self.blocks_per_batch
@@ -244,6 +246,7 @@ impl S3BlockStore {
     ///
     /// Returns `Err(ObjectStore(Precondition))` on ETag mismatch.
     /// Returns `Err(ObjectStore(AlreadyExists))` if batch was created by another writer.
+    #[allow(dead_code)]
     #[instrument(skip(self, data), fields(batch = batch_num, size = data.len(), etag = ?etag))]
     pub async fn put_batch_conditional(
         &self,

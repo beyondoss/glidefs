@@ -782,4 +782,161 @@ mod tests {
         let resp = request(&router, Method::GET, "/metrics", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    // =========================================================================
+    // Drain / Promote / Snapshot / Flush-mode endpoint tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_drain_export_success() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/drain",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_promote_export_success() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        // Create a readonly export
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "readonly": true}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/promote",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_promote_nonexistent_export_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/nope/promote",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_export_success() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/snapshot",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_nonexistent_export_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/nope/snapshot",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_flush_mode_set_success() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/flush-mode",
+            Some(r#"{"mode":"continuous","pack_interval_secs":10,"manifest_interval_secs":60}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_flush_mode_nonexistent_export_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/nope/flush-mode",
+            Some(r#"{"mode":"demand_driven"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_flush_mode_invalid_json_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/flush-mode",
+            Some("not json"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }

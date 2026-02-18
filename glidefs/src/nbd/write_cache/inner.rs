@@ -228,6 +228,7 @@ pub(crate) struct CacheInner {
 
 impl CacheInner {
     /// Check if block is present (lock-free read).
+    #[allow(dead_code)]
     #[inline]
     pub(super) fn is_present(&self, block_num: usize) -> bool {
         if block_num >= self.num_blocks {
@@ -374,6 +375,16 @@ impl CacheInner {
 
         // Atomic rename (POSIX guarantees this is atomic)
         std::fs::rename(&tmp_path, &path)?;
+
+        // Persist the v2 block map (content hashes) alongside metadata.
+        // This ensures clean blocks (flushed to S3, WAL truncated) retain
+        // their hash-to-chunk mapping across daemon restarts.
+        let block_map_path = self.config.block_map_path();
+        let bm_snapshot = self.block_map_snapshot();
+        if let Err(e) = bm_snapshot.persist_to_file(&block_map_path) {
+            warn!(error = %e, "failed to persist block map");
+            return Err(CacheError::Io(e));
+        }
 
         let present_count = self.count_present();
         debug!(

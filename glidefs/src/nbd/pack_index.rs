@@ -41,6 +41,7 @@ impl HostPackIndex {
         self.index.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
     }

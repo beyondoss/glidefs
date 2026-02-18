@@ -87,6 +87,7 @@ impl PackRegistry {
         self.pack_ids.retain(|id| !to_remove.contains(id));
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn pack_id_set(&self) -> HashSet<Uuid> {
         self.pack_ids.iter().copied().collect()
     }

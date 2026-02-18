@@ -250,6 +250,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_scrubber_shutdown_during_inter_pass_sleep() {
+        let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index = Arc::new(HostPackIndex::new());
+
+        // Insert a single valid block so the scrubber completes one pass quickly
+        let data = Bytes::from(vec![0xCC; 4096]);
+        let hash = blake3_128(&data);
+        cache.insert(hash, data);
+        pack_index.insert(
+            hash,
+            PackLocation {
+                pack_id: Uuid::new_v4(),
+                offset: 0,
+                comp_length: 100,
+            },
+        );
+
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+        let metrics = Arc::new(ScrubberMetrics::new());
+        let metrics_clone = Arc::clone(&metrics);
+
+        let handle = tokio::spawn(async move {
+            scrubber(
+                cache,
+                pack_index,
+                ScrubberConfig {
+                    blocks_per_second: 100_000, // Very fast — completes pass quickly
+                },
+                metrics_clone,
+                shutdown_clone,
+            )
+            .await;
+        });
+
+        // Wait for at least one pass to complete (scrubber should enter 60s sleep)
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if metrics.blocks_checked.load(Ordering::Relaxed) >= 1 {
+                break;
+            }
+        }
+        assert!(
+            metrics.blocks_checked.load(Ordering::Relaxed) >= 1,
+            "scrubber should have completed at least one pass"
+        );
+
+        // Cancel during the 60s inter-pass sleep — should exit promptly
+        shutdown.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            result.is_ok(),
+            "scrubber should exit promptly when cancelled during inter-pass sleep"
+        );
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn test_scrubber_disabled_when_zero() {
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         let pack_index = Arc::new(HostPackIndex::new());

@@ -1810,6 +1810,31 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_export_name() {
+        // Valid names
+        assert!(validate_export_name("vol1").is_ok());
+        assert!(validate_export_name("my-export.v2").is_ok());
+        assert!(validate_export_name("a").is_ok());
+        assert!(validate_export_name("vm_ubuntu-22.04").is_ok());
+        assert!(validate_export_name(&"a".repeat(128)).is_ok());
+
+        // Empty / too long
+        assert!(validate_export_name("").is_err());
+        assert!(validate_export_name(&"a".repeat(129)).is_err());
+
+        // Must start with alphanumeric
+        assert!(validate_export_name("-leading-hyphen").is_err());
+        assert!(validate_export_name(".leading-dot").is_err());
+        assert!(validate_export_name("_leading-underscore").is_err());
+
+        // Path traversal / invalid characters
+        assert!(validate_export_name("../etc/passwd").is_err());
+        assert!(validate_export_name("foo/bar").is_err());
+        assert!(validate_export_name("foo bar").is_err());
+        assert!(validate_export_name("name\0null").is_err());
+    }
+
+    #[test]
     fn test_extract_export_name() {
         // Valid paths
         assert_eq!(

@@ -273,6 +273,7 @@ impl ExportMetrics {
     }
 
     /// Record S3 fetch latency (sampled to reduce mutex contention).
+    #[allow(dead_code)]
     #[inline]
     pub fn record_s3_fetch_latency(&self, duration: Duration) {
         if self.should_sample() {
@@ -281,6 +282,7 @@ impl ExportMetrics {
     }
 
     /// Record local file read latency (sampled to reduce mutex contention).
+    #[allow(dead_code)]
     #[inline]
     pub fn record_file_read_latency(&self, duration: Duration) {
         if self.should_sample() {
@@ -326,6 +328,7 @@ impl ExportMetrics {
     }
 
     /// Record an S3 read operation.
+    #[allow(dead_code)]
     #[inline]
     pub fn record_s3_read(&self, bytes: u64) {
         self.s3_bytes_read.fetch_add(bytes, Ordering::Relaxed);
@@ -333,18 +336,21 @@ impl ExportMetrics {
     }
 
     /// Record a cache hit.
+    #[allow(dead_code)]
     #[inline]
     pub fn record_cache_hit(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a cache miss.
+    #[allow(dead_code)]
     #[inline]
     pub fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a failed S3 PUT operation.
+    #[allow(dead_code)]
     #[inline]
     pub fn record_s3_put_error(&self) {
         self.s3_put_errors.fetch_add(1, Ordering::Relaxed);

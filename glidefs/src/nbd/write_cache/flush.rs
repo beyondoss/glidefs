@@ -51,6 +51,7 @@ impl WriteCache<Active> {
     }
 
     /// Save metadata to disk.
+    #[allow(dead_code)]
     pub fn save_metadata(&self) -> Result<(), CacheError> {
         self.inner.save_metadata()
     }

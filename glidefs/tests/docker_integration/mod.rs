@@ -18,6 +18,7 @@ mod fork_roundtrip;
 mod data_integrity;
 mod concurrent;
 mod resize;
+mod range_reads;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

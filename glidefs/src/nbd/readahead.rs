@@ -139,6 +139,51 @@ mod tests {
     }
 
     #[test]
+    fn test_ring_buffer_wraparound() {
+        let mut det = SequentialDetector::new();
+
+        // Fill the ring buffer completely (4 entries) then keep going
+        // to exercise the wraparound from pos=3 -> pos=0
+        assert_eq!(det.record(10), None);
+        assert_eq!(det.record(11), None);
+        assert!(det.record(12).is_some()); // sequential detected, pos=3
+        // Next record wraps pos to 0
+        let result = det.record(13); // ring: [13, 11, 12, 12] -> last 3: [11, 12, 13]
+        // Still sequential but same pack target, so dedup suppresses
+        // (13/25 = pack 0, same as 12/25 = pack 0, so next_pack_start is 25 for both)
+        // Already triggered for pack start 25, so None
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_initial_state_no_false_triggers() {
+        let mut det = SequentialDetector::new();
+
+        // Record only 1 entry — ring has mostly u64::MAX, should never trigger
+        assert_eq!(det.record(0), None);
+
+        // A fresh detector with no entries should never trigger
+        let det2 = SequentialDetector::new();
+        assert_eq!(det2.len, 0);
+    }
+
+    #[test]
+    fn test_large_chunk_indices() {
+        let mut det = SequentialDetector::new();
+
+        // Test with large chunk indices near pack boundaries
+        let base = BLOCKS_PER_PACK as u64 * 1000; // pack 1000
+        assert_eq!(det.record(base), None);
+        assert_eq!(det.record(base + 1), None);
+        let result = det.record(base + 2);
+        assert!(result.is_some(), "should trigger at high chunk indices");
+
+        let target = result.unwrap();
+        let expected_next_pack = ((base + 2) / BLOCKS_PER_PACK as u64 + 1) * BLOCKS_PER_PACK as u64;
+        assert_eq!(target, expected_next_pack);
+    }
+
+    #[test]
     fn test_reset_on_non_sequential() {
         let mut det = SequentialDetector::new();
 
