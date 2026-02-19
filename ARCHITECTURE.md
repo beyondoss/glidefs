@@ -88,8 +88,8 @@ Assemble packs (up to 100 blocks × 128KB = ~12.8MB, async)
               ▼
         CAS-clear Dirty flags (only if sequence unchanged since snapshot)
 
-Manifest sync is NOT done here — handled on-demand by drain/snapshot.
-Packs uploaded here are discoverable only after a manifest sync.
+Manifest sync (delta or full) after successful pack upload.
+Ensures flushed packs are discoverable on cross-host recovery.
 ```
 
 ### Delta Manifests
@@ -810,9 +810,9 @@ Supported storage backends: **Amazon S3** (`s3://`), **Google Cloud Storage** (`
 
 One unified policy for all exports — no modes, no configuration:
 
-- **Pack-size trigger**: When an export accumulates `BLOCKS_PER_PACK` (100) dirty blocks, the write path notifies the flush scheduler via `tokio::sync::Notify`. The scheduler wakes, flushes dirty blocks as content-addressed packs to S3, and checkpoints. Event-driven, not polled.
+- **Pack-size trigger**: When an export accumulates `BLOCKS_PER_PACK` (100) dirty blocks, the write path notifies the flush scheduler via `tokio::sync::Notify`. The scheduler wakes, flushes dirty blocks as content-addressed packs to S3, syncs the manifest (delta or full), and checkpoints. Event-driven, not polled.
 - **Local checkpoint** (5s): Periodic WAL truncation + block state persistence. No S3 involvement.
-- **Manifest sync**: NOT done by the scheduler. Manifests are synced only on drain/snapshot (orchestrator-triggered). Packs uploaded by the scheduler are discoverable only after a manifest sync. Orphaned packs after crash are cleaned by GC.
+- **Manifest sync**: After every successful pack upload, the scheduler syncs the manifest so flushed packs are immediately discoverable on cross-host recovery (host death without drain). Uses delta manifests when possible to minimize S3 bandwidth.
 
 The dirty block counter only increments on `Clean→Dirty` transitions, so rewriting the same block 100 times counts as 1 dirty block — natural write coalescing.
 
@@ -869,13 +869,13 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 | Process crash mid-S3-sync | Orphaned packs in S3 | Harmless: packs are immutable, GC can clean up unreferenced packs |
 | S3 sustained outage | Circuit breaker opens | Reads from local SSD continue; writes accumulate locally; breaker probes S3 every 30s |
 | Local SSD full | `ENOSPC` to guest (NBD_ENOSPC, not EIO) | Write handler rejects new-block writes at >95% SSD utilization; capacity monitor pressure-flushes dirtiest exports to S3, freeing physical space. Overwrites to already-present blocks are still allowed. |
-| SSD failure after flush | **Data loss for CLEAN blocks without pack index entries** | Blocks in CLEAN state have known hashes in the block map. If the pack index (redb on SSD) is also lost, the hash→pack location mapping is gone — no fallback to S3. Recreate VM from base image or last manifest. **Mitigation**: pack index entries for previously-flushed blocks persist in redb across restarts, so the risk window is limited to entries not yet committed. For forked exports, all entries are populated on fork creation. |
+| SSD failure | Same as host death — writes since last manifest sync are lost | Recreate from last S3 manifest; `rebuild()` repopulates pack index from manifest's pack index section. Packs from un-synced flushes are orphaned (GC cleans up after grace period). |
 
 ## Testing
 
 | Suite | Command | Count | What It Covers |
 |-------|---------|-------|----------------|
 | Unit | `cargo test --features test-utils --lib` | ~327 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables, CRC32 integrity, delta manifest serde |
-| Integration | `cargo test --features test-utils --test integration` | ~54 | Crash recovery, concurrent writes, flush consistency, delta manifests (no Docker) |
+| Integration | `cargo test --features test-utils --test integration` | ~55 | Crash recovery, concurrent writes, flush consistency, delta manifests (no Docker) |
 | Docker | `cargo test --features docker-tests --test docker_integration` | ~20 | Real S3 via MinIO (testcontainers-rs), end-to-end pack upload/download |
 | Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free algorithms (AtomicBlockMap, SeqLock) |

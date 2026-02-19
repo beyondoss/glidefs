@@ -4,13 +4,14 @@
 //! 1. Data written on Node A is readable from Node B via S3
 //! 2. Unwritten blocks return zeros (sparse VM support)
 //! 3. Cache metrics correctly track S3 fetches
+//! 4. Pack flush (without drain) syncs manifest for cross-host recovery
 //!
 //! Run with: `cargo test --features test-utils --test integration`
 
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use super::{create_v2_cold_reader, create_v2_test_cache};
+use super::{create_v2_cold_reader, create_v2_test_cache, BLOCK_SIZE};
 
 /// Test: Data written on Node A is readable from Node B after flush to S3.
 ///
@@ -238,5 +239,78 @@ async fn test_batch_prefetch_optimization() {
 
     // No S3 errors should have occurred
     let snapshot = reader_metrics.snapshot();
+    assert_eq!(snapshot.s3_get_errors, 0, "Should have no S3 errors");
+}
+
+/// Test: Cross-host recovery works after pack flush without explicit drain.
+///
+/// Simulates host death: Node A writes data, the flush scheduler uploads packs
+/// and syncs the manifest (via flush_packs + sync_manifest), but drain is never
+/// called. Node B cold-wakes from the S3 manifest and reads the data.
+///
+/// This proves the flush scheduler's manifest sync closes the durability gap
+/// for unplanned host death.
+#[tokio::test]
+async fn test_recovery_after_pack_flush_without_drain() {
+    let s3: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+
+    // === NODE A: Write data, flush packs + sync manifest (no drain) ===
+    let node_a_dir = TempDir::new().unwrap();
+    let (cache_a, content_store_a, pack_index_a, clean_cache_a, _metrics_a) =
+        create_v2_test_cache(&node_a_dir, "vol1", Arc::clone(&s3));
+
+    // Write 3 blocks with distinct patterns
+    let block_0_data: Vec<u8> = vec![0xAA; BLOCK_SIZE];
+    let block_1_data: Vec<u8> = vec![0xBB; BLOCK_SIZE];
+    let block_2_data: Vec<u8> = vec![0xCC; BLOCK_SIZE];
+
+    cache_a.write(0, &block_0_data, clean_cache_a.as_ref()).unwrap();
+    cache_a.write(BLOCK_SIZE as u64, &block_1_data, clean_cache_a.as_ref()).unwrap();
+    cache_a.write(2 * BLOCK_SIZE as u64, &block_2_data, clean_cache_a.as_ref()).unwrap();
+
+    // Simulate what the flush scheduler does: flush_packs + sync_manifest.
+    // Critically, we do NOT call flush_to_s3 or drain — this is what happens
+    // when the host dies after the scheduler fires but before drain.
+    let (stats, seq_cutpoint) = cache_a
+        .flush_packs(&content_store_a, &pack_index_a)
+        .await
+        .unwrap();
+    assert!(stats.packs_uploaded > 0, "should have uploaded packs");
+
+    // sync_manifest: this is the fix — without it, cold wake would lose data
+    cache_a
+        .sync_manifest(&content_store_a, &pack_index_a, seq_cutpoint)
+        .await
+        .unwrap();
+
+    // Simulate host death — drop everything, only S3 survives
+    drop(cache_a);
+    drop(node_a_dir);
+
+    // === NODE B: Cold wake from S3 manifest (different host, empty cache) ===
+    let node_b_dir = TempDir::new().unwrap();
+    let (cache_b, content_store_b, pack_index_b, clean_cache_b, metrics_b) =
+        create_v2_cold_reader(&node_b_dir, "vol1", Arc::clone(&s3)).await;
+
+    // Read all 3 blocks — should succeed via S3 read-through
+    let read_0 = cache_b
+        .read_v2(0, BLOCK_SIZE, clean_cache_b.as_ref(), &pack_index_b, &content_store_b, &metrics_b)
+        .await
+        .unwrap();
+    let read_1 = cache_b
+        .read_v2(BLOCK_SIZE as u64, BLOCK_SIZE, clean_cache_b.as_ref(), &pack_index_b, &content_store_b, &metrics_b)
+        .await
+        .unwrap();
+    let read_2 = cache_b
+        .read_v2(2 * BLOCK_SIZE as u64, BLOCK_SIZE, clean_cache_b.as_ref(), &pack_index_b, &content_store_b, &metrics_b)
+        .await
+        .unwrap();
+
+    assert_eq!(read_0.as_ref(), &block_0_data[..], "Block 0 data mismatch after cross-host recovery");
+    assert_eq!(read_1.as_ref(), &block_1_data[..], "Block 1 data mismatch after cross-host recovery");
+    assert_eq!(read_2.as_ref(), &block_2_data[..], "Block 2 data mismatch after cross-host recovery");
+
+    let snapshot = metrics_b.snapshot();
     assert_eq!(snapshot.s3_get_errors, 0, "Should have no S3 errors");
 }

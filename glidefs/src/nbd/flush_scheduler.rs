@@ -2,13 +2,12 @@
 //!
 //! Each export runs one scheduler that handles two concerns:
 //! - **Pack-size flush** (event-driven): when dirty blocks reach BLOCKS_PER_PACK,
-//!   the write path notifies the scheduler to flush packs to S3.
+//!   the write path notifies the scheduler to flush packs + sync manifest to S3.
 //! - **Local checkpoint** (periodic, 5s): persists block states and truncates the
 //!   WAL. No S3 involvement.
 //!
-//! Manifest sync is NOT done here — it's handled on-demand by drain/snapshot
-//! (orchestrator-triggered). Packs uploaded here are discoverable only after
-//! a manifest sync.
+//! Manifest sync happens after every successful pack upload so that flushed packs
+//! are immediately discoverable on cross-host recovery (host death without drain).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,7 +59,7 @@ pub async fn flush_scheduler(
             () = flush_notify.notified() => {
                 let start = Instant::now();
                 match cache.flush_packs(&content_store, &pack_index).await {
-                    Ok((stats, _)) => {
+                    Ok((stats, seq_cutpoint)) => {
                         metrics.record_s3_put_latency(start.elapsed());
                         metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
                         if stats.packs_uploaded > 0 {
@@ -70,6 +69,11 @@ pub async fn flush_scheduler(
                                 bytes = stats.bytes_uploaded,
                                 "pack-size flush"
                             );
+                            // Sync manifest so flushed packs are discoverable
+                            // on cross-host recovery (host death without drain).
+                            if let Err(e) = cache.sync_manifest(&content_store, &pack_index, seq_cutpoint).await {
+                                warn!(error = %e, "manifest sync after flush failed");
+                            }
                         }
                         // Checkpoint after flush to persist clean block states.
                         if let Err(e) = cache.local_checkpoint() {
