@@ -1,7 +1,7 @@
 # Pack Size Analysis
 
-**Date**: 2026-02-18
-**Current value**: `BLOCKS_PER_PACK = 25` (in `glidefs/src/nbd/pack.rs`)
+**Date**: 2026-02-19
+**Current value**: `BLOCKS_PER_PACK = 100` (in `glidefs/src/nbd/pack.rs`)
 **Block size**: 128KB (fixed; see `BLOCK_SIZE_ANALYSIS.md`)
 
 ## Method
@@ -26,13 +26,8 @@ the same machine at release optimization level.
 LZ4 compression ratio on real filesystem blocks: **1.93x** (128KB raw -> ~66KB
 compressed, averaged across all 15,872 blocks).
 
-This is consistent across all pack sizes — compression operates per-block, so
-pack size doesn't change the ratio. The 100-block sample showed 8.17x, which
-reflects the mix of highly compressible zero-heavy blocks in the sample; the
-full-corpus average of 1.93x is the correct number.
-
-Index overhead (pack header + 24-byte entries per block) is negligible at all
-sizes: 0.04% of pack size.
+Consistent across all pack sizes — compression operates per-block. Index
+overhead (pack header + 24-byte entries per block) is negligible: 0.04%.
 
 ## Pack Size vs Compressed Size
 
@@ -41,57 +36,46 @@ sizes: 0.04% of pack size.
 | 10 | 1.2MB | 665KB | 15KB | 1.3MB | 1.93x |
 | 25 | 3.1MB | 1.6MB | 64KB | 3.1MB | 1.93x |
 | 50 | 6.2MB | 3.2MB | 170KB | 6.3MB | 1.93x |
-| 100 | 12.5MB | 6.5MB | 853KB | 12.5MB | 1.93x |
+| **100** | **12.5MB** | **6.5MB** | **853KB** | **12.5MB** | **1.93x** |
 | 200 | 25.0MB | 12.9MB | 3.9MB | 24.2MB | 1.93x |
 | 500 | 62.5MB | 31.9MB | 16.1MB | 53.2MB | 1.96x |
 | 1000 | 125.0MB | 63.2MB | 46.5MB | 87.0MB | 1.98x |
-
-Variance in compressed size grows with pack size because larger packs are more
-likely to land on a run of highly compressible (or incompressible) blocks. The
-min/max spread at 1000 blocks (46.5-87.0MB) reflects real content variation, not
-measurement noise.
 
 ## Assembly Timings (hash + LZ4 compress + pack wire format)
 
 | Blocks/Pack | Total Assembly | Per-Block |
 |-------------|---------------|-----------|
-| 10 | 2.8ms | 280us |
-| 25 | 6.0ms | 238us |
-| 50 | 21.3ms | 426us |
-| 100 | 29.3ms | 293us |
-| 200 | 62.6ms | 313us |
-| 500 | 144.7ms | 290us |
-| 1000 | 277.8ms | 278us |
+| 10 | 1.0ms | 101us |
+| 25 | 3.0ms | 119us |
+| 50 | 10.9ms | 219us |
+| **100** | **23.6ms** | **236us** |
+| 200 | 47.8ms | 239us |
+| 500 | 107.9ms | 216us |
+| 1000 | 209.6ms | 210us |
 
-Per-block assembly cost is roughly flat at **~280-300us/block** (blake3 hash +
-LZ4 compress dominates). The 50-block outlier (426us) is likely a cache
-interaction; the trend is linear. Pack size does not affect per-block compute
-cost.
-
-This means **assembly time scales linearly with pack size**. A 100-block pack
-takes ~29ms to assemble; a 1000-block pack takes ~278ms. This is relevant for
-flush latency: larger packs mean fewer but slower pack uploads per flush cycle.
+Per-block assembly cost stabilizes around **~210-240us/block** at 100+
+(blake3 hash + LZ4 compress dominates). Assembly time scales linearly.
 
 ## Prefetch Timings (parse index + extract + LZ4 decompress all blocks)
 
 | Blocks/Pack | Full Prefetch | Per-Block | Single Extract |
 |-------------|--------------|-----------|----------------|
-| 10 | 0.9ms | 88us | 27us |
-| 25 | 1.6ms | 63us | 30us |
-| 50 | 4.3ms | 87us | 121us |
-| 100 | 5.3ms | 53us | 37us |
-| 200 | 10.2ms | 51us | 88us |
-| 500 | 27.3ms | 55us | 45us |
-| 1000 | 60.2ms | 60us | 58us |
+| 10 | 0.3ms | 34us | 20us |
+| 25 | 1.0ms | 39us | 18us |
+| 50 | 2.2ms | 44us | 46us |
+| **100** | **4.4ms** | **44us** | **29us** |
+| 200 | 8.6ms | 43us | 35us |
+| 500 | 21.3ms | 43us | 36us |
+| 1000 | 42.9ms | 43us | 38us |
 
-Full-pack prefetch (`resolve_pack` path) decompresses all sibling blocks into
-the clean cache. Per-block cost stabilizes around **~55us/block** at 100+ blocks.
-Single-block extract (`resolve_chunk` range-read path) is ~30-90us regardless
-of pack size — it's just a slice + LZ4 decompress of one block.
+Full-pack prefetch (`resolve_pack`) decompresses all sibling blocks into
+the clean cache. Per-block cost stabilizes at **~43us/block** above 100.
+Single-block extract (`resolve_chunk` range-read) is ~20-40us regardless
+of pack size — one slice + LZ4 decompress.
 
 ## S3 Transfer Model
 
-Using conservative same-region estimates: 20ms fixed latency + 100 MB/s per
+Conservative same-region estimates: 20ms fixed latency + 100 MB/s per
 connection.
 
 | Blocks/Pack | Avg Pack Size | S3 Transfer | S3 GET Total | Amortized/Block |
@@ -104,133 +88,176 @@ connection.
 | 500 | 31.9MB | 319.0ms | 339.0ms | 0.68ms |
 | 1000 | 63.2MB | 631.7ms | 651.7ms | 0.65ms |
 
-The amortized S3 cost per block follows a **1/N curve with a fixed offset**.
+The amortized S3 cost per block follows a 1/N curve with a fixed offset.
 The knee is around 100 blocks:
 
-- 25 -> 100 blocks: saves 0.60ms/block (**41% reduction**)
-- 100 -> 200 blocks: saves 0.10ms/block (12% reduction)
-- 200 -> 1000 blocks: saves 0.10ms/block (13% reduction)
+- 25 -> 100: saves 0.60ms/block (41% reduction)
+- 100 -> 200: saves 0.10ms/block (12%)
+- 200 -> 1000: saves 0.10ms/block (13%)
 
-Beyond 100 blocks, you're deep into diminishing returns on amortized GET cost.
+Beyond 100, diminishing returns on amortized GET cost.
 
 ## Cold Read Latency
 
-When a block isn't in the local cache, GlideFS either:
+Two paths for cache misses:
 
-1. **Range-read** (`resolve_chunk`): GET the specific block's compressed bytes
-   from the pack using an S3 range request. Cost: ~20ms fixed + tiny transfer.
-   Pack size is irrelevant for this path.
+1. **Range-read** (`resolve_chunk`): S3 range request for one block's
+   compressed bytes. ~20ms fixed + tiny transfer. Pack size irrelevant.
 
-2. **Prefetch** (`resolve_pack`): GET the entire pack, decompress all blocks
-   into the clean cache. Cost: S3 GET Total (above) + prefetch decompress time.
+2. **Prefetch** (`resolve_pack`): GET entire pack, decompress all blocks
+   into clean cache.
 
-For prefetch at 100 blocks/pack:
-- S3 download: 84.6ms (20ms latency + 64.6ms for 6.5MB)
-- Decompress all 100 blocks: 5.3ms
-- **Total: ~90ms** to populate 100 blocks in cache
+| Blocks/Pack | S3 Download | Decompress | Total | Blocks Cached |
+|-------------|-------------|------------|-------|---------------|
+| 25 | 36.2ms | 1.0ms | ~37ms | 25 |
+| **100** | **84.6ms** | **4.4ms** | **~89ms** | **100** |
+| 200 | 149.3ms | 8.6ms | ~158ms | 200 |
 
-For comparison, at 25 blocks/pack (current):
-- S3 download: 36.2ms
-- Decompress: 1.6ms
-- **Total: ~38ms** to populate 25 blocks in cache
-
-Larger packs mean higher single-prefetch latency (90ms vs 38ms), but each
-prefetch populates 4x more blocks. For workloads with spatial locality
-(sequential reads, filesystem traversal), the 100-block prefetch is a clear
-win — subsequent reads are cache hits. For fully random reads with no locality,
-you're downloading 6.5MB to read 128KB, but the range-read path avoids this
-entirely.
+Larger packs: higher single-prefetch latency, but 4x more cache population
+per round trip. Sequential workloads (filesystem traversal, boot) win from
+the prefetch. Random reads use range-read regardless.
 
 ## S3 PUT Cost
 
-Flushes are event-driven (pack full, VM drain, compute node drain) — there is
-no fixed flush interval. PUT cost is therefore purely a function of **unique
-write throughput**:
+This is the primary argument for larger packs. S3 charges per-operation
+($5/million PUTs). Fewer, larger packs = fewer PUTs for the same data.
+
+### Flush Model
+
+Flushes are **event-driven**: the write path notifies the flush scheduler
+when dirty blocks reach `BLOCKS_PER_PACK`. No periodic S3 flush timer
+exists — the 5-second checkpoint is local only (WAL truncation, no S3).
+
+This means:
+
+- Dirty blocks accumulate until the pack-size threshold is crossed
+- A VM writing slowly may hold dirty blocks for minutes before triggering
+- `drain` and `snapshot` force-flush everything regardless of count
+
+### Write Coalescing
+
+Same block written N times between flushes = 1 dirty block. This matters:
+
+| Workload | Writes/sec | Unique blocks/sec | Time to 100 dirty |
+|----------|-----------|-------------------|-------------------|
+| Idle VM (logging, timers) | 5-20 | 5-20 | 5-20s |
+| App server (moderate I/O) | 50-200 | 30-100 | 1-3s |
+| npm install / build | 500-2000 | 200-500 | 0.2-0.5s |
+| DB (small hot set, 1000 pages) | 500-5000 | 50-200 | 0.5-2s |
+
+Workloads with small hot sets (databases, logging) rewrite the same blocks
+repeatedly. A database writing 5000 blocks/sec across a 1000-page hot set
+dirties ~200 unique blocks/sec — the rest are overwrites of already-dirty
+blocks. This is the coalescing win: fewer unique dirty blocks means fewer
+packs, fewer PUTs.
+
+For workloads with very low unique write rates, dirty blocks may sit below
+the pack-size threshold for extended periods. This is fine — durability is
+not the concern (GlideFS is write-behind; local SSD loss before flush = data
+loss regardless). These blocks flush on drain/snapshot.
+
+### Fleet Cost
+
+With event-driven flush, each flush produces exactly 1 pack. PUTs scale
+linearly with unique dirty block throughput:
 
 ```
-PUT cost = (unique 128KB blocks written across fleet) / BLOCKS_PER_PACK * $0.000005
+PUTs/month = unique_blocks_dirtied_per_day * 30 / BLOCKS_PER_PACK
+PUT cost   = PUTs / 1,000 * $0.005
 ```
 
-The dedup ratio dominates this calculation far more than pack size does. At
-1.93x dedup on forked images, roughly half the blocks written across a fleet
-share content with existing packs and generate no new PUTs regardless of pack
-size. Pack size only affects how many PUTs the remaining unique blocks require.
+Example: 1000 VMs, moderate app server workload (~50 unique blocks/sec):
 
-The relative improvement from pack size is straightforward:
+| Blocks/Pack | PUTs/VM/day | PUTs/Mo (1K VMs) | PUT Cost/Mo |
+|-------------|------------|-------------------|-------------|
+| 25 | 172,800 | 5,184M | $25,920 |
+| **100** | **43,200** | **1,296M** | **$6,480** |
+| 200 | 21,600 | 648M | $3,240 |
+| 500 | 8,640 | 259M | $1,296 |
 
-| Pack Size | PUTs per 1000 unique blocks |
-|-----------|----------------------------|
-| 25 | 40 |
-| 100 | 10 |
-| 200 | 5 |
+The relationship is linear: 2x pack size = 0.5x PUTs. But this formula is
+**conservative for larger pack sizes**. Larger packs take longer to fill,
+which extends the coalescing window — a block dirtied early has more time
+to be overwritten before the pack flushes. For hot-set workloads (databases,
+logging), the effective unique count per pack can be well below
+`BLOCKS_PER_PACK`, giving fewer PUTs than the formula predicts.
 
-Going from 25 to 100 blocks/pack cuts PUT count 4x. Going from 100 to 200 only
-cuts it 2x further with significantly higher memory and prefetch latency costs.
-
-To estimate actual fleet costs, substitute your measured unique write throughput
-per VM. The formula is:
-
-```
-monthly PUTs = (unique blocks written/day per VM) * fleet_size * 30 / BLOCKS_PER_PACK
-monthly cost = monthly PUTs / 1000 * $0.005
-```
-
-The key input is unique write throughput, which varies widely by workload. Idle
-VMs on a shared base image may write almost nothing unique; write-heavy workloads
-will dominate. Measure this before treating any cost number as meaningful.
+Measure `dirty_block_count` growth over time at your target pack size,
+not raw write IOPS.
 
 ## Memory
 
-| Blocks/Pack | Peak Memory (raw + compressed) |
-|-------------|-------------------------------|
-| 25 | 4.7MB |
-| 100 | 19.0MB |
-| 200 | 37.9MB |
-| 500 | 94.4MB |
-| 1000 | 188.2MB |
+Pack assembly takes ownership of compressed blocks and frees each `Vec<u8>`
+as it's copied into the output buffer. Peak memory per pack ≈ compressed
+output size (not raw + compressed as in earlier versions).
 
-At 100 blocks/pack, a single pack assembly holds ~19MB. With the rayon-
-parallelized flush path, multiple packs can be assembled concurrently. At 100
-blocks/pack with 8 concurrent pack assemblies: ~152MB. Manageable on any server.
+The flush path uses `buffer_unordered(4)` to pipeline assembly and upload —
+at most 4 packs are in-flight simultaneously.
 
-At 1000 blocks/pack, 8 concurrent assemblies would be ~1.5GB. This is the
-practical ceiling.
+| Blocks/Pack | Per-Pack Peak | Flush Peak (4 in-flight) |
+|-------------|--------------|-------------------------|
+| 25 | 1.6MB | 6.4MB |
+| **100** | **6.5MB** | **26MB** |
+| 200 | 12.9MB | 52MB |
+| 500 | 31.9MB | 128MB |
+| 1000 | 63.2MB | 253MB |
 
-## Flush Latency Impact
+At 100 blocks/pack: 26MB during flush. At 500: 128MB. Even 1000 blocks/pack
+at 253MB is manageable.
 
-With the current 25 blocks/pack, a drain flush of N dirty blocks produces N/25
-packs. During normal operation, a flush is triggered when a pack fills (exactly
-100 blocks at the new size), so drain flushes are the primary case where pack
-count varies.
+This is a significant improvement over the previous model (raw + compressed
+held simultaneously, all packs assembled before any upload). The old model
+at 100 blocks/pack was 19MB/pack with 8 concurrent assemblies = 152MB.
 
-At 100 blocks/pack vs 25, drain flushes produce 4x fewer packs:
-- Per-block assembly cost is unchanged (~280-300us/block)
-- Fewer packs means fewer S3 round trips and less contention on the upload semaphore
-- Total assembly compute per flush is similar; the savings come from the upload phase
+## Tradeoff Summary
+
+| Factor | Favors smaller packs | Favors larger packs |
+|--------|---------------------|---------------------|
+| S3 PUT cost | | Fewer PUTs (linear) |
+| S3 GET amortization | | Better amortized cost (1/N) |
+| Prefetch latency | Lower (37ms at 25) | Higher (89ms at 100) |
+| Range-read latency | Irrelevant | Irrelevant |
+| Memory | Lower | Higher (but manageable) |
+| Flush trigger rate | More frequent, smaller | Less frequent, larger |
+| GC granularity | Less zombie storage | More zombie storage (no compaction) |
 
 ## Recommendation
 
-**Change `BLOCKS_PER_PACK` from 25 to 100.**
+**Make `BLOCKS_PER_PACK` a runtime config option. Default to 500.**
 
-The data supports this:
+The case for 500:
 
-1. **Per-block compute cost is unchanged** (~280-300us/block regardless of pack
-   size). No regression on the flush hot path.
+1. **5x fewer S3 PUTs than 100.** PUT cost reduction is linear — no
+   diminishing returns. This is the primary cost lever.
 
-2. **4x fewer S3 PUTs per flush**. Fewer round trips, less upload semaphore
-   contention, lower cost.
+2. **Longer coalescing window.** At 50 unique blocks/sec, a 500-block pack
+   takes ~10s to fill vs ~2s at 100. Hot-set workloads get significantly
+   more overwrites in that window, reducing effective PUTs beyond what the
+   linear model predicts.
 
-3. **Amortized S3 GET cost drops 41%** (1.45ms -> 0.85ms per block). Prefetch
-   populates 4x more blocks per S3 round trip.
+3. **128MB flush peak is fine.** 4 packs in-flight at 31.9MB each. This
+   was the blocker before owned assembly — it isn't anymore.
 
-4. **Memory is reasonable**: 19MB per pack, ~152MB for 8 concurrent assemblies.
+4. **Range-read path makes prefetch latency irrelevant for cold reads.**
+   Single-block access uses S3 range requests (~20ms) regardless of pack
+   size. Prefetch (339ms at 500 blocks) only runs on sequential detection,
+   where the higher per-prefetch cost is offset by 5x more cache population.
 
-5. **Diminishing returns beyond 100**: going to 200 only saves 0.10ms/block
-   amortized GET cost (12%) while doubling memory and prefetch latency.
+5. **GC granularity is the real cost — but storage is cheap.** A 500-block
+   pack (~32MB) where 1 block goes dead holds ~32MB hostage until all 499
+   siblings also die. No compaction exists (remote manifests reference
+   pack IDs; rewriting requires cross-host coordination). But S3 storage
+   is $0.023/GB/month — a 32MB zombie pack costs $0.0007/month to hold.
+   PUT savings at fleet scale dwarf this. The worst zombie producers
+   (high-frequency overwrites of small block sets — DB WAL, logging) are
+   already directed to local NVMe per the README. GlideFS workloads (OS,
+   app code, data files) have cohort-correlated lifetimes: blocks written
+   together during a deploy tend to die together at the next deploy.
 
-6. **Prefetch latency (90ms) is acceptable** for cold reads given the range-read
-   path exists for latency-sensitive single-block access.
+Why not 1000: 253MB flush peak starts to matter on smaller instances, and
+63MB S3 objects are slow to upload on constrained networks. 500 is the
+sweet spot — halves PUT cost vs 200 without hitting practical limits.
 
-Going beyond 200 blocks/pack offers diminishing returns on amortized cost while
-increasing memory pressure, prefetch latency, and pack size variance. 100 is
-the knee of the curve.
+Why configurable: workloads vary. Write-heavy fleets benefit from 500+.
+Read-heavy or latency-sensitive deployments may prefer 200. The read path
+handles any pack size — only new packs use the configured value.

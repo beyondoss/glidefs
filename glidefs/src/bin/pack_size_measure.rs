@@ -296,9 +296,8 @@ fn measure_pack_size(
     let s3_get_ms = s3_latency_ms + s3_transfer_ms;
     let amortized_per_block_ms = s3_get_ms / blocks_per_pack as f64;
 
-    // Peak memory
-    let raw_mem = blocks_per_pack * BLOCK_SIZE;
-    let peak_memory_mb = (raw_mem + avg_compressed_pack_bytes) as f64 / (1024.0 * 1024.0);
+    // Peak memory per pack during assembly (owned: output buffer only, input freed as consumed)
+    let peak_memory_mb = avg_compressed_pack_bytes as f64 / (1024.0 * 1024.0);
 
     PackMeasurement {
         blocks_per_pack,
@@ -495,21 +494,26 @@ fn main() {
     println!("└────────────┴──────────────┴──────────────┴──────────────┴──────────────┘");
 
     // === Cost Table (at scale) ===
+    // Model: event-driven flush (1 pack per flush), 1000 VMs,
+    // moderate app server writing ~50 unique blocks/sec.
     println!();
-    println!("S3 PUT Cost Impact (1000 VMs, 5000 dirty blocks/flush, 5760 flushes/day)");
-    let flushes_per_month = 5760.0 * 30.0;
-    let dirty_per_flush = 5000.0_f64;
+    let unique_blocks_per_sec = 50.0_f64;
     let vms = 1000.0_f64;
+    let unique_blocks_per_day = unique_blocks_per_sec * 86400.0;
+    println!(
+        "S3 PUT Cost ({:.0} VMs, {:.0} unique blocks/sec per VM)",
+        vms, unique_blocks_per_sec
+    );
     println!("┌────────────┬──────────────┬──────────────┬──────────────┐");
-    println!("│ Blocks/Pack│ Packs/Flush  │ PUTs/Mo (1K) │ PUT Cost/Mo  │");
+    println!("│ Blocks/Pack│ PUTs/VM/day  │ PUTs/Mo (1K) │ PUT Cost/Mo  │");
     println!("├────────────┼──────────────┼──────────────┼──────────────┤");
     for m in &results {
-        let packs_per_flush = (dirty_per_flush / m.blocks_per_pack as f64).ceil();
-        let puts_per_month = packs_per_flush * flushes_per_month * vms;
+        let puts_per_vm_day = unique_blocks_per_day / m.blocks_per_pack as f64;
+        let puts_per_month = puts_per_vm_day * 30.0 * vms;
         let cost = puts_per_month * 0.005 / 1000.0;
         println!(
             "│ {:>10} │ {:>12.0} │ {:>11.1}M │ ${:>10.0} │",
-            m.blocks_per_pack, packs_per_flush, puts_per_month / 1e6, cost,
+            m.blocks_per_pack, puts_per_vm_day, puts_per_month / 1e6, cost,
         );
     }
     println!("└────────────┴──────────────┴──────────────┴──────────────┘");
