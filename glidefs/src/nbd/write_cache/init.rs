@@ -7,10 +7,11 @@ use parking_lot::{Mutex, RwLock};
 use tracing::{info, instrument, warn};
 
 use crate::nbd::block_map::{
-    AtomicBlockMap, BlockMap, BlockMapEntry, BlockMapKind, ForkedBlockMap,
+    AtomicBlockMap, BlockMap, BlockMapEntry, BlockMapKind, Blake3Hash, ForkedBlockMap,
     SequenceNumber, SparseBlockState, SparseStateMap, blake3_128, zero_block_hash,
 };
 use crate::nbd::manifest::Manifest;
+use super::inner::BaseManifestState;
 use crate::nbd::state::{Active, Initializing, Recovering};
 use crate::nbd::wal::Wal;
 
@@ -164,6 +165,7 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             manifest_pack_hashes: Mutex::new(HashSet::new()),
+            base_manifest_state: Mutex::new(None),
         });
 
         info!(
@@ -225,6 +227,19 @@ impl WriteCache<Initializing> {
 
         let manifest_hashes = manifest.pack_index.iter().map(|e| e.hash).collect();
 
+        // Initialize base_manifest_state from the manifest we're restoring from.
+        // This allows delta manifests to work immediately after restore.
+        let base_block_map: std::collections::HashMap<u64, Blake3Hash> = manifest
+            .block_map
+            .iter()
+            .map(|e| (e.chunk_index, e.hash))
+            .collect();
+        let base_state = BaseManifestState {
+            sequence: manifest.sequence,
+            block_map: base_block_map,
+            syncs_since_base: 0,
+        };
+
         let inner = Arc::new(CacheInner {
             config,
             data_file,
@@ -239,6 +254,7 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             manifest_pack_hashes: Mutex::new(manifest_hashes),
+            base_manifest_state: Mutex::new(Some(base_state)),
         });
 
         info!("cache opened from manifest, directly Active");

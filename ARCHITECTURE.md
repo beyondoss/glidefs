@@ -78,7 +78,7 @@ For each dirty block (via spawn_blocking — off async runtime):
     └── Dedup check against HostPackIndex
     │
     ▼
-Assemble packs (25 blocks × 128KB = ~3.2MB, async)
+Assemble packs (up to 100 blocks × 128KB = ~12.8MB, async)
     │
     └──► ContentStore::put_pack() ──► S3 PUT (concurrent, semaphore-gated)
               │
@@ -89,8 +89,28 @@ Assemble packs (25 blocks × 128KB = ~3.2MB, async)
         CAS-clear Dirty flags (only if sequence unchanged since snapshot)
               │
               ▼
-        Upload manifest to S3 (point-in-time snapshot)
+        Upload manifest to S3 (delta or full — see [Delta Manifests](#delta-manifests))
 ```
+
+### Delta Manifests
+
+Background sync uploads a **delta manifest** containing only blocks that changed since the last full (base) manifest. This reduces S3 bandwidth from O(all blocks) to O(changed blocks) — a flush that touched 100 blocks uploads ~2.5KB instead of the full manifest.
+
+**S3 layout**: `manifests/{name}` (full/base) + `manifests/{name}.delta` (single delta, no chains). At most 2 S3 GETs to restore.
+
+**How it works**: The flush path caches the last full manifest's block map as a `HashMap<u64, Blake3Hash>`. On sync, it diffs the current block map against the cached base — upserts are entries that differ, deletes are entries in the base but absent from the current map. The delta is serialized and uploaded to `manifests/{name}.delta`, replacing any previous delta.
+
+**Compaction** (fall back to full manifest upload):
+1. No base state yet (first sync after open)
+2. Delta block size > 50% of estimated full manifest size
+3. `syncs_since_base >= 10`
+4. Explicit `snapshot()` or `flush_to_s3()` (fork, migration)
+
+Compaction uploads a full manifest and deletes the `.delta` file.
+
+**Restore**: `get_effective_manifest()` fetches the base, optionally fetches the delta. If the delta's `base_sequence` matches the base's `sequence`, it merges them via `apply_to()`. Stale deltas (wrong `base_sequence`) are ignored with a warning — the base is used as-is.
+
+**GC safety**: GC takes the conservative union of pack entries from both base and delta manifests. Dead packs from overwritten blocks survive one compaction cycle, well within the 24h grace period. (`manifest.rs`, `content_store.rs`, `write_cache/flush.rs`)
 
 ## Concepts & Terminology
 
@@ -98,8 +118,8 @@ Assemble packs (25 blocks × 128KB = ~3.2MB, async)
 |------|-----------|-----|
 | Export | A virtual block device served over NBD, with its own cache and S3 prefix | Not a filesystem — raw blocks only |
 | Block/Chunk | Fixed-size unit of data (default 128KB to match ZFS recordsize) | Not variable-sized |
-| Pack | S3 object containing up to 25 LZ4-compressed blocks with a self-describing index | Not a single block per S3 object |
-| Manifest | Binary snapshot of an export's block map + pack index, stored in S3 | Not a log — it's a point-in-time image |
+| Pack | S3 object containing up to 100 LZ4-compressed blocks with a self-describing index | Not a single block per S3 object |
+| Manifest | Binary snapshot of an export's block map + pack index, stored in S3. Synced as delta (changed blocks only) with periodic compaction to full snapshot. | Not a log — it's a point-in-time image |
 | Block Map | Per-chunk metadata: BLAKE3-128 hash, dirty flag, sequence number | Not the data itself |
 | Pack Index | Host-level hash→pack location mapping for content-addressed lookups. Backed by redb (disk-resident, not RAM). Pruned on export removal to bound size to active exports. | Not per-export — shared across all exports on a host |
 | Drain | Flush all dirty blocks to S3 so the export can be stopped or migrated | Not a delete — S3 data is preserved |
@@ -116,7 +136,8 @@ Assemble packs (25 blocks × 128KB = ~3.2MB, async)
 ├── nbd/{export_name}/
 │   ├── export.json                          ← Export definition (name, size_gb, s3_prefix)
 │   ├── manifests/
-│   │   ├── {export_name}                    ← Current manifest snapshot (GLDE format)
+│   │   ├── {export_name}                    ← Full manifest snapshot (GLDE format, base)
+│   │   ├── {export_name}.delta              ← Delta manifest since last base (optional)
 │   │   └── bases/
 │   │       ├── {image_name}                 ← Base image manifest (from bless)
 │   │       └── {image_name}.hot-set         ← Boot hot set (chunk indices)
@@ -126,7 +147,7 @@ Assemble packs (25 blocks × 128KB = ~3.2MB, async)
 │       └── {export_name}                    ← Pack ID list for GC (GLPR format)
 ```
 
-Packs use 256-way prefix sharding (`packs/ab/{uuid}`) to avoid S3 LIST performance degradation. Manifests are atomic overwrites — the latest is always consistent. Pack registries are append-only and compacted by GC.
+Packs use 256-way prefix sharding (`packs/ab/{uuid}`) to avoid S3 LIST performance degradation. Manifests are atomic overwrites — the latest is always consistent. The `.delta` file, when present, contains only blocks changed since the last full manifest (see [Delta Manifests](#delta-manifests)). Pack registries are append-only and compacted by GC.
 
 ## Core Mechanism: Write-Behind Cache
 
@@ -283,7 +304,7 @@ WriteCache<Draining>
 
 ### Pack Format (`GLPK`)
 
-Self-describing S3 object. Up to 25 LZ4-compressed blocks with a content-addressed index.
+Self-describing S3 object. Up to 100 LZ4-compressed blocks with a content-addressed index.
 
 ```
 ┌─────────────────────────── Pack ───────────────────────────┐
@@ -303,13 +324,16 @@ S3 key: `packs/{first-2-hex-of-uuid}/{uuid}` — 256-way prefix sharding for S3 
 
 ### Manifest Format (`GLDE`)
 
-Binary snapshot of export state. Sparse: only written chunks are stored. CRC32 trailer for integrity.
+Binary snapshot of export state. Sparse: only written chunks are stored. CRC32 trailer for integrity. Version 2 (current); version 1 still accepted on read for backward compatibility.
+
+#### Full Manifest (flags = 0x0000)
 
 ```
 ┌─────────────────────────── Manifest ────────────────────────┐
 │ Header (46 + name_len bytes)                                │
-│   magic: "GLDE"  version: 1  flags  name_len  sequence      │
-│   chunk_size  device_size  block_map_count  pack_index_count│
+│   magic: "GLDE"  version: 2  flags: 0x0000  name_len       │
+│   sequence  chunk_size  device_size                         │
+│   block_map_count  pack_index_count                         │
 │   name (variable length)                                    │
 ├─────────────────────────────────────────────────────────────┤
 │ Block Map (25 bytes × block_map_count)                      │
@@ -322,7 +346,39 @@ Binary snapshot of export state. Sparse: only written chunks are stored. CRC32 t
 └─────────────────────────────────────────────────────────────┘
 ```
 
-S3 key: `manifests/{name}`. Atomic overwrite — the latest manifest is always a consistent snapshot. (`manifest.rs`)
+S3 key: `manifests/{name}`. Atomic overwrite — the latest full manifest is always a consistent snapshot.
+
+#### Delta Manifest (flags = 0x0001)
+
+Contains only blocks changed since the last full manifest. See [Delta Manifests](#delta-manifests).
+
+```
+┌──────────────────────── Delta Manifest ─────────────────────┐
+│ Header (46 + name_len bytes)                                │
+│   magic: "GLDE"  version: 2  flags: 0x0001  name_len       │
+│   sequence  chunk_size  device_size                         │
+│   block_map_count (= upsert count)                          │
+│   pack_index_count (= new pack count)                       │
+│   name (variable length)                                    │
+├─────────────────────────────────────────────────────────────┤
+│ Delta-specific (16 bytes)                                   │
+│   base_sequence: u64 LE                                     │
+│   deleted_count: u64 LE                                     │
+├─────────────────────────────────────────────────────────────┤
+│ Upserted Blocks (25 bytes × block_map_count)                │
+│   [chunk_index:u64][hash:16][flags:u8]                      │
+├─────────────────────────────────────────────────────────────┤
+│ Deleted Chunk Indices (8 bytes × deleted_count)             │
+│   [chunk_index:u64]                                         │
+├─────────────────────────────────────────────────────────────┤
+│ New Pack Entries (40 bytes × pack_index_count)              │
+│   [hash:16][pack_id:16][offset:u32][comp_length:u32]        │
+├─────────────────────────────────────────────────────────────┤
+│ Trailing CRC32 (4 bytes)                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+S3 key: `manifests/{name}.delta`. Replaced on each sync cycle; deleted on compaction. (`manifest.rs`)
 
 ### WAL Entry Format
 
@@ -365,7 +421,8 @@ Orphaned packs accumulate in S3 when exports are deleted or blocks are overwritt
 
 ```
 For each S3 prefix:
-    1. List all manifests → extract live pack IDs
+    1. List all manifests (full + delta) → extract live pack IDs
+       (conservative union: packs from base + packs from delta)
     2. List all pack registries → extract known pack IDs
     3. dead = known - live
     4. Mark newly dead packs with timestamp in GC state file
@@ -586,9 +643,9 @@ Sequence numbers replace hashes as the race detection token in flush. There is a
 
 Per-block storage means one S3 PUT per 128KB write. At 28K IOPS, that's 28K PUTs/second — prohibitively expensive ($0.14/hour in S3 API costs alone).
 
-Packing 25 blocks per S3 object reduces PUTs by 25x. Content addressing (hash as identity) enables cross-export deduplication on the same host without coordination.
+Packing up to 100 blocks per S3 object reduces PUTs by up to 100x. Content addressing (hash as identity) enables cross-export deduplication on the same host without coordination.
 
-Trade-off: read amplification. A cache miss fetches the entire pack (~3.2MB) even if only one block (128KB) is needed. The 99.67% cache hit rate makes this acceptable — misses are rare, and the extra data often prefills the cache for subsequent reads.
+Trade-off: read amplification. A cache miss fetches the entire pack (up to ~12.8MB) even if only one block (128KB) is needed. The 99.67% cache hit rate makes this acceptable — misses are rare, and the extra data often prefills the cache for subsequent reads.
 
 ### Why BLAKE3-128 instead of full BLAKE3-256?
 
@@ -816,7 +873,7 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 
 | Suite | Command | Count | What It Covers |
 |-------|---------|-------|----------------|
-| Unit | `cargo test --features test-utils --lib` | ~320 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables, CRC32 integrity |
-| Integration | `cargo test --features test-utils --test integration` | ~46 | Crash recovery, concurrent writes, flush consistency (no Docker) |
+| Unit | `cargo test --features test-utils --lib` | ~337 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables, CRC32 integrity, delta manifest serde |
+| Integration | `cargo test --features test-utils --test integration` | ~53 | Crash recovery, concurrent writes, flush consistency, delta manifests (no Docker) |
 | Docker | `cargo test --features docker-tests --test docker_integration` | ~9 | Real S3 via MinIO (testcontainers-rs), end-to-end pack upload/download |
 | Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free algorithms (AtomicBlockMap, SeqLock) |

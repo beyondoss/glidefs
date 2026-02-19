@@ -7,7 +7,7 @@ use crate::nbd::block_map::{
     BlockMapKind, Blake3Hash, SparseBlockState, blake3_128, lz4_compress,
 };
 use crate::nbd::content_store::ContentStore;
-use crate::nbd::manifest::{Manifest, ManifestBlockEntry};
+use crate::nbd::manifest::{Manifest, ManifestBlockEntry, ManifestDelta};
 use crate::nbd::pack::{self, PackLocation, BLOCKS_PER_PACK};
 use crate::nbd::pack_index::HostPackIndex;
 use crate::nbd::pack_registry::PackRegistry;
@@ -402,10 +402,13 @@ impl WriteCache<Active> {
         Ok((stats, seq_cutpoint))
     }
 
-    /// Build and upload a manifest from current state.
+    /// Build and upload a full (base) manifest from current state.
+    ///
+    /// After upload, populates `base_manifest_state` for future delta computation
+    /// and deletes any existing `.delta` file from S3.
     ///
     /// Returns the S3 ETag if the backend provides one.
-    async fn upload_manifest(
+    async fn upload_full_manifest(
         &self,
         content_store: &ContentStore,
         host_pack_index: &HostPackIndex,
@@ -440,7 +443,172 @@ impl WriteCache<Active> {
             .put_manifest(&self.inner.export_name, manifest.serialize())
             .await?;
 
+        // Update base_manifest_state for future delta computation.
+        {
+            use super::inner::BaseManifestState;
+            let base_block_map = manifest
+                .block_map
+                .iter()
+                .map(|e| (e.chunk_index, e.hash))
+                .collect();
+            *self.inner.base_manifest_state.lock() = Some(BaseManifestState {
+                sequence: seq_cutpoint,
+                block_map: base_block_map,
+                syncs_since_base: 0,
+            });
+        }
+
+        // Delete any existing delta (we just compacted).
+        if let Err(e) = content_store
+            .delete_delta_manifest(&self.inner.export_name)
+            .await
+        {
+            warn!(error = %e, "failed to delete delta manifest after compaction (harmless)");
+        }
+
+        info!(sequence = seq_cutpoint, "uploaded full manifest");
         Ok(etag)
+    }
+
+    /// Build and upload a delta manifest if possible, otherwise fall back to full.
+    ///
+    /// Compaction triggers (fall back to full):
+    /// 1. No base_manifest_state (first sync)
+    /// 2. Delta size > 50% of estimated full manifest size
+    /// 3. syncs_since_base >= 10
+    async fn upload_delta_or_full_manifest(
+        &self,
+        content_store: &ContentStore,
+        host_pack_index: &HostPackIndex,
+        seq_cutpoint: u64,
+    ) -> Result<Option<String>, CacheError> {
+        use super::inner::BaseManifestState;
+        use crate::nbd::manifest::MANIFEST_BLOCK_ENTRY_SIZE;
+
+        // Check if we have base state for delta computation.
+        let base_state = self.inner.base_manifest_state.lock().take();
+        let base_state = match base_state {
+            Some(s) => s,
+            None => {
+                // No base state — must upload full.
+                debug!("no base manifest state, uploading full manifest");
+                return self
+                    .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
+                    .await;
+            }
+        };
+
+        // Check sync count compaction trigger.
+        if base_state.syncs_since_base >= 10 {
+            debug!(
+                syncs_since_base = base_state.syncs_since_base,
+                "compaction trigger: sync count, uploading full manifest"
+            );
+            return self
+                .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
+                .await;
+        }
+
+        // Snapshot current block map and compute delta.
+        let chunk_size = self.inner.config.block_size as u32;
+        let post_flush_snap = self.inner.block_map_snapshot();
+        let current_entries: Vec<ManifestBlockEntry> = post_flush_snap
+            .iter_non_empty()
+            .map(|(idx, entry)| ManifestBlockEntry {
+                chunk_index: idx as u64,
+                hash: entry.hash,
+                flags: entry.flags,
+            })
+            .collect();
+
+        // Compute upserts: entries that differ from base.
+        let mut upserted = Vec::new();
+        let mut current_map = std::collections::HashMap::new();
+        for entry in &current_entries {
+            current_map.insert(entry.chunk_index, entry);
+            match base_state.block_map.get(&entry.chunk_index) {
+                Some(&base_hash) if base_hash == entry.hash => {
+                    // Unchanged — skip.
+                }
+                _ => {
+                    // New or changed — upsert.
+                    upserted.push(entry.clone());
+                }
+            }
+        }
+
+        // Compute deletes: entries in base but not in current.
+        let deleted_chunks: Vec<u64> = base_state
+            .block_map
+            .keys()
+            .filter(|k| !current_map.contains_key(k))
+            .copied()
+            .collect();
+
+        // Derive new pack entries only for upserted hashes.
+        let upserted_hashes: std::collections::HashSet<Blake3Hash> =
+            upserted.iter().map(|e| e.hash).collect();
+        let all_pack_entries = host_pack_index.derive_for_block_map(&post_flush_snap)?;
+        let new_pack_entries: Vec<_> = all_pack_entries
+            .into_iter()
+            .filter(|e| upserted_hashes.contains(&e.hash))
+            .collect();
+
+        // Size-based compaction trigger: delta block changes > 50% of full block map.
+        // Compare block-level sizes only (pack entries scale proportionally).
+        let delta_block_size = upserted.len() * MANIFEST_BLOCK_ENTRY_SIZE
+            + deleted_chunks.len() * 8;
+        let full_block_size = current_entries.len() * MANIFEST_BLOCK_ENTRY_SIZE;
+        if full_block_size > 0 && delta_block_size * 2 > full_block_size {
+            debug!(
+                delta_entries = upserted.len(),
+                deleted = deleted_chunks.len(),
+                full_entries = current_entries.len(),
+                "compaction trigger: delta > 50% of full, uploading full manifest"
+            );
+            return self
+                .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
+                .await;
+        }
+
+        // Build and upload delta.
+        let delta = ManifestDelta {
+            name: self.inner.export_name.clone(),
+            base_sequence: base_state.sequence,
+            sequence: seq_cutpoint,
+            chunk_size,
+            device_size: self.inner.config.device_size,
+            upserted,
+            deleted_chunks,
+            new_pack_entries,
+        };
+
+        // Cache the full manifest's pack hashes for pack index pruning.
+        // We need to derive from the full current state, not just the delta.
+        let full_pack_entries = host_pack_index.derive_for_block_map(&post_flush_snap)?;
+        *self.inner.manifest_pack_hashes.lock() =
+            full_pack_entries.iter().map(|e| e.hash).collect();
+
+        content_store
+            .put_delta_manifest(&self.inner.export_name, delta.serialize())
+            .await?;
+
+        // Put back base_manifest_state with incremented sync count.
+        *self.inner.base_manifest_state.lock() = Some(BaseManifestState {
+            sequence: base_state.sequence,
+            block_map: base_state.block_map,
+            syncs_since_base: base_state.syncs_since_base + 1,
+        });
+
+        info!(
+            sequence = seq_cutpoint,
+            base_sequence = base_state.sequence,
+            upserts = delta.upserted.len(),
+            deletes = delta.deleted_chunks.len(),
+            new_packs = delta.new_pack_entries.len(),
+            "uploaded delta manifest"
+        );
+        Ok(None) // deltas don't return etag
     }
 
     /// Flush dirty blocks to S3 as packs (no manifest upload).
@@ -459,15 +627,15 @@ impl WriteCache<Active> {
     /// Upload a manifest reflecting the current block map state.
     ///
     /// Call after `flush_packs()` with the returned `seq_cutpoint` to persist
-    /// a recovery manifest. Separated from pack flushes so the scheduler can
-    /// sync manifests at a lower frequency.
+    /// a recovery manifest. Uses delta manifests when possible to reduce S3
+    /// bandwidth, falling back to full on compaction triggers.
     pub async fn sync_manifest(
         &self,
         content_store: &ContentStore,
         host_pack_index: &Arc<HostPackIndex>,
         seq_cutpoint: u64,
     ) -> Result<(), CacheError> {
-        self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        self.upload_delta_or_full_manifest(content_store, host_pack_index, seq_cutpoint).await?;
         // Checkpoint: block map outside lock, fast save + truncate under lock.
         self.inner.persist_block_map()?;
         let mut wal = self.inner.wal.lock();
@@ -609,7 +777,7 @@ impl WriteCache<Active> {
         host_pack_index: &Arc<HostPackIndex>,
     ) -> Result<FlushStats, CacheError> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
-        self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint).await?;
         self.update_registry(content_store, &stats.new_pack_ids).await;
         // Checkpoint: persist block map outside the lock (safe for clean blocks),
         // then hold the WAL lock only for fast block-states save + truncate.
@@ -631,7 +799,7 @@ impl WriteCache<Active> {
         host_pack_index: &Arc<HostPackIndex>,
     ) -> Result<SnapshotResult, CacheError> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
-        let manifest_etag = self.upload_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        let manifest_etag = self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint).await?;
         self.update_registry(content_store, &stats.new_pack_ids).await;
         // Checkpoint: block map outside lock, fast save + truncate under lock.
         self.inner.persist_block_map()?;

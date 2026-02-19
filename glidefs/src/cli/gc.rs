@@ -17,7 +17,6 @@ use uuid::Uuid;
 
 use crate::config::Settings;
 use crate::nbd::content_store::ContentStore;
-use crate::nbd::manifest::Manifest;
 use crate::nbd::pack_registry::PackRegistry;
 use crate::parse_object_store::parse_url_opts;
 
@@ -251,29 +250,26 @@ async fn reconcile_prefix(
     max_deletes: usize,
     dry_run: bool,
 ) -> Result<usize> {
-    // 1. List all manifests, parse, collect live pack IDs
+    // 1. List all manifests, load effective (base + optional delta), collect live pack IDs.
+    //    list_all_manifests() filters .delta and .hot-set files, returning only base names.
+    //    get_effective_manifest() merges base + delta, producing a conservative union of
+    //    all referenced packs — safe for GC liveness.
     let mut live_packs: HashSet<Uuid> = HashSet::new();
     let manifest_names = content_store.list_all_manifests().await?;
 
     for name in &manifest_names {
-        match content_store.get_manifest(name).await {
-            Ok(Some(data)) => match Manifest::deserialize(&data) {
-                Ok(manifest) => {
-                    for entry in &manifest.pack_index {
-                        live_packs.insert(entry.pack_id);
-                    }
-                    stats.manifests_scanned += 1;
+        match content_store.get_effective_manifest(name).await {
+            Ok(Some(manifest)) => {
+                for entry in &manifest.pack_index {
+                    live_packs.insert(entry.pack_id);
                 }
-                Err(e) => {
-                    warn!(manifest = %name, error = %e, "skipping corrupt manifest");
-                    stats.manifest_errors += 1;
-                }
-            },
+                stats.manifests_scanned += 1;
+            }
             Ok(None) => {
                 warn!(manifest = %name, "manifest disappeared during GC");
             }
             Err(e) => {
-                warn!(manifest = %name, error = %e, "failed to fetch manifest");
+                warn!(manifest = %name, error = %e, "failed to fetch/parse manifest");
                 stats.manifest_errors += 1;
             }
         }

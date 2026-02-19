@@ -9,7 +9,7 @@ use crate::nbd::cache::BlockCache;
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::flush_scheduler::{flush_scheduler, FlushMode};
 use crate::nbd::handler::NBDBlockHandler;
-use crate::nbd::manifest::{deserialize_hot_set, Manifest};
+use crate::nbd::manifest::deserialize_hot_set;
 use crate::nbd::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::nbd::pack::PackLocation;
 use crate::nbd::pack_index::HostPackIndex;
@@ -573,16 +573,13 @@ impl ExportRouter {
         };
 
         let cache = if let Some(manifest_name) = manifest_name {
-            // Fork path: load manifest from S3, populate pack index, open from manifest
-            let manifest_data = content_store
-                .get_manifest(manifest_name)
+            // Fork path: load effective manifest (base + optional delta) from S3
+            let manifest = content_store
+                .get_effective_manifest(manifest_name)
                 .await?
                 .ok_or_else(|| {
                     RouterError::Manifest(format!("manifest '{}' not found in S3", manifest_name))
                 })?;
-
-            let manifest = Manifest::deserialize(&manifest_data)
-                .map_err(|e| RouterError::Manifest(format!("invalid manifest: {}", e)))?;
 
             // Populate pack index from manifest entries
             let batch: Vec<_> = manifest.pack_index.iter().map(|entry| {

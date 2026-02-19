@@ -5,12 +5,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::nbd::block_map::{
     BlockMap, BlockMapKind, Blake3Hash, SequenceNumber,
     SparseBlockState, SparseStateMap,
 };
+
+/// Cached state from the most recent full (base) manifest upload.
+///
+/// Used to compute delta manifests: diff current block_map against
+/// this cached snapshot to produce upserts and deletes.
+pub(super) struct BaseManifestState {
+    pub sequence: u64,
+    pub block_map: HashMap<u64, Blake3Hash>,
+    pub syncs_since_base: u32,
+}
 use crate::nbd::state::BlockState;
 use crate::nbd::wal::Wal;
 
@@ -228,12 +238,18 @@ pub(crate) struct CacheInner {
 
     /// Cached set of hashes from the most recent manifest build.
     ///
-    /// Updated on every `upload_manifest()` and on-demand via
+    /// Updated on every `upload_full_manifest()` and on-demand via
     /// `rebuild_manifest_hashes()`. Used by pack index pruning to
     /// determine which entries are still needed — the manifest is the
     /// durable reference, not the live block_map (which has ZERO
     /// placeholders for in-flight flushes).
     pub(super) manifest_pack_hashes: Mutex<HashSet<Blake3Hash>>,
+
+    /// Cached state from the last full (base) manifest upload.
+    ///
+    /// Used to compute delta manifests by diffing the current block_map
+    /// against this snapshot. None until the first full manifest upload.
+    pub(super) base_manifest_state: Mutex<Option<BaseManifestState>>,
 }
 
 impl CacheInner {

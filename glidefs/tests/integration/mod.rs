@@ -7,6 +7,7 @@
 //! 4. Crash recovery - dirty blocks survive process crashes
 
 mod crash_recovery;
+mod delta_manifest;
 mod failure_injection;
 mod gc;
 mod property_tests;
@@ -19,7 +20,6 @@ use tempfile::TempDir;
 
 use glidefs::nbd::cache::SimpleBlockCache;
 use glidefs::nbd::content_store::ContentStore;
-use glidefs::nbd::manifest::Manifest;
 use glidefs::nbd::metrics::ExportMetrics;
 use glidefs::nbd::pack_index::HostPackIndex;
 use glidefs::nbd::state::Active;
@@ -65,9 +65,9 @@ pub fn create_v2_test_cache(
 /// Cold reader: creates a WriteCache whose block_map is populated from the S3 manifest.
 ///
 /// After a writer calls `flush_to_s3`, the manifest in S3 contains the block map and
-/// pack entries. This helper downloads the manifest, opens a WriteCache via
-/// `open_from_manifest` (populating the block_map), and rebuilds the HostPackIndex
-/// so `read_v2` can resolve blocks through S3.
+/// pack entries. This helper downloads the effective manifest (base + optional delta),
+/// opens a WriteCache via `open_from_manifest` (populating the block_map), and rebuilds
+/// the HostPackIndex so `read_v2` can resolve blocks through S3.
 pub async fn create_v2_cold_reader(
     temp_dir: &TempDir,
     name: &str,
@@ -81,14 +81,12 @@ pub async fn create_v2_cold_reader(
 ) {
     let content_store = ContentStore::new(Arc::clone(&s3), "test");
 
-    // Fetch manifest from S3
-    let manifest_bytes = content_store
-        .get_manifest(name)
+    // Fetch effective manifest (base + optional delta) from S3
+    let manifest = content_store
+        .get_effective_manifest(name)
         .await
         .expect("manifest fetch failed")
         .expect("manifest should exist in S3");
-    let manifest =
-        Manifest::deserialize(&manifest_bytes).expect("manifest deserialization failed");
 
     // Rebuild pack_index from manifest
     let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
