@@ -106,28 +106,40 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     // Discover exports from S3 (recovers exports created via API)
     info!("Discovering exports from S3...");
-    let mut discovered_count = 0;
-    match router.discover_exports().await {
+    let discovered_count = match router.discover_exports().await {
         Ok(discovered) => {
-            for config in discovered {
-                info!(
-                    "Discovered export '{}' ({}GB) from S3",
-                    config.name, config.size_gb
-                );
-                if let Err(e) = router.create_export(config.clone(), false, None).await {
-                    tracing::warn!("Failed to restore export '{}': {}", config.name, e);
-                } else {
-                    discovered_count += 1;
-                }
-            }
+            use futures::stream::{self, StreamExt};
+
+            let total = discovered.len();
+            info!("Found {} export(s) in S3, recovering in parallel...", total);
+            let count: usize = stream::iter(discovered)
+                .map(|config| {
+                    let router = Arc::clone(&router);
+                    async move {
+                        let name = config.name.clone();
+                        match router.create_export(config, false, None).await {
+                            Ok(()) => {
+                                info!("Restored export '{}'", name);
+                                1
+                            }
+                            Err(e) => {
+                                warn!("Failed to restore export '{}': {}", name, e);
+                                0
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(16)
+                .fold(0usize, |acc, n| async move { acc + n })
+                .await;
+            info!("Discovered {}/{} export(s) from S3", count, total);
+            count
         }
         Err(e) => {
-            tracing::warn!("Failed to discover exports from S3: {} (continuing with config)", e);
+            warn!("Failed to discover exports from S3: {} (continuing with config)", e);
+            0
         }
-    }
-    if discovered_count > 0 {
-        info!("Discovered {} export(s) from S3", discovered_count);
-    }
+    };
 
     // Load static exports from config (can add new exports or override discovered ones)
     let exports = nbd_config.get_exports();
@@ -137,15 +149,29 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         ));
     }
 
-    for export_config in exports {
-        info!(
-            "Loading static export '{}' ({}GB)",
-            export_config.name, export_config.size_gb
-        );
-        router
-            .create_export(export_config.clone(), false, None)
-            .await
-            .with_context(|| format!("Failed to create export '{}'", export_config.name))?;
+    {
+        use futures::stream::{self, StreamExt};
+
+        let errors: Vec<_> = stream::iter(exports)
+            .map(|config| {
+                let router = Arc::clone(&router);
+                async move {
+                    let name = config.name.clone();
+                    info!("Loading static export '{}' ({}GB)", name, config.size_gb);
+                    router
+                        .create_export(config, false, None)
+                        .await
+                        .with_context(|| format!("Failed to create export '{}'", name))
+                }
+            })
+            .buffer_unordered(16)
+            .filter_map(|r| async { r.err() })
+            .collect()
+            .await;
+
+        if let Some(first) = errors.into_iter().next() {
+            return Err(first);
+        }
     }
 
     let mut handles = Vec::new();

@@ -139,6 +139,35 @@ Three ways to attach `/dev/nbdN` to the server:
 
 Netlink is the right choice for production. Create the export via HTTP API, configure the kernel device via netlink, connect over UDS — single binary, no moving parts.
 
+### Binary Upgrades (Zero-Downtime)
+
+GlideFS supports binary upgrades without VM disruption when using netlink-based NBD (`NBD_GENL`). The kernel holds the socket fd and queues I/O during the restart window.
+
+```
+1. Set NBD_ATTR_DEAD_CONN_TIMEOUT on device setup (e.g. 30s)
+2. SIGUSR1 → drain all exports to S3
+3. SIGTERM → graceful shutdown
+4. Start new binary (same config, same cache dir)
+5. New process recovers exports in parallel from local WAL + redb
+6. /health/ready returns 200 → all exports serving
+7. NBD_CMD_RECONFIGURE with new socket fds
+8. Kernel resumes queued I/O
+```
+
+The block device stays alive throughout. Firecracker never sees a disconnect.
+
+Recovery is local — the new process reads WAL and redb from the same SSD, not S3. Export recovery runs 16-wide parallel. The `/health/ready` endpoint gates on all exports being loaded, cache writable, and S3 reachable.
+
+`dead_conn_timeout` must exceed: drain time + process restart + parallel WAL recovery. For typical deployments (< 100 exports), 30 seconds is conservative.
+
+### Flush and Durability
+
+Writes are durable on local SSD immediately. They are **not** in S3 until flushed. Local disk loss before flush = data loss for unflushed blocks.
+
+- Automatic flush runs on a background schedule (configurable)
+- `POST /api/exports/{name}/drain` forces a full flush before shutdown or migration
+- `POST /api/exports/{name}/snapshot` creates a point-in-time manifest in S3
+
 ### Scrubber
 
 Background integrity verification is disabled by default (`scrubber_blocks_per_second = 0`). The read path already verifies BLAKE3 hashes on S3 fetch. The scrubber re-hashes blocks in the local cache to detect silent SSD corruption — enable it if your workload demands it.
@@ -149,14 +178,6 @@ scrubber_blocks_per_second = 1000  # verify 1000 cached blocks/sec
 ```
 
 At 1,000 blocks/sec with 128KB blocks: ~2% of one core for BLAKE3 hashing, ~128MB/sec of cache reads. Full pass time depends on cache size.
-
-### Flush and Durability
-
-Writes are durable on local SSD immediately. They are **not** in S3 until flushed. Local disk loss before flush = data loss for unflushed blocks.
-
-- Automatic flush runs on a background schedule (configurable)
-- `POST /api/exports/{name}/drain` forces a full flush before shutdown or migration
-- `POST /api/exports/{name}/snapshot` creates a point-in-time manifest in S3
 
 ## Key Design Choices
 
