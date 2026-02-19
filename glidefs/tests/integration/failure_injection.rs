@@ -169,7 +169,7 @@ fn create_test_cache(
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: name.to_string(),
-        device_size: 10 * 1024 * 1024, // 10MB
+        device_size: 64 * 1024 * 1024, // 64MB
         block_size: BLOCK_SIZE,
         wal_sync: false,
     };
@@ -220,7 +220,7 @@ async fn create_reader_from_manifest(
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: name.to_string(),
-        device_size: 10 * 1024 * 1024,
+        device_size: manifest.device_size,
         block_size: BLOCK_SIZE,
         wal_sync: false,
     };
@@ -715,14 +715,15 @@ async fn test_partial_pack_upload_preserves_dirty() {
     let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
-    // Write enough blocks for multiple packs (25 blocks per pack, so 60 blocks = 2-3 packs)
-    for i in 0..60u8 {
-        let data: Vec<u8> = (0..BLOCK_SIZE).map(|j| i.wrapping_add(j as u8)).collect();
+    // Write enough blocks for multiple packs (100 blocks per pack, so 250 blocks = 2-3 packs)
+    let num_blocks = 250u32;
+    for i in 0..num_blocks {
+        let data: Vec<u8> = (0..BLOCK_SIZE).map(|j| (i as u8).wrapping_add(j as u8)).collect();
         cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
     }
 
     let dirty_before = cache.dirty_block_count();
-    assert_eq!(dirty_before, 60, "should have 60 dirty blocks");
+    assert_eq!(dirty_before, num_blocks as u64, "should have all blocks dirty");
 
     // Fail after 2 PUTs (first pack upload succeeds, second fails)
     s3.set_fail_after_puts(2);
@@ -761,7 +762,7 @@ async fn test_partial_pack_upload_preserves_dirty() {
     let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
         create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
-    for i in 0..60u8 {
+    for i in 0..num_blocks {
         let data = reader_cache
             .read_v2(
                 i as u64 * BLOCK_SIZE as u64,
@@ -774,7 +775,7 @@ async fn test_partial_pack_upload_preserves_dirty() {
             .await
             .unwrap();
 
-        let expected: Vec<u8> = (0..BLOCK_SIZE).map(|j| i.wrapping_add(j as u8)).collect();
+        let expected: Vec<u8> = (0..BLOCK_SIZE).map(|j| (i as u8).wrapping_add(j as u8)).collect();
         assert_eq!(
             data.as_ref(),
             &expected[..],

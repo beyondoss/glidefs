@@ -396,11 +396,11 @@ async fn test_gc_respects_max_deletes() {
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
     // Create orphans: write blocks, flush, overwrite with different data, flush
-    write_blocks(&cache, 0, 50, 0, cc.as_ref()); // enough blocks to create multiple packs
+    write_blocks(&cache, 0, 200, 0, cc.as_ref()); // enough blocks to create multiple packs
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
     let _orphan_count = stats1.new_pack_ids.len();
 
-    write_blocks(&cache, 0, 50, 42, cc.as_ref());
+    write_blocks(&cache, 0, 200, 42, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     // Inject old timestamps so all orphans are eligible
