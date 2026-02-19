@@ -198,9 +198,10 @@ impl NbdConfig {
         self.block_size.unwrap_or(Self::DEFAULT_BLOCK_SIZE)
     }
 
-    pub const DEFAULT_SCRUBBER_BPS: u64 = 1000;
+    pub const DEFAULT_SCRUBBER_BPS: u64 = 0;
 
-    /// Get the scrubber rate in blocks per second (default: 1000, 0 = disabled).
+    /// Get the scrubber rate in blocks per second (default: 0 = disabled).
+    /// Set to a positive value (e.g. 1000) to enable continuous background verification.
     pub fn scrubber_blocks_per_second(&self) -> u64 {
         self.scrubber_blocks_per_second
             .unwrap_or(Self::DEFAULT_SCRUBBER_BPS)

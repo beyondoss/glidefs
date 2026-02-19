@@ -168,7 +168,7 @@ The write path avoids all locks. Three techniques make this possible:
 Every block is identified by its BLAKE3-128 hash (16 bytes, truncated from 256-bit), computed at flush time (not on the write path). This enables:
 
 - **Cross-export deduplication**: Identical blocks across all exports on a host resolve to the same hash in `HostPackIndex` — only stored once in S3. Ten identical 10GB VMs use ~10GB of S3, not 100GB.
-- **Integrity verification**: Read path verifies hash after S3 fetch and LZ4 decompression. Background scrubber re-hashes cached blocks to detect bit rot.
+- **Integrity verification**: Read path verifies hash after S3 fetch and LZ4 decompression. Optional background scrubber can re-hash cached blocks to detect bit rot.
 - **Sparse manifests**: Only non-zero, written chunks are stored — a 500GB export with 2GB of data has a tiny manifest.
 
 The well-known hash of a 128KB zero block (`ZERO_BLOCK_HASH`) lets unwritten regions return zeros without any storage or S3 interaction. (`block_map.rs:77`)
@@ -331,7 +331,7 @@ Binary snapshot of export state. Sparse: only written chunks are stored. CRC32 t
 ```
 ┌─────────────────────────── Manifest ────────────────────────┐
 │ Header (46 + name_len bytes)                                │
-│   magic: "GLDE"  version: 2  flags: 0x0000  name_len       │
+│   magic: "GLDE"  version: 2  flags: 0x0000  name_len        │
 │   sequence  chunk_size  device_size                         │
 │   block_map_count  pack_index_count                         │
 │   name (variable length)                                    │
@@ -355,7 +355,7 @@ Contains only blocks changed since the last full manifest. See [Delta Manifests]
 ```
 ┌──────────────────────── Delta Manifest ─────────────────────┐
 │ Header (46 + name_len bytes)                                │
-│   magic: "GLDE"  version: 2  flags: 0x0001  name_len       │
+│   magic: "GLDE"  version: 2  flags: 0x0001  name_len        │
 │   sequence  chunk_size  device_size                         │
 │   block_map_count (= upsert count)                          │
 │   pack_index_count (= new pack count)                       │
@@ -397,7 +397,7 @@ CRC32 trailer detects torn writes. On recovery, replay stops at the first corrup
 Rate-limited background task that re-hashes blocks in the CleanCache against their content address. On mismatch (bit rot, memory corruption), evicts the block — the next read re-fetches from S3, which is the authoritative source.
 
 - Iterates all hashes in `HostPackIndex`, checks if each is in CleanCache
-- Rate-limited: `scrubber_blocks_per_second` (default 1000, 0 = disabled)
+- Rate-limited: `scrubber_blocks_per_second` (default 0 = disabled, set e.g. 1000 to enable)
 - 60s sleep between full passes
 - Prometheus counters: `blocks_checked`, `blocks_evicted`
 
@@ -671,7 +671,7 @@ Dense arrays pre-allocate for all blocks: a 1TB export with 128KB blocks has 8M 
 
 Sparse page tables allocate on first write. The directory (one pointer per page) costs ~530KB. Each 4KB page covers 128 hash entries or 4096 state entries. An empty export: ~530KB. A 1%-written export: ~5MB. The cost is one extra pointer dereference on the hot path — a branch that predicts correctly almost every time and is noise next to the SSD pwrite that follows it.
 
-We considered co-locating state into `HashEntry` (add `state: AtomicU8`, bump to 40 bytes, 102 entries/page). Rejected because state transitions (`set_present`, `transition_to_dirty`) are lock-free today — direct CAS on `AtomicU8`. `AtomicBlockMap` is behind a `RwLock` (for fork-overlay swaps). Co-locating would force every state transition through a read lock. Two separate sparse structures preserve lock-free state transitions while achieving the same memory savings.
+State is kept in a separate `SparseStateMap` rather than co-located in `HashEntry`. State transitions (`set_present`, `transition_to_dirty`) are direct CAS on `AtomicU8` — fully lock-free. The `AtomicBlockMap` is behind a `RwLock<BlockMapKind>` for fork-overlay swaps, so co-locating state there would force every state transition through a read lock. Two separate sparse structures keep state transitions lock-free while achieving the same memory savings.
 
 ### Why SeqLock instead of RwLock for the block map?
 
@@ -796,7 +796,7 @@ Supported storage backends: **Amazon S3** (`s3://`), **Google Cloud Storage** (`
 | Variable | Default | Why |
 |----------|---------|-----|
 | `block_size` | 128KB | Matches ZFS recordsize |
-| `scrubber_blocks_per_second` | 1000 | Background integrity rate; 0 = disabled |
+| `scrubber_blocks_per_second` | 0 | Background integrity rate (disabled by default); set to e.g. 1000 to enable |
 | `memory_size_gb` | 1.0 | Foyer in-memory cache for hot blocks |
 | `ssd_cache_size_gb` | 10.0 | Foyer SSD tier catches memory evictions |
 | `connect_timeout_secs` | 10 | S3 connection timeout |
