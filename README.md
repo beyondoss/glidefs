@@ -1,6 +1,6 @@
 # GlideFS
 
-NBD block device server that turns S3 into fast local storage. Writes hit local SSD in 20 microseconds. Background sync uploads to S3 as content-addressed packs.
+NBD block device server that turns S3 into fast local storage. Writes hit local SSD in 5 microseconds. Background sync uploads to S3 as content-addressed packs.
 
 Built for microVM storage at [Paraglide](https://paraglide.sh).
 
@@ -87,7 +87,7 @@ curl -X DELETE localhost:8080/api/exports/my-vm
 | `/api/exports/{name}/drain` | POST | Flush to S3 for shutdown/migration |
 | `/api/exports/{name}/snapshot` | POST | Point-in-time snapshot to S3 |
 | `/api/exports/{name}/promote` | POST | Promote readonly to read-write |
-| `/api/exports/{name}/flush-mode` | POST | Set flush mode |
+| `/health/ready` | GET | Readiness check |
 | `/api/exports/{name}/metrics` | GET | I/O metrics |
 | `/health` | GET | Health check |
 | `/metrics` | GET | Prometheus metrics |
@@ -101,6 +101,62 @@ glidefs bless --image ubuntu-22.04.raw --name ubuntu-22.04-v1 --config glidefs.t
 ```
 
 Exports forked from base images share blocks via content addressing. Identical data is stored once.
+
+## Operations
+
+### Cache Sizing
+
+The clean cache (foyer) is shared across all exports via content addressing. Identical blocks are stored once.
+
+| Component | What it holds | Sizing guidance |
+|---|---|---|
+| Memory cache (`memory_size_gb`) | Hot decompressed blocks | 1-4GB. Serves ~100ns reads. |
+| SSD cache (`ssd_cache_size_gb`) | Warm blocks evicted from memory | Size for your unique working set. Shared OS/runtime blocks deduplicate automatically. |
+| Dirty data + WAL | Unflushed writes, per-export | Grows between flush cycles. Budget 10-100MB per active export. |
+
+For 2,000 VMs on one host with a shared base image: the OS/runtime blocks (~2-3GB) are stored once in cache. Per-VM unique data (app state, DB pages) is what scales. A 2TB NVMe comfortably handles this.
+
+### Transport
+
+Use the Unix domain socket for NBD. TCP between client and server on the same host adds latency, connection-drop risk, and firewall surface for no benefit. The only failure mode with UDS is server process death — which is the same regardless of transport.
+
+```toml
+[servers.nbd]
+unix_socket = "/var/run/glidefs.sock"
+```
+
+TCP is available but only useful if you need to serve NBD to a different host.
+
+### Device Setup
+
+Three ways to attach `/dev/nbdN` to the server:
+
+| Method | Kernel | Notes |
+|---|---|---|
+| `nbd-client` | Any | External dependency. `nbd-client -N myexport -u /var/run/glidefs.sock /dev/nbd0` |
+| ioctl | Any | `NBD_SET_SOCK` + `NBD_SET_SIZE` + `NBD_DO_IT`. Blocks a thread per device. No reconnect. |
+| Netlink (`NBD_GENL`) | 4.10+ | Preferred. Non-blocking, supports `NBD_CMD_RECONFIGURE` for live resize, multiple sockets per device for failover. No external tools. |
+
+Netlink is the right choice for production. Create the export via HTTP API, configure the kernel device via netlink, connect over UDS — single binary, no moving parts.
+
+### Scrubber
+
+Background integrity verification is disabled by default (`scrubber_blocks_per_second = 0`). The read path already verifies BLAKE3 hashes on S3 fetch. The scrubber re-hashes blocks in the local cache to detect silent SSD corruption — enable it if your workload demands it.
+
+```toml
+[servers.nbd]
+scrubber_blocks_per_second = 1000  # verify 1000 cached blocks/sec
+```
+
+At 1,000 blocks/sec with 128KB blocks: ~2% of one core for BLAKE3 hashing, ~128MB/sec of cache reads. Full pass time depends on cache size.
+
+### Flush and Durability
+
+Writes are durable on local SSD immediately. They are **not** in S3 until flushed. Local disk loss before flush = data loss for unflushed blocks.
+
+- Automatic flush runs on a background schedule (configurable)
+- `POST /api/exports/{name}/drain` forces a full flush before shutdown or migration
+- `POST /api/exports/{name}/snapshot` creates a point-in-time manifest in S3
 
 ## Key Design Choices
 
