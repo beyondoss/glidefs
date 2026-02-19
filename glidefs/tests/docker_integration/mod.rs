@@ -114,7 +114,7 @@ impl TestServer {
             wal_sync: false,
             max_s3_uploads: 128,
             max_s3_downloads: 512,
-        }));
+        }).expect("failed to create test router"));
 
         // Pre-bind to get a random port, then release for the server
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
