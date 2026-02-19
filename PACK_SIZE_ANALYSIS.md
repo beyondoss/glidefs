@@ -143,37 +143,41 @@ entirely.
 
 ## S3 PUT Cost
 
-The pack size directly affects the number of S3 PUT operations per flush. Fewer,
-larger packs = fewer PUTs = lower cost.
+Flushes are event-driven (pack full, VM drain, compute node drain) — there is
+no fixed flush interval. PUT cost is therefore purely a function of **unique
+write throughput**:
 
-| Blocks/Pack | Packs per Flush (5000 dirty blocks) |
-|-------------|-------------------------------------|
-| 25 | 200 |
-| 100 | 50 |
-| 200 | 25 |
+```
+PUT cost = (unique 128KB blocks written across fleet) / BLOCKS_PER_PACK * $0.000005
+```
 
-At $0.005 per 1,000 PUTs, the per-flush PUT cost at 100 blocks/pack is 4x lower
-than at 25. But this is the **ceiling** — the actual number of packs uploaded is
-lower because dedup skips blocks already in the pack index. In practice:
+The dedup ratio dominates this calculation far more than pack size does. At
+1.93x dedup on forked images, roughly half the blocks written across a fleet
+share content with existing packs and generate no new PUTs regardless of pack
+size. Pack size only affects how many PUTs the remaining unique blocks require.
 
-- VMs forked from a blessed base image share most blocks. After the first VM
-  flushes, subsequent VMs' base blocks match existing hashes and generate no
-  new packs.
-- Repeated flushes of the same VM only upload packs for blocks that changed
-  since the last flush AND whose content is genuinely new (not seen before).
-- The dedup benchmarks show ~1.93x dedup ratio on forked images at 128KB block
-  size, meaning roughly half the blocks across forked VMs are shared.
+The relative improvement from pack size is straightforward:
 
-The real cost driver is **unique dirty blocks per flush**, not total dirty blocks.
-For a fleet of 1000 VMs sharing a base image with ~10% unique writes per flush,
-the actual PUT count at 100 blocks/pack would be roughly:
+| Pack Size | PUTs per 1000 unique blocks |
+|-----------|----------------------------|
+| 25 | 40 |
+| 100 | 10 |
+| 200 | 5 |
 
-- 5000 dirty blocks x 10% unique = 500 unique blocks -> 5 packs -> 5 PUTs
-- Per VM per flush: 5 PUTs
-- 1000 VMs x 5760 flushes/day x 30 days = 864M PUTs/month -> $4,320/month
+Going from 25 to 100 blocks/pack cuts PUT count 4x. Going from 100 to 200 only
+cuts it 2x further with significantly higher memory and prefetch latency costs.
 
-Even at 50% unique (pessimistic): 25 PUTs/flush -> $21,600/month. The pack
-size matters less than the dedup ratio for cost.
+To estimate actual fleet costs, substitute your measured unique write throughput
+per VM. The formula is:
+
+```
+monthly PUTs = (unique blocks written/day per VM) * fleet_size * 30 / BLOCKS_PER_PACK
+monthly cost = monthly PUTs / 1000 * $0.005
+```
+
+The key input is unique write throughput, which varies widely by workload. Idle
+VMs on a shared base image may write almost nothing unique; write-heavy workloads
+will dominate. Measure this before treating any cost number as meaningful.
 
 ## Memory
 
@@ -194,17 +198,15 @@ practical ceiling.
 
 ## Flush Latency Impact
 
-With the current 25 blocks/pack and 5000 dirty blocks per flush:
-- 200 packs x 6ms assembly = 1.2s compute (sequential, ~0.7s with rayon)
-- 200 S3 PUTs (bounded by `max_s3_uploads` semaphore, default 128)
+With the current 25 blocks/pack, a drain flush of N dirty blocks produces N/25
+packs. During normal operation, a flush is triggered when a pack fills (exactly
+100 blocks at the new size), so drain flushes are the primary case where pack
+count varies.
 
-At 100 blocks/pack:
-- 50 packs x 29ms assembly = 1.45s compute (sequential, ~0.9s with rayon)
-- 50 S3 PUTs
-
-Assembly time per flush is similar (slightly higher total, but fewer packs to
-upload). The S3 upload phase drops 4x — fewer PUTs means fewer round trips
-and less contention on the upload semaphore.
+At 100 blocks/pack vs 25, drain flushes produce 4x fewer packs:
+- Per-block assembly cost is unchanged (~280-300us/block)
+- Fewer packs means fewer S3 round trips and less contention on the upload semaphore
+- Total assembly compute per flush is similar; the savings come from the upload phase
 
 ## Recommendation
 

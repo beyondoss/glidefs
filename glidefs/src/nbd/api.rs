@@ -212,11 +212,16 @@ where
                         block_size: put_req.block_size,
                     };
 
-                    match router.create_export(config, put_req.readonly, put_req.manifest_name.as_deref()).await {
-                        Ok(()) => json_response(
-                            StatusCode::CREATED,
-                            &ApiResponse::success(format!("Export '{}' created", name)),
-                        ),
+                    match router.create_export(config.clone(), put_req.readonly, put_req.manifest_name.as_deref()).await {
+                        Ok(()) => {
+                            if let Err(e) = router.save_export(&config).await {
+                                warn!("Failed to persist export to S3: {} (export is functional)", e);
+                            }
+                            json_response(
+                                StatusCode::CREATED,
+                                &ApiResponse::success(format!("Export '{}' created", name)),
+                            )
+                        }
                         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
                     }
                 }

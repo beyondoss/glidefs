@@ -159,13 +159,17 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                     let name = config.name.clone();
                     info!("Loading static export '{}' ({}GB)", name, config.size_gb);
                     router
-                        .create_export(config, false, None)
+                        .create_export(config.clone(), false, None)
                         .await
-                        .with_context(|| format!("Failed to create export '{}'", name))
+                        .with_context(|| format!("Failed to create export '{}'", name))?;
+                    if let Err(e) = router.save_export(&config).await {
+                        warn!("Failed to persist export '{}' to S3: {}", name, e);
+                    }
+                    Ok(())
                 }
             })
             .buffer_unordered(16)
-            .filter_map(|r| async { r.err() })
+            .filter_map(|r: Result<()>| async { r.err() })
             .collect()
             .await;
 

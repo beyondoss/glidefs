@@ -156,9 +156,9 @@ GlideFS supports binary upgrades without VM disruption when using netlink-based 
 
 The block device stays alive throughout. Firecracker never sees a disconnect.
 
-Recovery is local — the new process reads WAL and redb from the same SSD, not S3. Export recovery runs 16-wide parallel. The `/health/ready` endpoint gates on all exports being loaded, cache writable, and S3 reachable.
+Recovery is local — the new process reads WAL and redb from the same SSD, not S3. Discovery (S3) runs 32-wide parallel, export creation (local I/O) runs 16-wide parallel. No S3 writes on the recovery path. The `/health/ready` endpoint gates on all exports being loaded, cache writable, and S3 reachable.
 
-`dead_conn_timeout` must exceed: drain time + process restart + parallel WAL recovery. For typical deployments (< 100 exports), 30 seconds is conservative.
+`dead_conn_timeout` must exceed: drain time + process restart + discovery + parallel WAL recovery. 2000 exports recover in ~6 seconds. 30 seconds is conservative.
 
 ### Flush and Durability
 

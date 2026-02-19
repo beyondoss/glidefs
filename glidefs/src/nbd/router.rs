@@ -407,7 +407,8 @@ impl ExportRouter {
     }
 
     /// Save export definition to S3 (idempotent).
-    async fn save_export(&self, config: &ExportConfig) -> Result<(), RouterError> {
+    /// Persist export definition to S3 for discovery on restart.
+    pub async fn save_export(&self, config: &ExportConfig) -> Result<(), RouterError> {
         let path = self.export_json_path(&config.name);
         let json = serde_json::to_vec(config)?;
         self.object_store.put(&path, Bytes::from(json).into()).await?;
@@ -447,17 +448,18 @@ impl ExportRouter {
 
     /// Discover all exports from S3.
     ///
-    /// Lists the `{db_path}/nbd/` prefix and loads each `export.json` found.
+    /// Lists the `{db_path}/nbd/` prefix and loads each `export.json` in parallel.
     pub async fn discover_exports(&self) -> Result<Vec<ExportConfig>, RouterError> {
+        use futures::stream::{self, StreamExt};
+
         let prefix = Path::from(format!("{}/nbd/", self.db_path));
-        let mut exports = Vec::new();
 
         // List all objects under the nbd prefix
-        let mut stream = self.object_store.list(Some(&prefix));
+        let mut list_stream = self.object_store.list(Some(&prefix));
 
         // Collect export names from export.json files
         let mut export_names = std::collections::HashSet::new();
-        while let Some(result) = stream.next().await {
+        while let Some(result) = list_stream.next().await {
             let meta = result?;
             let path_str = meta.location.to_string();
             // Look for paths like "{db_path}/nbd/{name}/export.json"
@@ -469,20 +471,25 @@ impl ExportRouter {
             }
         }
 
-        // Load each export definition
-        for name in export_names {
-            match self.load_export(&name).await {
-                Ok(Some(config)) => {
-                    exports.push(config);
+        // Load export definitions in parallel
+        let exports: Vec<ExportConfig> = stream::iter(export_names)
+            .map(|name| async move {
+                match self.load_export(&name).await {
+                    Ok(Some(config)) => Some(config),
+                    Ok(None) => {
+                        warn!("Export.json disappeared during discovery: {}", name);
+                        None
+                    }
+                    Err(e) => {
+                        warn!("Failed to load export '{}': {}", name, e);
+                        None
+                    }
                 }
-                Ok(None) => {
-                    warn!("Export.json disappeared during discovery: {}", name);
-                }
-                Err(e) => {
-                    warn!("Failed to load export '{}': {}", name, e);
-                }
-            }
-        }
+            })
+            .buffer_unordered(32)
+            .filter_map(|x| async { x })
+            .collect()
+            .await;
 
         Ok(exports)
     }
@@ -718,12 +725,6 @@ impl ExportRouter {
         exports.insert(name.clone(), state);
 
         info!("Export '{}' created successfully (readonly={})", name, readonly);
-
-        // Persist export definition to S3 for discovery on restart
-        if let Err(e) = self.save_export(&config).await {
-            warn!("Failed to persist export to S3: {} (export is functional)", e);
-        }
-
         Ok(())
     }
 
@@ -951,7 +952,10 @@ impl ExportRouter {
             block_size: Some(block_size),
         };
 
-        self.create_export(config, readonly, Some(name)).await?;
+        self.create_export(config.clone(), readonly, Some(name)).await?;
+        if let Err(e) = self.save_export(&config).await {
+            warn!("Failed to persist resized export to S3: {}", e);
+        }
 
         info!("Export '{}' resized to {}GB", name, new_size_gb);
         Ok(())
@@ -1535,8 +1539,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let router = create_test_router(&temp_dir);
 
-        // Create export (should persist to S3)
-        router.create_export(test_export_config("auto-persist"), false, None).await.unwrap();
+        // Create export and persist to S3
+        let config = test_export_config("auto-persist");
+        router.create_export(config.clone(), false, None).await.unwrap();
+        router.save_export(&config).await.unwrap();
 
         // Verify it was persisted
         let loaded = router.load_export("auto-persist").await.unwrap();
@@ -1548,8 +1554,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let router = create_test_router(&temp_dir);
 
-        // Create export
-        router.create_export(test_export_config("purge-vol"), false, None).await.unwrap();
+        // Create export and persist
+        let config = test_export_config("purge-vol");
+        router.create_export(config.clone(), false, None).await.unwrap();
+        router.save_export(&config).await.unwrap();
 
         // Verify persisted
         let loaded = router.load_export("purge-vol").await.unwrap();

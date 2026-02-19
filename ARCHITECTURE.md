@@ -542,7 +542,7 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 
 ### Export Persistence & Discovery
 
-Export definitions are saved to S3 as `{db_path}/nbd/{name}/export.json` on creation. On startup, `discover_exports()` lists all `export.json` files under the `nbd/` prefix and recreates exports from their definitions + S3 manifests. This enables stateless restarts — a new node can resume serving any export by reading its definition and manifest from S3. (`router.rs:save_export`, `router.rs:discover_exports`)
+Export definitions are saved to S3 as `{db_path}/nbd/{name}/export.json` by the API and static config paths (not on the recovery path — discovered exports skip the redundant S3 PUT). On startup, `discover_exports()` lists all `export.json` files under the `nbd/` prefix and loads them 32-wide parallel, then `create_export()` recovers each from local WAL + redb 16-wide parallel. No S3 writes on the recovery path. This enables both stateless restarts (new node from S3) and fast binary upgrades (same node, local state intact — 2000 exports in ~6s). (`router.rs:save_export`, `router.rs:discover_exports`, `cli/server.rs`)
 
 ### Storage Compatibility
 
