@@ -160,6 +160,31 @@ Recovery is local — the new process reads WAL and redb from the same SSD, not 
 
 `dead_conn_timeout` must exceed: drain time + process restart + discovery + parallel WAL recovery. 2000 exports recover in ~6 seconds. 30 seconds is conservative.
 
+### Database Workloads
+
+Mount the database's WAL directory on a separate volume that's not GlideFS. Keep GlideFS for the OS, application code, and data files.
+
+```
+/dev/vda → GlideFS    (OS, app, DB data files)
+/dev/vdb → local NVMe  (WAL only)
+```
+
+```sh
+# PostgreSQL
+initdb --waldir=/mnt/wal
+
+# MySQL/InnoDB
+innodb_log_group_home_dir = /mnt/wal
+```
+
+**Why:** Database WAL is high-frequency sequential writes to blocks the DB recycles within minutes. A busy Postgres writing 100MB/s of WAL generates ~8 pack uploads/second per VM — all for data that's transient. At 2000 VMs, that's 16,000 S3 PUTs/second of dead WAL segments.
+
+**Durability is unchanged.** GlideFS is write-behind: the DB fsyncs WAL to local SSD, but that data isn't in S3 until the next flush cycle. Host death loses unflushed WAL either way. Separating it stops paying S3 costs for durability you didn't have.
+
+**Migration:** Force a checkpoint before migrating (`CHECKPOINT` in Postgres). The WAL volume is local-only — GlideFS drain + wake handles the data files, the DB recovers from the checkpoint.
+
+**Forks:** Fork gets the CoW snapshot of data files but no WAL. The forked DB starts from the last checkpoint — clean state, no in-flight transactions.
+
 ### Flush and Durability
 
 Writes are durable on local SSD immediately. They are **not** in S3 until flushed. Local disk loss before flush = data loss for unflushed blocks.

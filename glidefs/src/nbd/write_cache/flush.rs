@@ -319,7 +319,7 @@ impl WriteCache<Active> {
         let zero_hash = self.inner.zero_block_hash;
         let inner = Arc::clone(&self.inner);
         let pack_index_clone = Arc::clone(host_pack_index);
-        let batch = crate::task::spawn_blocking_named("flush-compute", move || {
+        let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
             compute_flush_batch(&inner, &snapshot, &pack_index_clone, zero_hash)
         })
         .await
@@ -327,37 +327,49 @@ impl WriteCache<Active> {
 
         let mut stats = batch.stats;
 
-        // 4. Assemble packs then upload concurrently.
-        //    Separate assembly from upload so we can fire all S3 PUTs at once.
-        let mut pack_meta: Vec<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>)> = Vec::new();
-        let mut upload_pairs: Vec<(uuid::Uuid, Vec<u8>)> = Vec::new();
+        // 4. Pipeline: assemble packs + upload with bounded concurrency.
+        //    Each pack is assembled (consuming its compressed blocks) then uploaded.
+        //    buffer_unordered(4) keeps at most 4 packs in flight, freeing memory
+        //    as uploads complete instead of holding all packs at once.
+        use futures::stream::{self, StreamExt};
 
-        for chunk in batch.to_upload.chunks(BLOCKS_PER_PACK) {
-            let pack_id = uuid::Uuid::new_v4();
-            let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size);
-            let pack_size = pack_bytes.len() as u64;
-            pack_meta.push((pack_id, pack_size, index_entries));
-            upload_pairs.push((pack_id, pack_bytes));
+        let to_upload = std::mem::take(&mut batch.to_upload);
+        let mut owned_chunks: Vec<Vec<(Blake3Hash, Vec<u8>)>> = Vec::new();
+        {
+            let mut iter = to_upload.into_iter().peekable();
+            while iter.peek().is_some() {
+                owned_chunks.push(iter.by_ref().take(BLOCKS_PER_PACK).collect());
+            }
         }
 
-        // Upload all packs concurrently
-        let upload_futs: Vec<_> = upload_pairs
-            .into_iter()
-            .map(|(id, bytes)| content_store.put_pack(id, bytes))
-            .collect();
-        futures::future::try_join_all(upload_futs).await?;
+        let pack_results: Vec<Result<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>), CacheError>> =
+            stream::iter(owned_chunks)
+                .map(|chunk| {
+                    let cs = &*content_store;
+                    async move {
+                        let pack_id = uuid::Uuid::new_v4();
+                        let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size);
+                        let pack_size = pack_bytes.len() as u64;
+                        cs.put_pack(pack_id, pack_bytes).await?;
+                        Ok((pack_id, pack_size, index_entries))
+                    }
+                })
+                .buffer_unordered(4)
+                .collect()
+                .await;
 
         // Register in host pack index for future dedup
         let mut batch_entries = Vec::new();
-        for (pack_id, pack_size, index_entries) in &pack_meta {
+        for result in pack_results {
+            let (pack_id, pack_size, index_entries) = result?;
             stats.packs_uploaded += 1;
-            stats.bytes_uploaded += *pack_size;
-            stats.new_pack_ids.push(*pack_id);
-            for entry in index_entries {
+            stats.bytes_uploaded += pack_size;
+            stats.new_pack_ids.push(pack_id);
+            for entry in &index_entries {
                 batch_entries.push((
                     entry.hash,
                     PackLocation {
-                        pack_id: *pack_id,
+                        pack_id,
                         offset: entry.offset,
                         comp_length: entry.comp_length,
                     },

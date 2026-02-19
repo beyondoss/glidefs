@@ -190,7 +190,7 @@ fn measure_pack_size(
     let assembled_packs: Vec<Vec<u8>> = prepared_packs
         .iter()
         .map(|prepared| {
-            let (pack_bytes, _entries) = assemble_pack(prepared, BLOCK_SIZE as u32);
+            let (pack_bytes, _entries) = assemble_pack(prepared.clone(), BLOCK_SIZE as u32);
             pack_bytes
         })
         .collect();
@@ -216,7 +216,7 @@ fn measure_pack_size(
                 .iter()
                 .map(|data| (blake3_128(data), lz4_compress(data)))
                 .collect();
-            let (pack, _) = assemble_pack(&prepped, BLOCK_SIZE as u32);
+            let (pack, _) = assemble_pack(prepped, BLOCK_SIZE as u32);
             std::hint::black_box(&pack);
         }
     }
@@ -229,7 +229,7 @@ fn measure_pack_size(
                 .iter()
                 .map(|data| (blake3_128(data), lz4_compress(data)))
                 .collect();
-            let (_pack, _entries) = assemble_pack(&prepped, BLOCK_SIZE as u32);
+            let (_pack, _entries) = assemble_pack(prepped, BLOCK_SIZE as u32);
             assembly_times.push(start.elapsed().as_micros() as f64);
         }
     }

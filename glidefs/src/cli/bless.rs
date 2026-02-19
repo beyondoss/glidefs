@@ -219,7 +219,7 @@ async fn upload_pack(
     stats: &mut BlessStats,
 ) -> Result<()> {
     let pack_id = Uuid::new_v4();
-    let (pack_bytes, index_entries) = assemble_pack(batch, chunk_size);
+    let (pack_bytes, index_entries) = assemble_pack(std::mem::take(batch), chunk_size);
     let pack_size = pack_bytes.len() as u64;
 
     content_store
@@ -238,7 +238,6 @@ async fn upload_pack(
 
     stats.packs_uploaded += 1;
     stats.bytes_uploaded += pack_size;
-    batch.clear();
     Ok(())
 }
 
