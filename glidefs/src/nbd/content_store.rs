@@ -9,10 +9,11 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use super::manifest::manifest_s3_key;
+use super::manifest::{delta_manifest_s3_key, manifest_s3_key, Manifest, ManifestDelta};
 use super::pack::pack_s3_key;
 use super::pack_registry::registry_s3_key;
 
@@ -44,6 +45,10 @@ pub struct ContentStore {
     object_store: Arc<dyn ObjectStore>,
     base_path: String,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
+    /// Global S3 upload concurrency limit shared across all exports (background flush).
+    upload_semaphore: Option<Arc<Semaphore>>,
+    /// Global S3 download concurrency limit shared across all exports (read path).
+    download_semaphore: Option<Arc<Semaphore>>,
 }
 
 impl ContentStore {
@@ -52,12 +57,26 @@ impl ContentStore {
             object_store,
             base_path: base_path.trim_end_matches('/').to_string(),
             circuit_breaker: None,
+            upload_semaphore: None,
+            download_semaphore: None,
         }
     }
 
     /// Attach a shared circuit breaker for S3 calls.
     pub fn with_circuit_breaker(mut self, cb: Arc<CircuitBreaker>) -> Self {
         self.circuit_breaker = Some(cb);
+        self
+    }
+
+    /// Attach a shared semaphore to limit concurrent S3 uploads across all exports.
+    pub fn with_upload_semaphore(mut self, sem: Arc<Semaphore>) -> Self {
+        self.upload_semaphore = Some(sem);
+        self
+    }
+
+    /// Attach a shared semaphore to limit concurrent S3 downloads across all exports.
+    pub fn with_download_semaphore(mut self, sem: Arc<Semaphore>) -> Self {
+        self.download_semaphore = Some(sem);
         self
     }
 
@@ -83,9 +102,16 @@ impl ContentStore {
     }
 
     /// Upload a pack to S3.
+    ///
+    /// If an upload semaphore is attached, acquires a permit before uploading
+    /// to bound global S3 upload concurrency across all exports.
     #[instrument(skip(self, data), fields(pack_id = %pack_id, size = data.len()))]
     pub async fn put_pack(&self, pack_id: Uuid, data: Vec<u8>) -> Result<(), ContentStoreError> {
         self.check_circuit()?;
+        let _permit = match &self.upload_semaphore {
+            Some(sem) => Some(sem.acquire().await.expect("upload semaphore closed")),
+            None => None,
+        };
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
@@ -113,7 +139,8 @@ impl ContentStore {
     /// Fetch a single compressed block from a pack via S3 range request.
     ///
     /// Returns only the compressed bytes at `[offset..offset+comp_length]` —
-    /// typically ~100KB vs ~3MB for the full pack.
+    /// typically ~100KB vs ~3MB for the full pack. If a download semaphore is
+    /// attached, acquires a permit to bound global S3 read concurrency.
     #[instrument(skip(self), fields(pack_id = %pack_id, offset, comp_length))]
     pub async fn get_block(
         &self,
@@ -122,6 +149,10 @@ impl ContentStore {
         comp_length: u32,
     ) -> Result<bytes::Bytes, ContentStoreError> {
         self.check_circuit()?;
+        let _permit = match &self.download_semaphore {
+            Some(sem) => Some(sem.acquire().await.expect("download semaphore closed")),
+            None => None,
+        };
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
         let start = offset as u64;
@@ -136,6 +167,9 @@ impl ContentStore {
     /// Returns a stream of `Bytes` chunks. The caller can parse the header/index
     /// from early chunks and decompress blocks incrementally as data arrives,
     /// avoiding buffering the full ~3MB pack in memory.
+    ///
+    /// If a download semaphore is attached, a permit is held for the duration of
+    /// the stream (dropped when the returned stream is dropped).
     #[instrument(skip(self), fields(pack_id = %pack_id))]
     pub async fn get_pack_stream(
         &self,
@@ -145,12 +179,19 @@ impl ContentStore {
         ContentStoreError,
     > {
         self.check_circuit()?;
+        let permit = match &self.download_semaphore {
+            Some(sem) => Some(sem.acquire().await.expect("download semaphore closed")),
+            None => None,
+        };
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
         let result = self.object_store.get(&path).await;
         self.record_s3_result(&result);
         let response = result?;
-        let stream = response.into_stream().map(|r| r.map_err(ContentStoreError::from));
+        let stream = response.into_stream().map(move |r| {
+            let _permit = &permit; // hold permit until stream is consumed/dropped
+            r.map_err(ContentStoreError::from)
+        });
         Ok(Box::pin(stream))
     }
 
@@ -191,6 +232,114 @@ impl ContentStore {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    // =========================================================================
+    // Delta manifest operations
+    // =========================================================================
+
+    /// Upload a delta manifest to S3.
+    #[instrument(skip(self, data), fields(name = %name, size = data.len()))]
+    pub async fn put_delta_manifest(
+        &self,
+        name: &str,
+        data: Vec<u8>,
+    ) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, delta_manifest_s3_key(name));
+        let path = ObjectPath::from(key);
+        let payload = PutPayload::from(data);
+        let result = self.object_store.put(&path, payload).await;
+        self.record_s3_result(&result);
+        result?;
+        debug!("uploaded delta manifest");
+        Ok(())
+    }
+
+    /// Download a delta manifest from S3. Returns None if not found.
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn get_delta_manifest(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, delta_manifest_s3_key(name));
+        let path = ObjectPath::from(key);
+        let result = self.object_store.get(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(response) => {
+                let bytes = response.bytes().await?;
+                Ok(Some(bytes.to_vec()))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete a delta manifest from S3 (idempotent).
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn delete_delta_manifest(&self, name: &str) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, delta_manifest_s3_key(name));
+        let path = ObjectPath::from(key);
+        let result = self.object_store.delete(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Fetch the effective manifest by merging base + optional delta.
+    ///
+    /// 1. Fetch base manifest via `get_manifest()`
+    /// 2. Fetch delta via `get_delta_manifest()` (may not exist)
+    /// 3. If delta exists and `delta.base_sequence == base.sequence`, apply delta
+    /// 4. If delta is stale (wrong base_sequence), warn and return base only
+    /// 5. If no delta, return base
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn get_effective_manifest(
+        &self,
+        name: &str,
+    ) -> Result<Option<Manifest>, ContentStoreError> {
+        let base_data = match self.get_manifest(name).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let base = Manifest::deserialize(&base_data).map_err(|e| {
+            ContentStoreError::ObjectStore(object_store::Error::Generic {
+                store: "manifest",
+                source: Box::new(e),
+            })
+        })?;
+
+        let delta_data = match self.get_delta_manifest(name).await? {
+            Some(d) => d,
+            None => return Ok(Some(base)),
+        };
+
+        let delta = match ManifestDelta::deserialize(&delta_data) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(name = %name, error = %e, "failed to deserialize delta manifest, using base only");
+                return Ok(Some(base));
+            }
+        };
+
+        if delta.base_sequence != base.sequence {
+            tracing::warn!(
+                name = %name,
+                delta_base_seq = delta.base_sequence,
+                base_seq = base.sequence,
+                "stale delta manifest (base_sequence mismatch), using base only"
+            );
+            return Ok(Some(base));
+        }
+
+        Ok(Some(delta.apply_to(&base)))
     }
 
     /// List all base manifest names under `manifests/bases/`.
@@ -317,7 +466,8 @@ impl ContentStore {
     /// List all manifest names under `manifests/` (not just bases).
     ///
     /// Returns paths relative to `manifests/`, e.g. `"vm1"`, `"bases/ubuntu-22.04"`.
-    /// Filters out `.hot-set` files.
+    /// Filters out `.hot-set` and `.delta` files (delta manifests are accessed via
+    /// `get_delta_manifest` using the deterministic key pattern).
     pub async fn list_all_manifests(&self) -> Result<Vec<String>, ContentStoreError> {
         self.check_circuit()?;
         let prefix_str = format!("{}/manifests/", self.base_path);
@@ -329,8 +479,8 @@ impl ContentStore {
             let path_str = meta.location.to_string();
             // Extract path relative to manifests/
             if let Some(relative) = path_str.strip_prefix(&prefix_str) {
-                // Skip hot-set files
-                if relative.ends_with(".hot-set") {
+                // Skip hot-set and delta files
+                if relative.ends_with(".hot-set") || relative.ends_with(".delta") {
                     continue;
                 }
                 if !relative.is_empty() {

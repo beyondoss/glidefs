@@ -4,7 +4,6 @@
 //! Used by orchestrators for microVM scale-to-zero and live migration.
 
 use crate::config::ExportConfig;
-use crate::nbd::flush_scheduler::FlushMode;
 use crate::nbd::metrics::prometheus_header;
 use crate::nbd::router::{ExportRouter, RouterError};
 use url::form_urlencoded;
@@ -36,9 +35,6 @@ pub struct PutExportRequest {
     /// If set, fork this export from the named S3 manifest.
     #[serde(default)]
     pub manifest_name: Option<String>,
-    /// Flush mode for this export.
-    #[serde(default)]
-    pub flush_mode: Option<FlushMode>,
 }
 
 /// Response for export info.
@@ -47,7 +43,6 @@ pub struct ExportInfoResponse {
     pub name: String,
     pub size_bytes: u64,
     pub readonly: bool,
-    pub flush_mode: Option<FlushMode>,
 }
 
 /// Response for list exports.
@@ -130,16 +125,14 @@ where
         // GET /api/exports - List all exports
         (Method::GET, ["api", "exports"]) => {
             let exports = router.list_exports().await;
-            let mut responses = Vec::new();
-            for e in exports {
-                let flush_mode = router.get_flush_mode(&e.name).await;
-                responses.push(ExportInfoResponse {
+            let responses: Vec<_> = exports
+                .into_iter()
+                .map(|e| ExportInfoResponse {
                     name: e.name,
                     size_bytes: e.size,
                     readonly: e.readonly,
-                    flush_mode,
-                });
-            }
+                })
+                .collect();
             json_response(StatusCode::OK, &ListExportsResponse { exports: responses })
         }
 
@@ -217,7 +210,6 @@ where
                         size_gb: put_req.size_gb,
                         s3_prefix: put_req.s3_prefix,
                         block_size: put_req.block_size,
-                        flush_mode: put_req.flush_mode,
                     };
 
                     match router.create_export(config, put_req.readonly, put_req.manifest_name.as_deref()).await {
@@ -233,7 +225,6 @@ where
 
         // GET /api/exports/{name} - Get export info
         (Method::GET, ["api", "exports", name]) => {
-            let flush_mode = router.get_flush_mode(name).await;
             let exports = router.list_exports().await;
             match exports.into_iter().find(|e| e.name == *name) {
                 Some(export) => json_response(
@@ -242,42 +233,9 @@ where
                         name: export.name,
                         size_bytes: export.size,
                         readonly: export.readonly,
-                        flush_mode,
                     },
                 ),
                 None => error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name)),
-            }
-        }
-
-        // POST /api/exports/{name}/flush-mode - Set flush mode
-        (Method::POST, ["api", "exports", name, "flush-mode"]) => {
-            let body = match req.collect().await {
-                Ok(b) => b.to_bytes(),
-                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
-            };
-
-            let mode: FlushMode = match serde_json::from_slice(&body) {
-                Ok(m) => m,
-                Err(e) => {
-                    return Ok(error_response(
-                        StatusCode::BAD_REQUEST,
-                        &format!("Invalid JSON: {}", e),
-                    ))
-                }
-            };
-
-            match router.set_flush_mode(name, mode).await {
-                Ok(()) => json_response(
-                    StatusCode::OK,
-                    &ApiResponse::success(format!("Flush mode updated for '{}'", name)),
-                ),
-                Err(RouterError::ExportNotFound(name)) => {
-                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
-                }
-                Err(RouterError::InvalidExportName(_)) => {
-                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
-                }
-                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
 
@@ -419,22 +377,18 @@ where
             // Host-level pack index size (content-addressed dedup entries)
             {
                 use std::fmt::Write;
-                let entries = router.pack_index().len();
+                let entries = router.pack_index().len().unwrap_or(0);
                 writeln!(output, "# HELP glidefs_pack_index_entries Number of entries in the host-level pack index").unwrap();
                 writeln!(output, "# TYPE glidefs_pack_index_entries gauge").unwrap();
                 writeln!(output, "glidefs_pack_index_entries {entries}").unwrap();
             }
-            // SSD capacity backpressure
+            // SSD capacity
             {
                 use std::fmt::Write;
                 let utilization = router.ssd_utilization();
-                let bp_active = if router.backpressure_active() { 1 } else { 0 };
                 writeln!(output, "# HELP glidefs_ssd_utilization_ratio Fraction of local SSD capacity used").unwrap();
                 writeln!(output, "# TYPE glidefs_ssd_utilization_ratio gauge").unwrap();
                 writeln!(output, "glidefs_ssd_utilization_ratio {utilization:.6}").unwrap();
-                writeln!(output, "# HELP glidefs_ssd_backpressure_active Whether flush backpressure is active (0=no, 1=yes)").unwrap();
-                writeln!(output, "# TYPE glidefs_ssd_backpressure_active gauge").unwrap();
-                writeln!(output, "glidefs_ssd_backpressure_active {bp_active}").unwrap();
             }
             Response::builder()
                 .status(StatusCode::OK)
@@ -530,7 +484,9 @@ mod tests {
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
             wal_sync: false,
-        }))
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+        }).expect("failed to create test router"))
     }
 
     /// Helper to make a request and get the response.
@@ -803,7 +759,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Drain / Promote / Snapshot / Flush-mode endpoint tests
+    // Drain / Promote / Snapshot endpoint tests
     // =========================================================================
 
     #[tokio::test]
@@ -901,61 +857,4 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn test_flush_mode_set_success() {
-        let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
-        request(
-            &router,
-            Method::PUT,
-            "/api/exports/vol1",
-            Some(r#"{"size_gb": 0.01}"#),
-        )
-        .await;
-
-        let resp = request(
-            &router,
-            Method::POST,
-            "/api/exports/vol1/flush-mode",
-            Some(r#"{"mode":"continuous","pack_interval_secs":10,"manifest_interval_secs":60}"#),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_flush_mode_nonexistent_export_returns_404() {
-        let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
-        let resp = request(
-            &router,
-            Method::POST,
-            "/api/exports/nope/flush-mode",
-            Some(r#"{"mode":"demand_driven"}"#),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_flush_mode_invalid_json_returns_400() {
-        let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
-        request(
-            &router,
-            Method::PUT,
-            "/api/exports/vol1",
-            Some(r#"{"size_gb": 0.01}"#),
-        )
-        .await;
-
-        let resp = request(
-            &router,
-            Method::POST,
-            "/api/exports/vol1/flush-mode",
-            Some("not json"),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
 }

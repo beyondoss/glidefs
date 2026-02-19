@@ -49,7 +49,9 @@ pub async fn run_bless(
     info!(image = %image_path.display(), name = %name, chunk_size, "starting bless");
 
     // --- Load existing base manifests for cross-image dedup ---
-    let pack_index = HostPackIndex::new();
+    let pack_index_dir = tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
+    let pack_index = HostPackIndex::open(pack_index_dir.path().join("pack_index.redb"))
+        .context("Failed to open pack index")?;
     let base_names = content_store.list_base_manifests().await?;
     if !base_names.is_empty() {
         info!(count = base_names.len(), "loading existing base manifests for dedup");
@@ -63,9 +65,9 @@ pub async fn run_bless(
                 }
             }
         }
-        pack_index.rebuild(&manifests);
+        pack_index.rebuild(&manifests)?;
         info!(
-            entries = pack_index.len(),
+            entries = pack_index.len()?,
             "dedup index loaded from {} manifest(s)",
             manifests.len()
         );
@@ -109,7 +111,7 @@ pub async fn run_bless(
         });
 
         // Dedup: skip if already in pack index (from prior base images)
-        if pack_index.contains(&hash) {
+        if pack_index.contains(&hash)? {
             stats.deduped_chunks += 1;
             continue;
         }
@@ -143,7 +145,7 @@ pub async fn run_bless(
         );
     }
 
-    let pack_entries = pack_index.derive_for_block_map(&block_map);
+    let pack_entries = pack_index.derive_for_block_map(&block_map)?;
 
     // Collect hot set chunk indices before block_entries is moved into the manifest
     let hot_set_chunks: Vec<u64> = block_entries.iter().map(|e| e.chunk_index).collect();
@@ -225,16 +227,14 @@ async fn upload_pack(
         .await
         .context("Failed to upload pack")?;
 
-    for entry in &index_entries {
-        pack_index.insert(
-            entry.hash,
-            PackLocation {
-                pack_id,
-                offset: entry.offset,
-                comp_length: entry.comp_length,
-            },
-        );
-    }
+    let pi_entries: Vec<_> = index_entries.iter().map(|entry| {
+        (entry.hash, PackLocation {
+            pack_id,
+            offset: entry.offset,
+            comp_length: entry.comp_length,
+        })
+    }).collect();
+    pack_index.insert_batch(&pi_entries)?;
 
     stats.packs_uploaded += 1;
     stats.bytes_uploaded += pack_size;
@@ -272,7 +272,9 @@ mod tests {
         image_data: &[u8],
         chunk_size: u32,
     ) -> Result<BlessStats> {
-        let pack_index = HostPackIndex::new();
+        let pack_index_dir = tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
+        let pack_index = HostPackIndex::open(pack_index_dir.path().join("pack_index.redb"))
+            .context("Failed to open pack index")?;
 
         // Load existing base manifests for dedup
         let base_names = content_store.list_base_manifests().await?;
@@ -286,7 +288,7 @@ mod tests {
                     manifests.push(m);
                 }
             }
-            pack_index.rebuild(&manifests);
+            pack_index.rebuild(&manifests)?;
         }
 
         let device_size = image_data.len() as u64;
@@ -316,7 +318,7 @@ mod tests {
                 flags: 0,
             });
 
-            if pack_index.contains(&hash) {
+            if pack_index.contains(&hash)? {
                 stats.deduped_chunks += 1;
                 continue;
             }
@@ -347,7 +349,7 @@ mod tests {
             );
         }
 
-        let pack_entries = pack_index.derive_for_block_map(&block_map);
+        let pack_entries = pack_index.derive_for_block_map(&block_map)?;
 
         // Collect hot set chunk indices before block_entries is moved into the manifest
         let hot_set_chunks: Vec<u64> = block_entries.iter().map(|e| e.chunk_index).collect();

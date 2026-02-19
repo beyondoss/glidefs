@@ -220,8 +220,8 @@ async fn test_fork_registries_independent() {
         wal_sync: false,
     };
     let child_cs = ContentStore::new(Arc::clone(&s3) as _, "test");
-    let child_pi = glidefs::nbd::pack_index::HostPackIndex::new();
-    child_pi.rebuild(std::slice::from_ref(&manifest));
+    let child_pi = Arc::new(glidefs::nbd::pack_index::HostPackIndex::open(child_dir.path().join("pack_index.redb")).unwrap());
+    child_pi.rebuild(std::slice::from_ref(&manifest)).unwrap();
     let child_cc = glidefs::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     let child_cache = glidefs::nbd::write_cache::WriteCache::open_from_manifest(
@@ -396,11 +396,11 @@ async fn test_gc_respects_max_deletes() {
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
     // Create orphans: write blocks, flush, overwrite with different data, flush
-    write_blocks(&cache, 0, 50, 0, cc.as_ref()); // enough blocks to create multiple packs
+    write_blocks(&cache, 0, 200, 0, cc.as_ref()); // enough blocks to create multiple packs
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
     let _orphan_count = stats1.new_pack_ids.len();
 
-    write_blocks(&cache, 0, 50, 42, cc.as_ref());
+    write_blocks(&cache, 0, 200, 42, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     // Inject old timestamps so all orphans are eligible

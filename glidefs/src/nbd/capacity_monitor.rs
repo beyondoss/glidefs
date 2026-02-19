@@ -7,8 +7,8 @@
 //! |-------------|--------------------------------------------------------------|
 //! | < 80%       | Normal — no intervention                                     |
 //! | ≥ 80%       | Warn — log + metric for alerting                             |
-//! | ≥ 90%       | Escalate — switch DemandDriven → Continuous(2s/10s)          |
-//! | < 80%       | Restore — restore original flush modes                       |
+//! | ≥ 90%       | Escalate — pressure-flush dirtiest exports to S3             |
+//! | < 80%       | Normal — pressure resolved                                   |
 //!
 //! Hole-punching clean blocks was considered and rejected: `fallocate(PUNCH_HOLE)`
 //! races with `pwrite` at the kernel level, risking silent data corruption.
@@ -49,7 +49,7 @@ pub enum PressureLevel {
     Normal = 0,
     /// ≥ warn_threshold — log warning, no override.
     Warn = 1,
-    /// ≥ escalate_threshold — flush modes escalated.
+    /// ≥ escalate_threshold — pressure flush triggered.
     Escalated = 2,
 }
 
@@ -68,8 +68,7 @@ impl PressureLevel {
 /// Run the capacity monitor loop until shutdown.
 ///
 /// Polls `statvfs` on the router's cache directory at `config.poll_interval`.
-/// On SSD pressure, escalates flush modes across all exports. On recovery,
-/// restores original modes.
+/// On SSD pressure, triggers pressure flushes on the dirtiest exports.
 pub async fn capacity_monitor(
     router: Arc<ExportRouter>,
     config: CapacityConfig,
@@ -93,13 +92,13 @@ pub async fn capacity_monitor(
 
                 if new_level != current_level {
                     match (current_level, new_level) {
-                        // Escalating to flush override
+                        // Escalating — pressure-flush dirtiest exports
                         (prev, PressureLevel::Escalated) if prev < PressureLevel::Escalated => {
                             warn!(
                                 utilization = format!("{:.1}%", utilization * 100.0),
-                                "SSD pressure: escalating flush modes"
+                                "SSD pressure: flushing dirtiest exports"
                             );
-                            router.escalate_flush_modes().await;
+                            router.pressure_flush().await;
                         }
                         // Entering warn zone
                         (PressureLevel::Normal, PressureLevel::Warn) => {
@@ -112,9 +111,8 @@ pub async fn capacity_monitor(
                         (prev, PressureLevel::Normal) if prev > PressureLevel::Normal => {
                             info!(
                                 utilization = format!("{:.1}%", utilization * 100.0),
-                                "SSD pressure resolved: restoring flush modes"
+                                "SSD pressure resolved"
                             );
-                            router.restore_flush_modes().await;
                         }
                         // De-escalating from Escalated to Warn (keep overrides,
                         // only restore when fully below warn threshold)

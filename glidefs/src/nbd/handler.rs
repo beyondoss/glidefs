@@ -8,6 +8,7 @@ use super::cache::BlockCache;
 use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
 use super::metrics::ExportMetrics;
+use super::pack::BLOCKS_PER_PACK;
 use super::pack_index::HostPackIndex;
 use super::readahead::SequentialDetector;
 use super::state::Active;
@@ -17,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::time::Instant;
+use tokio::sync::Notify;
 
 /// NBD device descriptor used during transmission phase.
 #[derive(Clone)]
@@ -58,6 +60,13 @@ pub struct NBDBlockHandler {
 
     /// Sequential read-ahead detector
     readahead: Mutex<SequentialDetector>,
+
+    /// SSD utilization ratio shared from ExportRouter.
+    /// Used to reject writes to new blocks when SSD > 95%.
+    ssd_utilization: Arc<AtomicU64>,
+
+    /// Notifies the flush scheduler when dirty blocks reach BLOCKS_PER_PACK.
+    flush_notify: Arc<Notify>,
 }
 
 impl NBDBlockHandler {
@@ -68,6 +77,7 @@ impl NBDBlockHandler {
     /// * `device_size` - Size of the block device in bytes
     /// * `readonly` - Whether this export rejects writes
     /// * `metrics` - Shared metrics for tracking I/O statistics
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cache: Arc<WriteCache<Active>>,
         content_store: Arc<ContentStore>,
@@ -76,6 +86,8 @@ impl NBDBlockHandler {
         device_size: u64,
         readonly: bool,
         metrics: Arc<ExportMetrics>,
+        ssd_utilization: Arc<AtomicU64>,
+        flush_notify: Arc<Notify>,
     ) -> Self {
         Self {
             cache,
@@ -86,6 +98,8 @@ impl NBDBlockHandler {
             readonly: AtomicBool::new(readonly),
             metrics,
             readahead: Mutex::new(SequentialDetector::new()),
+            ssd_utilization,
+            flush_notify,
         }
     }
 
@@ -111,6 +125,14 @@ impl NBDBlockHandler {
     #[allow(dead_code)]
     pub fn set_device_size(&self, new_size: u64) {
         self.device_size.store(new_size, Ordering::Relaxed);
+    }
+
+    /// Notify the flush scheduler if dirty blocks have reached pack size.
+    #[inline]
+    fn check_flush_threshold(&self) {
+        if self.cache.dirty_block_count() >= BLOCKS_PER_PACK as u64 {
+            self.flush_notify.notify_one();
+        }
     }
 
     // ========================================================================
@@ -174,7 +196,8 @@ impl NBDBlockHandler {
     /// Write data to the cache.
     ///
     /// Writes go to local SSD immediately. S3 sync happens in background.
-    /// Returns error if the export is readonly.
+    /// Returns error if the export is readonly or SSD is near-full and
+    /// the write touches blocks not yet present on SSD.
     pub fn write(&self, offset: u64, data: &[u8], fua: bool) -> CommandResult<()> {
         let start = Instant::now();
 
@@ -190,8 +213,17 @@ impl NBDBlockHandler {
             return Ok(());
         }
 
+        // Reject writes to new blocks when SSD is near-full.
+        // Overwrites to already-present blocks are allowed (no new SSD space).
+        const WRITE_REJECT_THRESHOLD: f64 = 0.95;
+        let util = f64::from_bits(self.ssd_utilization.load(Ordering::Relaxed));
+        if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, data.len()) {
+            return Err(CommandError::NoSpace);
+        }
+
         self.metrics.record_guest_write(data.len() as u64);
         self.cache.write(offset, data, self.clean_cache.as_ref())?;
+        self.check_flush_threshold();
 
         if fua {
             self.flush()?;
@@ -220,6 +252,7 @@ impl NBDBlockHandler {
         }
 
         self.cache.zero_range(offset, length as u64)?;
+        self.check_flush_threshold();
 
         if fua {
             self.flush()?;
@@ -249,6 +282,7 @@ impl NBDBlockHandler {
         }
 
         self.cache.zero_range(offset, length as u64)?;
+        self.check_flush_threshold();
 
         if fua {
             self.flush()?;
@@ -306,7 +340,7 @@ mod tests {
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
         let clean_cache: Arc<dyn BlockCache> =
             Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::new());
+        let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
 
         // Create metrics for this handler
         let metrics = Arc::new(ExportMetrics::new());
@@ -323,6 +357,8 @@ mod tests {
             1024 * 1024,
             readonly,
             metrics,
+            Arc::new(AtomicU64::new(0f64.to_bits())),
+            Arc::new(Notify::const_new()),
         );
 
         (handler, temp_dir)

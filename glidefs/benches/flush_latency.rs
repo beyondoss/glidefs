@@ -24,7 +24,7 @@ const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 struct BenchHarness {
     cache: WriteCache<Active>,
     content_store: ContentStore,
-    pack_index: HostPackIndex,
+    pack_index: Arc<HostPackIndex>,
     clean_cache: Arc<dyn BlockCache>,
     #[allow(dead_code)]
     temp_dir: TempDir,
@@ -44,7 +44,7 @@ impl BenchHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3), "bench");
-        let pack_index = HostPackIndex::new();
+        let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         let cache = WriteCache::open(config).expect("Failed to open cache");

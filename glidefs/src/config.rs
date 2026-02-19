@@ -5,7 +5,6 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-use crate::nbd::flush_scheduler::FlushMode;
 
 // Note: Block-level compression is intentionally NOT implemented.
 // ZFS handles compression at its layer, and block-level compression would:
@@ -139,6 +138,16 @@ pub struct NbdConfig {
     /// exits with a warning. Set higher for large caches with many dirty blocks.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub shutdown_timeout_secs: Option<u64>,
+
+    /// Max concurrent S3 pack uploads across all exports (default: 128, 0 = unlimited).
+    /// Bounds host-level S3 upload concurrency to prevent connection exhaustion.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_s3_uploads: Option<usize>,
+
+    /// Max concurrent S3 pack downloads across all exports (default: 512, 0 = unlimited).
+    /// Bounds host-level S3 read concurrency on the NBD read path.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_s3_downloads: Option<usize>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -160,10 +169,6 @@ pub struct ExportConfig {
     /// Larger blocks (256KB+) improve throughput for sequential I/O.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block_size: Option<usize>,
-
-    /// Flush mode for this export (default: inherit from global or DemandDriven).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub flush_mode: Option<FlushMode>,
 
 }
 
@@ -216,6 +221,22 @@ impl NbdConfig {
         )
     }
 
+    pub const DEFAULT_MAX_S3_UPLOADS: usize = 128;
+
+    /// Max concurrent S3 pack uploads across all exports (default: 128, 0 = unlimited).
+    pub fn max_s3_uploads(&self) -> usize {
+        self.max_s3_uploads
+            .unwrap_or(Self::DEFAULT_MAX_S3_UPLOADS)
+    }
+
+    pub const DEFAULT_MAX_S3_DOWNLOADS: usize = 512;
+
+    /// Max concurrent S3 pack downloads across all exports (default: 512, 0 = unlimited).
+    pub fn max_s3_downloads(&self) -> usize {
+        self.max_s3_downloads
+            .unwrap_or(Self::DEFAULT_MAX_S3_DOWNLOADS)
+    }
+
     /// Get the list of exports, handling legacy single-device config.
     pub fn get_exports(&self) -> Vec<ExportConfig> {
         if !self.exports.is_empty() {
@@ -229,7 +250,6 @@ impl NbdConfig {
                 size_gb,
                 s3_prefix: None,
                 block_size: None,
-                flush_mode: None,
 
             }];
         }
@@ -240,7 +260,6 @@ impl NbdConfig {
             size_gb: Self::DEFAULT_DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
-            flush_mode: None,
         }]
     }
 }
@@ -490,8 +509,7 @@ impl Settings {
                         size_gb: 100.0,
                         s3_prefix: None,
                         block_size: None,
-                        flush_mode: None,
-        
+                
                     }],
                     device_name: None,
                     device_size_gb: None,
@@ -499,6 +517,8 @@ impl Settings {
                     scrubber_blocks_per_second: None,
                     wal_sync: None,
                     shutdown_timeout_secs: None,
+                    max_s3_uploads: None,
+                    max_s3_downloads: None,
                 }),
             },
             aws: Some(AwsConfig(aws_config)),

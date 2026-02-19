@@ -44,6 +44,8 @@ pub struct FlushStats {
     /// Blocks left dirty because a concurrent write changed their sequence
     /// during the flush cycle (CAS failure on the sequence-number check).
     pub blocks_cas_failed: usize,
+    /// Blocks skipped due to CRC32 mismatch (SSD corruption detected).
+    pub blocks_corrupted: usize,
     /// Number of pack objects uploaded.
     pub packs_uploaded: usize,
     /// Total bytes uploaded to S3.

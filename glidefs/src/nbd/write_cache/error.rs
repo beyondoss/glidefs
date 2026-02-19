@@ -1,7 +1,8 @@
 use thiserror::Error;
 
-use crate::nbd::block_map::{Blake3Hash, MetadataLimitExceeded};
+use crate::nbd::block_map::Blake3Hash;
 use crate::nbd::content_store::ContentStoreError;
+use crate::nbd::pack_index::PackIndexError;
 
 /// Errors that can occur during cache operations.
 #[derive(Error, Debug)]
@@ -42,8 +43,8 @@ pub enum CacheError {
     #[error("Unsupported block size {0}: must not exceed {1} (ZERO_BLOCK_BYTES is compiled for this size)")]
     UnsupportedBlockSize(usize, usize),
 
-    #[error("Metadata memory budget exhausted (ENOSPC)")]
-    MetadataLimitExceeded(#[from] MetadataLimitExceeded),
+    #[error("Pack index error: {0}")]
+    PackIndex(#[from] PackIndexError),
 }
 
 impl CacheError {

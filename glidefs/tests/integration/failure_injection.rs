@@ -154,6 +154,7 @@ impl ObjectStore for FailingObjectStore {
 }
 
 /// Helper to create a writer cache with the failing object store.
+#[allow(clippy::type_complexity)]
 fn create_test_cache(
     temp_dir: &TempDir,
     name: &str,
@@ -161,21 +162,21 @@ fn create_test_cache(
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    HostPackIndex,
+    Arc<HostPackIndex>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
 ) {
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: name.to_string(),
-        device_size: 10 * 1024 * 1024, // 10MB
+        device_size: 64 * 1024 * 1024, // 64MB
         block_size: BLOCK_SIZE,
         wal_sync: false,
     };
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
-    let pack_index = HostPackIndex::new();
+    let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
@@ -197,7 +198,7 @@ async fn create_reader_from_manifest(
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    HostPackIndex,
+    Arc<HostPackIndex>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
 ) {
@@ -213,13 +214,13 @@ async fn create_reader_from_manifest(
         Manifest::deserialize(&manifest_bytes).expect("manifest deserialization failed");
 
     // Rebuild pack_index from manifest
-    let pack_index = HostPackIndex::new();
-    pack_index.rebuild(std::slice::from_ref(&manifest));
+    let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+    pack_index.rebuild(std::slice::from_ref(&manifest)).unwrap();
 
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: name.to_string(),
-        device_size: 10 * 1024 * 1024,
+        device_size: manifest.device_size,
         block_size: BLOCK_SIZE,
         wal_sync: false,
     };
@@ -651,11 +652,10 @@ async fn test_concurrent_drain_safety() {
         cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
     }
 
-    // Wrap in Arc for sharing across tasks (ContentStore and HostPackIndex
-    // don't implement Clone, but flush_to_s3 takes &self references)
+    // Wrap in Arc for sharing across tasks (ContentStore doesn't implement
+    // Clone, but flush_to_s3 takes &self references)
     let cache = Arc::new(cache);
     let content_store = Arc::new(content_store);
-    let pack_index = Arc::new(pack_index);
 
     let mut handles = vec![];
     for _ in 0..3 {
@@ -715,14 +715,15 @@ async fn test_partial_pack_upload_preserves_dirty() {
     let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
-    // Write enough blocks for multiple packs (25 blocks per pack, so 60 blocks = 2-3 packs)
-    for i in 0..60u8 {
-        let data: Vec<u8> = (0..BLOCK_SIZE).map(|j| i.wrapping_add(j as u8)).collect();
+    // Write enough blocks for multiple packs (100 blocks per pack, so 250 blocks = 2-3 packs)
+    let num_blocks = 250u32;
+    for i in 0..num_blocks {
+        let data: Vec<u8> = (0..BLOCK_SIZE).map(|j| (i as u8).wrapping_add(j as u8)).collect();
         cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
     }
 
     let dirty_before = cache.dirty_block_count();
-    assert_eq!(dirty_before, 60, "should have 60 dirty blocks");
+    assert_eq!(dirty_before, num_blocks as u64, "should have all blocks dirty");
 
     // Fail after 2 PUTs (first pack upload succeeds, second fails)
     s3.set_fail_after_puts(2);
@@ -761,7 +762,7 @@ async fn test_partial_pack_upload_preserves_dirty() {
     let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
         create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
-    for i in 0..60u8 {
+    for i in 0..num_blocks {
         let data = reader_cache
             .read_v2(
                 i as u64 * BLOCK_SIZE as u64,
@@ -774,7 +775,7 @@ async fn test_partial_pack_upload_preserves_dirty() {
             .await
             .unwrap();
 
-        let expected: Vec<u8> = (0..BLOCK_SIZE).map(|j| i.wrapping_add(j as u8)).collect();
+        let expected: Vec<u8> = (0..BLOCK_SIZE).map(|j| (i as u8).wrapping_add(j as u8)).collect();
         assert_eq!(
             data.as_ref(),
             &expected[..],

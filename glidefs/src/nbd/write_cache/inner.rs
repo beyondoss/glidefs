@@ -5,12 +5,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::nbd::block_map::{
-    BlockMap, BlockMapKind, Blake3Hash, MetadataLimitExceeded, SequenceNumber,
+    BlockMap, BlockMapKind, Blake3Hash, SequenceNumber,
     SparseBlockState, SparseStateMap,
 };
+
+/// Cached state from the most recent full (base) manifest upload.
+///
+/// Used to compute delta manifests: diff current block_map against
+/// this cached snapshot to produce upserts and deletes.
+pub(super) struct BaseManifestState {
+    pub sequence: u64,
+    pub block_map: HashMap<u64, Blake3Hash>,
+    pub syncs_since_base: u32,
+}
 use crate::nbd::state::BlockState;
 use crate::nbd::wal::Wal;
 
@@ -90,10 +100,16 @@ impl SyncFile {
     }
 }
 
-// Safety: SyncFile only exposes positional I/O methods which are thread-safe.
-// pread/pwrite are atomic per POSIX and don't use the shared file position.
+// SAFETY: SyncFile only exposes positional I/O methods (pread/pwrite via
+// FileExt::{read_exact_at, write_all_at}) which are atomic per POSIX and don't
+// use the shared file position. Do NOT add seek-based read/write methods —
+// they would make this impl unsound.
 unsafe impl Sync for SyncFile {}
-unsafe impl Send for SyncFile {}
+// File is already Send; this static assert guards against future regressions.
+const _: () = {
+    const fn _assert_send<T: Send>() {}
+    let _ = _assert_send::<std::fs::File>;
+};
 
 
 /// Check if a block is all zeros.
@@ -228,12 +244,18 @@ pub(crate) struct CacheInner {
 
     /// Cached set of hashes from the most recent manifest build.
     ///
-    /// Updated on every `upload_manifest()` and on-demand via
+    /// Updated on every `upload_full_manifest()` and on-demand via
     /// `rebuild_manifest_hashes()`. Used by pack index pruning to
     /// determine which entries are still needed — the manifest is the
     /// durable reference, not the live block_map (which has ZERO
     /// placeholders for in-flight flushes).
     pub(super) manifest_pack_hashes: Mutex<HashSet<Blake3Hash>>,
+
+    /// Cached state from the last full (base) manifest upload.
+    ///
+    /// Used to compute delta manifests by diffing the current block_map
+    /// against this snapshot. None until the first full manifest upload.
+    pub(super) base_manifest_state: Mutex<Option<BaseManifestState>>,
 }
 
 impl CacheInner {
@@ -248,13 +270,12 @@ impl CacheInner {
     }
 
     /// Mark block as present (lock-free CAS NOT_PRESENT -> CLEAN).
-    /// Returns `Err(MetadataLimitExceeded)` if the page budget is exhausted.
     #[inline]
-    pub(super) fn set_present(&self, block_num: usize) -> Result<(), MetadataLimitExceeded> {
+    pub(super) fn set_present(&self, block_num: usize) {
         if block_num >= self.num_blocks {
-            return Ok(());
+            return;
         }
-        self.state_map.set_present(block_num)
+        self.state_map.set_present(block_num);
     }
 
     /// CAS loop to transition a block to Dirty state (lock-free).
@@ -302,22 +323,39 @@ impl CacheInner {
     }
 
     /// Set a block map entry (takes read lock — interior mutability handles the write).
-    ///
-    /// Returns `Err(MetadataLimitExceeded)` if the page-table memory budget is
-    /// exhausted (only when a budget is configured).
     #[inline]
     pub(super) fn block_map_set(
         &self,
         chunk_index: usize,
         hash: Blake3Hash,
         seq: u64,
-    ) -> Result<(), crate::nbd::block_map::MetadataLimitExceeded> {
-        self.block_map.read().set(chunk_index, hash, seq)
+    ) {
+        self.block_map.read().set(chunk_index, hash, seq);
     }
 
     /// Snapshot the block map (takes read lock).
     pub(super) fn block_map_snapshot(&self) -> BlockMap {
         self.block_map.read().snapshot(&self.state_map)
+    }
+
+    // -- CRC32 dirty-block integrity ------------------------------------------
+
+    /// Load the CRC32 checksum for a chunk (takes read lock).
+    #[inline]
+    pub(super) fn block_map_get_crc32(&self, chunk_index: usize) -> u32 {
+        self.block_map.read().get_crc32(chunk_index)
+    }
+
+    /// Clear the CRC32 checksum for a chunk (takes read lock).
+    #[inline]
+    pub(super) fn block_map_clear_crc32(&self, chunk_index: usize) {
+        self.block_map.read().clear_crc32(chunk_index)
+    }
+
+    /// CAS the CRC32 checksum (takes read lock).
+    #[inline]
+    pub(super) fn block_map_cas_crc32(&self, chunk_index: usize, expected: u32, new: u32) -> Result<u32, u32> {
+        self.block_map.read().cas_crc32(chunk_index, expected, new)
     }
 
     /// Count present blocks (for metrics/logging).
@@ -350,14 +388,14 @@ impl CacheInner {
         file.write_all(&(self.config.block_size as u64).to_le_bytes())?;
         file.write_all(&(self.num_blocks as u64).to_le_bytes())?;
 
-        // v4 sparse format: collect (index, state) pairs for non-zero entries
-        let mut sparse_entries: Vec<(u32, u8)> = Vec::new();
-        for idx in 0..self.num_blocks {
-            let state = self.state_map.get(idx);
-            if state != SparseBlockState::NOT_PRESENT {
-                sparse_entries.push((idx as u32, state));
-            }
-        }
+        // v4 sparse format: collect (index, state) pairs for non-zero entries.
+        // Uses iter_present() which only visits allocated pages — O(allocated_pages)
+        // not O(num_blocks).
+        let sparse_entries: Vec<(u32, u8)> = self
+            .state_map
+            .iter_present()
+            .map(|(idx, state)| (idx as u32, state))
+            .collect();
 
         // Write entry count then entries: index(u32 LE) + state(u8) = 5 bytes each
         file.write_all(&(sparse_entries.len() as u64).to_le_bytes())?;
@@ -500,7 +538,7 @@ impl CacheInner {
 
                 // Populate state_map: first set_present (0->1), then CAS to target state
                 // Ignore budget errors during load (no budget set yet).
-                let _ = state_map.set_present(idx);
+                state_map.set_present(idx);
                 if state != SparseBlockState::CLEAN {
                     let _ = state_map.cas(idx, SparseBlockState::CLEAN, state);
                 }
@@ -561,7 +599,7 @@ impl CacheInner {
                     x if x == BlockState::Dirty as u8 => SparseBlockState::DIRTY,
                     _ => SparseBlockState::DIRTY, // conservative
                 };
-                let _ = state_map.set_present(idx);
+                state_map.set_present(idx);
                 if new_state != SparseBlockState::CLEAN {
                     let _ = state_map.cas(idx, SparseBlockState::CLEAN, new_state);
                 }

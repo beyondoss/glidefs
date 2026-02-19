@@ -17,6 +17,8 @@ NBDServer ──► ExportRouter ──► NBDBlockHandler ──► WriteCache<
                                        pwrite()   block_map_set  transition_to_dirty
                                       (local SSD)  (ZERO, seq)    (CAS on SparseStateMap)
                                                         │
+                                                   clear_crc32(0)
+                                                        │
                                                    WAL append(ZERO, seq)
                                                         │
                                                     return OK     ◄── ~5µs
@@ -47,8 +49,8 @@ WriteCache ──► AtomicBlockMap lookup
               │           └─ miss ▼
               │
               ├── Tier 3: S3 pack fetch                       50-300ms
-              │           ├─ HostPackIndex lookup (hash → pack location)
-              │           ├─ ContentStore::get_block() (S3 range GET)
+              │           ├─ HostPackIndex lookup (redb, hash → pack location)
+              │           ├─ ContentStore::get_block() (S3 range GET, semaphore-gated)
               │           ├─ LZ4 decompress
               │           ├─ Verify BLAKE3 hash
               │           ├─ Insert into CleanCache
@@ -63,34 +65,52 @@ Multi-chunk reads fan out with `futures::future::try_join_all()`. Sequential acc
 ### Background Sync (S3 upload)
 
 ```
-FlushScheduler
+FlushScheduler (event-driven: Notify from write path when dirty_count ≥ 100)
     │
     ▼
 Scan SparseStateMap for Dirty pages (skip unallocated pages)
     │
     ▼
-For each dirty block:
+For each dirty block (via spawn_blocking — off async runtime):
     ├── Record (chunk_index, sequence) at snapshot time
     ├── Skip: zero_block_hash entries, blocks already in HostPackIndex
-    ├── Read block data from SSD → compute BLAKE3-128 hash (deferred from write)
+    ├── Read block data from SSD → CRC32 verify → BLAKE3-128 hash → LZ4 compress
     └── Dedup check against HostPackIndex
     │
     ▼
-Batch into packs (25 blocks × 128KB = ~3.2MB)
+Assemble packs (up to 100 blocks × 128KB = ~12.8MB, async)
     │
-    ├──► LZ4 compress each block
-    ├──► Assemble pack (GLPK header + index + data)
-    └──► ContentStore::put_pack() ──► S3 PUT (concurrent via try_join_all)
+    └──► ContentStore::put_pack() ──► S3 PUT (concurrent, semaphore-gated)
               │
               ▼
-        HostPackIndex.insert(hash → pack location)
+        HostPackIndex.insert_batch(hash → pack location)
               │
               ▼
         CAS-clear Dirty flags (only if sequence unchanged since snapshot)
-              │
-              ▼
-        Upload manifest to S3 (point-in-time snapshot)
+
+Manifest sync (delta or full) after successful pack upload.
+Ensures flushed packs are discoverable on cross-host recovery.
 ```
+
+### Delta Manifests
+
+Background sync uploads a **delta manifest** containing only blocks that changed since the last full (base) manifest. This reduces S3 bandwidth from O(all blocks) to O(changed blocks) — a flush that touched 100 blocks uploads ~2.5KB instead of the full manifest.
+
+**S3 layout**: `manifests/{name}` (full/base) + `manifests/{name}.delta` (single delta, no chains). At most 2 S3 GETs to restore.
+
+**How it works**: The flush path caches the last full manifest's block map as a `HashMap<u64, Blake3Hash>`. On sync, it diffs the current block map against the cached base — upserts are entries that differ, deletes are entries in the base but absent from the current map. The delta is serialized and uploaded to `manifests/{name}.delta`, replacing any previous delta.
+
+**Compaction** (fall back to full manifest upload):
+1. No base state yet (first sync after open)
+2. Delta block size > 50% of estimated full manifest size
+3. `syncs_since_base >= 10`
+4. Explicit `snapshot()` or `flush_to_s3()` (fork, migration)
+
+Compaction uploads a full manifest and deletes the `.delta` file.
+
+**Restore**: `get_effective_manifest()` fetches the base, optionally fetches the delta. If the delta's `base_sequence` matches the base's `sequence`, it merges them via `apply_to()`. Stale deltas (wrong `base_sequence`) are ignored with a warning — the base is used as-is.
+
+**GC safety**: GC takes the conservative union of pack entries from both base and delta manifests. Dead packs from overwritten blocks survive one compaction cycle, well within the 24h grace period. (`manifest.rs`, `content_store.rs`, `write_cache/flush.rs`)
 
 ## Concepts & Terminology
 
@@ -98,10 +118,10 @@ Batch into packs (25 blocks × 128KB = ~3.2MB)
 |------|-----------|-----|
 | Export | A virtual block device served over NBD, with its own cache and S3 prefix | Not a filesystem — raw blocks only |
 | Block/Chunk | Fixed-size unit of data (default 128KB to match ZFS recordsize) | Not variable-sized |
-| Pack | S3 object containing up to 25 LZ4-compressed blocks with a self-describing index | Not a single block per S3 object |
-| Manifest | Binary snapshot of an export's block map + pack index, stored in S3 | Not a log — it's a point-in-time image |
+| Pack | S3 object containing up to 100 LZ4-compressed blocks with a self-describing index | Not a single block per S3 object |
+| Manifest | Binary snapshot of an export's block map + pack index, stored in S3. Synced as delta (changed blocks only) with periodic compaction to full snapshot. | Not a log — it's a point-in-time image |
 | Block Map | Per-chunk metadata: BLAKE3-128 hash, dirty flag, sequence number | Not the data itself |
-| Pack Index | Host-level hash→pack location mapping for content-addressed lookups. Pruned on export removal to bound memory to active exports. | Not per-export — shared across all exports on a host |
+| Pack Index | Host-level hash→pack location mapping for content-addressed lookups. Backed by redb (disk-resident, not RAM). Pruned on export removal to bound size to active exports. | Not per-export — shared across all exports on a host |
 | Drain | Flush all dirty blocks to S3 so the export can be stopped or migrated | Not a delete — S3 data is preserved |
 | Clean Cache | Read-through Foyer HybridCache (memory + SSD tiers) for blocks fetched from S3 | Not the write cache (dirty blocks on local SSD) |
 | Circuit Breaker | Lock-free S3 failure detector that fast-fails requests during outages | Not a retry mechanism — it prevents retries |
@@ -116,7 +136,8 @@ Batch into packs (25 blocks × 128KB = ~3.2MB)
 ├── nbd/{export_name}/
 │   ├── export.json                          ← Export definition (name, size_gb, s3_prefix)
 │   ├── manifests/
-│   │   ├── {export_name}                    ← Current manifest snapshot (GLDE format)
+│   │   ├── {export_name}                    ← Full manifest snapshot (GLDE format, base)
+│   │   ├── {export_name}.delta              ← Delta manifest since last base (optional)
 │   │   └── bases/
 │   │       ├── {image_name}                 ← Base image manifest (from bless)
 │   │       └── {image_name}.hot-set         ← Boot hot set (chunk indices)
@@ -126,7 +147,7 @@ Batch into packs (25 blocks × 128KB = ~3.2MB)
 │       └── {export_name}                    ← Pack ID list for GC (GLPR format)
 ```
 
-Packs use 256-way prefix sharding (`packs/ab/{uuid}`) to avoid S3 LIST performance degradation. Manifests are atomic overwrites — the latest is always consistent. Pack registries are append-only and compacted by GC.
+Packs use 256-way prefix sharding (`packs/ab/{uuid}`) to avoid S3 LIST performance degradation. Manifests are atomic overwrites — the latest is always consistent. The `.delta` file, when present, contains only blocks changed since the last full manifest (see [Delta Manifests](#delta-manifests)). Pack registries are append-only and compacted by GC.
 
 ## Core Mechanism: Write-Behind Cache
 
@@ -250,8 +271,6 @@ When the overlay exceeds 50% of the parent's entries, the fork has diverged enou
 
 - **Lock-free state transitions**: State ops (`set_present`, `transition_to_dirty`) use direct CAS on `AtomicU8` — no RwLock. Co-locating state inside `AtomicBlockMap` would force every state transition through the block map's read lock.
 - **Independent per-fork state**: Each fork has its own `SparseStateMap` while sharing the parent's hash data through `Arc<BlockMap>`. The parent never needs mutation.
-- **Shared memory budget**: Both `AtomicBlockMap` and `SparseStateMap` share an `Arc<AtomicUsize>` page budget. When exhausted, writes fail with ENOSPC propagated to the NBD client.
-
 Created via `open_from_manifest()` when a parent block map is provided. (`block_map.rs:SparseStateMap`, `write_cache/init.rs:open_from_manifest`)
 
 ## Device Lifecycle (Typestate)
@@ -285,7 +304,7 @@ WriteCache<Draining>
 
 ### Pack Format (`GLPK`)
 
-Self-describing S3 object. Up to 25 LZ4-compressed blocks with a content-addressed index.
+Self-describing S3 object. Up to 100 LZ4-compressed blocks with a content-addressed index.
 
 ```
 ┌─────────────────────────── Pack ───────────────────────────┐
@@ -305,13 +324,16 @@ S3 key: `packs/{first-2-hex-of-uuid}/{uuid}` — 256-way prefix sharding for S3 
 
 ### Manifest Format (`GLDE`)
 
-Binary snapshot of export state. Sparse: only written chunks are stored. CRC32 trailer for integrity.
+Binary snapshot of export state. Sparse: only written chunks are stored. CRC32 trailer for integrity. Version 2 (current); version 1 still accepted on read for backward compatibility.
+
+#### Full Manifest (flags = 0x0000)
 
 ```
 ┌─────────────────────────── Manifest ────────────────────────┐
 │ Header (46 + name_len bytes)                                │
-│   magic: "GLDE"  version: 1  flags  name_len  sequence      │
-│   chunk_size  device_size  block_map_count  pack_index_count│
+│   magic: "GLDE"  version: 2  flags: 0x0000  name_len       │
+│   sequence  chunk_size  device_size                         │
+│   block_map_count  pack_index_count                         │
 │   name (variable length)                                    │
 ├─────────────────────────────────────────────────────────────┤
 │ Block Map (25 bytes × block_map_count)                      │
@@ -324,7 +346,39 @@ Binary snapshot of export state. Sparse: only written chunks are stored. CRC32 t
 └─────────────────────────────────────────────────────────────┘
 ```
 
-S3 key: `manifests/{name}`. Atomic overwrite — the latest manifest is always a consistent snapshot. (`manifest.rs`)
+S3 key: `manifests/{name}`. Atomic overwrite — the latest full manifest is always a consistent snapshot.
+
+#### Delta Manifest (flags = 0x0001)
+
+Contains only blocks changed since the last full manifest. See [Delta Manifests](#delta-manifests).
+
+```
+┌──────────────────────── Delta Manifest ─────────────────────┐
+│ Header (46 + name_len bytes)                                │
+│   magic: "GLDE"  version: 2  flags: 0x0001  name_len       │
+│   sequence  chunk_size  device_size                         │
+│   block_map_count (= upsert count)                          │
+│   pack_index_count (= new pack count)                       │
+│   name (variable length)                                    │
+├─────────────────────────────────────────────────────────────┤
+│ Delta-specific (16 bytes)                                   │
+│   base_sequence: u64 LE                                     │
+│   deleted_count: u64 LE                                     │
+├─────────────────────────────────────────────────────────────┤
+│ Upserted Blocks (25 bytes × block_map_count)                │
+│   [chunk_index:u64][hash:16][flags:u8]                      │
+├─────────────────────────────────────────────────────────────┤
+│ Deleted Chunk Indices (8 bytes × deleted_count)             │
+│   [chunk_index:u64]                                         │
+├─────────────────────────────────────────────────────────────┤
+│ New Pack Entries (40 bytes × pack_index_count)              │
+│   [hash:16][pack_id:16][offset:u32][comp_length:u32]        │
+├─────────────────────────────────────────────────────────────┤
+│ Trailing CRC32 (4 bytes)                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+S3 key: `manifests/{name}.delta`. Replaced on each sync cycle; deleted on compaction. (`manifest.rs`)
 
 ### WAL Entry Format
 
@@ -367,7 +421,8 @@ Orphaned packs accumulate in S3 when exports are deleted or blocks are overwritt
 
 ```
 For each S3 prefix:
-    1. List all manifests → extract live pack IDs
+    1. List all manifests (full + delta) → extract live pack IDs
+       (conservative union: packs from base + packs from delta)
     2. List all pack registries → extract known pack IDs
     3. dead = known - live
     4. Mark newly dead packs with timestamp in GC state file
@@ -397,6 +452,64 @@ Per-export append-only list of pack UUIDs, stored in S3 at `pack-registries/{nam
 
 Written by the flush path after uploading packs. Inherited by forks (the fork's registry starts with the parent's pack IDs). Compacted by GC after dead packs are deleted. (`pack_registry.rs`)
 
+## Data Integrity
+
+Every layer has a verification mechanism. The goal: corruption is detected before it reaches the guest or S3.
+
+### Verification Chain
+
+| Layer | What's Protected | Hash/Check | When Verified | On Failure |
+|-------|-----------------|------------|---------------|------------|
+| S3 packs | Block data in transit/at rest | BLAKE3-128 | Read path: after S3 fetch + LZ4 decompress | `HashMismatch` error → re-fetch from S3 |
+| Clean cache (Foyer) | Cached blocks on SSD/memory | BLAKE3-128 | Background scrubber re-hashes against content address | Evict from cache → next read re-fetches from S3 |
+| Manifest | Block map + pack index snapshot | CRC32 trailer | On deserialization (load from S3) | Reject manifest, return error |
+| WAL entries | Per-entry metadata | CRC32 trailer | On replay (crash recovery) | Stop replay at first corrupt entry, discard torn tail |
+| Dirty blocks (SSD) | Block data between write and flush | CRC32 in `HashEntry` | Flush time: before BLAKE3 computation | Skip block (stays dirty), do NOT launder to S3 |
+
+### Dirty Block CRC32
+
+Dirty blocks sit on local SSD between guest writes and S3 flush — up to ~100 blocks per export (pack-size trigger). During this window, SSD bit rot or firmware bugs could silently corrupt the data. Without verification, the flush path would compute BLAKE3 over corrupted data, producing a valid-looking but wrong hash, and upload it to S3 — permanently laundering the corruption.
+
+The `crc32` field in `HashEntry` (repurposed from `_pad`) catches this:
+
+```
+Write path (~5µs):
+    pwrite(data) → block_map_set(ZERO, seq) → clear_crc32(0)
+                                                     │
+                                              AtomicU32 store, negligible
+
+Checkpoint (background, every ~5s):
+    for each dirty block where crc32 == 0:
+        seq_before = block_map_get(idx).seq
+        data = pread(block from SSD)
+        seq_after = block_map_get(idx).seq
+        if seq_before != seq_after → skip (concurrent write)
+        crc32 = crc32fast::hash(data)
+        CAS(0, crc32)                        ← only store if still 0
+
+Flush (background):
+    for each dirty block:
+        data = pread(block from SSD)
+        stored_crc = get_crc32(idx)
+        if stored_crc != 0:
+            computed_crc = crc32fast::hash(data)
+            if computed_crc != stored_crc:
+                if seq changed → concurrent write, skip (CAS failure)
+                else → SSD corruption detected, skip block
+        hash = blake3_128(data)              ← only reached if CRC32 passes
+        ... pack, upload, clear dirty
+```
+
+Each dirty block gets CRC32 computed **once** (at first checkpoint after write) and verified **once** (at flush before BLAKE3). No redundant hashing. Not on the read or write hot paths.
+
+### What Is NOT Verified
+
+| Gap | Why Acceptable |
+|-----|---------------|
+| Dirty block reads (guest reads dirty data from SSD) | Read path returns raw pread data — no checksum. The guest sees whatever is on disk. If SSD corrupts a dirty block and the guest reads it before checkpoint, the guest gets corrupt data. Mitigation: checkpoint runs every ~5s, so the window is small. Adding CRC32 verification on the read path would cause false positives from concurrent write races (write changes data between CRC32 compute and pread). |
+| SSD data file between flush cycles | Once a block is flushed (Dirty → Clean), its CRC32 is cleared. The block remains on SSD but is only served as a fallback — reads prefer the clean cache or S3. If the SSD corrupts a clean block, the scrubber catches it in the clean cache; if the block isn't in the clean cache, the next read fetches from S3. |
+| redb pack index | Derived data — rebuildable from S3 manifests. If corrupted, `rebuild()` repopulates from scratch. |
+
 ## CLI Commands
 
 | Command | Purpose |
@@ -419,7 +532,7 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/exports/{name}` | `PUT` | Create or resize export (idempotent) |
-| `/api/exports/{name}` | `GET` | Get export info (size, readonly, flush mode) |
+| `/api/exports/{name}` | `GET` | Get export info (size, readonly) |
 | `/api/exports/{name}` | `DELETE` | Remove export (after drain) |
 | `/api/exports` | `GET` | List all exports |
 | `/api/exports/{name}/snapshot` | `POST` | Drain dirty blocks + upload manifest |
@@ -470,14 +583,14 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 
 ### Why write-behind instead of write-through?
 
-S3 PUT latency is 50-200ms. ZFS issues FLUSH after every snapshot. Write-through would make snapshots take 5-15 seconds instead of <100ms.
+S3 PUT latency is 50-200ms. Write-through would make snapshots take 5-15 seconds instead of <100ms.
 
 Write-behind trades durability for latency: data between the last FLUSH and the next S3 sync is at risk if the host dies. This is acceptable because:
 
-1. Background sync keeps the dirty window small (5s in continuous mode)
+1. Pack-size flush keeps the dirty window small (flush triggers at 100 dirty blocks = ~12.8MB per export)
 2. SIGTERM triggers a drain before exit
 3. The workload (microVMs) is ephemeral — VMs can be recreated from base images
-4. Production VMs use continuous flush mode to minimize the window
+4. Max dirty data node-wide is bounded: 99 blocks × 128KB × 2000 exports ≈ 25GB
 
 ### Why defer hashing to flush time?
 
@@ -496,13 +609,19 @@ None of this work is needed until flush time. With deferred hashing, the write p
 
 The read path distinguishes ZERO-placeholder from never-written using the **state map**: ZERO hash + state != NotPresent = deferred hash (SSD pread), ZERO hash + NotPresent = never written (return zeros).
 
-### Why the HostPackIndex is not persisted
+### Why redb for the HostPackIndex?
 
-The `HostPackIndex` (DashMap mapping BLAKE3 hash → S3 pack location) is an in-memory structure that starts **empty** on process restart. It is not rebuilt from manifests.
+The `HostPackIndex` maps BLAKE3 hash → S3 pack location. It's the cross-export dedup index — shared across all exports on a host. Every `get()` is followed by a 5-50ms S3 fetch, so microsecond lookup latency from an embedded database is fine.
 
-On cold start, `discover_exports()` scans S3 for `export.json` files, then each export is created with `manifest_name: None` — the normal `WriteCache::open()` path. This loads the block map (with hashes) and state map from local `.meta`/`.blockmap` files and replays the WAL. The pack index is not populated.
+Previously this was an in-memory `DashMap` that grew unbounded with total unique blocks across all VMs. For 5,000 VMs with 100K unique blocks each, that's 500M entries × ~56 bytes = ~28GB of RAM just for the dedup index. Moving to redb puts this on disk where it belongs.
 
-**Why this is safe**: the read tier resolution has a fallback chain:
+**Why redb specifically**: (1) already in our stack elsewhere, (2) embedded — no server to manage, (3) supports concurrent read transactions with single writer, (4) mmap-based — OS page cache handles hot entries transparently.
+
+**Durability**: `Durability::None` — the pack index is derived data, rebuildable from S3 manifests via `rebuild()`. No fsync overhead.
+
+**Batch inserts**: `insert_batch()` groups entries into a single write transaction. Flush, fork, and bless all produce entries in batches — one transaction per batch instead of per-entry.
+
+**On cold start**: the redb file persists at `{cache_dir}/pack_index.redb`. If present, entries survive restart — no need to rebuild from manifests. If the file is deleted or corrupted, the index starts empty and repopulates lazily as the flush scheduler runs. The read path has a fallback chain that handles missing entries:
 
 ```
 block_map_get(hash)
@@ -510,17 +629,13 @@ block_map_get(hash)
   ├─ ZERO + not present → return zeros
   ├─ zero_block_hash    → return zeros
   ├─ clean_cache hit    → return cached
-  ├─ pack_index hit     → S3 range GET  ← empty after restart
+  ├─ pack_index hit     → S3 range GET  ← redb lookup (~µs)
   └─ SSD pread fallback → local block   ← catches everything else
 ```
 
-After flush, blocks transition `DIRTY → CLEAN` but **remain on the SSD data file** — blocks are never evicted from their slot. So after restart, CLEAN blocks with known hashes but no pack_index entry fall through to Tier 3 (SSD pread), which is actually *faster* (~µs) than an S3 fetch (~50ms).
+After flush, blocks transition `DIRTY → CLEAN` but **remain on the SSD data file** — blocks are never evicted from their slot. So CLEAN blocks with known hashes but no pack_index entry fall through to Tier 4 (SSD pread), which is actually *faster* (~µs) than an S3 fetch (~50ms).
 
-The pack index repopulates lazily as the flush scheduler runs and uploads new packs via `pack_index.insert()`. Previously-flushed CLEAN blocks that are never re-dirtied never re-enter the index — they serve reads from local SSD indefinitely.
-
-**Cold-start cost at 2,000 VMs**: one S3 LIST call, then per-export local I/O to load `.meta` + `.blockmap` + WAL replay + `finish_recovery()` (re-hash dirty blocks). With ~100 dirty blocks per export at 128KB, that's ~25GB of I/O — bounded by NVMe throughput, not S3. No manifest scan, no index rebuild.
-
-**Known gap**: see "SSD failure after flush" in Failure Modes below.
+**Required for fork correctness**: forked exports have blocks that exist only in S3 (inherited from the parent). These blocks have no local SSD data — the pread fallback would return zeros, causing silent data corruption. The pack index entry is the only path to the S3 pack. This is why `prune_unreferenced()` must be careful: it only prunes entries not referenced by any active export's manifest.
 
 Sequence numbers replace hashes as the race detection token in flush. There is a narrow TOCTOU window between checking the sequence and doing the CAS (nanoseconds), identical to the previous hash-based approach and self-healing.
 
@@ -528,9 +643,9 @@ Sequence numbers replace hashes as the race detection token in flush. There is a
 
 Per-block storage means one S3 PUT per 128KB write. At 28K IOPS, that's 28K PUTs/second — prohibitively expensive ($0.14/hour in S3 API costs alone).
 
-Packing 25 blocks per S3 object reduces PUTs by 25x. Content addressing (hash as identity) enables cross-export deduplication on the same host without coordination.
+Packing up to 100 blocks per S3 object reduces PUTs by up to 100x. Content addressing (hash as identity) enables cross-export deduplication on the same host without coordination.
 
-Trade-off: read amplification. A cache miss fetches the entire pack (~3.2MB) even if only one block (128KB) is needed. The 99.67% cache hit rate makes this acceptable — misses are rare, and the extra data often prefills the cache for subsequent reads.
+Trade-off: read amplification. A cache miss fetches the entire pack (up to ~12.8MB) even if only one block (128KB) is needed. The 99.67% cache hit rate makes this acceptable — misses are rare, and the extra data often prefills the cache for subsequent reads.
 
 ### Why BLAKE3-128 instead of full BLAKE3-256?
 
@@ -543,14 +658,6 @@ Matches ZFS default recordsize. Analysis in `BLOCK_SIZE_ANALYSIS.md` shows 128KB
 ### Why typestate instead of runtime state checks?
 
 Compile-time prevention of invalid operations. You literally cannot call `write()` on a `WriteCache<Recovering>` — the method doesn't exist for that type parameter. No runtime cost, no forgotten state checks.
-
-### Why no block-level compression?
-
-1. ZFS handles compression at its layer — double-compression wastes CPU
-2. Would break the fixed block size assumption (compressed blocks vary in size)
-3. Content addressing relies on consistent hashing — compressing before hashing would prevent dedup across compression changes
-
-LZ4 compression is applied *inside packs* for S3 storage efficiency, not at the block device layer.
 
 ### Why a lock-free circuit breaker?
 
@@ -574,46 +681,66 @@ We considered `RwLock` but rejected it: even uncontended lock/unlock has ~25ns o
 
 **C11 memory ordering**: The writer stores data fields with `Release` ordering, not `Relaxed`. Under the C11 model (which matters on ARM/Graviton), a `Relaxed` data store can be observed by a reader via a `Relaxed` load without establishing any happens-before relationship — the reader's subsequent `Relaxed` v2 load might miss the writer's version change entirely, producing a torn read. With `Release` data stores, the reader's `Acquire` fence (between data loads and v2 load) synchronizes-with the observed Release, making the writer's odd version visible to v2 and forcing a retry. Loom tests exhaustively verify this property. SeqLock is single-writer by design; concurrent writers break the version parity invariant.
 
+### S3 Concurrency Limits
+
+With 5,000 VMs on a single host, unbounded S3 concurrency is a problem. Each export's flush can upload multiple packs concurrently, and each cache miss triggers an S3 GET. In the worst case: 5,000 VMs × 25 packs = 125K concurrent uploads, or 5,000 × 256 in-flight NBD reads = 1.28M concurrent GETs.
+
+Two host-level `tokio::Semaphore`s bound this — one for uploads (background flush), one for downloads (read path). The semaphores live on `ExportRouter` and are shared (via `Arc`) to every `ContentStore` instance. This is a global gate, not per-export.
+
+| Semaphore | Default | Rationale |
+|-----------|---------|-----------|
+| `max_s3_uploads` | 128 | Background flush is not latency-sensitive; caps inflight PUTs |
+| `max_s3_downloads` | 512 | Read path is latency-sensitive (NBD client waiting); higher limit |
+
+Set to 0 for unlimited (tests use this). Permit is acquired before the S3 call and held for the duration of the request. For streaming downloads (`get_pack_stream`), the permit is held until the stream is fully consumed.
+
+(`content_store.rs`, `router.rs`, `config.rs`)
+
 ### SSD Backpressure
 
-The local SSD is the one resource without explicit bounds — every other critical resource has backpressure (memory: page budget, S3: circuit breaker, Foyer: size limits). With 2000 sparse cache files on a 100GB SSD, physical space can be exhausted. A background capacity monitor polls `statvfs` every 5 seconds and takes escalating action:
+With 2000 sparse cache files on a 100GB SSD, physical space can be exhausted. Two mechanisms provide SSD backpressure:
+
+**1. Write rejection at 95%**: The NBD write handler checks SSD utilization before each write. If SSD > 95% and the write targets blocks not yet present on SSD (would allocate new space), it rejects with `ENOSPC`. Overwrites to already-present blocks are allowed — a VM doing in-place database updates keeps working. (`handler.rs:WRITE_REJECT_THRESHOLD`)
+
+**2. Pressure flush**: A background capacity monitor polls `statvfs` every 5 seconds and takes escalating action:
 
 | SSD Utilization | Action |
 |---|---|
 | < 80% | Normal — no intervention |
 | ≥ 80% | Warn — log + `glidefs_ssd_utilization_ratio` gauge for alerting |
-| ≥ 90% | Escalate — switch flush modes to Continuous(2s/10s) across all exports |
-| < 80% (recovery) | Restore original flush modes |
+| ≥ 90% | Escalate — pressure-flush the 8 dirtiest exports to S3 |
+| ≥ 95% | Reject — new-block writes return ENOSPC (per-write check in handler) |
+| < 80% (recovery) | Normal — pressure resolved |
 
-The 5µs write path is never touched — the monitor only adjusts background flush aggressiveness via the existing `watch::channel<FlushMode>` that each export's flush scheduler already monitors.
+The pressure flush directly flushes dirty packs from the exports with the most dirty blocks, prioritizing data that frees the most SSD space.
 
-**Why not hole-punch clean blocks?** `fallocate(PUNCH_HOLE)` on CLEAN block regions would reclaim physical SSD space, but it races with `pwrite` at the kernel level. A concurrent guest write could land data via pwrite, then the punch deallocates it — silent data corruption. No userspace CAS ordering prevents this because both are kernel syscalls on the same inode. The escalated flush is the real backpressure: it converts dirty blocks to clean blocks faster, and clean blocks don't contribute to ENOSPC pressure.
+**Why not hole-punch clean blocks?** `fallocate(PUNCH_HOLE)` on CLEAN block regions would reclaim physical SSD space, but it races with `pwrite` at the kernel level. A concurrent guest write could land data via pwrite, then the punch deallocates it — silent data corruption. No userspace CAS ordering prevents this because both are kernel syscalls on the same inode. The pressure flush is the real backpressure: it converts dirty blocks to clean blocks faster, and clean blocks don't contribute to ENOSPC pressure.
 
 ## Package Structure
 
 | File | Purpose |
 |------|---------|
 | `nbd/server.rs` | TCP/Unix socket listener, NBD protocol negotiation, concurrent request dispatch |
-| `nbd/router.rs` | Multi-tenant export manager: create, delete, drain, promote, resize |
-| `nbd/handler.rs` | Thin wrapper dispatching NBD commands (read/write/flush) to WriteCache |
+| `nbd/router.rs` | Multi-tenant export manager: create, delete, drain (concurrent, 16-wide), promote, resize |
+| `nbd/handler.rs` | NBD command dispatch (read/write/flush) with SSD write rejection at 95% |
 | `nbd/write_cache/mod.rs` | `WriteCache<S>` typestate wrapper, `FlushStats`, `SnapshotResult` |
 | `nbd/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, `SparseStateMap` integration, metadata persistence |
 | `nbd/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
 | `nbd/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → S3 → SSD fallback) |
-| `nbd/write_cache/flush.rs` | Dirty block scan, pack assembly, S3 upload, manifest sync |
+| `nbd/write_cache/flush.rs` | Dirty block scan, CRC32 checkpoint compute + flush verify (spawn_blocking), pack assembly, S3 upload, manifest sync |
 | `nbd/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading |
 | `nbd/write_cache/recovery.rs` | WAL replay, dirty block verification after crash |
 | `nbd/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
 | `nbd/write_cache/error.rs` | `CacheError` type |
-| `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
+| `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock + per-entry CRC32), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
 | `nbd/state.rs` | `BlockState` enum + sealed typestate markers (`Initializing`, `Active`, etc.) |
 | `nbd/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
-| `nbd/pack_index.rs` | `HostPackIndex`: `DashMap<Blake3Hash, PackLocation>` for cross-export dedup |
+| `nbd/pack_index.rs` | `HostPackIndex`: redb-backed `Blake3Hash → PackLocation` index for cross-export dedup |
 | `nbd/pack_registry.rs` | Per-export pack ID tracking for garbage collection |
-| `nbd/capacity_monitor.rs` | SSD capacity monitor: `statvfs` polling, flush backpressure escalation/recovery |
+| `nbd/capacity_monitor.rs` | SSD capacity monitor: `statvfs` polling, pressure flush on dirtiest exports |
 | `nbd/content_store.rs` | S3 PUT/GET for packs and manifests via `object_store` crate |
 | `nbd/manifest.rs` | Binary manifest serialization/deserialization (GLDE format) |
-| `nbd/flush_scheduler.rs` | `DemandDriven` or `Continuous` flush modes with `tokio::select!` |
+| `nbd/flush_scheduler.rs` | Event-driven pack flush (Notify) + periodic WAL checkpoint (5s) |
 | `nbd/wal.rs` | Append-only WAL for crash recovery with CRC32 integrity |
 | `nbd/cache.rs` | `BlockCache` trait + `FoyerBlockCache` (memory + SSD hybrid) |
 | `nbd/readahead.rs` | Sequential read detector: 3+ consecutive chunks triggers pack prefetch |
@@ -650,11 +777,12 @@ url = "s3://my-bucket/vms"    # Also: gs://, az://, file://, memory://
 [servers.nbd]
 unix_socket = "/var/run/glidefs.sock"
 api_address = "127.0.0.1:8080"
+max_s3_uploads = 128             # Global S3 PUT concurrency (0 = unlimited)
+max_s3_downloads = 512            # Global S3 GET concurrency (0 = unlimited)
 
 [[servers.nbd.exports]]
 name = "vm-prod-1"
 size_gb = 100.0
-flush_mode = { Continuous = { pack_interval_secs = 5, manifest_interval_secs = 60 } }
 
 # Cloud credentials (all values support ${ENV_VAR} expansion)
 [aws]
@@ -674,16 +802,21 @@ Supported storage backends: **Amazon S3** (`s3://`), **Google Cloud Storage** (`
 | `connect_timeout_secs` | 10 | S3 connection timeout |
 | `request_timeout_secs` | 300 | S3 request timeout (large packs take time) |
 | `shutdown_timeout_secs` | 30 | Grace period for drain on SIGTERM |
+| `max_s3_uploads` | 128 | Global S3 PUT concurrency limit (0 = unlimited) |
+| `max_s3_downloads` | 512 | Global S3 GET concurrency limit (0 = unlimited) |
 | `wal_sync` | false | fsync WAL per batch; true = slower but crash-safe metadata |
 
-## Flush Modes
+## Flush Scheduling
 
-| Mode | Behavior | Use Case |
-|------|----------|----------|
-| `DemandDriven` | Flush only on explicit trigger (API call, drain, shutdown). Local checkpoint every 5s keeps WAL bounded. | Dev/preview VMs where some data loss on host death is acceptable |
-| `Continuous` | Periodic pack flush (~5s) + manifest sync (~60s) | Production VMs that need a small dirty window |
+One unified policy for all exports — no modes, no configuration:
 
-Mode can be changed at runtime via `watch::Sender`. The scheduler re-reads the mode on each loop iteration. (`flush_scheduler.rs`)
+- **Pack-size trigger**: When an export accumulates `BLOCKS_PER_PACK` (100) dirty blocks, the write path notifies the flush scheduler via `tokio::sync::Notify`. The scheduler wakes, flushes dirty blocks as content-addressed packs to S3, syncs the manifest (delta or full), and checkpoints. Event-driven, not polled.
+- **Local checkpoint** (5s): Periodic WAL truncation + block state persistence. No S3 involvement.
+- **Manifest sync**: After every successful pack upload, the scheduler syncs the manifest so flushed packs are immediately discoverable on cross-host recovery (host death without drain). Uses delta manifests when possible to minimize S3 bandwidth.
+
+The dirty block counter only increments on `Clean→Dirty` transitions, so rewriting the same block 100 times counts as 1 dirty block — natural write coalescing.
+
+At 2K microVMs per node: max ~25GB dirty data node-wide (99 blocks × 128KB × 2000 exports). (`flush_scheduler.rs`, `handler.rs:check_flush_threshold`)
 
 ## Memory Overhead
 
@@ -697,7 +830,7 @@ AtomicBlockMap (hash + sequence storage)
 │   ├── [0] → HashPage { entries: [HashEntry; 128] }  4096 bytes
 │   ├── [1] → null  (unwritten — zero cost)
 │   └── ...
-│   HashEntry: 32 bytes (#[repr(C)]): version(u32) + _pad(u32) + hash_lo(u64) + hash_hi(u64) + seq(u64)
+│   HashEntry: 32 bytes (#[repr(C)]): version(u32) + crc32(u32) + hash_lo(u64) + hash_hi(u64) + seq(u64)
 
 SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 ├── directory: Box<[AtomicPtr<StatePage>]>    16 KB  (2048 entries for 8M blocks)
@@ -710,7 +843,7 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 |-----------|-------------------|-----------------|--------|-------|
 | `AtomicBlockMap` directory | ~512 KB | 4 KB per 128 blocks written | — | 32 bytes/entry × 128 entries/page |
 | `SparseStateMap` directory | ~16 KB | 4 KB per 4096 blocks written | — | 1 byte/entry × 4096 entries/page |
-| `HostPackIndex` | — | — | ~56 bytes/unique hash | DashMap, pruned on export removal |
+| `HostPackIndex` | — | — | ~40 bytes/unique hash (on disk) | redb, disk-resident, pruned on export removal |
 | `CleanCache` (memory) | — | — | `memory_size_gb` | Configured, default 1GB |
 | `CleanCache` (SSD) | — | — | `ssd_cache_size_gb` | Configured, default 10GB |
 
@@ -721,10 +854,6 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 | 100% written | ~260 MB |
 | 2,000 empty exports | ~1 GB |
 | 2,000 exports, 1% written | ~10 GB |
-
-### Memory Budget
-
-Each export's page tables share an `Arc<AtomicUsize>` budget counter. Page allocation decrements the budget; when exhausted, writes return `MetadataLimitExceeded` → NBD ENOSPC. This prevents a runaway guest from consuming memory budgeted for other VMs. (`block_map.rs:ensure_page`)
 
 ## Failure Modes
 
@@ -739,15 +868,14 @@ Each export's page tables share an `Arc<AtomicUsize>` budget counter. Page alloc
 | Process crash mid-WAL-write | Torn WAL entry | CRC32 detects; replay stops at corruption, discards torn tail |
 | Process crash mid-S3-sync | Orphaned packs in S3 | Harmless: packs are immutable, GC can clean up unreferenced packs |
 | S3 sustained outage | Circuit breaker opens | Reads from local SSD continue; writes accumulate locally; breaker probes S3 every 30s |
-| Metadata budget exhaustion | `ENOSPC` to guest | Guest sees write failure; existing data intact; flush frees budget by clearing dirty blocks |
-| Local SSD full | `ENOSPC` to guest (NBD_ENOSPC, not EIO) | Capacity monitor escalates flush → Continuous(2s/10s); dirty blocks drain to S3, freeing physical space |
-| SSD failure after flush | **Data loss for CLEAN blocks** | Blocks in CLEAN state have known hashes in the block map but the pack index is empty (not persisted) and the SSD data is gone. Tier 3 pread returns errors or garbage — no fallback to S3 because the hash→pack location mapping is lost. Recreate VM from base image or last manifest. **Mitigation**: the risk window is narrow (SSD must fail between last flush and next restart), and the workload is ephemeral VMs. A future fix could attempt manifest-based pack index reconstruction on Tier 3 read failure. |
+| Local SSD full | `ENOSPC` to guest (NBD_ENOSPC, not EIO) | Write handler rejects new-block writes at >95% SSD utilization; capacity monitor pressure-flushes dirtiest exports to S3, freeing physical space. Overwrites to already-present blocks are still allowed. |
+| SSD failure | Same as host death — writes since last manifest sync are lost | Recreate from last S3 manifest; `rebuild()` repopulates pack index from manifest's pack index section. Packs from un-synced flushes are orphaned (GC cleans up after grace period). |
 
 ## Testing
 
 | Suite | Command | Count | What It Covers |
 |-------|---------|-------|----------------|
-| Unit | `cargo test --features test-utils --lib` | ~307 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables |
-| Integration | `cargo test --features test-utils --test integration` | ~46 | Crash recovery, concurrent writes, flush consistency (no Docker) |
-| Docker | `cargo test --features docker-tests --test docker_integration` | ~9 | Real S3 via MinIO (testcontainers-rs), end-to-end pack upload/download |
+| Unit | `cargo test --features test-utils --lib` | ~327 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables, CRC32 integrity, delta manifest serde |
+| Integration | `cargo test --features test-utils --test integration` | ~55 | Crash recovery, concurrent writes, flush consistency, delta manifests (no Docker) |
+| Docker | `cargo test --features docker-tests --test docker_integration` | ~20 | Real S3 via MinIO (testcontainers-rs), end-to-end pack upload/download |
 | Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free algorithms (AtomicBlockMap, SeqLock) |

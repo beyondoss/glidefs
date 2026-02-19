@@ -30,7 +30,7 @@ use super::block_map::Blake3Hash;
 
 pub const PACK_MAGIC: &[u8; 4] = b"GLPK";
 pub const PACK_VERSION: u16 = 1;
-pub const BLOCKS_PER_PACK: usize = 25;
+pub const BLOCKS_PER_PACK: usize = 100;
 pub const PACK_HEADER_SIZE: usize = 16;
 pub const PACK_INDEX_ENTRY_SIZE: usize = 24;
 
