@@ -866,6 +866,30 @@ impl SparseStateMap {
         })
     }
 
+    /// Iterate over all allocated pages, yielding `(block_index, state)` for
+    /// entries with a non-zero state (present blocks).
+    ///
+    /// Only visits allocated pages — O(allocated_pages × PAGE_SIZE), not
+    /// O(total_blocks). This is a major win for sparse exports.
+    pub fn iter_present(&self) -> impl Iterator<Item = (usize, u8)> + '_ {
+        (0..self.num_pages).flat_map(move |page_idx| {
+            let page = self.load_page(page_idx);
+            let page_start = page_idx << STATE_PAGE_BITS;
+            let page_end = std::cmp::min(page_start + STATE_PAGE_SIZE, self.num_entries);
+            let count = page_end - page_start;
+
+            (0..count).filter_map(move |entry_idx| {
+                let page = page?;
+                let state = page.states[entry_idx].load(Ordering::Acquire);
+                if state != SparseBlockState::NOT_PRESENT {
+                    Some((page_start + entry_idx, state))
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
     /// Count blocks with a non-zero state (present blocks).
     pub fn count_present(&self) -> usize {
         let mut count = 0;

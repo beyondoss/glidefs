@@ -483,31 +483,76 @@ impl WriteCache<Active> {
         seq_cutpoint: u64,
     ) -> Result<Option<String>, CacheError> {
         use super::inner::BaseManifestState;
-        use crate::nbd::manifest::MANIFEST_BLOCK_ENTRY_SIZE;
 
-        // Check if we have base state for delta computation.
-        let base_state = self.inner.base_manifest_state.lock().take();
-        let base_state = match base_state {
-            Some(s) => s,
-            None => {
-                // No base state — must upload full.
-                debug!("no base manifest state, uploading full manifest");
-                return self
-                    .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
-                    .await;
+        // Check compaction triggers while borrowing (no take yet).
+        // Extract decision before any .await to avoid holding MutexGuard across await.
+        let needs_full = {
+            let guard = self.inner.base_manifest_state.lock();
+            match guard.as_ref() {
+                None => Some("no base manifest state"),
+                Some(s) if s.syncs_since_base >= 10 => Some("compaction trigger: sync count"),
+                Some(_) => None, // proceed to delta path
             }
         };
-
-        // Check sync count compaction trigger.
-        if base_state.syncs_since_base >= 10 {
-            debug!(
-                syncs_since_base = base_state.syncs_since_base,
-                "compaction trigger: sync count, uploading full manifest"
-            );
+        if let Some(reason) = needs_full {
+            debug!("{reason}, uploading full manifest");
             return self
                 .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
                 .await;
         }
+
+        // Take ownership for delta computation. From here, any error must
+        // restore the state before propagating.
+        let Some(base_state) = self.inner.base_manifest_state.lock().take() else {
+            // Shouldn't happen (we just checked), but fall back to full upload.
+            return self
+                .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
+                .await;
+        };
+
+        // Run the fallible delta logic, restoring base_state on error.
+        let result = self
+            .try_upload_delta(
+                content_store,
+                host_pack_index,
+                seq_cutpoint,
+                &base_state,
+            )
+            .await;
+
+        match result {
+            Ok(compacted) => {
+                if compacted {
+                    // Full manifest was uploaded (size trigger) — upload_full_manifest
+                    // already set new base_manifest_state, nothing to restore.
+                } else {
+                    // Delta uploaded — put back with incremented sync count.
+                    *self.inner.base_manifest_state.lock() = Some(BaseManifestState {
+                        sequence: base_state.sequence,
+                        block_map: base_state.block_map,
+                        syncs_since_base: base_state.syncs_since_base + 1,
+                    });
+                }
+                Ok(None)
+            }
+            Err(e) => {
+                // Restore state so next sync can retry delta.
+                *self.inner.base_manifest_state.lock() = Some(base_state);
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner delta upload logic. Returns Ok(true) if compaction was triggered
+    /// (full manifest uploaded instead), Ok(false) if delta was uploaded.
+    async fn try_upload_delta(
+        &self,
+        content_store: &ContentStore,
+        host_pack_index: &HostPackIndex,
+        seq_cutpoint: u64,
+        base_state: &super::inner::BaseManifestState,
+    ) -> Result<bool, CacheError> {
+        use crate::nbd::manifest::MANIFEST_BLOCK_ENTRY_SIZE;
 
         // Snapshot current block map and compute delta.
         let chunk_size = self.inner.config.block_size as u32;
@@ -566,9 +611,9 @@ impl WriteCache<Active> {
                 full_entries = current_entries.len(),
                 "compaction trigger: delta > 50% of full, uploading full manifest"
             );
-            return self
-                .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
-                .await;
+            self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
+                .await?;
+            return Ok(true); // compacted
         }
 
         // Build and upload delta.
@@ -593,13 +638,6 @@ impl WriteCache<Active> {
             .put_delta_manifest(&self.inner.export_name, delta.serialize())
             .await?;
 
-        // Put back base_manifest_state with incremented sync count.
-        *self.inner.base_manifest_state.lock() = Some(BaseManifestState {
-            sequence: base_state.sequence,
-            block_map: base_state.block_map,
-            syncs_since_base: base_state.syncs_since_base + 1,
-        });
-
         info!(
             sequence = seq_cutpoint,
             base_sequence = base_state.sequence,
@@ -608,7 +646,7 @@ impl WriteCache<Active> {
             new_packs = delta.new_pack_entries.len(),
             "uploaded delta manifest"
         );
-        Ok(None) // deltas don't return etag
+        Ok(false) // delta, not compacted
     }
 
     /// Flush dirty blocks to S3 as packs (no manifest upload).
@@ -636,7 +674,16 @@ impl WriteCache<Active> {
         seq_cutpoint: u64,
     ) -> Result<(), CacheError> {
         self.upload_delta_or_full_manifest(content_store, host_pack_index, seq_cutpoint).await?;
-        // Checkpoint: block map outside lock, fast save + truncate under lock.
+        self.checkpoint()?;
+        Ok(())
+    }
+
+    /// Persist block map + block states and truncate WAL.
+    ///
+    /// Block map is persisted outside the WAL lock (safe: clean blocks
+    /// don't change), then the WAL lock is held only for the fast
+    /// block-states save + truncate.
+    fn checkpoint(&self) -> Result<(), CacheError> {
         self.inner.persist_block_map()?;
         let mut wal = self.inner.wal.lock();
         self.inner.save_block_states()?;
@@ -652,12 +699,7 @@ impl WriteCache<Active> {
     pub fn local_checkpoint(&self) -> Result<(), CacheError> {
         // Compute CRC32 for dirty blocks that don't have one yet.
         self.compute_dirty_crc32s();
-        // Block map outside lock (safe: clean blocks don't change).
-        self.inner.persist_block_map()?;
-        // Fast save + truncate under lock.
-        let mut wal = self.inner.wal.lock();
-        self.inner.save_block_states()?;
-        wal.truncate()?;
+        self.checkpoint()?;
         debug!("local checkpoint complete");
         Ok(())
     }
@@ -779,12 +821,7 @@ impl WriteCache<Active> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint).await?;
         self.update_registry(content_store, &stats.new_pack_ids).await;
-        // Checkpoint: persist block map outside the lock (safe for clean blocks),
-        // then hold the WAL lock only for fast block-states save + truncate.
-        self.inner.persist_block_map()?;
-        let mut wal = self.inner.wal.lock();
-        self.inner.save_block_states()?;
-        wal.truncate()?;
+        self.checkpoint()?;
         Ok(stats)
     }
 
@@ -801,11 +838,7 @@ impl WriteCache<Active> {
         let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
         let manifest_etag = self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint).await?;
         self.update_registry(content_store, &stats.new_pack_ids).await;
-        // Checkpoint: block map outside lock, fast save + truncate under lock.
-        self.inner.persist_block_map()?;
-        let mut wal = self.inner.wal.lock();
-        self.inner.save_block_states()?;
-        wal.truncate()?;
+        self.checkpoint()?;
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,

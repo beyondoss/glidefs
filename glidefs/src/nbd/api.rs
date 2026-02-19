@@ -532,7 +532,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-        }))
+        }).expect("failed to create test router"))
     }
 
     /// Helper to make a request and get the response.

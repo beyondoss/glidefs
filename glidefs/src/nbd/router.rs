@@ -72,6 +72,13 @@ pub enum RouterError {
 
     #[error("Manifest error: {0}")]
     Manifest(String),
+
+    #[error("Drain incomplete for '{name}': {remaining} dirty blocks after {iterations} iterations")]
+    DrainIncomplete {
+        name: String,
+        remaining: u64,
+        iterations: usize,
+    },
 }
 
 /// Information about an export for NBD protocol.
@@ -117,7 +124,11 @@ const MAX_DRAIN_ITERATIONS: usize = 100;
 
 impl ExportState {
     /// Drain all dirty blocks to S3 via v2 content-addressed packs.
-    pub async fn drain(&self) -> Result<(), RouterError> {
+    ///
+    /// Returns an error if dirty blocks remain after MAX_DRAIN_ITERATIONS.
+    /// Callers that can tolerate incomplete drains (e.g. teardown) should
+    /// handle `RouterError::DrainIncomplete` explicitly.
+    pub async fn drain(&self, name: &str) -> Result<(), RouterError> {
         // Loop until no more dirty blocks remain (concurrent writes may
         // produce new dirty data between flushes).
         for _ in 0..MAX_DRAIN_ITERATIONS {
@@ -130,12 +141,17 @@ impl ExportState {
                 return Ok(());
             }
         }
+        let remaining = self.cache.dirty_block_count();
         warn!(
             "drain hit iteration limit ({}), {} dirty blocks remain",
             MAX_DRAIN_ITERATIONS,
-            self.cache.dirty_block_count()
+            remaining,
         );
-        Ok(())
+        Err(RouterError::DrainIncomplete {
+            name: name.to_string(),
+            remaining,
+            iterations: MAX_DRAIN_ITERATIONS,
+        })
     }
 
     /// Get the current flush mode.
@@ -232,7 +248,7 @@ fn validate_export_name(name: &str) -> Result<(), RouterError> {
 
 impl ExportRouter {
     /// Create a new export router.
-    pub fn new(config: RouterConfig) -> Self {
+    pub fn new(config: RouterConfig) -> Result<Self, RouterError> {
         let s3_circuit_breaker = Arc::new(CircuitBreaker::new(
             CircuitBreakerConfig::consecutive(5)
                 .reset_timeout(Duration::from_secs(30))
@@ -252,10 +268,10 @@ impl ExportRouter {
 
         let pack_index = Arc::new(
             HostPackIndex::open(config.cache_dir.join("pack_index.redb"))
-                .expect("failed to open pack_index.redb"),
+                .map_err(|e| RouterError::Io(std::io::Error::other(e.to_string())))?,
         );
 
-        Self {
+        Ok(Self {
             exports: RwLock::new(HashMap::new()),
             object_store: config.object_store,
             db_path: config.db_path,
@@ -270,7 +286,7 @@ impl ExportRouter {
             download_semaphore,
             backpressure_saved_modes: parking_lot::Mutex::new(HashMap::new()),
             ssd_utilization: Arc::new(AtomicU64::new(0f64.to_bits())),
-        }
+        })
     }
 
     /// Get a reference to the shared pack index (for scrubber).
@@ -856,7 +872,7 @@ impl ExportRouter {
             .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
 
         info!("Draining export '{}'...", name);
-        state.drain().await?;
+        state.drain(name).await?;
         info!("Export '{}' drained successfully", name);
         Ok(())
     }
@@ -1156,7 +1172,7 @@ impl ExportRouter {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-        })
+        }).expect("failed to create test router")
     }
 }
 
@@ -1194,7 +1210,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-        })
+        }).expect("failed to create test router")
     }
 
     fn test_export_config(name: &str) -> ExportConfig {

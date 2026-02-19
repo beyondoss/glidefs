@@ -100,10 +100,16 @@ impl SyncFile {
     }
 }
 
-// Safety: SyncFile only exposes positional I/O methods which are thread-safe.
-// pread/pwrite are atomic per POSIX and don't use the shared file position.
+// SAFETY: SyncFile only exposes positional I/O methods (pread/pwrite via
+// FileExt::{read_exact_at, write_all_at}) which are atomic per POSIX and don't
+// use the shared file position. Do NOT add seek-based read/write methods —
+// they would make this impl unsound.
 unsafe impl Sync for SyncFile {}
-unsafe impl Send for SyncFile {}
+// File is already Send; this static assert guards against future regressions.
+const _: () = {
+    const fn _assert_send<T: Send>() {}
+    let _ = _assert_send::<std::fs::File>;
+};
 
 
 /// Check if a block is all zeros.
@@ -382,14 +388,14 @@ impl CacheInner {
         file.write_all(&(self.config.block_size as u64).to_le_bytes())?;
         file.write_all(&(self.num_blocks as u64).to_le_bytes())?;
 
-        // v4 sparse format: collect (index, state) pairs for non-zero entries
-        let mut sparse_entries: Vec<(u32, u8)> = Vec::new();
-        for idx in 0..self.num_blocks {
-            let state = self.state_map.get(idx);
-            if state != SparseBlockState::NOT_PRESENT {
-                sparse_entries.push((idx as u32, state));
-            }
-        }
+        // v4 sparse format: collect (index, state) pairs for non-zero entries.
+        // Uses iter_present() which only visits allocated pages — O(allocated_pages)
+        // not O(num_blocks).
+        let sparse_entries: Vec<(u32, u8)> = self
+            .state_map
+            .iter_present()
+            .map(|(idx, state)| (idx as u32, state))
+            .collect();
 
         // Write entry count then entries: index(u32 LE) + state(u8) = 5 bytes each
         file.write_all(&(sparse_entries.len() as u64).to_le_bytes())?;

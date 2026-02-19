@@ -102,7 +102,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         wal_sync: nbd_config.wal_sync(),
         max_s3_uploads: nbd_config.max_s3_uploads(),
         max_s3_downloads: nbd_config.max_s3_downloads(),
-    }));
+    }).context("Failed to initialize export router")?);
 
     // Discover exports from S3 (recovers exports created via API)
     info!("Discovering exports from S3...");
