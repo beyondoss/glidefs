@@ -71,13 +71,16 @@ pub async fn flush_scheduler(
                             );
                             // Sync manifest so flushed packs are discoverable
                             // on cross-host recovery (host death without drain).
+                            // sync_manifest includes checkpoint (persist + WAL truncate).
                             if let Err(e) = cache.sync_manifest(&content_store, &pack_index, seq_cutpoint).await {
                                 warn!(error = %e, "manifest sync after flush failed");
                             }
-                        }
-                        // Checkpoint after flush to persist clean block states.
-                        if let Err(e) = cache.local_checkpoint() {
-                            warn!(error = %e, "checkpoint after flush failed");
+                        } else {
+                            // No packs uploaded — still checkpoint to persist
+                            // clean block states and compute CRC32s.
+                            if let Err(e) = cache.local_checkpoint() {
+                                warn!(error = %e, "checkpoint after flush failed");
+                            }
                         }
                     }
                     Err(e) => {
