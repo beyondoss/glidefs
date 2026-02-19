@@ -7,7 +7,7 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState}
 use crate::config::ExportConfig;
 use crate::nbd::cache::BlockCache;
 use crate::nbd::content_store::ContentStore;
-use crate::nbd::flush_scheduler::{flush_scheduler, FlushMode};
+use crate::nbd::flush_scheduler::flush_scheduler;
 use crate::nbd::handler::NBDBlockHandler;
 use crate::nbd::manifest::deserialize_hot_set;
 use crate::nbd::metrics::{ExportMetrics, MetricsSnapshot};
@@ -113,7 +113,6 @@ pub struct ExportState {
     pub pack_index: Arc<HostPackIndex>,
     pub readonly: bool,
     pub metrics: Arc<ExportMetrics>,
-    flush_mode_tx: watch::Sender<FlushMode>,
     flush_shutdown_tx: watch::Sender<bool>,
     flush_handle: JoinHandle<()>,
 }
@@ -152,11 +151,6 @@ impl ExportState {
             remaining,
             iterations: MAX_DRAIN_ITERATIONS,
         })
-    }
-
-    /// Get the current flush mode.
-    pub fn flush_mode(&self) -> FlushMode {
-        self.flush_mode_tx.borrow().clone()
     }
 }
 
@@ -220,10 +214,6 @@ pub struct ExportRouter {
     /// Global S3 download concurrency limit (None = unlimited).
     download_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 
-    /// Original flush modes saved before backpressure override.
-    /// Empty when no backpressure is active.
-    backpressure_saved_modes: parking_lot::Mutex<HashMap<String, FlushMode>>,
-
     /// SSD utilization ratio (0.0–1.0), updated by capacity monitor.
     /// Shared with NBDBlockHandler instances for write rejection at high utilization.
     ssd_utilization: Arc<AtomicU64>, // f64 bits via to_bits()/from_bits()
@@ -284,7 +274,6 @@ impl ExportRouter {
             s3_circuit_breaker,
             upload_semaphore,
             download_semaphore,
-            backpressure_saved_modes: parking_lot::Mutex::new(HashMap::new()),
             ssd_utilization: Arc::new(AtomicU64::new(0f64.to_bits())),
         })
     }
@@ -378,54 +367,34 @@ impl ExportRouter {
         self.ssd_utilization.store(ratio.to_bits(), Ordering::Relaxed);
     }
 
-    /// Returns true if flush backpressure is currently active.
-    pub fn backpressure_active(&self) -> bool {
-        !self.backpressure_saved_modes.lock().is_empty()
-    }
-
-    /// Escalate flush modes under SSD pressure.
+    /// Flush dirty packs from the dirtiest exports under SSD pressure.
     ///
-    /// Saves each export's current flush mode (idempotent — only saves once),
-    /// then switches DemandDriven → Continuous(2s/10s) and shortens existing
-    /// Continuous intervals to min(current, 2s/10s).
-    pub async fn escalate_flush_modes(&self) {
+    /// Does NOT free SSD space — data files retain physical allocation.
+    /// Purpose: ensure data reaches S3 (portability) before potential disk full.
+    pub async fn pressure_flush(&self) {
         let exports = self.exports.read().await;
-        let mut saved = self.backpressure_saved_modes.lock();
-
-        for (name, state) in exports.iter() {
-            let current = state.flush_mode();
-            // Only save if not already saved (idempotent across repeated calls)
-            saved.entry(name.clone()).or_insert(current.clone());
-
-            let escalated = match &current {
-                FlushMode::DemandDriven => FlushMode::Continuous {
-                    pack_interval_secs: 2,
-                    manifest_interval_secs: 10,
-                },
-                FlushMode::Continuous {
-                    pack_interval_secs,
-                    manifest_interval_secs,
-                } => FlushMode::Continuous {
-                    pack_interval_secs: (*pack_interval_secs).min(2),
-                    manifest_interval_secs: (*manifest_interval_secs).min(10),
-                },
-            };
-            let _ = state.flush_mode_tx.send(escalated);
-        }
-    }
-
-    /// Restore original flush modes after SSD pressure subsides.
-    pub async fn restore_flush_modes(&self) {
-        let exports = self.exports.read().await;
-        let mut saved = self.backpressure_saved_modes.lock();
-
-        for (name, state) in exports.iter() {
-            if let Some(original) = saved.remove(name.as_str()) {
-                let _ = state.flush_mode_tx.send(original);
+        let mut targets: Vec<_> = exports
+            .iter()
+            .filter(|(_, s)| s.cache.dirty_block_count() > 0)
+            .collect();
+        targets.sort_by(|a, b| {
+            b.1.cache
+                .dirty_block_count()
+                .cmp(&a.1.cache.dirty_block_count())
+        });
+        for (name, state) in targets.iter().take(8) {
+            match state
+                .cache
+                .flush_packs(&state.content_store, &state.pack_index)
+                .await
+            {
+                Ok((stats, _)) if stats.packs_uploaded > 0 => {
+                    info!(export = %name, packs = stats.packs_uploaded, "pressure flush");
+                }
+                Err(e) => warn!(export = %name, error = %e, "pressure flush failed"),
+                _ => {}
             }
         }
-        // Clear any stale entries for exports that were removed during backpressure
-        saved.clear();
     }
 
     // =========================================================================
@@ -576,9 +545,6 @@ impl ExportRouter {
         let clean_cache = Arc::clone(&self.clean_cache);
         let pack_index = Arc::clone(&self.pack_index);
 
-        // Flush trigger shared between scheduler and API triggers
-        let flush_trigger = Arc::new(Notify::new());
-
         // Create write cache — either from manifest (fork) or fresh (normal)
         let cache_config = WriteCacheConfig {
             cache_dir: self.cache_dir.clone(),
@@ -701,6 +667,9 @@ impl ExportRouter {
             }
         }
 
+        // Shared notify: write path signals when dirty count crosses BLOCKS_PER_PACK
+        let flush_notify = Arc::new(Notify::new());
+
         // Create handler for block I/O
         let handler = Arc::new(NBDBlockHandler::new(
             Arc::clone(&cache),
@@ -711,20 +680,18 @@ impl ExportRouter {
             readonly,
             Arc::clone(&metrics),
             Arc::clone(&self.ssd_utilization),
+            Arc::clone(&flush_notify),
         ));
 
         // Start flush scheduler for this export
-        let flush_mode = config.flush_mode.clone().unwrap_or_default();
-        let (flush_mode_tx, flush_mode_rx) = watch::channel(flush_mode);
         let (flush_shutdown_tx, flush_shutdown_rx) = watch::channel(false);
         let flush_cache = Arc::clone(&cache);
         let flush_cs = Arc::clone(&content_store);
         let flush_pi = Arc::clone(&pack_index);
-        let flush_trig = Arc::clone(&flush_trigger);
         let export_name = name.clone();
         let flush_metrics = Arc::clone(&metrics);
         let flush_handle = spawn_named(&format!("flush-{}", name), async move {
-            flush_scheduler(flush_cache, flush_cs, flush_pi, flush_mode_rx, flush_trig, flush_shutdown_rx, flush_metrics).await;
+            flush_scheduler(flush_cache, flush_cs, flush_pi, flush_notify, flush_shutdown_rx, flush_metrics).await;
             info!("Flush scheduler for export '{}' stopped", export_name);
         });
 
@@ -736,7 +703,6 @@ impl ExportRouter {
             pack_index,
             readonly,
             metrics,
-            flush_mode_tx,
             flush_shutdown_tx,
             flush_handle,
         };
@@ -902,25 +868,6 @@ impl ExportRouter {
         failed
     }
 
-    /// Change the flush mode for an export at runtime.
-    pub async fn set_flush_mode(&self, name: &str, mode: FlushMode) -> Result<(), RouterError> {
-        let exports = self.exports.read().await;
-        let state = exports
-            .get(name)
-            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
-        state
-            .flush_mode_tx
-            .send(mode)
-            .map_err(|_| RouterError::Manifest("flush scheduler stopped".to_string()))?;
-        Ok(())
-    }
-
-    /// Get the current flush mode for an export.
-    pub async fn get_flush_mode(&self, name: &str) -> Option<FlushMode> {
-        let exports = self.exports.read().await;
-        exports.get(name).map(|s| s.flush_mode())
-    }
-
     /// Promote a readonly export to read-write.
     pub async fn promote_export(&self, name: &str) -> Result<(), RouterError> {
         validate_export_name(name)?;
@@ -1002,7 +949,6 @@ impl ExportRouter {
             size_gb: new_size_gb,
             s3_prefix: None, // Will use name as prefix (same as before)
             block_size: Some(block_size),
-            flush_mode: None,
         };
 
         self.create_export(config, readonly, Some(name)).await?;
@@ -1219,7 +1165,6 @@ mod tests {
             size_gb: 0.01, // 10MB
             s3_prefix: None,
             block_size: None,
-            flush_mode: None,
         }
     }
 
@@ -1556,22 +1501,19 @@ mod tests {
                 size_gb: 1.0,
                 s3_prefix: None,
                 block_size: None,
-                flush_mode: None,
-            },
+                },
             ExportConfig {
                 name: "discover-vol2".to_string(),
                 size_gb: 2.0,
                 s3_prefix: None,
                 block_size: None,
-                flush_mode: None,
-            },
+                },
             ExportConfig {
                 name: "discover-vol3".to_string(),
                 size_gb: 3.0,
                 s3_prefix: None,
                 block_size: None,
-                flush_mode: None,
-            },
+                },
         ];
 
         for config in &configs {
@@ -1679,7 +1621,6 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("source".to_string()), // same S3 prefix as source
             block_size: None,
-            flush_mode: None,
         };
         router.create_export(fork_config, false, Some("source")).await.unwrap();
 
@@ -1706,7 +1647,6 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("src".to_string()),
             block_size: None,
-            flush_mode: None,
         };
         router.create_export(fork_config, false, Some("src")).await.unwrap();
 
@@ -1739,7 +1679,6 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("nonexistent-source".to_string()),
             block_size: None,
-            flush_mode: None,
         };
 
         let result = router.create_export(config, false, Some("does-not-exist")).await;
@@ -1829,7 +1768,6 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            flush_mode: None,
         };
         router.create_export(fork_config, false, Some("parent")).await.unwrap();
 

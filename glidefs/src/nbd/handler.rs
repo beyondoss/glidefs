@@ -8,6 +8,7 @@ use super::cache::BlockCache;
 use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
 use super::metrics::ExportMetrics;
+use super::pack::BLOCKS_PER_PACK;
 use super::pack_index::HostPackIndex;
 use super::readahead::SequentialDetector;
 use super::state::Active;
@@ -17,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::time::Instant;
+use tokio::sync::Notify;
 
 /// NBD device descriptor used during transmission phase.
 #[derive(Clone)]
@@ -62,6 +64,9 @@ pub struct NBDBlockHandler {
     /// SSD utilization ratio shared from ExportRouter.
     /// Used to reject writes to new blocks when SSD > 95%.
     ssd_utilization: Arc<AtomicU64>,
+
+    /// Notifies the flush scheduler when dirty blocks reach BLOCKS_PER_PACK.
+    flush_notify: Arc<Notify>,
 }
 
 impl NBDBlockHandler {
@@ -82,6 +87,7 @@ impl NBDBlockHandler {
         readonly: bool,
         metrics: Arc<ExportMetrics>,
         ssd_utilization: Arc<AtomicU64>,
+        flush_notify: Arc<Notify>,
     ) -> Self {
         Self {
             cache,
@@ -93,6 +99,7 @@ impl NBDBlockHandler {
             metrics,
             readahead: Mutex::new(SequentialDetector::new()),
             ssd_utilization,
+            flush_notify,
         }
     }
 
@@ -118,6 +125,14 @@ impl NBDBlockHandler {
     #[allow(dead_code)]
     pub fn set_device_size(&self, new_size: u64) {
         self.device_size.store(new_size, Ordering::Relaxed);
+    }
+
+    /// Notify the flush scheduler if dirty blocks have reached pack size.
+    #[inline]
+    fn check_flush_threshold(&self) {
+        if self.cache.dirty_block_count() >= BLOCKS_PER_PACK as u64 {
+            self.flush_notify.notify_one();
+        }
     }
 
     // ========================================================================
@@ -208,6 +223,7 @@ impl NBDBlockHandler {
 
         self.metrics.record_guest_write(data.len() as u64);
         self.cache.write(offset, data, self.clean_cache.as_ref())?;
+        self.check_flush_threshold();
 
         if fua {
             self.flush()?;
@@ -236,6 +252,7 @@ impl NBDBlockHandler {
         }
 
         self.cache.zero_range(offset, length as u64)?;
+        self.check_flush_threshold();
 
         if fua {
             self.flush()?;
@@ -265,6 +282,7 @@ impl NBDBlockHandler {
         }
 
         self.cache.zero_range(offset, length as u64)?;
+        self.check_flush_threshold();
 
         if fua {
             self.flush()?;
@@ -340,6 +358,7 @@ mod tests {
             readonly,
             metrics,
             Arc::new(AtomicU64::new(0f64.to_bits())),
+            Arc::new(Notify::const_new()),
         );
 
         (handler, temp_dir)

@@ -154,7 +154,6 @@ impl TestServer {
             size_gb,
             s3_prefix: None,
             block_size: None,
-            flush_mode: None,
         };
         self.router
             .create_export(config, false, None)
@@ -169,7 +168,6 @@ impl TestServer {
             size_gb,
             s3_prefix: None,
             block_size: None,
-            flush_mode: None,
         };
         self.router
             .create_export(config, false, Some(name))
@@ -184,7 +182,6 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_prefix.to_string()),
             block_size: None,
-            flush_mode: None,
         };
         self.router
             .create_export(config, false, Some(name))
@@ -207,7 +204,6 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_manifest.to_string()),
             block_size: None,
-            flush_mode: None,
         };
         self.router
             .create_export(config, false, Some(source_manifest))
@@ -222,7 +218,6 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_manifest.to_string()),
             block_size: None,
-            flush_mode: None,
         };
         self.router
             .create_export(config, true, Some(source_manifest))

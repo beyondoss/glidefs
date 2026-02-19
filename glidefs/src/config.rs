@@ -5,7 +5,6 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-use crate::nbd::flush_scheduler::FlushMode;
 
 // Note: Block-level compression is intentionally NOT implemented.
 // ZFS handles compression at its layer, and block-level compression would:
@@ -171,10 +170,6 @@ pub struct ExportConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block_size: Option<usize>,
 
-    /// Flush mode for this export (default: inherit from global or DemandDriven).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub flush_mode: Option<FlushMode>,
-
 }
 
 impl ExportConfig {
@@ -255,7 +250,6 @@ impl NbdConfig {
                 size_gb,
                 s3_prefix: None,
                 block_size: None,
-                flush_mode: None,
 
             }];
         }
@@ -266,7 +260,6 @@ impl NbdConfig {
             size_gb: Self::DEFAULT_DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
-            flush_mode: None,
         }]
     }
 }
@@ -516,8 +509,7 @@ impl Settings {
                         size_gb: 100.0,
                         s3_prefix: None,
                         block_size: None,
-                        flush_mode: None,
-        
+                
                     }],
                     device_name: None,
                     device_size_gb: None,
