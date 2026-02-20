@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::nbd::block_map::{
     AtomicBlockMap, BlockMap, BlockMapEntry, BlockMapKind, Blake3Hash, ForkedBlockMap,
@@ -76,7 +76,7 @@ impl WriteCache<Initializing> {
                 entries
             }
             Err(e) => {
-                warn!(error = %e, "WAL replay failed, continuing with persisted block map");
+                error!(error = %e, "WAL replay failed — dirty blocks since last checkpoint may be lost, continuing with persisted block map");
                 vec![]
             }
         };
@@ -142,7 +142,8 @@ impl WriteCache<Initializing> {
         let wal = match Wal::open(&wal_path) {
             Ok(w) => w,
             Err(e) => {
-                warn!(error = %e, "failed to open WAL, creating new");
+                warn!(error = %e, "failed to open WAL, removing and creating new");
+                let _ = std::fs::remove_file(&wal_path);
                 Wal::open(&wal_path).map_err(CacheError::Io)?
             }
         };

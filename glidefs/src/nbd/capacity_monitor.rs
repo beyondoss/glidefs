@@ -90,7 +90,14 @@ pub async fn capacity_monitor(
 
                 let new_level = PressureLevel::classify(utilization, &config);
 
-                if new_level != current_level {
+                // Re-flush every poll while sustained at Escalated
+                if new_level == PressureLevel::Escalated && current_level == PressureLevel::Escalated {
+                    warn!(
+                        utilization = format!("{:.1}%", utilization * 100.0),
+                        "SSD pressure sustained: flushing dirtiest exports"
+                    );
+                    router.pressure_flush().await;
+                } else if new_level != current_level {
                     match (current_level, new_level) {
                         // Escalating — pressure-flush dirtiest exports
                         (prev, PressureLevel::Escalated) if prev < PressureLevel::Escalated => {

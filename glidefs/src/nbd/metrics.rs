@@ -64,22 +64,15 @@ pub struct ExportMetrics {
     /// Blocks left dirty per flush due to concurrent-write CAS failures
     pub flush_blocks_cas_failed: AtomicU64,
 
-    /// Counter for latency sampling (reduces histogram mutex contention)
-    latency_sample_counter: AtomicU64,
-
-    // Latency tracking for diagnosing performance issues (sampled)
-    /// Read operation latencies (microseconds) - sampled 1:64
-    read_latencies: Mutex<LatencyHistogram>,
-    /// Write operation latencies (microseconds) - sampled 1:64
-    write_latencies: Mutex<LatencyHistogram>,
-    /// S3 fetch latencies (microseconds) - sampled 1:64
-    s3_fetch_latencies: Mutex<LatencyHistogram>,
-    /// Local file read latencies (microseconds) - sampled 1:64
-    file_read_latencies: Mutex<LatencyHistogram>,
-    /// Local file write latencies (microseconds) - sampled 1:64
-    file_write_latencies: Mutex<LatencyHistogram>,
-    /// S3 PUT latencies (microseconds) - sampled 1:64
-    s3_put_latencies: Mutex<LatencyHistogram>,
+    // Latency tracking for diagnosing performance issues (sampled 1:64).
+    // Each histogram has its own sample counter so high-frequency operation types
+    // (e.g. reads) don't starve low-frequency ones (e.g. S3 PUTs).
+    read_latencies: SampledHistogram,
+    write_latencies: SampledHistogram,
+    s3_fetch_latencies: SampledHistogram,
+    file_read_latencies: SampledHistogram,
+    file_write_latencies: SampledHistogram,
+    s3_put_latencies: SampledHistogram,
 }
 
 /// Simple histogram for latency tracking.
@@ -92,6 +85,35 @@ pub struct LatencyHistogram {
     pub max_us: u64,
     /// Buckets: [<100us, <1ms, <10ms, <100ms, <1s, >=1s]
     pub buckets: [u64; 6],
+}
+
+/// A latency histogram with its own per-type sample counter.
+/// Each histogram independently samples 1-in-64 operations so that
+/// high-frequency op types don't crowd out low-frequency ones.
+#[derive(Debug)]
+struct SampledHistogram {
+    counter: AtomicU64,
+    histogram: Mutex<LatencyHistogram>,
+}
+
+impl SampledHistogram {
+    fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+            histogram: Mutex::new(LatencyHistogram::default()),
+        }
+    }
+
+    #[inline]
+    fn record(&self, duration: Duration) {
+        if self.counter.fetch_add(1, Ordering::Relaxed).is_multiple_of(LATENCY_SAMPLE_INTERVAL) {
+            self.histogram.lock().record(duration);
+        }
+    }
+
+    fn snapshot(&self) -> LatencySnapshot {
+        self.histogram.lock().snapshot()
+    }
 }
 
 impl LatencyHistogram {
@@ -230,13 +252,12 @@ impl Default for ExportMetrics {
             s3_get_errors: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
             flush_blocks_cas_failed: AtomicU64::new(0),
-            latency_sample_counter: AtomicU64::new(0),
-            read_latencies: Mutex::new(LatencyHistogram::default()),
-            write_latencies: Mutex::new(LatencyHistogram::default()),
-            s3_fetch_latencies: Mutex::new(LatencyHistogram::default()),
-            file_read_latencies: Mutex::new(LatencyHistogram::default()),
-            file_write_latencies: Mutex::new(LatencyHistogram::default()),
-            s3_put_latencies: Mutex::new(LatencyHistogram::default()),
+            read_latencies: SampledHistogram::new(),
+            write_latencies: SampledHistogram::new(),
+            s3_fetch_latencies: SampledHistogram::new(),
+            file_read_latencies: SampledHistogram::new(),
+            file_write_latencies: SampledHistogram::new(),
+            s3_put_latencies: SampledHistogram::new(),
         }
     }
 }
@@ -247,56 +268,36 @@ impl ExportMetrics {
         Self::default()
     }
 
-    /// Check if we should record this latency sample.
-    /// Uses a shared counter to sample ~1 in 64 operations.
-    #[inline]
-    fn should_sample(&self) -> bool {
-        // Relaxed is fine - we don't need precise sampling, just reduced contention
-        self.latency_sample_counter
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(LATENCY_SAMPLE_INTERVAL)
-    }
-
-    /// Record read operation latency (sampled to reduce mutex contention).
+    /// Record read operation latency (sampled 1:64 to reduce mutex contention).
     #[inline]
     pub fn record_read_latency(&self, duration: Duration) {
-        if self.should_sample() {
-            self.read_latencies.lock().record(duration);
-        }
+        self.read_latencies.record(duration);
     }
 
-    /// Record write operation latency (sampled to reduce mutex contention).
+    /// Record write operation latency (sampled 1:64 to reduce mutex contention).
     #[inline]
     pub fn record_write_latency(&self, duration: Duration) {
-        if self.should_sample() {
-            self.write_latencies.lock().record(duration);
-        }
+        self.write_latencies.record(duration);
     }
 
-    /// Record S3 fetch latency (sampled to reduce mutex contention).
+    /// Record S3 fetch latency (sampled 1:64 to reduce mutex contention).
     #[inline]
     pub fn record_s3_fetch_latency(&self, duration: Duration) {
-        if self.should_sample() {
-            self.s3_fetch_latencies.lock().record(duration);
-        }
+        self.s3_fetch_latencies.record(duration);
     }
 
-    /// Record local file read latency (sampled to reduce mutex contention).
+    /// Record local file read latency (sampled 1:64 to reduce mutex contention).
     #[allow(dead_code)]
     #[inline]
     pub fn record_file_read_latency(&self, duration: Duration) {
-        if self.should_sample() {
-            self.file_read_latencies.lock().record(duration);
-        }
+        self.file_read_latencies.record(duration);
     }
 
-    /// Record local file write latency (sampled to reduce mutex contention).
+    /// Record local file write latency (sampled 1:64 to reduce mutex contention).
     #[inline]
     #[allow(dead_code)] // Available for future instrumentation
     pub fn record_file_write_latency(&self, duration: Duration) {
-        if self.should_sample() {
-            self.file_write_latencies.lock().record(duration);
-        }
+        self.file_write_latencies.record(duration);
     }
 
     /// Record a guest write operation.
@@ -376,12 +377,10 @@ impl ExportMetrics {
         }
     }
 
-    /// Record S3 PUT latency (sampled to reduce mutex contention).
+    /// Record S3 PUT latency (sampled 1:64 to reduce mutex contention).
     #[inline]
     pub fn record_s3_put_latency(&self, duration: Duration) {
-        if self.should_sample() {
-            self.s3_put_latencies.lock().record(duration);
-        }
+        self.s3_put_latencies.record(duration);
     }
 
     /// Get a snapshot of current metrics.
@@ -415,12 +414,12 @@ impl ExportMetrics {
         };
 
         // Get latency snapshots
-        let read_latency = Some(self.read_latencies.lock().snapshot());
-        let write_latency = Some(self.write_latencies.lock().snapshot());
-        let s3_fetch_latency = Some(self.s3_fetch_latencies.lock().snapshot());
-        let file_read_latency = Some(self.file_read_latencies.lock().snapshot());
-        let file_write_latency = Some(self.file_write_latencies.lock().snapshot());
-        let s3_put_latency = Some(self.s3_put_latencies.lock().snapshot());
+        let read_latency = Some(self.read_latencies.snapshot());
+        let write_latency = Some(self.write_latencies.snapshot());
+        let s3_fetch_latency = Some(self.s3_fetch_latencies.snapshot());
+        let file_read_latency = Some(self.file_read_latencies.snapshot());
+        let file_write_latency = Some(self.file_write_latencies.snapshot());
+        let s3_put_latency = Some(self.s3_put_latencies.snapshot());
 
         MetricsSnapshot {
             guest_bytes_written,

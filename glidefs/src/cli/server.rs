@@ -289,7 +289,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     info!("Cancelling all servers...");
     shutdown.cancel();
 
-    match tokio::time::timeout(shutdown_timeout, async {
+    let shutdown_result = match tokio::time::timeout(shutdown_timeout, async {
         info!("Waiting for servers to exit...");
         for handle in handles {
             let _ = handle.await;
@@ -297,21 +297,25 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
         // Graceful shutdown: drain all exports
         info!("Final drain before shutdown...");
-        if let Err(e) = router.shutdown().await {
-            tracing::error!("Shutdown drain failed: {}", e);
-        }
+        router.shutdown().await
     })
     .await
     {
-        Ok(()) => {}
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            tracing::error!("Shutdown drain failed: {}", e);
+            Err(anyhow::anyhow!(e))
+        }
         Err(_) => {
-            warn!(
+            let msg = format!(
                 "Shutdown timed out after {}s, exiting with possible dirty blocks",
                 shutdown_timeout.as_secs()
             );
+            warn!("{}", msg);
+            Err(anyhow::anyhow!(msg))
         }
-    }
+    };
 
     info!("Shutdown complete");
-    Ok(())
+    shutdown_result
 }

@@ -138,7 +138,10 @@ impl NBDServer {
             }
             Transport::Unix(path) => {
                 // Remove existing socket file if it exists
-                let _ = std::fs::remove_file(path);
+                if path.exists() {
+                    warn!("Removing existing Unix socket at {:?}", path);
+                    let _ = std::fs::remove_file(path);
+                }
 
                 let listener = UnixListener::bind(path).map_err(|e| {
                     std::io::Error::new(

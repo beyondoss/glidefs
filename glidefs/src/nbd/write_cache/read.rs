@@ -219,7 +219,7 @@ impl WriteCache<Active> {
     ///
     /// Streams the pack body: reads the header+index first, then decompresses
     /// each block incrementally as bytes arrive, inserting into clean_cache.
-    /// Peak memory: stream buffer + one compressed block + one decompressed block.
+    /// Peak memory: full pack buffer + one decompressed block at a time.
     async fn resolve_pack(
         &self,
         target_hash: &crate::nbd::block_map::Blake3Hash,
@@ -244,6 +244,8 @@ impl WriteCache<Active> {
 
         // Accumulate bytes from the stream into a working buffer.
         // We process blocks as soon as we have enough data for each one.
+        // Cap at 128MB to guard against malformed S3 responses.
+        const MAX_PACK_BUF: usize = 128 * 1024 * 1024;
         let mut buf = Vec::new();
         let mut pack_idx: Option<pack::PackIndex> = None;
         let mut next_entry = 0usize;
@@ -251,6 +253,11 @@ impl WriteCache<Active> {
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| CacheError::PackFormat(format!("stream error: {e}")))?;
+            if buf.len() + chunk.len() > MAX_PACK_BUF {
+                return Err(CacheError::PackFormat(format!(
+                    "pack stream exceeded {}MB limit", MAX_PACK_BUF / (1024 * 1024)
+                )));
+            }
             buf.extend_from_slice(&chunk);
 
             // Try to parse the header + index if we haven't yet.

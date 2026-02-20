@@ -113,6 +113,8 @@ pub struct ExportState {
     pub pack_index: Arc<HostPackIndex>,
     pub readonly: bool,
     pub metrics: Arc<ExportMetrics>,
+    /// Original s3_prefix from ExportConfig (None = use export name).
+    pub s3_prefix: Option<String>,
     flush_shutdown_tx: watch::Sender<bool>,
     flush_handle: JoinHandle<()>,
 }
@@ -263,7 +265,7 @@ impl ExportRouter {
 
         let pack_index = Arc::new(
             HostPackIndex::open(config.cache_dir.join("pack_index.redb"))
-                .map_err(|e| RouterError::Io(std::io::Error::other(e.to_string())))?,
+                .map_err(|e| RouterError::Io(std::io::Error::other(e)))?,
         );
 
         Ok(Self {
@@ -515,6 +517,7 @@ impl ExportRouter {
         manifest_name: Option<&str>,
     ) -> Result<(), RouterError> {
         let name = config.name.clone();
+        let orig_s3_prefix = config.s3_prefix.clone();
         validate_export_name(&name)?;
 
         // Check if export already exists - idempotent: return success if already exists
@@ -720,6 +723,7 @@ impl ExportRouter {
             pack_index,
             readonly,
             metrics,
+            s3_prefix: orig_s3_prefix,
             flush_shutdown_tx,
             flush_handle,
         };
@@ -916,7 +920,7 @@ impl ExportRouter {
     pub async fn resize_export(&self, name: &str, new_size_gb: f64) -> Result<(), RouterError> {
         validate_export_name(name)?;
         // Get current export info
-        let (current_size, readonly, block_size) = {
+        let (current_size, readonly, block_size, orig_s3_prefix) = {
             let exports = self.exports.read().await;
             let state = exports
                 .get(name)
@@ -924,7 +928,8 @@ impl ExportRouter {
             let current_size = state.handler.device_size();
             let readonly = state.readonly;
             let block_size = state.cache.block_size();
-            (current_size, readonly, block_size)
+            let s3_prefix = state.s3_prefix.clone();
+            (current_size, readonly, block_size, s3_prefix)
         };
 
         let new_size_bytes = (new_size_gb * 1_000_000_000.0) as u64;
@@ -964,7 +969,7 @@ impl ExportRouter {
         let config = ExportConfig {
             name: name.to_string(),
             size_gb: new_size_gb,
-            s3_prefix: None, // Will use name as prefix (same as before)
+            s3_prefix: orig_s3_prefix,
             block_size: Some(block_size),
             blocks_per_pack: None,
             flush_mode: None,

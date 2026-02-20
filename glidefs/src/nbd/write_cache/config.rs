@@ -50,9 +50,15 @@ impl WriteCacheConfig {
         self.cache_dir.join(format!("{}.wal", self.device_name))
     }
 
-    /// Validate configuration. Currently a no-op — zero-block hash and buffer
-    /// are computed per block_size at construction time, so all sizes are supported.
+    /// Validate configuration. Guards against zero block_size which would
+    /// cause division-by-zero in num_blocks().
     pub fn validate(&self) -> Result<(), CacheError> {
+        if self.block_size == 0 {
+            return Err(CacheError::InvalidMetadata);
+        }
+        if self.device_size == 0 {
+            return Err(CacheError::InvalidMetadata);
+        }
         Ok(())
     }
 }

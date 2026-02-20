@@ -220,7 +220,7 @@ impl NBDBlockHandler {
         }
 
         if offset + data.len() as u64 > self.device_size() {
-            return Err(CommandError::NoSpace);
+            return Err(CommandError::InvalidArgument);
         }
 
         if data.is_empty() {
@@ -330,7 +330,7 @@ impl NBDBlockHandler {
     ///
     /// S3 sync happens asynchronously in the background via the sync worker.
     pub fn flush(&self) -> CommandResult<()> {
-        self.cache.flush().map_err(|_| CommandError::IoError)
+        self.cache.flush().map_err(CommandError::from)
     }
 }
 
@@ -416,7 +416,7 @@ mod tests {
 
         let data = vec![42u8; 4096];
         let result = handler.write(1024 * 1024, &data, false);
-        assert!(matches!(result, Err(CommandError::NoSpace)));
+        assert!(matches!(result, Err(CommandError::InvalidArgument)));
     }
 
     #[test]
