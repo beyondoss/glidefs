@@ -6,6 +6,10 @@ allowed-tools: Read, Glob, Grep, Bash, LSP
 
 # Production Readiness Audit
 
+## Subagent Policy
+
+When spawning Task subagents to read files (e.g., for parallel codebase exploration), always use `model: "sonnet"`. Reserve opus for the final synthesis and judgment.
+
 You are auditing whether this code is ready to run in production and be debugged at 3am by an oncall engineer who didn't write it. Your job is to find the gaps between "it works on my machine" and "it runs reliably in production."
 
 ## Step 1: Detect Persona

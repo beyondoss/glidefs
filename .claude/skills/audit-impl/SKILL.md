@@ -6,6 +6,10 @@ allowed-tools: Read, Glob, Grep, Bash, LSP, Edit, Write
 
 # Implementation Audit
 
+## Subagent Policy
+
+When spawning Task subagents to read files (e.g., for parallel codebase exploration), always use `model: "sonnet"`. Reserve opus for the final synthesis and judgment.
+
 You just finished implementing something. Now prove it works. This is not a victory lap — this is the moment you catch the thing that would have broken at demo time.
 
 **You may not stop working until your confidence has reached at least 9/10.** The 1-point deduction is reserved for things you genuinely cannot know (runtime behavior you can't test locally, edge cases in production traffic, third-party service behavior). It is NOT for laziness, shortcuts, or "I think it's probably fine."
