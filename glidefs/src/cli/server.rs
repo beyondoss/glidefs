@@ -187,7 +187,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     // Start ublk devices for exports that request it
     #[cfg(all(target_os = "linux", feature = "ublk"))]
-    let mut ublk_server = {
+    let ublk_server = {
         let mut server = crate::block::ublk::UblkServer::new(Arc::clone(&router));
         if let Some(ref ublk_config) = settings.servers.ublk {
             server = server.with_nr_queues(ublk_config.nr_queues());

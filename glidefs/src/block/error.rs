@@ -52,7 +52,7 @@ impl CommandError {
 
     /// Map to Linux errno (used by ublk server).
     #[cfg(target_os = "linux")]
-    pub fn to_linux_errno(self) -> i32 {
+    pub(crate) fn to_linux_errno(self) -> i32 {
         match self {
             CommandError::InvalidArgument => libc::EINVAL,
             CommandError::IoError => libc::EIO,

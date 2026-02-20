@@ -4,6 +4,7 @@
 //! by a `BlockHandler`. The device runs per-queue I/O threads that receive
 //! commands via io_uring and dispatch to the handler.
 
+use anyhow::Context as _;
 use crate::block::handler::BlockHandler;
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::helpers::IoBuf;
@@ -376,7 +377,7 @@ fn queue_io_loop(
     let exe = smol::LocalExecutor::new();
 
     let mut tasks = Vec::new();
-    for tag in 0..dev.dev_info.queue_depth as u16 {
+    for tag in 0..dev.dev_info.queue_depth {
         let q = q_rc.clone();
         let handler = Arc::clone(handler);
         let tokio_handle = tokio_handle.clone();
