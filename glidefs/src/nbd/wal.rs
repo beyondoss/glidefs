@@ -152,7 +152,16 @@ impl Wal {
                     }
                 }
                 Ok(None) => break,  // clean EOF
-                Err(_) => break,    // corrupted or truncated entry
+                Err(e) => {
+                    // Log corruption type (CRC mismatch vs short read) for diagnostics.
+                    // This is expected for torn writes after unclean shutdown.
+                    tracing::warn!(
+                        recovered = entries.len(),
+                        error = %e,
+                        "WAL replay stopped at corrupted/truncated entry"
+                    );
+                    break;
+                }
             }
         }
 

@@ -731,7 +731,9 @@ impl ExportRouter {
         // create_export could have inserted between our read lock check and
         // this write lock acquisition.
         if exports.contains_key(&name) {
-            info!("Export '{}' already exists (concurrent create), skipping", name);
+            info!("Export '{}' already exists (concurrent create), cleaning up", name);
+            // Abort the flush scheduler task we just spawned to avoid leaking it.
+            state.flush_handle.abort();
             return Ok(());
         }
         exports.insert(name.clone(), state);

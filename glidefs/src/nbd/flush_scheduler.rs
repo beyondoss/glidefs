@@ -87,6 +87,11 @@ pub async fn flush_scheduler(
                     Err(e) => {
                         metrics.record_flush_error();
                         warn!(error = %e, "pack flush failed");
+                        // Still checkpoint on flush error to prevent WAL growth
+                        // when S3 is down and flush_notify fires continuously.
+                        if let Err(e) = cache.local_checkpoint() {
+                            warn!(error = %e, "checkpoint after flush error failed");
+                        }
                     }
                 }
             }

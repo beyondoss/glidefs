@@ -431,10 +431,24 @@ impl Settings {
     pub fn validate(&self) -> Result<()> {
         // Cache validation
         anyhow::ensure!(
-            self.cache.disk_size_gb > 0.0,
-            "cache.disk_size_gb must be > 0, got {}",
+            self.cache.disk_size_gb.is_finite() && self.cache.disk_size_gb > 0.0,
+            "cache.disk_size_gb must be a finite number > 0, got {}",
             self.cache.disk_size_gb
         );
+        if let Some(mem) = self.cache.memory_size_gb {
+            anyhow::ensure!(
+                mem.is_finite() && mem > 0.0,
+                "cache.memory_size_gb must be a finite number > 0, got {}",
+                mem
+            );
+        }
+        if let Some(ssd) = self.cache.ssd_cache_size_gb {
+            anyhow::ensure!(
+                ssd.is_finite() && ssd > 0.0,
+                "cache.ssd_cache_size_gb must be a finite number > 0, got {}",
+                ssd
+            );
+        }
 
         // Storage timeout validation
         if let Some(t) = self.storage.connect_timeout_secs {
@@ -464,16 +478,31 @@ impl Settings {
                     "export name must not be empty"
                 );
                 anyhow::ensure!(
+                    export.name.len() <= 128
+                        && export.name.starts_with(|c: char| c.is_ascii_alphanumeric())
+                        && export.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
+                    "export '{}': name must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric",
+                    export.name
+                );
+                anyhow::ensure!(
                     names.insert(&export.name),
                     "duplicate export name: '{}'",
                     export.name
                 );
                 anyhow::ensure!(
-                    export.size_gb > 0.0,
-                    "export '{}': size_gb must be > 0, got {}",
+                    export.size_gb.is_finite() && export.size_gb > 0.0,
+                    "export '{}': size_gb must be a finite number > 0, got {}",
                     export.name,
                     export.size_gb
                 );
+                if let Some(ref fm) = export.flush_mode {
+                    anyhow::ensure!(
+                        fm == "auto" || fm == "manual",
+                        "export '{}': flush_mode must be 'auto' or 'manual', got '{}'",
+                        export.name,
+                        fm
+                    );
+                }
                 if let Some(bs) = export.block_size {
                     anyhow::ensure!(
                         bs.is_power_of_two() && (4096..=1_048_576).contains(&bs),
@@ -749,7 +778,7 @@ url = "s3://bucket/data"
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("disk_size_gb must be > 0"), "got: {err}");
+        assert!(err.contains("disk_size_gb must be a finite number > 0"), "got: {err}");
     }
 
     #[test]
@@ -774,7 +803,7 @@ size_gb = 0.0
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("size_gb must be > 0"), "got: {err}");
+        assert!(err.contains("size_gb must be a finite number > 0"), "got: {err}");
     }
 
     #[test]

@@ -9,9 +9,10 @@ async fn test_export_discovery_from_s3() {
     let ctx = TestContext::new().await;
     let db_path = "discovery-test";
 
-    // --- Server 1: create export, write data, drain ---
+    // --- Server 1: create export, save to S3, write data, drain ---
     let server1 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server1.create_export("dynamic-vol", 0.01).await;
+    server1.save_export("dynamic-vol", 0.01).await;
 
     let mut client = NbdClient::connect(server1.addr, "dynamic-vol").await.unwrap();
     client.write(0, &[0xDD; 4096]).await.unwrap();

@@ -164,6 +164,19 @@ impl TestServer {
             .unwrap();
     }
 
+    /// Persist an export definition to S3 (for discovery by other servers).
+    pub async fn save_export(&self, name: &str, size_gb: f64) {
+        let config = ExportConfig {
+            name: name.to_string(),
+            size_gb,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+        };
+        self.router.save_export(&config).await.unwrap();
+    }
+
     /// Restore an export from its S3 manifest (after drain/restart).
     pub async fn restore_export(&self, name: &str, size_gb: f64) {
         let config = ExportConfig {

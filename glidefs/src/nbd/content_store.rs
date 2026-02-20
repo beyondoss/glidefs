@@ -101,6 +101,18 @@ impl ContentStore {
         }
     }
 
+    /// Record an S3 error from a streaming list operation to the circuit breaker.
+    #[inline]
+    fn record_s3_list_error(&self, error: &object_store::Error) {
+        if let Some(cb) = &self.circuit_breaker {
+            if is_connectivity_error(error) {
+                cb.record_failure();
+            } else {
+                cb.record_success();
+            }
+        }
+    }
+
     /// Upload a pack to S3.
     ///
     /// If an upload semaphore is attached, acquires a permit before uploading
@@ -349,7 +361,13 @@ impl ContentStore {
         let mut names = Vec::new();
         let mut stream = self.object_store.list(Some(&prefix));
         while let Some(result) = stream.next().await {
-            let meta = result?;
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
             if let Some(name) = meta.location.filename() {
                 names.push(name.to_string());
             }
@@ -438,7 +456,13 @@ impl ContentStore {
         let mut names = Vec::new();
         let mut stream = self.object_store.list(Some(&prefix));
         while let Some(result) = stream.next().await {
-            let meta = result?;
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
             if let Some(name) = meta.location.filename() {
                 names.push(name.to_string());
             }
@@ -475,7 +499,13 @@ impl ContentStore {
         let mut names = Vec::new();
         let mut stream = self.object_store.list(Some(&prefix));
         while let Some(result) = stream.next().await {
-            let meta = result?;
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
             let path_str = meta.location.to_string();
             // Extract path relative to manifests/
             if let Some(relative) = path_str.strip_prefix(&prefix_str) {

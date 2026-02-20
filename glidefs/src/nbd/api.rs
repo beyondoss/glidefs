@@ -157,7 +157,16 @@ where
             }
 
             let body = match req.collect().await {
-                Ok(b) => b.to_bytes(),
+                Ok(b) => {
+                    let bytes = b.to_bytes();
+                    if bytes.len() > 65_536 {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            "Request body too large (max 64KB)",
+                        ));
+                    }
+                    bytes
+                }
                 Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
             };
 
@@ -175,6 +184,24 @@ where
                 return Ok(error_response(
                     StatusCode::BAD_REQUEST,
                     &format!("Invalid size_gb {}: must be between 0 and 16384", put_req.size_gb),
+                ));
+            }
+
+            if let Some(bs) = put_req.block_size
+                && (!bs.is_power_of_two() || !(4096..=1_048_576).contains(&bs))
+            {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid block_size {}: must be a power of 2 between 4096 and 1048576", bs),
+                ));
+            }
+
+            if let Some(ref fm) = put_req.flush_mode
+                && fm != "auto" && fm != "manual"
+            {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid flush_mode '{}': must be 'auto' or 'manual'", fm),
                 ));
             }
 
