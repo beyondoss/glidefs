@@ -4,7 +4,7 @@
 //! consecutive chunks are read, triggers prefetch of the next pack to
 //! hide S3 latency for sequential workloads (boot, large file reads).
 
-use crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK;
+use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
 
 /// Tracks recent chunk accesses to detect sequential read patterns.
 pub struct SequentialDetector {
@@ -86,7 +86,10 @@ mod tests {
         assert_eq!(det.record(0), None);
         assert_eq!(det.record(1), None);
         let result = det.record(2);
-        assert!(result.is_some(), "3 consecutive chunks should trigger readahead");
+        assert!(
+            result.is_some(),
+            "3 consecutive chunks should trigger readahead"
+        );
 
         // Feed [0, 1, 100] — non-sequential, should return None
         let mut det = SequentialDetector::new();
@@ -179,7 +182,8 @@ mod tests {
         assert!(result.is_some(), "should trigger at high chunk indices");
 
         let target = result.unwrap();
-        let expected_next_pack = ((base + 2) / DEFAULT_BLOCKS_PER_PACK as u64 + 1) * DEFAULT_BLOCKS_PER_PACK as u64;
+        let expected_next_pack =
+            ((base + 2) / DEFAULT_BLOCKS_PER_PACK as u64 + 1) * DEFAULT_BLOCKS_PER_PACK as u64;
         assert_eq!(target, expected_next_pack);
     }
 
@@ -214,6 +218,10 @@ mod tests {
         assert_eq!(det.record(100), None);
 
         // Only 1 more sequential — ring has [2, 100, 101], last 3 not consecutive
-        assert_eq!(det.record(101), None, "only 2 sequential after break should not trigger");
+        assert_eq!(
+            det.record(101),
+            None,
+            "only 2 sequential after break should not trigger"
+        );
     }
 }

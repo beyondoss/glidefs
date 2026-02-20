@@ -1,9 +1,9 @@
+use crate::block::block_map::{BlockMap, BlockMapEntry, blake3_128, lz4_compress, zero_block_hash};
+use crate::block::content_store::ContentStore;
+use crate::block::manifest::{Manifest, ManifestBlockEntry, serialize_hot_set};
+use crate::block::pack::{DEFAULT_BLOCKS_PER_PACK, PackLocation, assemble_pack};
+use crate::block::pack_index::HostPackIndex;
 use crate::config::Settings;
-use crate::nbd::block_map::{blake3_128, lz4_compress, BlockMap, BlockMapEntry, zero_block_hash};
-use crate::nbd::content_store::ContentStore;
-use crate::nbd::manifest::{serialize_hot_set, Manifest, ManifestBlockEntry};
-use crate::nbd::pack::{assemble_pack, PackLocation, DEFAULT_BLOCKS_PER_PACK};
-use crate::nbd::pack_index::HostPackIndex;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use std::io::Read;
@@ -53,19 +53,25 @@ pub async fn run_bless(
     info!(image = %image_path.display(), name = %name, chunk_size, "starting bless");
 
     // --- Load existing base manifests for cross-image dedup ---
-    let pack_index_dir = tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
+    let pack_index_dir =
+        tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
     let pack_index = HostPackIndex::open(pack_index_dir.path().join("pack_index.redb"))
         .context("Failed to open pack index")?;
     let base_names = content_store.list_base_manifests().await?;
     if !base_names.is_empty() {
-        info!(count = base_names.len(), "loading existing base manifests for dedup");
+        info!(
+            count = base_names.len(),
+            "loading existing base manifests for dedup"
+        );
         let mut manifests = Vec::new();
         for base_name in &base_names {
             let key = format!("bases/{}", base_name);
             if let Some(data) = content_store.get_manifest(&key).await? {
                 match Manifest::deserialize(&data) {
                     Ok(m) => manifests.push(m),
-                    Err(e) => tracing::warn!(name = %base_name, error = %e, "skipping corrupt manifest"),
+                    Err(e) => {
+                        tracing::warn!(name = %base_name, error = %e, "skipping corrupt manifest")
+                    }
                 }
             }
         }
@@ -86,7 +92,8 @@ pub async fn run_bless(
     info!(device_size, num_chunks, "reading image");
 
     let mut block_entries: Vec<ManifestBlockEntry> = Vec::with_capacity(num_chunks);
-    let mut batch: Vec<(crate::nbd::block_map::Blake3Hash, Vec<u8>)> = Vec::with_capacity(DEFAULT_BLOCKS_PER_PACK);
+    let mut batch: Vec<(crate::block::block_map::Blake3Hash, Vec<u8>)> =
+        Vec::with_capacity(DEFAULT_BLOCKS_PER_PACK);
     let mut buf = vec![0u8; chunk_size as usize];
 
     let mut stats = BlessStats::default();
@@ -127,13 +134,27 @@ pub async fn run_bless(
 
         // Flush pack when full
         if batch.len() >= DEFAULT_BLOCKS_PER_PACK {
-            upload_pack(&content_store, &pack_index, &mut batch, chunk_size, &mut stats).await?;
+            upload_pack(
+                &content_store,
+                &pack_index,
+                &mut batch,
+                chunk_size,
+                &mut stats,
+            )
+            .await?;
         }
     }
 
     // Flush remaining partial pack
     if !batch.is_empty() {
-        upload_pack(&content_store, &pack_index, &mut batch, chunk_size, &mut stats).await?;
+        upload_pack(
+            &content_store,
+            &pack_index,
+            &mut batch,
+            chunk_size,
+            &mut stats,
+        )
+        .await?;
     }
 
     // --- Build and upload manifest ---
@@ -195,10 +216,16 @@ pub async fn run_bless(
     println!("  Image size:      {:.1} GB", device_size as f64 / 1e9);
     println!("  Total chunks:    {}", num_chunks);
     println!("  Zero chunks:     {} (skipped)", stats.zero_chunks);
-    println!("  Deduped chunks:  {} (already in S3)", stats.deduped_chunks);
+    println!(
+        "  Deduped chunks:  {} (already in S3)",
+        stats.deduped_chunks
+    );
     println!("  Unique chunks:   {} (uploaded)", stats.unique_chunks);
     println!("  Packs uploaded:  {}", stats.packs_uploaded);
-    println!("  Bytes uploaded:  {:.1} MB", stats.bytes_uploaded as f64 / 1e6);
+    println!(
+        "  Bytes uploaded:  {:.1} MB",
+        stats.bytes_uploaded as f64 / 1e6
+    );
     println!("  Hot set:         {} chunks", hot_set_chunks.len());
     println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
     println!("  Manifest:        manifests/{}", manifest_key);
@@ -218,7 +245,7 @@ struct BlessStats {
 async fn upload_pack(
     content_store: &ContentStore,
     pack_index: &HostPackIndex,
-    batch: &mut Vec<(crate::nbd::block_map::Blake3Hash, Vec<u8>)>,
+    batch: &mut Vec<(crate::block::block_map::Blake3Hash, Vec<u8>)>,
     chunk_size: u32,
     stats: &mut BlessStats,
 ) -> Result<()> {
@@ -231,20 +258,25 @@ async fn upload_pack(
         .await
         .context("Failed to upload pack")?;
 
-    let pi_entries: Vec<_> = index_entries.iter().map(|entry| {
-        (entry.hash, PackLocation {
-            pack_id,
-            offset: entry.offset,
-            comp_length: entry.comp_length,
+    let pi_entries: Vec<_> = index_entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.hash,
+                PackLocation {
+                    pack_id,
+                    offset: entry.offset,
+                    comp_length: entry.comp_length,
+                },
+            )
         })
-    }).collect();
+        .collect();
     pack_index.insert_batch(&pi_entries)?;
 
     stats.packs_uploaded += 1;
     stats.bytes_uploaded += pack_size;
     Ok(())
 }
-
 
 /// Read exactly buf.len() bytes, or fewer at EOF.
 fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -261,9 +293,9 @@ fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nbd::block_map::{lz4_decompress, Blake3Hash};
-    use crate::nbd::manifest::deserialize_hot_set;
-    use crate::nbd::pack::extract_block;
+    use crate::block::block_map::{Blake3Hash, lz4_decompress};
+    use crate::block::manifest::deserialize_hot_set;
+    use crate::block::pack::extract_block;
     use object_store::memory::InMemory;
 
     const TEST_CHUNK_SIZE: u32 = 131072; // 128KB
@@ -275,7 +307,8 @@ mod tests {
         image_data: &[u8],
         chunk_size: u32,
     ) -> Result<BlessStats> {
-        let pack_index_dir = tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
+        let pack_index_dir =
+            tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
         let pack_index = HostPackIndex::open(pack_index_dir.path().join("pack_index.redb"))
             .context("Failed to open pack index")?;
 
@@ -331,12 +364,26 @@ mod tests {
             batch.push((hash, compressed));
 
             if batch.len() >= DEFAULT_BLOCKS_PER_PACK {
-                upload_pack(content_store, &pack_index, &mut batch, chunk_size, &mut stats).await?;
+                upload_pack(
+                    content_store,
+                    &pack_index,
+                    &mut batch,
+                    chunk_size,
+                    &mut stats,
+                )
+                .await?;
             }
         }
 
         if !batch.is_empty() {
-            upload_pack(content_store, &pack_index, &mut batch, chunk_size, &mut stats).await?;
+            upload_pack(
+                content_store,
+                &pack_index,
+                &mut batch,
+                chunk_size,
+                &mut stats,
+            )
+            .await?;
         }
 
         // Build manifest
@@ -460,8 +507,14 @@ mod tests {
         let stats2 = bless_bytes(&cs, "idempotent", &image, TEST_CHUNK_SIZE)
             .await
             .unwrap();
-        assert_eq!(stats2.unique_chunks, 0, "re-bless should upload zero new blocks");
-        assert_eq!(stats2.packs_uploaded, 0, "re-bless should upload zero new packs");
+        assert_eq!(
+            stats2.unique_chunks, 0,
+            "re-bless should upload zero new blocks"
+        );
+        assert_eq!(
+            stats2.packs_uploaded, 0,
+            "re-bless should upload zero new packs"
+        );
         assert_eq!(stats2.deduped_chunks, 4, "all blocks should be deduped");
     }
 
@@ -518,8 +571,14 @@ mod tests {
         let stats_b = bless_bytes(&cs, "image-b", &image_b, TEST_CHUNK_SIZE)
             .await
             .unwrap();
-        assert_eq!(stats_b.deduped_chunks, 8, "8 shared chunks should be deduped");
-        assert_eq!(stats_b.unique_chunks, 2, "only 2 new chunks should be uploaded");
+        assert_eq!(
+            stats_b.deduped_chunks, 8,
+            "8 shared chunks should be deduped"
+        );
+        assert_eq!(
+            stats_b.unique_chunks, 2,
+            "only 2 new chunks should be uploaded"
+        );
     }
 
     #[test]

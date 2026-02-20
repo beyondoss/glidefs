@@ -3,7 +3,7 @@ use anyhow::Result;
 mod circuit_breaker;
 mod cli;
 mod config;
-mod nbd;
+mod block;
 mod parse_object_store;
 mod storage_compatibility;
 mod task;

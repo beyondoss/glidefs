@@ -10,17 +10,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use object_store::ObjectStore;
 use rand::Rng;
 use tempfile::TempDir;
 
-use glidefs::nbd::cache::{BlockCache, SimpleBlockCache};
-use glidefs::nbd::content_store::ContentStore;
-use glidefs::nbd::metrics::ExportMetrics;
-use glidefs::nbd::pack_index::HostPackIndex;
-use glidefs::nbd::state::Active;
-use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
+use glidefs::block::cache::{BlockCache, SimpleBlockCache};
+use glidefs::block::content_store::ContentStore;
+use glidefs::block::metrics::ExportMetrics;
+use glidefs::block::pack_index::HostPackIndex;
+use glidefs::block::state::Active;
+use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128 KB (production block size)
 
@@ -50,15 +50,15 @@ impl ReadBenchHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3_backend), "bench");
-        let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let pack_index =
+            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         let metrics = ExportMetrics::new();
 
         let cache = WriteCache::open(config).expect("Failed to open cache");
         let cache = cache.skip_recovery_for_test();
 
         // Temporary clean_cache used during setup writes.
-        let setup_cache: Arc<dyn BlockCache> =
-            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let setup_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Write random data -- realistic compression ratios.
         let mut rng = rand::thread_rng();
@@ -71,10 +71,7 @@ impl ReadBenchHarness {
         }
 
         // Flush to S3 so the pack index and content store are populated.
-        cache
-            .snapshot(&content_store, &pack_index)
-            .await
-            .unwrap();
+        cache.snapshot(&content_store, &pack_index).await.unwrap();
 
         Self {
             cache,
@@ -168,8 +165,7 @@ fn bench_warm_read(c: &mut Criterion) {
 
         // Build the harness and pre-warm the cache.
         let harness = rt.block_on(ReadBenchHarness::new(num_blocks));
-        let clean_cache: Arc<dyn BlockCache> =
-            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Prime the cache with one full read pass.
         rt.block_on(harness.read_all_blocks(clean_cache.as_ref()));

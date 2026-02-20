@@ -1,17 +1,17 @@
 use std::marker::PhantomData;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tracing::{debug, info, instrument, warn};
 
-use crate::nbd::block_map::{
-    BlockMapKind, Blake3Hash, SparseBlockState, blake3_128, lz4_compress,
+use crate::block::block_map::{
+    Blake3Hash, BlockMapKind, SparseBlockState, blake3_128, lz4_compress,
 };
-use crate::nbd::content_store::ContentStore;
-use crate::nbd::manifest::{Manifest, ManifestBlockEntry, ManifestDelta};
-use crate::nbd::pack::{self, PackLocation, DEFAULT_BLOCKS_PER_PACK};
-use crate::nbd::pack_index::HostPackIndex;
-use crate::nbd::pack_registry::PackRegistry;
-use crate::nbd::state::{Active, Draining};
+use crate::block::content_store::ContentStore;
+use crate::block::manifest::{Manifest, ManifestBlockEntry, ManifestDelta};
+use crate::block::pack::{self, DEFAULT_BLOCKS_PER_PACK, PackLocation};
+use crate::block::pack_index::HostPackIndex;
+use crate::block::pack_registry::PackRegistry;
+use crate::block::state::{Active, Draining};
 
 use super::inner::CacheInner;
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
@@ -41,10 +41,7 @@ enum BlockResult {
         compressed: Option<Vec<u8>>,
     },
     /// Block skipped due to CRC mismatch or concurrent write.
-    Skipped {
-        cas_failed: bool,
-        corrupted: bool,
-    },
+    Skipped { cas_failed: bool, corrupted: bool },
 }
 
 /// CPU-heavy flush computation: read blocks from SSD, verify CRC32, hash, compress, dedup.
@@ -111,12 +108,11 @@ fn compute_flush_batch(
             let hash = blake3_128(&chunk_buf);
 
             // Zero block or already in pack index → deduped, no upload needed.
-            let compressed =
-                if hash == zero_hash || host_pack_index.contains(&hash)? {
-                    None
-                } else {
-                    Some(lz4_compress(&chunk_buf[..]))
-                };
+            let compressed = if hash == zero_hash || host_pack_index.contains(&hash)? {
+                None
+            } else {
+                Some(lz4_compress(&chunk_buf[..]))
+            };
 
             Ok(BlockResult::Computed {
                 chunk_index,
@@ -237,7 +233,10 @@ impl WriteCache<Active> {
     ///
     /// Called by `prune_pack_index` immediately before pruning to close the
     /// timing window between the last manifest upload and the prune call.
-    pub fn rebuild_manifest_hashes(&self, host_pack_index: &HostPackIndex) -> Result<(), CacheError> {
+    pub fn rebuild_manifest_hashes(
+        &self,
+        host_pack_index: &HostPackIndex,
+    ) -> Result<(), CacheError> {
         let snap = self.inner.block_map_snapshot();
         let hashes = host_pack_index
             .derive_for_block_map(&snap)?
@@ -300,7 +299,11 @@ impl WriteCache<Active> {
         //    Uses SparseStateMap::iter_with_state for O(allocated_pages) scan.
         let snapshot: Vec<(usize, u64)> = {
             let mut dirty = Vec::new();
-            for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
+            for idx in self
+                .inner
+                .state_map
+                .iter_with_state(SparseBlockState::DIRTY)
+            {
                 let (_hash, seq) = self.inner.block_map_get(idx);
                 // Skip entries written after our cutpoint
                 if seq > seq_cutpoint {
@@ -316,7 +319,10 @@ impl WriteCache<Active> {
             return Ok((FlushStats::default(), seq_cutpoint));
         }
 
-        info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
+        info!(
+            dirty_blocks = snapshot.len(),
+            seq_cutpoint, "starting flush"
+        );
 
         // 3. Offload CPU-heavy work (pread + crc32 + blake3 + lz4) to blocking thread pool.
         //    This prevents flush computation from starving the async runtime under
@@ -348,21 +354,22 @@ impl WriteCache<Active> {
         }
 
         #[allow(clippy::type_complexity)]
-        let pack_results: Vec<Result<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>), CacheError>> =
-            stream::iter(owned_chunks)
-                .map(|chunk| {
-                    let cs = content_store;
-                    async move {
-                        let pack_id = uuid::Uuid::new_v4();
-                        let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size)?;
-                        let pack_size = pack_bytes.len() as u64;
-                        cs.put_pack(pack_id, pack_bytes).await?;
-                        Ok((pack_id, pack_size, index_entries))
-                    }
-                })
-                .buffer_unordered(4)
-                .collect()
-                .await;
+        let pack_results: Vec<
+            Result<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>), CacheError>,
+        > = stream::iter(owned_chunks)
+            .map(|chunk| {
+                let cs = content_store;
+                async move {
+                    let pack_id = uuid::Uuid::new_v4();
+                    let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size)?;
+                    let pack_size = pack_bytes.len() as u64;
+                    cs.put_pack(pack_id, pack_bytes).await?;
+                    Ok((pack_id, pack_size, index_entries))
+                }
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
 
         // Register in host pack index for future dedup
         let mut batch_entries = Vec::new();
@@ -395,15 +402,20 @@ impl WriteCache<Active> {
                 continue;
             }
             // Replace ZERO placeholder with real content hash.
-            self.inner.block_map_set(chunk_index, actual_hash, snapshot_seq);
+            self.inner
+                .block_map_set(chunk_index, actual_hash, snapshot_seq);
             // CAS Dirty(2) -> Clean(1) on the state map.
-            if self.inner.state_map
-                .cas(chunk_index, SparseBlockState::DIRTY, SparseBlockState::CLEAN)
+            if self
+                .inner
+                .state_map
+                .cas(
+                    chunk_index,
+                    SparseBlockState::DIRTY,
+                    SparseBlockState::CLEAN,
+                )
                 .is_ok()
             {
-                self.inner
-                    .dirty_block_count
-                    .fetch_sub(1, Ordering::Relaxed);
+                self.inner.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
 
@@ -530,12 +542,7 @@ impl WriteCache<Active> {
 
         // Run the fallible delta logic, restoring base_state on error.
         let result = self
-            .try_upload_delta(
-                content_store,
-                host_pack_index,
-                seq_cutpoint,
-                &base_state,
-            )
+            .try_upload_delta(content_store, host_pack_index, seq_cutpoint, &base_state)
             .await;
 
         match result {
@@ -570,7 +577,7 @@ impl WriteCache<Active> {
         seq_cutpoint: u64,
         base_state: &super::inner::BaseManifestState,
     ) -> Result<bool, CacheError> {
-        use crate::nbd::manifest::MANIFEST_BLOCK_ENTRY_SIZE;
+        use crate::block::manifest::MANIFEST_BLOCK_ENTRY_SIZE;
 
         // Snapshot current block map and compute delta.
         let chunk_size = self.inner.config.block_size as u32;
@@ -623,8 +630,8 @@ impl WriteCache<Active> {
 
         // Size-based compaction trigger: delta block changes > 50% of full block map.
         // Compare block-level sizes only (pack entries scale proportionally).
-        let delta_block_size = upserted.len() * MANIFEST_BLOCK_ENTRY_SIZE
-            + deleted_chunks.len() * 8;
+        let delta_block_size =
+            upserted.len() * MANIFEST_BLOCK_ENTRY_SIZE + deleted_chunks.len() * 8;
         let full_block_size = current_entries.len() * MANIFEST_BLOCK_ENTRY_SIZE;
         if full_block_size > 0 && delta_block_size * 2 > full_block_size {
             debug!(
@@ -651,8 +658,7 @@ impl WriteCache<Active> {
         };
 
         // Cache the full manifest's pack hashes for pack index pruning.
-        *self.inner.manifest_pack_hashes.lock() =
-            all_pack_entries.iter().map(|e| e.hash).collect();
+        *self.inner.manifest_pack_hashes.lock() = all_pack_entries.iter().map(|e| e.hash).collect();
 
         content_store
             .put_delta_manifest(&self.inner.export_name, delta.serialize())
@@ -693,7 +699,8 @@ impl WriteCache<Active> {
         host_pack_index: &Arc<HostPackIndex>,
         seq_cutpoint: u64,
     ) -> Result<(), CacheError> {
-        self.upload_delta_or_full_manifest(content_store, host_pack_index, seq_cutpoint).await?;
+        self.upload_delta_or_full_manifest(content_store, host_pack_index, seq_cutpoint)
+            .await?;
         self.checkpoint()?;
         Ok(())
     }
@@ -735,7 +742,11 @@ impl WriteCache<Active> {
         let mut buf = vec![0u8; block_size];
         let mut computed = 0u64;
 
-        for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
+        for idx in self
+            .inner
+            .state_map
+            .iter_with_state(SparseBlockState::DIRTY)
+        {
             // Only compute for blocks without a CRC32.
             if self.inner.block_map_get_crc32(idx) != 0 {
                 continue;
@@ -751,7 +762,11 @@ impl WriteCache<Active> {
                 continue;
             }
 
-            if let Err(e) = self.inner.data_file.read_exact_at(&mut buf[..valid_bytes], offset) {
+            if let Err(e) = self
+                .inner
+                .data_file
+                .read_exact_at(&mut buf[..valid_bytes], offset)
+            {
                 warn!(
                     chunk_index = idx,
                     error = %e,
@@ -793,14 +808,14 @@ impl WriteCache<Active> {
             return;
         }
         let name = &self.inner.export_name;
-        let result: Result<(), crate::nbd::content_store::ContentStoreError> = async {
+        let result: Result<(), crate::block::content_store::ContentStoreError> = async {
             let mut registry = match content_store.get_registry(name).await? {
-                Some(data) => PackRegistry::deserialize(&data).map_err(|e| {
-                    object_store::Error::Generic {
+                Some(data) => {
+                    PackRegistry::deserialize(&data).map_err(|e| object_store::Error::Generic {
                         store: "registry",
                         source: Box::new(e),
-                    }
-                })?,
+                    })?
+                }
                 None => PackRegistry::new(),
             };
             registry.append(new_pack_ids);
@@ -838,9 +853,13 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         host_pack_index: &Arc<HostPackIndex>,
     ) -> Result<FlushStats, CacheError> {
-        let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
-        self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint).await?;
-        self.update_registry(content_store, &stats.new_pack_ids).await;
+        let (stats, seq_cutpoint) = self
+            .flush_dirty_inner(content_store, host_pack_index)
+            .await?;
+        self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
+            .await?;
+        self.update_registry(content_store, &stats.new_pack_ids)
+            .await;
         self.checkpoint()?;
         Ok(stats)
     }
@@ -855,9 +874,14 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         host_pack_index: &Arc<HostPackIndex>,
     ) -> Result<SnapshotResult, CacheError> {
-        let (stats, seq_cutpoint) = self.flush_dirty_inner(content_store, host_pack_index).await?;
-        let manifest_etag = self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint).await?;
-        self.update_registry(content_store, &stats.new_pack_ids).await;
+        let (stats, seq_cutpoint) = self
+            .flush_dirty_inner(content_store, host_pack_index)
+            .await?;
+        let manifest_etag = self
+            .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
+            .await?;
+        self.update_registry(content_store, &stats.new_pack_ids)
+            .await;
         self.checkpoint()?;
         Ok(SnapshotResult {
             manifest_etag,

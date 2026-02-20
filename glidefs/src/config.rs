@@ -6,7 +6,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing::warn;
 
-
 // Note: Block-level compression is intentionally NOT implemented.
 // ZFS handles compression at its layer, and block-level compression would:
 // 1. Interfere with ZFS's own compression
@@ -78,6 +77,31 @@ impl StorageConfig {
 pub struct ServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nbd: Option<NbdConfig>,
+
+    /// ublk transport config (Linux 6.0+, io_uring-based userspace block device).
+    /// Exports with `transport = "ublk"` require this section.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ublk: Option<UblkConfig>,
+}
+
+/// Configuration for the ublk transport (Linux 6.0+).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct UblkConfig {
+    /// Number of I/O queues per device (default: 1).
+    /// Higher values improve parallelism on multi-core hosts.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub nr_queues: Option<u16>,
+}
+
+impl UblkConfig {
+    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    pub const DEFAULT_NR_QUEUES: u16 = 1;
+
+    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    pub fn nr_queues(&self) -> u16 {
+        self.nr_queues.unwrap_or(Self::DEFAULT_NR_QUEUES)
+    }
 }
 
 /// NBD server configuration for block device access.
@@ -186,9 +210,21 @@ pub struct ExportConfig {
     /// When "manual", dirty blocks only flush on drain, snapshot, or shutdown.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub flush_mode: Option<String>,
+
+    /// Block device transport: "nbd" (default) or "ublk" (Linux 6.0+, io_uring).
+    /// ublk eliminates socket/protocol overhead for higher IOPS.
+    /// Requires `[servers.ublk]` section when set to "ublk".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transport: Option<String>,
 }
 
 impl ExportConfig {
+    /// Get the transport for this export: "nbd" (default) or "ublk".
+    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    pub fn transport(&self) -> &str {
+        self.transport.as_deref().unwrap_or("nbd")
+    }
+
     /// Get the S3 prefix for this export, defaulting to the export name.
     pub fn s3_prefix(&self) -> &str {
         self.s3_prefix.as_deref().unwrap_or(&self.name)
@@ -251,8 +287,7 @@ impl NbdConfig {
 
     /// Max concurrent S3 pack uploads across all exports (default: 128, 0 = unlimited).
     pub fn max_s3_uploads(&self) -> usize {
-        self.max_s3_uploads
-            .unwrap_or(Self::DEFAULT_MAX_S3_UPLOADS)
+        self.max_s3_uploads.unwrap_or(Self::DEFAULT_MAX_S3_UPLOADS)
     }
 
     pub const DEFAULT_MAX_S3_DOWNLOADS: usize = 512;
@@ -266,7 +301,7 @@ impl NbdConfig {
     /// Default blocks per pack for new exports.
     pub fn blocks_per_pack(&self) -> usize {
         self.blocks_per_pack
-            .unwrap_or(crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK)
+            .unwrap_or(crate::block::pack::DEFAULT_BLOCKS_PER_PACK)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -284,6 +319,7 @@ impl NbdConfig {
                 block_size: None,
                 blocks_per_pack: None,
                 flush_mode: None,
+                transport: None,
             }];
         }
 
@@ -295,6 +331,7 @@ impl NbdConfig {
             block_size: None,
             blocks_per_pack: None,
             flush_mode: None,
+            transport: None,
         }]
     }
 }
@@ -309,10 +346,7 @@ fn default_nbd_addresses() -> HashSet<SocketAddr> {
 }
 
 fn default_api_address() -> SocketAddr {
-    SocketAddr::new(
-        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-        8080,
-    )
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080)
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -485,14 +519,14 @@ impl Settings {
             // Export validation
             let mut names = HashSet::new();
             for export in &nbd.exports {
-                anyhow::ensure!(
-                    !export.name.is_empty(),
-                    "export name must not be empty"
-                );
+                anyhow::ensure!(!export.name.is_empty(), "export name must not be empty");
                 anyhow::ensure!(
                     export.name.len() <= 128
                         && export.name.starts_with(|c: char| c.is_ascii_alphanumeric())
-                        && export.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
+                        && export
+                            .name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
                     "export '{}': name must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric",
                     export.name
                 );
@@ -514,6 +548,21 @@ impl Settings {
                         export.name,
                         fm
                     );
+                }
+                if let Some(ref t) = export.transport {
+                    anyhow::ensure!(
+                        t == "nbd" || t == "ublk",
+                        "export '{}': transport must be 'nbd' or 'ublk', got '{}'",
+                        export.name,
+                        t
+                    );
+                    if t == "ublk" {
+                        anyhow::ensure!(
+                            self.servers.ublk.is_some(),
+                            "export '{}': transport 'ublk' requires [servers.ublk] section",
+                            export.name
+                        );
+                    }
                 }
                 if let Some(bs) = export.block_size {
                     anyhow::ensure!(
@@ -586,6 +635,7 @@ impl Settings {
                         block_size: None,
                         blocks_per_pack: None,
                         flush_mode: None,
+                        transport: None,
                     }],
                     device_name: None,
                     device_size_gb: None,
@@ -596,6 +646,7 @@ impl Settings {
                     max_s3_uploads: None,
                     max_s3_downloads: None,
                 }),
+                ublk: None,
             },
             aws: Some(AwsConfig(aws_config)),
             azure: None,
@@ -769,7 +820,10 @@ block_size = 7
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("block_size must be a power of 2"), "got: {err}");
+        assert!(
+            err.contains("block_size must be a power of 2"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -790,7 +844,10 @@ url = "s3://bucket/data"
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("disk_size_gb must be a finite number > 0"), "got: {err}");
+        assert!(
+            err.contains("disk_size_gb must be a finite number > 0"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -815,7 +872,10 @@ size_gb = 0.0
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("size_gb must be a finite number > 0"), "got: {err}");
+        assert!(
+            err.contains("size_gb must be a finite number > 0"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -901,7 +961,10 @@ connect_timeout_secs = 0
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("connect_timeout_secs must be > 0"), "got: {err}");
+        assert!(
+            err.contains("connect_timeout_secs must be > 0"),
+            "got: {err}"
+        );
     }
 
     #[test]

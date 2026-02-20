@@ -10,8 +10,8 @@
 #![no_main]
 
 use deku::prelude::*;
+use glidefs::block::NBDOptionHeader;
 use libfuzzer_sys::fuzz_target;
-use glidefs::nbd::NBDOptionHeader;
 
 fuzz_target!(|data: &[u8]| {
     // NBDOptionHeader expects 16 bytes with magic validation

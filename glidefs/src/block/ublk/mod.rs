@@ -20,7 +20,7 @@
 
 mod device;
 
-use crate::nbd::router::ExportRouter;
+use crate::block::router::ExportRouter;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,7 +56,17 @@ impl UblkServer {
     }
 
     /// Register a ublk device for an export. Returns the `/dev/ublkbN` path.
+    ///
+    /// Returns an error if a device is already registered for this export.
+    /// Call `remove_device` first to replace an existing device.
     pub async fn add_device(&mut self, export_name: &str) -> anyhow::Result<PathBuf> {
+        if self.devices.contains_key(export_name) {
+            anyhow::bail!(
+                "ublk device for export '{}' already registered",
+                export_name
+            );
+        }
+
         let handler = self
             .router
             .get_handler(export_name)
@@ -70,20 +80,41 @@ impl UblkServer {
     }
 
     /// Remove a ublk device for an export.
+    ///
+    /// Idempotent: returns `Ok(())` if no device is registered for this export.
     pub async fn remove_device(&mut self, export_name: &str) -> anyhow::Result<()> {
         if let Some(device) = self.devices.remove(export_name) {
+            tracing::info!(export = %export_name, "removing ublk device");
             device.unregister().await?;
+        } else {
+            tracing::debug!(export = %export_name, "no ublk device registered, nothing to remove");
         }
         Ok(())
     }
 
     /// Shutdown all ublk devices.
+    ///
+    /// Attempts every device even if some fail, then returns an aggregated
+    /// error describing which devices could not be unregistered.
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        let mut failed: Vec<String> = Vec::new();
+
         for (name, device) in self.devices {
+            tracing::info!(export = %name, "shutting down ublk device");
             if let Err(e) = device.unregister().await {
                 tracing::error!(export = %name, error = %e, "failed to unregister ublk device");
+                failed.push(format!("{name}: {e}"));
             }
         }
+
+        if !failed.is_empty() {
+            anyhow::bail!(
+                "ublk shutdown incomplete — {} device(s) failed: {}",
+                failed.len(),
+                failed.join(", ")
+            );
+        }
+
         Ok(())
     }
 }

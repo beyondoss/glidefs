@@ -7,8 +7,8 @@
 //!
 //! Run with: `cargo test --features test-utils --test integration`
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -19,13 +19,13 @@ use object_store::{
 };
 use tempfile::TempDir;
 
-use glidefs::nbd::cache::SimpleBlockCache;
-use glidefs::nbd::content_store::ContentStore;
-use glidefs::nbd::manifest::Manifest;
-use glidefs::nbd::metrics::ExportMetrics;
-use glidefs::nbd::pack_index::HostPackIndex;
-use glidefs::nbd::state::Active;
-use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
+use glidefs::block::cache::SimpleBlockCache;
+use glidefs::block::content_store::ContentStore;
+use glidefs::block::manifest::Manifest;
+use glidefs::block::metrics::ExportMetrics;
+use glidefs::block::pack_index::HostPackIndex;
+use glidefs::block::state::Active;
+use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024;
 
@@ -115,11 +115,7 @@ impl ObjectStore for FailingObjectStore {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> ObjectStoreResult<GetResult> {
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
         if self.fail_gets.load(Ordering::SeqCst) {
             return Err(object_store::Error::Generic {
                 store: "FailingObjectStore",
@@ -176,13 +172,20 @@ fn create_test_cache(
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
-    let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+    let pack_index =
+        Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
     let cache = cache.skip_recovery_for_test();
 
-    (Arc::new(cache), content_store, pack_index, clean_cache, metrics)
+    (
+        Arc::new(cache),
+        content_store,
+        pack_index,
+        clean_cache,
+        metrics,
+    )
 }
 
 /// Helper to create a cold reader cache from the manifest in S3.
@@ -210,11 +213,11 @@ async fn create_reader_from_manifest(
         .await
         .expect("manifest fetch failed")
         .expect("manifest should exist in S3");
-    let manifest =
-        Manifest::deserialize(&manifest_bytes).expect("manifest deserialization failed");
+    let manifest = Manifest::deserialize(&manifest_bytes).expect("manifest deserialization failed");
 
     // Rebuild pack_index from manifest
-    let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+    let pack_index =
+        Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
     pack_index.rebuild(std::slice::from_ref(&manifest)).unwrap();
 
     let config = WriteCacheConfig {
@@ -233,7 +236,13 @@ async fn create_reader_from_manifest(
     let cache = WriteCache::open_from_manifest(config, &manifest, None)
         .expect("Failed to open cache from manifest");
 
-    (Arc::new(cache), content_store, pack_index, clean_cache, metrics)
+    (
+        Arc::new(cache),
+        content_store,
+        pack_index,
+        clean_cache,
+        metrics,
+    )
 }
 
 // =============================================================================
@@ -255,7 +264,9 @@ async fn test_s3_failure_during_sync_marks_blocks_dirty() {
     // Write some blocks
     for i in 0..5 {
         let data = vec![i as u8; BLOCK_SIZE];
-        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
+        cache
+            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .unwrap();
     }
 
     assert_eq!(cache.dirty_block_count(), 5, "Should have 5 dirty blocks");
@@ -308,7 +319,9 @@ async fn test_s3_failure_during_read_returns_error() {
         create_test_cache(&writer_dir, "vol1", Arc::clone(&s3));
 
     let data = vec![0xAB; BLOCK_SIZE];
-    writer_cache.write(0, &data, writer_clean_cache.as_ref()).unwrap();
+    writer_cache
+        .write(0, &data, writer_clean_cache.as_ref())
+        .unwrap();
     writer_cache
         .flush_to_s3(&writer_content_store, &writer_pack_index)
         .await
@@ -498,7 +511,9 @@ async fn test_zero_blocks_not_synced_to_s3() {
     // Write zero blocks
     let zeros = vec![0u8; BLOCK_SIZE];
     for i in 0..10 {
-        cache.write(i as u64 * BLOCK_SIZE as u64, &zeros, clean_cache.as_ref()).unwrap();
+        cache
+            .write(i as u64 * BLOCK_SIZE as u64, &zeros, clean_cache.as_ref())
+            .unwrap();
     }
 
     // Flush to S3
@@ -532,7 +547,9 @@ async fn test_mixed_zero_nonzero_batch() {
         } else {
             vec![0xAB; BLOCK_SIZE] // Non-zero block
         };
-        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
+        cache
+            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .unwrap();
     }
 
     // Flush
@@ -586,7 +603,9 @@ async fn test_data_integrity_after_failure_recovery() {
     for i in 0..20u8 {
         let data: Vec<u8> = (0..BLOCK_SIZE).map(|j| i.wrapping_add(j as u8)).collect();
         expected_data.push(data.clone());
-        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
+        cache
+            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .unwrap();
     }
 
     // Enable S3 failures and attempt flush
@@ -649,7 +668,9 @@ async fn test_concurrent_drain_safety() {
     // Write data
     for i in 0..10 {
         let data = vec![i as u8; BLOCK_SIZE];
-        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
+        cache
+            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .unwrap();
     }
 
     // Wrap in Arc for sharing across tasks (ContentStore doesn't implement
@@ -726,11 +747,16 @@ async fn test_partial_pack_upload_preserves_dirty() {
         for j in 2..BLOCK_SIZE {
             data[j] = ((i as usize + j) % 256) as u8;
         }
-        cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
+        cache
+            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .unwrap();
     }
 
     let dirty_before = cache.dirty_block_count();
-    assert_eq!(dirty_before, num_blocks as u64, "should have all blocks dirty");
+    assert_eq!(
+        dirty_before, num_blocks as u64,
+        "should have all blocks dirty"
+    );
 
     // Fail after 2 PUTs (first pack upload succeeds, second fails)
     s3.set_fail_after_puts(2);

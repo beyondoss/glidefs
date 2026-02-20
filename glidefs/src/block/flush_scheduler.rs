@@ -14,14 +14,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
-use crate::nbd::content_store::ContentStore;
-use crate::nbd::metrics::ExportMetrics;
-use crate::nbd::pack_index::HostPackIndex;
-use crate::nbd::state::Active;
-use crate::nbd::write_cache::WriteCache;
+use crate::block::content_store::ContentStore;
+use crate::block::metrics::ExportMetrics;
+use crate::block::pack_index::HostPackIndex;
+use crate::block::state::Active;
+use crate::block::write_cache::WriteCache;
 
 /// Run the flush scheduler for a single export.
 ///
@@ -168,12 +168,12 @@ pub async fn flush_scheduler(
 mod tests {
     use super::*;
 
-    use crate::nbd::cache::{BlockCache, SimpleBlockCache};
-    use crate::nbd::content_store::ContentStore;
-    use crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK;
-    use crate::nbd::pack_index::HostPackIndex;
-    use crate::nbd::state::Initializing;
-    use crate::nbd::write_cache::WriteCacheConfig;
+    use crate::block::cache::{BlockCache, SimpleBlockCache};
+    use crate::block::content_store::ContentStore;
+    use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use crate::block::pack_index::HostPackIndex;
+    use crate::block::state::Initializing;
+    use crate::block::write_cache::WriteCacheConfig;
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
@@ -428,7 +428,10 @@ mod tests {
                 .write(offset, &[0xAA; 128 * 1024], clean_cache.as_ref())
                 .unwrap();
         }
-        assert_eq!(cache_check.dirty_block_count(), DEFAULT_BLOCKS_PER_PACK as u64);
+        assert_eq!(
+            cache_check.dirty_block_count(),
+            DEFAULT_BLOCKS_PER_PACK as u64
+        );
 
         let handle = tokio::spawn(async move {
             flush_scheduler(
@@ -512,17 +515,33 @@ mod tests {
         flush_notify_clone.notify_one();
         // After 500ms the second flush hasn't happened yet (still in backoff)
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(metrics_check.snapshot().flush_errors, 1, "should still be backing off");
+        assert_eq!(
+            metrics_check.snapshot().flush_errors,
+            1,
+            "should still be backing off"
+        );
         // After another 600ms (total 1.1s), the backoff has elapsed and flush was attempted
         tokio::time::sleep(Duration::from_millis(600)).await;
-        assert_eq!(metrics_check.snapshot().flush_errors, 2, "second flush should have been attempted");
+        assert_eq!(
+            metrics_check.snapshot().flush_errors,
+            2,
+            "second flush should have been attempted"
+        );
 
         // Third notify — should wait 2s backoff
         flush_notify_clone.notify_one();
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(metrics_check.snapshot().flush_errors, 2, "should still be in 2s backoff");
+        assert_eq!(
+            metrics_check.snapshot().flush_errors,
+            2,
+            "should still be in 2s backoff"
+        );
         tokio::time::sleep(Duration::from_millis(600)).await;
-        assert_eq!(metrics_check.snapshot().flush_errors, 3, "third flush after 2s backoff");
+        assert_eq!(
+            metrics_check.snapshot().flush_errors,
+            3,
+            "third flush after 2s backoff"
+        );
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -581,7 +600,11 @@ mod tests {
         flush_notify_clone.notify_one();
         // Wait past the 1s backoff + processing time
         tokio::time::sleep(Duration::from_millis(1200)).await;
-        assert_eq!(cache_check.dirty_block_count(), 0, "flush should have succeeded");
+        assert_eq!(
+            cache_check.dirty_block_count(),
+            0,
+            "flush should have succeeded"
+        );
         assert_eq!(metrics_check.snapshot().flush_errors, 1, "no new errors");
 
         // Write more blocks and fail again — should start from 1s, not 2s
@@ -596,7 +619,11 @@ mod tests {
         flush_notify_clone.notify_one();
         // Should fail immediately (backoff was reset to zero by success)
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(metrics_check.snapshot().flush_errors, 2, "immediate retry after reset");
+        assert_eq!(
+            metrics_check.snapshot().flush_errors,
+            2,
+            "immediate retry after reset"
+        );
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;

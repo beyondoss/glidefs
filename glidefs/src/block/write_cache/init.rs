@@ -1,19 +1,19 @@
 use bytes::Bytes;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashSet;
 use std::marker::PhantomData;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use parking_lot::{Mutex, RwLock};
+use std::sync::atomic::AtomicU64;
 use tracing::{error, info, instrument, warn};
 
-use crate::nbd::block_map::{
-    AtomicBlockMap, BlockMap, BlockMapEntry, BlockMapKind, Blake3Hash, ForkedBlockMap,
+use super::inner::BaseManifestState;
+use crate::block::block_map::{
+    AtomicBlockMap, Blake3Hash, BlockMap, BlockMapEntry, BlockMapKind, ForkedBlockMap,
     SequenceNumber, SparseBlockState, SparseStateMap, blake3_128, zero_block_hash,
 };
-use crate::nbd::manifest::Manifest;
-use super::inner::BaseManifestState;
-use crate::nbd::state::{Active, Initializing, Recovering};
-use crate::nbd::wal::Wal;
+use crate::block::manifest::Manifest;
+use crate::block::state::{Active, Initializing, Recovering};
+use crate::block::wal::Wal;
 
 use super::inner::CacheInner;
 use super::{CacheError, WriteCache, WriteCacheConfig};
@@ -75,7 +75,11 @@ impl WriteCache<Initializing> {
         let wal_entries = match Wal::replay(&wal_path, persisted_max_seq) {
             Ok(entries) => {
                 if !entries.is_empty() {
-                    info!(entries = entries.len(), min_seq = persisted_max_seq + 1, "replaying WAL entries");
+                    info!(
+                        entries = entries.len(),
+                        min_seq = persisted_max_seq + 1,
+                        "replaying WAL entries"
+                    );
                 }
                 entries
             }
@@ -102,7 +106,10 @@ impl WriteCache<Initializing> {
             // The SSD may have been overwritten by a later write that didn't
             // make it to the WAL, so we trust the SSD state over the WAL hash.
             let chunk_offset = entry.chunk_index * chunk_size_u64;
-            let valid_bytes = std::cmp::min(chunk_size_u64, config.device_size.saturating_sub(chunk_offset)) as usize;
+            let valid_bytes = std::cmp::min(
+                chunk_size_u64,
+                config.device_size.saturating_sub(chunk_offset),
+            ) as usize;
             let mut chunk_buf = vec![0u8; chunk_size as usize];
             if valid_bytes > 0
                 && let Err(e) = data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset)
@@ -112,11 +119,14 @@ impl WriteCache<Initializing> {
             }
 
             let hash = blake3_128(&chunk_buf);
-            persisted_bm.set(chunk_index, BlockMapEntry {
-                hash,
-                flags: BlockMapEntry::FLAG_DIRTY,
-                sequence: entry.sequence,
-            });
+            persisted_bm.set(
+                chunk_index,
+                BlockMapEntry {
+                    hash,
+                    flags: BlockMapEntry::FLAG_DIRTY,
+                    sequence: entry.sequence,
+                },
+            );
             max_wal_seq = max_wal_seq.max(entry.sequence);
 
             // Synchronize state_map with WAL replay: mark as Dirty so
@@ -201,7 +211,8 @@ impl WriteCache<Initializing> {
         config.validate()?;
         std::fs::create_dir_all(&config.cache_dir)?;
 
-        let data_file = super::inner::SyncFile::open(&config.data_path(), true, config.device_size)?;
+        let data_file =
+            super::inner::SyncFile::open(&config.data_path(), true, config.device_size)?;
 
         let num_blocks = config.num_blocks();
 

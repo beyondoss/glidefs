@@ -4,8 +4,8 @@
 //! mismatch (bit rot, memory corruption), evicts the block from the clean cache.
 //! S3 is the authoritative source of truth; the next read will re-fetch.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -111,9 +111,9 @@ pub async fn scrubber(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nbd::block_map::blake3_128;
-    use crate::nbd::cache::SimpleBlockCache;
-    use crate::nbd::pack::PackLocation;
+    use crate::block::block_map::blake3_128;
+    use crate::block::cache::SimpleBlockCache;
+    use crate::block::pack::PackLocation;
     use bytes::Bytes;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -122,7 +122,8 @@ mod tests {
     async fn test_scrubber_detects_corruption() {
         let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
+        let pack_index =
+            Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
 
         // Insert a valid block
         let data = Bytes::from(vec![0xAA; 4096]);
@@ -191,7 +192,8 @@ mod tests {
     async fn test_scrubber_leaves_valid_blocks() {
         let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
+        let pack_index =
+            Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
 
         // Insert valid blocks
         let data1 = Bytes::from(vec![0xAA; 4096]);
@@ -269,7 +271,8 @@ mod tests {
     async fn test_scrubber_shutdown_during_inter_pass_sleep() {
         let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
+        let pack_index =
+            Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
 
         // Insert a single valid block so the scrubber completes one pass quickly
         let data = Bytes::from(vec![0xCC; 4096]);
@@ -328,7 +331,8 @@ mod tests {
     async fn test_scrubber_disabled_when_zero() {
         let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
+        let pack_index =
+            Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
         let shutdown = CancellationToken::new();
 
         // Should return immediately when blocks_per_second = 0

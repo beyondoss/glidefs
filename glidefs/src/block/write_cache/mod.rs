@@ -28,7 +28,7 @@ mod tests;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::nbd::state::Draining;
+use crate::block::state::Draining;
 
 pub use config::WriteCacheConfig;
 pub use error::CacheError;

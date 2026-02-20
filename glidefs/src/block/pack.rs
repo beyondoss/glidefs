@@ -229,13 +229,11 @@ pub fn pack_s3_key(pack_id: uuid::Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nbd::block_map::{blake3_128, lz4_compress, lz4_decompress};
+    use crate::block::block_map::{blake3_128, lz4_compress, lz4_decompress};
 
     /// Helper: generate deterministic test data for block `i`.
     fn test_block_data(i: usize, size: usize) -> Vec<u8> {
-        (0..size)
-            .map(|j| ((i * 31 + j * 7) % 256) as u8)
-            .collect()
+        (0..size).map(|j| ((i * 31 + j * 7) % 256) as u8).collect()
     }
 
     #[test]
@@ -264,8 +262,7 @@ mod tests {
 
         // For each entry: extract, decompress, verify hash matches original.
         for (i, entry) in index.entries.iter().enumerate() {
-            let compressed =
-                extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
+            let compressed = extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
             let decompressed = lz4_decompress(compressed).unwrap();
             let hash = blake3_128(&decompressed);
             assert_eq!(hash, originals[i].0, "hash mismatch at block {i}");
@@ -292,9 +289,12 @@ mod tests {
         assert_eq!(index.entries.len(), 1);
         assert_eq!(index.entries[0].hash, hash);
 
-        let compressed =
-            extract_block(&pack_bytes, index.entries[0].offset, index.entries[0].comp_length)
-                .unwrap();
+        let compressed = extract_block(
+            &pack_bytes,
+            index.entries[0].offset,
+            index.entries[0].comp_length,
+        )
+        .unwrap();
         let decompressed = lz4_decompress(compressed).unwrap();
         assert_eq!(decompressed, data);
     }
@@ -341,8 +341,7 @@ mod tests {
             .find(|e| e.hash == target_hash)
             .expect("should find block by hash");
 
-        let compressed =
-            extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
+        let compressed = extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
         let decompressed = lz4_decompress(compressed).unwrap();
         assert_eq!(decompressed, expected_data[3].1);
     }
@@ -352,9 +351,7 @@ mod tests {
         let chunk_size: u32 = 4096;
         // Pseudo-random data that LZ4 cannot compress.
         let data: Vec<u8> = (0..chunk_size)
-            .map(|i| {
-                ((i.wrapping_mul(2654435761).wrapping_shr(16)) & 0xFF) as u8
-            })
+            .map(|i| ((i.wrapping_mul(2654435761).wrapping_shr(16)) & 0xFF) as u8)
             .collect();
         let hash = blake3_128(&data);
         let compressed = lz4_compress(&data);
@@ -364,9 +361,12 @@ mod tests {
         let index = parse_pack_index(&pack_bytes).unwrap();
         assert_eq!(index.entries.len(), 1);
 
-        let compressed =
-            extract_block(&pack_bytes, index.entries[0].offset, index.entries[0].comp_length)
-                .unwrap();
+        let compressed = extract_block(
+            &pack_bytes,
+            index.entries[0].offset,
+            index.entries[0].comp_length,
+        )
+        .unwrap();
         let decompressed = lz4_decompress(compressed).unwrap();
         assert_eq!(decompressed, data);
         assert_eq!(blake3_128(&decompressed), hash);
@@ -379,7 +379,10 @@ mod tests {
 
         assert!(key.starts_with("packs/"), "key must start with packs/");
         // Prefix is first 2 chars of the UUID string representation.
-        assert!(key.starts_with("packs/a7/"), "key must have 2-char hex prefix");
+        assert!(
+            key.starts_with("packs/a7/"),
+            "key must have 2-char hex prefix"
+        );
         assert!(
             key.contains(&id.to_string()),
             "key must contain the full UUID"
@@ -420,7 +423,10 @@ mod tests {
         // Less than PACK_HEADER_SIZE bytes
         let err = parse_pack_index(&[0u8; 8]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("too small for header"), "error: {err}");
+        assert!(
+            err.to_string().contains("too small for header"),
+            "error: {err}"
+        );
     }
 
     #[test]
@@ -434,7 +440,10 @@ mod tests {
         let truncated = &pack_bytes[..PACK_HEADER_SIZE + 10];
         let err = parse_pack_index(truncated).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("too small for index"), "error: {err}");
+        assert!(
+            err.to_string().contains("too small for index"),
+            "error: {err}"
+        );
     }
 
     #[test]

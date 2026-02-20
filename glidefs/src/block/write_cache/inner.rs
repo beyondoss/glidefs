@@ -1,15 +1,14 @@
+use parking_lot::{Mutex, RwLock};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::nbd::block_map::{
-    BlockMap, BlockMapKind, Blake3Hash, SequenceNumber,
-    SparseBlockState, SparseStateMap,
+use crate::block::block_map::{
+    Blake3Hash, BlockMap, BlockMapKind, SequenceNumber, SparseBlockState, SparseStateMap,
 };
 
 /// Cached state from the most recent full (base) manifest upload.
@@ -21,7 +20,7 @@ pub(super) struct BaseManifestState {
     pub block_map: HashMap<u64, Blake3Hash>,
     pub syncs_since_base: u32,
 }
-use crate::nbd::wal::Wal;
+use crate::block::wal::Wal;
 
 use super::config::WriteCacheConfig;
 use super::error::CacheError;
@@ -109,7 +108,6 @@ const _: () = {
     const fn _assert_send<T: Send>() {}
     let _ = _assert_send::<std::fs::File>;
 };
-
 
 /// Check if a block is all zeros.
 ///
@@ -213,7 +211,6 @@ pub(crate) struct CacheInner {
     pub(super) syncing_block_count: AtomicU64,
 
     // === v2 content-addressed structures ===
-
     /// Content-addressed block map: chunk_index -> (Blake3Hash, sequence).
     ///
     /// Wrapped in RwLock<BlockMapKind> to support both full (AtomicBlockMap)
@@ -297,7 +294,8 @@ impl CacheInner {
             }
 
             if current == SparseBlockState::CLEAN {
-                if self.state_map
+                if self
+                    .state_map
                     .cas(idx, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
                     .is_ok()
                 {
@@ -305,7 +303,8 @@ impl CacheInner {
                     break;
                 }
             } else if current == SparseBlockState::SYNCING {
-                if self.state_map
+                if self
+                    .state_map
                     .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
                     .is_ok()
                 {
@@ -327,12 +326,7 @@ impl CacheInner {
 
     /// Set a block map entry (takes read lock — interior mutability handles the write).
     #[inline]
-    pub(super) fn block_map_set(
-        &self,
-        chunk_index: usize,
-        hash: Blake3Hash,
-        seq: u64,
-    ) {
+    pub(super) fn block_map_set(&self, chunk_index: usize, hash: Blake3Hash, seq: u64) {
         self.block_map.read().set(chunk_index, hash, seq);
     }
 
@@ -357,7 +351,12 @@ impl CacheInner {
 
     /// CAS the CRC32 checksum (takes read lock).
     #[inline]
-    pub(super) fn block_map_cas_crc32(&self, chunk_index: usize, expected: u32, new: u32) -> Result<u32, u32> {
+    pub(super) fn block_map_cas_crc32(
+        &self,
+        chunk_index: usize,
+        expected: u32,
+        new: u32,
+    ) -> Result<u32, u32> {
         self.block_map.read().cas_crc32(chunk_index, expected, new)
     }
 
@@ -587,10 +586,7 @@ impl CacheInner {
                 present_bytes.iter().map(|&b| b != 0).collect()
             } else {
                 // Version 1: dirty blocks are present, clean blocks are NOT
-                old_state_bytes
-                    .iter()
-                    .map(|&s| s == OLD_DIRTY)
-                    .collect()
+                old_state_bytes.iter().map(|&s| s == OLD_DIRTY).collect()
             };
 
             // Convert old encoding to new sparse encoding and populate state_map

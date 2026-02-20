@@ -11,8 +11,8 @@
 
 use arbitrary::{Arbitrary, Unstructured};
 use deku::prelude::*;
+use glidefs::block::{NBDClientFlags, NBDOptionHeader, NBDRequest};
 use libfuzzer_sys::fuzz_target;
-use glidefs::nbd::{NBDClientFlags, NBDOptionHeader, NBDRequest};
 
 /// Structured input for protocol sequence fuzzing.
 #[derive(Debug, Arbitrary)]

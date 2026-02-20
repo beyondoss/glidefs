@@ -1,12 +1,12 @@
 use bytes::Bytes;
 use tracing::{debug, instrument, warn};
 
-use crate::nbd::block_map::{blake3_128, lz4_decompress};
-use crate::nbd::cache::BlockCache;
-use crate::nbd::content_store::ContentStore;
-use crate::nbd::pack;
-use crate::nbd::pack_index::HostPackIndex;
-use crate::nbd::state::Active;
+use crate::block::block_map::{blake3_128, lz4_decompress};
+use crate::block::cache::BlockCache;
+use crate::block::content_store::ContentStore;
+use crate::block::pack;
+use crate::block::pack_index::HostPackIndex;
+use crate::block::state::Active;
 
 use super::{CacheError, WriteCache};
 
@@ -45,7 +45,13 @@ impl WriteCache<Active> {
         // Single chunk fast path — no concurrency overhead.
         if num_chunks == 1 {
             let chunk_data = self
-                .resolve_chunk(start_chunk as usize, clean_cache, pack_index, content_store, Some(metrics))
+                .resolve_chunk(
+                    start_chunk as usize,
+                    clean_cache,
+                    pack_index,
+                    content_store,
+                    Some(metrics),
+                )
                 .await?;
             let chunk_start_byte = start_chunk * chunk_size;
             let slice_start = (offset - chunk_start_byte) as usize;
@@ -56,7 +62,13 @@ impl WriteCache<Active> {
         // Multi-chunk: resolve all concurrently.
         let futures: Vec<_> = (start_chunk..=end_chunk)
             .map(|chunk_idx| {
-                self.resolve_chunk(chunk_idx as usize, clean_cache, pack_index, content_store, Some(metrics))
+                self.resolve_chunk(
+                    chunk_idx as usize,
+                    clean_cache,
+                    pack_index,
+                    content_store,
+                    Some(metrics),
+                )
             })
             .collect();
         let chunks = futures::future::try_join_all(futures).await?;
@@ -178,7 +190,10 @@ impl WriteCache<Active> {
                 m.record_cache_miss();
             }
             let fetch_start = std::time::Instant::now();
-            let compressed = match content_store.get_block(pack_loc.pack_id, pack_loc.offset, pack_loc.comp_length).await {
+            let compressed = match content_store
+                .get_block(pack_loc.pack_id, pack_loc.offset, pack_loc.comp_length)
+                .await
+            {
                 Ok(data) => data,
                 Err(e) => {
                     if let Some(m) = metrics {
@@ -222,7 +237,7 @@ impl WriteCache<Active> {
     /// Peak memory: full pack buffer + one decompressed block at a time.
     async fn resolve_pack(
         &self,
-        target_hash: &crate::nbd::block_map::Blake3Hash,
+        target_hash: &crate::block::block_map::Blake3Hash,
         clean_cache: &dyn BlockCache,
         pack_index: &HostPackIndex,
         content_store: &ContentStore,
@@ -230,7 +245,9 @@ impl WriteCache<Active> {
     ) -> Result<Bytes, CacheError> {
         use futures::StreamExt;
 
-        let pack_loc = pack_index.get(target_hash)?.ok_or(CacheError::BlockNotFound { hash: *target_hash })?;
+        let pack_loc = pack_index
+            .get(target_hash)?
+            .ok_or(CacheError::BlockNotFound { hash: *target_hash })?;
 
         let mut stream = match content_store.get_pack_stream(pack_loc.pack_id).await {
             Ok(s) => s,
@@ -252,10 +269,12 @@ impl WriteCache<Active> {
         let mut target_data: Option<Bytes> = None;
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| CacheError::PackFormat(format!("stream error: {e}")))?;
+            let chunk =
+                chunk_result.map_err(|e| CacheError::PackFormat(format!("stream error: {e}")))?;
             if buf.len() + chunk.len() > MAX_PACK_BUF {
                 return Err(CacheError::PackFormat(format!(
-                    "pack stream exceeded {}MB limit", MAX_PACK_BUF / (1024 * 1024)
+                    "pack stream exceeded {}MB limit",
+                    MAX_PACK_BUF / (1024 * 1024)
                 )));
             }
             buf.extend_from_slice(&chunk);
@@ -265,8 +284,12 @@ impl WriteCache<Active> {
                 if buf.len() >= pack::PACK_HEADER_SIZE {
                     // Try parsing — need header + full index.
                     match pack::parse_pack_index(&buf) {
-                        Ok(idx) => { pack_idx = Some(idx); }
-                        Err(_) => { continue; } // Need more bytes for the index.
+                        Ok(idx) => {
+                            pack_idx = Some(idx);
+                        }
+                        Err(_) => {
+                            continue;
+                        } // Need more bytes for the index.
                     }
                 } else {
                     continue;

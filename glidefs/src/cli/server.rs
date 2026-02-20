@@ -1,8 +1,8 @@
+use crate::block::api::ApiServer;
+use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
+use crate::block::router::ExportRouter;
+use crate::block::server::NBDServer;
 use crate::config::Settings;
-use crate::nbd::api::ApiServer;
-use crate::nbd::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
-use crate::nbd::router::ExportRouter;
-use crate::nbd::server::NBDServer;
 use crate::parse_object_store::parse_url_opts;
 use crate::task::spawn_named;
 use anyhow::{Context, Result};
@@ -93,17 +93,20 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         .context("Failed to open foyer clean cache")?,
     );
 
-    let router = Arc::new(ExportRouter::new(crate::nbd::router::RouterConfig {
-        object_store: Arc::clone(&object_store),
-        db_path,
-        cache_dir,
-        block_size: nbd_config.block_size(),
-        clean_cache,
-        wal_sync: nbd_config.wal_sync(),
-        max_s3_uploads: nbd_config.max_s3_uploads(),
-        max_s3_downloads: nbd_config.max_s3_downloads(),
-        default_blocks_per_pack: nbd_config.blocks_per_pack(),
-    }).context("Failed to initialize export router")?);
+    let router = Arc::new(
+        ExportRouter::new(crate::block::router::RouterConfig {
+            object_store: Arc::clone(&object_store),
+            db_path,
+            cache_dir,
+            block_size: nbd_config.block_size(),
+            clean_cache,
+            wal_sync: nbd_config.wal_sync(),
+            max_s3_uploads: nbd_config.max_s3_uploads(),
+            max_s3_downloads: nbd_config.max_s3_downloads(),
+            default_blocks_per_pack: nbd_config.blocks_per_pack(),
+        })
+        .context("Failed to initialize export router")?,
+    );
 
     // Discover exports from S3 (recovers exports created via API)
     info!("Discovering exports from S3...");
@@ -137,7 +140,10 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             count
         }
         Err(e) => {
-            warn!("Failed to discover exports from S3: {} (continuing with config)", e);
+            warn!(
+                "Failed to discover exports from S3: {} (continuing with config)",
+                e
+            );
             0
         }
     };
@@ -179,11 +185,39 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Start ublk devices for exports that request it
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    let mut ublk_server = {
+        let mut server = crate::block::ublk::UblkServer::new(Arc::clone(&router));
+        if let Some(ref ublk_config) = settings.servers.ublk {
+            server = server.with_nr_queues(ublk_config.nr_queues());
+        }
+
+        for export in router.list_exports().await {
+            // Check if this export's config requests ublk transport.
+            // Discovered exports use the default (nbd) unless overridden.
+            let uses_ublk = nbd_config
+                .exports
+                .iter()
+                .find(|c| c.name == export.name)
+                .is_some_and(|c| c.transport() == "ublk");
+
+            if uses_ublk {
+                let path = server
+                    .add_device(&export.name)
+                    .await
+                    .with_context(|| format!("Failed to register ublk device for '{}'", export.name))?;
+                info!(export = %export.name, path = %path.display(), "ublk device registered");
+            }
+        }
+        server
+    };
+
     let mut handles = Vec::new();
 
     // Start background scrubber (integrity verification)
     {
-        use crate::nbd::scrubber::{scrubber, ScrubberConfig};
+        use crate::block::scrubber::{ScrubberConfig, scrubber};
         let bps = nbd_config.scrubber_blocks_per_second();
         if bps > 0 {
             info!("Starting background scrubber ({} blocks/sec)", bps);
@@ -192,7 +226,16 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             let sm = Arc::clone(router.scrubber_metrics());
             let shutdown_clone = shutdown.clone();
             handles.push(spawn_named("scrubber", async move {
-                scrubber(cc, pi, ScrubberConfig { blocks_per_second: bps }, sm, shutdown_clone).await;
+                scrubber(
+                    cc,
+                    pi,
+                    ScrubberConfig {
+                        blocks_per_second: bps,
+                    },
+                    sm,
+                    shutdown_clone,
+                )
+                .await;
                 Ok(())
             }));
         }
@@ -200,7 +243,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     // Start SSD capacity monitor (backpressure)
     {
-        use crate::nbd::capacity_monitor::{capacity_monitor, CapacityConfig};
+        use crate::block::capacity_monitor::{CapacityConfig, capacity_monitor};
         info!("Starting SSD capacity monitor");
         let router_clone = Arc::clone(&router);
         let shutdown_clone = shutdown.clone();
@@ -224,7 +267,10 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     // Start NBD Unix socket server
     if let Some(socket_path) = nbd_config.unix_socket.as_ref() {
-        info!("Starting NBD server on Unix socket {}", socket_path.display());
+        info!(
+            "Starting NBD server on Unix socket {}",
+            socket_path.display()
+        );
         let nbd_server = NBDServer::new_unix(Arc::clone(&router), socket_path);
         let shutdown_clone = shutdown.clone();
         handles.push(spawn_named("nbd-unix", async move {
@@ -254,14 +300,19 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             "  - {} ({}GB, {})",
             export.name,
             export.size / 1_000_000_000,
-            if export.readonly { "readonly" } else { "read-write" }
+            if export.readonly {
+                "readonly"
+            } else {
+                "read-write"
+            }
         );
     }
     info!("Send SIGUSR1 to drain all exports to S3 (for node maintenance)");
 
     // Set up signal handlers
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut sigusr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    let mut sigusr1 =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
 
     loop {
         tokio::select! {
@@ -293,6 +344,15 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         info!("Waiting for servers to exit...");
         for handle in handles {
             let _ = handle.await;
+        }
+
+        // Shutdown ublk devices before draining (removes /dev/ublkbN)
+        #[cfg(all(target_os = "linux", feature = "ublk"))]
+        {
+            info!("Shutting down ublk devices...");
+            if let Err(e) = ublk_server.shutdown().await {
+                tracing::error!("ublk shutdown failed: {}", e);
+            }
         }
 
         // Graceful shutdown: drain all exports

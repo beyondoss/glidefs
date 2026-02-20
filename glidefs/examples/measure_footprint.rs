@@ -8,9 +8,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use glidefs::nbd::cache::SimpleBlockCache;
-use glidefs::nbd::state::Active;
-use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
+use glidefs::block::cache::SimpleBlockCache;
+use glidefs::block::state::Active;
+use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 
@@ -39,11 +39,7 @@ fn disk_usage_mb(path: &std::path::Path) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn create_cache(
-    dir: &std::path::Path,
-    name: &str,
-    device_size: u64,
-) -> Arc<WriteCache<Active>> {
+fn create_cache(dir: &std::path::Path, name: &str, device_size: u64) -> Arc<WriteCache<Active>> {
     let config = WriteCacheConfig {
         cache_dir: dir.to_path_buf(),
         device_name: name.to_string(),
@@ -76,10 +72,17 @@ fn main() {
     let blocks_to_dirty = ((num_blocks as f64) * dirty_pct / 100.0) as usize;
 
     println!("=== WriteCache Footprint Measurement ===");
-    println!("Device size:     {} GB ({} blocks @ 128KB)", device_size, num_blocks);
+    println!(
+        "Device size:     {} GB ({} blocks @ 128KB)",
+        device_size, num_blocks
+    );
     println!("Exports:         {}", num_exports);
-    println!("Dirty per export: {}% ({} blocks = {} MB)",
-        dirty_pct, blocks_to_dirty, blocks_to_dirty * BLOCK_SIZE / (1024 * 1024));
+    println!(
+        "Dirty per export: {}% ({} blocks = {} MB)",
+        dirty_pct,
+        blocks_to_dirty,
+        blocks_to_dirty * BLOCK_SIZE / (1024 * 1024)
+    );
     println!();
 
     let tmp = tempfile::tempdir().expect("tempdir failed");
@@ -96,7 +99,11 @@ fn main() {
         // Each export gets its own subdirectory to avoid file collisions
         let export_dir = tmp.path().join(format!("export-{}", i));
         std::fs::create_dir_all(&export_dir).unwrap();
-        caches.push(create_cache(&export_dir, &format!("vm-{}", i), device_size_bytes));
+        caches.push(create_cache(
+            &export_dir,
+            &format!("vm-{}", i),
+            device_size_bytes,
+        ));
     }
     let create_elapsed = t0.elapsed();
     let rss_after_create = rss_mb();
@@ -104,11 +111,17 @@ fn main() {
 
     println!("\n--- After creating {} empty exports ---", num_exports);
     println!("Time:            {:.2}s", create_elapsed.as_secs_f64());
-    println!("RSS:             {:.1} MB (delta: {:.1} MB, per-export: {:.2} MB)",
-        rss_after_create, rss_after_create - rss_before,
-        (rss_after_create - rss_before) / num_exports as f64);
-    println!("Disk:            {:.1} MB (per-export: {:.2} MB)",
-        disk_after_create, disk_after_create / num_exports as f64);
+    println!(
+        "RSS:             {:.1} MB (delta: {:.1} MB, per-export: {:.2} MB)",
+        rss_after_create,
+        rss_after_create - rss_before,
+        (rss_after_create - rss_before) / num_exports as f64
+    );
+    println!(
+        "Disk:            {:.1} MB (per-export: {:.2} MB)",
+        disk_after_create,
+        disk_after_create / num_exports as f64
+    );
 
     if blocks_to_dirty == 0 {
         println!("\nNo dirty blocks requested, done.");
@@ -120,35 +133,58 @@ fn main() {
     let t1 = Instant::now();
     for cache in &caches {
         // Write blocks spread across the device (every Nth block)
-        let stride = if blocks_to_dirty > 0 { num_blocks / blocks_to_dirty } else { 1 };
+        let stride = if blocks_to_dirty > 0 {
+            num_blocks / blocks_to_dirty
+        } else {
+            1
+        };
         for j in 0..blocks_to_dirty {
             let block_idx = (j * stride) % num_blocks;
             let offset = block_idx as u64 * BLOCK_SIZE as u64;
-            cache.write(offset, &write_buf, clean_cache.as_ref()).unwrap();
+            cache
+                .write(offset, &write_buf, clean_cache.as_ref())
+                .unwrap();
         }
     }
     let write_elapsed = t1.elapsed();
     let rss_after_write = rss_mb();
     let disk_after_write = disk_usage_mb(tmp.path());
 
-    println!("\n--- After writing {}% dirty blocks to each export ---", dirty_pct);
-    println!("Time:            {:.2}s ({:.0} us/write)",
+    println!(
+        "\n--- After writing {}% dirty blocks to each export ---",
+        dirty_pct
+    );
+    println!(
+        "Time:            {:.2}s ({:.0} us/write)",
         write_elapsed.as_secs_f64(),
-        write_elapsed.as_micros() as f64 / (num_exports * blocks_to_dirty) as f64);
-    println!("RSS:             {:.1} MB (delta from empty: {:.1} MB, per-export: {:.2} MB)",
-        rss_after_write, rss_after_write - rss_after_create,
-        (rss_after_write - rss_after_create) / num_exports as f64);
-    println!("Disk:            {:.1} MB (per-export: {:.2} MB)",
-        disk_after_write, disk_after_write / num_exports as f64);
+        write_elapsed.as_micros() as f64 / (num_exports * blocks_to_dirty) as f64
+    );
+    println!(
+        "RSS:             {:.1} MB (delta from empty: {:.1} MB, per-export: {:.2} MB)",
+        rss_after_write,
+        rss_after_write - rss_after_create,
+        (rss_after_write - rss_after_create) / num_exports as f64
+    );
+    println!(
+        "Disk:            {:.1} MB (per-export: {:.2} MB)",
+        disk_after_write,
+        disk_after_write / num_exports as f64
+    );
 
     // Summary
     let total_per_export_mb = (rss_after_write - rss_before) / num_exports as f64;
     println!("\n=== Summary ===");
     println!("Total RSS per export:  {:.2} MB", total_per_export_mb);
-    println!("Projected 2000 exports: {:.1} GB RSS",
-        total_per_export_mb * 2000.0 / 1024.0);
-    println!("Disk per export:       {:.2} MB (actual, not pre-allocated)",
-        disk_after_write / num_exports as f64);
-    println!("Projected 2000 exports: {:.1} GB disk",
-        disk_after_write / num_exports as f64 * 2000.0 / 1024.0);
+    println!(
+        "Projected 2000 exports: {:.1} GB RSS",
+        total_per_export_mb * 2000.0 / 1024.0
+    );
+    println!(
+        "Disk per export:       {:.2} MB (actual, not pre-allocated)",
+        disk_after_write / num_exports as f64
+    );
+    println!(
+        "Projected 2000 exports: {:.1} GB disk",
+        disk_after_write / num_exports as f64 * 2000.0 / 1024.0
+    );
 }

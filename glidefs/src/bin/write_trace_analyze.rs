@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use glidefs::nbd::write_trace::{iter_entries, read_header, TraceEntry};
+use glidefs::block::write_trace::{TraceEntry, iter_entries, read_header};
 
 #[derive(Parser)]
 #[command(
@@ -60,7 +60,10 @@ fn main() {
     let entries: Vec<TraceEntry> = iter_entries(&data).collect();
 
     if entries.is_empty() {
-        println!("Trace: {} (empty — no writes recorded)", args.trace.display());
+        println!(
+            "Trace: {} (empty — no writes recorded)",
+            args.trace.display()
+        );
         return;
     }
 
@@ -104,24 +107,18 @@ fn main() {
     println!("  Duration:       {:.1}s", duration_s);
     println!();
     println!("  Total ops:      {}", total_writes);
-    println!(
-        "    Writes:       {}",
-        writes_by_op[0]
-    );
-    println!(
-        "    Trims:        {}",
-        writes_by_op[1]
-    );
-    println!(
-        "    WriteZeroes:  {}",
-        writes_by_op[2]
-    );
+    println!("    Writes:       {}", writes_by_op[0]);
+    println!("    Trims:        {}", writes_by_op[1]);
+    println!("    WriteZeroes:  {}", writes_by_op[2]);
     println!(
         "  Blocks touched: {} (including multi-block ops)",
         total_blocks_touched
     );
     println!("  Unique blocks:  {}", unique_blocks);
-    println!("  Overwrite ratio: {:.2}x (total / unique)", overwrite_ratio);
+    println!(
+        "  Overwrite ratio: {:.2}x (total / unique)",
+        overwrite_ratio
+    );
     if duration_s > 0.0 {
         println!(
             "  Unique rate:    {:.1} blocks/sec",
@@ -185,10 +182,7 @@ fn main() {
     let last_ts = entries.last().unwrap().elapsed_us;
 
     if args.timeline && duration_us > 0 {
-        println!(
-            "Write Rate Timeline ({:.0}s windows):",
-            args.window
-        );
+        println!("Write Rate Timeline ({:.0}s windows):", args.window);
         println!("  ┌──────────┬──────────┬──────────┬──────────┐");
         println!("  │ Time (s) │ Raw Ops  │ Unique   │ Blks/sec │");
         println!("  ├──────────┼──────────┼──────────┼──────────┤");
@@ -223,8 +217,7 @@ fn main() {
             // Advance by window/2 for overlapping windows (smoother)
             window_start += window_us / 2;
             // Reset entry_idx to find entries in the new window
-            entry_idx = entries
-                .partition_point(|e| e.elapsed_us < window_start);
+            entry_idx = entries.partition_point(|e| e.elapsed_us < window_start);
         }
 
         println!("  └──────────┴──────────┴──────────┴──────────┘");
@@ -240,10 +233,9 @@ fn main() {
     let num_buckets = duration_us.div_ceil(bucket_us) as usize;
     if num_buckets > 0 {
         let mut bucket_counts = vec![0u64; num_buckets.max(1)];
-        let mut bucket_unique: Vec<std::collections::HashSet<u32>> =
-            (0..num_buckets.max(1))
-                .map(|_| std::collections::HashSet::new())
-                .collect();
+        let mut bucket_unique: Vec<std::collections::HashSet<u32>> = (0..num_buckets.max(1))
+            .map(|_| std::collections::HashSet::new())
+            .collect();
 
         for e in &entries {
             let bucket = ((e.elapsed_us - first_ts) / bucket_us) as usize;
@@ -358,9 +350,7 @@ fn main() {
 
     println!("  └─────────────┴─────────┴──────────┴──────────┴──────────────┘");
     println!();
-    println!(
-        "  Note: \"Time to Fill\" is avg seconds between flush triggers."
-    );
+    println!("  Note: \"Time to Fill\" is avg seconds between flush triggers.");
     println!("  Lower = more frequent S3 PUTs. Higher = more coalescing.");
 
     // =========================================================================

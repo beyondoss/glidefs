@@ -6,8 +6,8 @@
 #![no_main]
 
 use deku::prelude::*;
+use glidefs::block::NBDClientFlags;
 use libfuzzer_sys::fuzz_target;
-use glidefs::nbd::NBDClientFlags;
 
 fuzz_target!(|data: &[u8]| {
     // NBDClientFlags expects 4 bytes

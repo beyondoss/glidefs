@@ -4,7 +4,7 @@
 //! by a `BlockHandler`. The device runs per-queue I/O threads that receive
 //! commands via io_uring and dispatch to the handler.
 
-use crate::nbd::handler::BlockHandler;
+use crate::block::handler::BlockHandler;
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
@@ -33,7 +33,10 @@ pub struct UblkDevice {
     worker: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
 }
 
-// The JoinHandle is Send. We only access it from &mut self (unregister/drop).
+// SAFETY: `JoinHandle<T>` is `!Sync` due to internal raw pointers.
+// This impl is sound because no `&self` method accesses `self.worker` —
+// only `unregister(self)` (by value) and `Drop::drop(&mut self)` touch it,
+// both requiring exclusive access.
 unsafe impl Sync for UblkDevice {}
 
 impl UblkDevice {
@@ -42,23 +45,17 @@ impl UblkDevice {
     /// Allocates a device ID, sets parameters, spawns per-queue I/O threads,
     /// and waits for the kernel to confirm the device is serving I/O.
     /// Returns once `/dev/ublkbN` is ready.
-    pub async fn register(
-        handler: Arc<BlockHandler>,
-        nr_queues: u16,
-    ) -> anyhow::Result<Self> {
+    pub async fn register(handler: Arc<BlockHandler>, nr_queues: u16) -> anyhow::Result<Self> {
         let dev_size = handler.device_size();
         let tokio_handle = tokio::runtime::Handle::current();
 
         // The worker thread signals back the dev_id + path once the device is started,
         // or an error if setup fails.
-        let (ready_tx, ready_rx) =
-            tokio::sync::oneshot::channel::<anyhow::Result<(i32, String)>>();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<anyhow::Result<(i32, String)>>();
 
         let worker = std::thread::Builder::new()
             .name("ublk".to_string())
-            .spawn(move || {
-                run_device(dev_size, nr_queues, handler, tokio_handle, ready_tx)
-            })?;
+            .spawn(move || run_device(dev_size, nr_queues, handler, tokio_handle, ready_tx))?;
 
         // Wait for device to be ready (or error during setup).
         let (dev_id, dev_path_str) = ready_rx
@@ -84,7 +81,7 @@ impl UblkDevice {
     ///
     /// Sends `UBLK_CMD_STOP_DEV` + `UBLK_CMD_DEL_DEV` to the kernel.
     /// Queue I/O loops receive `QueueIsDown` and exit. The worker thread
-    /// joins once `run_target()` returns.
+    /// is joined with a timeout to avoid hanging indefinitely.
     pub async fn unregister(mut self) -> anyhow::Result<()> {
         tracing::info!(dev_id = self.dev_id, "unregistering ublk device");
 
@@ -96,16 +93,60 @@ impl UblkDevice {
         })
         .await?;
 
-        // Always join the worker thread, even if kill_dev failed.
-        // The worker may have already exited on its own.
+        // If kill_dev failed, don't try to join — the worker may not exit.
+        // Drop will retry kill_dev as a safety net.
+        kill_result.map_err(|e| anyhow::anyhow!("ublk kill_dev failed: {:?}", e))?;
+
+        // Join the worker with a timeout. The io_uring idle timeout bounds
+        // worst-case exit latency, so we allow slightly more than that.
         if let Some(worker) = self.worker.take() {
-            worker
-                .join()
-                .map_err(|_| anyhow::anyhow!("ublk worker thread panicked"))??;
+            let timeout = std::time::Duration::from_secs(URING_IDLE_SECS + 5);
+            match tokio::time::timeout(timeout, tokio::task::spawn_blocking(move || worker.join()))
+                .await
+            {
+                Ok(Ok(Ok(Ok(())))) => {}
+                Ok(Ok(Ok(Err(e)))) => return Err(e.context("ublk worker thread exited with error")),
+                Ok(Ok(Err(_panic))) => return Err(anyhow::anyhow!("ublk worker thread panicked")),
+                Ok(Err(e)) => return Err(anyhow::anyhow!("join task failed: {}", e)),
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        dev_id,
+                        timeout_secs = timeout.as_secs(),
+                        "ublk worker thread did not exit in time; detaching"
+                    );
+                }
+            }
         }
 
-        kill_result.map_err(|e| anyhow::anyhow!("ublk kill_dev failed: {:?}", e))?;
         Ok(())
+    }
+}
+
+impl Drop for UblkDevice {
+    fn drop(&mut self) {
+        if self.worker.is_none() {
+            return; // unregister() already ran
+        }
+        // Worker still running — unregister() was not called (or panicked).
+        // Best-effort kill_dev so the kernel device doesn't become a zombie.
+        // We cannot join the thread in Drop, but kill_dev triggers QueueIsDown
+        // which causes the worker to exit within URING_IDLE_SECS.
+        tracing::warn!(
+            dev_id = self.dev_id,
+            path = %self.dev_path.display(),
+            "UblkDevice dropped without unregister — issuing best-effort kill_dev"
+        );
+        match UblkCtrl::new_simple(self.dev_id) {
+            Ok(ctrl) => {
+                if let Err(e) = ctrl.kill_dev() {
+                    tracing::error!(dev_id = self.dev_id, error = ?e, "kill_dev in Drop failed");
+                }
+            }
+            Err(e) => {
+                tracing::error!(dev_id = self.dev_id, error = ?e, "UblkCtrl::new_simple in Drop failed");
+            }
+        }
+        // JoinHandle is dropped here → thread detaches. It will exit on its own.
     }
 }
 
@@ -142,13 +183,11 @@ fn run_device(
     let tgt_init = move |dev: &mut UblkDev| {
         dev.tgt.dev_size = dev_size;
         dev.tgt.params = libublk::sys::ublk_params {
-            types: libublk::sys::UBLK_PARAM_TYPE_BASIC
-                | libublk::sys::UBLK_PARAM_TYPE_DISCARD,
+            types: libublk::sys::UBLK_PARAM_TYPE_BASIC | libublk::sys::UBLK_PARAM_TYPE_DISCARD,
             basic: libublk::sys::ublk_param_basic {
                 // Volatile cache + FUA: writes land in local SSD cache,
                 // FUA forces an fdatasync before returning.
-                attrs: libublk::sys::UBLK_ATTR_VOLATILE_CACHE
-                    | libublk::sys::UBLK_ATTR_FUA,
+                attrs: libublk::sys::UBLK_ATTR_VOLATILE_CACHE | libublk::sys::UBLK_ATTR_FUA,
                 logical_bs_shift: 9,   // 512 bytes (standard sector)
                 physical_bs_shift: 17, // 128KB (our block size)
                 io_opt_shift: 17,      // 128KB optimal I/O
@@ -266,7 +305,7 @@ async fn io_task(
         let offset = (iod.start_sector << 9) as u64;
         let length = (iod.nr_sectors << 9) as u32;
 
-        let result = dispatch_io(op, offset, length, fua, &mut buffer, handler, tokio_handle);
+        let result = dispatch_io(op, offset, length, fua, &mut buffer, handler, tokio_handle).await;
 
         // Commit result and fetch next command.
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), result)
@@ -277,7 +316,11 @@ async fn io_task(
 /// Dispatch a single I/O command to the BlockHandler.
 ///
 /// Returns bytes transferred (positive) on success, negative errno on error.
-fn dispatch_io(
+///
+/// Async so that reads can `.await` `BlockHandler::read()` on the smol executor,
+/// allowing other tags to make progress while this tag waits on S3. Write, flush,
+/// discard, and write-zeroes are synchronous in the handler and never suspend.
+async fn dispatch_io(
     op: u32,
     offset: u64,
     length: u32,
@@ -288,9 +331,13 @@ fn dispatch_io(
 ) -> i32 {
     match op {
         libublk::sys::UBLK_IO_OP_READ => {
-            // handler.read() is async (may fetch from S3).
-            // Bridge from smol thread via the tokio runtime handle.
-            match tokio_handle.block_on(handler.read(offset, length)) {
+            // Install the tokio runtime context so that tokio::spawn (used by
+            // read-ahead) and Notify work inside this smol-polled future.
+            // The EnterGuard is !Send, which is fine — smol's LocalExecutor
+            // never moves tasks across threads. Network I/O (S3 via reqwest)
+            // is driven by tokio's reactor on its worker threads.
+            let _guard = tokio_handle.enter();
+            match handler.read(offset, length).await {
                 Ok(data) => {
                     buffer.as_mut_slice()[..data.len()].copy_from_slice(&data);
                     data.len() as i32
@@ -313,12 +360,10 @@ fn dispatch_io(
             Ok(()) => 0,
             Err(e) => -e.to_linux_errno(),
         },
-        libublk::sys::UBLK_IO_OP_WRITE_ZEROES => {
-            match handler.write_zeroes(offset, length, fua) {
-                Ok(()) => 0,
-                Err(e) => -e.to_linux_errno(),
-            }
-        }
+        libublk::sys::UBLK_IO_OP_WRITE_ZEROES => match handler.write_zeroes(offset, length, fua) {
+            Ok(()) => 0,
+            Err(e) => -e.to_linux_errno(),
+        },
         _ => -libc::EINVAL,
     }
 }

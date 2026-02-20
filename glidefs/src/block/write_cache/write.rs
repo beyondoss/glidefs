@@ -1,9 +1,9 @@
 use tracing::{debug, instrument};
 
-use crate::nbd::block_map::Blake3Hash;
-use crate::nbd::cache::BlockCache;
-use crate::nbd::state::Active;
-use crate::nbd::wal::WalEntryRef;
+use crate::block::block_map::Blake3Hash;
+use crate::block::cache::BlockCache;
+use crate::block::state::Active;
+use crate::block::wal::WalEntryRef;
 
 use super::{CacheError, WriteCache};
 
@@ -23,7 +23,12 @@ impl WriteCache<Active> {
     /// does: pwrite → mark dirty → WAL append. This keeps the hot path to
     /// ~10-15µs instead of ~90µs (no 128KB pread, no blake3, no cache insert).
     #[instrument(skip(self, data, _clean_cache), fields(offset = offset, len = data.len()))]
-    pub fn write(&self, offset: u64, data: &[u8], _clean_cache: &dyn BlockCache) -> Result<(), CacheError> {
+    pub fn write(
+        &self,
+        offset: u64,
+        data: &[u8],
+        _clean_cache: &dyn BlockCache,
+    ) -> Result<(), CacheError> {
         if offset + data.len() as u64 > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
                 offset + data.len() as u64,
@@ -115,7 +120,11 @@ impl WriteCache<Active> {
         // If using a forked block map, check if overlay is large enough to flatten
         self.try_flatten_block_map();
 
-        debug!(start_block = start_block, end_block = end_block, "marked blocks dirty and present");
+        debug!(
+            start_block = start_block,
+            end_block = end_block,
+            "marked blocks dirty and present"
+        );
         Ok(())
     }
 
@@ -161,7 +170,12 @@ impl WriteCache<Active> {
             const FALLOC_FL_ZERO_RANGE: libc::c_int = 0x10;
 
             let ret = unsafe {
-                libc::fallocate(fd, FALLOC_FL_ZERO_RANGE, offset as libc::off_t, len as libc::off_t)
+                libc::fallocate(
+                    fd,
+                    FALLOC_FL_ZERO_RANGE,
+                    offset as libc::off_t,
+                    len as libc::off_t,
+                )
             };
 
             if ret != 0 {
@@ -233,16 +247,17 @@ impl WriteCache<Active> {
 
         // Static zero buffer - allocated once, reused forever
         const ZERO_CHUNK_SIZE: usize = 128 * 1024; // 128KB
-        static ZERO_CHUNK: LazyLock<Box<[u8]>> = LazyLock::new(|| {
-            vec![0u8; ZERO_CHUNK_SIZE].into_boxed_slice()
-        });
+        static ZERO_CHUNK: LazyLock<Box<[u8]>> =
+            LazyLock::new(|| vec![0u8; ZERO_CHUNK_SIZE].into_boxed_slice());
 
         let mut remaining = len;
         let mut current_offset = offset;
 
         while remaining > 0 {
             let chunk_size = (remaining as usize).min(ZERO_CHUNK_SIZE);
-            self.inner.data_file.write_all_at(&ZERO_CHUNK[..chunk_size], current_offset)?;
+            self.inner
+                .data_file
+                .write_all_at(&ZERO_CHUNK[..chunk_size], current_offset)?;
             remaining -= chunk_size as u64;
             current_offset += chunk_size as u64;
         }

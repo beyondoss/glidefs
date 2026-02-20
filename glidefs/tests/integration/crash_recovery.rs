@@ -13,11 +13,11 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use tempfile::TempDir;
 
-use glidefs::nbd::cache::SimpleBlockCache;
-use glidefs::nbd::state::Initializing;
-use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
+use glidefs::block::cache::SimpleBlockCache;
+use glidefs::block::state::Initializing;
+use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
-use super::{create_v2_cold_reader, BLOCK_SIZE, DEVICE_SIZE};
+use super::{BLOCK_SIZE, DEVICE_SIZE, create_v2_cold_reader};
 
 /// Helper to create a test cache config with `wal_sync: false`.
 fn test_config(dir: &TempDir, name: &str) -> WriteCacheConfig {
@@ -54,10 +54,14 @@ async fn test_metadata_atomicity() {
         cache.write(0, &test_data, &clean_cache).unwrap();
         cache.save_metadata().unwrap();
 
-        cache.write(BLOCK_SIZE as u64, &test_data, &clean_cache).unwrap();
+        cache
+            .write(BLOCK_SIZE as u64, &test_data, &clean_cache)
+            .unwrap();
         cache.save_metadata().unwrap();
 
-        cache.write(2 * BLOCK_SIZE as u64, &test_data, &clean_cache).unwrap();
+        cache
+            .write(2 * BLOCK_SIZE as u64, &test_data, &clean_cache)
+            .unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -77,7 +81,9 @@ async fn test_metadata_atomicity() {
 
         // All data should be readable
         for i in 0..3 {
-            let data = cache.read_local(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+            let data = cache
+                .read_local(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE)
+                .unwrap();
             assert_eq!(data.as_ref(), &test_data[..], "Block {} data mismatch", i);
         }
     }
@@ -212,7 +218,9 @@ async fn test_corrupted_magic_bytes() {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
-        cache.write(0, &vec![0xCC; BLOCK_SIZE], &clean_cache).unwrap();
+        cache
+            .write(0, &vec![0xCC; BLOCK_SIZE], &clean_cache)
+            .unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -387,23 +395,37 @@ async fn test_write_after_recovery_overwrites() {
         cache.write(0, &new_data, &clean_cache).unwrap();
 
         // Flush to S3 via v2 pack path
-        let content_store = glidefs::nbd::content_store::ContentStore::new(
-            Arc::clone(&s3_backend),
-            "test",
+        let content_store =
+            glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
+        let pack_index = Arc::new(
+            glidefs::block::pack_index::HostPackIndex::open(
+                temp_dir.path().join("pack_index.redb"),
+            )
+            .unwrap(),
         );
-        let pack_index = Arc::new(glidefs::nbd::pack_index::HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
-        cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+        cache
+            .flush_to_s3(&content_store, &pack_index)
+            .await
+            .unwrap();
     }
 
     // Verify: new data should be in S3, not old data
     {
         let cold_dir = TempDir::new().unwrap();
         let (cold_cache, content_store, pack_index, clean_cache, metrics) =
-            create_v2_cold_reader(&cold_dir, "write_during_recovery", Arc::clone(&s3_backend)).await;
+            create_v2_cold_reader(&cold_dir, "write_during_recovery", Arc::clone(&s3_backend))
+                .await;
 
         // Read from S3 (cold cache has no local data)
         let data = cold_cache
-            .read_v2(0, BLOCK_SIZE, clean_cache.as_ref(), &pack_index, &content_store, &metrics)
+            .read_v2(
+                0,
+                BLOCK_SIZE,
+                clean_cache.as_ref(),
+                &pack_index,
+                &content_store,
+                &metrics,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -443,7 +465,9 @@ async fn test_wal_recovery_without_metadata_save() {
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         cache.write(0, &block_0_data, &clean_cache).unwrap();
-        cache.write(BLOCK_SIZE as u64, &block_1_data, &clean_cache).unwrap();
+        cache
+            .write(BLOCK_SIZE as u64, &block_1_data, &clean_cache)
+            .unwrap();
 
         assert_eq!(cache.dirty_block_count(), 2);
 
@@ -458,21 +482,38 @@ async fn test_wal_recovery_without_metadata_save() {
 
         // Data should be readable from local SSD (pwrite'd before WAL append)
         let data_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
-        assert_eq!(data_0.as_ref(), &block_0_data[..], "block 0 data after recovery");
+        assert_eq!(
+            data_0.as_ref(),
+            &block_0_data[..],
+            "block 0 data after recovery"
+        );
 
         let data_1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
-        assert_eq!(data_1.as_ref(), &block_1_data[..], "block 1 data after recovery");
+        assert_eq!(
+            data_1.as_ref(),
+            &block_1_data[..],
+            "block 1 data after recovery"
+        );
 
         // Flush to S3 — WAL-replayed blocks have FLAG_DIRTY in the v2 block map,
         // so flush_dirty_inner picks them up even though v1 block_states says Clean.
-        let content_store = glidefs::nbd::content_store::ContentStore::new(
-            Arc::clone(&s3_backend),
-            "test",
+        let content_store =
+            glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
+        let pack_index = Arc::new(
+            glidefs::block::pack_index::HostPackIndex::open(
+                temp_dir.path().join("pack_index.redb"),
+            )
+            .unwrap(),
         );
-        let pack_index = Arc::new(glidefs::nbd::pack_index::HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
-        let stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+        let stats = cache
+            .flush_to_s3(&content_store, &pack_index)
+            .await
+            .unwrap();
         assert!(stats.packs_uploaded > 0, "should upload recovered blocks");
-        assert_eq!(stats.blocks_flushed, 2, "should flush both WAL-recovered blocks");
+        assert_eq!(
+            stats.blocks_flushed, 2,
+            "should flush both WAL-recovered blocks"
+        );
     }
 
     // Session 3: Verify from a cold reader that the data made it to S3
@@ -482,16 +523,38 @@ async fn test_wal_recovery_without_metadata_save() {
             create_v2_cold_reader(&cold_dir, "wal_recovery", Arc::clone(&s3_backend)).await;
 
         let data_0 = cold_cache
-            .read_v2(0, BLOCK_SIZE, clean_cache.as_ref(), &pack_index, &content_store, &metrics)
+            .read_v2(
+                0,
+                BLOCK_SIZE,
+                clean_cache.as_ref(),
+                &pack_index,
+                &content_store,
+                &metrics,
+            )
             .await
             .unwrap();
-        assert_eq!(data_0.as_ref(), &block_0_data[..], "block 0 from S3 after WAL recovery");
+        assert_eq!(
+            data_0.as_ref(),
+            &block_0_data[..],
+            "block 0 from S3 after WAL recovery"
+        );
 
         let data_1 = cold_cache
-            .read_v2(BLOCK_SIZE as u64, BLOCK_SIZE, clean_cache.as_ref(), &pack_index, &content_store, &metrics)
+            .read_v2(
+                BLOCK_SIZE as u64,
+                BLOCK_SIZE,
+                clean_cache.as_ref(),
+                &pack_index,
+                &content_store,
+                &metrics,
+            )
             .await
             .unwrap();
-        assert_eq!(data_1.as_ref(), &block_1_data[..], "block 1 from S3 after WAL recovery");
+        assert_eq!(
+            data_1.as_ref(),
+            &block_1_data[..],
+            "block 1 from S3 after WAL recovery"
+        );
     }
 }
 
@@ -530,10 +593,15 @@ async fn test_wal_recovery_multiple_crash_cycles() {
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Block 0 should be recovered from metadata (.meta says dirty)
-        assert!(cache.dirty_block_count() >= 1, "block 0 should be dirty from metadata");
+        assert!(
+            cache.dirty_block_count() >= 1,
+            "block 0 should be dirty from metadata"
+        );
 
         // Write block 1 (new data) — appends to WAL
-        cache.write(BLOCK_SIZE as u64, &data_session_2, &clean_cache).unwrap();
+        cache
+            .write(BLOCK_SIZE as u64, &data_session_2, &clean_cache)
+            .unwrap();
 
         // Crash without saving metadata — .meta still has only block 0 dirty
     }
@@ -545,19 +613,33 @@ async fn test_wal_recovery_multiple_crash_cycles() {
 
         // SSD data should be intact for both blocks
         let read_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
-        assert_eq!(read_0.as_ref(), &data_session_1[..], "block 0 from session 1");
+        assert_eq!(
+            read_0.as_ref(),
+            &data_session_1[..],
+            "block 0 from session 1"
+        );
 
         let read_1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
-        assert_eq!(read_1.as_ref(), &data_session_2[..], "block 1 from session 2");
+        assert_eq!(
+            read_1.as_ref(),
+            &data_session_2[..],
+            "block 1 from session 2"
+        );
 
         // Both should flush to S3 — block 0 from metadata + WAL,
         // block 1 from WAL only (both have FLAG_DIRTY in v2 block map).
-        let content_store = glidefs::nbd::content_store::ContentStore::new(
-            Arc::clone(&s3_backend),
-            "test",
+        let content_store =
+            glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
+        let pack_index = Arc::new(
+            glidefs::block::pack_index::HostPackIndex::open(
+                temp_dir.path().join("pack_index.redb"),
+            )
+            .unwrap(),
         );
-        let pack_index = Arc::new(glidefs::nbd::pack_index::HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
-        let stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+        let stats = cache
+            .flush_to_s3(&content_store, &pack_index)
+            .await
+            .unwrap();
         assert_eq!(stats.blocks_flushed, 2, "both blocks should flush to S3");
 
         // Verify from cold reader

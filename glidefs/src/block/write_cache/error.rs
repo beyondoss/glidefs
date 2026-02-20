@@ -1,8 +1,8 @@
 use thiserror::Error;
 
-use crate::nbd::block_map::Blake3Hash;
-use crate::nbd::content_store::ContentStoreError;
-use crate::nbd::pack_index::PackIndexError;
+use crate::block::block_map::Blake3Hash;
+use crate::block::content_store::ContentStoreError;
+use crate::block::pack_index::PackIndexError;
 
 /// Errors that can occur during cache operations.
 #[derive(Error, Debug)]
@@ -40,7 +40,9 @@ pub enum CacheError {
     DecompressFailed(String),
 
     #[allow(dead_code)]
-    #[error("Unsupported block size {0}: must not exceed {1} (ZERO_BLOCK_BYTES is compiled for this size)")]
+    #[error(
+        "Unsupported block size {0}: must not exceed {1} (ZERO_BLOCK_BYTES is compiled for this size)"
+    )]
     UnsupportedBlockSize(usize, usize),
 
     #[error("Pack index error: {0}")]

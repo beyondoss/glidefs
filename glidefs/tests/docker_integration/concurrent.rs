@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
+use crate::block_client::NbdClient;
 
 const BLOCK_SIZE: usize = 128 * 1024;
 
@@ -105,7 +105,7 @@ async fn test_drain_during_active_writes() {
     let drain_handle = tokio::spawn(async move {
         rx.await.unwrap();
         let failed = drain_router.drain_all().await;
-            assert!(failed.is_empty(), "drain_all failed for: {:?}", failed);
+        assert!(failed.is_empty(), "drain_all failed for: {:?}", failed);
     });
 
     writer_handle.await.unwrap();

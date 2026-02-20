@@ -15,9 +15,9 @@ use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::block::content_store::ContentStore;
+use crate::block::pack_registry::PackRegistry;
 use crate::config::Settings;
-use crate::nbd::content_store::ContentStore;
-use crate::nbd::pack_registry::PackRegistry;
 use crate::parse_object_store::parse_url_opts;
 
 // ---------------------------------------------------------------------------
@@ -45,8 +45,9 @@ impl GcState {
         let tmp = tempfile::NamedTempFile::new_in(dir)
             .with_context(|| format!("failed to create temp file in {}", dir.display()))?;
         std::fs::write(tmp.path(), &json)?;
-        tmp.persist(path)
-            .with_context(|| format!("failed to atomically rename GC state to {}", path.display()))?;
+        tmp.persist(path).with_context(|| {
+            format!("failed to atomically rename GC state to {}", path.display())
+        })?;
         Ok(())
     }
 
@@ -392,10 +393,7 @@ async fn reconcile_prefix(
                             continue;
                         }
                     }
-                    if let Err(e) = content_store
-                        .put_registry(&name, reg.serialize())
-                        .await
-                    {
+                    if let Err(e) = content_store.put_registry(&name, reg.serialize()).await {
                         warn!(registry = %name, error = %e, "failed to compact registry");
                     } else {
                         stats.registries_compacted += 1;
@@ -609,9 +607,7 @@ mod tests {
 
         // Mark dead with a timestamp in the past
         let old_ts = Utc::now() - chrono::Duration::hours(25);
-        state
-            .dead_packs
-            .insert(id.to_string(), old_ts.to_rfc3339());
+        state.dead_packs.insert(id.to_string(), old_ts.to_rfc3339());
 
         // Should be eligible (dead > 24h)
         assert!(state.is_eligible(&id, Duration::from_secs(86400)));
@@ -622,9 +618,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_reconciliation_deletes_orphaned_packs() {
-        use crate::nbd::content_store::ContentStore;
-        use crate::nbd::manifest::{Manifest, ManifestPackEntry};
-        use crate::nbd::block_map::Blake3Hash;
+        use crate::block::block_map::Blake3Hash;
+        use crate::block::content_store::ContentStore;
+        use crate::block::manifest::{Manifest, ManifestPackEntry};
         use object_store::memory::InMemory;
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -636,9 +632,18 @@ mod tests {
         let pack_c = Uuid::new_v4();
 
         // Upload packs to S3
-        content_store.put_pack(pack_a, vec![0u8; 100]).await.unwrap();
-        content_store.put_pack(pack_b, vec![0u8; 100]).await.unwrap();
-        content_store.put_pack(pack_c, vec![0u8; 100]).await.unwrap();
+        content_store
+            .put_pack(pack_a, vec![0u8; 100])
+            .await
+            .unwrap();
+        content_store
+            .put_pack(pack_b, vec![0u8; 100])
+            .await
+            .unwrap();
+        content_store
+            .put_pack(pack_c, vec![0u8; 100])
+            .await
+            .unwrap();
 
         // Create a manifest that only references pack_a
         let manifest = Manifest {
@@ -654,13 +659,19 @@ mod tests {
                 comp_length: 100,
             }],
         };
-        content_store.put_manifest("vm1", manifest.serialize()).await.unwrap();
+        content_store
+            .put_manifest("vm1", manifest.serialize())
+            .await
+            .unwrap();
 
         // Create a registry that references all 3 packs
         let registry = PackRegistry {
             pack_ids: vec![pack_a, pack_b, pack_c],
         };
-        content_store.put_registry("vm1", registry.serialize()).await.unwrap();
+        content_store
+            .put_registry("vm1", registry.serialize())
+            .await
+            .unwrap();
 
         // Run GC with zero grace period
         let mut state = new_gc_state_for_test();
@@ -694,15 +705,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_dry_run_doesnt_delete() {
-        use crate::nbd::content_store::ContentStore;
-        use crate::nbd::manifest::Manifest;
+        use crate::block::content_store::ContentStore;
+        use crate::block::manifest::Manifest;
         use object_store::memory::InMemory;
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = ContentStore::new(Arc::clone(&s3), "test/nbd/vm1");
 
         let dead_pack = Uuid::new_v4();
-        content_store.put_pack(dead_pack, vec![0u8; 100]).await.unwrap();
+        content_store
+            .put_pack(dead_pack, vec![0u8; 100])
+            .await
+            .unwrap();
 
         // Manifest with no pack references
         let manifest = Manifest {
@@ -713,12 +727,18 @@ mod tests {
             block_map: vec![],
             pack_index: vec![],
         };
-        content_store.put_manifest("vm1", manifest.serialize()).await.unwrap();
+        content_store
+            .put_manifest("vm1", manifest.serialize())
+            .await
+            .unwrap();
 
         let registry = PackRegistry {
             pack_ids: vec![dead_pack],
         };
-        content_store.put_registry("vm1", registry.serialize()).await.unwrap();
+        content_store
+            .put_registry("vm1", registry.serialize())
+            .await
+            .unwrap();
 
         let mut state = new_gc_state_for_test();
         let old_ts = Utc::now() - chrono::Duration::hours(25);
@@ -734,7 +754,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(report.packs_deleted(), 1, "dry run should report as deleted");
+        assert_eq!(
+            report.packs_deleted(),
+            1,
+            "dry run should report as deleted"
+        );
 
         // But the pack should still exist in S3
         let pack_data = content_store.get_pack(dead_pack).await;

@@ -8,34 +8,34 @@
 
 mod nbd_client;
 
-mod write_read;
-mod persistence;
 mod cold_wake;
-mod export_discovery;
-mod multi_export;
-mod live_migration;
-mod fork_roundtrip;
-mod data_integrity;
 mod concurrent;
-mod resize;
+mod data_integrity;
+mod export_discovery;
+mod fork_roundtrip;
+mod live_migration;
+mod multi_export;
+mod persistence;
 mod range_reads;
+mod resize;
+mod write_read;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
+use object_store::aws::AmazonS3Builder;
 use tempfile::TempDir;
+use testcontainers::ContainerAsync;
 use testcontainers::core::ExecCommand;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerAsync;
 use testcontainers_modules::minio::MinIO;
 use tokio_util::sync::CancellationToken;
 
+use glidefs::block::cache::{BlockCache, SimpleBlockCache};
+use glidefs::block::router::{ExportRouter, RouterConfig, SnapshotResponse};
+use glidefs::block::server::NBDServer;
 use glidefs::config::ExportConfig;
-use glidefs::nbd::cache::{BlockCache, SimpleBlockCache};
-use glidefs::nbd::router::{ExportRouter, RouterConfig, SnapshotResponse};
-use glidefs::nbd::server::NBDServer;
 
 // ---------------------------------------------------------------------------
 // TestContext — MinIO container + S3 object_store
@@ -58,9 +58,14 @@ impl TestContext {
         // (reqwest basic_auth doesn't work for S3 API — MinIO requires SigV4)
         minio
             .exec(ExecCommand::new(vec![
-                "curl", "-sf", "-X", "PUT",
-                "--aws-sigv4", "aws:amz:us-east-1:s3",
-                "-u", "minioadmin:minioadmin",
+                "curl",
+                "-sf",
+                "-X",
+                "PUT",
+                "--aws-sigv4",
+                "aws:amz:us-east-1:s3",
+                "-u",
+                "minioadmin:minioadmin",
                 "http://localhost:9000/test-bucket",
             ]))
             .await
@@ -101,21 +106,23 @@ impl TestServer {
     /// Start a GlideFS NBD server on a random port.
     pub async fn start(object_store: Arc<dyn ObjectStore>, db_path: &str) -> Self {
         let cache_dir = TempDir::new().unwrap();
-        let clean_cache: Arc<dyn BlockCache> =
-            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         let shutdown = CancellationToken::new();
 
-        let router = Arc::new(ExportRouter::new(RouterConfig {
-            object_store,
-            db_path: db_path.to_string(),
-            cache_dir: cache_dir.path().to_path_buf(),
-            block_size: 128 * 1024,
-            clean_cache,
-            wal_sync: false,
-            max_s3_uploads: 128,
-            max_s3_downloads: 512,
-            default_blocks_per_pack: glidefs::nbd::pack::DEFAULT_BLOCKS_PER_PACK,
-        }).expect("failed to create test router"));
+        let router = Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store,
+                db_path: db_path.to_string(),
+                cache_dir: cache_dir.path().to_path_buf(),
+                block_size: 128 * 1024,
+                clean_cache,
+                wal_sync: false,
+                max_s3_uploads: 128,
+                max_s3_downloads: 512,
+                default_blocks_per_pack: glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            })
+            .expect("failed to create test router"),
+        );
 
         // Pre-bind to get a random port, then release for the server
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

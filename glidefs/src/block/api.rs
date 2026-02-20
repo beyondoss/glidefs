@@ -3,10 +3,9 @@
 //! Provides REST endpoints for creating, draining, promoting, and removing exports.
 //! Used by orchestrators for microVM scale-to-zero and live migration.
 
+use crate::block::metrics::prometheus_header;
+use crate::block::router::{ExportRouter, RouterError};
 use crate::config::ExportConfig;
-use crate::nbd::metrics::prometheus_header;
-use crate::nbd::router::{ExportRouter, RouterError};
-use url::form_urlencoded;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
@@ -20,6 +19,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use url::form_urlencoded;
 
 /// Request to create or update an export (PUT /api/exports/{name}).
 /// Name comes from URL path, not body.
@@ -41,6 +41,9 @@ pub struct PutExportRequest {
     /// Flush mode: "auto" (default) or "manual" (drain-only).
     #[serde(default)]
     pub flush_mode: Option<String>,
+    /// Block device transport: "nbd" (default) or "ublk" (Linux 6.0+).
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 
 /// Response for export info.
@@ -152,7 +155,10 @@ where
             if !is_valid_export_name(name) {
                 return Ok(error_response(
                     StatusCode::BAD_REQUEST,
-                    &format!("Invalid export name '{}': must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric", name),
+                    &format!(
+                        "Invalid export name '{}': must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric",
+                        name
+                    ),
                 ));
             }
 
@@ -176,14 +182,17 @@ where
                     return Ok(error_response(
                         StatusCode::BAD_REQUEST,
                         &format!("Invalid JSON: {}", e),
-                    ))
+                    ));
                 }
             };
 
             if !put_req.size_gb.is_finite() || put_req.size_gb <= 0.0 || put_req.size_gb > 16384.0 {
                 return Ok(error_response(
                     StatusCode::BAD_REQUEST,
-                    &format!("Invalid size_gb {}: must be between 0 and 16384", put_req.size_gb),
+                    &format!(
+                        "Invalid size_gb {}: must be between 0 and 16384",
+                        put_req.size_gb
+                    ),
                 ));
             }
 
@@ -192,12 +201,16 @@ where
             {
                 return Ok(error_response(
                     StatusCode::BAD_REQUEST,
-                    &format!("Invalid block_size {}: must be a power of 2 between 4096 and 1048576", bs),
+                    &format!(
+                        "Invalid block_size {}: must be a power of 2 between 4096 and 1048576",
+                        bs
+                    ),
                 ));
             }
 
             if let Some(ref fm) = put_req.flush_mode
-                && fm != "auto" && fm != "manual"
+                && fm != "auto"
+                && fm != "manual"
             {
                 return Ok(error_response(
                     StatusCode::BAD_REQUEST,
@@ -235,7 +248,9 @@ where
                                     name, put_req.size_gb
                                 )),
                             ),
-                            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                            Err(e) => {
+                                error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                            }
                         }
                     } else {
                         // Already at or above requested size - no-op
@@ -254,12 +269,23 @@ where
                         block_size: put_req.block_size,
                         blocks_per_pack: put_req.blocks_per_pack,
                         flush_mode: put_req.flush_mode,
+                        transport: put_req.transport,
                     };
 
-                    match router.create_export(config.clone(), put_req.readonly, put_req.manifest_name.as_deref()).await {
+                    match router
+                        .create_export(
+                            config.clone(),
+                            put_req.readonly,
+                            put_req.manifest_name.as_deref(),
+                        )
+                        .await
+                    {
                         Ok(()) => {
                             if let Err(e) = router.save_export(&config).await {
-                                warn!("Failed to persist export to S3: {} (export is functional)", e);
+                                warn!(
+                                    "Failed to persist export to S3: {} (export is functional)",
+                                    e
+                                );
                             }
                             json_response(
                                 StatusCode::CREATED,
@@ -284,7 +310,10 @@ where
                         readonly: export.readonly,
                     },
                 ),
-                None => error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name)),
+                None => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
             }
         }
 
@@ -295,12 +324,14 @@ where
                     StatusCode::OK,
                     &ApiResponse::success(format!("Export '{}' drained", name)),
                 ),
-                Err(RouterError::ExportNotFound(name)) => {
-                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
-                }
-                Err(RouterError::InvalidExportName(_)) => {
-                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
-                }
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}'", name),
+                ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
@@ -309,12 +340,14 @@ where
         (Method::POST, ["api", "exports", name, "snapshot"]) => {
             match router.snapshot_export(name).await {
                 Ok(result) => json_response(StatusCode::OK, &result),
-                Err(RouterError::ExportNotFound(name)) => {
-                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
-                }
-                Err(RouterError::InvalidExportName(_)) => {
-                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
-                }
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}'", name),
+                ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
@@ -326,12 +359,14 @@ where
                     StatusCode::OK,
                     &ApiResponse::success(format!("Export '{}' promoted to read-write", name)),
                 ),
-                Err(RouterError::ExportNotFound(name)) => {
-                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
-                }
-                Err(RouterError::InvalidExportName(_)) => {
-                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
-                }
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}'", name),
+                ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
@@ -340,7 +375,10 @@ where
         (Method::GET, ["api", "exports", name, "metrics"]) => {
             match router.get_export_metrics(name).await {
                 Some(metrics) => json_response(StatusCode::OK, &metrics),
-                None => error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name)),
+                None => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
             }
         }
 
@@ -351,8 +389,7 @@ where
                 .uri()
                 .query()
                 .map(|q| {
-                    form_urlencoded::parse(q.as_bytes())
-                        .any(|(k, v)| k == "purge" && v == "true")
+                    form_urlencoded::parse(q.as_bytes()).any(|(k, v)| k == "purge" && v == "true")
                 })
                 .unwrap_or(false);
 
@@ -361,12 +398,14 @@ where
                     StatusCode::OK,
                     &ApiResponse::success(format!("Export '{}' removed", name)),
                 ),
-                Err(RouterError::ExportNotFound(name)) => {
-                    error_response(StatusCode::NOT_FOUND, &format!("Export '{}' not found", name))
-                }
-                Err(RouterError::InvalidExportName(_)) => {
-                    error_response(StatusCode::BAD_REQUEST, &format!("Invalid export name '{}'", name))
-                }
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}'", name),
+                ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
@@ -404,10 +443,18 @@ where
                 let evicted = sm.blocks_evicted.load(Ordering::Relaxed);
                 use std::fmt::Write;
                 writeln!(output, "# HELP glidefs_scrubber_blocks_checked_total Blocks verified by background scrubber").unwrap();
-                writeln!(output, "# TYPE glidefs_scrubber_blocks_checked_total counter").unwrap();
+                writeln!(
+                    output,
+                    "# TYPE glidefs_scrubber_blocks_checked_total counter"
+                )
+                .unwrap();
                 writeln!(output, "glidefs_scrubber_blocks_checked_total {checked}").unwrap();
                 writeln!(output, "# HELP glidefs_scrubber_blocks_evicted_total Corrupted blocks evicted by scrubber").unwrap();
-                writeln!(output, "# TYPE glidefs_scrubber_blocks_evicted_total counter").unwrap();
+                writeln!(
+                    output,
+                    "# TYPE glidefs_scrubber_blocks_evicted_total counter"
+                )
+                .unwrap();
                 writeln!(output, "glidefs_scrubber_blocks_evicted_total {evicted}").unwrap();
             }
             // S3 circuit breaker state (0=closed, 1=open, 2=half-open)
@@ -435,7 +482,11 @@ where
             {
                 use std::fmt::Write;
                 let utilization = router.ssd_utilization();
-                writeln!(output, "# HELP glidefs_ssd_utilization_ratio Fraction of local SSD capacity used").unwrap();
+                writeln!(
+                    output,
+                    "# HELP glidefs_ssd_utilization_ratio Fraction of local SSD capacity used"
+                )
+                .unwrap();
                 writeln!(output, "# TYPE glidefs_ssd_utilization_ratio gauge").unwrap();
                 writeln!(output, "glidefs_ssd_utilization_ratio {utilization:.6}").unwrap();
             }
@@ -519,24 +570,27 @@ impl ApiServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nbd::cache::SimpleBlockCache;
-    use crate::nbd::router::RouterConfig;
+    use crate::block::cache::SimpleBlockCache;
+    use crate::block::router::RouterConfig;
     use tempfile::TempDir;
 
     fn create_test_router(temp_dir: &TempDir) -> Arc<ExportRouter> {
         let s3: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
-        Arc::new(ExportRouter::new(RouterConfig {
-            object_store: s3,
-            db_path: "test".to_string(),
-            cache_dir: temp_dir.path().to_path_buf(),
-            block_size: 128 * 1024,
-            clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
-            wal_sync: false,
-            max_s3_uploads: 0,
-            max_s3_downloads: 0,
-            default_blocks_per_pack: crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK,
-        }).expect("failed to create test router"))
+        Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store: s3,
+                db_path: "test".to_string(),
+                cache_dir: temp_dir.path().to_path_buf(),
+                block_size: 128 * 1024,
+                clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+                wal_sync: false,
+                max_s3_uploads: 0,
+                max_s3_downloads: 0,
+                default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            })
+            .expect("failed to create test router"),
+        )
     }
 
     /// Helper to make a request and get the response.
@@ -616,8 +670,7 @@ mod tests {
         let resp = request(&router, Method::GET, "/health/ready", None).await;
         // May be OK or SERVICE_UNAVAILABLE depending on state
         assert!(
-            resp.status() == StatusCode::OK
-                || resp.status() == StatusCode::SERVICE_UNAVAILABLE
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
@@ -748,13 +801,7 @@ mod tests {
     async fn test_drain_missing_export_returns_404() {
         let temp = TempDir::new().unwrap();
         let router = create_test_router(&temp);
-        let resp = request(
-            &router,
-            Method::POST,
-            "/api/exports/nope/drain",
-            None,
-        )
-        .await;
+        let resp = request(&router, Method::POST, "/api/exports/nope/drain", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -790,13 +837,7 @@ mod tests {
     async fn test_invalid_json_returns_400() {
         let temp = TempDir::new().unwrap();
         let router = create_test_router(&temp);
-        let resp = request(
-            &router,
-            Method::PUT,
-            "/api/exports/vol1",
-            Some("not json"),
-        )
-        .await;
+        let resp = request(&router, Method::PUT, "/api/exports/vol1", Some("not json")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -824,13 +865,7 @@ mod tests {
         )
         .await;
 
-        let resp = request(
-            &router,
-            Method::POST,
-            "/api/exports/vol1/drain",
-            None,
-        )
-        .await;
+        let resp = request(&router, Method::POST, "/api/exports/vol1/drain", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -847,13 +882,7 @@ mod tests {
         )
         .await;
 
-        let resp = request(
-            &router,
-            Method::POST,
-            "/api/exports/vol1/promote",
-            None,
-        )
-        .await;
+        let resp = request(&router, Method::POST, "/api/exports/vol1/promote", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -861,13 +890,7 @@ mod tests {
     async fn test_promote_nonexistent_export_returns_404() {
         let temp = TempDir::new().unwrap();
         let router = create_test_router(&temp);
-        let resp = request(
-            &router,
-            Method::POST,
-            "/api/exports/nope/promote",
-            None,
-        )
-        .await;
+        let resp = request(&router, Method::POST, "/api/exports/nope/promote", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -883,13 +906,7 @@ mod tests {
         )
         .await;
 
-        let resp = request(
-            &router,
-            Method::POST,
-            "/api/exports/vol1/snapshot",
-            None,
-        )
-        .await;
+        let resp = request(&router, Method::POST, "/api/exports/vol1/snapshot", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -897,14 +914,7 @@ mod tests {
     async fn test_snapshot_nonexistent_export_returns_404() {
         let temp = TempDir::new().unwrap();
         let router = create_test_router(&temp);
-        let resp = request(
-            &router,
-            Method::POST,
-            "/api/exports/nope/snapshot",
-            None,
-        )
-        .await;
+        let resp = request(&router, Method::POST, "/api/exports/nope/snapshot", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
-
 }

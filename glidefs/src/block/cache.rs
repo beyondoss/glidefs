@@ -11,10 +11,10 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(any(test, feature = "test-utils"))]
+use parking_lot::Mutex;
+#[cfg(any(test, feature = "test-utils"))]
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-#[cfg(any(test, feature = "test-utils"))]
-use parking_lot::Mutex;
 
 use super::block_map::Blake3Hash;
 
@@ -189,7 +189,7 @@ impl BlockCache for SimpleBlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nbd::block_map::blake3_128;
+    use crate::block::block_map::blake3_128;
     use std::sync::Arc;
 
     fn make_hash(i: u8) -> Blake3Hash {

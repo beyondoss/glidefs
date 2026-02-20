@@ -7,7 +7,7 @@
 //! Usage in write_cache.rs:
 //! ```ignore
 //! #[cfg(loom)]
-//! use crate::nbd::sync::{AtomicU8, AtomicU64, Ordering};
+//! use crate::block::sync::{AtomicU8, AtomicU64, Ordering};
 //! #[cfg(not(loom))]
 //! use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 //! ```
@@ -16,10 +16,10 @@
 #![allow(unused_imports)]
 
 #[cfg(loom)]
-pub use loom::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+pub use loom::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 #[cfg(not(loom))]
-pub use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+pub use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 #[cfg(loom)]
 pub use loom::thread;

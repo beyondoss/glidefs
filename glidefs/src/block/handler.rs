@@ -14,9 +14,9 @@ use super::state::Active;
 use super::write_cache::WriteCache;
 use super::write_trace::WriteTracer;
 use bytes::Bytes;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::Notify;
 
@@ -144,8 +144,7 @@ impl BlockHandler {
     /// No-op when blocks_per_pack == 0 (manual flush mode).
     #[inline]
     fn check_flush_threshold(&self) {
-        if self.blocks_per_pack > 0
-            && self.cache.dirty_block_count() >= self.blocks_per_pack as u64
+        if self.blocks_per_pack > 0 && self.cache.dirty_block_count() >= self.blocks_per_pack as u64
         {
             self.flush_notify.notify_one();
         }
@@ -240,7 +239,11 @@ impl BlockHandler {
         self.metrics.record_guest_write(data.len() as u64);
         self.cache.write(offset, data, self.clean_cache.as_ref())?;
         if let Some(ref tracer) = self.write_tracer {
-            tracer.record(offset, data.len() as u64, super::write_trace::TraceOp::Write);
+            tracer.record(
+                offset,
+                data.len() as u64,
+                super::write_trace::TraceOp::Write,
+            );
         }
         self.check_flush_threshold();
 
@@ -305,7 +308,11 @@ impl BlockHandler {
 
         self.cache.zero_range(offset, length as u64)?;
         if let Some(ref tracer) = self.write_tracer {
-            tracer.record(offset, length as u64, super::write_trace::TraceOp::WriteZeroes);
+            tracer.record(
+                offset,
+                length as u64,
+                super::write_trace::TraceOp::WriteZeroes,
+            );
         }
         self.check_flush_threshold();
 
@@ -339,9 +346,9 @@ impl BlockHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nbd::cache::SimpleBlockCache;
-    use crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK;
-    use crate::nbd::write_cache::WriteCacheConfig;
+    use crate::block::cache::SimpleBlockCache;
+    use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use crate::block::write_cache::WriteCacheConfig;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
@@ -364,9 +371,9 @@ mod tests {
 
         // v2 read path components
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
-        let clean_cache: Arc<dyn BlockCache> =
-            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index =
+            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
 
         // Create metrics for this handler
         let metrics = Arc::new(ExportMetrics::new());
@@ -560,8 +567,7 @@ mod tests {
 
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
-        let clean_cache: Arc<dyn BlockCache> =
-            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         let pack_index =
             Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         let metrics = Arc::new(ExportMetrics::new());
@@ -638,10 +644,7 @@ mod tests {
             .await
             .is_ok()
         });
-        assert!(
-            !notified_early,
-            "should not notify below threshold (4 < 5)"
-        );
+        assert!(!notified_early, "should not notify below threshold (4 < 5)");
 
         // Write the 5th block — reaches threshold, SHOULD notify
         handler.write(4 * 4096, &[0xCC; 4096], false).unwrap();

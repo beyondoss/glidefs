@@ -5,9 +5,9 @@
 //!
 //! Run with: `cargo bench --bench manifest_serde`
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use glidefs::nbd::block_map::Blake3Hash;
-use glidefs::nbd::manifest::{Manifest, ManifestBlockEntry, ManifestPackEntry};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use glidefs::block::block_map::Blake3Hash;
+use glidefs::block::manifest::{Manifest, ManifestBlockEntry, ManifestPackEntry};
 
 /// Build a manifest with `num_blocks` block_map entries and a proportional
 /// number of pack_index entries (~1 pack per 25 blocks).
@@ -74,13 +74,9 @@ fn manifest_deserialize(c: &mut Criterion) {
 
         let data = make_manifest(num_blocks).serialize();
 
-        group.bench_with_input(
-            BenchmarkId::new("blocks", num_blocks),
-            &data,
-            |b, data| {
-                b.iter(|| Manifest::deserialize(data).unwrap());
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("blocks", num_blocks), &data, |b, data| {
+            b.iter(|| Manifest::deserialize(data).unwrap());
+        });
     }
 
     group.finish();

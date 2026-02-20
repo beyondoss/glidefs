@@ -2,8 +2,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use tracing::{info, instrument, warn};
 
-use crate::nbd::block_map::{SparseBlockState, blake3_128};
-use crate::nbd::state::{Active, Recovering};
+use crate::block::block_map::{SparseBlockState, blake3_128};
+use crate::block::state::{Active, Recovering};
 
 use super::{CacheError, WriteCache};
 
@@ -64,8 +64,11 @@ impl WriteCache<Recovering> {
         let zero_hash = self.inner.zero_block_hash;
         let mut corrected = 0;
 
-        for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
-
+        for idx in self
+            .inner
+            .state_map
+            .iter_with_state(SparseBlockState::DIRTY)
+        {
             let (hash, _seq) = self.inner.block_map_get(idx);
 
             // Zero-block hash entries are known content — no verification needed.
@@ -81,8 +84,10 @@ impl WriteCache<Recovering> {
 
             let mut buf = vec![0u8; block_size];
             if valid_bytes > 0
-                && let Err(e) =
-                    self.inner.data_file.read_exact_at(&mut buf[..valid_bytes], offset)
+                && let Err(e) = self
+                    .inner
+                    .data_file
+                    .read_exact_at(&mut buf[..valid_bytes], offset)
             {
                 warn!(
                     chunk_index = idx,

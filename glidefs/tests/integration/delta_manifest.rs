@@ -10,20 +10,20 @@
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use glidefs::nbd::content_store::ContentStore;
-use glidefs::nbd::manifest::{delta_manifest_s3_key, manifest_s3_key};
-use object_store::path::Path as ObjectPath;
+use glidefs::block::content_store::ContentStore;
+use glidefs::block::manifest::{delta_manifest_s3_key, manifest_s3_key};
 use object_store::ObjectStore;
+use object_store::path::Path as ObjectPath;
 
-use super::{create_v2_cold_reader, create_v2_test_cache, BLOCK_SIZE};
+use super::{BLOCK_SIZE, create_v2_cold_reader, create_v2_test_cache};
 
 /// Write `count` blocks starting at `start_idx` with data seeded by `seed`.
 fn write_blocks(
-    cache: &glidefs::nbd::write_cache::WriteCache<glidefs::nbd::state::Active>,
+    cache: &glidefs::block::write_cache::WriteCache<glidefs::block::state::Active>,
     start: u32,
     count: u32,
     seed: u8,
-    clean_cache: &glidefs::nbd::cache::SimpleBlockCache,
+    clean_cache: &glidefs::block::cache::SimpleBlockCache,
 ) {
     for i in start..start + count {
         let data: Vec<u8> = (0..BLOCK_SIZE)
@@ -48,8 +48,7 @@ async fn s3_key_exists(s3: &dyn ObjectStore, base_path: &str, relative_key: &str
 async fn test_delta_sync_cycle() {
     let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, cc, _metrics) =
-        create_v2_test_cache(&dir, "delta-test", Arc::clone(&s3));
+    let (cache, cs, pi, cc, _metrics) = create_v2_test_cache(&dir, "delta-test", Arc::clone(&s3));
 
     // Phase 1: Write 10 blocks, flush packs, sync (should be full — no base yet).
     write_blocks(&cache, 0, 10, 0xAA, cc.as_ref());
@@ -128,8 +127,7 @@ async fn test_compaction_trigger_sync_count() {
         let (_, seq) = cache.flush_packs(&cs, &pi).await.unwrap();
         cache.sync_manifest(&cs, &pi, seq).await.unwrap();
 
-        let has_delta =
-            s3_key_exists(&*s3, "test", &delta_manifest_s3_key("compact-test")).await;
+        let has_delta = s3_key_exists(&*s3, "test", &delta_manifest_s3_key("compact-test")).await;
 
         if i < 10 {
             assert!(
@@ -152,8 +150,7 @@ async fn test_compaction_trigger_sync_count() {
 async fn test_compaction_trigger_size_ratio() {
     let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pi, cc, _) =
-        create_v2_test_cache(&dir, "size-compact", Arc::clone(&s3));
+    let (cache, cs, pi, cc, _) = create_v2_test_cache(&dir, "size-compact", Arc::clone(&s3));
 
     // Establish base with 10 blocks.
     write_blocks(&cache, 0, 10, 0x01, cc.as_ref());
@@ -189,7 +186,13 @@ async fn test_compaction_trigger_size_ratio() {
         create_v2_cold_reader(&reader_dir, "size-compact", Arc::clone(&s3)).await;
 
     for i in 0..12u32 {
-        let seed: u8 = if i < 7 { 0x03 } else if i < 10 { 0x01 } else { 0x02 };
+        let seed: u8 = if i < 7 {
+            0x03
+        } else if i < 10 {
+            0x01
+        } else {
+            0x02
+        };
         let expected: Vec<u8> = (0..BLOCK_SIZE)
             .map(|j| seed.wrapping_add(i as u8).wrapping_add(j as u8))
             .collect();
@@ -286,15 +289,15 @@ async fn test_stale_delta_ignored() {
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     // Manually upload a stale delta with wrong base_sequence.
-    let stale_delta = glidefs::nbd::manifest::ManifestDelta {
+    let stale_delta = glidefs::block::manifest::ManifestDelta {
         name: "stale-test".to_string(),
         base_sequence: 999999, // won't match base
         sequence: 1000000,
         chunk_size: BLOCK_SIZE as u32,
         device_size: 64 * 1024 * 1024,
-        upserted: vec![glidefs::nbd::manifest::ManifestBlockEntry {
+        upserted: vec![glidefs::block::manifest::ManifestBlockEntry {
             chunk_index: 0,
-            hash: glidefs::nbd::block_map::Blake3Hash::from_bytes([0xFF; 16]),
+            hash: glidefs::block::block_map::Blake3Hash::from_bytes([0xFF; 16]),
             flags: 0,
         }],
         deleted_chunks: vec![1, 2, 3, 4],
@@ -346,11 +349,7 @@ async fn test_delta_is_smaller_than_full() {
 
     // Get full manifest size.
     let base_key = format!("test/{}", manifest_s3_key("size-test"));
-    let base_size = s3
-        .head(&ObjectPath::from(base_key))
-        .await
-        .unwrap()
-        .size;
+    let base_size = s3.head(&ObjectPath::from(base_key)).await.unwrap().size;
 
     // Write 5 more blocks, sync delta.
     write_blocks(&cache, 200, 5, 0x02, cc.as_ref());
@@ -359,11 +358,7 @@ async fn test_delta_is_smaller_than_full() {
 
     // Get delta manifest size.
     let delta_key = format!("test/{}", delta_manifest_s3_key("size-test"));
-    let delta_size = s3
-        .head(&ObjectPath::from(delta_key))
-        .await
-        .unwrap()
-        .size;
+    let delta_size = s3.head(&ObjectPath::from(delta_key)).await.unwrap().size;
 
     assert!(
         delta_size < base_size,
@@ -385,21 +380,33 @@ async fn test_gc_with_delta_manifests() {
     write_blocks(&cache, 0, 110, 0x01, cc.as_ref());
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
     let base_pack_ids = stats1.new_pack_ids.clone();
-    assert!(!base_pack_ids.is_empty(), "should have created packs in base flush");
+    assert!(
+        !base_pack_ids.is_empty(),
+        "should have created packs in base flush"
+    );
 
     // Phase 2: Write more blocks, flush packs, sync delta → new packs referenced by delta.
     write_blocks(&cache, 200, 110, 0x02, cc.as_ref());
     let (stats2, seq) = cache.flush_packs(&cs, &pi).await.unwrap();
     cache.sync_manifest(&cs, &pi, seq).await.unwrap();
     let delta_pack_ids = stats2.new_pack_ids.clone();
-    assert!(!delta_pack_ids.is_empty(), "should have created packs in delta flush");
+    assert!(
+        !delta_pack_ids.is_empty(),
+        "should have created packs in delta flush"
+    );
 
     // Upload a registry with all pack IDs.
-    let all_pack_ids: Vec<_> = base_pack_ids.iter().chain(delta_pack_ids.iter()).copied().collect();
-    let registry = glidefs::nbd::pack_registry::PackRegistry {
+    let all_pack_ids: Vec<_> = base_pack_ids
+        .iter()
+        .chain(delta_pack_ids.iter())
+        .copied()
+        .collect();
+    let registry = glidefs::block::pack_registry::PackRegistry {
         pack_ids: all_pack_ids.clone(),
     };
-    cs.put_registry("gc-delta", registry.serialize()).await.unwrap();
+    cs.put_registry("gc-delta", registry.serialize())
+        .await
+        .unwrap();
 
     // Run GC — all packs should be live (referenced by base+delta).
     let gc_cs = ContentStore::new(Arc::clone(&s3), "test");
@@ -414,7 +421,11 @@ async fn test_gc_with_delta_manifests() {
     .await
     .unwrap();
 
-    assert_eq!(report.dead_found(), 0, "all packs should be live (base + delta)");
+    assert_eq!(
+        report.dead_found(),
+        0,
+        "all packs should be live (base + delta)"
+    );
     assert_eq!(
         report.live_packs(),
         all_pack_ids.len(),

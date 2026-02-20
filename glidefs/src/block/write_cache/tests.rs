@@ -1,11 +1,11 @@
 use super::*;
-use crate::nbd::block_map::blake3_128;
-use crate::nbd::state::{Active, Initializing};
+use crate::block::block_map::blake3_128;
+use crate::block::state::{Active, Initializing};
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 
 fn test_config(dir: &Path) -> WriteCacheConfig {
@@ -36,7 +36,7 @@ async fn test_write_read() {
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
-    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Write some data
     cache.write(0, b"hello world", &clean_cache).unwrap();
@@ -56,7 +56,7 @@ async fn test_flush() {
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
-    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     cache.write(0, b"data", &clean_cache).unwrap();
     cache.flush().unwrap();
@@ -70,7 +70,7 @@ async fn test_flush() {
 async fn test_metadata_persistence() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path());
-    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Create cache and write data
     {
@@ -97,22 +97,37 @@ async fn test_metadata_persistence() {
 fn test_is_zero_block() {
     // Test the is_zero_block helper function
     let zeros = vec![0u8; 4096];
-    assert!(super::inner::is_zero_block(&zeros), "all zeros should return true");
+    assert!(
+        super::inner::is_zero_block(&zeros),
+        "all zeros should return true"
+    );
 
     let mut non_zeros = vec![0u8; 4096];
     non_zeros[0] = 1;
-    assert!(!super::inner::is_zero_block(&non_zeros), "first byte non-zero");
+    assert!(
+        !super::inner::is_zero_block(&non_zeros),
+        "first byte non-zero"
+    );
 
     non_zeros[0] = 0;
     non_zeros[4095] = 1;
-    assert!(!super::inner::is_zero_block(&non_zeros), "last byte non-zero");
+    assert!(
+        !super::inner::is_zero_block(&non_zeros),
+        "last byte non-zero"
+    );
 
     non_zeros[4095] = 0;
     non_zeros[2048] = 1;
-    assert!(!super::inner::is_zero_block(&non_zeros), "middle byte non-zero");
+    assert!(
+        !super::inner::is_zero_block(&non_zeros),
+        "middle byte non-zero"
+    );
 
     // Empty slice
-    assert!(super::inner::is_zero_block(&[]), "empty slice is 'all zeros'");
+    assert!(
+        super::inner::is_zero_block(&[]),
+        "empty slice is 'all zeros'"
+    );
 }
 
 // ====================================================================
@@ -125,9 +140,9 @@ fn test_is_zero_block() {
 /// struct so tests can focus on behavior, not setup boilerplate.
 struct V2Harness {
     cache: WriteCache<Active>,
-    content_store: crate::nbd::content_store::ContentStore,
-    pack_index: Arc<crate::nbd::pack_index::HostPackIndex>,
-    clean_cache: crate::nbd::cache::SimpleBlockCache,
+    content_store: crate::block::content_store::ContentStore,
+    pack_index: Arc<crate::block::pack_index::HostPackIndex>,
+    clean_cache: crate::block::cache::SimpleBlockCache,
     #[allow(dead_code)]
     dir: TempDir,
 }
@@ -149,17 +164,28 @@ impl V2Harness {
             wal_sync: false,
         };
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let content_store = crate::nbd::content_store::ContentStore::new(object_store, "test-bucket");
-        let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap());
-        let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+        let content_store =
+            crate::block::content_store::ContentStore::new(object_store, "test-bucket");
+        let pack_index = Arc::new(
+            crate::block::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb"))
+                .unwrap(),
+        );
+        let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        Self { cache, content_store, pack_index, clean_cache, dir }
+        Self {
+            cache,
+            content_store,
+            pack_index,
+            clean_cache,
+            dir,
+        }
     }
 
     /// Flush and return stats.
     async fn flush(&self) -> FlushStats {
-        let result: Result<FlushStats, CacheError> = self.cache
+        let result: Result<FlushStats, CacheError> = self
+            .cache
             .flush_to_s3(&self.content_store, &self.pack_index)
             .await;
         result.unwrap()
@@ -167,8 +193,9 @@ impl V2Harness {
 
     /// v2 read through the full tiered resolution path.
     async fn read(&self, offset: u64, len: usize) -> Bytes {
-        let metrics = crate::nbd::metrics::ExportMetrics::new();
-        let result: Result<Bytes, CacheError> = self.cache
+        let metrics = crate::block::metrics::ExportMetrics::new();
+        let result: Result<Bytes, CacheError> = self
+            .cache
             .read_v2(
                 offset,
                 len,
@@ -182,13 +209,14 @@ impl V2Harness {
     }
 
     /// Get the manifest from S3.
-    async fn manifest(&self) -> crate::nbd::manifest::Manifest {
-        let bytes = self.content_store
+    async fn manifest(&self) -> crate::block::manifest::Manifest {
+        let bytes = self
+            .content_store
             .get_manifest("test")
             .await
             .unwrap()
             .expect("manifest should exist");
-        crate::nbd::manifest::Manifest::deserialize(&bytes).unwrap()
+        crate::block::manifest::Manifest::deserialize(&bytes).unwrap()
     }
 }
 
@@ -198,7 +226,9 @@ async fn test_flush_end_to_end() {
 
     // Write 10 distinct blocks (each 4KB = block_size)
     for i in 0u8..10 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     let stats = h.flush().await;
@@ -221,7 +251,9 @@ async fn test_flush_dedup_skips_existing() {
 
     // Write 5 blocks
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     let stats1 = h.flush().await;
@@ -231,7 +263,9 @@ async fn test_flush_dedup_skips_existing() {
 
     // Write the same data again to new offsets — same content, new positions
     for i in 0u8..5 {
-        h.cache.write((i as u64 + 5) * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write((i as u64 + 5) * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     let stats2 = h.flush().await;
@@ -246,7 +280,9 @@ async fn test_flush_partial_dedup() {
 
     // Write 10 blocks with unique data
     for i in 0u8..10 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     let stats1 = h.flush().await;
@@ -255,10 +291,14 @@ async fn test_flush_partial_dedup() {
 
     // Write 10 more blocks: 5 with SAME data as before (dedup), 5 with NEW data
     for i in 0u8..5 {
-        h.cache.write((i as u64 + 10) * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write((i as u64 + 10) * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
     for i in 0u8..5 {
-        h.cache.write((i as u64 + 15) * 4096, &vec![i + 100; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write((i as u64 + 15) * 4096, &vec![i + 100; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     let stats2 = h.flush().await;
@@ -273,9 +313,13 @@ async fn test_flush_zero_blocks_skipped() {
     let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
 
     // Write one real block
-    h.cache.write(0, &vec![42u8; 128 * 1024], &h.clean_cache).unwrap();
+    h.cache
+        .write(0, &vec![42u8; 128 * 1024], &h.clean_cache)
+        .unwrap();
     // Write a block of zeros — this should get ZERO_BLOCK_HASH
-    h.cache.write(128 * 1024, &vec![0u8; 128 * 1024], &h.clean_cache).unwrap();
+    h.cache
+        .write(128 * 1024, &vec![0u8; 128 * 1024], &h.clean_cache)
+        .unwrap();
 
     let stats = h.flush().await;
     assert_eq!(stats.blocks_flushed, 2);
@@ -288,7 +332,9 @@ async fn test_flush_clears_dirty_state() {
     let h = V2Harness::new().await;
 
     for i in 0u8..3 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     h.flush().await;
@@ -309,7 +355,10 @@ async fn test_flush_concurrent_write_stays_dirty() {
     h.cache.write(0, &vec![2u8; 4096], &h.clean_cache).unwrap();
 
     let stats = h.flush().await;
-    assert_eq!(stats.blocks_flushed, 1, "overwritten block should be flushed");
+    assert_eq!(
+        stats.blocks_flushed, 1,
+        "overwritten block should be flushed"
+    );
 }
 
 #[tokio::test]
@@ -322,7 +371,9 @@ async fn test_flush_manifest_self_contained() {
     for i in 0u16..600 {
         let mut data = vec![0xAAu8; 4096];
         data[..2].copy_from_slice(&(i + 1).to_le_bytes());
-        h.cache.write(i as u64 * 4096, &data, &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &data, &h.clean_cache)
+            .unwrap();
     }
 
     let stats = h.flush().await;
@@ -363,7 +414,10 @@ async fn test_v2_read_zero_block() {
 
     // Never written — block_map entry is Blake3Hash::ZERO → returns zeros.
     let got = h.read(0, 4096).await;
-    assert!(got.iter().all(|&b| b == 0), "unwritten block should be all zeros");
+    assert!(
+        got.iter().all(|&b| b == 0),
+        "unwritten block should be all zeros"
+    );
 }
 
 #[tokio::test]
@@ -371,11 +425,16 @@ async fn test_v2_read_trimmed_block() {
     let h = V2Harness::new().await;
 
     // Write a block, then zero it out.
-    h.cache.write(0, &vec![0xBBu8; 4096], &h.clean_cache).unwrap();
+    h.cache
+        .write(0, &vec![0xBBu8; 4096], &h.clean_cache)
+        .unwrap();
     h.cache.zero_range(0, 4096).unwrap();
 
     let got = h.read(0, 4096).await;
-    assert!(got.iter().all(|&b| b == 0), "trimmed block should be all zeros");
+    assert!(
+        got.iter().all(|&b| b == 0),
+        "trimmed block should be all zeros"
+    );
 }
 
 #[tokio::test]
@@ -395,31 +454,43 @@ async fn test_v2_read_spans_chunks() {
     let h = V2Harness::new().await;
 
     // Write two distinct chunks.
-    h.cache.write(0, &vec![0x11u8; 4096], &h.clean_cache).unwrap();
-    h.cache.write(4096, &vec![0x22u8; 4096], &h.clean_cache).unwrap();
+    h.cache
+        .write(0, &vec![0x11u8; 4096], &h.clean_cache)
+        .unwrap();
+    h.cache
+        .write(4096, &vec![0x22u8; 4096], &h.clean_cache)
+        .unwrap();
 
     // Read across the chunk boundary: last 100 bytes of chunk 0 + first 100 of chunk 1.
     let got = h.read(3996, 200).await;
     assert_eq!(got.len(), 200);
-    assert!(got[..100].iter().all(|&b| b == 0x11), "first 100 bytes from chunk 0");
-    assert!(got[100..].iter().all(|&b| b == 0x22), "last 100 bytes from chunk 1");
+    assert!(
+        got[..100].iter().all(|&b| b == 0x11),
+        "first 100 bytes from chunk 0"
+    );
+    assert!(
+        got[100..].iter().all(|&b| b == 0x22),
+        "last 100 bytes from chunk 1"
+    );
 }
 
 #[tokio::test]
 async fn test_v2_read_from_s3_pack() {
-    use crate::nbd::cache::BlockCache;
+    use crate::block::cache::BlockCache;
 
     let h = V2Harness::new().await;
 
     // Write blocks, flush to S3, clear clean_cache so reads go to S3.
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
     h.flush().await;
 
     // Clear clean_cache so reads must resolve through S3 packs.
     for i in 0u8..5 {
-        let hash = crate::nbd::block_map::blake3_128(&vec![i + 1; 4096]);
+        let hash = crate::block::block_map::blake3_128(&vec![i + 1; 4096]);
         h.clean_cache.remove(&hash);
     }
 
@@ -437,19 +508,21 @@ async fn test_v2_read_from_s3_pack() {
 
 #[tokio::test]
 async fn test_v2_pack_prefetch_warms_siblings() {
-    use crate::nbd::cache::BlockCache;
+    use crate::block::cache::BlockCache;
 
     let h = V2Harness::new().await;
 
     // Write 25 blocks (1 full pack).
     for i in 0u8..25 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
     h.flush().await;
 
     // Clear clean_cache so prefetch has to fetch from S3.
     for i in 0u8..25 {
-        let hash = crate::nbd::block_map::blake3_128(&vec![i + 1; 4096]);
+        let hash = crate::block::block_map::blake3_128(&vec![i + 1; 4096]);
         h.clean_cache.remove(&hash);
     }
 
@@ -486,25 +559,29 @@ async fn test_v2_pack_prefetch_warms_siblings() {
 
 #[tokio::test]
 async fn test_v2_mixed_dirty_and_clean_reads() {
-    use crate::nbd::cache::BlockCache;
+    use crate::block::cache::BlockCache;
 
     let h = V2Harness::new().await;
 
     // Write 5 blocks and flush to S3 (they'll become "clean" once evicted from cache).
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
     h.flush().await;
 
     // Clear clean_cache for flushed blocks so they must come from S3.
     for i in 0u8..5 {
-        let hash = crate::nbd::block_map::blake3_128(&vec![i + 1; 4096]);
+        let hash = crate::block::block_map::blake3_128(&vec![i + 1; 4096]);
         h.clean_cache.remove(&hash);
     }
 
     // Write 5 more blocks (dirty, not flushed).
     for i in 5u8..10 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     // Read all 10 blocks. First 5 from S3, last 5 from clean_cache/SSD.
@@ -522,8 +599,8 @@ async fn test_v2_mixed_dirty_and_clean_reads() {
 
 #[tokio::test]
 async fn test_v2_clean_cache_eviction() {
-    use crate::nbd::cache::{BlockCache, SimpleBlockCache};
-    use crate::nbd::block_map::blake3_128;
+    use crate::block::block_map::blake3_128;
+    use crate::block::cache::{BlockCache, SimpleBlockCache};
 
     // Budget: 3 blocks of 4096 bytes.
     let cache = SimpleBlockCache::new(3 * 4096);
@@ -539,7 +616,10 @@ async fn test_v2_clean_cache_eviction() {
     let h4 = blake3_128(&vec![4u8; 4096]);
 
     assert!(cache.get(&h0).await.is_none(), "oldest should be evicted");
-    assert!(cache.get(&h1).await.is_none(), "second oldest should be evicted");
+    assert!(
+        cache.get(&h1).await.is_none(),
+        "second oldest should be evicted"
+    );
     assert!(cache.get(&h4).await.is_some(), "newest should be present");
 }
 
@@ -553,10 +633,13 @@ async fn test_snapshot_returns_sequence_and_stats() {
 
     // Write 5 blocks
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
-    let result: SnapshotResult = h.cache
+    let result: SnapshotResult = h
+        .cache
         .snapshot(&h.content_store, &h.pack_index)
         .await
         .unwrap();
@@ -577,21 +660,28 @@ async fn test_snapshot_clears_dirty_state() {
 
     // Write blocks and snapshot
     for i in 0u8..3 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
-    let result1: SnapshotResult = h.cache
+    let result1: SnapshotResult = h
+        .cache
         .snapshot(&h.content_store, &h.pack_index)
         .await
         .unwrap();
     assert_eq!(result1.stats.blocks_flushed, 3);
 
     // Second snapshot with no new writes should be a no-op
-    let result2: SnapshotResult = h.cache
+    let result2: SnapshotResult = h
+        .cache
         .snapshot(&h.content_store, &h.pack_index)
         .await
         .unwrap();
-    assert_eq!(result2.stats.blocks_flushed, 0, "no dirty blocks after snapshot");
+    assert_eq!(
+        result2.stats.blocks_flushed, 0,
+        "no dirty blocks after snapshot"
+    );
 }
 
 #[tokio::test]
@@ -600,23 +690,29 @@ async fn test_snapshot_captures_concurrent_writes() {
 
     // Write blocks at different times
     h.cache.write(0, &vec![0xAA; 4096], &h.clean_cache).unwrap();
-    h.cache.write(4096, &vec![0xBB; 4096], &h.clean_cache).unwrap();
+    h.cache
+        .write(4096, &vec![0xBB; 4096], &h.clean_cache)
+        .unwrap();
 
-    let result: SnapshotResult = h.cache
+    let result: SnapshotResult = h
+        .cache
         .snapshot(&h.content_store, &h.pack_index)
         .await
         .unwrap();
     assert_eq!(result.stats.blocks_flushed, 2);
 
     // Write more after snapshot
-    h.cache.write(8192, &vec![0xCC; 4096], &h.clean_cache).unwrap();
+    h.cache
+        .write(8192, &vec![0xCC; 4096], &h.clean_cache)
+        .unwrap();
 
     // Manifest from first snapshot should have 2 blocks, not 3
     let manifest = h.manifest().await;
     assert_eq!(manifest.block_map.len(), 2);
 
     // Second snapshot picks up the new write
-    let result2: SnapshotResult = h.cache
+    let result2: SnapshotResult = h
+        .cache
         .snapshot(&h.content_store, &h.pack_index)
         .await
         .unwrap();
@@ -627,8 +723,12 @@ async fn test_snapshot_captures_concurrent_writes() {
 // open_from_manifest tests
 // ========================================================================
 
-fn make_test_manifest(num_entries: u64, device_size: u64, block_size: u32) -> crate::nbd::manifest::Manifest {
-    use crate::nbd::manifest::ManifestBlockEntry;
+fn make_test_manifest(
+    num_entries: u64,
+    device_size: u64,
+    block_size: u32,
+) -> crate::block::manifest::Manifest {
+    use crate::block::manifest::ManifestBlockEntry;
     let block_map: Vec<ManifestBlockEntry> = (0..num_entries)
         .map(|i| ManifestBlockEntry {
             chunk_index: i,
@@ -636,7 +736,7 @@ fn make_test_manifest(num_entries: u64, device_size: u64, block_size: u32) -> cr
             flags: 0,
         })
         .collect();
-    crate::nbd::manifest::Manifest {
+    crate::block::manifest::Manifest {
         name: "test-fork".to_string(),
         sequence: 42,
         chunk_size: block_size,
@@ -661,12 +761,7 @@ fn test_open_from_manifest_creates_clean_cache() {
         wal_sync: false,
     };
 
-    let cache = WriteCache::<Initializing>::open_from_manifest(
-        config,
-        &manifest,
-        None,
-    )
-    .unwrap();
+    let cache = WriteCache::<Initializing>::open_from_manifest(config, &manifest, None).unwrap();
 
     // No dirty blocks -- everything is in S3
     assert_eq!(cache.dirty_block_count(), 0);
@@ -694,7 +789,7 @@ fn test_open_from_manifest_creates_clean_cache() {
 
 #[test]
 fn test_open_from_manifest_with_forked_overlay() {
-    use crate::nbd::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
+    use crate::block::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
 
     let dir = TempDir::new().unwrap();
     let device_size: u64 = 1024 * 1024;
@@ -753,7 +848,7 @@ fn test_open_from_manifest_with_forked_overlay() {
 
 #[test]
 fn test_open_from_manifest_fork_writes_to_overlay() {
-    use crate::nbd::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
+    use crate::block::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
 
     let dir = TempDir::new().unwrap();
     let device_size: u64 = 1024 * 1024;
@@ -791,7 +886,7 @@ fn test_open_from_manifest_fork_writes_to_overlay() {
 
     // Write new data to chunk 0 -- should go to the overlay
     let new_data = vec![0xAB; block_size];
-    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
     cache.write(0, &new_data, &clean_cache).unwrap();
 
     // The overlay should have grown
@@ -817,13 +912,22 @@ fn test_open_from_manifest_fork_writes_to_overlay() {
     // Parent's entry at chunk 0 should be unchanged
     let parent_entry = parent.get(0);
     let expected_parent_hash = blake3_128("block-0".as_bytes());
-    assert_eq!(parent_entry.hash, expected_parent_hash, "parent must be unmodified");
-    assert_eq!(parent_entry.sequence, 42, "parent sequence must be unmodified");
+    assert_eq!(
+        parent_entry.hash, expected_parent_hash,
+        "parent must be unmodified"
+    );
+    assert_eq!(
+        parent_entry.sequence, 42,
+        "parent sequence must be unmodified"
+    );
 
     // Chunk 1 should still read from parent (not in overlay)
     let (hash_1, seq_1) = cache.inner.block_map_get(1);
     let expected_hash_1 = blake3_128("block-1".as_bytes());
-    assert_eq!(hash_1, expected_hash_1, "unwritten chunk should read from parent");
+    assert_eq!(
+        hash_1, expected_hash_1,
+        "unwritten chunk should read from parent"
+    );
     assert_eq!(seq_1, 42);
 
     // Should have 1 dirty block
@@ -846,7 +950,7 @@ async fn test_recovery_detects_hash_drift() {
         wal_sync: false,
     };
 
-    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
     let original_data = vec![0xAAu8; block_size];
     let modified_data = vec![0xBBu8; block_size];
     let original_hash = blake3_128(&original_data);
@@ -865,10 +969,16 @@ async fn test_recovery_detects_hash_drift() {
         // Persist both v1 metadata (block states) and v2 block map file
         cache.save_metadata().unwrap();
         let bm_snapshot = cache.inner.block_map_snapshot();
-        bm_snapshot.persist_to_file(&config.block_map_path()).unwrap();
+        bm_snapshot
+            .persist_to_file(&config.block_map_path())
+            .unwrap();
 
         // Simulate "SSD data drifted" by overwriting the data file directly
-        cache.inner.data_file.write_all_at(&modified_data, 0).unwrap();
+        cache
+            .inner
+            .data_file
+            .write_all_at(&modified_data, 0)
+            .unwrap();
 
         // Truncate WAL so recovery has to re-read from SSD (no WAL entries)
         cache.inner.wal.lock().truncate().unwrap();
@@ -886,7 +996,10 @@ async fn test_recovery_detects_hash_drift() {
             hash, expected_hash,
             "block_map should reflect SSD contents after recovery drift detection"
         );
-        assert_ne!(hash, original_hash, "hash should differ from pre-drift value");
+        assert_ne!(
+            hash, original_hash,
+            "hash should differ from pre-drift value"
+        );
 
         // Read should return the modified data
         let data = cache.read(0, block_size).unwrap();
@@ -904,7 +1017,9 @@ async fn test_flush_updates_pack_registry() {
 
     // Write enough blocks to produce at least 1 pack
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     let stats = h.flush().await;
@@ -914,15 +1029,11 @@ async fn test_flush_updates_pack_registry() {
     // Update registry (the real flush_to_s3 does this, but V2Harness.flush() only
     // calls flush_to_s3 which includes update_registry)
     // Verify registry exists in S3
-    let registry_data = h.content_store
-        .get_registry("test")
-        .await
-        .unwrap();
+    let registry_data = h.content_store.get_registry("test").await.unwrap();
     assert!(registry_data.is_some(), "registry should exist after flush");
 
-    let reg = crate::nbd::pack_registry::PackRegistry::deserialize(
-        &registry_data.unwrap()
-    ).unwrap();
+    let reg =
+        crate::block::pack_registry::PackRegistry::deserialize(&registry_data.unwrap()).unwrap();
     assert!(!reg.pack_ids.is_empty(), "registry should contain pack IDs");
 
     // Verify the pack IDs from flush stats match the registry
@@ -941,27 +1052,34 @@ async fn test_multiple_flushes_accumulate_registry() {
 
     // First flush
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
     let stats1 = h.flush().await;
 
     // Second flush with different data
     for i in 5u8..10 {
-        h.cache.write(i as u64 * 4096, &vec![i + 100; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 100; 4096], &h.clean_cache)
+            .unwrap();
     }
     let stats2 = h.flush().await;
 
-    let all_expected_ids: Vec<uuid::Uuid> = stats1.new_pack_ids.iter()
+    let all_expected_ids: Vec<uuid::Uuid> = stats1
+        .new_pack_ids
+        .iter()
         .chain(stats2.new_pack_ids.iter())
         .copied()
         .collect();
 
-    let registry_data = h.content_store
+    let registry_data = h
+        .content_store
         .get_registry("test")
         .await
         .unwrap()
         .expect("registry should exist");
-    let reg = crate::nbd::pack_registry::PackRegistry::deserialize(&registry_data).unwrap();
+    let reg = crate::block::pack_registry::PackRegistry::deserialize(&registry_data).unwrap();
 
     for pack_id in &all_expected_ids {
         assert!(
@@ -994,19 +1112,23 @@ async fn test_concurrent_flush_and_writes() {
         wal_sync: false,
     };
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let content_store = Arc::new(crate::nbd::content_store::ContentStore::new(
+    let content_store = Arc::new(crate::block::content_store::ContentStore::new(
         Arc::clone(&object_store),
         "test-conc",
     ));
-    let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap());
-    let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+    let pack_index = Arc::new(
+        crate::block::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap(),
+    );
+    let clean_cache = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = Arc::new(cache.finish_recovery().await.unwrap());
 
     // Seed some initial dirty blocks
     for i in 0u8..10 {
-        cache.write(i as u64 * 4096, &vec![i + 1; 4096], clean_cache.as_ref()).unwrap();
+        cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], clean_cache.as_ref())
+            .unwrap();
     }
 
     let mut tasks = JoinSet::new();
@@ -1032,7 +1154,9 @@ async fn test_concurrent_flush_and_writes() {
             for round in 0..20u8 {
                 let block_idx = (writer_id as u64 * 2) % 10;
                 let data = vec![writer_id.wrapping_add(round).wrapping_add(100); 4096];
-                cache.write(block_idx * 4096, &data, clean_cache.as_ref()).unwrap();
+                cache
+                    .write(block_idx * 4096, &data, clean_cache.as_ref())
+                    .unwrap();
                 tokio::task::yield_now().await;
             }
         });
@@ -1043,7 +1167,10 @@ async fn test_concurrent_flush_and_writes() {
     }
 
     // Final flush to capture any remaining dirty blocks
-    let _stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+    let _stats = cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
 
     // After final flush, all blocks should be clean
     assert_eq!(
@@ -1071,7 +1198,7 @@ async fn test_concurrent_flush_and_writes() {
 /// flatten via enough writes to cross the 50% threshold.
 #[tokio::test]
 async fn test_forked_block_map_concurrent_flatten() {
-    use crate::nbd::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
+    use crate::block::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
     use std::sync::Arc;
     use tokio::task::JoinSet;
 
@@ -1109,7 +1236,7 @@ async fn test_forked_block_map_concurrent_flatten() {
     )
     .unwrap();
     let cache = Arc::new(cache);
-    let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+    let clean_cache = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
 
     // Verify it starts as Forked
     {
@@ -1146,7 +1273,10 @@ async fn test_forked_block_map_concurrent_flatten() {
             for i in 0..10u64 {
                 let (hash, seq) = cache.inner.block_map_get(i as usize);
                 // Should always get a valid hash (parent or overlay)
-                assert!(!hash.is_zero() || seq == 0, "unexpected zero hash at chunk {i}");
+                assert!(
+                    !hash.is_zero() || seq == 0,
+                    "unexpected zero hash at chunk {i}"
+                );
                 tokio::task::yield_now().await;
             }
         });
@@ -1170,11 +1300,7 @@ async fn test_forked_block_map_concurrent_flatten() {
         let (hash, _) = cache.inner.block_map_get(i as usize);
         // The writers started at chunk 10+, so chunks 0..9 should still have parent hashes
         let expected = blake3_128(format!("block-{i}").as_bytes());
-        assert_eq!(
-            hash, expected,
-            "parent chunk {} should survive flatten",
-            i
-        );
+        assert_eq!(hash, expected, "parent chunk {} should survive flatten", i);
     }
 }
 
@@ -1197,7 +1323,7 @@ async fn test_draining_state_transition() {
         wal_sync: false,
     };
 
-    let clean_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
     let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
 
@@ -1250,7 +1376,7 @@ async fn test_draining_state_transition() {
 /// 3. The pack_index maps the correct hash for every block
 #[tokio::test]
 async fn test_concurrent_flush_write_s3_convergence() {
-    use crate::nbd::block_map::blake3_128;
+    use crate::block::block_map::blake3_128;
     use std::sync::Arc;
     use tokio::task::JoinSet;
 
@@ -1263,12 +1389,14 @@ async fn test_concurrent_flush_write_s3_convergence() {
         wal_sync: false,
     };
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let content_store = Arc::new(crate::nbd::content_store::ContentStore::new(
+    let content_store = Arc::new(crate::block::content_store::ContentStore::new(
         Arc::clone(&object_store),
         "test-converge",
     ));
-    let pack_index = Arc::new(crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap());
-    let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+    let pack_index = Arc::new(
+        crate::block::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap(),
+    );
+    let clean_cache = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = Arc::new(cache.finish_recovery().await.unwrap());
@@ -1317,8 +1445,15 @@ async fn test_concurrent_flush_write_s3_convergence() {
     }
 
     // Quiesced final flush — no concurrent writes
-    let _stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
-    assert_eq!(cache.dirty_block_count(), 0, "all blocks clean after final flush");
+    let _stats = cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
+    assert_eq!(
+        cache.dirty_block_count(),
+        0,
+        "all blocks clean after final flush"
+    );
 
     // Verify manifest is self-contained: every non-zero block_map hash has a
     // pack_index entry. A broken compound check would leave orphan hashes.
@@ -1327,7 +1462,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
         .await
         .unwrap()
         .expect("manifest should exist");
-    let manifest = crate::nbd::manifest::Manifest::deserialize(&manifest_bytes).unwrap();
+    let manifest = crate::block::manifest::Manifest::deserialize(&manifest_bytes).unwrap();
     let pack_hashes: std::collections::HashSet<_> =
         manifest.pack_index.iter().map(|e| e.hash).collect();
 
@@ -1345,8 +1480,8 @@ async fn test_concurrent_flush_write_s3_convergence() {
 
     // Verify reads through S3 return the correct final data.
     // Use a fresh clean_cache to force resolution through S3 packs.
-    let verify_cache = crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024);
-    let metrics = crate::nbd::metrics::ExportMetrics::new();
+    let verify_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let metrics = crate::block::metrics::ExportMetrics::new();
     for block_idx in 0u64..10 {
         let final_ssd = cache.read_local(block_idx * 4096, 4096).unwrap();
         let expected_hash = blake3_128(&final_ssd);
@@ -1398,20 +1533,24 @@ async fn test_concurrent_flush_write_s3_convergence() {
 /// entries are lost.
 #[tokio::test]
 async fn test_prune_stale_snapshot_loses_entries_regression() {
-    use crate::nbd::block_map::blake3_128;
+    use crate::block::block_map::blake3_128;
     use std::collections::HashSet;
 
     let h = V2Harness::new().await;
 
     // Write and flush 5 blocks
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
     h.flush().await;
 
     // Write 3 more (dirty, ZERO hash in block_map)
     for i in 5u8..8 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     // Stale snapshot: blocks 5-7 contribute nothing (ZERO hash)
@@ -1428,7 +1567,10 @@ async fn test_prune_stale_snapshot_loses_entries_regression() {
 
     let new_hashes: Vec<_> = (5u8..8).map(|i| blake3_128(&vec![i + 1; 4096])).collect();
     for hash in &new_hashes {
-        assert!(h.pack_index.get(hash).unwrap().is_some(), "hash in pack_index before prune");
+        assert!(
+            h.pack_index.get(hash).unwrap().is_some(),
+            "hash in pack_index before prune"
+        );
     }
 
     // Prune with stale snapshot → loses the freshly-flushed entries
@@ -1436,13 +1578,20 @@ async fn test_prune_stale_snapshot_loses_entries_regression() {
     assert!(removed >= 3, "stale prune should remove at least 3 entries");
 
     for hash in &new_hashes {
-        assert!(h.pack_index.get(hash).unwrap().is_none(), "stale prune loses entries");
+        assert!(
+            h.pack_index.get(hash).unwrap().is_none(),
+            "stale prune loses entries"
+        );
     }
 
     // Reads still work via SSD fallback
     for i in 5u8..8 {
         let data = h.read(i as u64 * 4096, 4096).await;
-        assert!(data.iter().all(|&b| b == i + 1), "block {} readable via SSD fallback", i);
+        assert!(
+            data.iter().all(|&b| b == i + 1),
+            "block {} readable via SSD fallback",
+            i
+        );
     }
 }
 
@@ -1454,19 +1603,23 @@ async fn test_prune_stale_snapshot_loses_entries_regression() {
 /// with this set retains all entries.
 #[tokio::test]
 async fn test_rebuild_manifest_hashes_prevents_prune_loss() {
-    use crate::nbd::block_map::blake3_128;
+    use crate::block::block_map::blake3_128;
 
     let h = V2Harness::new().await;
 
     // Write and flush 5 blocks
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
     h.flush().await;
 
     // Write 3 more (dirty, ZERO hash in block_map)
     for i in 5u8..8 {
-        h.cache.write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
     }
 
     // Flush blocks 5-7 → pack_index now has their hashes
@@ -1475,7 +1628,10 @@ async fn test_rebuild_manifest_hashes_prevents_prune_loss() {
 
     let all_hashes: Vec<_> = (0u8..8).map(|i| blake3_128(&vec![i + 1; 4096])).collect();
     for hash in &all_hashes {
-        assert!(h.pack_index.get(hash).unwrap().is_some(), "all hashes in pack_index before prune");
+        assert!(
+            h.pack_index.get(hash).unwrap().is_some(),
+            "all hashes in pack_index before prune"
+        );
     }
 
     // The fix: rebuild manifest hashes before pruning (what prune_pack_index does)
@@ -1483,11 +1639,18 @@ async fn test_rebuild_manifest_hashes_prevents_prune_loss() {
     let referenced = h.cache.referenced_hashes();
 
     // All 8 hashes should be in the referenced set
-    assert!(referenced.len() >= 8, "rebuild should capture all 8 hashes, got {}", referenced.len());
+    assert!(
+        referenced.len() >= 8,
+        "rebuild should capture all 8 hashes, got {}",
+        referenced.len()
+    );
 
     // Prune with manifest-based referenced set → nothing removed
     let removed = h.pack_index.prune_unreferenced(&referenced).unwrap();
-    assert_eq!(removed, 0, "rebuild_manifest_hashes should prevent any pruning");
+    assert_eq!(
+        removed, 0,
+        "rebuild_manifest_hashes should prevent any pruning"
+    );
 
     // All entries still present
     for (i, hash) in all_hashes.iter().enumerate() {
@@ -1522,19 +1685,26 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // Verify CRC32 was computed (non-zero).
     let inner = h.cache.inner();
     let crc_after_checkpoint = inner.block_map_get_crc32(0);
-    assert_ne!(crc_after_checkpoint, 0, "checkpoint should have computed CRC32");
+    assert_ne!(
+        crc_after_checkpoint, 0,
+        "checkpoint should have computed CRC32"
+    );
 
     // Corrupt the block on SSD (simulate bit rot after checkpoint).
     let corrupted_data = vec![0xFFu8; 4096];
     inner.data_file.write_all_at(&corrupted_data, 0).unwrap();
 
     // Flush should detect CRC32 mismatch and skip the block.
-    let (stats, _seq) = h.cache
+    let (stats, _seq) = h
+        .cache
         .flush_packs(&h.content_store, &h.pack_index)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 1, "should detect 1 corrupted block");
-    assert_eq!(stats.packs_uploaded, 0, "corrupted block should not be uploaded");
+    assert_eq!(
+        stats.packs_uploaded, 0,
+        "corrupted block should not be uploaded"
+    );
     assert_eq!(h.cache.dirty_block_count(), 1, "block should remain dirty");
 
     // CRC32 should have been cleared so next checkpoint can recompute.
@@ -1545,12 +1715,16 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     h.cache.local_checkpoint().unwrap();
     let crc_recomputed = inner.block_map_get_crc32(0);
     assert_ne!(crc_recomputed, 0, "checkpoint should recompute CRC32");
-    assert_ne!(crc_recomputed, crc_after_checkpoint, "new CRC32 should differ (different data)");
+    assert_ne!(
+        crc_recomputed, crc_after_checkpoint,
+        "new CRC32 should differ (different data)"
+    );
 
     // Next flush succeeds — CRC32 now matches the (corrupted) SSD data.
     // This is the inherent limitation of deferred checksumming: if corruption
     // is persistent, the next checkpoint captures the corrupted state.
-    let (stats2, _seq) = h.cache
+    let (stats2, _seq) = h
+        .cache
         .flush_packs(&h.content_store, &h.pack_index)
         .await
         .unwrap();
@@ -1564,18 +1738,23 @@ async fn test_crc32_cleared_on_write() {
     let h = V2Harness::new().await;
 
     // Write, checkpoint (compute CRC32).
-    h.cache.write(0, &vec![0xAAu8; 4096], &h.clean_cache).unwrap();
+    h.cache
+        .write(0, &vec![0xAAu8; 4096], &h.clean_cache)
+        .unwrap();
     h.cache.local_checkpoint().unwrap();
 
     let inner = h.cache.inner();
     assert_ne!(inner.block_map_get_crc32(0), 0);
 
     // Write new data to the same block — CRC32 should be cleared.
-    h.cache.write(0, &vec![0xBBu8; 4096], &h.clean_cache).unwrap();
+    h.cache
+        .write(0, &vec![0xBBu8; 4096], &h.clean_cache)
+        .unwrap();
     assert_eq!(inner.block_map_get_crc32(0), 0, "write should clear CRC32");
 
     // Flush without a checkpoint in between — CRC32 is 0, verification skipped.
-    let (stats, _) = h.cache
+    let (stats, _) = h
+        .cache
         .flush_packs(&h.content_store, &h.pack_index)
         .await
         .unwrap();
@@ -1591,7 +1770,9 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
 
     // Write 5 distinct blocks.
     for i in 0u8..5 {
-        h.cache.write(i as u64 * 4096, &vec![i + 10; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 10; 4096], &h.clean_cache)
+            .unwrap();
     }
     assert_eq!(h.cache.dirty_block_count(), 5);
 
@@ -1600,15 +1781,26 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
 
     let inner = h.cache.inner();
     for i in 0..5 {
-        assert_ne!(inner.block_map_get_crc32(i), 0, "block {i} should have CRC32");
+        assert_ne!(
+            inner.block_map_get_crc32(i),
+            0,
+            "block {i} should have CRC32"
+        );
     }
 
     // Corrupt blocks 1 and 3 on SSD (leave 0, 2, 4 intact).
-    inner.data_file.write_all_at(&vec![0xFFu8; 4096], 4096).unwrap();
-    inner.data_file.write_all_at(&vec![0xFEu8; 4096], 3 * 4096).unwrap();
+    inner
+        .data_file
+        .write_all_at(&vec![0xFFu8; 4096], 4096)
+        .unwrap();
+    inner
+        .data_file
+        .write_all_at(&vec![0xFEu8; 4096], 3 * 4096)
+        .unwrap();
 
     // Flush: should upload 3 good blocks, skip 2 corrupted.
-    let (stats, _) = h.cache
+    let (stats, _) = h
+        .cache
         .flush_packs(&h.content_store, &h.pack_index)
         .await
         .unwrap();
@@ -1617,7 +1809,11 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     assert_eq!(stats.packs_uploaded, 1, "3 good blocks → 1 pack");
 
     // Good blocks (0, 2, 4) should be clean now; corrupted (1, 3) still dirty.
-    assert_eq!(h.cache.dirty_block_count(), 2, "corrupted blocks remain dirty");
+    assert_eq!(
+        h.cache.dirty_block_count(),
+        2,
+        "corrupted blocks remain dirty"
+    );
 
     // CRC32 cleared on corrupted blocks so next checkpoint recomputes.
     assert_eq!(inner.block_map_get_crc32(1), 0);
@@ -1629,13 +1825,18 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     assert_ne!(inner.block_map_get_crc32(3), 0);
 
     // Second flush succeeds for the remaining 2 blocks.
-    let (stats2, _) = h.cache
+    let (stats2, _) = h
+        .cache
         .flush_packs(&h.content_store, &h.pack_index)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0);
     assert_eq!(stats2.blocks_flushed, 2);
-    assert_eq!(h.cache.dirty_block_count(), 0, "all blocks clean after heal");
+    assert_eq!(
+        h.cache.dirty_block_count(),
+        0,
+        "all blocks clean after heal"
+    );
 }
 
 /// CRC32 verified correctly on the happy path: checkpoint computes CRC32,
@@ -1651,16 +1852,23 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     // Cycle 1: write 3 blocks, checkpoint (computes CRC32), flush.
     for i in 0u8..3 {
-        h.cache.write(i as u64 * 4096, &vec![i + 10; 4096], &h.clean_cache).unwrap();
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 10; 4096], &h.clean_cache)
+            .unwrap();
     }
     h.cache.local_checkpoint().unwrap();
 
     let inner = h.cache.inner();
     for i in 0..3 {
-        assert_ne!(inner.block_map_get_crc32(i), 0, "cycle 1: block {i} should have CRC32");
+        assert_ne!(
+            inner.block_map_get_crc32(i),
+            0,
+            "cycle 1: block {i} should have CRC32"
+        );
     }
 
-    let (stats1, _) = h.cache
+    let (stats1, _) = h
+        .cache
         .flush_packs(&h.content_store, &h.pack_index)
         .await
         .unwrap();
@@ -1670,22 +1878,35 @@ async fn test_crc32_happy_path_multi_cycle() {
     assert_eq!(h.cache.dirty_block_count(), 0, "cycle 1: all clean");
 
     // Cycle 2: write 2 new blocks + overwrite 1 existing block.
-    h.cache.write(3 * 4096, &vec![0xDD; 4096], &h.clean_cache).unwrap();
-    h.cache.write(4 * 4096, &vec![0xEE; 4096], &h.clean_cache).unwrap();
+    h.cache
+        .write(3 * 4096, &vec![0xDD; 4096], &h.clean_cache)
+        .unwrap();
+    h.cache
+        .write(4 * 4096, &vec![0xEE; 4096], &h.clean_cache)
+        .unwrap();
     h.cache.write(0, &vec![0xFF; 4096], &h.clean_cache).unwrap(); // overwrite block 0
 
     assert_eq!(h.cache.dirty_block_count(), 3);
 
     // Block 0's CRC32 should be cleared by the overwrite.
-    assert_eq!(inner.block_map_get_crc32(0), 0, "overwrite should clear CRC32");
+    assert_eq!(
+        inner.block_map_get_crc32(0),
+        0,
+        "overwrite should clear CRC32"
+    );
 
     h.cache.local_checkpoint().unwrap();
 
     for idx in [0, 3, 4] {
-        assert_ne!(inner.block_map_get_crc32(idx), 0, "cycle 2: block {idx} should have CRC32");
+        assert_ne!(
+            inner.block_map_get_crc32(idx),
+            0,
+            "cycle 2: block {idx} should have CRC32"
+        );
     }
 
-    let (stats2, _) = h.cache
+    let (stats2, _) = h
+        .cache
         .flush_packs(&h.content_store, &h.pack_index)
         .await
         .unwrap();
@@ -1719,14 +1940,14 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         wal_sync: false,
     };
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let content_store = Arc::new(crate::nbd::content_store::ContentStore::new(
+    let content_store = Arc::new(crate::block::content_store::ContentStore::new(
         Arc::clone(&object_store),
         "test-crc32-conc",
     ));
     let pack_index = Arc::new(
-        crate::nbd::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap(),
+        crate::block::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap(),
     );
-    let clean_cache = Arc::new(crate::nbd::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+    let clean_cache = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = Arc::new(cache.finish_recovery().await.unwrap());
@@ -1752,7 +1973,10 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
             for _ in 0..10 {
                 cache.local_checkpoint().unwrap();
                 let (stats, _) = cache.flush_packs(&cs, &pi).await.unwrap();
-                corrupted.fetch_add(stats.blocks_corrupted as u64, std::sync::atomic::Ordering::Relaxed);
+                corrupted.fetch_add(
+                    stats.blocks_corrupted as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 tokio::task::yield_now().await;
             }
         });
@@ -1786,7 +2010,10 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
 
     // Final quiesced flush to verify convergence.
     cache.local_checkpoint().unwrap();
-    let stats = cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+    let stats = cache
+        .flush_to_s3(&content_store, &pack_index)
+        .await
+        .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);
     assert_eq!(cache.dirty_block_count(), 0);
 }

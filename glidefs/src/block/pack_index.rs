@@ -101,7 +101,10 @@ impl HostPackIndex {
     }
 
     /// Insert a batch of entries in a single transaction.
-    pub fn insert_batch(&self, entries: &[(Blake3Hash, PackLocation)]) -> Result<(), PackIndexError> {
+    pub fn insert_batch(
+        &self,
+        entries: &[(Blake3Hash, PackLocation)],
+    ) -> Result<(), PackIndexError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -201,7 +204,10 @@ impl HostPackIndex {
     /// everything flushed up to that moment.
     ///
     /// Returns the number of entries removed.
-    pub fn prune_unreferenced(&self, referenced: &HashSet<Blake3Hash>) -> Result<usize, PackIndexError> {
+    pub fn prune_unreferenced(
+        &self,
+        referenced: &HashSet<Blake3Hash>,
+    ) -> Result<usize, PackIndexError> {
         let mut txn = self.db.begin_write()?;
         let removed;
         {
@@ -227,7 +233,10 @@ impl HostPackIndex {
     /// Derive pack index entries for a specific VM's block map.
     /// Returns ManifestPackEntry for each non-empty hash in the block map
     /// that exists in this host index.
-    pub fn derive_for_block_map(&self, block_map: &BlockMap) -> Result<Vec<ManifestPackEntry>, PackIndexError> {
+    pub fn derive_for_block_map(
+        &self,
+        block_map: &BlockMap,
+    ) -> Result<Vec<ManifestPackEntry>, PackIndexError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(PACK_TABLE)?;
         let mut result = Vec::new();
@@ -252,7 +261,7 @@ impl HostPackIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nbd::block_map::{blake3_128, BlockMapEntry};
+    use crate::block::block_map::{BlockMapEntry, blake3_128};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -287,7 +296,10 @@ mod tests {
 
         index.insert(hash, location);
 
-        let got = index.get(&hash).unwrap().expect("should find inserted hash");
+        let got = index
+            .get(&hash)
+            .unwrap()
+            .expect("should find inserted hash");
         assert_eq!(got.pack_id, pack_id);
         assert_eq!(got.offset, 100);
         assert_eq!(got.comp_length, 2048);
