@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -18,7 +17,7 @@ async fn test_fork_flush_cold_wake() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), "fork-cold-wake").await;
     server.create_export("parent", 0.01).await;
 
-    let mut client = NbdClient::connect(server.addr, "parent").await.unwrap();
+    let mut client = server.connect("parent").await;
     let patterns: [u8; 4] = [0xAA, 0xBB, 0xCC, 0xDD];
     for (i, &pat) in patterns.iter().enumerate() {
         client
@@ -36,7 +35,7 @@ async fn test_fork_flush_cold_wake() {
         .fork_export("child", "parent", 0.01)
         .await;
 
-    let mut child_client = NbdClient::connect(server.addr, "child").await.unwrap();
+    let mut child_client = server.connect("child").await;
     let fork_patterns: [u8; 2] = [0xEE, 0xFF];
     for (i, &pat) in fork_patterns.iter().enumerate() {
         let offset = ((4 + i) * BLOCK_SIZE) as u64;
@@ -58,7 +57,7 @@ async fn test_fork_flush_cold_wake() {
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), "fork-cold-wake").await;
     server2.restore_forked_export("child", "parent", 0.01).await;
 
-    let mut reader = NbdClient::connect(server2.addr, "child").await.unwrap();
+    let mut reader = server2.connect("child").await;
 
     let all_patterns: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
     for (i, &expected) in all_patterns.iter().enumerate() {
@@ -90,7 +89,7 @@ async fn test_fork_independent_of_parent() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), "fork-isolation").await;
     server.create_export("parent", 0.01).await;
 
-    let mut parent_client = NbdClient::connect(server.addr, "parent").await.unwrap();
+    let mut parent_client = server.connect("parent").await;
     parent_client
         .write(0, &vec![0x11; BLOCK_SIZE])
         .await
@@ -104,7 +103,7 @@ async fn test_fork_independent_of_parent() {
         .fork_export("child", "parent", 0.01)
         .await;
 
-    let mut child_client = NbdClient::connect(server.addr, "child").await.unwrap();
+    let mut child_client = server.connect("child").await;
 
     // --- Phase 3: overwrite block 0 on child, then on parent ---
     child_client
@@ -146,7 +145,7 @@ async fn test_fork_independent_of_parent() {
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), "fork-isolation").await;
     server2.restore_forked_export("child", "parent", 0.01).await;
 
-    let mut reader = NbdClient::connect(server2.addr, "child").await.unwrap();
+    let mut reader = server2.connect("child").await;
     let restored = reader.read(0, BLOCK_SIZE as u32).await.unwrap();
     assert!(
         restored.iter().all(|&b| b == 0x99),

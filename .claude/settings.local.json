@@ -65,7 +65,8 @@
       "WebFetch(domain:docs.kernel.org)",
       "WebFetch(domain:lwn.net)",
       "WebFetch(domain:jpospisil.com)",
-      "WebFetch(domain:people.redhat.com)"
+      "WebFetch(domain:people.redhat.com)",
+      "Skill(architecture-doc)"
     ]
   }
 }

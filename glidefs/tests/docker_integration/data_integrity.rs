@@ -6,7 +6,6 @@ use object_store::{path::Path as ObjPath, ObjectStore};
 
 use glidefs::config::ExportConfig;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -21,7 +20,7 @@ async fn test_corrupt_pack_detected() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server.create_export("vol1", 0.01).await;
 
-    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+    let mut client = server.connect("vol1").await;
     client
         .write(0, &vec![0xAA; BLOCK_SIZE])
         .await
@@ -69,7 +68,7 @@ async fn test_corrupt_pack_detected() {
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server2.restore_export("vol1", 0.01).await;
 
-    let mut client2 = NbdClient::connect(server2.addr, "vol1").await.unwrap();
+    let mut client2 = server2.connect("vol1").await;
 
     // Phase 4: Read both blocks. At least one should fail due to BLAKE3 hash mismatch
     // or decompression failure from the corrupted pack.
@@ -95,7 +94,7 @@ async fn test_corrupt_manifest_rejected() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server.create_export("vol1", 0.01).await;
 
-    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+    let mut client = server.connect("vol1").await;
     client
         .write(0, &vec![0xCC; BLOCK_SIZE])
         .await

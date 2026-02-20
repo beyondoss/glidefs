@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -14,7 +13,7 @@ async fn test_live_migration_readonly_fork_promote() {
     let server_a = TestServer::start(Arc::clone(&ctx.object_store), "mig-a").await;
     server_a.create_export("vm1", 0.01).await;
 
-    let mut client_a = NbdClient::connect(server_a.addr, "vm1").await.unwrap();
+    let mut client_a = server_a.connect("vm1").await;
     client_a.write(0, &vec![0xAA; BLOCK_SIZE]).await.unwrap();
     client_a.write(BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE]).await.unwrap();
     client_a.write(2 * BLOCK_SIZE as u64, &vec![0xCC; BLOCK_SIZE]).await.unwrap();
@@ -28,7 +27,7 @@ async fn test_live_migration_readonly_fork_promote() {
     let server_b = TestServer::start(Arc::clone(&ctx.object_store), "mig-a").await;
     server_b.fork_export_readonly("vm1", "vm1", 0.01).await;
 
-    let mut client_b = NbdClient::connect(server_b.addr, "vm1").await.unwrap();
+    let mut client_b = server_b.connect("vm1").await;
 
     // Verify all 4 blocks read back correctly on Server B
     let patterns: &[u8] = &[0xAA, 0xBB, 0xCC, 0xDD];
@@ -53,7 +52,7 @@ async fn test_live_migration_readonly_fork_promote() {
 
     // Reconnect after promote (the old connection may still see old state)
     client_b.disconnect().await.unwrap();
-    let mut client_b = NbdClient::connect(server_b.addr, "vm1").await.unwrap();
+    let mut client_b = server_b.connect("vm1").await;
 
     // Write new data to block 4
     client_b.write(4 * BLOCK_SIZE as u64, &vec![0xEE; BLOCK_SIZE]).await.unwrap();
@@ -95,7 +94,7 @@ async fn test_migration_survives_cold_wake() {
     let server_a = TestServer::start(Arc::clone(&ctx.object_store), "cold-mig-a").await;
     server_a.create_export("vm1", 0.01).await;
 
-    let mut client_a = NbdClient::connect(server_a.addr, "vm1").await.unwrap();
+    let mut client_a = server_a.connect("vm1").await;
     client_a.write(0, &vec![0xAA; BLOCK_SIZE]).await.unwrap();
     client_a.write(BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE]).await.unwrap();
     client_a.flush().await.unwrap();
@@ -110,7 +109,7 @@ async fn test_migration_survives_cold_wake() {
     server_b.fork_export_readonly("vm1", "vm1", 0.01).await;
     server_b.promote_export("vm1").await;
 
-    let mut client_b = NbdClient::connect(server_b.addr, "vm1").await.unwrap();
+    let mut client_b = server_b.connect("vm1").await;
     client_b.write(2 * BLOCK_SIZE as u64, &vec![0xCC; BLOCK_SIZE]).await.unwrap();
     client_b.flush().await.unwrap();
     client_b.disconnect().await.unwrap();
@@ -122,7 +121,7 @@ async fn test_migration_survives_cold_wake() {
     let server_c = TestServer::start(Arc::clone(&ctx.object_store), "cold-mig-a").await;
     server_c.restore_export("vm1", 0.01).await;
 
-    let mut client_c = NbdClient::connect(server_c.addr, "vm1").await.unwrap();
+    let mut client_c = server_c.connect("vm1").await;
 
     let expected: &[u8] = &[0xAA, 0xBB, 0xCC];
     for (i, &pattern) in expected.iter().enumerate() {

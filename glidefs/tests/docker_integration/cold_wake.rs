@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -15,7 +14,7 @@ async fn test_cold_wake_from_different_node() {
     let server_a = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server_a.create_export("vol1", 0.01).await;
 
-    let mut client_a = NbdClient::connect(server_a.addr, "vol1").await.unwrap();
+    let mut client_a = server_a.connect("vol1").await;
 
     let pattern: Vec<u8> = (0..BLOCK_SIZE).map(|i| ((i * 7 + 13) % 256) as u8).collect();
     client_a.write(0, &pattern).await.unwrap();
@@ -29,7 +28,7 @@ async fn test_cold_wake_from_different_node() {
     let server_b = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server_b.restore_export("vol1", 0.01).await;
 
-    let mut client_b = NbdClient::connect(server_b.addr, "vol1").await.unwrap();
+    let mut client_b = server_b.connect("vol1").await;
 
     let read_data = client_b.read(0, BLOCK_SIZE as u32).await.unwrap();
     assert_eq!(read_data, pattern, "data should be readable from cold node via S3");
@@ -47,7 +46,7 @@ async fn test_cold_wake_multiple_blocks() {
     let server_a = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server_a.create_export("vol1", 0.01).await;
 
-    let mut client_a = NbdClient::connect(server_a.addr, "vol1").await.unwrap();
+    let mut client_a = server_a.connect("vol1").await;
 
     for i in 0..8u8 {
         let data = vec![i + 1; BLOCK_SIZE];
@@ -63,7 +62,7 @@ async fn test_cold_wake_multiple_blocks() {
     let server_b = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server_b.restore_export("vol1", 0.01).await;
 
-    let mut client_b = NbdClient::connect(server_b.addr, "vol1").await.unwrap();
+    let mut client_b = server_b.connect("vol1").await;
 
     for i in 0..8u8 {
         let data = client_b

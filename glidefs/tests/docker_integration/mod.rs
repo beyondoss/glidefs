@@ -273,6 +273,13 @@ impl TestServer {
         );
     }
 
+    /// Connect a block client to a named export.
+    pub async fn connect(&self, export_name: &str) -> nbd_client::NbdClient {
+        nbd_client::NbdClient::connect(self.addr, export_name)
+            .await
+            .unwrap()
+    }
+
     /// Drain all exports and shut down gracefully.
     pub async fn shutdown(self) {
         if let Err(e) = self.router.shutdown().await {

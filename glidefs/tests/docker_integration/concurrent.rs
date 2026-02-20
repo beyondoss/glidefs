@@ -38,7 +38,7 @@ async fn test_concurrent_clients_same_export() {
     }
 
     // Single reader verifies all 12 blocks
-    let mut reader = NbdClient::connect(addr, "vol1").await.unwrap();
+    let mut reader = server.connect("vol1").await;
     for client_idx in 0..4u64 {
         let expected = fill_bytes[client_idx as usize];
         let base_block = client_idx * 3;
@@ -112,7 +112,7 @@ async fn test_drain_during_active_writes() {
     drain_handle.await.unwrap();
 
     // Verify all 10 blocks are correct on the live server
-    let mut reader = NbdClient::connect(addr, "vol1").await.unwrap();
+    let mut reader = server.connect("vol1").await;
     for i in 0..10u64 {
         let data = reader
             .read(i * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
@@ -135,7 +135,7 @@ async fn test_drain_during_active_writes() {
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server2.restore_export("vol1", 0.01).await;
 
-    let mut reader2 = NbdClient::connect(server2.addr, "vol1").await.unwrap();
+    let mut reader2 = server2.connect("vol1").await;
     for i in 0..10u64 {
         let data = reader2
             .read(i * BLOCK_SIZE as u64, BLOCK_SIZE as u32)

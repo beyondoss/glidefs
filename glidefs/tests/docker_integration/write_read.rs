@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -12,7 +11,7 @@ async fn test_write_read_roundtrip() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), "roundtrip").await;
     server.create_export("vol1", 0.01).await; // 10MB
 
-    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+    let mut client = server.connect("vol1").await;
 
     // Write a known pattern
     let data: Vec<u8> = (0..BLOCK_SIZE as usize).map(|i| (i % 256) as u8).collect();
@@ -33,7 +32,7 @@ async fn test_unwritten_blocks_return_zeros() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), "zeros").await;
     server.create_export("vol1", 0.01).await;
 
-    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+    let mut client = server.connect("vol1").await;
 
     let data = client.read(512 * 1024, 4096).await.unwrap();
     assert!(data.iter().all(|&b| b == 0), "unwritten blocks should be zeros");
@@ -48,7 +47,7 @@ async fn test_last_write_wins() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), "last-write").await;
     server.create_export("vol1", 0.01).await;
 
-    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+    let mut client = server.connect("vol1").await;
 
     // Write block, then overwrite
     client.write(0, &vec![0x11; BLOCK_SIZE as usize]).await.unwrap();

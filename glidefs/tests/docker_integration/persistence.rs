@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -15,7 +14,7 @@ async fn test_persistence_through_restart() {
     let server1 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server1.create_export("vol1", 0.01).await;
 
-    let mut client = NbdClient::connect(server1.addr, "vol1").await.unwrap();
+    let mut client = server1.connect("vol1").await;
 
     let block_data: Vec<Vec<u8>> = (0..5)
         .map(|i| vec![(i + 1) as u8; BLOCK_SIZE])
@@ -34,7 +33,7 @@ async fn test_persistence_through_restart() {
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server2.restore_export("vol1", 0.01).await;
 
-    let mut client2 = NbdClient::connect(server2.addr, "vol1").await.unwrap();
+    let mut client2 = server2.connect("vol1").await;
 
     for (i, expected) in block_data.iter().enumerate() {
         let read = client2
@@ -57,7 +56,7 @@ async fn test_overwrite_survives_restart() {
     let server1 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server1.create_export("vol1", 0.01).await;
 
-    let mut client = NbdClient::connect(server1.addr, "vol1").await.unwrap();
+    let mut client = server1.connect("vol1").await;
     client.write(0, &vec![0x11; BLOCK_SIZE]).await.unwrap();
     client.flush().await.unwrap();
 
@@ -65,7 +64,7 @@ async fn test_overwrite_survives_restart() {
     server1.drain_all().await;
 
     // Overwrite
-    let mut client2 = NbdClient::connect(server1.addr, "vol1").await.unwrap();
+    let mut client2 = server1.connect("vol1").await;
     client2.write(0, &vec![0xFF; BLOCK_SIZE]).await.unwrap();
     client2.flush().await.unwrap();
 
@@ -80,7 +79,7 @@ async fn test_overwrite_survives_restart() {
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server2.restore_export("vol1", 0.01).await;
 
-    let mut reader = NbdClient::connect(server2.addr, "vol1").await.unwrap();
+    let mut reader = server2.connect("vol1").await;
     let data = reader.read(0, BLOCK_SIZE as u32).await.unwrap();
     assert!(
         data.iter().all(|&b| b == 0xFF),

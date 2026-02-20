@@ -24,7 +24,9 @@ pub enum NBDError {
 
 pub type Result<T> = std::result::Result<T, NBDError>;
 
-/// Error type for NBD command handlers
+/// Error type for block I/O command handlers.
+///
+/// Transport-agnostic: each transport maps these to its own error codes.
 #[derive(Debug, Clone, Copy)]
 pub enum CommandError {
     /// Invalid argument (EINVAL)
@@ -38,12 +40,24 @@ pub enum CommandError {
 }
 
 impl CommandError {
-    pub fn to_errno(self) -> u32 {
+    /// Map to NBD wire format errno (used by NBD server).
+    pub fn to_nbd_errno(self) -> u32 {
         match self {
             CommandError::InvalidArgument => super::protocol::NBD_EINVAL,
             CommandError::IoError => super::protocol::NBD_EIO,
             CommandError::NoSpace => super::protocol::NBD_ENOSPC,
             CommandError::ReadOnly => super::protocol::NBD_EROFS,
+        }
+    }
+
+    /// Map to Linux errno (used by ublk server).
+    #[cfg(target_os = "linux")]
+    pub fn to_linux_errno(self) -> i32 {
+        match self {
+            CommandError::InvalidArgument => libc::EINVAL,
+            CommandError::IoError => libc::EIO,
+            CommandError::NoSpace => libc::ENOSPC,
+            CommandError::ReadOnly => libc::EROFS,
         }
     }
 }

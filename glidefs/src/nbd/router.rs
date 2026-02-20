@@ -8,7 +8,7 @@ use crate::config::ExportConfig;
 use crate::nbd::cache::BlockCache;
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::flush_scheduler::flush_scheduler;
-use crate::nbd::handler::NBDBlockHandler;
+use crate::nbd::handler::BlockHandler;
 use crate::nbd::manifest::deserialize_hot_set;
 use crate::nbd::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::nbd::pack::PackLocation;
@@ -107,7 +107,7 @@ pub struct SnapshotResponse {
 
 /// State for a single export.
 pub struct ExportState {
-    pub handler: Arc<NBDBlockHandler>,
+    pub handler: Arc<BlockHandler>,
     pub cache: Arc<WriteCache<Active>>,
     pub content_store: Arc<ContentStore>,
     pub pack_index: Arc<HostPackIndex>,
@@ -222,7 +222,7 @@ pub struct ExportRouter {
     download_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 
     /// SSD utilization ratio (0.0–1.0), updated by capacity monitor.
-    /// Shared with NBDBlockHandler instances for write rejection at high utilization.
+    /// Shared with BlockHandler instances for write rejection at high utilization.
     ssd_utilization: Arc<AtomicU64>, // f64 bits via to_bits()/from_bits()
 }
 
@@ -689,7 +689,7 @@ impl ExportRouter {
         let flush_notify = Arc::new(Notify::new());
 
         // Create handler for block I/O
-        let handler = Arc::new(NBDBlockHandler::new(
+        let handler = Arc::new(BlockHandler::new(
             Arc::clone(&cache),
             Arc::clone(&content_store),
             Arc::clone(&clean_cache),
@@ -773,7 +773,7 @@ impl ExportRouter {
     }
 
     /// Get handler for an export (used during NBD negotiation).
-    pub async fn get_handler(&self, name: &str) -> Option<Arc<NBDBlockHandler>> {
+    pub async fn get_handler(&self, name: &str) -> Option<Arc<BlockHandler>> {
         let exports = self.exports.read().await;
         exports.get(name).map(|s| Arc::clone(&s.handler))
     }

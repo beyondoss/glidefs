@@ -1,12 +1,12 @@
 # GlideFS
 
-NBD block device server that turns S3 into fast local storage. Writes hit local SSD in 5 microseconds. Background sync uploads to S3 as content-addressed packs.
+Block device server that turns S3 into fast local storage. Writes hit local SSD in 5 microseconds. Background sync uploads to S3 as content-addressed packs.
 
 Built for microVM storage at [Paraglide](https://paraglide.sh).
 
 ## How It Works
 
-Guests see a block device over NBD. Writes go to local SSD immediately. A background scheduler packs dirty blocks, compresses with LZ4, and uploads to S3. Reads serve from local cache; misses pull from S3, verify BLAKE3 hashes, and cache locally.
+Guests see a standard block device (NBD or ublk). Writes go to local SSD immediately. A background scheduler packs dirty blocks, compresses with LZ4, and uploads to S3. Reads serve from local cache; misses pull from S3, verify BLAKE3 hashes, and cache locally.
 
 ```
 Write path:  Guest → NBD → local SSD pwrite() → return OK      ~5µs
@@ -118,16 +118,30 @@ For 2,000 VMs on one host with a shared base image: the OS/runtime blocks (~2-3G
 
 ### Transport
 
-Use the Unix domain socket for NBD. TCP between client and server on the same host adds latency, connection-drop risk, and firewall surface for no benefit. The only failure mode with UDS is server process death — which is the same regardless of transport.
+Two options. NBD works everywhere. ublk is opt-in on Linux 6.0+ for lower overhead.
+
+#### NBD (default)
+
+Unix domain socket. TCP adds latency and firewall surface for no benefit on the same host.
 
 ```toml
 [servers.nbd]
 unix_socket = "/var/run/glidefs.sock"
 ```
 
-TCP is available but only useful if you need to serve NBD to a different host.
+TCP is available for serving to a different host.
 
-### Device Setup
+#### ublk (Linux 6.0+)
+
+io_uring-based userspace block device. No socket overhead, no protocol serialization, native multi-queue.
+
+```sh
+cargo build --release -p glidefs --features ublk
+```
+
+Requires `CONFIG_BLK_DEV_UBLK=y` in the host kernel. One `/dev/ublkbN` device per export — the block device appears when the export is created. No client tool needed.
+
+### Device Setup (NBD)
 
 Three ways to attach `/dev/nbdN` to the server:
 
@@ -137,7 +151,9 @@ Three ways to attach `/dev/nbdN` to the server:
 | ioctl | Any | `NBD_SET_SOCK` + `NBD_SET_SIZE` + `NBD_DO_IT`. Blocks a thread per device. No reconnect. |
 | Netlink (`NBD_GENL`) | 4.10+ | Preferred. Non-blocking, supports `NBD_CMD_RECONFIGURE` for live resize, multiple sockets per device for failover. No external tools. |
 
-Netlink is the right choice for production. Create the export via HTTP API, configure the kernel device via netlink, connect over UDS — single binary, no moving parts.
+Netlink is the right choice for NBD production. Create the export via HTTP API, configure the kernel device via netlink, connect over UDS — single binary, no moving parts.
+
+ublk devices need no client setup — `/dev/ublkbN` appears when the export registers and disappears when it's removed.
 
 ### Binary Upgrades (Zero-Downtime)
 

@@ -1,8 +1,8 @@
-//! NBD protocol handlers for block I/O operations.
+//! Transport-agnostic block I/O handler.
 //!
 //! This module provides:
-//! - `NBDBlockHandler`: Thin handler that uses WriteCache for all I/O
-//! - `NBDDevice`: Device descriptor used during NBD transmission phase
+//! - `BlockHandler`: Thin handler that uses WriteCache for all I/O
+//! - `BlockDevice`: Device descriptor used during transmission phase
 
 use super::cache::BlockCache;
 use super::content_store::ContentStore;
@@ -20,14 +20,14 @@ use parking_lot::Mutex;
 use std::time::Instant;
 use tokio::sync::Notify;
 
-/// NBD device descriptor used during transmission phase.
+/// Block device descriptor used during transmission phase.
 #[derive(Clone)]
-pub struct NBDDevice {
+pub struct BlockDevice {
     pub name: Vec<u8>,
     pub size: u64,
 }
 
-/// Handler for NBD protocol operations using write-behind cache.
+/// Handler for block I/O operations using write-behind cache.
 ///
 /// This is a thin layer that delegates all I/O to the WriteCache.
 /// The key performance benefit: `flush()` only syncs to local SSD,
@@ -35,7 +35,9 @@ pub struct NBDDevice {
 ///
 /// Reads use read-through caching: if a block isn't present locally,
 /// it's fetched from S3 on demand.
-pub struct NBDBlockHandler {
+///
+/// Transport-agnostic: used by both NBD and ublk frontends.
+pub struct BlockHandler {
     /// The write-behind cache (must be in Active state)
     cache: Arc<WriteCache<Active>>,
 
@@ -76,7 +78,7 @@ pub struct NBDBlockHandler {
     write_tracer: Option<Arc<WriteTracer>>,
 }
 
-impl NBDBlockHandler {
+impl BlockHandler {
     /// Create a new block handler.
     ///
     /// # Arguments
@@ -343,11 +345,11 @@ mod tests {
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
-    fn test_handler() -> (NBDBlockHandler, TempDir) {
+    fn test_handler() -> (BlockHandler, TempDir) {
         test_handler_with_readonly(false)
     }
 
-    fn test_handler_with_readonly(readonly: bool) -> (NBDBlockHandler, TempDir) {
+    fn test_handler_with_readonly(readonly: bool) -> (BlockHandler, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let config = WriteCacheConfig {
             cache_dir: temp_dir.path().to_path_buf(),
@@ -373,7 +375,7 @@ mod tests {
         let cache = WriteCache::open(config).unwrap();
         // Skip recovery for test - go straight to active
         let cache = cache.skip_recovery_for_test();
-        let handler = NBDBlockHandler::new(
+        let handler = BlockHandler::new(
             Arc::new(cache),
             content_store,
             clean_cache,
@@ -545,7 +547,7 @@ mod tests {
     /// Notify so we can observe whether auto-flush was triggered.
     fn test_handler_with_flush_config(
         blocks_per_pack: usize,
-    ) -> (NBDBlockHandler, Arc<Notify>, TempDir) {
+    ) -> (BlockHandler, Arc<Notify>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         // 256 blocks × 4096 = 1MB device, enough for threshold tests
         let config = WriteCacheConfig {
@@ -567,7 +569,7 @@ mod tests {
 
         let cache = WriteCache::open(config).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let handler = NBDBlockHandler::new(
+        let handler = BlockHandler::new(
             Arc::new(cache),
             content_store,
             clean_cache,

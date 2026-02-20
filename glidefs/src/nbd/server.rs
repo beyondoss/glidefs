@@ -12,7 +12,7 @@
 //! - This allows multiple requests to be in-flight simultaneously
 
 use super::error::{NBDError, Result};
-use super::handler::{NBDBlockHandler, NBDDevice};
+use super::handler::{BlockHandler, BlockDevice};
 use super::protocol::*;
 use super::router::ExportRouter;
 use bytes::{Bytes, BytesMut};
@@ -250,7 +250,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         Ok(())
     }
 
-    async fn negotiate_options(&mut self) -> Result<(NBDDevice, Arc<NBDBlockHandler>)> {
+    async fn negotiate_options(&mut self) -> Result<(BlockDevice, Arc<BlockHandler>)> {
         loop {
             let mut header_buf = [0u8; NBD_OPTION_HEADER_SIZE];
             match self.reader.read_exact(&mut header_buf).await {
@@ -344,7 +344,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn handle_export_name_option(
         &mut self,
         length: u32,
-    ) -> Result<(NBDDevice, Arc<NBDBlockHandler>)> {
+    ) -> Result<(BlockDevice, Arc<BlockHandler>)> {
         if length > MAX_OPTION_DATA_LEN {
             return Err(NBDError::Protocol(format!(
                 "export name length {length} exceeds maximum {MAX_OPTION_DATA_LEN}"
@@ -365,7 +365,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             NBDError::DeviceNotFound(name_buf.clone())
         })?;
 
-        let device = NBDDevice {
+        let device = BlockDevice {
             name: name_buf,
             size: handler.device_size(),
         };
@@ -436,7 +436,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
     async fn handle_go_option(
         &mut self,
         length: u32,
-    ) -> Result<(NBDDevice, Arc<NBDBlockHandler>)> {
+    ) -> Result<(BlockDevice, Arc<BlockHandler>)> {
         let data = self.read_option_data(length).await?;
 
         // Parse export name
@@ -472,7 +472,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             }
         };
 
-        let device = NBDDevice {
+        let device = BlockDevice {
             name: name_bytes.to_vec(),
             size: handler.device_size(),
         };
@@ -550,8 +550,8 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
     /// processing requests one at a time.
     async fn handle_transmission(
         self,
-        device: NBDDevice,
-        handler: Arc<NBDBlockHandler>,
+        device: BlockDevice,
+        handler: Arc<BlockHandler>,
     ) -> Result<()> {
         let export_name = String::from_utf8_lossy(&device.name).to_string();
 
@@ -597,7 +597,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
         reader: &mut R,
         shutdown: &CancellationToken,
         export_name: &str,
-        handler: Arc<NBDBlockHandler>,
+        handler: Arc<BlockHandler>,
         response_tx: mpsc::Sender<Response>,
         tasks: &mut JoinSet<()>,
     ) -> Result<()> {
@@ -661,7 +661,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                 }
                 let _ = response_tx.send(Response::Simple {
                     cookie: request.cookie,
-                    error: super::error::CommandError::InvalidArgument.to_errno(),
+                    error: super::error::CommandError::InvalidArgument.to_nbd_errno(),
                     data: Bytes::new(),
                 }).await;
                 continue;
@@ -692,7 +692,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                                 // the Linux kernel module) expect `length` bytes of data
                                 // in every read reply, even on error.
                                 let zeros = Bytes::from(vec![0u8; length as usize]);
-                                Response::Simple { cookie, error: e.to_errno(), data: zeros }
+                                Response::Simple { cookie, error: e.to_nbd_errno(), data: zeros }
                             }
                         };
                         let _ = tx.send(response).await;
@@ -714,7 +714,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                         };
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
                         };
                         let _ = tx.send(response).await;
                     });
@@ -734,7 +734,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                         let result = h.flush();
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
                         };
                         let _ = tx.send(response).await;
                     });
@@ -750,7 +750,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                         let result = h.trim(offset, length, fua);
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
                         };
                         let _ = tx.send(response).await;
                     });
@@ -766,7 +766,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                         let result = h.write_zeroes(offset, length, fua);
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
                         };
                         let _ = tx.send(response).await;
                     });
@@ -782,7 +782,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                         let result = h.cache(offset, length);
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_errno(), data: Bytes::new() },
+                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
                         };
                         let _ = tx.send(response).await;
                     });
@@ -791,7 +791,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     warn!("Unknown NBD command: {}", cmd);
                     let _ = response_tx.send(Response::Simple {
                         cookie: request.cookie,
-                        error: super::error::CommandError::InvalidArgument.to_errno(),
+                        error: super::error::CommandError::InvalidArgument.to_nbd_errno(),
                         data: Bytes::new(),
                     }).await;
                 }

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -14,7 +13,7 @@ async fn test_export_discovery_from_s3() {
     server1.create_export("dynamic-vol", 0.01).await;
     server1.save_export("dynamic-vol", 0.01).await;
 
-    let mut client = NbdClient::connect(server1.addr, "dynamic-vol").await.unwrap();
+    let mut client = server1.connect("dynamic-vol").await;
     client.write(0, &[0xDD; 4096]).await.unwrap();
     client.flush().await.unwrap();
     client.disconnect().await.unwrap();
@@ -45,7 +44,7 @@ async fn test_export_discovery_from_s3() {
     }
 
     // Verify data is readable
-    let mut client2 = NbdClient::connect(server2.addr, "dynamic-vol").await.unwrap();
+    let mut client2 = server2.connect("dynamic-vol").await;
     let read = client2.read(0, 4096).await.unwrap();
     assert_eq!(&read[..], &[0xDD; 4096], "discovered export should have original data");
 

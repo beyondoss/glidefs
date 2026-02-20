@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -20,7 +19,7 @@ async fn test_resize_preserves_data_and_extends() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server.create_export("vol1", 0.01).await;
 
-    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+    let mut client = server.connect("vol1").await;
     let old_size = client.export_size;
 
     client.write(0, &vec![0x11; BLOCK_SIZE]).await.unwrap();
@@ -31,7 +30,7 @@ async fn test_resize_preserves_data_and_extends() {
     server.resize_export("vol1", 0.02).await;
 
     // Reconnect — the client must reconnect to observe the new size.
-    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+    let mut client = server.connect("vol1").await;
     let new_size = client.export_size;
     assert!(
         new_size > old_size,
@@ -62,7 +61,7 @@ async fn test_resize_preserves_data_and_extends() {
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server2.restore_export("vol1", 0.02).await;
 
-    let mut client = NbdClient::connect(server2.addr, "vol1").await.unwrap();
+    let mut client = server2.connect("vol1").await;
     assert_eq!(
         client.export_size, new_size,
         "restored export should match the resized capacity"

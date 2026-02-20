@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -12,8 +11,8 @@ async fn test_multiple_exports_isolation() {
     server.create_export("vol-a", 0.01).await;
     server.create_export("vol-b", 0.01).await;
 
-    let mut client_a = NbdClient::connect(server.addr, "vol-a").await.unwrap();
-    let mut client_b = NbdClient::connect(server.addr, "vol-b").await.unwrap();
+    let mut client_a = server.connect("vol-a").await;
+    let mut client_b = server.connect("vol-b").await;
 
     // Write different data to each export
     client_a.write(0, &[0x11; 4096]).await.unwrap();

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::nbd_client::NbdClient;
 use crate::TestContext;
 use crate::TestServer;
 
@@ -20,7 +19,7 @@ async fn test_sub_block_and_cross_block_reads() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), "range-reads").await;
     server.create_export("vol1", 0.01).await;
 
-    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+    let mut client = server.connect("vol1").await;
 
     // Write block 0 = 0xAA, block 1 = 0xBB
     client.write(0, &vec![0xAA; BLOCK_SIZE]).await.unwrap();
@@ -78,7 +77,7 @@ async fn test_range_reads_after_cold_wake() {
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server.create_export("vol1", 0.01).await;
 
-    let mut client = NbdClient::connect(server.addr, "vol1").await.unwrap();
+    let mut client = server.connect("vol1").await;
     client.write(0, &vec![0x11; BLOCK_SIZE]).await.unwrap();
     client
         .write(BLOCK_SIZE as u64, &vec![0x22; BLOCK_SIZE])
@@ -94,7 +93,7 @@ async fn test_range_reads_after_cold_wake() {
     let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path).await;
     server2.restore_export("vol1", 0.01).await;
 
-    let mut client2 = NbdClient::connect(server2.addr, "vol1").await.unwrap();
+    let mut client2 = server2.connect("vol1").await;
 
     // Sub-block: 1KB from offset 1000 within block 0
     let sub = client2.read(1000, 1024).await.unwrap();
