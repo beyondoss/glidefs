@@ -49,11 +49,22 @@ if [ ! -x "$CHURN_BIN" ]; then
     exit 1
 fi
 
-if [ ! -f "$BASE" ]; then
-    echo "error: base image not found at $BASE"
-    echo "Run ./scripts/gen_dedup_images.sh first"
-    exit 1
-fi
+# Database workloads need more space than the 512MB base image provides.
+# Create a fresh 1GB ext4 image instead of forking the base.
+case "$WORKLOAD" in
+    postgres|sqlite)
+        FRESH_IMAGE=true
+        IMG_SIZE_MB=1024
+        ;;
+    *)
+        FRESH_IMAGE=false
+        if [ ! -f "$BASE" ]; then
+            echo "error: base image not found at $BASE"
+            echo "Run ./scripts/gen_dedup_images.sh first"
+            exit 1
+        fi
+        ;;
+esac
 
 mkdir -p "$OUT"
 
@@ -64,9 +75,17 @@ echo "  Interval:  ${INTERVAL}s"
 echo "  Snapshots: $(( DURATION / INTERVAL ))"
 echo ""
 
-# Create working image (fork from base)
-echo "Forking base image..."
-cp "$BASE" "$OUT/live.raw"
+# Create working image
+if [ "$FRESH_IMAGE" = true ]; then
+    echo "Creating fresh ${IMG_SIZE_MB}MB ext4 image..."
+    dd if=/dev/zero of="$OUT/live.raw" bs=1M count="$IMG_SIZE_MB" 2>/dev/null
+    docker run --rm --privileged \
+        -v "$OUT:/work" \
+        glidefs-dedup-helper bash -c "mkfs.ext4 -q /work/live.raw" 2>/dev/null
+else
+    echo "Forking base image..."
+    cp "$BASE" "$OUT/live.raw"
+fi
 
 # Define workload scripts
 case "$WORKLOAD" in
@@ -234,10 +253,10 @@ FEATEOF
 
             # Tune for aggressive checkpoints (listen_addresses defaults to localhost)
             {
-                echo "shared_buffers = 32MB"
+                echo "shared_buffers = 16MB"
                 echo "checkpoint_timeout = 30s"
-                echo "max_wal_size = 64MB"
-                echo "min_wal_size = 16MB"
+                echo "max_wal_size = 32MB"
+                echo "min_wal_size = 32MB"
                 echo "wal_level = minimal"
                 echo "max_wal_senders = 0"
                 echo "fsync = on"
@@ -247,7 +266,7 @@ FEATEOF
             su postgres -c "$PGBIN/pg_ctl -D $PGDATA -l $PGDATA/logfile start -w" 2>&1
             sleep 2
             su postgres -c "$PGBIN/createdb pgbench" 2>&1
-            su postgres -c "$PGBIN/pgbench -i -s 5 pgbench" 2>&1
+            su postgres -c "$PGBIN/pgbench -i -s 1 pgbench" 2>&1
 
             # Run pgbench: mixed read/write TPC-B transactions
             # -c 4 clients, -T runs for the full duration
@@ -387,19 +406,19 @@ if [ "$USE_CHROOT" = true ]; then
 else
     # Run in container directly, data files on mounted filesystem.
     # Binaries (postgres, python3, sqlite3) come from the container image.
+    # Write workload script to a file to avoid nested quoting issues.
+    WORKLOAD_FILE="$OUT/workload.sh"
+    printf '%s\n' "$WORKLOAD_SCRIPT" > "$WORKLOAD_FILE"
+    chmod +x "$WORKLOAD_FILE"
     CONTAINER_ID=$(docker run -d --rm --privileged \
         -v "$OUT:/work" \
         glidefs-dedup-helper bash -c "
             set -e
             mkdir -p /mnt/img
             mount -o loop /work/live.raw /mnt/img
+            cd /tmp
 
-            # Data goes to the mounted filesystem
-            export HOME=/mnt/img/root
-            mkdir -p /mnt/img/root
-            cd /mnt/img/root
-
-            bash -c '$WORKLOAD_SCRIPT' &
+            bash /work/workload.sh &
             WORK_PID=\$!
 
             for i in \$(seq 1 $DURATION); do
@@ -465,9 +484,15 @@ if [ "$NUM_SNAPS" -lt 2 ]; then
     exit 0
 fi
 
+# For fresh images, compare against snap_000 (not the forked base)
+CHURN_BASE="${SNAPS[0]}"
+if [ "$FRESH_IMAGE" = false ] && [ -f "$BASE" ]; then
+    CHURN_BASE="$BASE"
+fi
+
 echo "Cumulative churn (base → final):"
 "$CHURN_BIN" \
-    --base "$BASE" \
+    --base "$CHURN_BASE" \
     --duration-secs "$DURATION" \
     "${SNAPS[-1]}" 2>/dev/null
 
