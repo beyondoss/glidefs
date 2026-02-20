@@ -448,8 +448,9 @@ mod tests {
         // Notify (simulating what the write path does)
         flush_notify_clone.notify_one();
 
-        // Wait for flush to complete
-        for _ in 0..40 {
+        // Wait for flush to complete (5s budget — flush_packs + sync_manifest +
+        // checkpoint can be slow on loaded CI machines with a single-threaded runtime).
+        for _ in 0..100 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if cache_check.dirty_block_count() == 0 {
                 break;
