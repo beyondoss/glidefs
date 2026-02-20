@@ -93,5 +93,7 @@ jobs:
         run: cargo build --features ublk,test-utils --verbose
       - name: Test (ublk)
         run: cargo test --features ublk,test-utils --verbose
+      - name: Load ublk kernel module
+        run: sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
       - name: Docker integration (ublk)
-        run: cargo test --features ublk,docker-tests --test docker_integration --verbose
+        run: sudo -E env "PATH=$PATH" cargo test --features ublk,docker-tests --test docker_integration --verbose

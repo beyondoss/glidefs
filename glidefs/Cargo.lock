@@ -1501,6 +1501,7 @@ dependencies = [
  "mimalloc",
  "object_store",
  "parking_lot",
+ "paste",
  "proptest",
  "rand 0.8.5",
  "rayon",

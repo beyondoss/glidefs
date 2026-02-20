@@ -82,6 +82,7 @@ tokio = { version = "1.49", features = ["test-util"] }
 futures = "0.3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.4"
+paste = "1"
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 
