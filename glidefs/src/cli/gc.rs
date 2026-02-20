@@ -256,6 +256,7 @@ async fn reconcile_prefix(
     //    all referenced packs — safe for GC liveness.
     let mut live_packs: HashSet<Uuid> = HashSet::new();
     let manifest_names = content_store.list_all_manifests().await?;
+    let mut manifest_failed = false;
 
     for name in &manifest_names {
         match content_store.get_effective_manifest(name).await {
@@ -269,10 +270,18 @@ async fn reconcile_prefix(
                 warn!(manifest = %name, "manifest disappeared during GC");
             }
             Err(e) => {
-                warn!(manifest = %name, error = %e, "failed to fetch/parse manifest");
+                warn!(manifest = %name, error = %e, "failed to fetch/parse manifest — treating all packs in prefix as live");
                 stats.manifest_errors += 1;
+                manifest_failed = true;
             }
         }
+    }
+
+    // If any manifest failed to parse, we cannot determine liveness accurately.
+    // Skip this prefix entirely to avoid deleting packs that might be live.
+    if manifest_failed {
+        warn!("skipping GC for prefix due to manifest errors — no packs will be deleted");
+        return Ok(0);
     }
 
     // 2. List all registries, parse, collect known pack IDs

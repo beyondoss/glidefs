@@ -27,6 +27,10 @@ pub async fn run_bless(
         .with_writer(std::io::stderr)
         .init();
 
+    if !chunk_size.is_power_of_two() {
+        anyhow::bail!("chunk_size must be a power of two, got {chunk_size}");
+    }
+
     let start = Instant::now();
 
     // --- Setup ---

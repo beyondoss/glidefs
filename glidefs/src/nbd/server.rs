@@ -667,6 +667,12 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                 continue;
             }
 
+            // Bound concurrent in-flight tasks to prevent unbounded memory growth.
+            // When at the limit, drain one completed task before spawning a new one.
+            while tasks.len() >= MAX_INFLIGHT_REQUESTS {
+                tasks.join_next().await;
+            }
+
             match request.cmd_type {
                 NBDCommand::Read => {
                     // Spawn task to handle read concurrently

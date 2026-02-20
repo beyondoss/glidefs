@@ -61,7 +61,9 @@
       "Bash(/Users/jared/Code/Apps/paraglidehq/glidefs/glidefs/target/release/pack_size_measure:*)",
       "Bash(./scripts/steady_state_churn.sh:*)",
       "Bash(docker build:*)",
-      "Bash(docker ps:*)"
+      "Bash(docker ps:*)",
+      "WebFetch(domain:docs.kernel.org)",
+      "WebFetch(domain:lwn.net)"
     ]
   }
 }

@@ -96,7 +96,9 @@ pub async fn capacity_monitor(
                         utilization = format!("{:.1}%", utilization * 100.0),
                         "SSD pressure sustained: flushing dirtiest exports"
                     );
-                    router.pressure_flush().await;
+                    if tokio::time::timeout(Duration::from_secs(30), router.pressure_flush()).await.is_err() {
+                        warn!("pressure flush timed out after 30s");
+                    }
                 } else if new_level != current_level {
                     match (current_level, new_level) {
                         // Escalating — pressure-flush dirtiest exports
@@ -105,7 +107,9 @@ pub async fn capacity_monitor(
                                 utilization = format!("{:.1}%", utilization * 100.0),
                                 "SSD pressure: flushing dirtiest exports"
                             );
-                            router.pressure_flush().await;
+                            if tokio::time::timeout(Duration::from_secs(30), router.pressure_flush()).await.is_err() {
+                                warn!("pressure flush timed out after 30s");
+                            }
                         }
                         // Entering warn zone
                         (PressureLevel::Normal, PressureLevel::Warn) => {

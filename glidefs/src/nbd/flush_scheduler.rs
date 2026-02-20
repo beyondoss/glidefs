@@ -44,6 +44,11 @@ pub async fn flush_scheduler(
     let mut checkpoint_ticker =
         tokio::time::interval_at(tokio::time::Instant::now() + jitter, checkpoint_interval);
 
+    // Backoff state: when flush fails (e.g., S3 down), wait before retrying
+    // to avoid a tight spin of failed flush_packs calls.
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    let mut flush_backoff = Duration::ZERO;
+
     loop {
         tokio::select! {
             biased;
@@ -58,9 +63,24 @@ pub async fn flush_scheduler(
 
             // Event-driven: write path notifies when dirty count crosses blocks_per_pack.
             () = flush_notify.notified() => {
+                // If we're in backoff after a previous failure, wait before retrying.
+                if flush_backoff > Duration::ZERO {
+                    tokio::select! {
+                        biased;
+                        Ok(()) = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                info!("flush scheduler: shutting down during backoff");
+                                return;
+                            }
+                        }
+                        () = tokio::time::sleep(flush_backoff) => {}
+                    }
+                }
+
                 let start = Instant::now();
                 match cache.flush_packs(&content_store, &pack_index).await {
                     Ok((stats, seq_cutpoint)) => {
+                        flush_backoff = Duration::ZERO;
                         metrics.record_s3_put_latency(start.elapsed());
                         metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
                         if stats.packs_uploaded > 0 {
@@ -85,8 +105,14 @@ pub async fn flush_scheduler(
                         }
                     }
                     Err(e) => {
+                        // Exponential backoff: 1s → 2s → 4s → ... → 30s cap.
+                        flush_backoff = if flush_backoff.is_zero() {
+                            Duration::from_secs(1)
+                        } else {
+                            flush_backoff.saturating_mul(2).min(MAX_BACKOFF)
+                        };
                         metrics.record_flush_error();
-                        warn!(error = %e, "pack flush failed");
+                        warn!(error = %e, backoff_secs = flush_backoff.as_secs(), "pack flush failed, backing off");
                         // Still checkpoint on flush error to prevent WAL growth
                         // when S3 is down and flush_notify fires continuously.
                         if let Err(e) = cache.local_checkpoint() {

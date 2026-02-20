@@ -294,7 +294,7 @@ impl NBDBlockHandler {
         }
 
         if offset + length as u64 > self.device_size() {
-            return Err(CommandError::NoSpace);
+            return Err(CommandError::InvalidArgument);
         }
 
         if length == 0 {
