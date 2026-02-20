@@ -35,6 +35,12 @@ const MAX_INFLIGHT_REQUESTS: usize = 256;
 /// is either a bug or a malicious client trying to OOM the server.
 const MAX_OPTION_DATA_LEN: u32 = 64 * 1024;
 
+/// Maximum payload size for a single NBD read/write request (32MB).
+/// Matches the Linux kernel NBD module's `NBD_MAX_BUFFER_SIZE` (32MB)
+/// and QEMU's max request size. Without this cap, a malicious client
+/// could request up to 4GB per request (u32::MAX), exhausting memory.
+const MAX_REQUEST_PAYLOAD: u32 = 32 * 1024 * 1024;
+
 /// Response to be sent back to the client.
 /// Sent through a channel from handler tasks to the writer task.
 #[derive(Debug)]
@@ -627,6 +633,33 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
             );
 
             let fua = (request.flags & NBD_CMD_FLAG_FUA) != 0;
+
+            // Reject oversized payloads before allocating any memory.
+            if request.length > MAX_REQUEST_PAYLOAD {
+                warn!(
+                    length = request.length,
+                    max = MAX_REQUEST_PAYLOAD,
+                    "rejecting oversized NBD request"
+                );
+                // For writes, we must still drain the payload bytes from the socket
+                // to keep the protocol stream in sync.
+                if matches!(request.cmd_type, NBDCommand::Write) {
+                    let mut remaining = request.length as u64;
+                    let mut drain_buf = vec![0u8; 64 * 1024];
+                    while remaining > 0 {
+                        let to_read = std::cmp::min(remaining, drain_buf.len() as u64) as usize;
+                        reader.read_exact(&mut drain_buf[..to_read]).await
+                            .map_err(NBDError::Io)?;
+                        remaining -= to_read as u64;
+                    }
+                }
+                let _ = response_tx.send(Response::Simple {
+                    cookie: request.cookie,
+                    error: super::error::CommandError::InvalidArgument.to_errno(),
+                    data: Bytes::new(),
+                }).await;
+                continue;
+            }
 
             match request.cmd_type {
                 NBDCommand::Read => {

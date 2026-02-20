@@ -603,13 +603,17 @@ impl WriteCache<Active> {
             .copied()
             .collect();
 
-        // Derive new pack entries only for upserted hashes.
+        // Derive pack entries once for the full current state. We need
+        // them both for filtering (delta) and for caching (pruning).
+        let all_pack_entries = host_pack_index.derive_for_block_map(&post_flush_snap)?;
+
+        // Filter to only upserted hashes for the delta manifest.
         let upserted_hashes: std::collections::HashSet<Blake3Hash> =
             upserted.iter().map(|e| e.hash).collect();
-        let all_pack_entries = host_pack_index.derive_for_block_map(&post_flush_snap)?;
         let new_pack_entries: Vec<_> = all_pack_entries
-            .into_iter()
+            .iter()
             .filter(|e| upserted_hashes.contains(&e.hash))
+            .cloned()
             .collect();
 
         // Size-based compaction trigger: delta block changes > 50% of full block map.
@@ -642,10 +646,8 @@ impl WriteCache<Active> {
         };
 
         // Cache the full manifest's pack hashes for pack index pruning.
-        // We need to derive from the full current state, not just the delta.
-        let full_pack_entries = host_pack_index.derive_for_block_map(&post_flush_snap)?;
         *self.inner.manifest_pack_hashes.lock() =
-            full_pack_entries.iter().map(|e| e.hash).collect();
+            all_pack_entries.iter().map(|e| e.hash).collect();
 
         content_store
             .put_delta_manifest(&self.inner.export_name, delta.serialize())

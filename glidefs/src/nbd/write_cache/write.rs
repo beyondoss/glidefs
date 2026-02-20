@@ -70,7 +70,10 @@ impl WriteCache<Active> {
 
         // Record dirty blocks in WAL + block map with placeholder hash.
         // Real hash is computed at flush-to-S3 time from SSD data.
+        // Batch all WAL entries under a single lock acquisition to reduce
+        // lock/unlock overhead on multi-block writes.
         {
+            let mut wal = self.inner.wal.lock();
             for block in start_block..=end_block {
                 let idx = block as usize;
                 if idx >= self.inner.num_blocks {
@@ -89,11 +92,10 @@ impl WriteCache<Active> {
                     hash: Blake3Hash::ZERO,
                     sequence: seq,
                 };
-                self.inner.wal.lock().append(&wal_entry)?;
+                wal.append(&wal_entry)?;
             }
 
             // Flush WAL buffer (or fsync if wal_sync is enabled)
-            let mut wal = self.inner.wal.lock();
             if self.inner.config.wal_sync {
                 wal.sync()?;
             } else {
@@ -162,12 +164,14 @@ impl WriteCache<Active> {
 
         // Record dirty blocks in WAL + block map.
         // zero_range uses the precomputed zero_block_hash since we know the content.
+        // Batch all WAL entries under a single lock acquisition.
         {
             let block_size = self.inner.config.block_size as u64;
             let start_block = offset / block_size;
             let end_block = (offset + len - 1) / block_size;
             let zero_hash = self.inner.zero_block_hash;
 
+            let mut wal = self.inner.wal.lock();
             for block in start_block..=end_block {
                 let idx = block as usize;
                 if idx >= self.inner.num_blocks {
@@ -184,10 +188,9 @@ impl WriteCache<Active> {
                     hash: zero_hash,
                     sequence: seq,
                 };
-                self.inner.wal.lock().append(&wal_entry)?;
+                wal.append(&wal_entry)?;
             }
 
-            let mut wal = self.inner.wal.lock();
             if self.inner.config.wal_sync {
                 wal.sync()?;
             } else {

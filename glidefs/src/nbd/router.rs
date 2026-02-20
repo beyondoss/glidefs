@@ -291,8 +291,6 @@ impl ExportRouter {
 
     /// Prune pack index entries not referenced by any active export.
     ///
-    /// Prune pack index entries not referenced by any active export.
-    ///
     /// Forces a manifest-hash rebuild on all remaining exports first to
     /// capture everything flushed up to this moment, then prunes. This
     /// closes the timing window where a flush inserts into the pack index
@@ -804,8 +802,12 @@ impl ExportRouter {
 
     /// Check readiness: exports exist, cache writable, and S3 reachable.
     pub async fn readiness_check(&self) -> ReadinessStatus {
-        let exports = self.exports.read().await;
-        let exports_count = exports.len();
+        let exports_count = {
+            let exports = self.exports.read().await;
+            exports.len()
+        };
+        // Lock released — I/O probes below can take seconds and must not
+        // hold the read lock (it blocks create/remove/shutdown write locks).
 
         let cache_writable = {
             let probe = self.cache_dir.join(".health-probe");

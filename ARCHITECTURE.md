@@ -206,26 +206,21 @@ Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N 
 Stored in `SparseStateMap` — a sparse page table of `AtomicU8` values, lock-free, outside the block map's `RwLock`. Encoding: `NotPresent=0, Clean=1, Dirty=2, Syncing=3`. NotPresent=0 means unallocated pages are implicitly "never written" with no memory cost.
 
 ```
-NotPresent ───[write]───► Dirty ───[sync start]───► Syncing
-                            ▲           │                │
-                            │    write during sync ──────┤
-                            │                            │
-                          Clean ◄── upload success ──────┘
-                            │                            │
-                            └──[write]──► Dirty    upload failure
-                                                         │
-                                                         ▼
-                                                   Dirty (retry)
+NotPresent ───[write]───► Dirty ───[flush + seq match]───► Clean
+                            ▲                                 │
+                            └────────[write]──────────────────┘
 ```
+
+The flush path uses **sequence-number CAS** instead of a Syncing intermediate state: when a block is flushed, `CAS(Dirty→Clean)` succeeds only if the block's sequence number hasn't changed since the flush snapshot. If a concurrent write changed the sequence, the CAS is skipped and the block stays Dirty for the next flush cycle. This eliminates the Dirty→Syncing→Clean three-phase dance.
 
 | From | Event | To | Encoding | Notes |
 |------|-------|----|----------|-------|
 | NotPresent | Guest write | Dirty | 0 → 2 | Page allocated on first touch, SSD pwrite, WAL appended |
 | Clean | Guest write | Dirty | 1 → 2 | Block already on SSD, re-dirtied |
-| Dirty | Sync worker claims | Syncing | 2 → 3 | CAS on SparseStateMap entry |
-| Syncing | S3 PUT success | Clean | 3 → 1 | Block is durable in S3 |
-| Syncing | S3 PUT failure | Dirty | 3 → 2 | Conservative: re-sync next cycle |
-| Syncing | Guest write during sync | Dirty | 3 → 2 | New data overwrites; block needs re-sync |
+| Dirty | Flush success + seq match | Clean | 2 → 1 | Sequence guard: skip if block was rewritten during flush |
+| Dirty | Flush success + seq mismatch | Dirty | — | Concurrent write changed the block; stays dirty for next cycle |
+
+The `Syncing=3` constant exists and is handled defensively (crash recovery converts Syncing→Dirty, `transition_to_dirty` handles Syncing→Dirty for writes during sync), but no current code path transitions a block INTO the Syncing state. It is reserved for future use.
 
 Presence is derived: `is_present = state != 0`. This eliminates the separate `present_chunks` bitmap. (`block_map.rs:SparseStateMap`)
 
