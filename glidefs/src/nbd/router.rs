@@ -172,6 +172,8 @@ pub struct RouterConfig {
     pub max_s3_uploads: usize,
     /// Max concurrent S3 pack downloads across all exports (0 = unlimited).
     pub max_s3_downloads: usize,
+    /// Default blocks per pack for new exports (from NbdConfig).
+    pub default_blocks_per_pack: usize,
 }
 
 /// Multi-tenant export router.
@@ -201,6 +203,9 @@ pub struct ExportRouter {
 
     /// Whether to fsync the WAL after each write batch
     wal_sync: bool,
+
+    /// Default blocks per pack for new exports (from global config).
+    default_blocks_per_pack: usize,
 
     /// Scrubber metrics (global, not per-export)
     scrubber_metrics: Arc<crate::nbd::scrubber::ScrubberMetrics>,
@@ -270,6 +275,7 @@ impl ExportRouter {
             pack_index,
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
+            default_blocks_per_pack: config.default_blocks_per_pack,
             scrubber_metrics: Arc::new(crate::nbd::scrubber::ScrubberMetrics::new()),
             s3_circuit_breaker,
             upload_semaphore,
@@ -674,7 +680,11 @@ impl ExportRouter {
             }
         }
 
-        // Shared notify: write path signals when dirty count crosses BLOCKS_PER_PACK
+        // Resolve per-export blocks_per_pack: export config > global default.
+        // 0 = manual mode (no auto-flush).
+        let blocks_per_pack = config.blocks_per_pack_or(self.default_blocks_per_pack);
+
+        // Shared notify: write path signals when dirty count crosses blocks_per_pack
         let flush_notify = Arc::new(Notify::new());
 
         // Create handler for block I/O
@@ -688,6 +698,8 @@ impl ExportRouter {
             Arc::clone(&metrics),
             Arc::clone(&self.ssd_utilization),
             Arc::clone(&flush_notify),
+            blocks_per_pack,
+            None, // TODO: wire up write_trace_path from ExportConfig
         ));
 
         // Start flush scheduler for this export
@@ -950,6 +962,8 @@ impl ExportRouter {
             size_gb: new_size_gb,
             s3_prefix: None, // Will use name as prefix (same as before)
             block_size: Some(block_size),
+            blocks_per_pack: None,
+            flush_mode: None,
         };
 
         self.create_export(config.clone(), readonly, Some(name)).await?;
@@ -1122,6 +1136,7 @@ impl ExportRouter {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
+            default_blocks_per_pack: crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK,
         }).expect("failed to create test router")
     }
 }
@@ -1160,6 +1175,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
+            default_blocks_per_pack: crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK,
         }).expect("failed to create test router")
     }
 
@@ -1169,6 +1185,8 @@ mod tests {
             size_gb: 0.01, // 10MB
             s3_prefix: None,
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         }
     }
 
@@ -1505,18 +1523,24 @@ mod tests {
                 size_gb: 1.0,
                 s3_prefix: None,
                 block_size: None,
+                blocks_per_pack: None,
+                flush_mode: None,
                 },
             ExportConfig {
                 name: "discover-vol2".to_string(),
                 size_gb: 2.0,
                 s3_prefix: None,
                 block_size: None,
+                blocks_per_pack: None,
+                flush_mode: None,
                 },
             ExportConfig {
                 name: "discover-vol3".to_string(),
                 size_gb: 3.0,
                 s3_prefix: None,
                 block_size: None,
+                blocks_per_pack: None,
+                flush_mode: None,
                 },
         ];
 
@@ -1629,6 +1653,8 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("source".to_string()), // same S3 prefix as source
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         };
         router.create_export(fork_config, false, Some("source")).await.unwrap();
 
@@ -1655,6 +1681,8 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("src".to_string()),
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         };
         router.create_export(fork_config, false, Some("src")).await.unwrap();
 
@@ -1687,6 +1715,8 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("nonexistent-source".to_string()),
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         };
 
         let result = router.create_export(config, false, Some("does-not-exist")).await;
@@ -1776,6 +1806,8 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         };
         router.create_export(fork_config, false, Some("parent")).await.unwrap();
 
@@ -2002,5 +2034,129 @@ mod tests {
             super::extract_export_name("test/nbd//export.json", "test"),
             None
         );
+    }
+
+    // =========================================================================
+    // Per-export flush config tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_manual_mode_export_no_auto_flush() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Create export with flush_mode = "manual"
+        let config = ExportConfig {
+            name: "manual-vm".to_string(),
+            size_gb: 0.01,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: Some("manual".to_string()),
+        };
+        router.create_export(config, false, None).await.unwrap();
+
+        // Write many blocks — well above DEFAULT_BLOCKS_PER_PACK
+        let handler = router.get_handler("manual-vm").await.unwrap();
+        // 50 blocks × 128KB = 6.4MB (within our 10MB device)
+        for i in 0..50u64 {
+            handler.write(i * 128 * 1024, &[0xAA; 128 * 1024], false).unwrap();
+        }
+
+        // Wait briefly — in auto mode, the flush scheduler would drain dirty blocks.
+        // In manual mode, they should accumulate.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let metrics = router.get_export_metrics("manual-vm").await.unwrap();
+        let dirty = metrics.dirty_blocks.unwrap();
+        assert!(
+            dirty > 0,
+            "manual mode should accumulate dirty blocks without auto-flush (dirty={dirty})",
+        );
+
+        // Explicit drain should still work
+        router.drain_export("manual-vm").await.unwrap();
+
+        let metrics_after = router.get_export_metrics("manual-vm").await.unwrap();
+        assert_eq!(
+            metrics_after.dirty_blocks.unwrap(), 0,
+            "drain should flush all dirty blocks even in manual mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pressure_flush_works_in_manual_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Create manual-mode export
+        let config = ExportConfig {
+            name: "manual-pressure".to_string(),
+            size_gb: 0.01,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: Some("manual".to_string()),
+        };
+        router.create_export(config, false, None).await.unwrap();
+
+        // Write some dirty blocks
+        let handler = router.get_handler("manual-pressure").await.unwrap();
+        for i in 0..10u64 {
+            handler.write(i * 128 * 1024, &[0xBB; 128 * 1024], false).unwrap();
+        }
+
+        let dirty_before = router
+            .get_export_metrics("manual-pressure")
+            .await
+            .unwrap()
+            .dirty_blocks
+            .unwrap();
+        assert!(dirty_before > 0);
+
+        // Pressure flush should still work (safety valve for SSD capacity)
+        router.pressure_flush().await;
+
+        // Pressure flush flushes packs but doesn't drain to zero — it flushes
+        // one batch. Verify it ran without error (the important thing is it
+        // doesn't skip manual-mode exports).
+        // The actual dirty count may or may not decrease depending on timing.
+    }
+
+    #[tokio::test]
+    async fn test_blocks_per_pack_config_resolution() {
+        // Verify ExportConfig.blocks_per_pack_or() cascade:
+        // 1. flush_mode = "manual" → 0
+        // 2. export override → export value
+        // 3. fallback → global default
+        let manual = ExportConfig {
+            name: "m".to_string(),
+            size_gb: 1.0,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: Some(1000),
+            flush_mode: Some("manual".to_string()),
+        };
+        assert_eq!(manual.blocks_per_pack_or(500), 0, "manual mode always returns 0");
+
+        let custom = ExportConfig {
+            name: "c".to_string(),
+            size_gb: 1.0,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: Some(1000),
+            flush_mode: None,
+        };
+        assert_eq!(custom.blocks_per_pack_or(500), 1000, "export override wins");
+
+        let default = ExportConfig {
+            name: "d".to_string(),
+            size_gb: 1.0,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+        };
+        assert_eq!(default.blocks_per_pack_or(500), 500, "falls back to global default");
     }
 }

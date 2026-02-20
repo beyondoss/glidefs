@@ -8,7 +8,7 @@ use crate::nbd::block_map::{
 };
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::manifest::{Manifest, ManifestBlockEntry, ManifestDelta};
-use crate::nbd::pack::{self, PackLocation, BLOCKS_PER_PACK};
+use crate::nbd::pack::{self, PackLocation, DEFAULT_BLOCKS_PER_PACK};
 use crate::nbd::pack_index::HostPackIndex;
 use crate::nbd::pack_registry::PackRegistry;
 use crate::nbd::state::{Active, Draining};
@@ -338,14 +338,15 @@ impl WriteCache<Active> {
         {
             let mut iter = to_upload.into_iter().peekable();
             while iter.peek().is_some() {
-                owned_chunks.push(iter.by_ref().take(BLOCKS_PER_PACK).collect());
+                owned_chunks.push(iter.by_ref().take(DEFAULT_BLOCKS_PER_PACK).collect());
             }
         }
 
+        #[allow(clippy::type_complexity)]
         let pack_results: Vec<Result<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>), CacheError>> =
             stream::iter(owned_chunks)
                 .map(|chunk| {
-                    let cs = &*content_store;
+                    let cs = content_store;
                     async move {
                         let pack_id = uuid::Uuid::new_v4();
                         let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size);

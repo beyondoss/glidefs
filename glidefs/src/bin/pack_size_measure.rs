@@ -497,7 +497,7 @@ fn main() {
     // Model: event-driven flush (1 pack per flush), 1000 VMs,
     // moderate app server writing ~50 unique blocks/sec.
     println!();
-    let unique_blocks_per_sec = 50.0_f64;
+    let unique_blocks_per_sec = 5.0_f64;
     let vms = 1000.0_f64;
     let unique_blocks_per_day = unique_blocks_per_sec * 86400.0;
     println!(

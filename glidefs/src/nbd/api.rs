@@ -35,6 +35,12 @@ pub struct PutExportRequest {
     /// If set, fork this export from the named S3 manifest.
     #[serde(default)]
     pub manifest_name: Option<String>,
+    /// Blocks per S3 pack (default: inherit from global config). 0 = manual mode.
+    #[serde(default)]
+    pub blocks_per_pack: Option<usize>,
+    /// Flush mode: "auto" (default) or "manual" (drain-only).
+    #[serde(default)]
+    pub flush_mode: Option<String>,
 }
 
 /// Response for export info.
@@ -210,6 +216,8 @@ where
                         size_gb: put_req.size_gb,
                         s3_prefix: put_req.s3_prefix,
                         block_size: put_req.block_size,
+                        blocks_per_pack: put_req.blocks_per_pack,
+                        flush_mode: put_req.flush_mode,
                     };
 
                     match router.create_export(config.clone(), put_req.readonly, put_req.manifest_name.as_deref()).await {
@@ -491,6 +499,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
+            default_blocks_per_pack: crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK,
         }).expect("failed to create test router"))
     }
 

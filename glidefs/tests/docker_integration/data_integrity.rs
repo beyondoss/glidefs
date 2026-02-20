@@ -122,6 +122,8 @@ async fn test_corrupt_manifest_rejected() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
     };
     let result = server2
         .router

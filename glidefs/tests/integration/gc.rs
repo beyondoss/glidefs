@@ -44,13 +44,13 @@ fn write_blocks(
 ) {
     for i in 0..count {
         let offset = (start + i) * BLOCK_SIZE;
-        // Use seed as a prefix byte followed by block-specific data.
-        // This ensures no two (seed, index) pairs produce the same block content,
-        // avoiding cross-seed hash collisions from cyclic byte patterns.
+        // Embed seed + block index as LE u16 to ensure unique content per block,
+        // even for block indices > 255 (u8 wrapping caused dedup at 500 blocks/pack).
         let mut data = vec![0u8; BLOCK_SIZE];
         data[0] = seed;
-        data[1] = (start + i) as u8;
-        for (b, byte) in data.iter_mut().enumerate().take(BLOCK_SIZE).skip(2) {
+        let idx = (start + i) as u16;
+        data[1..3].copy_from_slice(&idx.to_le_bytes());
+        for (b, byte) in data.iter_mut().enumerate().take(BLOCK_SIZE).skip(3) {
             *byte = ((i + b) % 256) as u8;
         }
         cache.write(offset as u64, &data, clean_cache).unwrap();
@@ -395,12 +395,13 @@ async fn test_gc_respects_max_deletes() {
     let (cache, cs, pi, cc, _m) =
         create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _);
 
-    // Create orphans: write blocks, flush, overwrite with different data, flush
-    write_blocks(&cache, 0, 200, 0, cc.as_ref()); // enough blocks to create multiple packs
+    // Create orphans: write blocks, flush, overwrite with different data, flush.
+    // Need >500 blocks per write to create multiple packs (500 blocks/pack).
+    write_blocks(&cache, 0, 750, 0, cc.as_ref());
     let stats1 = cache.flush_to_s3(&cs, &pi).await.unwrap();
     let _orphan_count = stats1.new_pack_ids.len();
 
-    write_blocks(&cache, 0, 200, 42, cc.as_ref());
+    write_blocks(&cache, 0, 750, 42, cc.as_ref());
     cache.flush_to_s3(&cs, &pi).await.unwrap();
 
     // Inject old timestamps so all orphans are eligible

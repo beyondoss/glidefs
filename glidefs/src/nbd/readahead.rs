@@ -4,7 +4,7 @@
 //! consecutive chunks are read, triggers prefetch of the next pack to
 //! hide S3 latency for sequential workloads (boot, large file reads).
 
-use crate::nbd::pack::BLOCKS_PER_PACK;
+use crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK;
 
 /// Tracks recent chunk accesses to detect sequential read patterns.
 pub struct SequentialDetector {
@@ -55,8 +55,8 @@ impl SequentialDetector {
         }
 
         // Calculate the first chunk of the next pack
-        let current_pack = chunk_index / BLOCKS_PER_PACK as u64;
-        let next_pack_start = (current_pack + 1) * BLOCKS_PER_PACK as u64;
+        let current_pack = chunk_index / DEFAULT_BLOCKS_PER_PACK as u64;
+        let next_pack_start = (current_pack + 1) * DEFAULT_BLOCKS_PER_PACK as u64;
 
         // Don't re-trigger for the same target
         if self.last_readahead_chunk == Some(next_pack_start) {
@@ -119,10 +119,10 @@ mod tests {
         assert_eq!(dup, None, "should not re-trigger for the same pack");
 
         // Keep feeding until we cross into the next pack boundary.
-        // BLOCKS_PER_PACK = 25, so pack 0 is chunks 0..24, pack 1 is 25..49.
+        // DEFAULT_BLOCKS_PER_PACK = 500, so pack 0 is chunks 0..499, pack 1 is 500..999.
         // We need to reach a point where the next-pack calculation differs.
         let mut new_trigger = None;
-        for i in 4..=BLOCKS_PER_PACK as u64 + 2 {
+        for i in 4..=DEFAULT_BLOCKS_PER_PACK as u64 + 2 {
             if let Some(t) = det.record(i) {
                 new_trigger = Some(t);
                 break;
@@ -172,14 +172,14 @@ mod tests {
         let mut det = SequentialDetector::new();
 
         // Test with large chunk indices near pack boundaries
-        let base = BLOCKS_PER_PACK as u64 * 1000; // pack 1000
+        let base = DEFAULT_BLOCKS_PER_PACK as u64 * 1000; // pack 1000
         assert_eq!(det.record(base), None);
         assert_eq!(det.record(base + 1), None);
         let result = det.record(base + 2);
         assert!(result.is_some(), "should trigger at high chunk indices");
 
         let target = result.unwrap();
-        let expected_next_pack = ((base + 2) / BLOCKS_PER_PACK as u64 + 1) * BLOCKS_PER_PACK as u64;
+        let expected_next_pack = ((base + 2) / DEFAULT_BLOCKS_PER_PACK as u64 + 1) * DEFAULT_BLOCKS_PER_PACK as u64;
         assert_eq!(target, expected_next_pack);
     }
 

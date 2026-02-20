@@ -8,11 +8,11 @@ use super::cache::BlockCache;
 use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
 use super::metrics::ExportMetrics;
-use super::pack::BLOCKS_PER_PACK;
 use super::pack_index::HostPackIndex;
 use super::readahead::SequentialDetector;
 use super::state::Active;
 use super::write_cache::WriteCache;
+use super::write_trace::WriteTracer;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -65,8 +65,15 @@ pub struct NBDBlockHandler {
     /// Used to reject writes to new blocks when SSD > 95%.
     ssd_utilization: Arc<AtomicU64>,
 
-    /// Notifies the flush scheduler when dirty blocks reach BLOCKS_PER_PACK.
+    /// Notifies the flush scheduler when dirty blocks reach the threshold.
     flush_notify: Arc<Notify>,
+
+    /// Flush threshold: auto-flush when dirty blocks reach this count.
+    /// 0 = manual mode (no auto-flush, drain/snapshot only).
+    blocks_per_pack: usize,
+
+    /// Optional write trace recorder. Zero cost when None.
+    write_tracer: Option<Arc<WriteTracer>>,
 }
 
 impl NBDBlockHandler {
@@ -88,6 +95,8 @@ impl NBDBlockHandler {
         metrics: Arc<ExportMetrics>,
         ssd_utilization: Arc<AtomicU64>,
         flush_notify: Arc<Notify>,
+        blocks_per_pack: usize,
+        write_tracer: Option<Arc<WriteTracer>>,
     ) -> Self {
         Self {
             cache,
@@ -100,6 +109,8 @@ impl NBDBlockHandler {
             readahead: Mutex::new(SequentialDetector::new()),
             ssd_utilization,
             flush_notify,
+            blocks_per_pack,
+            write_tracer,
         }
     }
 
@@ -127,10 +138,13 @@ impl NBDBlockHandler {
         self.device_size.store(new_size, Ordering::Relaxed);
     }
 
-    /// Notify the flush scheduler if dirty blocks have reached pack size.
+    /// Notify the flush scheduler if dirty blocks have reached the threshold.
+    /// No-op when blocks_per_pack == 0 (manual flush mode).
     #[inline]
     fn check_flush_threshold(&self) {
-        if self.cache.dirty_block_count() >= BLOCKS_PER_PACK as u64 {
+        if self.blocks_per_pack > 0
+            && self.cache.dirty_block_count() >= self.blocks_per_pack as u64
+        {
             self.flush_notify.notify_one();
         }
     }
@@ -223,6 +237,9 @@ impl NBDBlockHandler {
 
         self.metrics.record_guest_write(data.len() as u64);
         self.cache.write(offset, data, self.clean_cache.as_ref())?;
+        if let Some(ref tracer) = self.write_tracer {
+            tracer.record(offset, data.len() as u64, super::write_trace::TraceOp::Write);
+        }
         self.check_flush_threshold();
 
         if fua {
@@ -252,6 +269,9 @@ impl NBDBlockHandler {
         }
 
         self.cache.zero_range(offset, length as u64)?;
+        if let Some(ref tracer) = self.write_tracer {
+            tracer.record(offset, length as u64, super::write_trace::TraceOp::Trim);
+        }
         self.check_flush_threshold();
 
         if fua {
@@ -282,6 +302,9 @@ impl NBDBlockHandler {
         }
 
         self.cache.zero_range(offset, length as u64)?;
+        if let Some(ref tracer) = self.write_tracer {
+            tracer.record(offset, length as u64, super::write_trace::TraceOp::WriteZeroes);
+        }
         self.check_flush_threshold();
 
         if fua {
@@ -315,6 +338,7 @@ impl NBDBlockHandler {
 mod tests {
     use super::*;
     use crate::nbd::cache::SimpleBlockCache;
+    use crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK;
     use crate::nbd::write_cache::WriteCacheConfig;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
@@ -359,6 +383,8 @@ mod tests {
             metrics,
             Arc::new(AtomicU64::new(0f64.to_bits())),
             Arc::new(Notify::const_new()),
+            DEFAULT_BLOCKS_PER_PACK,
+            None,
         );
 
         (handler, temp_dir)
@@ -511,4 +537,134 @@ mod tests {
         assert!(read_data.iter().all(|&b| b == 0));
     }
 
+    // =========================================================================
+    // Per-export flush threshold tests
+    // =========================================================================
+
+    /// Helper: create a handler with a specific blocks_per_pack and a shared
+    /// Notify so we can observe whether auto-flush was triggered.
+    fn test_handler_with_flush_config(
+        blocks_per_pack: usize,
+    ) -> (NBDBlockHandler, Arc<Notify>, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        // 256 blocks × 4096 = 1MB device, enough for threshold tests
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "flush-test".to_string(),
+            device_size: 1024 * 1024,
+            block_size: 4096,
+            wal_sync: false,
+        };
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
+        let clean_cache: Arc<dyn BlockCache> =
+            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index =
+            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let metrics = Arc::new(ExportMetrics::new());
+        let flush_notify = Arc::new(Notify::new());
+
+        let cache = WriteCache::open(config).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let handler = NBDBlockHandler::new(
+            Arc::new(cache),
+            content_store,
+            clean_cache,
+            pack_index,
+            1024 * 1024,
+            false,
+            metrics,
+            Arc::new(AtomicU64::new(0f64.to_bits())),
+            Arc::clone(&flush_notify),
+            blocks_per_pack,
+            None,
+        );
+
+        (handler, flush_notify, temp_dir)
+    }
+
+    #[test]
+    fn test_manual_mode_never_notifies() {
+        // blocks_per_pack = 0 → manual mode, no auto-flush
+        let (handler, flush_notify, _temp) = test_handler_with_flush_config(0);
+
+        // Write 200 blocks — well above any reasonable threshold
+        for i in 0..200u64 {
+            handler.write(i * 4096, &[0xAA; 4096], false).unwrap();
+        }
+
+        // flush_notify should NOT have been triggered.
+        // Notify doesn't have try_recv, so we check via a zero-timeout wait.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let was_notified = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                flush_notify.notified(),
+            )
+            .await
+            .is_ok()
+        });
+        assert!(
+            !was_notified,
+            "manual mode (blocks_per_pack=0) should never notify flush scheduler"
+        );
+    }
+
+    #[test]
+    fn test_custom_threshold_triggers_at_configured_value() {
+        // blocks_per_pack = 5 → auto-flush after 5 dirty blocks
+        let (handler, flush_notify, _temp) = test_handler_with_flush_config(5);
+
+        // Write 4 blocks — below threshold, should NOT notify
+        for i in 0..4u64 {
+            handler.write(i * 4096, &[0xBB; 4096], false).unwrap();
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let notified_early = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                flush_notify.notified(),
+            )
+            .await
+            .is_ok()
+        });
+        assert!(
+            !notified_early,
+            "should not notify below threshold (4 < 5)"
+        );
+
+        // Write the 5th block — reaches threshold, SHOULD notify
+        handler.write(4 * 4096, &[0xCC; 4096], false).unwrap();
+
+        let notified_at_threshold = rt.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                flush_notify.notified(),
+            )
+            .await
+            .is_ok()
+        });
+        assert!(
+            notified_at_threshold,
+            "should notify when dirty blocks reach threshold (5 >= 5)"
+        );
+    }
+
+    #[test]
+    fn test_default_threshold_matches_default_blocks_per_pack() {
+        // Verify the default handler uses DEFAULT_BLOCKS_PER_PACK
+        let (handler, _temp) = test_handler();
+        assert_eq!(
+            handler.blocks_per_pack, DEFAULT_BLOCKS_PER_PACK,
+            "default handler should use DEFAULT_BLOCKS_PER_PACK"
+        );
+    }
 }

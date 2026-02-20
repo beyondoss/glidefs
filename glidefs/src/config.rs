@@ -148,6 +148,12 @@ pub struct NbdConfig {
     /// Bounds host-level S3 read concurrency on the NBD read path.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_s3_downloads: Option<usize>,
+
+    /// Default blocks per S3 pack for new exports (default: 500).
+    /// Higher values reduce S3 PUT costs but increase zombie storage.
+    /// Per-export override available via exports config or API.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub blocks_per_pack: Option<usize>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -170,6 +176,15 @@ pub struct ExportConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block_size: Option<usize>,
 
+    /// Blocks per S3 pack (default: inherit from global nbd.blocks_per_pack).
+    /// 0 = manual flush mode (no auto-flush, drain/snapshot only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub blocks_per_pack: Option<usize>,
+
+    /// Flush mode: "auto" (default) or "manual" (drain-only, no auto S3 flush).
+    /// When "manual", dirty blocks only flush on drain, snapshot, or shutdown.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub flush_mode: Option<String>,
 }
 
 impl ExportConfig {
@@ -186,6 +201,15 @@ impl ExportConfig {
     /// Get the block size, falling back to the provided default.
     pub fn block_size_or(&self, default: usize) -> usize {
         self.block_size.unwrap_or(default)
+    }
+
+    /// Resolve blocks_per_pack: export override > global default > compile-time default.
+    /// Returns 0 for manual flush mode (drain-only).
+    pub fn blocks_per_pack_or(&self, global_default: usize) -> usize {
+        if self.flush_mode.as_deref() == Some("manual") {
+            return 0;
+        }
+        self.blocks_per_pack.unwrap_or(global_default)
     }
 }
 
@@ -238,6 +262,12 @@ impl NbdConfig {
             .unwrap_or(Self::DEFAULT_MAX_S3_DOWNLOADS)
     }
 
+    /// Default blocks per pack for new exports.
+    pub fn blocks_per_pack(&self) -> usize {
+        self.blocks_per_pack
+            .unwrap_or(crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK)
+    }
+
     /// Get the list of exports, handling legacy single-device config.
     pub fn get_exports(&self) -> Vec<ExportConfig> {
         if !self.exports.is_empty() {
@@ -251,7 +281,8 @@ impl NbdConfig {
                 size_gb,
                 s3_prefix: None,
                 block_size: None,
-
+                blocks_per_pack: None,
+                flush_mode: None,
             }];
         }
 
@@ -261,6 +292,8 @@ impl NbdConfig {
             size_gb: Self::DEFAULT_DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         }]
     }
 }
@@ -510,11 +543,12 @@ impl Settings {
                         size_gb: 100.0,
                         s3_prefix: None,
                         block_size: None,
-                
+                        blocks_per_pack: None,
+                        flush_mode: None,
                     }],
                     device_name: None,
                     device_size_gb: None,
-    
+                    blocks_per_pack: None,
                     scrubber_blocks_per_second: None,
                     wal_sync: None,
                     shutdown_timeout_secs: None,

@@ -141,7 +141,7 @@ echo ""
 echo "Building filesystem helper..."
 docker build -q -t glidefs-dedup-helper -f - . >/dev/null 2>&1 <<'HELPER'
 FROM ubuntu:22.04
-RUN apt-get update -qq && apt-get install -y -qq e2fsprogs xfsprogs btrfs-progs tar nodejs npm >/dev/null 2>&1
+RUN apt-get update -qq && apt-get install -y -qq e2fsprogs xfsprogs btrfs-progs tar nodejs npm git python3-pip >/dev/null 2>&1
 HELPER
 
 # ---------------------------------------------------------------------------
@@ -235,6 +235,55 @@ docker run --rm --privileged \
         echo "const express = require(\"express\"); const app = express(); app.listen(3000);" > index.js
         cd / && umount /mnt/img
         echo "[forked/vm-3-app] Done"
+
+        echo "[forked/vm-4-git-clone] Forking + git clone..."
+        cp /work/forked/base.raw /work/forked/vm-4-git-clone.raw
+        mount -o loop /work/forked/vm-4-git-clone.raw /mnt/img
+        cd /mnt/img/root
+        git clone --depth 1 https://github.com/expressjs/express.git >/dev/null 2>&1 || true
+        cd / && umount /mnt/img
+        echo "[forked/vm-4-git-clone] Done"
+
+        echo "[forked/vm-5-pip-django] Forking + pip install django..."
+        cp /work/forked/base.raw /work/forked/vm-5-pip-django.raw
+        mount -o loop /work/forked/vm-5-pip-django.raw /mnt/img
+        cd /mnt/img/root && mkdir -p app && cd app
+        pip3 install django >/dev/null 2>&1 || true
+        cd / && umount /mnt/img
+        echo "[forked/vm-5-pip-django] Done"
+
+        echo "[forked/vm-6-many-files] Forking + creating 10000 small files..."
+        cp /work/forked/base.raw /work/forked/vm-6-many-files.raw
+        mount -o loop /work/forked/vm-6-many-files.raw /mnt/img
+        cd /mnt/img/root && mkdir -p project
+        for i in $(seq 1 10000); do
+            dir="project/d$(( i % 100 ))"
+            mkdir -p "$dir"
+            echo "file ${i} content $(date +%s%N)" > "${dir}/f${i}.txt"
+        done
+        cd / && umount /mnt/img
+        echo "[forked/vm-6-many-files] Done"
+
+        echo "[forked/vm-7-mixed-workload] Forking + npm + git + files..."
+        cp /work/forked/base.raw /work/forked/vm-7-mixed-workload.raw
+        mount -o loop /work/forked/vm-7-mixed-workload.raw /mnt/img
+        cd /mnt/img/root && mkdir -p app && cd app
+        npm init -y >/dev/null 2>&1
+        npm install express body-parser cors >/dev/null 2>&1
+        git init >/dev/null 2>&1
+        git config user.email "test@test.com"
+        git config user.name "test"
+        mkdir -p src tests config
+        for i in $(seq 1 100); do
+            dd if=/dev/urandom bs=2048 count=1 2>/dev/null | base64 > src/module_${i}.ts
+        done
+        for i in $(seq 1 50); do
+            dd if=/dev/urandom bs=1024 count=1 2>/dev/null | base64 > tests/test_${i}.ts
+        done
+        echo "{\"port\":3000}" > config/default.json
+        git add -A >/dev/null 2>&1 && git commit -m "init" >/dev/null 2>&1
+        cd / && umount /mnt/img
+        echo "[forked/vm-7-mixed-workload] Done"
     '
 
 # ---------------------------------------------------------------------------
@@ -383,9 +432,11 @@ for name in $INDEP_NAMES; do
 done
 echo ""
 echo "Forked from same base (ext4):"
-for name in base vm-0-express vm-1-express vm-2-nextjs vm-3-app; do
-    size=$(ls -lh "$OUT/forked/${name}.raw" | awk '{print $5}')
-    echo "  $OUT/forked/${name}.raw  ($size)"
+for name in base vm-0-express vm-1-express vm-2-nextjs vm-3-app vm-4-git-clone vm-5-pip-django vm-6-many-files vm-7-mixed-workload; do
+    [ -f "$OUT/forked/${name}.raw" ] && {
+        size=$(ls -lh "$OUT/forked/${name}.raw" | awk '{print $5}')
+        echo "  $OUT/forked/${name}.raw  ($size)"
+    }
 done
 echo ""
 echo "Forked from same base (XFS):"

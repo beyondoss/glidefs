@@ -169,7 +169,7 @@ fn create_test_cache(
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: name.to_string(),
-        device_size: 64 * 1024 * 1024, // 64MB
+        device_size: 256 * 1024 * 1024, // 256MB (enough for multi-pack tests at 500 blocks/pack)
         block_size: BLOCK_SIZE,
         wal_sync: false,
     };
@@ -715,10 +715,17 @@ async fn test_partial_pack_upload_preserves_dirty() {
     let (cache, content_store, pack_index, clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
 
-    // Write enough blocks for multiple packs (100 blocks per pack, so 250 blocks = 2-3 packs)
-    let num_blocks = 250u32;
+    // Write enough blocks for 3 packs (500 blocks per pack, so 1250 = 3 packs).
+    // fail_after_puts(2) lets 2 pack uploads succeed, fails the 3rd.
+    let num_blocks = 1250u32;
     for i in 0..num_blocks {
-        let data: Vec<u8> = (0..BLOCK_SIZE).map(|j| (i as u8).wrapping_add(j as u8)).collect();
+        // Embed block index as LE u16 to ensure unique content per block (avoids u8 wrapping dedup).
+        let mut data = vec![0u8; BLOCK_SIZE];
+        data[..2].copy_from_slice(&(i as u16).to_le_bytes());
+        #[allow(clippy::needless_range_loop)]
+        for j in 2..BLOCK_SIZE {
+            data[j] = ((i as usize + j) % 256) as u8;
+        }
         cache.write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref()).unwrap();
     }
 
@@ -775,7 +782,12 @@ async fn test_partial_pack_upload_preserves_dirty() {
             .await
             .unwrap();
 
-        let expected: Vec<u8> = (0..BLOCK_SIZE).map(|j| (i as u8).wrapping_add(j as u8)).collect();
+        let mut expected = vec![0u8; BLOCK_SIZE];
+        expected[..2].copy_from_slice(&(i as u16).to_le_bytes());
+        #[allow(clippy::needless_range_loop)]
+        for j in 2..BLOCK_SIZE {
+            expected[j] = ((i as usize + j) % 256) as u8;
+        }
         assert_eq!(
             data.as_ref(),
             &expected[..],

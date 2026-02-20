@@ -2,7 +2,7 @@ use crate::config::Settings;
 use crate::nbd::block_map::{blake3_128, lz4_compress, BlockMap, BlockMapEntry, zero_block_hash};
 use crate::nbd::content_store::ContentStore;
 use crate::nbd::manifest::{serialize_hot_set, Manifest, ManifestBlockEntry};
-use crate::nbd::pack::{assemble_pack, PackLocation, BLOCKS_PER_PACK};
+use crate::nbd::pack::{assemble_pack, PackLocation, DEFAULT_BLOCKS_PER_PACK};
 use crate::nbd::pack_index::HostPackIndex;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
@@ -82,7 +82,7 @@ pub async fn run_bless(
     info!(device_size, num_chunks, "reading image");
 
     let mut block_entries: Vec<ManifestBlockEntry> = Vec::with_capacity(num_chunks);
-    let mut batch: Vec<(crate::nbd::block_map::Blake3Hash, Vec<u8>)> = Vec::with_capacity(BLOCKS_PER_PACK);
+    let mut batch: Vec<(crate::nbd::block_map::Blake3Hash, Vec<u8>)> = Vec::with_capacity(DEFAULT_BLOCKS_PER_PACK);
     let mut buf = vec![0u8; chunk_size as usize];
 
     let mut stats = BlessStats::default();
@@ -122,7 +122,7 @@ pub async fn run_bless(
         batch.push((hash, compressed));
 
         // Flush pack when full
-        if batch.len() >= BLOCKS_PER_PACK {
+        if batch.len() >= DEFAULT_BLOCKS_PER_PACK {
             upload_pack(&content_store, &pack_index, &mut batch, chunk_size, &mut stats).await?;
         }
     }
@@ -326,7 +326,7 @@ mod tests {
             stats.unique_chunks += 1;
             batch.push((hash, compressed));
 
-            if batch.len() >= BLOCKS_PER_PACK {
+            if batch.len() >= DEFAULT_BLOCKS_PER_PACK {
                 upload_pack(content_store, &pack_index, &mut batch, chunk_size, &mut stats).await?;
             }
         }

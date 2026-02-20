@@ -21,6 +21,7 @@ pub mod state;
 pub mod sync;
 pub mod wal;
 pub mod write_cache;
+pub mod write_trace;
 
 // Re-export protocol types for fuzzing
 #[cfg(feature = "fuzz")]

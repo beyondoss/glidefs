@@ -314,15 +314,19 @@ async fn test_flush_concurrent_write_stays_dirty() {
 
 #[tokio::test]
 async fn test_flush_manifest_self_contained() {
-    let h = V2Harness::new().await;
+    // 3MB device (750 blocks at 4KB) — enough for 600 writes
+    let h = V2Harness::with_config(3 * 1024 * 1024, 4096).await;
 
-    // Write 130 blocks (will produce 2 packs: 100 + 30)
-    for i in 0u16..130 {
-        h.cache.write(i as u64 * 4096, &vec![(i + 1) as u8; 4096], &h.clean_cache).unwrap();
+    // Write 600 unique blocks (will produce 2 packs: 500 + 100).
+    // Embed block index as LE bytes so every block has a unique hash.
+    for i in 0u16..600 {
+        let mut data = vec![0xAAu8; 4096];
+        data[..2].copy_from_slice(&(i + 1).to_le_bytes());
+        h.cache.write(i as u64 * 4096, &data, &h.clean_cache).unwrap();
     }
 
     let stats = h.flush().await;
-    assert_eq!(stats.packs_uploaded, 2, "should produce 2 packs (100+30)");
+    assert_eq!(stats.packs_uploaded, 2, "should produce 2 packs (500+100)");
 
     let manifest = h.manifest().await;
     let pack_hashes: std::collections::HashSet<_> =

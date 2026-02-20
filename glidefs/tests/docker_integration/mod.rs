@@ -114,6 +114,7 @@ impl TestServer {
             wal_sync: false,
             max_s3_uploads: 128,
             max_s3_downloads: 512,
+            default_blocks_per_pack: glidefs::nbd::pack::DEFAULT_BLOCKS_PER_PACK,
         }).expect("failed to create test router"));
 
         // Pre-bind to get a random port, then release for the server
@@ -154,6 +155,8 @@ impl TestServer {
             size_gb,
             s3_prefix: None,
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         };
         self.router
             .create_export(config, false, None)
@@ -168,6 +171,8 @@ impl TestServer {
             size_gb,
             s3_prefix: None,
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         };
         self.router
             .create_export(config, false, Some(name))
@@ -182,6 +187,8 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_prefix.to_string()),
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         };
         self.router
             .create_export(config, false, Some(name))
@@ -204,6 +211,8 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_manifest.to_string()),
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         };
         self.router
             .create_export(config, false, Some(source_manifest))
@@ -218,6 +227,8 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_manifest.to_string()),
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
         };
         self.router
             .create_export(config, true, Some(source_manifest))

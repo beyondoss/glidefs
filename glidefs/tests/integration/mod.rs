@@ -26,7 +26,7 @@ use glidefs::nbd::state::Active;
 use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
-const DEVICE_SIZE: u64 = 64 * 1024 * 1024; // 64MB
+const DEVICE_SIZE: u64 = 256 * 1024 * 1024; // 256MB (enough for multi-pack tests at 500 blocks/pack)
 
 /// Shared v2 test harness: creates a WriteCache with ContentStore + HostPackIndex + SimpleBlockCache.
 ///

@@ -1,8 +1,9 @@
 //! Per-export flush scheduler.
 //!
 //! Each export runs one scheduler that handles two concerns:
-//! - **Pack-size flush** (event-driven): when dirty blocks reach BLOCKS_PER_PACK,
-//!   the write path notifies the scheduler to flush packs + sync manifest to S3.
+//! - **Pack-size flush** (event-driven): when dirty blocks reach the per-export
+//!   `blocks_per_pack` threshold, the write path notifies the scheduler to flush
+//!   packs + sync manifest to S3. Disabled in manual mode (blocks_per_pack = 0).
 //! - **Local checkpoint** (periodic, 5s): persists block states and truncates the
 //!   WAL. No S3 involvement.
 //!
@@ -55,7 +56,7 @@ pub async fn flush_scheduler(
                 }
             }
 
-            // Event-driven: write path notifies when dirty count crosses BLOCKS_PER_PACK.
+            // Event-driven: write path notifies when dirty count crosses blocks_per_pack.
             () = flush_notify.notified() => {
                 let start = Instant::now();
                 match cache.flush_packs(&content_store, &pack_index).await {
@@ -108,7 +109,7 @@ mod tests {
 
     use crate::nbd::cache::{BlockCache, SimpleBlockCache};
     use crate::nbd::content_store::ContentStore;
-    use crate::nbd::pack::BLOCKS_PER_PACK;
+    use crate::nbd::pack::DEFAULT_BLOCKS_PER_PACK;
     use crate::nbd::pack_index::HostPackIndex;
     use crate::nbd::state::Initializing;
     use crate::nbd::write_cache::WriteCacheConfig;
@@ -131,7 +132,7 @@ mod tests {
         let config = WriteCacheConfig {
             cache_dir: temp_dir.path().to_path_buf(),
             device_name: "sched-test".to_string(),
-            device_size: 128 * 1024 * (BLOCKS_PER_PACK as u64 + 10), // enough for BLOCKS_PER_PACK + headroom
+            device_size: 128 * 1024 * (DEFAULT_BLOCKS_PER_PACK as u64 + 10), // enough for DEFAULT_BLOCKS_PER_PACK + headroom
             block_size: 128 * 1024,
             wal_sync: false,
         };
@@ -206,14 +207,14 @@ mod tests {
         let cache_check = Arc::clone(&cache);
         let flush_notify_clone = Arc::clone(&flush_notify);
 
-        // Write BLOCKS_PER_PACK dirty blocks
-        for i in 0..BLOCKS_PER_PACK {
+        // Write DEFAULT_BLOCKS_PER_PACK dirty blocks
+        for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
                 .write(offset, &[0xAA; 128 * 1024], clean_cache.as_ref())
                 .unwrap();
         }
-        assert_eq!(cache_check.dirty_block_count(), BLOCKS_PER_PACK as u64);
+        assert_eq!(cache_check.dirty_block_count(), DEFAULT_BLOCKS_PER_PACK as u64);
 
         let handle = tokio::spawn(async move {
             flush_scheduler(

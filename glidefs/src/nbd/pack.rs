@@ -30,7 +30,7 @@ use super::block_map::Blake3Hash;
 
 pub const PACK_MAGIC: &[u8; 4] = b"GLPK";
 pub const PACK_VERSION: u16 = 1;
-pub const BLOCKS_PER_PACK: usize = 100;
+pub const DEFAULT_BLOCKS_PER_PACK: usize = 500;
 pub const PACK_HEADER_SIZE: usize = 16;
 pub const PACK_INDEX_ENTRY_SIZE: usize = 24;
 
@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn test_pack_round_trip() {
         let chunk_size: u32 = 131072; // 128KB
-        let block_count = BLOCKS_PER_PACK; // 25
+        let block_count = DEFAULT_BLOCKS_PER_PACK;
 
         // Build blocks: hash the raw data, then compress it.
         let mut blocks = Vec::with_capacity(block_count);
