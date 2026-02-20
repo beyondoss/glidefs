@@ -72,6 +72,7 @@ parking_lot = "0.12"
 chrono = { version = "0.4.43", features = ["serde"] }
 
 [dev-dependencies]
+tokio = { version = "1.49", features = ["test-util"] }
 futures = "0.3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 proptest = "1.4"

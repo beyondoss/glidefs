@@ -144,8 +144,112 @@ mod tests {
     use crate::nbd::pack_index::HostPackIndex;
     use crate::nbd::state::Initializing;
     use crate::nbd::write_cache::WriteCacheConfig;
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
     use object_store::memory::InMemory;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
+
+    /// Object store that can toggle PUT failures for testing backoff.
+    #[derive(Debug)]
+    struct FailingObjectStore {
+        inner: InMemory,
+        fail_puts: AtomicBool,
+    }
+
+    impl FailingObjectStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                fail_puts: AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail_puts(&self, fail: bool) {
+            self.fail_puts.store(fail, Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Display for FailingObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingObjectStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for FailingObjectStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            if self.fail_puts.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "FailingObjectStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Simulated S3 failure",
+                    )),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> ObjectStoreResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
 
     #[allow(clippy::type_complexity)]
     fn test_scheduler_components() -> (
@@ -169,6 +273,55 @@ mod tests {
         };
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let content_store = Arc::new(ContentStore::new(s3, "test"));
+        let pack_index =
+            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let metrics = Arc::new(ExportMetrics::new());
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+        let cache = WriteCache::<Initializing>::open(config).unwrap();
+        let cache = Arc::new(cache.skip_recovery_for_test());
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let flush_notify = Arc::new(Notify::new());
+
+        (
+            cache,
+            content_store,
+            pack_index,
+            flush_notify,
+            shutdown_rx,
+            shutdown_tx,
+            metrics,
+            clean_cache,
+            temp_dir,
+        )
+    }
+
+    /// Like test_scheduler_components but with a custom object store.
+    #[allow(clippy::type_complexity)]
+    fn test_scheduler_components_with_store(
+        s3: Arc<dyn object_store::ObjectStore>,
+    ) -> (
+        Arc<WriteCache<Active>>,
+        Arc<ContentStore>,
+        Arc<HostPackIndex>,
+        Arc<Notify>,
+        watch::Receiver<bool>,
+        watch::Sender<bool>,
+        Arc<ExportMetrics>,
+        Arc<dyn BlockCache>,
+        TempDir,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "sched-backoff".to_string(),
+            device_size: 128 * 1024 * (DEFAULT_BLOCKS_PER_PACK as u64 + 10),
+            block_size: 128 * 1024,
+            wal_sync: false,
+        };
+
         let content_store = Arc::new(ContentStore::new(s3, "test"));
         let pack_index =
             Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
@@ -277,5 +430,203 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Test that the scheduler backs off exponentially when flush fails.
+    #[tokio::test(start_paused = true)]
+    async fn test_flush_backoff_on_failure() {
+        let failing_s3 = Arc::new(FailingObjectStore::new());
+        failing_s3.set_fail_puts(true);
+
+        let (
+            cache,
+            content_store,
+            pack_index,
+            flush_notify,
+            shutdown_rx,
+            shutdown_tx,
+            metrics,
+            clean_cache,
+            _temp,
+        ) = test_scheduler_components_with_store(failing_s3.clone() as _);
+
+        let metrics_check = Arc::clone(&metrics);
+        let flush_notify_clone = Arc::clone(&flush_notify);
+
+        // Write enough dirty blocks to trigger flush
+        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+            let offset = i as u64 * 128 * 1024;
+            cache
+                .write(offset, &[0xBB; 128 * 1024], clean_cache.as_ref())
+                .unwrap();
+        }
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache,
+                content_store,
+                pack_index,
+                flush_notify,
+                shutdown_rx,
+                metrics,
+            )
+            .await;
+        });
+
+        // First notify — should fail immediately (no backoff yet), backoff set to 1s
+        flush_notify_clone.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(metrics_check.snapshot().flush_errors, 1);
+
+        // Second notify — should wait 1s backoff before attempting flush
+        flush_notify_clone.notify_one();
+        // After 500ms the second flush hasn't happened yet (still in backoff)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(metrics_check.snapshot().flush_errors, 1, "should still be backing off");
+        // After another 600ms (total 1.1s), the backoff has elapsed and flush was attempted
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(metrics_check.snapshot().flush_errors, 2, "second flush should have been attempted");
+
+        // Third notify — should wait 2s backoff
+        flush_notify_clone.notify_one();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(metrics_check.snapshot().flush_errors, 2, "should still be in 2s backoff");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(metrics_check.snapshot().flush_errors, 3, "third flush after 2s backoff");
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Test that successful flush resets the backoff.
+    #[tokio::test(start_paused = true)]
+    async fn test_flush_backoff_resets_on_success() {
+        let failing_s3 = Arc::new(FailingObjectStore::new());
+        failing_s3.set_fail_puts(true);
+
+        let (
+            cache,
+            content_store,
+            pack_index,
+            flush_notify,
+            shutdown_rx,
+            shutdown_tx,
+            metrics,
+            clean_cache,
+            _temp,
+        ) = test_scheduler_components_with_store(failing_s3.clone() as _);
+
+        let metrics_check = Arc::clone(&metrics);
+        let cache_check = Arc::clone(&cache);
+        let flush_notify_clone = Arc::clone(&flush_notify);
+
+        // Write dirty blocks
+        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+            let offset = i as u64 * 128 * 1024;
+            cache
+                .write(offset, &[0xCC; 128 * 1024], clean_cache.as_ref())
+                .unwrap();
+        }
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache,
+                content_store,
+                pack_index,
+                flush_notify,
+                shutdown_rx,
+                metrics,
+            )
+            .await;
+        });
+
+        // First notify — fails, backoff = 1s
+        flush_notify_clone.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(metrics_check.snapshot().flush_errors, 1);
+        assert!(cache_check.dirty_block_count() > 0, "blocks still dirty");
+
+        // Enable S3 — next flush should succeed and reset backoff
+        failing_s3.set_fail_puts(false);
+        flush_notify_clone.notify_one();
+        // Wait past the 1s backoff + processing time
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(cache_check.dirty_block_count(), 0, "flush should have succeeded");
+        assert_eq!(metrics_check.snapshot().flush_errors, 1, "no new errors");
+
+        // Write more blocks and fail again — should start from 1s, not 2s
+        failing_s3.set_fail_puts(true);
+        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+            let offset = i as u64 * 128 * 1024;
+            cache_check
+                .write(offset, &[0xDD; 128 * 1024], clean_cache.as_ref())
+                .unwrap();
+        }
+
+        flush_notify_clone.notify_one();
+        // Should fail immediately (backoff was reset to zero by success)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(metrics_check.snapshot().flush_errors, 2, "immediate retry after reset");
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Test that shutdown is respected during backoff sleep.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_during_backoff() {
+        let failing_s3 = Arc::new(FailingObjectStore::new());
+        failing_s3.set_fail_puts(true);
+
+        let (
+            cache,
+            content_store,
+            pack_index,
+            flush_notify,
+            shutdown_rx,
+            shutdown_tx,
+            metrics,
+            clean_cache,
+            _temp,
+        ) = test_scheduler_components_with_store(failing_s3 as _);
+
+        let flush_notify_clone = Arc::clone(&flush_notify);
+
+        // Write dirty blocks
+        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+            let offset = i as u64 * 128 * 1024;
+            cache
+                .write(offset, &[0xEE; 128 * 1024], clean_cache.as_ref())
+                .unwrap();
+        }
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache,
+                content_store,
+                pack_index,
+                flush_notify,
+                shutdown_rx,
+                metrics,
+            )
+            .await;
+        });
+
+        // Trigger first failure to enter backoff
+        flush_notify_clone.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Trigger second notify — scheduler is now sleeping in 1s backoff
+        flush_notify_clone.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Signal shutdown while scheduler is in backoff sleep
+        shutdown_tx.send(true).unwrap();
+
+        // Scheduler should exit promptly despite being in backoff
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("scheduler should exit within 2s during backoff")
+            .unwrap();
     }
 }
