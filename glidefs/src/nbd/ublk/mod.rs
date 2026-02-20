@@ -20,11 +20,13 @@
 
 mod device;
 
-use crate::nbd::handler::BlockHandler;
 use crate::nbd::router::ExportRouter;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Default number of I/O queues per device.
+const DEFAULT_NR_QUEUES: u16 = 1;
 
 /// Manages ublk devices for exports.
 ///
@@ -33,6 +35,7 @@ use std::sync::Arc;
 /// that dispatch to the handler.
 pub struct UblkServer {
     router: Arc<ExportRouter>,
+    nr_queues: u16,
     devices: HashMap<String, device::UblkDevice>,
 }
 
@@ -41,8 +44,15 @@ impl UblkServer {
     pub fn new(router: Arc<ExportRouter>) -> Self {
         Self {
             router,
+            nr_queues: DEFAULT_NR_QUEUES,
             devices: HashMap::new(),
         }
+    }
+
+    /// Set the number of I/O queues per device (default: 1).
+    pub fn with_nr_queues(mut self, nr_queues: u16) -> Self {
+        self.nr_queues = nr_queues;
+        self
     }
 
     /// Register a ublk device for an export. Returns the `/dev/ublkbN` path.
@@ -53,7 +63,7 @@ impl UblkServer {
             .await
             .ok_or_else(|| anyhow::anyhow!("export '{}' not found", export_name))?;
 
-        let device = device::UblkDevice::register(handler).await?;
+        let device = device::UblkDevice::register(handler, self.nr_queues).await?;
         let path = device.dev_path().to_path_buf();
         self.devices.insert(export_name.to_string(), device);
         Ok(path)

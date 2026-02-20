@@ -79,6 +79,12 @@ pub enum RouterError {
         remaining: u64,
         iterations: usize,
     },
+
+    #[error("Shutdown incomplete: {incomplete_count} export(s) with dirty blocks: {details}")]
+    ShutdownIncomplete {
+        incomplete_count: usize,
+        details: String,
+    },
 }
 
 /// Information about an export for NBD protocol.
@@ -976,9 +982,7 @@ impl ExportRouter {
         };
 
         self.create_export(config.clone(), readonly, Some(name)).await?;
-        if let Err(e) = self.save_export(&config).await {
-            warn!("Failed to persist resized export to S3: {}", e);
-        }
+        self.save_export(&config).await?;
 
         info!("Export '{}' resized to {}GB", name, new_size_gb);
         Ok(())
@@ -1011,7 +1015,7 @@ impl ExportRouter {
         };
 
         info!("Removing export '{}'...", name);
-        Self::teardown_export(name, state).await;
+        let remaining = Self::teardown_export(name, state).await;
 
         // Prune pack index entries no longer referenced by any active export.
         // Must run after teardown (which drops the removed export's cache) so
@@ -1031,6 +1035,14 @@ impl ExportRouter {
             }
         }
 
+        if remaining > 0 {
+            return Err(RouterError::DrainIncomplete {
+                name: name.to_string(),
+                remaining,
+                iterations: MAX_DRAIN_ITERATIONS,
+            });
+        }
+
         info!("Export '{}' removed", name);
         Ok(())
     }
@@ -1038,7 +1050,10 @@ impl ExportRouter {
     /// Shutdown all exports gracefully.
     ///
     /// This properly transitions each cache through the typestate:
-    /// Active → Draining → finished
+    /// Active → Draining → finished.
+    ///
+    /// Returns `Err(ShutdownIncomplete)` if any export had dirty blocks
+    /// remaining after drain attempts, indicating potential data loss.
     pub async fn shutdown(&self) -> Result<(), RouterError> {
         info!("Shutting down all exports...");
 
@@ -1047,9 +1062,25 @@ impl ExportRouter {
         let export_list: Vec<_> = exports.drain().collect();
         drop(exports); // Release the lock
 
+        let mut incomplete: Vec<(String, u64)> = Vec::new();
         for (name, state) in export_list {
             info!("Shutting down export '{}'...", name);
-            Self::teardown_export(&name, state).await;
+            let remaining = Self::teardown_export(&name, state).await;
+            if remaining > 0 {
+                incomplete.push((name, remaining));
+            }
+        }
+
+        if !incomplete.is_empty() {
+            let details = incomplete
+                .iter()
+                .map(|(name, remaining)| format!("{name}({remaining} dirty)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(RouterError::ShutdownIncomplete {
+                incomplete_count: incomplete.len(),
+                details,
+            });
         }
 
         info!("All exports shut down");
@@ -1058,7 +1089,9 @@ impl ExportRouter {
 
     /// Drain dirty blocks, stop flush scheduler, and transition cache through
     /// the Draining typestate. Shared by `remove_export` and `shutdown`.
-    async fn teardown_export(name: &str, state: ExportState) {
+    ///
+    /// Returns the number of dirty blocks remaining (0 = fully drained).
+    async fn teardown_export(name: &str, state: ExportState) -> u64 {
         let ExportState {
             handler,
             cache,
@@ -1093,11 +1126,11 @@ impl ExportRouter {
                 }
             }
         }
-        if !drain_done {
+        let remaining = if drain_done { 0 } else { cache.dirty_block_count() };
+        if remaining > 0 {
             warn!(
                 "Teardown drain for '{}' incomplete, {} dirty blocks remain",
-                name,
-                cache.dirty_block_count()
+                name, remaining,
             );
         }
 
@@ -1125,6 +1158,8 @@ impl ExportRouter {
                 );
             }
         }
+
+        remaining
     }
 
     /// Create a minimal router for testing protocol handling.

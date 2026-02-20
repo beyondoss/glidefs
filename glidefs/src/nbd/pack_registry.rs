@@ -8,6 +8,7 @@
 //!   magic      [u8; 4]  = "GLPR"
 //!   count      u32 LE   (number of pack IDs)
 //!   pack_ids   [Uuid; count]  (16 bytes each, packed)
+//!   crc32      u32 LE   (CRC32 over all preceding bytes)
 
 use std::collections::HashSet;
 use std::io;
@@ -17,6 +18,7 @@ use uuid::Uuid;
 pub const PACK_REGISTRY_MAGIC: &[u8; 4] = b"GLPR";
 const HEADER_SIZE: usize = 8; // 4 magic + 4 count
 const UUID_SIZE: usize = 16;
+const CRC_SIZE: usize = 4;
 
 #[derive(Debug)]
 pub struct PackRegistry {
@@ -37,13 +39,16 @@ impl PackRegistry {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let total = HEADER_SIZE + self.pack_ids.len() * UUID_SIZE;
+        let payload = HEADER_SIZE + self.pack_ids.len() * UUID_SIZE;
+        let total = payload + CRC_SIZE;
         let mut buf = Vec::with_capacity(total);
         buf.extend_from_slice(PACK_REGISTRY_MAGIC);
         buf.extend_from_slice(&(self.pack_ids.len() as u32).to_le_bytes());
         for id in &self.pack_ids {
             buf.extend_from_slice(id.as_bytes());
         }
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
         buf
     }
 
@@ -63,13 +68,36 @@ impl PackRegistry {
         }
 
         let count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        let expected = HEADER_SIZE + count * UUID_SIZE;
-        if data.len() < expected {
+        let payload_len = HEADER_SIZE + count * UUID_SIZE;
+        if data.len() < payload_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "pack registry truncated: have {} bytes, need {expected}",
+                    "pack registry truncated: have {} bytes, need {payload_len}",
                     data.len()
+                ),
+            ));
+        }
+
+        if data.len() < payload_len + CRC_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "pack registry missing CRC32: have {} bytes, need {}",
+                    data.len(),
+                    payload_len + CRC_SIZE,
+                ),
+            ));
+        }
+
+        let stored_crc =
+            u32::from_le_bytes(data[payload_len..payload_len + CRC_SIZE].try_into().unwrap());
+        let computed_crc = crc32fast::hash(&data[..payload_len]);
+        if stored_crc != computed_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "pack registry CRC32 mismatch: stored {stored_crc:#010x}, computed {computed_crc:#010x}"
                 ),
             ));
         }
@@ -129,7 +157,7 @@ mod tests {
     fn test_registry_empty() {
         let reg = PackRegistry::new();
         let data = reg.serialize();
-        assert_eq!(data.len(), HEADER_SIZE);
+        assert_eq!(data.len(), HEADER_SIZE + CRC_SIZE);
 
         let restored = PackRegistry::deserialize(&data).unwrap();
         assert!(restored.pack_ids.is_empty());
@@ -149,7 +177,7 @@ mod tests {
 
         assert_eq!(restored.pack_ids.len(), 10_000);
         assert_eq!(restored.pack_ids, ids);
-        assert_eq!(data.len(), HEADER_SIZE + 10_000 * UUID_SIZE);
+        assert_eq!(data.len(), HEADER_SIZE + 10_000 * UUID_SIZE + CRC_SIZE);
         assert!(
             elapsed.as_millis() < 10,
             "round-trip took {}ms, expected < 10ms",
@@ -235,5 +263,36 @@ mod tests {
     #[test]
     fn test_registry_s3_key() {
         assert_eq!(registry_s3_key("my-vm"), "pack-registries/my-vm");
+    }
+
+    #[test]
+    fn test_registry_crc32_corruption_detected() {
+        let reg = PackRegistry {
+            pack_ids: vec![Uuid::new_v4(); 5],
+        };
+        let mut data = reg.serialize();
+        // Flip a byte in the UUID payload
+        data[HEADER_SIZE + 3] ^= 0xFF;
+        let result = PackRegistry::deserialize(&data);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("CRC32 mismatch"),
+            "corrupted payload should fail CRC check"
+        );
+    }
+
+    #[test]
+    fn test_registry_missing_crc_rejected() {
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let mut data = Vec::new();
+        data.extend_from_slice(PACK_REGISTRY_MAGIC);
+        data.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        for id in &ids {
+            data.extend_from_slice(id.as_bytes());
+        }
+        // No CRC32 appended
+        let result = PackRegistry::deserialize(&data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing CRC32"));
     }
 }

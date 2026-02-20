@@ -444,6 +444,8 @@ Per-export append-only list of pack UUIDs, stored in S3 at `pack-registries/{nam
 ├─────────────────────────────────────────────────┤
 │ Pack IDs (16 bytes × count)                     │
 │   [uuid:16][uuid:16]...                         │
+├─────────────────────────────────────────────────┤
+│ CRC32 (4 bytes LE, over all preceding bytes)    │
 └─────────────────────────────────────────────────┘
 ```
 

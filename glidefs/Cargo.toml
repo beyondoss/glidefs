@@ -32,7 +32,7 @@ docker-tests = ["test-utils"]
 # Expose protocol types for fuzzing
 fuzz = []
 # ublk transport (Linux 6.0+ only, io_uring-based userspace block device)
-ublk = ["dep:libublk"]
+ublk = ["dep:libublk", "dep:smol"]
 
 [dependencies]
 console-subscriber = { version = "0.5", optional = true }
@@ -75,6 +75,7 @@ chrono = { version = "0.4.43", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libublk = { version = "0.4", optional = true }
+smol = { version = "2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["test-util"] }
