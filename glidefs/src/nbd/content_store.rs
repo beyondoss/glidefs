@@ -24,6 +24,9 @@ pub enum ContentStoreError {
 
     #[error("S3 circuit breaker is open (service temporarily unavailable)")]
     CircuitOpen,
+
+    #[error("S3 concurrency semaphore closed")]
+    SemaphoreClosed,
 }
 
 /// Returns true for errors that indicate S3 connectivity failure (network,
@@ -121,7 +124,7 @@ impl ContentStore {
     pub async fn put_pack(&self, pack_id: Uuid, data: Vec<u8>) -> Result<(), ContentStoreError> {
         self.check_circuit()?;
         let _permit = match &self.upload_semaphore {
-            Some(sem) => Some(sem.acquire().await.expect("upload semaphore closed")),
+            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
             None => None,
         };
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
@@ -162,7 +165,7 @@ impl ContentStore {
     ) -> Result<bytes::Bytes, ContentStoreError> {
         self.check_circuit()?;
         let _permit = match &self.download_semaphore {
-            Some(sem) => Some(sem.acquire().await.expect("download semaphore closed")),
+            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
             None => None,
         };
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
@@ -192,7 +195,7 @@ impl ContentStore {
     > {
         self.check_circuit()?;
         let permit = match &self.download_semaphore {
-            Some(sem) => Some(sem.acquire().await.expect("download semaphore closed")),
+            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
             None => None,
         };
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));

@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use crate::nbd::block_map::{blake3_128, lz4_decompress};
 use crate::nbd::cache::BlockCache;
@@ -102,9 +102,12 @@ impl WriteCache<Active> {
         if clean_cache.get(&hash).await.is_some() {
             return Ok(());
         }
-        let _ = self
+        if let Err(e) = self
             .resolve_pack(&hash, clean_cache, pack_index, content_store, None)
-            .await;
+            .await
+        {
+            warn!(chunk_index, error = %e, "prefetch failed");
+        }
         Ok(())
     }
 

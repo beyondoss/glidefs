@@ -21,7 +21,6 @@ pub(super) struct BaseManifestState {
     pub block_map: HashMap<u64, Blake3Hash>,
     pub syncs_since_base: u32,
 }
-use crate::nbd::state::BlockState;
 use crate::nbd::wal::Wal;
 
 use super::config::WriteCacheConfig;
@@ -546,15 +545,19 @@ impl CacheInner {
         } else {
             // Legacy v1/v2/v3: dense block_states + presence bitmap
             // Old encoding: Clean=0, Dirty=1, Syncing=2
+            const OLD_CLEAN: u8 = 0;
+            const OLD_DIRTY: u8 = 1;
+            const OLD_SYNCING: u8 = 2;
+
             let mut old_state_bytes = vec![0u8; stored_num_blocks];
             file.read_exact(&mut old_state_bytes)?;
 
             // Convert Syncing(2) -> Dirty(1) in old encoding
             for state in &mut old_state_bytes {
-                if *state == BlockState::Syncing as u8 {
-                    *state = BlockState::Dirty as u8;
+                if *state == OLD_SYNCING {
+                    *state = OLD_DIRTY;
                 }
-                if *state == BlockState::Dirty as u8 {
+                if *state == OLD_DIRTY {
                     dirty_count += 1;
                 }
             }
@@ -582,21 +585,21 @@ impl CacheInner {
                 // Version 1: dirty blocks are present, clean blocks are NOT
                 old_state_bytes
                     .iter()
-                    .map(|&s| s == BlockState::Dirty as u8)
+                    .map(|&s| s == OLD_DIRTY)
                     .collect()
             };
 
             // Convert old encoding to new sparse encoding and populate state_map
             for (idx, &old_state) in old_state_bytes.iter().enumerate() {
                 let is_present = present.get(idx).copied().unwrap_or(false);
-                if !is_present && old_state == BlockState::Clean as u8 {
+                if !is_present && old_state == OLD_CLEAN {
                     // Not present + clean in old encoding -> NOT_PRESENT (0) in new
                     continue;
                 }
                 // Block is present (or dirty/syncing which implies present)
                 let new_state = match old_state {
-                    x if x == BlockState::Clean as u8 => SparseBlockState::CLEAN,
-                    x if x == BlockState::Dirty as u8 => SparseBlockState::DIRTY,
+                    OLD_CLEAN => SparseBlockState::CLEAN,
+                    OLD_DIRTY => SparseBlockState::DIRTY,
                     _ => SparseBlockState::DIRTY, // conservative
                 };
                 state_map.set_present(idx);

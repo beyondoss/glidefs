@@ -38,6 +38,6 @@ pub use router::{ExportInfo, ExportRouter, RouterError};
 #[allow(unused_imports)]
 pub use server::NBDServer;
 #[allow(unused_imports)]
-pub use state::{Active, BlockState, DeviceState, Draining, Initializing, Recovering};
+pub use state::{Active, DeviceState, Draining, Initializing, Recovering};
 #[allow(unused_imports)]
 pub use write_cache::{CacheError, WriteCache, WriteCacheConfig};

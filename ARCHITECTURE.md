@@ -728,7 +728,7 @@ The pressure flush directly flushes dirty packs from the exports with the most d
 | `nbd/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
 | `nbd/write_cache/error.rs` | `CacheError` type |
 | `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock + per-entry CRC32), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
-| `nbd/state.rs` | `BlockState` enum + sealed typestate markers (`Initializing`, `Active`, etc.) |
+| `nbd/state.rs` | Sealed typestate markers (`Initializing`, `Recovering`, `Active`, `Draining`) |
 | `nbd/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
 | `nbd/pack_index.rs` | `HostPackIndex`: redb-backed `Blake3Hash → PackLocation` index for cross-export dedup |
 | `nbd/pack_registry.rs` | Per-export pack ID tracking for garbage collection |

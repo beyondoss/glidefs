@@ -591,12 +591,8 @@ impl AtomicBlockMap {
 
 /// Block state constants for the sparse state map.
 ///
-/// Encoding is shifted by 1 from the legacy `BlockState` so that the natural
-/// zero-initialized default (unallocated pages) represents "not present".
-/// Block state constants for the sparse state map.
-///
-/// Encoding is shifted by 1 from the legacy `BlockState` so that the natural
-/// zero-initialized default (unallocated pages) represents "not present".
+/// Zero-initialized default (unallocated pages) represents "not present",
+/// so Clean/Dirty/Syncing are shifted by 1 from the legacy metadata encoding.
 pub struct SparseBlockState;
 
 impl SparseBlockState {
@@ -1244,26 +1240,53 @@ impl ForkedBlockMap {
     ///
     /// For each chunk slot, the overlay entry takes precedence over the parent.
     /// Flags are loaded from the external `SparseStateMap`.
+    ///
+    /// Iterates page-by-page through the overlay, skipping null pages to avoid
+    /// per-entry atomic loads for regions the fork never touched (~97% typical).
     pub fn snapshot(&self, state_map: &SparseStateMap) -> BlockMap {
         let mut entries = Vec::with_capacity(self.num_chunks);
-        for i in 0..self.num_chunks {
-            let flag = state_map.get(i);
-            let (hash, seq) = self.overlay.get(i);
-            if hash.is_zero() && seq == 0 {
-                let parent_entry = self.parent.get(i);
-                entries.push(BlockMapEntry {
-                    hash: parent_entry.hash,
-                    flags: flag,
-                    sequence: parent_entry.sequence,
-                });
+        let mut chunk_i = 0;
+
+        for page_idx in 0..self.overlay.num_pages {
+            let page_end = std::cmp::min((page_idx + 1) << HASH_PAGE_BITS, self.num_chunks);
+            let count = page_end - chunk_i;
+
+            if let Some(page) = self.overlay.load_page(page_idx) {
+                // Overlay page exists — check each entry.
+                for entry_idx in 0..count {
+                    let flag = state_map.get(chunk_i);
+                    let (hash, seq) = page.entries[entry_idx].read();
+                    if hash.is_zero() && seq == 0 {
+                        let parent_entry = self.parent.get(chunk_i);
+                        entries.push(BlockMapEntry {
+                            hash: parent_entry.hash,
+                            flags: flag,
+                            sequence: parent_entry.sequence,
+                        });
+                    } else {
+                        entries.push(BlockMapEntry {
+                            hash,
+                            flags: flag,
+                            sequence: seq,
+                        });
+                    }
+                    chunk_i += 1;
+                }
             } else {
-                entries.push(BlockMapEntry {
-                    hash,
-                    flags: flag,
-                    sequence: seq,
-                });
+                // Null overlay page — read directly from parent (no atomics).
+                for _ in 0..count {
+                    let flag = state_map.get(chunk_i);
+                    let parent_entry = self.parent.get(chunk_i);
+                    entries.push(BlockMapEntry {
+                        hash: parent_entry.hash,
+                        flags: flag,
+                        sequence: parent_entry.sequence,
+                    });
+                    chunk_i += 1;
+                }
             }
         }
+
         BlockMap {
             entries,
             chunk_size: self.chunk_size,
