@@ -25,9 +25,8 @@ Use the same persona auto-detection as the `audit` skill based on target directo
 
 ## Step 2: Pre-Work
 
-1. **Read `.architecture-index`** and the target's ARCHITECTURE.md
-2. **Read `CLAUDE.md`** — note the idempotency/atomicity requirements (these MUST be tested)
-3. **Inventory all test files**:
+1. **Read `CLAUDE.md`** — note the idempotency/atomicity requirements (these MUST be tested)
+2. **Inventory all test files**:
    - Rust: `Grep` for `#[cfg(test)]` and `#[test]`, `Glob` for `tests/*.rs`
    - Go: `Glob` for `*_test.go`, check for `//go:build integration` tags
    - TS: `Glob` for `*.test.ts`, `*.spec.ts`

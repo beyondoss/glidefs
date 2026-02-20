@@ -141,7 +141,12 @@ echo ""
 echo "Building filesystem helper..."
 docker build -q -t glidefs-dedup-helper -f - . >/dev/null 2>&1 <<'HELPER'
 FROM ubuntu:22.04
-RUN apt-get update -qq && apt-get install -y -qq e2fsprogs xfsprogs btrfs-progs tar nodejs npm git python3-pip >/dev/null 2>&1
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && apt-get install -y -qq \
+    e2fsprogs xfsprogs btrfs-progs tar \
+    nodejs npm git python3-pip \
+    postgresql postgresql-client sqlite3 \
+    curl >/dev/null 2>&1
 HELPER
 
 # ---------------------------------------------------------------------------
