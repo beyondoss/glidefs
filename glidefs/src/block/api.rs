@@ -218,6 +218,19 @@ where
                 ));
             }
 
+            if let Some(ref t) = put_req.transport
+                && t != "nbd"
+            {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "Invalid transport '{}': only 'nbd' is supported via the API. \
+                         To use ublk, configure it in the server config file",
+                        t
+                    ),
+                ));
+            }
+
             if let Some(ref prefix) = put_req.s3_prefix
                 && (prefix.contains("..") || prefix.starts_with('/'))
             {
@@ -831,6 +844,34 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ublk_transport_rejected() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "transport": "ublk"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_nbd_transport_accepted() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "transport": "nbd"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]

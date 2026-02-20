@@ -73,9 +73,11 @@ impl UblkServer {
             .await
             .ok_or_else(|| anyhow::anyhow!("export '{}' not found", export_name))?;
 
-        let device = device::UblkDevice::register(handler, self.nr_queues).await?;
+        let name = export_name.to_string();
+        let device =
+            device::UblkDevice::register(handler, self.nr_queues, name.clone()).await?;
         let path = device.dev_path().to_path_buf();
-        self.devices.insert(export_name.to_string(), device);
+        self.devices.insert(name, device);
         Ok(path)
     }
 
@@ -92,18 +94,32 @@ impl UblkServer {
         Ok(())
     }
 
-    /// Shutdown all ublk devices.
+    /// Shutdown all ublk devices concurrently.
     ///
-    /// Attempts every device even if some fail, then returns an aggregated
-    /// error describing which devices could not be unregistered.
+    /// Issues `kill_dev` + thread join for every device in parallel, then
+    /// returns an aggregated error describing which devices could not be
+    /// unregistered.
     pub async fn shutdown(self) -> anyhow::Result<()> {
-        let mut failed: Vec<String> = Vec::new();
+        let mut set = tokio::task::JoinSet::new();
 
         for (name, device) in self.devices {
-            tracing::info!(export = %name, "shutting down ublk device");
-            if let Err(e) = device.unregister().await {
-                tracing::error!(export = %name, error = %e, "failed to unregister ublk device");
-                failed.push(format!("{name}: {e}"));
+            set.spawn(async move {
+                tracing::info!(export = %name, "shutting down ublk device");
+                (name, device.unregister().await)
+            });
+        }
+
+        let mut failed: Vec<String> = Vec::new();
+        while let Some(result) = set.join_next().await {
+            match result {
+                Ok((name, Err(e))) => {
+                    tracing::error!(export = %name, error = %e, "failed to unregister ublk device");
+                    failed.push(format!("{name}: {e}"));
+                }
+                Err(e) => {
+                    failed.push(format!("shutdown task failed: {e}"));
+                }
+                Ok((_, Ok(()))) => {}
             }
         }
 

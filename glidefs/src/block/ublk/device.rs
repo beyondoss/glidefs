@@ -11,7 +11,9 @@ use libublk::io::{UblkDev, UblkQueue};
 use libublk::{BufDesc, UblkError, UblkFlags};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Per-queue I/O depth (max inflight commands per queue).
 const QUEUE_DEPTH: u16 = 128;
@@ -33,19 +35,17 @@ pub struct UblkDevice {
     worker: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
 }
 
-// SAFETY: `JoinHandle<T>` is `!Sync` due to internal raw pointers.
-// This impl is sound because no `&self` method accesses `self.worker` —
-// only `unregister(self)` (by value) and `Drop::drop(&mut self)` touch it,
-// both requiring exclusive access.
-unsafe impl Sync for UblkDevice {}
-
 impl UblkDevice {
     /// Register a new ublk device backed by the given handler.
     ///
     /// Allocates a device ID, sets parameters, spawns per-queue I/O threads,
     /// and waits for the kernel to confirm the device is serving I/O.
     /// Returns once `/dev/ublkbN` is ready.
-    pub async fn register(handler: Arc<BlockHandler>, nr_queues: u16) -> anyhow::Result<Self> {
+    pub async fn register(
+        handler: Arc<BlockHandler>,
+        nr_queues: u16,
+        export_name: String,
+    ) -> anyhow::Result<Self> {
         let dev_size = handler.device_size();
         let tokio_handle = tokio::runtime::Handle::current();
 
@@ -53,9 +53,12 @@ impl UblkDevice {
         // or an error if setup fails.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<anyhow::Result<(i32, String)>>();
 
+        let thread_name = format!("ublk-{export_name}");
         let worker = std::thread::Builder::new()
-            .name("ublk".to_string())
-            .spawn(move || run_device(dev_size, nr_queues, handler, tokio_handle, ready_tx))?;
+            .name(thread_name)
+            .spawn(move || {
+                run_device(dev_size, nr_queues, handler, tokio_handle, ready_tx)
+            })?;
 
         // Wait for device to be ready (or error during setup).
         let (dev_id, dev_path_str) = ready_rx
@@ -114,6 +117,10 @@ impl UblkDevice {
                         timeout_secs = timeout.as_secs(),
                         "ublk worker thread did not exit in time; detaching"
                     );
+                    return Err(anyhow::anyhow!(
+                        "ublk worker thread for dev_id {dev_id} did not exit within {}s",
+                        timeout.as_secs()
+                    ));
                 }
             }
         }
@@ -147,6 +154,70 @@ impl Drop for UblkDevice {
             }
         }
         // JoinHandle is dropped here → thread detaches. It will exit on its own.
+    }
+}
+
+/// Tracks queue thread initialization for fail-fast on queue setup errors.
+///
+/// Each queue thread signals success or failure. The `on_started` callback
+/// waits until all queues have reported, then either proceeds or aborts.
+struct QueueLatch {
+    total: u16,
+    state: Mutex<LatchState>,
+    condvar: Condvar,
+}
+
+struct LatchState {
+    reported: u16,
+    failed: u16,
+}
+
+impl QueueLatch {
+    fn new(total: u16) -> Self {
+        Self {
+            total,
+            state: Mutex::new(LatchState {
+                reported: 0,
+                failed: 0,
+            }),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn signal_ready(&self) {
+        let mut state = self.state.lock();
+        state.reported += 1;
+        self.condvar.notify_one();
+    }
+
+    fn signal_failed(&self) {
+        let mut state = self.state.lock();
+        state.failed += 1;
+        state.reported += 1;
+        self.condvar.notify_one();
+    }
+
+    /// Wait until all queues have reported. Returns `true` if all succeeded.
+    fn wait_all(&self, timeout: Duration) -> bool {
+        let mut state = self.state.lock();
+        let deadline = Instant::now() + timeout;
+        while state.reported < self.total {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            let result = self.condvar.wait_for(&mut state, remaining);
+            if result.timed_out() && state.reported < self.total {
+                return false;
+            }
+        }
+        state.failed == 0
+    }
+
+    /// Get current (reported, failed) counts.
+    fn counts(&self) -> (u16, u16) {
+        let state = self.state.lock();
+        (state.reported, state.failed)
     }
 }
 
@@ -209,17 +280,66 @@ fn run_device(
         Ok(())
     };
 
+    // Queue latch: tracks per-queue initialization for fail-fast.
+    let latch = Arc::new(QueueLatch::new(nr_queues));
+
     // Per-queue I/O handler — runs on a dedicated thread per queue.
     // Cloned once per queue by run_target().
-    let q_handler = move |qid: u16, dev: &UblkDev| {
-        queue_io_loop(qid, dev, &handler, &tokio_handle);
+    let q_handler = {
+        let latch = Arc::clone(&latch);
+        move |qid: u16, dev: &UblkDev| {
+            queue_io_loop(qid, dev, &handler, &tokio_handle, &latch);
+        }
     };
 
     // Called after the device is started and serving I/O.
     let on_started = move |ctrl: &UblkCtrl| {
-        let dev_id = ctrl.dev_info().dev_id as i32;
+        // Wait for all queue threads to report initialization status.
+        if !latch.wait_all(Duration::from_secs(5)) {
+            let (reported, failed) = latch.counts();
+            if ready_tx
+                .send(Err(anyhow::anyhow!(
+                    "ublk queue init failed: {failed} failed, {reported}/{} reported",
+                    latch.total,
+                )))
+                .is_err()
+            {
+                tracing::warn!("ublk ready channel closed during queue init failure");
+            }
+            if let Err(e) = ctrl.kill_dev() {
+                tracing::error!(error = ?e, "kill_dev after queue init failure");
+            }
+            return;
+        }
+
+        let dev_id = match i32::try_from(ctrl.dev_info().dev_id) {
+            Ok(id) => id,
+            Err(_) => {
+                if ready_tx
+                    .send(Err(anyhow::anyhow!(
+                        "ublk dev_id {} overflows i32",
+                        ctrl.dev_info().dev_id,
+                    )))
+                    .is_err()
+                {
+                    tracing::warn!("ublk ready channel closed during dev_id overflow");
+                }
+                if let Err(e) = ctrl.kill_dev() {
+                    tracing::error!(error = ?e, "kill_dev after dev_id overflow");
+                }
+                return;
+            }
+        };
+
         let dev_path = ctrl.get_bdev_path();
-        let _ = ready_tx.send(Ok((dev_id, dev_path)));
+        if ready_tx.send(Ok((dev_id, dev_path))).is_err() {
+            // Receiver dropped — caller gave up. Kill the device so it
+            // doesn't become an orphan with no UblkDevice tracking it.
+            tracing::warn!("ublk ready channel closed — killing orphaned device");
+            if let Err(e) = ctrl.kill_dev() {
+                tracing::error!(error = ?e, "kill_dev after channel drop");
+            }
+        }
     };
 
     ctrl.run_target(tgt_init, q_handler, on_started)
@@ -239,11 +359,16 @@ fn queue_io_loop(
     dev: &UblkDev,
     handler: &Arc<BlockHandler>,
     tokio_handle: &tokio::runtime::Handle,
+    latch: &QueueLatch,
 ) {
     let q_rc = match UblkQueue::new(qid, dev) {
-        Ok(q) => Rc::new(q),
+        Ok(q) => {
+            latch.signal_ready();
+            Rc::new(q)
+        }
         Err(e) => {
             tracing::error!(qid, error = ?e, "failed to create ublk queue");
+            latch.signal_failed();
             return;
         }
     };
@@ -317,9 +442,10 @@ async fn io_task(
 ///
 /// Returns bytes transferred (positive) on success, negative errno on error.
 ///
-/// Async so that reads can `.await` `BlockHandler::read()` on the smol executor,
-/// allowing other tags to make progress while this tag waits on S3. Write, flush,
-/// discard, and write-zeroes are synchronous in the handler and never suspend.
+/// The tokio runtime context is installed at the top of every dispatch so that
+/// tokio-dependent futures (Notify, tokio::spawn for read-ahead, reqwest for S3)
+/// work inside this smol-polled task. The EnterGuard is !Send, which is fine —
+/// smol's LocalExecutor never moves tasks across threads.
 async fn dispatch_io(
     op: u32,
     offset: u64,
@@ -329,26 +455,19 @@ async fn dispatch_io(
     handler: &BlockHandler,
     tokio_handle: &tokio::runtime::Handle,
 ) -> i32 {
+    let _guard = tokio_handle.enter();
     match op {
         libublk::sys::UBLK_IO_OP_READ => {
-            // Install the tokio runtime context so that tokio::spawn (used by
-            // read-ahead) and Notify work inside this smol-polled future.
-            // The EnterGuard is !Send, which is fine — smol's LocalExecutor
-            // never moves tasks across threads. Network I/O (S3 via reqwest)
-            // is driven by tokio's reactor on its worker threads.
-            let _guard = tokio_handle.enter();
-            match handler.read(offset, length).await {
-                Ok(data) => {
-                    buffer.as_mut_slice()[..data.len()].copy_from_slice(&data);
-                    data.len() as i32
-                }
+            let buf = &mut buffer.as_mut_slice()[..length as usize];
+            match handler.read_into(offset, length, buf).await {
+                Ok(n) => i32::try_from(n).unwrap_or(-libc::EIO),
                 Err(e) => -e.to_linux_errno(),
             }
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
             let data = &buffer.as_slice()[..length as usize];
             match handler.write(offset, data, fua) {
-                Ok(()) => length as i32,
+                Ok(()) => i32::try_from(length).unwrap_or(-libc::EIO),
                 Err(e) => -e.to_linux_errno(),
             }
         }
@@ -365,5 +484,310 @@ async fn dispatch_io(
             Err(e) => -e.to_linux_errno(),
         },
         _ => -libc::EINVAL,
+    }
+}
+
+#[cfg(all(test, feature = "test-utils"))]
+mod tests {
+    use super::*;
+    use crate::block::cache::SimpleBlockCache;
+    use crate::block::content_store::ContentStore;
+    use crate::block::error::CommandError;
+    use crate::block::metrics::ExportMetrics;
+    use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use crate::block::pack_index::HostPackIndex;
+    use crate::block::write_cache::{WriteCache, WriteCacheConfig};
+    use object_store::memory::InMemory;
+    use std::sync::atomic::AtomicU64;
+    use tempfile::TempDir;
+    use tokio::sync::Notify;
+
+    const DEVICE_SIZE: u64 = 1024 * 1024; // 1MB
+    const BLOCK_SIZE: usize = 4096;
+
+    fn make_handler(readonly: bool) -> (BlockHandler, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let config = WriteCacheConfig {
+            cache_dir: temp.path().to_path_buf(),
+            device_name: "ublk-test".to_string(),
+            device_size: DEVICE_SIZE,
+            block_size: BLOCK_SIZE,
+            wal_sync: false,
+        };
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
+        let clean_cache: Arc<dyn crate::block::cache::BlockCache> =
+            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index =
+            Arc::new(HostPackIndex::open(temp.path().join("pack_index.redb")).unwrap());
+        let metrics = Arc::new(ExportMetrics::new());
+        let cache = WriteCache::open(config).unwrap().skip_recovery_for_test();
+        let handler = BlockHandler::new(
+            Arc::new(cache),
+            content_store,
+            clean_cache,
+            pack_index,
+            DEVICE_SIZE,
+            readonly,
+            metrics,
+            Arc::new(AtomicU64::new(0f64.to_bits())),
+            Arc::new(Notify::const_new()),
+            DEFAULT_BLOCKS_PER_PACK,
+            None,
+        );
+        (handler, temp)
+    }
+
+    /// Simulate dispatch_io without IoBuf (which requires libublk/io_uring).
+    /// Tests the handler dispatch logic directly.
+    async fn test_dispatch(
+        op: u32,
+        offset: u64,
+        length: u32,
+        fua: bool,
+        write_data: Option<&[u8]>,
+        read_buf: Option<&mut [u8]>,
+        handler: &BlockHandler,
+    ) -> i32 {
+        match op {
+            libublk::sys::UBLK_IO_OP_READ => {
+                let buf = read_buf.expect("read requires a buffer");
+                match handler.read_into(offset, length, buf).await {
+                    Ok(n) => i32::try_from(n).unwrap_or(-libc::EIO),
+                    Err(e) => -e.to_linux_errno(),
+                }
+            }
+            libublk::sys::UBLK_IO_OP_WRITE => {
+                let data = write_data.expect("write requires data");
+                match handler.write(offset, data, fua) {
+                    Ok(()) => i32::try_from(length).unwrap_or(-libc::EIO),
+                    Err(e) => -e.to_linux_errno(),
+                }
+            }
+            libublk::sys::UBLK_IO_OP_FLUSH => match handler.flush() {
+                Ok(()) => 0,
+                Err(e) => -e.to_linux_errno(),
+            },
+            libublk::sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
+                Ok(()) => 0,
+                Err(e) => -e.to_linux_errno(),
+            },
+            libublk::sys::UBLK_IO_OP_WRITE_ZEROES => {
+                match handler.write_zeroes(offset, length, fua) {
+                    Ok(()) => 0,
+                    Err(e) => -e.to_linux_errno(),
+                }
+            }
+            _ => -libc::EINVAL,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_read_roundtrip() {
+        let (handler, _dir) = make_handler(false);
+        let data = vec![0x42u8; BLOCK_SIZE];
+
+        let result = test_dispatch(
+            libublk::sys::UBLK_IO_OP_WRITE,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            Some(&data),
+            None,
+            &handler,
+        )
+        .await;
+        assert_eq!(result, BLOCK_SIZE as i32);
+
+        let mut read_buf = vec![0u8; BLOCK_SIZE];
+        let result = test_dispatch(
+            libublk::sys::UBLK_IO_OP_READ,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            None,
+            Some(&mut read_buf),
+            &handler,
+        )
+        .await;
+        assert_eq!(result, BLOCK_SIZE as i32);
+        assert_eq!(read_buf, data);
+    }
+
+    #[tokio::test]
+    async fn flush_returns_ok() {
+        let (handler, _dir) = make_handler(false);
+        let result = test_dispatch(
+            libublk::sys::UBLK_IO_OP_FLUSH,
+            0,
+            0,
+            false,
+            None,
+            None,
+            &handler,
+        )
+        .await;
+        assert_eq!(result, 0);
+    }
+
+    #[tokio::test]
+    async fn discard_returns_ok() {
+        let (handler, _dir) = make_handler(false);
+        let result = test_dispatch(
+            libublk::sys::UBLK_IO_OP_DISCARD,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            None,
+            None,
+            &handler,
+        )
+        .await;
+        assert_eq!(result, 0);
+    }
+
+    #[tokio::test]
+    async fn write_zeroes_clears_data() {
+        let (handler, _dir) = make_handler(false);
+
+        // Write non-zero data.
+        let data = vec![0xFFu8; BLOCK_SIZE];
+        test_dispatch(
+            libublk::sys::UBLK_IO_OP_WRITE,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            Some(&data),
+            None,
+            &handler,
+        )
+        .await;
+
+        // Write zeroes over it.
+        let result = test_dispatch(
+            libublk::sys::UBLK_IO_OP_WRITE_ZEROES,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            None,
+            None,
+            &handler,
+        )
+        .await;
+        assert_eq!(result, 0);
+
+        // Read back — should be zeros.
+        let mut read_buf = vec![0xFFu8; BLOCK_SIZE];
+        test_dispatch(
+            libublk::sys::UBLK_IO_OP_READ,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            None,
+            Some(&mut read_buf),
+            &handler,
+        )
+        .await;
+        assert_eq!(read_buf, vec![0u8; BLOCK_SIZE]);
+    }
+
+    #[tokio::test]
+    async fn unknown_op_returns_einval() {
+        let (handler, _dir) = make_handler(false);
+        let result = test_dispatch(0xFF, 0, 0, false, None, None, &handler).await;
+        assert_eq!(result, -libc::EINVAL);
+    }
+
+    #[tokio::test]
+    async fn read_beyond_device_returns_error() {
+        let (handler, _dir) = make_handler(false);
+        let mut read_buf = vec![0u8; BLOCK_SIZE];
+        let result = test_dispatch(
+            libublk::sys::UBLK_IO_OP_READ,
+            DEVICE_SIZE, // at device boundary = out of bounds
+            BLOCK_SIZE as u32,
+            false,
+            None,
+            Some(&mut read_buf),
+            &handler,
+        )
+        .await;
+        assert!(result < 0, "expected negative errno, got {result}");
+    }
+
+    #[tokio::test]
+    async fn write_with_fua_succeeds() {
+        let (handler, _dir) = make_handler(false);
+        let data = vec![0xABu8; BLOCK_SIZE];
+        let result = test_dispatch(
+            libublk::sys::UBLK_IO_OP_WRITE,
+            0,
+            BLOCK_SIZE as u32,
+            true, // FUA
+            Some(&data),
+            None,
+            &handler,
+        )
+        .await;
+        assert_eq!(result, BLOCK_SIZE as i32);
+    }
+
+    #[tokio::test]
+    async fn write_readonly_returns_erofs() {
+        let (handler, _dir) = make_handler(true);
+        let data = vec![0x42u8; BLOCK_SIZE];
+        let result = test_dispatch(
+            libublk::sys::UBLK_IO_OP_WRITE,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            Some(&data),
+            None,
+            &handler,
+        )
+        .await;
+        assert_eq!(result, -libc::EROFS);
+    }
+
+    #[tokio::test]
+    async fn zero_length_read_returns_zero() {
+        let (handler, _dir) = make_handler(false);
+        let mut read_buf = vec![0u8; 0];
+        let result = test_dispatch(
+            libublk::sys::UBLK_IO_OP_READ,
+            0,
+            0,
+            false,
+            None,
+            Some(&mut read_buf),
+            &handler,
+        )
+        .await;
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn queue_latch_all_ready() {
+        let latch = QueueLatch::new(3);
+        latch.signal_ready();
+        latch.signal_ready();
+        latch.signal_ready();
+        assert!(latch.wait_all(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn queue_latch_one_failed() {
+        let latch = QueueLatch::new(3);
+        latch.signal_ready();
+        latch.signal_failed();
+        latch.signal_ready();
+        assert!(!latch.wait_all(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn queue_latch_timeout() {
+        let latch = QueueLatch::new(3);
+        latch.signal_ready(); // only 1 of 3
+        assert!(!latch.wait_all(Duration::from_millis(50)));
     }
 }

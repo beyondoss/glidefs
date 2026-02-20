@@ -96,6 +96,99 @@ impl WriteCache<Active> {
         Ok(Bytes::from(result))
     }
 
+    /// Read blocks directly into a caller-provided buffer.
+    ///
+    /// Same resolution order as `read_v2` (block_map → clean_cache → S3 → SSD),
+    /// but copies chunk data directly into `buf` instead of building an intermediate
+    /// `Vec<u8>` + `Bytes`. Eliminates one allocation in the multi-chunk path.
+    ///
+    /// Returns the number of bytes written to `buf`.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    #[instrument(skip(self, buf, clean_cache, pack_index, content_store, metrics), fields(offset = offset, len = len))]
+    pub async fn read_into_v2(
+        &self,
+        offset: u64,
+        len: usize,
+        buf: &mut [u8],
+        clean_cache: &dyn BlockCache,
+        pack_index: &HostPackIndex,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) -> Result<usize, CacheError> {
+        if offset + len as u64 > self.inner.config.device_size {
+            return Err(CacheError::offset_out_of_bounds(
+                offset + len as u64,
+                self.inner.config.device_size,
+            ));
+        }
+
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let chunk_size = self.inner.config.block_size as u64;
+        let start_chunk = offset / chunk_size;
+        let end_chunk = (offset + len as u64 - 1) / chunk_size;
+        let num_chunks = (end_chunk - start_chunk + 1) as usize;
+
+        // Single chunk fast path — no concurrency overhead.
+        if num_chunks == 1 {
+            let chunk_data = self
+                .resolve_chunk(
+                    start_chunk as usize,
+                    clean_cache,
+                    pack_index,
+                    content_store,
+                    Some(metrics),
+                )
+                .await?;
+            let chunk_start_byte = start_chunk * chunk_size;
+            let slice_start = (offset - chunk_start_byte) as usize;
+            let slice_end = std::cmp::min(slice_start + len, chunk_data.len());
+            let n = slice_end - slice_start;
+            buf[..n].copy_from_slice(&chunk_data[slice_start..slice_end]);
+            return Ok(n);
+        }
+
+        // Multi-chunk: resolve all concurrently, copy directly into buf.
+        let futures: Vec<_> = (start_chunk..=end_chunk)
+            .map(|chunk_idx| {
+                self.resolve_chunk(
+                    chunk_idx as usize,
+                    clean_cache,
+                    pack_index,
+                    content_store,
+                    Some(metrics),
+                )
+            })
+            .collect();
+        let chunks = futures::future::try_join_all(futures).await?;
+
+        let mut pos = 0;
+        for (i, chunk_data) in chunks.into_iter().enumerate() {
+            let chunk_idx = start_chunk + i as u64;
+            let chunk_start_byte = chunk_idx * chunk_size;
+            let slice_start = if chunk_idx == start_chunk {
+                (offset - chunk_start_byte) as usize
+            } else {
+                0
+            };
+            let slice_end = if chunk_idx == end_chunk {
+                let end_byte = offset + len as u64;
+                let relative_end = (end_byte - chunk_start_byte) as usize;
+                std::cmp::min(relative_end, chunk_data.len())
+            } else {
+                chunk_data.len()
+            };
+            let n = slice_end - slice_start;
+            buf[pos..pos + n].copy_from_slice(&chunk_data[slice_start..slice_end]);
+            pos += n;
+        }
+
+        debug!(chunks = num_chunks, "read_into complete");
+        Ok(pos)
+    }
+
     /// Prefetch a single chunk into the clean cache.
     ///
     /// Fetches the entire pack containing this chunk, decompressing and caching

@@ -208,6 +208,69 @@ impl BlockHandler {
         Ok(data)
     }
 
+    /// Read data directly into a caller-provided buffer.
+    ///
+    /// Same as `read()` but writes directly into `buf` instead of returning `Bytes`,
+    /// eliminating the intermediate allocation in the multi-chunk path.
+    /// Used by the ublk transport where the kernel provides the destination buffer.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    pub async fn read_into(
+        &self,
+        offset: u64,
+        length: u32,
+        buf: &mut [u8],
+    ) -> CommandResult<usize> {
+        let start = Instant::now();
+
+        if offset + length as u64 > self.device_size() {
+            return Err(CommandError::InvalidArgument);
+        }
+
+        if length == 0 {
+            return Ok(0);
+        }
+
+        self.metrics.record_guest_read(length as u64);
+
+        let n = self
+            .cache
+            .read_into_v2(
+                offset,
+                length as usize,
+                buf,
+                self.clean_cache.as_ref(),
+                &self.pack_index,
+                &self.content_store,
+                &self.metrics,
+            )
+            .await?;
+
+        // Sequential read-ahead: detect patterns and prefetch next pack
+        {
+            let chunk_size = self.cache.block_size() as u64;
+            let chunk_idx = offset / chunk_size;
+            if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
+                let cache = Arc::clone(&self.cache);
+                let clean_cache = Arc::clone(&self.clean_cache);
+                let pack_index = Arc::clone(&self.pack_index);
+                let content_store = Arc::clone(&self.content_store);
+                tokio::spawn(async move {
+                    let _ = cache
+                        .prefetch_chunk(
+                            readahead_chunk as usize,
+                            clean_cache.as_ref(),
+                            &pack_index,
+                            &content_store,
+                        )
+                        .await;
+                });
+            }
+        }
+
+        self.metrics.record_read_latency(start.elapsed());
+        Ok(n)
+    }
+
     /// Write data to the cache.
     ///
     /// Writes go to local SSD immediately. S3 sync happens in background.
