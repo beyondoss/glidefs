@@ -84,6 +84,7 @@ impl UblkServer {
     /// Remove a ublk device for an export.
     ///
     /// Idempotent: returns `Ok(())` if no device is registered for this export.
+    #[allow(dead_code)] // used in docker integration tests (resize)
     pub async fn remove_device(&mut self, export_name: &str) -> anyhow::Result<()> {
         if let Some(device) = self.devices.remove(export_name) {
             tracing::info!(export = %export_name, "removing ublk device");
