@@ -123,6 +123,7 @@ async fn test_corrupt_manifest_rejected() {
         block_size: None,
         blocks_per_pack: None,
         flush_mode: None,
+        transport: None,
     };
     let result = server2
         .router

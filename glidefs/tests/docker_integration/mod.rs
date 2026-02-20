@@ -164,6 +164,7 @@ impl TestServer {
             block_size: None,
             blocks_per_pack: None,
             flush_mode: None,
+            transport: None,
         };
         self.router
             .create_export(config, false, None)
@@ -180,6 +181,7 @@ impl TestServer {
             block_size: None,
             blocks_per_pack: None,
             flush_mode: None,
+            transport: None,
         };
         self.router.save_export(&config).await.unwrap();
     }
@@ -193,6 +195,7 @@ impl TestServer {
             block_size: None,
             blocks_per_pack: None,
             flush_mode: None,
+            transport: None,
         };
         self.router
             .create_export(config, false, Some(name))
@@ -209,6 +212,7 @@ impl TestServer {
             block_size: None,
             blocks_per_pack: None,
             flush_mode: None,
+            transport: None,
         };
         self.router
             .create_export(config, false, Some(name))
@@ -233,6 +237,7 @@ impl TestServer {
             block_size: None,
             blocks_per_pack: None,
             flush_mode: None,
+            transport: None,
         };
         self.router
             .create_export(config, false, Some(source_manifest))
@@ -249,6 +254,7 @@ impl TestServer {
             block_size: None,
             blocks_per_pack: None,
             flush_mode: None,
+            transport: None,
         };
         self.router
             .create_export(config, true, Some(source_manifest))

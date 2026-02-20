@@ -100,7 +100,7 @@ impl UblkDevice {
 
         // If kill_dev failed, don't try to join — the worker may not exit.
         // Drop will retry kill_dev as a safety net.
-        kill_result.map_err(|e| anyhow::anyhow!("ublk kill_dev failed: {:?}", e))?;
+        kill_result.map_err(|e| anyhow::anyhow!("ublk kill_dev failed: {}", e))?;
 
         // Join the worker with a timeout. The io_uring idle timeout bounds
         // worst-case exit latency, so we allow slightly more than that.
@@ -246,7 +246,7 @@ fn run_device(
     {
         Ok(c) => c,
         Err(e) => {
-            let err = anyhow::anyhow!("ublk build failed: {:?}", e);
+            let err = anyhow::anyhow!("ublk build failed: {}", e);
             let _ = ready_tx.send(Err(anyhow::anyhow!("{:#}", &err)));
             return Err(err);
         }
@@ -345,7 +345,7 @@ fn run_device(
     };
 
     ctrl.run_target(tgt_init, q_handler, on_started)
-        .map_err(|e| anyhow::anyhow!("ublk run_target failed: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("ublk run_target failed: {}", e))?;
 
     Ok(())
 }
@@ -430,7 +430,13 @@ async fn io_task(
         let op = iod.op_flags & 0xff;
         let fua = (iod.op_flags & libublk::sys::UBLK_IO_F_FUA) != 0;
         let offset = iod.start_sector << 9;
-        let length = (u64::from(iod.nr_sectors) * 512) as u32;
+        let byte_len = u64::from(iod.nr_sectors) * 512;
+        debug_assert!(
+            byte_len <= u64::from(u32::MAX),
+            "nr_sectors {nr_sectors} exceeds u32 byte range",
+            nr_sectors = iod.nr_sectors,
+        );
+        let length = byte_len as u32;
 
         let result = dispatch_io(op, offset, length, fua, &mut buffer, handler, tokio_handle).await;
 
@@ -457,12 +463,14 @@ async fn handle_io(
 ) -> i32 {
     match op {
         libublk::sys::UBLK_IO_OP_READ => {
+            debug_assert!(buf.len() >= length as usize, "read buf too small");
             match handler.read_into(offset, length, buf).await {
                 Ok(n) => i32::try_from(n).unwrap_or(-libc::EIO),
                 Err(e) => -e.to_linux_errno(),
             }
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
+            debug_assert_eq!(buf.len(), length as usize, "write buf/length mismatch");
             match handler.write(offset, buf, fua) {
                 Ok(()) => i32::try_from(length).unwrap_or(-libc::EIO),
                 Err(e) => -e.to_linux_errno(),
