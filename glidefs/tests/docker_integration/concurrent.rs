@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::TestContext;
 use crate::TestServer;
-use crate::block_client::NbdClient;
+use crate::nbd_client::NbdClient;
 
 const BLOCK_SIZE: usize = 128 * 1024;
 

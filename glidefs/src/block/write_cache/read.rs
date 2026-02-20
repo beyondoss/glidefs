@@ -104,6 +104,7 @@ impl WriteCache<Active> {
     ///
     /// Returns the number of bytes written to `buf`.
     #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)] // deps owned by BlockHandler, passed through
     #[instrument(skip(self, buf, clean_cache, pack_index, content_store, metrics), fields(offset = offset, len = len))]
     pub async fn read_into_v2(
         &self,

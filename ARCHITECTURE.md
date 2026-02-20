@@ -740,38 +740,38 @@ The pressure flush directly flushes dirty packs from the exports with the most d
 
 | File | Purpose |
 |------|---------|
-| `nbd/server.rs` | NBD transport: TCP/Unix socket listener, protocol negotiation, concurrent request dispatch |
-| `nbd/ublk/mod.rs` | ublk transport: per-export `/dev/ublkbN` device management (Linux 6.0+, `--features ublk`) |
-| `nbd/ublk/device.rs` | Single ublk device: io_uring registration, per-queue I/O loop, teardown |
-| `nbd/router.rs` | Multi-tenant export manager: create, delete, drain (concurrent, 16-wide), promote, resize |
-| `nbd/handler.rs` | Transport-agnostic block I/O dispatch (read/write/flush/trim) with SSD write rejection at 95% |
-| `nbd/write_cache/mod.rs` | `WriteCache<S>` typestate wrapper, `FlushStats`, `SnapshotResult` |
-| `nbd/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, `SparseStateMap` integration, metadata persistence |
-| `nbd/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
-| `nbd/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → S3 → SSD fallback) |
-| `nbd/write_cache/flush.rs` | Dirty block scan, CRC32 checkpoint compute + flush verify (spawn_blocking), pack assembly, S3 upload, manifest sync |
-| `nbd/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading |
-| `nbd/write_cache/recovery.rs` | WAL replay, dirty block verification after crash |
-| `nbd/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
-| `nbd/write_cache/error.rs` | `CacheError` type |
-| `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock + per-entry CRC32), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
-| `nbd/state.rs` | Sealed typestate markers (`Initializing`, `Recovering`, `Active`, `Draining`) |
-| `nbd/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
-| `nbd/pack_index.rs` | `HostPackIndex`: redb-backed `Blake3Hash → PackLocation` index for cross-export dedup |
-| `nbd/pack_registry.rs` | Per-export pack ID tracking for garbage collection |
-| `nbd/capacity_monitor.rs` | SSD capacity monitor: `statvfs` polling, pressure flush on dirtiest exports |
-| `nbd/content_store.rs` | S3 PUT/GET for packs and manifests via `object_store` crate |
-| `nbd/manifest.rs` | Binary manifest serialization/deserialization (GLDE format) |
-| `nbd/flush_scheduler.rs` | Event-driven pack flush (Notify) + periodic WAL checkpoint (5s) |
-| `nbd/wal.rs` | Append-only WAL for crash recovery with CRC32 integrity |
-| `nbd/cache.rs` | `BlockCache` trait + `FoyerBlockCache` (memory + SSD hybrid) |
-| `nbd/readahead.rs` | Sequential read detector: 3+ consecutive chunks triggers pack prefetch |
-| `nbd/scrubber.rs` | Background corruption detection: re-hash cached blocks, evict on mismatch |
-| `nbd/sync.rs` | Loom/std compatibility shim: re-exports atomics for exhaustive interleaving tests |
-| `nbd/metrics.rs` | Per-export Prometheus-compatible telemetry with sampled latency histograms |
-| `nbd/protocol.rs` | NBD wire format: handshake options, transmission commands, reply serialization |
-| `nbd/api.rs` | HTTP REST API for export CRUD, drain, promote, metrics |
-| `nbd/error.rs` | Error types: `NBDError` (protocol-specific), `CommandError` (transport-agnostic, maps to NBD errno or Linux errno) |
+| `block/server.rs` | NBD transport: TCP/Unix socket listener, protocol negotiation, concurrent request dispatch |
+| `block/ublk/mod.rs` | ublk transport: per-export `/dev/ublkbN` device management (Linux 6.0+, `--features ublk`) |
+| `block/ublk/device.rs` | Single ublk device: io_uring registration, per-queue I/O loop, teardown |
+| `block/router.rs` | Multi-tenant export manager: create, delete, drain (concurrent, 16-wide), promote, resize |
+| `block/handler.rs` | Transport-agnostic block I/O dispatch (read/write/flush/trim) with SSD write rejection at 95% |
+| `block/write_cache/mod.rs` | `WriteCache<S>` typestate wrapper, `FlushStats`, `SnapshotResult` |
+| `block/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, `SparseStateMap` integration, metadata persistence |
+| `block/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
+| `block/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → S3 → SSD fallback) |
+| `block/write_cache/flush.rs` | Dirty block scan, CRC32 checkpoint compute + flush verify (spawn_blocking), pack assembly, S3 upload, manifest sync |
+| `block/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading |
+| `block/write_cache/recovery.rs` | WAL replay, dirty block verification after crash |
+| `block/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
+| `block/write_cache/error.rs` | `CacheError` type |
+| `block/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock + per-entry CRC32), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
+| `block/state.rs` | Sealed typestate markers (`Initializing`, `Recovering`, `Active`, `Draining`) |
+| `block/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
+| `block/pack_index.rs` | `HostPackIndex`: redb-backed `Blake3Hash → PackLocation` index for cross-export dedup |
+| `block/pack_registry.rs` | Per-export pack ID tracking for garbage collection |
+| `block/capacity_monitor.rs` | SSD capacity monitor: `statvfs` polling, pressure flush on dirtiest exports |
+| `block/content_store.rs` | S3 PUT/GET for packs and manifests via `object_store` crate |
+| `block/manifest.rs` | Binary manifest serialization/deserialization (GLDE format) |
+| `block/flush_scheduler.rs` | Event-driven pack flush (Notify) + periodic WAL checkpoint (5s) |
+| `block/wal.rs` | Append-only WAL for crash recovery with CRC32 integrity |
+| `block/cache.rs` | `BlockCache` trait + `FoyerBlockCache` (memory + SSD hybrid) |
+| `block/readahead.rs` | Sequential read detector: 3+ consecutive chunks triggers pack prefetch |
+| `block/scrubber.rs` | Background corruption detection: re-hash cached blocks, evict on mismatch |
+| `block/sync.rs` | Loom/std compatibility shim: re-exports atomics for exhaustive interleaving tests |
+| `block/metrics.rs` | Per-export Prometheus-compatible telemetry with sampled latency histograms |
+| `block/protocol.rs` | NBD wire format: handshake options, transmission commands, reply serialization |
+| `block/api.rs` | HTTP REST API for export CRUD, drain, promote, metrics |
+| `block/error.rs` | Error types: `NBDError` (protocol-specific), `CommandError` (transport-agnostic, maps to NBD errno or Linux errno) |
 | `circuit_breaker.rs` | Lock-free S3 circuit breaker (single AtomicU64, CAS transitions) |
 | `config.rs` | TOML configuration parsing with environment variable expansion |
 | `storage_compatibility.rs` | S3 conditional write check (`PutMode::Create`) for fencing support |
