@@ -349,7 +349,7 @@ impl WriteCache<Active> {
                     let cs = content_store;
                     async move {
                         let pack_id = uuid::Uuid::new_v4();
-                        let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size);
+                        let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size)?;
                         let pack_size = pack_bytes.len() as u64;
                         cs.put_pack(pack_id, pack_bytes).await?;
                         Ok((pack_id, pack_size, index_entries))

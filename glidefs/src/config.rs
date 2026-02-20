@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use tracing::warn;
 
 
 // Note: Block-level compression is intentionally NOT implemented.
@@ -460,6 +461,17 @@ impl Settings {
 
         // NBD validation
         if let Some(nbd) = &self.servers.nbd {
+            // Deprecated field warnings
+            if nbd.blocks_per_batch.is_some() {
+                warn!("config: 'blocks_per_batch' is deprecated and ignored");
+            }
+            if nbd.device_name.is_some() {
+                warn!("config: 'device_name' is deprecated, use 'exports' array instead");
+            }
+            if nbd.device_size_gb.is_some() {
+                warn!("config: 'device_size_gb' is deprecated, use 'exports' array instead");
+            }
+
             if let Some(bs) = nbd.block_size {
                 anyhow::ensure!(
                     bs.is_power_of_two() && (4096..=1_048_576).contains(&bs),

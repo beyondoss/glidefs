@@ -27,7 +27,9 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+use tracing::warn;
 
 const MAGIC: &[u8; 8] = b"GLIDETRC";
 const VERSION: u32 = 1;
@@ -50,6 +52,7 @@ pub struct WriteTracer {
     writer: parking_lot::Mutex<BufWriter<File>>,
     start: Instant,
     block_size: u32,
+    warned: AtomicBool,
 }
 
 impl WriteTracer {
@@ -90,6 +93,7 @@ impl WriteTracer {
             writer: parking_lot::Mutex::new(writer),
             start: Instant::now(),
             block_size,
+            warned: AtomicBool::new(false),
         })
     }
 
@@ -114,13 +118,21 @@ impl WriteTracer {
         // Best-effort: drop writes on I/O error rather than failing the
         // guest write path.
         let mut w = self.writer.lock();
-        let _ = w.write_all(&buf);
+        if let Err(e) = w.write_all(&buf)
+            && !self.warned.swap(true, Ordering::Relaxed)
+        {
+            warn!(error = %e, "write trace I/O failed, further errors will be silent");
+        }
     }
 
     /// Flush buffered data to disk. Called on export teardown.
     pub fn finish(&self) {
         let mut w = self.writer.lock();
-        let _ = w.flush();
+        if let Err(e) = w.flush()
+            && !self.warned.swap(true, Ordering::Relaxed)
+        {
+            warn!(error = %e, "write trace flush failed");
+        }
     }
 }
 

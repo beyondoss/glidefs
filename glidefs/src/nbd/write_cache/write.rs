@@ -49,10 +49,19 @@ impl WriteCache<Active> {
         //
         // By setting present first, prefetch's CAS will fail if we've claimed the block,
         // or if prefetch wins the CAS, our pwrite will overwrite their stale S3 data.
+        //
+        // CRITICAL: Clear CRC32 BEFORE pwrite. Between pwrite and block_map_set there
+        // is a window where SSD data has changed but the sequence number is stale. A
+        // concurrent flush during this window would see a CRC mismatch with matching
+        // sequence — indistinguishable from real SSD corruption. Clearing the CRC first
+        // ensures the flush sees CRC=0 and skips the check. The second clear after
+        // block_map_set (in the WAL block below) handles the case where checkpoint
+        // recomputes a CRC between our clear and pwrite.
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
+                self.inner.block_map_clear_crc32(idx);
             }
         }
 
@@ -127,6 +136,19 @@ impl WriteCache<Active> {
                 offset + len,
                 self.inner.config.device_size,
             ));
+        }
+
+        // Clear CRC32 before SSD write (same race as write() — see comment there).
+        {
+            let block_size = self.inner.config.block_size as u64;
+            let start_block = offset / block_size;
+            let end_block = (offset + len - 1) / block_size;
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx < self.inner.num_blocks {
+                    self.inner.block_map_clear_crc32(idx);
+                }
+            }
         }
 
         // Zero the file range

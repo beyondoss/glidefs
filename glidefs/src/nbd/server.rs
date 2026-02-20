@@ -598,6 +598,9 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
         response_tx: mpsc::Sender<Response>,
         tasks: &mut JoinSet<()>,
     ) -> Result<()> {
+        // Reusable buffer for draining oversized write payloads (allocated on first use).
+        let mut drain_buf: Option<Vec<u8>> = None;
+
         loop {
             let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
 
@@ -644,11 +647,11 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                 // For writes, we must still drain the payload bytes from the socket
                 // to keep the protocol stream in sync.
                 if matches!(request.cmd_type, NBDCommand::Write) {
+                    let buf = drain_buf.get_or_insert_with(|| vec![0u8; 64 * 1024]);
                     let mut remaining = request.length as u64;
-                    let mut drain_buf = vec![0u8; 64 * 1024];
                     while remaining > 0 {
-                        let to_read = std::cmp::min(remaining, drain_buf.len() as u64) as usize;
-                        reader.read_exact(&mut drain_buf[..to_read]).await
+                        let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
+                        reader.read_exact(&mut buf[..to_read]).await
                             .map_err(NBDError::Io)?;
                         remaining -= to_read as u64;
                     }

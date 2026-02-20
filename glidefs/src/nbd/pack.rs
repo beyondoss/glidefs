@@ -69,15 +69,17 @@ pub struct PackIndexEntry {
 ///
 /// Returns the complete pack bytes and the index entries with their final offsets.
 ///
-/// Panics if `blocks.len()` exceeds `u16::MAX`.
+/// Returns an error if `blocks.len()` exceeds `u16::MAX` (wire format limit).
 pub fn assemble_pack(
     blocks: Vec<(Blake3Hash, Vec<u8>)>,
     chunk_size: u32,
-) -> (Vec<u8>, Vec<PackIndexEntry>) {
-    let block_count: u16 = blocks
-        .len()
-        .try_into()
-        .expect("block count must fit in u16");
+) -> io::Result<(Vec<u8>, Vec<PackIndexEntry>)> {
+    let block_count: u16 = blocks.len().try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("block count {} exceeds u16::MAX", blocks.len()),
+        )
+    })?;
 
     let data_start = PACK_HEADER_SIZE + blocks.len() * PACK_INDEX_ENTRY_SIZE;
 
@@ -120,7 +122,7 @@ pub fn assemble_pack(
     }
 
     debug_assert_eq!(buf.len(), total_size);
-    (buf, entries)
+    Ok((buf, entries))
 }
 
 /// Parse a pack's header and block index from raw bytes.
@@ -252,7 +254,7 @@ mod tests {
             blocks.push((hash, compressed));
         }
 
-        let (pack_bytes, entries) = assemble_pack(blocks, chunk_size);
+        let (pack_bytes, entries) = assemble_pack(blocks, chunk_size).unwrap();
 
         // Parse the index back.
         let index = parse_pack_index(&pack_bytes).unwrap();
@@ -282,7 +284,7 @@ mod tests {
         let compressed = lz4_compress(&data);
         let blocks = vec![(hash, compressed)];
 
-        let (pack_bytes, entries) = assemble_pack(blocks, chunk_size);
+        let (pack_bytes, entries) = assemble_pack(blocks, chunk_size).unwrap();
         assert_eq!(entries.len(), 1);
 
         let index = parse_pack_index(&pack_bytes).unwrap();
@@ -304,7 +306,7 @@ mod tests {
         let compressed = lz4_compress(&data);
         let blocks = vec![(hash, compressed.clone()), (hash, compressed)];
 
-        let (pack_bytes, _) = assemble_pack(blocks, 4096);
+        let (pack_bytes, _) = assemble_pack(blocks, 4096).unwrap();
 
         // First 4 bytes: magic.
         assert_eq!(&pack_bytes[..4], b"GLPK");
@@ -328,7 +330,7 @@ mod tests {
             blocks.push((hash, compressed));
         }
 
-        let (pack_bytes, _) = assemble_pack(blocks, chunk_size);
+        let (pack_bytes, _) = assemble_pack(blocks, chunk_size).unwrap();
         let index = parse_pack_index(&pack_bytes).unwrap();
 
         // Look up block 3 by its hash.
@@ -358,7 +360,7 @@ mod tests {
         let compressed = lz4_compress(&data);
         let blocks = vec![(hash, compressed)];
 
-        let (pack_bytes, _) = assemble_pack(blocks, chunk_size);
+        let (pack_bytes, _) = assemble_pack(blocks, chunk_size).unwrap();
         let index = parse_pack_index(&pack_bytes).unwrap();
         assert_eq!(index.entries.len(), 1);
 
@@ -390,7 +392,7 @@ mod tests {
         let data = vec![0u8; 4096];
         let hash = blake3_128(&data);
         let compressed = lz4_compress(&data);
-        let (mut pack_bytes, _) = assemble_pack(vec![(hash, compressed)], 4096);
+        let (mut pack_bytes, _) = assemble_pack(vec![(hash, compressed)], 4096).unwrap();
 
         // Corrupt magic bytes
         pack_bytes[0..4].copy_from_slice(b"NOPE");
@@ -404,7 +406,7 @@ mod tests {
         let data = vec![0u8; 4096];
         let hash = blake3_128(&data);
         let compressed = lz4_compress(&data);
-        let (mut pack_bytes, _) = assemble_pack(vec![(hash, compressed)], 4096);
+        let (mut pack_bytes, _) = assemble_pack(vec![(hash, compressed)], 4096).unwrap();
 
         // Set version to 99
         pack_bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
@@ -426,7 +428,7 @@ mod tests {
         let data = vec![0u8; 4096];
         let hash = blake3_128(&data);
         let compressed = lz4_compress(&data);
-        let (pack_bytes, _) = assemble_pack(vec![(hash, compressed)], 4096);
+        let (pack_bytes, _) = assemble_pack(vec![(hash, compressed)], 4096).unwrap();
 
         // Truncate after header but before the full index entry
         let truncated = &pack_bytes[..PACK_HEADER_SIZE + 10];
@@ -440,7 +442,7 @@ mod tests {
         let data = vec![42u8; 4096];
         let hash = blake3_128(&data);
         let compressed = lz4_compress(&data);
-        let (pack_bytes, entries) = assemble_pack(vec![(hash, compressed)], 4096);
+        let (pack_bytes, entries) = assemble_pack(vec![(hash, compressed)], 4096).unwrap();
 
         // Valid extraction works
         assert!(extract_block(&pack_bytes, entries[0].offset, entries[0].comp_length).is_some());
@@ -468,7 +470,7 @@ mod tests {
         // Assembling with 0 blocks produces a header-only pack. This is allowed
         // for symmetry (a valid but useless pack), and parse_pack_index handles
         // it correctly.
-        let (pack_bytes, entries) = assemble_pack(vec![], 131072);
+        let (pack_bytes, entries) = assemble_pack(vec![], 131072).unwrap();
         assert!(entries.is_empty());
         assert_eq!(pack_bytes.len(), PACK_HEADER_SIZE);
 
