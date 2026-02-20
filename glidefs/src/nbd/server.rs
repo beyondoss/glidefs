@@ -864,6 +864,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                         // Flush before drain
                         let _ = writer.flush().await;
                         if let Err(e) = router.drain_export(&export_name).await {
+                            router.record_drain_error(&export_name).await;
                             warn!("Failed to drain on disconnect: {}", e);
                         }
                         info!("Client disconnected, drain complete");

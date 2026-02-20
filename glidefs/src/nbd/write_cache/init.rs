@@ -49,6 +49,9 @@ impl WriteCache<Initializing> {
         let export_name = config.device_name.clone();
         let chunk_size = config.block_size as u32;
 
+        // Track recovery issues for metrics
+        let mut recovery_warning_count: u64 = 0;
+
         // Load persisted block map (or create empty)
         let mut persisted_bm = if block_map_path.exists() {
             match BlockMap::load_from_file(&block_map_path) {
@@ -57,7 +60,8 @@ impl WriteCache<Initializing> {
                     bm
                 }
                 Err(e) => {
-                    warn!(error = %e, "failed to load v2 block map, starting fresh");
+                    error!(error = %e, "failed to load v2 block map, starting fresh — dedup will be unavailable until next full flush");
+                    recovery_warning_count += 1;
                     BlockMap::new(config.device_size, chunk_size)
                 }
             }
@@ -77,6 +81,7 @@ impl WriteCache<Initializing> {
             }
             Err(e) => {
                 error!(error = %e, "WAL replay failed — dirty blocks since last checkpoint may be lost, continuing with persisted block map");
+                recovery_warning_count += 1;
                 vec![]
             }
         };
@@ -167,11 +172,13 @@ impl WriteCache<Initializing> {
             zero_block_bytes: zbb,
             manifest_pack_hashes: Mutex::new(HashSet::new()),
             base_manifest_state: Mutex::new(None),
+            recovery_warnings: AtomicU64::new(recovery_warning_count),
         });
 
         info!(
             dirty_blocks = dirty_count,
             present_blocks = present_count,
+            recovery_warnings = recovery_warning_count,
             "cache opened, transitioning to Recovering"
         );
 
@@ -256,6 +263,7 @@ impl WriteCache<Initializing> {
             zero_block_bytes: zbb,
             manifest_pack_hashes: Mutex::new(manifest_hashes),
             base_manifest_state: Mutex::new(Some(base_state)),
+            recovery_warnings: AtomicU64::new(0),
         });
 
         info!("cache opened from manifest, directly Active");

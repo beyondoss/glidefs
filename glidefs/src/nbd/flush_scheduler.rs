@@ -49,6 +49,11 @@ pub async fn flush_scheduler(
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
     let mut flush_backoff = Duration::ZERO;
 
+    // Pending manifest sync: if sync_manifest fails after a successful pack
+    // flush, we retry on the next checkpoint tick to close the window where
+    // packs are on S3 but not referenced by any manifest.
+    let mut manifest_pending: Option<u64> = None;
+
     loop {
         tokio::select! {
             biased;
@@ -93,8 +98,21 @@ pub async fn flush_scheduler(
                             // Sync manifest so flushed packs are discoverable
                             // on cross-host recovery (host death without drain).
                             // sync_manifest includes checkpoint (persist + WAL truncate).
-                            if let Err(e) = cache.sync_manifest(&content_store, &pack_index, seq_cutpoint).await {
-                                warn!(error = %e, "manifest sync after flush failed");
+                            // Retry up to 3 times; if all fail, defer to checkpoint tick.
+                            let mut synced = false;
+                            for attempt in 0..3 {
+                                match cache.sync_manifest(&content_store, &pack_index, seq_cutpoint).await {
+                                    Ok(()) => { synced = true; break; }
+                                    Err(e) => {
+                                        metrics.record_manifest_sync_error();
+                                        warn!(error = %e, attempt = attempt + 1, "manifest sync after flush failed");
+                                    }
+                                }
+                            }
+                            if synced {
+                                manifest_pending = None;
+                            } else {
+                                manifest_pending = Some(seq_cutpoint);
                             }
                         } else {
                             // No packs uploaded — still checkpoint to persist
@@ -122,9 +140,21 @@ pub async fn flush_scheduler(
                 }
             }
 
-            // Periodic: truncate WAL every 5s.
+            // Periodic: checkpoint every 5s + retry pending manifest sync.
             _ = checkpoint_ticker.tick() => {
-                if cache.dirty_block_count() > 0
+                // Retry manifest sync that failed after a previous pack flush.
+                if let Some(seq) = manifest_pending {
+                    match cache.sync_manifest(&content_store, &pack_index, seq).await {
+                        Ok(()) => {
+                            info!("deferred manifest sync succeeded");
+                            manifest_pending = None;
+                        }
+                        Err(e) => {
+                            metrics.record_manifest_sync_error();
+                            warn!(error = %e, "deferred manifest sync retry failed");
+                        }
+                    }
+                } else if cache.dirty_block_count() > 0
                     && let Err(e) = cache.local_checkpoint()
                 {
                     warn!(error = %e, "local checkpoint failed");

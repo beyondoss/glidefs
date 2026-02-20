@@ -204,6 +204,11 @@ impl WriteCache<Active> {
         self.inner.syncing_block_count.load(Ordering::Relaxed)
     }
 
+    /// Number of recovery issues encountered during cache open.
+    pub fn recovery_warning_count(&self) -> u64 {
+        self.inner.recovery_warnings.load(Ordering::Relaxed)
+    }
+
     /// Get the device size.
     #[allow(dead_code)]
     pub fn device_size(&self) -> u64 {

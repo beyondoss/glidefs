@@ -462,6 +462,7 @@ Every layer has a verification mechanism. The goal: corruption is detected befor
 | S3 packs | Block data in transit/at rest | BLAKE3-128 | Read path: after S3 fetch + LZ4 decompress | `HashMismatch` error → re-fetch from S3 |
 | Clean cache (Foyer) | Cached blocks on SSD/memory | BLAKE3-128 | Background scrubber re-hashes against content address | Evict from cache → next read re-fetches from S3 |
 | Manifest | Block map + pack index snapshot | CRC32 trailer | On deserialization (load from S3) | Reject manifest, return error |
+| Pack registry | Per-export pack ID list for GC | CRC32 trailer | On deserialization (load from S3) | Reject registry, return error |
 | WAL entries | Per-entry metadata | CRC32 trailer | On replay (crash recovery) | Stop replay at first corrupt entry, discard torn tail |
 | Dirty blocks (SSD) | Block data between write and flush | CRC32 in `HashEntry` | Flush time: before BLAKE3 computation | Skip block (stays dirty), do NOT launder to S3 |
 

@@ -255,6 +255,10 @@ pub(crate) struct CacheInner {
     /// Used to compute delta manifests by diffing the current block_map
     /// against this snapshot. None until the first full manifest upload.
     pub(super) base_manifest_state: Mutex<Option<BaseManifestState>>,
+
+    /// Number of recovery issues encountered during cache open (WAL replay
+    /// failure, block map load failure). Exposed via metrics for monitoring.
+    pub(super) recovery_warnings: AtomicU64,
 }
 
 impl CacheInner {

@@ -64,6 +64,12 @@ pub struct ExportMetrics {
     /// Blocks left dirty per flush due to concurrent-write CAS failures
     pub flush_blocks_cas_failed: AtomicU64,
 
+    /// Failed manifest syncs after successful pack flush
+    pub manifest_sync_errors: AtomicU64,
+
+    /// Recovery issues (WAL replay failure, block map load failure)
+    pub recovery_warnings: AtomicU64,
+
     // Latency tracking for diagnosing performance issues (sampled 1:64).
     // Each histogram has its own sample counter so high-frequency operation types
     // (e.g. reads) don't starve low-frequency ones (e.g. S3 PUTs).
@@ -252,6 +258,8 @@ impl Default for ExportMetrics {
             s3_get_errors: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
             flush_blocks_cas_failed: AtomicU64::new(0),
+            manifest_sync_errors: AtomicU64::new(0),
+            recovery_warnings: AtomicU64::new(0),
             read_latencies: SampledHistogram::new(),
             write_latencies: SampledHistogram::new(),
             s3_fetch_latencies: SampledHistogram::new(),
@@ -377,6 +385,18 @@ impl ExportMetrics {
         }
     }
 
+    /// Record a failed manifest sync after successful pack flush.
+    #[inline]
+    pub fn record_manifest_sync_error(&self) {
+        self.manifest_sync_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a recovery warning (WAL replay failure, block map load failure).
+    #[inline]
+    pub fn record_recovery_warning(&self) {
+        self.recovery_warnings.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record S3 PUT latency (sampled 1:64 to reduce mutex contention).
     #[inline]
     pub fn record_s3_put_latency(&self, duration: Duration) {
@@ -437,6 +457,8 @@ impl ExportMetrics {
             s3_get_errors: self.s3_get_errors.load(Ordering::Relaxed),
             flush_errors: self.flush_errors.load(Ordering::Relaxed),
             flush_blocks_cas_failed: self.flush_blocks_cas_failed.load(Ordering::Relaxed),
+            manifest_sync_errors: self.manifest_sync_errors.load(Ordering::Relaxed),
+            recovery_warnings: self.recovery_warnings.load(Ordering::Relaxed),
             dirty_blocks: None,
             syncing_blocks: None,
             write_amplification,
@@ -471,6 +493,8 @@ pub struct MetricsSnapshot {
     pub s3_get_errors: u64,
     pub flush_errors: u64,
     pub flush_blocks_cas_failed: u64,
+    pub manifest_sync_errors: u64,
+    pub recovery_warnings: u64,
 
     // Cache state (populated by router)
     /// Number of dirty blocks waiting to be synced to S3
@@ -552,6 +576,8 @@ impl MetricsSnapshot {
         let _ = writeln!(out, "glidefs_s3_get_errors_total{{{label}}} {}", self.s3_get_errors);
         let _ = writeln!(out, "glidefs_flush_errors_total{{{label}}} {}", self.flush_errors);
         let _ = writeln!(out, "glidefs_flush_blocks_cas_failed_total{{{label}}} {}", self.flush_blocks_cas_failed);
+        let _ = writeln!(out, "glidefs_manifest_sync_errors_total{{{label}}} {}", self.manifest_sync_errors);
+        let _ = writeln!(out, "glidefs_recovery_warnings_total{{{label}}} {}", self.recovery_warnings);
 
         // Cache state (gauges)
         if let Some(dirty) = self.dirty_blocks {
@@ -669,6 +695,10 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_flush_errors_total counter
 # HELP glidefs_flush_blocks_cas_failed_total Blocks left dirty per flush due to concurrent-write CAS failures
 # TYPE glidefs_flush_blocks_cas_failed_total counter
+# HELP glidefs_manifest_sync_errors_total Failed manifest syncs after successful pack flush
+# TYPE glidefs_manifest_sync_errors_total counter
+# HELP glidefs_recovery_warnings_total Recovery issues (WAL replay failure, block map load failure)
+# TYPE glidefs_recovery_warnings_total counter
 # HELP glidefs_read_latency_seconds NBD read operation latency
 # TYPE glidefs_read_latency_seconds histogram
 # HELP glidefs_write_latency_seconds NBD write operation latency

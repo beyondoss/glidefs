@@ -661,6 +661,14 @@ impl ExportRouter {
             Arc::new(cache)
         };
 
+        // Record any recovery issues in metrics
+        let rw = cache.recovery_warning_count();
+        if rw > 0 {
+            for _ in 0..rw {
+                metrics.record_recovery_warning();
+            }
+        }
+
         // Boot hot set prefetch: warm the clean cache before the VM reads
         if let Some(manifest_name) = manifest_name {
             // Extract base name from manifest_name (e.g., "bases/ubuntu-22.04" → "ubuntu-22.04")
@@ -868,6 +876,17 @@ impl ExportRouter {
         state.drain(name).await?;
         info!("Export '{}' drained successfully", name);
         Ok(())
+    }
+
+    /// Record a drain/flush error for the named export's metrics.
+    ///
+    /// Best-effort: silently does nothing if the export doesn't exist
+    /// (it may have been removed between the drain attempt and this call).
+    pub async fn record_drain_error(&self, name: &str) {
+        let exports = self.exports.read().await;
+        if let Some(state) = exports.get(name) {
+            state.metrics.record_flush_error();
+        }
     }
 
     /// Drain all exports. Returns (name, error) pairs for any that failed.
@@ -1097,6 +1116,7 @@ impl ExportRouter {
             cache,
             content_store,
             pack_index,
+            metrics,
             flush_shutdown_tx,
             flush_handle,
             ..
@@ -1122,6 +1142,7 @@ impl ExportRouter {
                 }
                 Ok(_) => {}
                 Err(e) => {
+                    metrics.record_flush_error();
                     warn!("Drain error for '{}' (retrying): {}", name, e);
                 }
             }
