@@ -205,13 +205,13 @@ where
                 ));
             }
 
-            if let Some(ref prefix) = put_req.s3_prefix {
-                if prefix.contains("..") || prefix.starts_with('/') {
-                    return Ok(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "Invalid s3_prefix: must not contain '..' or start with '/'",
-                    ));
-                }
+            if let Some(ref prefix) = put_req.s3_prefix
+                && (prefix.contains("..") || prefix.starts_with('/'))
+            {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid s3_prefix: must not contain '..' or start with '/'",
+                ));
             }
 
             // Check if export already exists

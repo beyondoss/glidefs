@@ -63,7 +63,9 @@
       "Bash(docker build:*)",
       "Bash(docker ps:*)",
       "WebFetch(domain:docs.kernel.org)",
-      "WebFetch(domain:lwn.net)"
+      "WebFetch(domain:lwn.net)",
+      "WebFetch(domain:jpospisil.com)",
+      "WebFetch(domain:people.redhat.com)"
     ]
   }
 }
