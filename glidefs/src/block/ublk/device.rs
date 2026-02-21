@@ -612,7 +612,7 @@ async fn io_task_zc(
 ) -> Result<(), UblkError> {
     let auto_reg = sys::ublk_auto_buf_reg {
         index: tag,
-        flags: 0,
+        flags: sys::UBLK_AUTO_BUF_REG_FALLBACK as u8,
         reserved0: 0,
         reserved1: 0,
     };
@@ -625,6 +625,17 @@ async fn io_task_zc(
         let iod = q.get_iod(tag);
         let op = iod.op_flags & 0xff;
         let fua = (iod.op_flags & sys::UBLK_IO_F_FUA) != 0;
+
+        // If auto buffer registration failed, manually register before I/O.
+        if (iod.op_flags & sys::UBLK_IO_F_NEED_REG_BUF) != 0 {
+            let res = q.submit_register_io_buf(tag, tag).await;
+            if res < 0 {
+                q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), -libc::EIO)
+                    .await?;
+                continue;
+            }
+        }
+
         let offset = iod.start_sector << 9;
         let byte_len = u64::from(iod.nr_sectors) * 512;
         debug_assert!(
