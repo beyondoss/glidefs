@@ -436,7 +436,7 @@ impl<'a> QueueExecutor<'a> {
                 // SAFETY: single-threaded, no concurrent access to tasks vec.
                 // Wakers only push to the SegQueue (lock-free), never touch tasks.
                 &mut *std::ptr::addr_of_mut!(
-                    (*std::ptr::from_ref(self).cast_mut()).tasks[idx]
+                    (&mut (*std::ptr::from_ref(self).cast_mut()).tasks)[idx]
                 )
             };
 
