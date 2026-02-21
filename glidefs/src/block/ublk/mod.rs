@@ -40,6 +40,12 @@ pub struct UblkServer {
     devices: HashMap<String, device::UblkDevice>,
 }
 
+impl Default for UblkServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UblkServer {
     /// Create a new ublk server.
     ///

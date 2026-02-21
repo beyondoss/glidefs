@@ -313,6 +313,7 @@ impl QueueLatch {
 /// 1. Build the ublk control device (allocates `/dev/ublkbN`)
 /// 2. `run_target()` sets params, spawns queue threads, starts the device
 /// 3. Blocks until `kill_dev()` triggers shutdown
+#[allow(clippy::too_many_arguments)]
 fn run_device(
     dev_size: u64,
     nr_queues: u16,

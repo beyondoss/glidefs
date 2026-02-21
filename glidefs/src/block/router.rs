@@ -1045,6 +1045,7 @@ impl ExportRouter {
 
     /// Check if a transport is available on this build/platform.
     #[allow(dead_code)] // Used by API layer (api.rs)
+    #[allow(clippy::match_like_matches_macro)] // arms have different cfg! expressions
     pub fn device_available(transport: &str) -> bool {
         match transport {
             "nbd" => cfg!(target_os = "linux"),
