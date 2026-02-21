@@ -1007,7 +1007,7 @@ impl ExportRouter {
                 info!("Shutting down ublk devices...");
                 let ublk = {
                     let mut guard = self.ublk_server.lock().await;
-                    std::mem::replace(&mut *guard, crate::block::ublk::UblkServer::new())
+                    std::mem::take(&mut *guard)
                 };
                 if let Err(e) = ublk.shutdown().await {
                     warn!("ublk device shutdown failed: {}", e);
