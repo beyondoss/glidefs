@@ -470,8 +470,12 @@ struct QueueExecutor<'a> {
     wakers: Vec<Waker>,
     /// Shared atomic bitmask + eventfd.
     bits: Arc<WakeupBits>,
-    /// Number of live tasks. O(1) completion check.
+    /// Number of live I/O tasks (excludes daemons). O(1) completion check.
     alive: Cell<usize>,
+    /// Number of daemon tasks (spawned first, indices 0..num_daemons).
+    /// Daemon tasks don't gate shutdown — when all I/O tasks complete,
+    /// the event loop exits and daemon futures are dropped.
+    num_daemons: usize,
 }
 
 impl<'a> QueueExecutor<'a> {
@@ -481,9 +485,33 @@ impl<'a> QueueExecutor<'a> {
             wakers: Vec::new(),
             bits: Arc::new(WakeupBits::new(efd)),
             alive: Cell::new(0),
+            num_daemons: 0,
         }
     }
 
+    /// Spawn a daemon task that does NOT count toward `all_done()`.
+    ///
+    /// Must be called before any `spawn()` calls. Used for helper tasks
+    /// (e.g., the eventfd PollAdd watcher) whose lifetime should not gate
+    /// the event loop exit.
+    fn spawn_daemon(&mut self, future: impl Future<Output = ()> + 'a) {
+        debug_assert_eq!(
+            self.alive.get(), 0,
+            "spawn_daemon must be called before spawn"
+        );
+        let idx = self.tasks.len();
+        assert!(idx < 192, "QueueExecutor supports at most 192 tasks");
+        self.tasks.push(UnsafeCell::new(Some(Box::pin(future))));
+        self.wakers.push(Waker::from(Arc::new(TaskWaker {
+            bits: Arc::clone(&self.bits),
+            idx,
+        })));
+        self.num_daemons = idx + 1;
+        // Mark for initial poll.
+        self.bits.words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
+    }
+
+    /// Spawn an I/O task that counts toward `all_done()`.
     fn spawn(&mut self, future: impl Future<Output = ()> + 'a) {
         let idx = self.tasks.len();
         assert!(idx < 192, "QueueExecutor supports at most 192 tasks");
@@ -519,14 +547,16 @@ impl<'a> QueueExecutor<'a> {
                     let mut cx = TaskContext::from_waker(&self.wakers[idx]);
                     if task.as_mut().poll(&mut cx).is_ready() {
                         *slot = None;
-                        self.alive.set(self.alive.get() - 1);
+                        if idx >= self.num_daemons {
+                            self.alive.set(self.alive.get() - 1);
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Check if all tasks have completed.
+    /// Check if all I/O tasks have completed (daemons excluded).
     fn all_done(&self) -> bool {
         self.alive.get() == 0
     }
@@ -800,12 +830,12 @@ fn queue_io_loop(
     let zero_copy = q_rc.support_auto_buf_zc();
     let mut exe = QueueExecutor::new(efd_fd);
 
-    // Spawn eventfd watcher — keeps a PollAdd registered on the eventfd so that
-    // eventfd writes (from wakers on tokio threads) generate CQEs that unblock
-    // io_uring_enter().
+    // Spawn eventfd watcher as a daemon — it keeps a PollAdd registered on the
+    // eventfd so that eventfd writes (from wakers on tokio threads) generate CQEs
+    // that unblock io_uring_enter(). Daemon: doesn't gate shutdown.
     {
         let q = q_rc.clone();
-        exe.spawn(async move {
+        exe.spawn_daemon(async move {
             loop {
                 let sqe = io_uring::opcode::PollAdd::new(
                     io_uring::types::Fd(efd_fd),
