@@ -7,11 +7,12 @@
 //! Run: `cargo test --features docker-tests --test docker_integration`
 
 mod nbd_client;
+#[cfg(target_os = "linux")]
+mod nbd_kernel_client;
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 mod ublk_client;
 
 use std::net::SocketAddr;
-#[cfg(all(target_os = "linux", feature = "ublk"))]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -36,8 +37,16 @@ use glidefs::config::ExportConfig;
 #[derive(Clone, Copy)]
 pub enum Transport {
     Nbd,
+    #[cfg(target_os = "linux")]
+    NbdKernel,
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     Ublk,
+}
+
+/// Check if kernel NBD is available (nbd module loaded).
+#[cfg(target_os = "linux")]
+pub fn nbd_kernel_available() -> bool {
+    std::path::Path::new("/dev/nbd0").exists()
 }
 
 /// Check if ublk is available on this system (kernel module loaded + sufficient privileges).
@@ -72,6 +81,19 @@ macro_rules! transport_test {
             $body
         }
 
+        #[cfg(target_os = "linux")]
+        paste::paste! {
+            #[tokio::test]
+            async fn [< $name _nbd_kernel >]() {
+                if !$crate::nbd_kernel_available() {
+                    eprintln!("nbd-kernel: skipping (nbd module not loaded or insufficient privileges)");
+                    return;
+                }
+                let $transport = $crate::Transport::NbdKernel;
+                $body
+            }
+        }
+
         #[cfg(all(target_os = "linux", feature = "ublk"))]
         paste::paste! {
             #[tokio::test]
@@ -93,6 +115,8 @@ macro_rules! transport_test {
 
 pub enum TestClient {
     Nbd(nbd_client::NbdClient),
+    #[cfg(target_os = "linux")]
+    NbdKernel(nbd_kernel_client::NbdKernelClient),
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     Ublk(ublk_client::UblkClient),
 }
