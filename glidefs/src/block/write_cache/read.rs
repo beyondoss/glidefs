@@ -307,6 +307,12 @@ impl WriteCache<Active> {
             return Ok(self.inner.zero_block_bytes.clone());
         }
 
+        // Fast path: block is present on local SSD — skip cache/index lookups.
+        // The data file is authoritative for any present block (Dirty, Clean, or Syncing).
+        if self.inner.is_present(chunk_index) {
+            return self.sync_read_local_block(chunk_index as u64);
+        }
+
         // Tier 1: clean_cache (recently written or previously fetched from S3).
         if let Some(data) = clean_cache.get(&hash).await {
             if let Some(m) = metrics {
@@ -670,6 +676,13 @@ impl WriteCache<Active> {
         // Explicit zero-range.
         if hash == self.inner.zero_block_hash {
             return Ok(ChunkSource::Zero);
+        }
+
+        // Fast path: block is present on local SSD — skip cache/index lookups.
+        // The data file is authoritative for any present block (Dirty, Clean, or Syncing).
+        if self.inner.is_present(chunk_index) {
+            let file_offset = chunk_index as u64 * self.inner.config.block_size as u64;
+            return Ok(ChunkSource::LocalSsd { file_offset });
         }
 
         // Tier 1: clean_cache (recently written or previously fetched from S3).
