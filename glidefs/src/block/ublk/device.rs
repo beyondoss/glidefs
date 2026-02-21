@@ -10,14 +10,16 @@ use ublk_core::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use ublk_core::helpers::IoBuf;
 use ublk_core::io::{UblkDev, UblkQueue};
 use ublk_core::{sys, BufDesc, UblkError, UblkFlags};
+use std::cell::{Cell, UnsafeCell};
 use std::future::Future;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker};
-use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll, Wake, Waker};
+use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::block::write_cache::ChunkSource;
@@ -387,64 +389,138 @@ fn drain_eventfd(fd: RawFd) {
 // QueueExecutor: minimal single-threaded executor with eventfd wakers
 // ---------------------------------------------------------------------------
 
-/// Shared wakeup state between executor and wakers.
+/// Atomic bitmask for task wakeups.
 ///
-/// Uses `Arc<crossbeam::queue::SegQueue>` — a lock-free MPSC queue that is
-/// safe to push from any thread (tokio workers) and pop from the executor
-/// thread. No RefCell, no try_borrow_mut, no lost wakeups.
-struct WakeupQueue {
-    queue: crossbeam::queue::SegQueue<usize>,
+/// 3 × `AtomicU64` = 192 bits — enough for `QUEUE_DEPTH` (128) + overhead
+/// tasks (eventfd watcher, etc.).
+///
+/// `wake()` sets one bit with a single `fetch_or` + signals the eventfd.
+/// Duplicate wakeups collapse naturally (OR is idempotent).
+/// `drain()` atomically grabs all pending bits in three swaps.
+struct WakeupBits {
+    words: [AtomicU64; 3],
     efd: RawFd,
 }
 
-/// Minimal single-threaded async executor with eventfd-signaling wakers.
+impl WakeupBits {
+    fn new(efd: RawFd) -> Self {
+        Self {
+            words: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            efd,
+        }
+    }
+
+    /// Mark a task as needing a poll + signal the eventfd.
+    #[inline]
+    fn wake(&self, idx: usize) {
+        self.words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
+        signal_eventfd(self.efd);
+    }
+
+    /// Atomically drain all pending wakeup bits.
+    ///
+    /// Bits that arrive between word swaps are deferred to the next drain
+    /// (the eventfd signal ensures prompt re-entry to the event loop).
+    fn drain(&self) -> [u64; 3] {
+        [
+            self.words[0].swap(0, Ordering::Acquire),
+            self.words[1].swap(0, Ordering::Acquire),
+            self.words[2].swap(0, Ordering::Acquire),
+        ]
+    }
+}
+
+/// Per-task waker: sets an atomic bit + signals eventfd on `wake()`.
 ///
-/// Every waker produced by this executor writes to the eventfd on `wake()`.
-/// This means any `wake()` call from any thread (tokio, io_uring CQE handler,
-/// internal) unblocks `io_uring_enter()` — no wrapper needed.
+/// Uses `std::task::Wake` — no raw vtable. Clone = `Arc::clone` (one atomic
+/// increment). Wake = one `fetch_or` + one `write(2)` syscall. Zero heap
+/// allocation on the hot path.
+struct TaskWaker {
+    bits: Arc<WakeupBits>,
+    idx: usize,
+}
+
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        self.bits.wake(self.idx);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.bits.wake(self.idx);
+    }
+}
+
+/// Minimal single-threaded async executor with atomic-bitmask wakers.
+///
+/// Every waker signals an eventfd, so any `wake()` from any thread (tokio
+/// workers, io_uring CQE handlers, internal) unblocks `io_uring_enter()`.
+/// No wrapper or combined waker needed — the signal is baked into every waker.
+///
+/// Hot-path costs:
+/// - `tick()`: three atomic swaps to drain, then iterate set bits (zero alloc)
+/// - `wake()`: one atomic `fetch_or` + one `write(2)` syscall
+/// - Waker clone: one atomic increment (`Arc::clone`)
+/// - Duplicate wakeups collapse (OR is idempotent → one poll per tick)
+/// - `all_done()`: O(1) counter check
 struct QueueExecutor<'a> {
-    tasks: Vec<Option<Pin<Box<dyn Future<Output = ()> + 'a>>>>,
-    wakeups: Arc<WakeupQueue>,
+    /// Task futures. `UnsafeCell` for interior mutability (single-threaded).
+    tasks: Vec<UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + 'a>>>>>,
+    /// Pre-allocated wakers, one per task. Passed by reference in `tick()` —
+    /// zero atomic ops unless the polled future internally clones the waker.
+    wakers: Vec<Waker>,
+    /// Shared atomic bitmask + eventfd.
+    bits: Arc<WakeupBits>,
+    /// Number of live tasks. O(1) completion check.
+    alive: Cell<usize>,
 }
 
 impl<'a> QueueExecutor<'a> {
     fn new(efd: RawFd) -> Self {
         Self {
             tasks: Vec::new(),
-            wakeups: Arc::new(WakeupQueue {
-                queue: crossbeam::queue::SegQueue::new(),
-                efd,
-            }),
+            wakers: Vec::new(),
+            bits: Arc::new(WakeupBits::new(efd)),
+            alive: Cell::new(0),
         }
     }
 
     fn spawn(&mut self, future: impl Future<Output = ()> + 'a) {
         let idx = self.tasks.len();
-        self.tasks.push(Some(Box::pin(future)));
-        // Wake immediately so the task gets its first poll.
-        self.wakeups.queue.push(idx);
+        assert!(idx < 192, "QueueExecutor supports at most 192 tasks");
+        self.tasks.push(UnsafeCell::new(Some(Box::pin(future))));
+        self.wakers.push(Waker::from(Arc::new(TaskWaker {
+            bits: Arc::clone(&self.bits),
+            idx,
+        })));
+        self.alive.set(self.alive.get() + 1);
+        // Mark for initial poll.
+        self.bits.words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
     }
 
-    /// Poll all woken tasks. Called after io_uring_enter returns.
+    /// Poll all woken tasks. Called after `io_uring_enter()` returns.
+    ///
+    /// Drains the atomic bitmask in one shot, then iterates set bits.
+    /// Tasks woken during this call are deferred to the next `tick()`
+    /// (the eventfd signal ensures prompt re-entry to the event loop).
     fn tick(&self) {
-        // Drain wakeup queue — we loop because polling a task may wake others.
-        loop {
-            let Some(idx) = self.wakeups.queue.pop() else { break };
-
-            // Get the task slot.
-            let task_slot = unsafe {
-                // SAFETY: single-threaded, no concurrent access to tasks vec.
-                // Wakers only push to the SegQueue (lock-free), never touch tasks.
-                &mut *std::ptr::addr_of_mut!(
-                    (&mut (*std::ptr::from_ref(self).cast_mut()).tasks)[idx]
-                )
-            };
-
-            if let Some(task) = task_slot {
-                let waker = make_queue_waker(Arc::clone(&self.wakeups), idx);
-                let mut cx = TaskContext::from_waker(&waker);
-                if task.as_mut().poll(&mut cx).is_ready() {
-                    *task_slot = None; // Task finished, drop it.
+        let words = self.bits.drain();
+        for (word_idx, mut word) in words.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1; // clear lowest set bit
+                let idx = word_idx * 64 + bit;
+                if idx >= self.tasks.len() {
+                    continue;
+                }
+                // SAFETY: single-threaded — only this thread accesses the tasks vec.
+                // Wakers only touch the atomic WakeupBits, never the task storage.
+                let slot = unsafe { &mut *self.tasks[idx].get() };
+                if let Some(task) = slot {
+                    let mut cx = TaskContext::from_waker(&self.wakers[idx]);
+                    if task.as_mut().poll(&mut cx).is_ready() {
+                        *slot = None;
+                        self.alive.set(self.alive.get() - 1);
+                    }
                 }
             }
         }
@@ -452,101 +528,32 @@ impl<'a> QueueExecutor<'a> {
 
     /// Check if all tasks have completed.
     fn all_done(&self) -> bool {
-        self.tasks.iter().all(|t| t.is_none())
+        self.alive.get() == 0
     }
 }
 
-// --- RawWaker vtable for QueueExecutor ---
+/// Waker that unparks a thread. Used by `block_on`.
+struct ThreadWaker(std::thread::Thread);
 
-/// Per-waker data: shared wakeup queue + task index.
-struct QueueWakerData {
-    wakeups: Arc<WakeupQueue>,
-    idx: usize,
-}
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
 
-const QUEUE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    queue_waker_clone,
-    queue_waker_wake,
-    queue_waker_wake_by_ref,
-    queue_waker_drop,
-);
-
-unsafe fn queue_waker_clone(ptr: *const ()) -> RawWaker {
-    let data = unsafe { &*(ptr as *const QueueWakerData) };
-    let cloned = Box::new(QueueWakerData {
-        wakeups: Arc::clone(&data.wakeups),
-        idx: data.idx,
-    });
-    RawWaker::new(Box::into_raw(cloned) as *const (), &QUEUE_WAKER_VTABLE)
-}
-
-unsafe fn queue_waker_wake(ptr: *const ()) {
-    let data = unsafe { Box::from_raw(ptr as *mut QueueWakerData) };
-    // Push task index to lock-free wakeup queue.
-    data.wakeups.queue.push(data.idx);
-    // ALWAYS signal eventfd — this is the critical invariant.
-    // Any wake() from any thread unblocks io_uring_enter().
-    signal_eventfd(data.wakeups.efd);
-}
-
-unsafe fn queue_waker_wake_by_ref(ptr: *const ()) {
-    let data = unsafe { &*(ptr as *const QueueWakerData) };
-    data.wakeups.queue.push(data.idx);
-    signal_eventfd(data.wakeups.efd);
-}
-
-unsafe fn queue_waker_drop(ptr: *const ()) {
-    drop(unsafe { Box::from_raw(ptr as *mut QueueWakerData) });
-}
-
-fn make_queue_waker(wakeups: Arc<WakeupQueue>, idx: usize) -> Waker {
-    let data = Box::new(QueueWakerData { wakeups, idx });
-    // SAFETY: vtable functions correctly manage the Box<QueueWakerData>.
-    unsafe {
-        Waker::from_raw(RawWaker::new(
-            Box::into_raw(data) as *const (),
-            &QUEUE_WAKER_VTABLE,
-        ))
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
     }
 }
 
-/// Minimal block_on: parks the current thread and polls a single future.
+/// Minimal `block_on`: parks the current thread and polls a single future.
 ///
 /// Used to drive the top-level async event loop on the queue thread.
-/// The future internally calls io_uring_enter() which blocks, so this
+/// The future internally calls `io_uring_enter()` which blocks, so this
 /// rarely actually parks — the future drives forward via CQEs.
 fn block_on<F: Future>(mut future: F) -> F::Output {
     // SAFETY: We never move `future` after pinning.
     let mut future = unsafe { Pin::new_unchecked(&mut future) };
-
-    let thread = std::thread::current();
-    let waker = {
-        // A simple waker that unparks this thread.
-        fn raw_clone(ptr: *const ()) -> RawWaker {
-            let thread = unsafe { Arc::from_raw(ptr as *const std::thread::Thread) };
-            let cloned = Arc::clone(&thread);
-            std::mem::forget(thread); // Don't drop the original
-            RawWaker::new(Arc::into_raw(cloned) as *const (), &BLOCK_ON_VTABLE)
-        }
-        fn raw_wake(ptr: *const ()) {
-            let thread = unsafe { Arc::from_raw(ptr as *const std::thread::Thread) };
-            thread.unpark();
-        }
-        fn raw_wake_by_ref(ptr: *const ()) {
-            let thread = unsafe { &*(ptr as *const std::thread::Thread) };
-            thread.unpark();
-        }
-        fn raw_drop(ptr: *const ()) {
-            drop(unsafe { Arc::from_raw(ptr as *const std::thread::Thread) });
-        }
-        static BLOCK_ON_VTABLE: RawWakerVTable =
-            RawWakerVTable::new(raw_clone, raw_wake, raw_wake_by_ref, raw_drop);
-
-        let arc = Arc::new(thread);
-        let raw = RawWaker::new(Arc::into_raw(arc) as *const (), &BLOCK_ON_VTABLE);
-        unsafe { Waker::from_raw(raw) }
-    };
-
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
     let mut cx = TaskContext::from_waker(&waker);
     loop {
         match future.as_mut().poll(&mut cx) {
