@@ -21,6 +21,7 @@
 mod device;
 
 use crate::block::handler::BlockHandler;
+use device::KernelFeatures;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,14 +36,20 @@ const DEFAULT_NR_QUEUES: u16 = 1;
 /// that dispatch to the handler.
 pub struct UblkServer {
     nr_queues: u16,
+    features: KernelFeatures,
     devices: HashMap<String, device::UblkDevice>,
 }
 
 impl UblkServer {
     /// Create a new ublk server.
+    ///
+    /// Probes the running kernel for supported ublk features (recovery,
+    /// zero-copy). Falls back to conservative defaults on older kernels.
     pub fn new() -> Self {
+        let features = device::detect_features();
         Self {
             nr_queues: DEFAULT_NR_QUEUES,
+            features,
             devices: HashMap::new(),
         }
     }
@@ -71,7 +78,8 @@ impl UblkServer {
 
         let name = export_name.to_string();
         let device =
-            device::UblkDevice::register(handler, self.nr_queues, name.clone()).await?;
+            device::UblkDevice::register(handler, self.nr_queues, name.clone(), &self.features)
+                .await?;
         let path = device.dev_path().to_path_buf();
         self.devices.insert(name, device);
         Ok(path)
@@ -93,6 +101,108 @@ impl UblkServer {
             tracing::debug!(export = %export_name, "no ublk device registered, nothing to remove");
         }
         Ok(())
+    }
+
+    /// Scan for QUIESCED ublk devices left behind by a previous crash and
+    /// recover them.
+    ///
+    /// `get_handler` resolves an export name to its `BlockHandler`. Devices
+    /// whose export has no matching handler are logged and skipped (they may
+    /// belong to another glidefs instance).
+    ///
+    /// Returns the number of successfully recovered devices.
+    pub async fn recover_quiesced_devices(
+        &mut self,
+        get_handler: impl Fn(&str) -> Option<Arc<BlockHandler>>,
+    ) -> usize {
+        if !self.features.recovery {
+            tracing::debug!("kernel does not support UBLK_F_USER_RECOVERY, skipping scan");
+            return 0;
+        }
+
+        // Collect candidate device IDs.
+        let mut candidates: Vec<i32> = Vec::new();
+        libublk::ctrl::UblkCtrl::for_each_dev_id(|dev_id| {
+            candidates.push(dev_id);
+        });
+
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        tracing::info!(count = candidates.len(), "scanning ublk devices for QUIESCED state");
+
+        let mut recovered = 0usize;
+        for dev_id in candidates {
+            let ctrl = match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(dev_id, error = %e, "cannot open ublk ctrl, skipping");
+                    continue;
+                }
+            };
+
+            // Only recover devices we own.
+            let name = ctrl.get_name().unwrap_or_default();
+            if name != "glidefs" {
+                continue;
+            }
+
+            // Only recover QUIESCED devices.
+            let state = ctrl.dev_info().state as u32;
+            if state != libublk::sys::UBLK_S_DEV_QUIESCED {
+                continue;
+            }
+
+            // Extract export name from target JSON.
+            let export_name = match ctrl
+                .get_target_data_from_json()
+                .and_then(|v| v.get("export_name")?.as_str().map(String::from))
+            {
+                Some(n) => n,
+                None => {
+                    tracing::warn!(dev_id, "QUIESCED glidefs device has no export_name in target JSON, skipping");
+                    continue;
+                }
+            };
+
+            // Skip if we already have this export registered.
+            if self.devices.contains_key(&export_name) {
+                tracing::debug!(dev_id, export = %export_name, "already registered, skipping recovery");
+                continue;
+            }
+
+            // Look up the handler for this export.
+            let handler = match get_handler(&export_name) {
+                Some(h) => h,
+                None => {
+                    tracing::warn!(dev_id, export = %export_name, "no handler for QUIESCED device, skipping");
+                    continue;
+                }
+            };
+
+            tracing::info!(dev_id, export = %export_name, "recovering QUIESCED ublk device");
+            match device::UblkDevice::recover(
+                dev_id,
+                handler,
+                self.nr_queues,
+                export_name.clone(),
+                &self.features,
+            )
+            .await
+            {
+                Ok(dev) => {
+                    tracing::info!(dev_id, export = %export_name, path = %dev.dev_path().display(), "ublk device recovered");
+                    self.devices.insert(export_name, dev);
+                    recovered += 1;
+                }
+                Err(e) => {
+                    tracing::error!(dev_id, export = %export_name, error = %e, "failed to recover ublk device");
+                }
+            }
+        }
+
+        recovered
     }
 
     /// Shutdown all ublk devices concurrently.

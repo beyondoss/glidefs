@@ -1017,6 +1017,32 @@ impl ExportRouter {
         Ok(())
     }
 
+    /// Recover QUIESCED ublk devices left by a previous daemon crash.
+    ///
+    /// Scans `/sys/class/ublk-char/` for glidefs-owned devices in QUIESCED
+    /// state and resumes them using the already-created export handlers.
+    /// Returns the number of successfully recovered devices.
+    ///
+    /// Call AFTER all exports have been created (via `create_export`) so that
+    /// handlers exist for matching.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub async fn recover_ublk_devices(&self) -> usize {
+        // Snapshot ublk-transport handlers. Release exports read lock before
+        // taking the ublk mutex to avoid lock ordering issues.
+        let handlers: HashMap<String, Arc<BlockHandler>> = {
+            let exports = self.exports.read().await;
+            exports
+                .iter()
+                .filter(|(_, s)| s.transport == "ublk")
+                .map(|(name, s)| (name.clone(), Arc::clone(&s.handler)))
+                .collect()
+        };
+
+        let mut ublk = self.ublk_server.lock().await;
+        ublk.recover_quiesced_devices(|name| handlers.get(name).cloned())
+            .await
+    }
+
     /// Check if a transport is available on this build/platform.
     #[allow(dead_code)] // Used by API layer (api.rs)
     pub fn device_available(transport: &str) -> bool {

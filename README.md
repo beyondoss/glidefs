@@ -186,15 +186,19 @@ On startup, GlideFS discovers exports from S3, recovers WAL + redb from local SS
 
 The orchestrator does nothing. Same device paths, same VMs, no reconnection needed.
 
-**ublk (VM restart required):** Kernel removes `/dev/ublkbN` immediately on process exit. VMs get I/O errors.
+**ublk (zero-downtime on Linux 6.3+):** With `UBLK_F_USER_RECOVERY_REISSUE`, the kernel keeps `/dev/ublkbN` alive in QUIESCED state and reissues in-flight I/O to the new process. Same device paths, same VMs.
 
 ```
-1. Start new binary
-2. New process discovers exports, creates new /dev/ublkbN devices
-3. /health/ready returns 200
-4. Orchestrator queries GET /api/exports → gets new device paths
-5. Orchestrator re-attaches devices to VMs (or restarts VMs)
+1. SIGUSR1 → drain all exports to S3
+2. SIGTERM → graceful shutdown (ublk devices enter QUIESCED state)
+3. Start new binary (same config, same cache dir)
+4. New process discovers exports, recovers from WAL + redb
+5. Scans for QUIESCED glidefs devices, resumes them via START_USER_RECOVERY
+6. Kernel reissues queued I/O to new process
+7. /health/ready returns 200
 ```
+
+On kernels before 6.3 (no `UBLK_F_USER_RECOVERY`), ublk devices are removed on process exit. VMs get I/O errors and must be re-attached to new device paths after recovery.
 
 **Full compute node reboot:** Everything starts fresh. Orchestrator creates exports via API, gets device paths, starts VMs.
 

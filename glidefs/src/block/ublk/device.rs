@@ -520,25 +520,46 @@ fn queue_io_loop(
 
 /// Per-tag async I/O task.
 ///
-/// Registers a buffer with the kernel, then loops: receive command, dispatch
-/// to the BlockHandler, commit the result and fetch the next command.
+/// When the kernel supports auto buffer registration (`UBLK_F_AUTO_BUF_REG` +
+/// `UBLK_F_SUPPORT_ZERO_COPY`), we access kernel bio pages directly via
+/// `iod.addr` — eliminating a 128KB memcpy per READ/WRITE. On older kernels
+/// we fall back to `IoBuf`-based I/O.
 async fn io_task(
     q: &UblkQueue<'_>,
     tag: u16,
     handler: &BlockHandler,
     tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
-    let buf_size = q.dev.dev_info.max_io_buf_bytes as usize;
-    let mut buffer = IoBuf::<u8>::new(buf_size);
+    let zero_copy = q.support_auto_buf_zc();
 
-    // Initial fetch — registers this tag's buffer with the kernel.
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), 0, Some(&buffer))
-        .await?;
+    // Traditional: allocate IoBuf. Zero-copy: no daemon buffer needed.
+    let mut buffer = if zero_copy {
+        None
+    } else {
+        Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
+    };
+
+    let auto_reg = sys::ublk_auto_buf_reg {
+        index: tag,
+        flags: 0,
+        reserved0: 0,
+        reserved1: 0,
+    };
+
+    // Initial fetch.
+    if zero_copy {
+        q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_reg), 0, None)
+            .await?;
+    } else {
+        let buf = buffer.as_ref().unwrap();
+        q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(buf))
+            .await?;
+    }
 
     loop {
         let iod = q.get_iod(tag);
         let op = iod.op_flags & 0xff;
-        let fua = (iod.op_flags & libublk::sys::UBLK_IO_F_FUA) != 0;
+        let fua = (iod.op_flags & sys::UBLK_IO_F_FUA) != 0;
         let offset = iod.start_sector << 9;
         let byte_len = u64::from(iod.nr_sectors) * 512;
         debug_assert!(
@@ -548,11 +569,46 @@ async fn io_task(
         );
         let length = byte_len as u32;
 
-        let result = dispatch_io(op, offset, length, fua, &mut buffer, handler, tokio_handle).await;
+        let result = if zero_copy {
+            let _guard = tokio_handle.enter();
+            let needs_data = matches!(op, sys::UBLK_IO_OP_READ | sys::UBLK_IO_OP_WRITE);
+            if needs_data && length > 0 {
+                // SAFETY: The kernel guarantees `iod.addr` points to valid, mapped
+                // bio pages for the duration of this I/O request (from `get_iod` to
+                // `submit_io_commit_cmd`). The smol `LocalExecutor` never moves tasks
+                // between threads, so the pointer stays valid throughout the await.
+                let buf = unsafe {
+                    std::slice::from_raw_parts_mut(iod.addr as *mut u8, length as usize)
+                };
+                handle_io(op, offset, length, fua, buf, handler).await
+            } else {
+                handle_io(op, offset, length, fua, &mut [], handler).await
+            }
+        } else {
+            dispatch_io(
+                op,
+                offset,
+                length,
+                fua,
+                buffer.as_mut().unwrap(),
+                handler,
+                tokio_handle,
+            )
+            .await
+        };
 
         // Commit result and fetch next command.
-        q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), result)
+        if zero_copy {
+            q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
+                .await?;
+        } else {
+            q.submit_io_commit_cmd(
+                tag,
+                BufDesc::Slice(buffer.as_ref().unwrap().as_slice()),
+                result,
+            )
             .await?;
+        }
     }
 }
 

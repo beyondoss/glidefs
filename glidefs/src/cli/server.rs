@@ -110,7 +110,8 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         .context("Failed to initialize export router")?,
     );
 
-    // Discover exports from S3 (recovers exports created via API)
+    // Discover exports from S3 (recovers exports created via API).
+    // Device registration is deferred until after ublk recovery scanning.
     info!("Discovering exports from S3...");
     let discovered_count = match router.discover_exports().await {
         Ok(discovered) => {
@@ -123,15 +124,8 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                     let router = Arc::clone(&router);
                     async move {
                         let name = config.name.clone();
-                        let transport = config.transport().to_string();
                         match router.create_export(config, false, None).await {
                             Ok(()) => {
-                                // Register kernel block device on Linux.
-                                #[cfg(target_os = "linux")]
-                                if let Err(e) = router.register_device(&name, &transport).await {
-                                    warn!("Failed to register device for '{}': {}", name, e);
-                                }
-                                let _ = &transport; // suppress unused on non-Linux
                                 info!("Restored export '{}'", name);
                                 1
                             }
@@ -157,7 +151,8 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         }
     };
 
-    // Load static exports from config (can add new exports or override discovered ones)
+    // Load static exports from config (can add new exports or override discovered ones).
+    // Device registration is deferred until after ublk recovery scanning.
     let exports = nbd_config.get_exports();
     if exports.is_empty() && discovered_count == 0 {
         return Err(anyhow::anyhow!(
@@ -173,7 +168,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                 let router = Arc::clone(&router);
                 async move {
                     let name = config.name.clone();
-                    let transport = config.transport().to_string();
                     info!("Loading static export '{}' ({}GB)", name, config.size_gb);
                     router
                         .create_export(config.clone(), false, None)
@@ -182,12 +176,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                     if let Err(e) = router.save_export(&config).await {
                         warn!("Failed to persist export '{}' to S3: {}", name, e);
                     }
-                    // Register kernel block device on Linux.
-                    #[cfg(target_os = "linux")]
-                    if let Err(e) = router.register_device(&name, &transport).await {
-                        warn!("Failed to register device for '{}': {}", name, e);
-                    }
-                    let _ = &transport; // suppress unused on non-Linux
                     Ok(())
                 }
             })
@@ -198,6 +186,36 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
         if let Some(first) = errors.into_iter().next() {
             return Err(first);
+        }
+    }
+
+    // Recover QUIESCED ublk devices from a previous daemon crash.
+    // Must happen after all exports are created so handlers exist for matching.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    {
+        let recovered = router.recover_ublk_devices().await;
+        if recovered > 0 {
+            info!("Recovered {} QUIESCED ublk device(s)", recovered);
+        }
+    }
+
+    // Register kernel block devices for exports that don't already have one.
+    // Recovered ublk devices are already registered, so they'll be skipped.
+    #[cfg(target_os = "linux")]
+    {
+        for export in router.list_exports().await {
+            if router.get_device_path(&export.name).await.is_some() {
+                continue; // already has a device (recovered or previously registered)
+            }
+            if let Err(e) = router
+                .register_device(&export.name, &export.transport)
+                .await
+            {
+                warn!(
+                    "Failed to register device for '{}': {}",
+                    export.name, e
+                );
+            }
         }
     }
 
