@@ -505,6 +505,28 @@ fn queue_io_loop(
     tokio_handle: &tokio::runtime::Handle,
     latch: &QueueLatch,
 ) {
+    // Initialize the thread-local io_uring before UblkQueue::new() so we can
+    // set SINGLE_ISSUER — each queue thread is the sole submitter to its ring.
+    let sq_depth = dev.tgt.sq_depth as u32;
+    let cq_depth = dev.tgt.cq_depth as u32;
+    if let Err(e) = libublk::ublk_init_task_ring(|cell| {
+        if cell.get().is_none() {
+            let ring = io_uring::IoUring::builder()
+                .setup_cqsize(cq_depth)
+                .setup_coop_taskrun()
+                .setup_single_issuer()
+                .build(sq_depth)
+                .map_err(libublk::UblkError::IOError)?;
+            cell.set(std::cell::RefCell::new(ring))
+                .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+        }
+        Ok(())
+    }) {
+        tracing::error!(qid, error = ?e, "failed to init io_uring for ublk queue");
+        latch.signal_failed();
+        return;
+    }
+
     let q_rc = match UblkQueue::new(qid, dev) {
         Ok(q) => {
             latch.signal_ready();
