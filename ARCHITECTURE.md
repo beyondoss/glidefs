@@ -1,6 +1,6 @@
 # GlideFS Architecture
 
-High-performance NBD server that turns S3 into fast block storage for microVMs, using local SSD as a write-behind cache.
+High-performance block storage server that turns S3 into fast block storage for microVMs, using local SSD as a write-behind cache. Transport-agnostic: NBD (default, cross-platform) and ublk (Linux 6.0+, io_uring-based, opt-in via `--features ublk`).
 
 ## Data Flow
 
@@ -8,9 +8,9 @@ High-performance NBD server that turns S3 into fast block storage for microVMs, 
 
 ```
 Guest VM
-    │ NBD WRITE
+    │ WRITE (NBD or ublk)
     ▼
-NBDServer ──► ExportRouter ──► NBDBlockHandler ──► WriteCache<Active>
+Transport ──► ExportRouter ──► BlockHandler ──► WriteCache<Active>
                                                         │
                                             ┌───────────┼───────────┐
                                             ▼           ▼           ▼
@@ -32,7 +32,7 @@ cache. See [Deferred Hashing](#deferred-hashing).
 
 ```
 Guest VM
-    │ NBD READ
+    │ READ (NBD or ublk)
     ▼
 WriteCache ──► AtomicBlockMap lookup
                       │
@@ -116,7 +116,9 @@ Compaction uploads a full manifest and deletes the `.delta` file.
 
 | Term | Definition | NOT |
 |------|-----------|-----|
-| Export | A virtual block device served over NBD, with its own cache and S3 prefix | Not a filesystem — raw blocks only |
+| Transport | The kernel-to-userspace block I/O channel: NBD (TCP/Unix socket, cross-platform) or ublk (io_uring, Linux 6.0+) | Not the storage layer — both transports use the same `BlockHandler` |
+| BlockHandler | Transport-agnostic I/O handler: read/write/flush/trim/write_zeroes/cache. Used by both NBD and ublk. | Not protocol-specific — knows nothing about NBD or ublk wire formats |
+| Export | A virtual block device served over a transport, with its own cache and S3 prefix | Not a filesystem — raw blocks only |
 | Block/Chunk | Fixed-size unit of data (default 128KB to match ZFS recordsize) | Not variable-sized |
 | Pack | S3 object containing up to 100 LZ4-compressed blocks with a self-describing index | Not a single block per S3 object |
 | Manifest | Binary snapshot of an export's block map + pack index, stored in S3. Synced as delta (changed blocks only) with periodic compaction to full snapshot. | Not a log — it's a point-in-time image |
@@ -206,26 +208,21 @@ Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N 
 Stored in `SparseStateMap` — a sparse page table of `AtomicU8` values, lock-free, outside the block map's `RwLock`. Encoding: `NotPresent=0, Clean=1, Dirty=2, Syncing=3`. NotPresent=0 means unallocated pages are implicitly "never written" with no memory cost.
 
 ```
-NotPresent ───[write]───► Dirty ───[sync start]───► Syncing
-                            ▲           │                │
-                            │    write during sync ──────┤
-                            │                            │
-                          Clean ◄── upload success ──────┘
-                            │                            │
-                            └──[write]──► Dirty    upload failure
-                                                         │
-                                                         ▼
-                                                   Dirty (retry)
+NotPresent ───[write]───► Dirty ───[flush + seq match]───► Clean
+                            ▲                                 │
+                            └────────[write]──────────────────┘
 ```
+
+The flush path uses **sequence-number CAS** instead of a Syncing intermediate state: when a block is flushed, `CAS(Dirty→Clean)` succeeds only if the block's sequence number hasn't changed since the flush snapshot. If a concurrent write changed the sequence, the CAS is skipped and the block stays Dirty for the next flush cycle. This eliminates the Dirty→Syncing→Clean three-phase dance.
 
 | From | Event | To | Encoding | Notes |
 |------|-------|----|----------|-------|
 | NotPresent | Guest write | Dirty | 0 → 2 | Page allocated on first touch, SSD pwrite, WAL appended |
 | Clean | Guest write | Dirty | 1 → 2 | Block already on SSD, re-dirtied |
-| Dirty | Sync worker claims | Syncing | 2 → 3 | CAS on SparseStateMap entry |
-| Syncing | S3 PUT success | Clean | 3 → 1 | Block is durable in S3 |
-| Syncing | S3 PUT failure | Dirty | 3 → 2 | Conservative: re-sync next cycle |
-| Syncing | Guest write during sync | Dirty | 3 → 2 | New data overwrites; block needs re-sync |
+| Dirty | Flush success + seq match | Clean | 2 → 1 | Sequence guard: skip if block was rewritten during flush |
+| Dirty | Flush success + seq mismatch | Dirty | — | Concurrent write changed the block; stays dirty for next cycle |
+
+The `Syncing=3` constant exists and is handled defensively (crash recovery converts Syncing→Dirty, `transition_to_dirty` handles Syncing→Dirty for writes during sync), but no current code path transitions a block INTO the Syncing state. It is reserved for future use.
 
 Presence is derived: `is_present = state != 0`. This eliminates the separate `present_chunks` bitmap. (`block_map.rs:SparseStateMap`)
 
@@ -447,6 +444,8 @@ Per-export append-only list of pack UUIDs, stored in S3 at `pack-registries/{nam
 ├─────────────────────────────────────────────────┤
 │ Pack IDs (16 bytes × count)                     │
 │   [uuid:16][uuid:16]...                         │
+├─────────────────────────────────────────────────┤
+│ CRC32 (4 bytes LE, over all preceding bytes)    │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -463,6 +462,7 @@ Every layer has a verification mechanism. The goal: corruption is detected befor
 | S3 packs | Block data in transit/at rest | BLAKE3-128 | Read path: after S3 fetch + LZ4 decompress | `HashMismatch` error → re-fetch from S3 |
 | Clean cache (Foyer) | Cached blocks on SSD/memory | BLAKE3-128 | Background scrubber re-hashes against content address | Evict from cache → next read re-fetches from S3 |
 | Manifest | Block map + pack index snapshot | CRC32 trailer | On deserialization (load from S3) | Reject manifest, return error |
+| Pack registry | Per-export pack ID list for GC | CRC32 trailer | On deserialization (load from S3) | Reject registry, return error |
 | WAL entries | Per-entry metadata | CRC32 trailer | On replay (crash recovery) | Stop replay at first corrupt entry, discard torn tail |
 | Dirty blocks (SSD) | Block data between write and flush | CRC32 in `HashEntry` | Flush time: before BLAKE3 computation | Skip block (stays dirty), do NOT launder to S3 |
 
@@ -515,7 +515,7 @@ Each dirty block gets CRC32 computed **once** (at first checkpoint after write) 
 | Command | Purpose |
 |---------|---------|
 | `glidefs init [path]` | Generate a default `glidefs.toml` config file |
-| `glidefs run -c glidefs.toml` | Start the NBD server with HTTP management API |
+| `glidefs run -c glidefs.toml` | Start the block server (NBD + optional ublk) with HTTP management API |
 | `glidefs bless --image disk.raw --name ubuntu-22.04 -c glidefs.toml` | Convert a raw disk image into a content-addressed base image in S3 |
 | `glidefs gc -c glidefs.toml [--dry-run] [--grace-period 24h]` | Delete orphaned packs in S3 |
 
@@ -542,7 +542,7 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 
 ### Export Persistence & Discovery
 
-Export definitions are saved to S3 as `{db_path}/nbd/{name}/export.json` on creation. On startup, `discover_exports()` lists all `export.json` files under the `nbd/` prefix and recreates exports from their definitions + S3 manifests. This enables stateless restarts — a new node can resume serving any export by reading its definition and manifest from S3. (`router.rs:save_export`, `router.rs:discover_exports`)
+Export definitions are saved to S3 as `{db_path}/nbd/{name}/export.json` by the API and static config paths (not on the recovery path — discovered exports skip the redundant S3 PUT). On startup, `discover_exports()` lists all `export.json` files under the `nbd/` prefix and loads them 32-wide parallel, then `create_export()` recovers each from local WAL + redb 16-wide parallel. No S3 writes on the recovery path. This enables both stateless restarts (new node from S3) and fast binary upgrades (same node, local state intact — 2000 exports in ~6s). (`router.rs:save_export`, `router.rs:discover_exports`, `cli/server.rs`)
 
 ### Storage Compatibility
 
@@ -568,8 +568,8 @@ Per-export Prometheus metrics exposed at `/metrics`. Latency histograms are samp
 | `glidefs_coalesce_ratio` | Gauge | Guest writes per S3 batch (higher = better batching) |
 | `glidefs_dirty_blocks` | Gauge | Blocks waiting for S3 sync |
 | `glidefs_syncing_blocks` | Gauge | Blocks currently uploading |
-| `glidefs_read_latency_seconds` | Histogram | End-to-end NBD read latency |
-| `glidefs_write_latency_seconds` | Histogram | End-to-end NBD write latency |
+| `glidefs_read_latency_seconds` | Histogram | End-to-end block read latency |
+| `glidefs_write_latency_seconds` | Histogram | End-to-end block write latency |
 | `glidefs_s3_fetch_latency_seconds` | Histogram | S3 GET latency (cache misses) |
 | `glidefs_s3_put_latency_seconds` | Histogram | S3 PUT latency (pack uploads) |
 | `glidefs_s3_put_errors_total` | Counter | S3 upload failures |
@@ -580,6 +580,26 @@ Per-export Prometheus metrics exposed at `/metrics`. Latency histograms are samp
 Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 
 ## Design Decisions
+
+### Why NBD + ublk instead of just one transport?
+
+NBD is cross-platform and battle-tested — it works on macOS (dev), Linux (prod), and anywhere with a TCP stack. But it has inherent overhead: socket read/write syscalls per I/O, protocol framing (28-byte headers with magic numbers), and single-connection architecture.
+
+ublk eliminates all of that on Linux 6.0+: io_uring shared memory replaces sockets, fixed mmap'd descriptors replace protocol parsing, and native multi-queue gives per-CPU I/O parallelism. Benchmarks show 2-3x IOPS improvement for random 4K reads.
+
+The storage layer (`BlockHandler`, `WriteCache`, `ContentStore`) is transport-agnostic — both frontends call the same 6 methods. The `BlockHandler` command interface maps 1:1 between transports:
+
+| NBD | ublk | BlockHandler |
+|-----|------|---|
+| `NBD_CMD_READ` | `UBLK_IO_OP_READ` | `handler.read(offset, length)` |
+| `NBD_CMD_WRITE` | `UBLK_IO_OP_WRITE` | `handler.write(offset, data, fua)` |
+| `NBD_CMD_FLUSH` | `UBLK_IO_OP_FLUSH` | `handler.flush()` |
+| `NBD_CMD_TRIM` | `UBLK_IO_OP_DISCARD` | `handler.trim(offset, length, fua)` |
+| `NBD_CMD_WRITE_ZEROES` | `UBLK_IO_OP_WRITE_ZEROES` | `handler.write_zeroes(offset, length, fua)` |
+
+Errors use transport-specific mapping: `CommandError::to_nbd_errno()` for NBD wire format, `CommandError::to_linux_errno()` for ublk. The values happen to match today (NBD uses Linux errno on the wire), but encoding them separately makes the contract explicit.
+
+NBD remains the default for development and broad compatibility. ublk is opt-in for production Linux deployments where per-I/O overhead matters.
 
 ### Why write-behind instead of write-through?
 
@@ -720,36 +740,38 @@ The pressure flush directly flushes dirty packs from the exports with the most d
 
 | File | Purpose |
 |------|---------|
-| `nbd/server.rs` | TCP/Unix socket listener, NBD protocol negotiation, concurrent request dispatch |
-| `nbd/router.rs` | Multi-tenant export manager: create, delete, drain (concurrent, 16-wide), promote, resize |
-| `nbd/handler.rs` | NBD command dispatch (read/write/flush) with SSD write rejection at 95% |
-| `nbd/write_cache/mod.rs` | `WriteCache<S>` typestate wrapper, `FlushStats`, `SnapshotResult` |
-| `nbd/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, `SparseStateMap` integration, metadata persistence |
-| `nbd/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
-| `nbd/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → S3 → SSD fallback) |
-| `nbd/write_cache/flush.rs` | Dirty block scan, CRC32 checkpoint compute + flush verify (spawn_blocking), pack assembly, S3 upload, manifest sync |
-| `nbd/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading |
-| `nbd/write_cache/recovery.rs` | WAL replay, dirty block verification after crash |
-| `nbd/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
-| `nbd/write_cache/error.rs` | `CacheError` type |
-| `nbd/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock + per-entry CRC32), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
-| `nbd/state.rs` | `BlockState` enum + sealed typestate markers (`Initializing`, `Active`, etc.) |
-| `nbd/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
-| `nbd/pack_index.rs` | `HostPackIndex`: redb-backed `Blake3Hash → PackLocation` index for cross-export dedup |
-| `nbd/pack_registry.rs` | Per-export pack ID tracking for garbage collection |
-| `nbd/capacity_monitor.rs` | SSD capacity monitor: `statvfs` polling, pressure flush on dirtiest exports |
-| `nbd/content_store.rs` | S3 PUT/GET for packs and manifests via `object_store` crate |
-| `nbd/manifest.rs` | Binary manifest serialization/deserialization (GLDE format) |
-| `nbd/flush_scheduler.rs` | Event-driven pack flush (Notify) + periodic WAL checkpoint (5s) |
-| `nbd/wal.rs` | Append-only WAL for crash recovery with CRC32 integrity |
-| `nbd/cache.rs` | `BlockCache` trait + `FoyerBlockCache` (memory + SSD hybrid) |
-| `nbd/readahead.rs` | Sequential read detector: 3+ consecutive chunks triggers pack prefetch |
-| `nbd/scrubber.rs` | Background corruption detection: re-hash cached blocks, evict on mismatch |
-| `nbd/sync.rs` | Loom/std compatibility shim: re-exports atomics for exhaustive interleaving tests |
-| `nbd/metrics.rs` | Per-export Prometheus-compatible telemetry with sampled latency histograms |
-| `nbd/protocol.rs` | NBD wire format: handshake options, transmission commands, reply serialization |
-| `nbd/api.rs` | HTTP REST API for export CRUD, drain, promote, metrics |
-| `nbd/error.rs` | Error types: `NBDError`, `CommandError`, `RouterError` |
+| `block/server.rs` | NBD transport: TCP/Unix socket listener, protocol negotiation, concurrent request dispatch |
+| `block/ublk/mod.rs` | ublk transport: per-export `/dev/ublkbN` device management (Linux 6.0+, `--features ublk`) |
+| `block/ublk/device.rs` | Single ublk device: io_uring registration, per-queue I/O loop, teardown |
+| `block/router.rs` | Multi-tenant export manager: create, delete, drain (concurrent, 16-wide), promote, resize |
+| `block/handler.rs` | Transport-agnostic block I/O dispatch (read/write/flush/trim) with SSD write rejection at 95% |
+| `block/write_cache/mod.rs` | `WriteCache<S>` typestate wrapper, `FlushStats`, `SnapshotResult` |
+| `block/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, `SparseStateMap` integration, metadata persistence |
+| `block/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
+| `block/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → S3 → SSD fallback) |
+| `block/write_cache/flush.rs` | Dirty block scan, CRC32 checkpoint compute + flush verify (spawn_blocking), pack assembly, S3 upload, manifest sync |
+| `block/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading |
+| `block/write_cache/recovery.rs` | WAL replay, dirty block verification after crash |
+| `block/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
+| `block/write_cache/error.rs` | `CacheError` type |
+| `block/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock + per-entry CRC32), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
+| `block/state.rs` | Sealed typestate markers (`Initializing`, `Recovering`, `Active`, `Draining`) |
+| `block/pack.rs` | Pack wire format (GLPK): assemble, parse, extract blocks |
+| `block/pack_index.rs` | `HostPackIndex`: redb-backed `Blake3Hash → PackLocation` index for cross-export dedup |
+| `block/pack_registry.rs` | Per-export pack ID tracking for garbage collection |
+| `block/capacity_monitor.rs` | SSD capacity monitor: `statvfs` polling, pressure flush on dirtiest exports |
+| `block/content_store.rs` | S3 PUT/GET for packs and manifests via `object_store` crate |
+| `block/manifest.rs` | Binary manifest serialization/deserialization (GLDE format) |
+| `block/flush_scheduler.rs` | Event-driven pack flush (Notify) + periodic WAL checkpoint (5s) |
+| `block/wal.rs` | Append-only WAL for crash recovery with CRC32 integrity |
+| `block/cache.rs` | `BlockCache` trait + `FoyerBlockCache` (memory + SSD hybrid) |
+| `block/readahead.rs` | Sequential read detector: 3+ consecutive chunks triggers pack prefetch |
+| `block/scrubber.rs` | Background corruption detection: re-hash cached blocks, evict on mismatch |
+| `block/sync.rs` | Loom/std compatibility shim: re-exports atomics for exhaustive interleaving tests |
+| `block/metrics.rs` | Per-export Prometheus-compatible telemetry with sampled latency histograms |
+| `block/protocol.rs` | NBD wire format: handshake options, transmission commands, reply serialization |
+| `block/api.rs` | HTTP REST API for export CRUD, drain, promote, metrics |
+| `block/error.rs` | Error types: `NBDError` (protocol-specific), `CommandError` (transport-agnostic, maps to NBD errno or Linux errno) |
 | `circuit_breaker.rs` | Lock-free S3 circuit breaker (single AtomicU64, CAS transitions) |
 | `config.rs` | TOML configuration parsing with environment variable expansion |
 | `storage_compatibility.rs` | S3 conditional write check (`PutMode::Create`) for fencing support |
@@ -868,7 +890,7 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 | Process crash mid-WAL-write | Torn WAL entry | CRC32 detects; replay stops at corruption, discards torn tail |
 | Process crash mid-S3-sync | Orphaned packs in S3 | Harmless: packs are immutable, GC can clean up unreferenced packs |
 | S3 sustained outage | Circuit breaker opens | Reads from local SSD continue; writes accumulate locally; breaker probes S3 every 30s |
-| Local SSD full | `ENOSPC` to guest (NBD_ENOSPC, not EIO) | Write handler rejects new-block writes at >95% SSD utilization; capacity monitor pressure-flushes dirtiest exports to S3, freeing physical space. Overwrites to already-present blocks are still allowed. |
+| Local SSD full | `ENOSPC` to guest | Write handler rejects new-block writes at >95% SSD utilization; capacity monitor pressure-flushes dirtiest exports to S3, freeing physical space. Overwrites to already-present blocks are still allowed. |
 | SSD failure | Same as host death — writes since last manifest sync are lost | Recreate from last S3 manifest; `rebuild()` repopulates pack index from manifest's pack index section. Packs from un-synced flushes are orphaned (GC cleans up after grace period). |
 
 ## Testing
@@ -877,5 +899,5 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 |-------|---------|-------|----------------|
 | Unit | `cargo test --features test-utils --lib` | ~327 | Lock-free atomics, wire format round-trips, state transitions, sparse page tables, CRC32 integrity, delta manifest serde |
 | Integration | `cargo test --features test-utils --test integration` | ~55 | Crash recovery, concurrent writes, flush consistency, delta manifests (no Docker) |
-| Docker | `cargo test --features docker-tests --test docker_integration` | ~20 | Real S3 via MinIO (testcontainers-rs), end-to-end pack upload/download |
+| Docker | `cargo test --features docker-tests --test docker_integration` | ~20 | Real S3 via MinIO (testcontainers-rs), end-to-end via `TestServer.connect()` (transport-agnostic client abstraction) |
 | Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free algorithms (AtomicBlockMap, SeqLock) |

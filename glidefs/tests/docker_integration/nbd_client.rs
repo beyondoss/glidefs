@@ -3,14 +3,14 @@
 //! Speaks the NBD wire protocol (fixed newstyle handshake + OPT_GO + transmission)
 //! directly over TCP. No kernel NBD module needed — runs on macOS and Linux.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 // Protocol constants from glidefs
-use glidefs::nbd::protocol::*;
+use glidefs::block::protocol::*;
 
 pub struct NbdClient {
     stream: TcpStream,

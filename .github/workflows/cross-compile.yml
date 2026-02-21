@@ -13,7 +13,7 @@ env:
 
 jobs:
   cross-compile:
-    name: Cross compile for ${{ matrix.target }}
+    name: ${{ matrix.platform }}-${{ matrix.variant || '' }}${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -22,10 +22,22 @@ jobs:
             arch: amd64
             os: ubuntu-latest
             platform: linux
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+            os: ubuntu-latest
+            platform: linux
+            features: ublk
+            variant: ublk-
           - target: aarch64-unknown-linux-gnu
             arch: arm64
             os: ubuntu-latest
             platform: linux
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            os: ubuntu-latest
+            platform: linux
+            features: ublk
+            variant: ublk-
           - target: armv7-unknown-linux-gnueabihf
             arch: armv7
             os: ubuntu-latest
@@ -78,7 +90,7 @@ jobs:
           # architectures where the io_uring ABI is identical.
           RUSTFLAGS: '--cfg=io_uring_skip_arch_check --cfg tokio_unstable'
         run: |
-          cross build --profile ci --target ${{ matrix.target }}
+          cross build --profile ci --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
       - name: Build with cargo (macOS)
         if: matrix.platform == 'darwin'
@@ -89,14 +101,14 @@ jobs:
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          cp glidefs/target/${{ matrix.target }}/ci/glidefs artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}
-          chmod +x artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}
+          cp glidefs/target/${{ matrix.target }}/ci/glidefs artifacts/glidefs-${{ matrix.platform }}-${{ matrix.variant || '' }}${{ matrix.arch }}
+          chmod +x artifacts/glidefs-${{ matrix.platform }}-${{ matrix.variant || '' }}${{ matrix.arch }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: glidefs-${{ matrix.platform }}-${{ matrix.arch }}
-          path: artifacts/glidefs-${{ matrix.platform }}-${{ matrix.arch }}
+          name: glidefs-${{ matrix.platform }}-${{ matrix.variant || '' }}${{ matrix.arch }}
+          path: artifacts/glidefs-${{ matrix.platform }}-${{ matrix.variant || '' }}${{ matrix.arch }}
           retention-days: 7
 
   release:

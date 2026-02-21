@@ -1,17 +1,17 @@
 # GlideFS
 
-NBD block device server that turns S3 into fast local storage. Writes hit local SSD in 5 microseconds. Background sync uploads to S3 as content-addressed packs.
+Block device server that turns S3 into fast local storage. Writes hit local SSD in 5 microseconds. Background sync uploads to S3 as content-addressed packs.
 
 Built for microVM storage at [Paraglide](https://paraglide.sh).
 
 ## How It Works
 
-Guests see a block device over NBD. Writes go to local SSD immediately. A background scheduler packs dirty blocks, compresses with LZ4, and uploads to S3. Reads serve from local cache; misses pull from S3, verify BLAKE3 hashes, and cache locally.
+Guests see a standard block device (NBD or ublk). Writes go to local SSD immediately. A background scheduler packs dirty blocks, compresses with LZ4, and uploads to S3. Reads serve from local cache; misses pull from S3, verify BLAKE3 hashes, and cache locally.
 
 ```
-Write path:  Guest → NBD → local SSD pwrite() → return OK      ~5µs
-Read path:   Guest → NBD → local cache hit → return data       ~500µs
-             Guest → NBD → cache miss → S3 GET → LZ4 → verify → cache → return   50-300ms
+Write path:  Guest → NBD/ublk → local SSD pwrite() → return OK      ~5µs
+Read path:   Guest → NBD/ublk → local cache hit → return data       ~500µs
+             Guest → NBD/ublk → cache miss → S3 GET → LZ4 → verify → cache → return   50-300ms
 ```
 
 ## Install
@@ -57,16 +57,22 @@ Supports S3, Azure Blob Storage, and GCS. Cloud credentials are configured via `
 
 ## API
 
-Exports are virtual block devices. Manage them over HTTP:
+Exports are virtual block devices. The API creates them, returns a device path, and handles teardown. The orchestrator never touches NBD or ublk directly.
 
 ```sh
-# Create a 500GB export
+# Create a 500GB export — returns device path
 curl -X PUT localhost:8080/api/exports/my-vm \
   -d '{"size_gb": 500}'
+# → {"name":"my-vm","size_bytes":500000000000,"readonly":false,"transport":"nbd","device":"/dev/nbd0"}
 
 # Fork from an existing manifest
 curl -X PUT localhost:8080/api/exports/my-vm-fork \
   -d '{"size_gb": 500, "manifest_name": "my-vm"}'
+
+# Use ublk transport (Linux 6.0+, requires --features ublk)
+curl -X PUT localhost:8080/api/exports/my-vm \
+  -d '{"size_gb": 500, "transport": "ublk"}'
+# → {"name":"my-vm","size_bytes":500000000000,"readonly":false,"transport":"ublk","device":"/dev/ublkb0"}
 
 # Snapshot to S3
 curl -X POST localhost:8080/api/exports/my-vm/snapshot
@@ -74,16 +80,18 @@ curl -X POST localhost:8080/api/exports/my-vm/snapshot
 # Drain (flush all dirty blocks, prepare for migration)
 curl -X POST localhost:8080/api/exports/my-vm/drain
 
-# Delete
+# Delete (removes kernel device + export)
 curl -X DELETE localhost:8080/api/exports/my-vm
 ```
 
+PUT is idempotent. Same size → returns current state. Larger size → grows the export. All endpoints that modify state are idempotent.
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/exports` | GET | List exports |
-| `/api/exports/{name}` | PUT | Create or update export |
+| `/api/exports` | GET | List exports (includes transport + device path) |
+| `/api/exports/{name}` | PUT | Create or resize export (returns device path) |
 | `/api/exports/{name}` | GET | Get export info |
-| `/api/exports/{name}` | DELETE | Remove export |
+| `/api/exports/{name}` | DELETE | Remove export (removes kernel device) |
 | `/api/exports/{name}/drain` | POST | Flush to S3 for shutdown/migration |
 | `/api/exports/{name}/snapshot` | POST | Point-in-time snapshot to S3 |
 | `/api/exports/{name}/promote` | POST | Promote readonly to read-write |
@@ -118,26 +126,114 @@ For 2,000 VMs on one host with a shared base image: the OS/runtime blocks (~2-3G
 
 ### Transport
 
-Use the Unix domain socket for NBD. TCP between client and server on the same host adds latency, connection-drop risk, and firewall surface for no benefit. The only failure mode with UDS is server process death — which is the same regardless of transport.
+Two options. NBD works everywhere. ublk is opt-in on Linux 6.0+ for lower overhead.
+
+#### NBD (default)
+
+Unix domain socket. TCP adds latency and firewall surface for no benefit on the same host.
 
 ```toml
 [servers.nbd]
 unix_socket = "/var/run/glidefs.sock"
 ```
 
-TCP is available but only useful if you need to serve NBD to a different host.
+TCP is available for serving to a different host.
+
+#### ublk (Linux 6.0+)
+
+io_uring-based userspace block device. No socket overhead, no protocol serialization, native multi-queue.
+
+```sh
+cargo build --release -p glidefs --features ublk
+```
+
+Requires `CONFIG_BLK_DEV_UBLK=y` in the host kernel. One `/dev/ublkbN` device per export — the block device appears when the export is created. No client tool needed.
 
 ### Device Setup
 
-Three ways to attach `/dev/nbdN` to the server:
+The API handles kernel device creation automatically. `PUT /api/exports/{name}` returns a `device` path. Pass it to your hypervisor.
 
-| Method | Kernel | Notes |
-|---|---|---|
-| `nbd-client` | Any | External dependency. `nbd-client -N myexport -u /var/run/glidefs.sock /dev/nbd0` |
-| ioctl | Any | `NBD_SET_SOCK` + `NBD_SET_SIZE` + `NBD_DO_IT`. Blocks a thread per device. No reconnect. |
-| Netlink (`NBD_GENL`) | 4.10+ | Preferred. Non-blocking, supports `NBD_CMD_RECONFIGURE` for live resize, multiple sockets per device for failover. No external tools. |
+```
+PUT /api/exports/vm-abc {"size_gb": 500}
+→ {"device": "/dev/nbd0", "transport": "nbd", ...}
 
-Netlink is the right choice for production. Create the export via HTTP API, configure the kernel device via netlink, connect over UDS — single binary, no moving parts.
+Orchestrator passes /dev/nbd0 to Firecracker. Done.
+```
+
+**NBD** (Linux 4.10+): GlideFS creates `/dev/nbdN` via generic netlink (`NBD_GENL`). Internal socketpair — no external `nbd-client`. The NBD protocol server still accepts external connections over Unix socket / TCP for debugging or cross-host access.
+
+**ublk** (Linux 6.0+): GlideFS creates `/dev/ublkbN` via io_uring. No socket, no protocol overhead.
+
+Both transports: the orchestrator doesn't know or care which one is in use. It gets a device path from the API and passes it to the VM.
+
+### Restart Behavior
+
+On startup, GlideFS discovers exports from S3, recovers WAL + redb from local SSD, and re-registers kernel devices. Recovery is local — no S3 writes. 2000 exports recover in ~6 seconds.
+
+**NBD (zero-downtime):** The kernel queues I/O during the restart window via `dead_conn_timeout`. VMs never see a disconnect. Device paths (`/dev/nbdN`) stay the same.
+
+```
+1. SIGUSR1 → drain all exports to S3
+2. SIGTERM → graceful shutdown (NBD devices stay alive in kernel)
+3. Start new binary (same config, same cache dir)
+4. New process discovers exports, recovers from WAL + redb
+5. NBD_CMD_RECONFIGURE swaps socket fds on existing /dev/nbdN devices
+6. Kernel resumes queued I/O on new sockets
+7. /health/ready returns 200
+```
+
+`nbd_dead_conn_timeout` must exceed: drain + restart + recovery. Default 30 seconds.
+
+The orchestrator does nothing. Same device paths, same VMs, no reconnection needed.
+
+**ublk (zero-downtime on Linux 6.3+):** With `UBLK_F_USER_RECOVERY_REISSUE`, the kernel keeps `/dev/ublkbN` alive in QUIESCED state and reissues in-flight I/O to the new process. Same device paths, same VMs.
+
+```
+1. SIGUSR1 → drain all exports to S3
+2. SIGTERM → graceful shutdown (ublk devices enter QUIESCED state)
+3. Start new binary (same config, same cache dir)
+4. New process discovers exports, recovers from WAL + redb
+5. Scans for QUIESCED glidefs devices, resumes them via START_USER_RECOVERY
+6. Kernel reissues queued I/O to new process
+7. /health/ready returns 200
+```
+
+On kernels before 6.3 (no `UBLK_F_USER_RECOVERY`), ublk devices are removed on process exit. VMs get I/O errors and must be re-attached to new device paths after recovery.
+
+**Full compute node reboot:** Everything starts fresh. Orchestrator creates exports via API, gets device paths, starts VMs.
+
+### Database Workloads
+
+Mount the database's WAL directory on a separate volume that's not GlideFS. Keep GlideFS for the OS, application code, and data files.
+
+```
+/dev/vda → GlideFS    (OS, app, DB data files)
+/dev/vdb → local NVMe  (WAL only)
+```
+
+```sh
+# PostgreSQL
+initdb --waldir=/mnt/wal
+
+# MySQL/InnoDB
+innodb_log_group_home_dir = /mnt/wal
+```
+
+**Why:** Database WAL is high-frequency sequential writes to blocks the DB recycles within minutes. A busy Postgres writing 100MB/s of WAL generates ~8 pack uploads/second per VM — all for data that's transient. At 2000 VMs, that's 16,000 S3 PUTs/second of dead WAL segments.
+
+**Durability is unchanged.** GlideFS is write-behind: the DB fsyncs WAL to local SSD, but that data isn't in S3 until the next flush cycle. Host death loses unflushed WAL either way. Separating it stops paying S3 costs for durability you didn't have.
+
+**Migration:** Force a checkpoint before migrating (`CHECKPOINT` in Postgres). The WAL volume is local-only — GlideFS drain + wake handles the data files, the DB recovers from the checkpoint.
+
+**Forks:** Fork gets the CoW snapshot of data files but no WAL. The forked DB starts from the last checkpoint — clean state, no in-flight transactions.
+
+### Flush and Durability
+
+Writes are durable on local SSD immediately. They are **not** in S3 until flushed. Local disk loss before flush = data loss for unflushed blocks.
+
+- Automatic flush runs on a background schedule (configurable)
+- `POST /api/exports/{name}/drain` forces a full flush before shutdown or migration
+- `POST /api/exports/{name}/snapshot` creates a point-in-time manifest in S3
 
 ### Scrubber
 
@@ -149,14 +245,6 @@ scrubber_blocks_per_second = 1000  # verify 1000 cached blocks/sec
 ```
 
 At 1,000 blocks/sec with 128KB blocks: ~2% of one core for BLAKE3 hashing, ~128MB/sec of cache reads. Full pass time depends on cache size.
-
-### Flush and Durability
-
-Writes are durable on local SSD immediately. They are **not** in S3 until flushed. Local disk loss before flush = data loss for unflushed blocks.
-
-- Automatic flush runs on a background schedule (configurable)
-- `POST /api/exports/{name}/drain` forces a full flush before shutdown or migration
-- `POST /api/exports/{name}/snapshot` creates a point-in-time manifest in S3
 
 ## Key Design Choices
 

@@ -17,9 +17,9 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use glidefs::nbd::block_map::{blake3_128, lz4_compress, lz4_decompress, Blake3Hash};
-use glidefs::nbd::pack::{
-    assemble_pack, extract_block, parse_pack_index, PACK_HEADER_SIZE, PACK_INDEX_ENTRY_SIZE,
+use glidefs::block::block_map::{Blake3Hash, blake3_128, lz4_compress, lz4_decompress};
+use glidefs::block::pack::{
+    PACK_HEADER_SIZE, PACK_INDEX_ENTRY_SIZE, assemble_pack, extract_block, parse_pack_index,
 };
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
@@ -33,7 +33,10 @@ const S3_BANDWIDTH_MBPS: f64 = 100.0; // MB/s per connection
 const DEFAULT_PACK_SIZES: &[usize] = &[10, 25, 50, 100, 200, 500, 1000];
 
 #[derive(Parser)]
-#[command(name = "pack_size_measure", about = "Empirical pack size analysis using real disk images")]
+#[command(
+    name = "pack_size_measure",
+    about = "Empirical pack size analysis using real disk images"
+)]
 struct Args {
     /// Raw disk/filesystem images to read blocks from.
     #[arg(required = true)]
@@ -190,7 +193,8 @@ fn measure_pack_size(
     let assembled_packs: Vec<Vec<u8>> = prepared_packs
         .iter()
         .map(|prepared| {
-            let (pack_bytes, _entries) = assemble_pack(prepared, BLOCK_SIZE as u32);
+            let (pack_bytes, _entries) =
+                assemble_pack(prepared.clone(), BLOCK_SIZE as u32).unwrap();
             pack_bytes
         })
         .collect();
@@ -216,7 +220,7 @@ fn measure_pack_size(
                 .iter()
                 .map(|data| (blake3_128(data), lz4_compress(data)))
                 .collect();
-            let (pack, _) = assemble_pack(&prepped, BLOCK_SIZE as u32);
+            let (pack, _) = assemble_pack(prepped, BLOCK_SIZE as u32).unwrap();
             std::hint::black_box(&pack);
         }
     }
@@ -229,7 +233,7 @@ fn measure_pack_size(
                 .iter()
                 .map(|data| (blake3_128(data), lz4_compress(data)))
                 .collect();
-            let (_pack, _entries) = assemble_pack(&prepped, BLOCK_SIZE as u32);
+            let (_pack, _entries) = assemble_pack(prepped, BLOCK_SIZE as u32).unwrap();
             assembly_times.push(start.elapsed().as_micros() as f64);
         }
     }
@@ -296,9 +300,8 @@ fn measure_pack_size(
     let s3_get_ms = s3_latency_ms + s3_transfer_ms;
     let amortized_per_block_ms = s3_get_ms / blocks_per_pack as f64;
 
-    // Peak memory
-    let raw_mem = blocks_per_pack * BLOCK_SIZE;
-    let peak_memory_mb = (raw_mem + avg_compressed_pack_bytes) as f64 / (1024.0 * 1024.0);
+    // Peak memory per pack during assembly (owned: output buffer only, input freed as consumed)
+    let peak_memory_mb = avg_compressed_pack_bytes as f64 / (1024.0 * 1024.0);
 
     PackMeasurement {
         blocks_per_pack,
@@ -428,9 +431,15 @@ fn main() {
     // === Size Table ===
     println!();
     println!("Pack Size vs Compressed Size");
-    println!("┌────────────┬──────────┬──────────────┬──────────────┬──────────────┬───────────┬─────────────┬────────────┐");
-    println!("│ Blocks/Pack│ # Packs  │ Raw Size     │ Avg Compress │ Min/Max      │ LZ4 Ratio │ Index OH    │ OH %       │");
-    println!("├────────────┼──────────┼──────────────┼──────────────┼──────────────┼───────────┼─────────────┼────────────┤");
+    println!(
+        "┌────────────┬──────────┬──────────────┬──────────────┬──────────────┬───────────┬─────────────┬────────────┐"
+    );
+    println!(
+        "│ Blocks/Pack│ # Packs  │ Raw Size     │ Avg Compress │ Min/Max      │ LZ4 Ratio │ Index OH    │ OH %       │"
+    );
+    println!(
+        "├────────────┼──────────┼──────────────┼──────────────┼──────────────┼───────────┼─────────────┼────────────┤"
+    );
     for m in &results {
         let raw = m.blocks_per_pack * BLOCK_SIZE;
         let oh_pct = m.index_overhead_bytes as f64 / m.avg_compressed_pack_bytes as f64 * 100.0;
@@ -447,16 +456,28 @@ fn main() {
             oh_pct,
         );
     }
-    println!("└────────────┴──────────┴──────────────┴──────────────┴──────────────┴───────────┴─────────────┴────────────┘");
+    println!(
+        "└────────────┴──────────┴──────────────┴──────────────┴──────────────┴───────────┴─────────────┴────────────┘"
+    );
 
     // === Timing Table ===
     println!();
     println!("Assembly & Decompress Timings (median)");
-    println!("┌────────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐");
-    println!("│ Blocks/Pack│ Assembly     │ Asm/Block    │ Prefetch All │ Per-Block    │ Single Block │");
-    println!("│            │ (hash+lz4+  │              │ (parse+      │ (prefetch/N) │ (extract+    │");
-    println!("│            │  assemble)   │              │  decomp all) │              │  decompress) │");
-    println!("├────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤");
+    println!(
+        "┌────────────┬──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐"
+    );
+    println!(
+        "│ Blocks/Pack│ Assembly     │ Asm/Block    │ Prefetch All │ Per-Block    │ Single Block │"
+    );
+    println!(
+        "│            │ (hash+lz4+  │              │ (parse+      │ (prefetch/N) │ (extract+    │"
+    );
+    println!(
+        "│            │  assemble)   │              │  decomp all) │              │  decompress) │"
+    );
+    println!(
+        "├────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤"
+    );
     for m in &results {
         let per_block_asm = m.assembly_us / m.blocks_per_pack as f64;
         let per_block_prefetch = m.prefetch_us / m.blocks_per_pack as f64;
@@ -470,7 +491,9 @@ fn main() {
             m.single_extract_us,
         );
     }
-    println!("└────────────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘");
+    println!(
+        "└────────────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────┘"
+    );
 
     // === S3 Transfer Estimate ===
     println!();
@@ -495,21 +518,29 @@ fn main() {
     println!("└────────────┴──────────────┴──────────────┴──────────────┴──────────────┘");
 
     // === Cost Table (at scale) ===
+    // Model: event-driven flush (1 pack per flush), 1000 VMs,
+    // moderate app server writing ~50 unique blocks/sec.
     println!();
-    println!("S3 PUT Cost Impact (1000 VMs, 5000 dirty blocks/flush, 5760 flushes/day)");
-    let flushes_per_month = 5760.0 * 30.0;
-    let dirty_per_flush = 5000.0_f64;
+    let unique_blocks_per_sec = 5.0_f64;
     let vms = 1000.0_f64;
+    let unique_blocks_per_day = unique_blocks_per_sec * 86400.0;
+    println!(
+        "S3 PUT Cost ({:.0} VMs, {:.0} unique blocks/sec per VM)",
+        vms, unique_blocks_per_sec
+    );
     println!("┌────────────┬──────────────┬──────────────┬──────────────┐");
-    println!("│ Blocks/Pack│ Packs/Flush  │ PUTs/Mo (1K) │ PUT Cost/Mo  │");
+    println!("│ Blocks/Pack│ PUTs/VM/day  │ PUTs/Mo (1K) │ PUT Cost/Mo  │");
     println!("├────────────┼──────────────┼──────────────┼──────────────┤");
     for m in &results {
-        let packs_per_flush = (dirty_per_flush / m.blocks_per_pack as f64).ceil();
-        let puts_per_month = packs_per_flush * flushes_per_month * vms;
+        let puts_per_vm_day = unique_blocks_per_day / m.blocks_per_pack as f64;
+        let puts_per_month = puts_per_vm_day * 30.0 * vms;
         let cost = puts_per_month * 0.005 / 1000.0;
         println!(
             "│ {:>10} │ {:>12.0} │ {:>11.1}M │ ${:>10.0} │",
-            m.blocks_per_pack, packs_per_flush, puts_per_month / 1e6, cost,
+            m.blocks_per_pack,
+            puts_per_vm_day,
+            puts_per_month / 1e6,
+            cost,
         );
     }
     println!("└────────────┴──────────────┴──────────────┴──────────────┘");

@@ -9,15 +9,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use object_store::ObjectStore;
 use tempfile::TempDir;
 
-use glidefs::nbd::cache::{BlockCache, SimpleBlockCache};
-use glidefs::nbd::content_store::ContentStore;
-use glidefs::nbd::pack_index::HostPackIndex;
-use glidefs::nbd::state::Active;
-use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
+use glidefs::block::cache::{BlockCache, SimpleBlockCache};
+use glidefs::block::content_store::ContentStore;
+use glidefs::block::pack_index::HostPackIndex;
+use glidefs::block::state::Active;
+use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 
@@ -44,7 +44,8 @@ impl BenchHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3), "bench");
-        let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let pack_index =
+            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         let cache = WriteCache::open(config).expect("Failed to open cache");

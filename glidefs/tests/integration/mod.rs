@@ -18,15 +18,15 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use tempfile::TempDir;
 
-use glidefs::nbd::cache::SimpleBlockCache;
-use glidefs::nbd::content_store::ContentStore;
-use glidefs::nbd::metrics::ExportMetrics;
-use glidefs::nbd::pack_index::HostPackIndex;
-use glidefs::nbd::state::Active;
-use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
+use glidefs::block::cache::SimpleBlockCache;
+use glidefs::block::content_store::ContentStore;
+use glidefs::block::metrics::ExportMetrics;
+use glidefs::block::pack_index::HostPackIndex;
+use glidefs::block::state::Active;
+use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
-const DEVICE_SIZE: u64 = 64 * 1024 * 1024; // 64MB
+const DEVICE_SIZE: u64 = 256 * 1024 * 1024; // 256MB (enough for multi-pack tests at 500 blocks/pack)
 
 /// Shared v2 test harness: creates a WriteCache with ContentStore + HostPackIndex + SimpleBlockCache.
 ///
@@ -53,13 +53,20 @@ pub fn create_v2_test_cache(
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(s3, "test");
-    let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+    let pack_index =
+        Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
     let cache = cache.skip_recovery_for_test();
 
-    (Arc::new(cache), content_store, pack_index, clean_cache, metrics)
+    (
+        Arc::new(cache),
+        content_store,
+        pack_index,
+        clean_cache,
+        metrics,
+    )
 }
 
 /// Cold reader: creates a WriteCache whose block_map is populated from the S3 manifest.
@@ -89,7 +96,8 @@ pub async fn create_v2_cold_reader(
         .expect("manifest should exist in S3");
 
     // Rebuild pack_index from manifest
-    let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+    let pack_index =
+        Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
     pack_index.rebuild(std::slice::from_ref(&manifest)).unwrap();
 
     let config = WriteCacheConfig {
@@ -106,5 +114,11 @@ pub async fn create_v2_cold_reader(
     let cache = WriteCache::open_from_manifest(config, &manifest, None)
         .expect("Failed to open cache from manifest");
 
-    (Arc::new(cache), content_store, pack_index, clean_cache, metrics)
+    (
+        Arc::new(cache),
+        content_store,
+        pack_index,
+        clean_cache,
+        metrics,
+    )
 }

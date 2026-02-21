@@ -13,8 +13,8 @@
 #![no_main]
 
 use deku::prelude::*;
+use glidefs::block::NBDRequest;
 use libfuzzer_sys::fuzz_target;
-use glidefs::nbd::NBDRequest;
 
 fuzz_target!(|data: &[u8]| {
     // NBDRequest expects 28 bytes with magic validation

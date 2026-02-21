@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-
+use tracing::warn;
 
 // Note: Block-level compression is intentionally NOT implemented.
 // ZFS handles compression at its layer, and block-level compression would:
@@ -77,6 +77,31 @@ impl StorageConfig {
 pub struct ServerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nbd: Option<NbdConfig>,
+
+    /// ublk transport config (Linux 6.0+, io_uring-based userspace block device).
+    /// Exports with `transport = "ublk"` require this section.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ublk: Option<UblkConfig>,
+}
+
+/// Configuration for the ublk transport (Linux 6.0+).
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct UblkConfig {
+    /// Number of I/O queues per device (default: 1).
+    /// Higher values improve parallelism on multi-core hosts.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub nr_queues: Option<u16>,
+}
+
+impl UblkConfig {
+    #[allow(dead_code)]
+    pub const DEFAULT_NR_QUEUES: u16 = 1;
+
+    #[allow(dead_code)]
+    pub fn nr_queues(&self) -> u16 {
+        self.nr_queues.unwrap_or(Self::DEFAULT_NR_QUEUES)
+    }
 }
 
 /// NBD server configuration for block device access.
@@ -148,6 +173,22 @@ pub struct NbdConfig {
     /// Bounds host-level S3 read concurrency on the NBD read path.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_s3_downloads: Option<usize>,
+
+    /// Default blocks per S3 pack for new exports (default: 500).
+    /// Higher values reduce S3 PUT costs but increase zombie storage.
+    /// Per-export override available via exports config or API.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub blocks_per_pack: Option<usize>,
+
+    /// Number of ublk I/O queues (default: 1). Only used with transport = "ublk".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ublk_nr_queues: Option<u16>,
+
+    /// NBD kernel device dead connection timeout in seconds (default: 30).
+    /// Controls how long the kernel queues I/O when the socket disconnects
+    /// (e.g., during a binary upgrade). Set to 0 to disable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub nbd_dead_conn_timeout: Option<u32>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -170,9 +211,30 @@ pub struct ExportConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub block_size: Option<usize>,
 
+    /// Blocks per S3 pack (default: inherit from global nbd.blocks_per_pack).
+    /// 0 = manual flush mode (no auto-flush, drain/snapshot only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub blocks_per_pack: Option<usize>,
+
+    /// Flush mode: "auto" (default) or "manual" (drain-only, no auto S3 flush).
+    /// When "manual", dirty blocks only flush on drain, snapshot, or shutdown.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub flush_mode: Option<String>,
+
+    /// Block device transport: "nbd" (default) or "ublk" (Linux 6.0+, io_uring).
+    /// ublk eliminates socket/protocol overhead for higher IOPS.
+    /// Requires `[servers.ublk]` section when set to "ublk".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transport: Option<String>,
 }
 
 impl ExportConfig {
+    /// Get the transport for this export: "nbd" (default) or "ublk".
+    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    pub fn transport(&self) -> &str {
+        self.transport.as_deref().unwrap_or("nbd")
+    }
+
     /// Get the S3 prefix for this export, defaulting to the export name.
     pub fn s3_prefix(&self) -> &str {
         self.s3_prefix.as_deref().unwrap_or(&self.name)
@@ -186,6 +248,15 @@ impl ExportConfig {
     /// Get the block size, falling back to the provided default.
     pub fn block_size_or(&self, default: usize) -> usize {
         self.block_size.unwrap_or(default)
+    }
+
+    /// Resolve blocks_per_pack: export override > global default > compile-time default.
+    /// Returns 0 for manual flush mode (drain-only).
+    pub fn blocks_per_pack_or(&self, global_default: usize) -> usize {
+        if self.flush_mode.as_deref() == Some("manual") {
+            return 0;
+        }
+        self.blocks_per_pack.unwrap_or(global_default)
     }
 }
 
@@ -226,8 +297,7 @@ impl NbdConfig {
 
     /// Max concurrent S3 pack uploads across all exports (default: 128, 0 = unlimited).
     pub fn max_s3_uploads(&self) -> usize {
-        self.max_s3_uploads
-            .unwrap_or(Self::DEFAULT_MAX_S3_UPLOADS)
+        self.max_s3_uploads.unwrap_or(Self::DEFAULT_MAX_S3_UPLOADS)
     }
 
     pub const DEFAULT_MAX_S3_DOWNLOADS: usize = 512;
@@ -236,6 +306,22 @@ impl NbdConfig {
     pub fn max_s3_downloads(&self) -> usize {
         self.max_s3_downloads
             .unwrap_or(Self::DEFAULT_MAX_S3_DOWNLOADS)
+    }
+
+    /// Default blocks per pack for new exports.
+    pub fn blocks_per_pack(&self) -> usize {
+        self.blocks_per_pack
+            .unwrap_or(crate::block::pack::DEFAULT_BLOCKS_PER_PACK)
+    }
+
+    /// Number of ublk I/O queues (default: 1).
+    pub fn ublk_nr_queues(&self) -> u16 {
+        self.ublk_nr_queues.unwrap_or(1)
+    }
+
+    /// NBD kernel device dead connection timeout in seconds (default: 30).
+    pub fn nbd_dead_conn_timeout(&self) -> u32 {
+        self.nbd_dead_conn_timeout.unwrap_or(30)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -251,7 +337,9 @@ impl NbdConfig {
                 size_gb,
                 s3_prefix: None,
                 block_size: None,
-
+                blocks_per_pack: None,
+                flush_mode: None,
+                transport: None,
             }];
         }
 
@@ -261,6 +349,9 @@ impl NbdConfig {
             size_gb: Self::DEFAULT_DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
         }]
     }
 }
@@ -275,10 +366,7 @@ fn default_nbd_addresses() -> HashSet<SocketAddr> {
 }
 
 fn default_api_address() -> SocketAddr {
-    SocketAddr::new(
-        IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-        8080,
-    )
+    SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 8080)
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -398,10 +486,24 @@ impl Settings {
     pub fn validate(&self) -> Result<()> {
         // Cache validation
         anyhow::ensure!(
-            self.cache.disk_size_gb > 0.0,
-            "cache.disk_size_gb must be > 0, got {}",
+            self.cache.disk_size_gb.is_finite() && self.cache.disk_size_gb > 0.0,
+            "cache.disk_size_gb must be a finite number > 0, got {}",
             self.cache.disk_size_gb
         );
+        if let Some(mem) = self.cache.memory_size_gb {
+            anyhow::ensure!(
+                mem.is_finite() && mem > 0.0,
+                "cache.memory_size_gb must be a finite number > 0, got {}",
+                mem
+            );
+        }
+        if let Some(ssd) = self.cache.ssd_cache_size_gb {
+            anyhow::ensure!(
+                ssd.is_finite() && ssd > 0.0,
+                "cache.ssd_cache_size_gb must be a finite number > 0, got {}",
+                ssd
+            );
+        }
 
         // Storage timeout validation
         if let Some(t) = self.storage.connect_timeout_secs {
@@ -413,6 +515,17 @@ impl Settings {
 
         // NBD validation
         if let Some(nbd) = &self.servers.nbd {
+            // Deprecated field warnings
+            if nbd.blocks_per_batch.is_some() {
+                warn!("config: 'blocks_per_batch' is deprecated and ignored");
+            }
+            if nbd.device_name.is_some() {
+                warn!("config: 'device_name' is deprecated, use 'exports' array instead");
+            }
+            if nbd.device_size_gb.is_some() {
+                warn!("config: 'device_size_gb' is deprecated, use 'exports' array instead");
+            }
+
             if let Some(bs) = nbd.block_size {
                 anyhow::ensure!(
                     bs.is_power_of_two() && (4096..=1_048_576).contains(&bs),
@@ -426,9 +539,16 @@ impl Settings {
             // Export validation
             let mut names = HashSet::new();
             for export in &nbd.exports {
+                anyhow::ensure!(!export.name.is_empty(), "export name must not be empty");
                 anyhow::ensure!(
-                    !export.name.is_empty(),
-                    "export name must not be empty"
+                    export.name.len() <= 128
+                        && export.name.starts_with(|c: char| c.is_ascii_alphanumeric())
+                        && export
+                            .name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
+                    "export '{}': name must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric",
+                    export.name
                 );
                 anyhow::ensure!(
                     names.insert(&export.name),
@@ -436,11 +556,34 @@ impl Settings {
                     export.name
                 );
                 anyhow::ensure!(
-                    export.size_gb > 0.0,
-                    "export '{}': size_gb must be > 0, got {}",
+                    export.size_gb.is_finite() && export.size_gb > 0.0,
+                    "export '{}': size_gb must be a finite number > 0, got {}",
                     export.name,
                     export.size_gb
                 );
+                if let Some(ref fm) = export.flush_mode {
+                    anyhow::ensure!(
+                        fm == "auto" || fm == "manual",
+                        "export '{}': flush_mode must be 'auto' or 'manual', got '{}'",
+                        export.name,
+                        fm
+                    );
+                }
+                if let Some(ref t) = export.transport {
+                    anyhow::ensure!(
+                        t == "nbd" || t == "ublk",
+                        "export '{}': transport must be 'nbd' or 'ublk', got '{}'",
+                        export.name,
+                        t
+                    );
+                    if t == "ublk" {
+                        anyhow::ensure!(
+                            self.servers.ublk.is_some(),
+                            "export '{}': transport 'ublk' requires [servers.ublk] section",
+                            export.name
+                        );
+                    }
+                }
                 if let Some(bs) = export.block_size {
                     anyhow::ensure!(
                         bs.is_power_of_two() && (4096..=1_048_576).contains(&bs),
@@ -510,17 +653,22 @@ impl Settings {
                         size_gb: 100.0,
                         s3_prefix: None,
                         block_size: None,
-                
+                        blocks_per_pack: None,
+                        flush_mode: None,
+                        transport: None,
                     }],
                     device_name: None,
                     device_size_gb: None,
-    
+                    blocks_per_pack: None,
                     scrubber_blocks_per_second: None,
                     wal_sync: None,
                     shutdown_timeout_secs: None,
                     max_s3_uploads: None,
                     max_s3_downloads: None,
+                    ublk_nr_queues: None,
+                    nbd_dead_conn_timeout: None,
                 }),
+                ublk: None,
             },
             aws: Some(AwsConfig(aws_config)),
             azure: None,
@@ -694,7 +842,10 @@ block_size = 7
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("block_size must be a power of 2"), "got: {err}");
+        assert!(
+            err.contains("block_size must be a power of 2"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -715,7 +866,10 @@ url = "s3://bucket/data"
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("disk_size_gb must be > 0"), "got: {err}");
+        assert!(
+            err.contains("disk_size_gb must be a finite number > 0"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -740,7 +894,10 @@ size_gb = 0.0
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("size_gb must be > 0"), "got: {err}");
+        assert!(
+            err.contains("size_gb must be a finite number > 0"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -826,7 +983,10 @@ connect_timeout_secs = 0
 
         let result = Settings::from_file(temp_file.path().to_str().unwrap());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("connect_timeout_secs must be > 0"), "got: {err}");
+        assert!(
+            err.contains("connect_timeout_secs must be > 0"),
+            "got: {err}"
+        );
     }
 
     #[test]

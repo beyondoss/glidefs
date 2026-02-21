@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 /// Check if verbose benchmark output is enabled via BENCH_VERBOSE=1
 fn is_verbose() -> bool {
@@ -21,15 +21,15 @@ fn is_verbose() -> bool {
         .unwrap_or(false)
 }
 use object_store::ObjectStore;
-use rand::{thread_rng, Rng};
+use rand::{Rng, thread_rng};
 use tempfile::TempDir;
 
-use glidefs::nbd::cache::{BlockCache, SimpleBlockCache};
-use glidefs::nbd::content_store::ContentStore;
-use glidefs::nbd::metrics::ExportMetrics;
-use glidefs::nbd::pack_index::HostPackIndex;
-use glidefs::nbd::state::Active;
-use glidefs::nbd::write_cache::{WriteCache, WriteCacheConfig};
+use glidefs::block::cache::{BlockCache, SimpleBlockCache};
+use glidefs::block::content_store::ContentStore;
+use glidefs::block::metrics::ExportMetrics;
+use glidefs::block::pack_index::HostPackIndex;
+use glidefs::block::state::Active;
+use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 const DEVICE_SIZE_MB: u64 = 256; // 256MB test device
@@ -60,7 +60,8 @@ impl TestHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3), "bench");
-        let pack_index = Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let pack_index =
+            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         let cache = WriteCache::open(config).expect("Failed to open cache");
@@ -326,11 +327,7 @@ fn bench_mixed_iops_during_flush(c: &mut Criterion) {
                         let data = vec![i as u8; BLOCK_SIZE];
                         harness
                             .cache
-                            .write(
-                                i * BLOCK_SIZE as u64,
-                                &data,
-                                harness.clean_cache.as_ref(),
-                            )
+                            .write(i * BLOCK_SIZE as u64, &data, harness.clean_cache.as_ref())
                             .unwrap();
                     }
 
@@ -502,7 +499,9 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                     if rng.gen_ratio(9, 10) {
                         // Sequential read (boot loading)
                         let block: u64 = rng.gen_range(0..512);
-                        let _ = harness.cache.read_local(block * BLOCK_SIZE as u64, BLOCK_SIZE);
+                        let _ = harness
+                            .cache
+                            .read_local(block * BLOCK_SIZE as u64, BLOCK_SIZE);
                         harness.metrics.record_guest_read(BLOCK_SIZE as u64);
                     } else {
                         // Random write (boot activity)
@@ -594,8 +593,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                 for i in 0..200 {
                     let size = rng.gen_range(1024..32768);
                     let data = vec![i as u8; size];
-                    let offset =
-                        (i as u64 * 32768) % (harness.device_blocks() * BLOCK_SIZE as u64);
+                    let offset = (i as u64 * 32768) % (harness.device_blocks() * BLOCK_SIZE as u64);
                     harness
                         .cache
                         .write(offset, &data, harness.clean_cache.as_ref())
@@ -605,8 +603,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
 
                 // Phase 2: Read back for linking (sequential)
                 for i in 0..200 {
-                    let offset =
-                        (i as u64 * 32768) % (harness.device_blocks() * BLOCK_SIZE as u64);
+                    let offset = (i as u64 * 32768) % (harness.device_blocks() * BLOCK_SIZE as u64);
                     let _ = harness.cache.read_local(offset, 32768);
                     harness.metrics.record_guest_read(32768);
                 }
@@ -664,11 +661,7 @@ fn bench_flush_to_s3_latency(c: &mut Criterion) {
                             let data = vec![i as u8; BLOCK_SIZE];
                             harness
                                 .cache
-                                .write(
-                                    i * BLOCK_SIZE as u64,
-                                    &data,
-                                    harness.clean_cache.as_ref(),
-                                )
+                                .write(i * BLOCK_SIZE as u64, &data, harness.clean_cache.as_ref())
                                 .unwrap();
                             harness.metrics.record_guest_write(BLOCK_SIZE as u64);
                         }
