@@ -169,6 +169,14 @@ impl WriteCache<Active> {
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
         let num_chunks = (end_chunk - start_chunk + 1) as usize;
 
+        // Fast path: all chunks present on local SSD → single pread of exact bytes.
+        // Bypasses per-chunk resolution, 128KB allocation, and Bytes wrapping.
+        // One atomic load per chunk + one pread of exactly `len` bytes.
+        if (start_chunk..=end_chunk).all(|i| self.inner.is_present(i as usize)) {
+            self.inner.data_file.read_exact_at(&mut buf[..len], offset)?;
+            return Ok(len);
+        }
+
         // Single chunk fast path — no concurrency overhead.
         if num_chunks == 1 {
             let chunk_data = self
@@ -605,6 +613,18 @@ impl WriteCache<Active> {
         let start_chunk = offset / chunk_size;
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
         let num_chunks = (end_chunk - start_chunk + 1) as usize;
+
+        // Fast path: all chunks present on local SSD → single LocalSsd entry.
+        // Collapses N per-chunk SQEs into one io_uring Read of exact bytes.
+        if (start_chunk..=end_chunk).all(|i| self.inner.is_present(i as usize)) {
+            return Ok(ReadPlan {
+                entries: vec![ChunkPlanEntry {
+                    source: ChunkSource::LocalSsd { file_offset: offset },
+                    slice_start: 0,
+                    slice_len: len,
+                }],
+            });
+        }
 
         // Resolve all chunks concurrently (same pattern as read_v2).
         let futures: Vec<_> = (start_chunk..=end_chunk)

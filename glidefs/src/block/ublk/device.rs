@@ -398,7 +398,7 @@ const COMBINED_VTABLE: RawWakerVTable = RawWakerVTable::new(
 );
 
 unsafe fn combined_clone(ptr: *const ()) -> RawWaker {
-    let data = &*(ptr as *const CombinedWaker);
+    let data = unsafe { &*(ptr as *const CombinedWaker) };
     let cloned = Box::new(CombinedWaker {
         inner: data.inner.clone(),
         efd: data.efd,
@@ -407,19 +407,19 @@ unsafe fn combined_clone(ptr: *const ()) -> RawWaker {
 }
 
 unsafe fn combined_wake(ptr: *const ()) {
-    let data = Box::from_raw(ptr as *mut CombinedWaker);
+    let data = unsafe { Box::from_raw(ptr as *mut CombinedWaker) };
     signal_eventfd(data.efd);
     data.inner.wake();
 }
 
 unsafe fn combined_wake_by_ref(ptr: *const ()) {
-    let data = &*(ptr as *const CombinedWaker);
+    let data = unsafe { &*(ptr as *const CombinedWaker) };
     signal_eventfd(data.efd);
     data.inner.wake_by_ref();
 }
 
 unsafe fn combined_drop(ptr: *const ()) {
-    drop(Box::from_raw(ptr as *mut CombinedWaker));
+    drop(unsafe { Box::from_raw(ptr as *mut CombinedWaker) });
 }
 
 /// Create a waker that signals both the smol executor and the eventfd.
