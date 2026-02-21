@@ -67,7 +67,8 @@
       "WebFetch(domain:jpospisil.com)",
       "WebFetch(domain:people.redhat.com)",
       "Skill(architecture-doc)",
-      "Bash(RUSTFLAGS=\"\" cargo metadata:*)"
+      "Bash(RUSTFLAGS=\"\" cargo metadata:*)",
+      "WebFetch(domain:www.kernel.org)"
     ]
   }
 }

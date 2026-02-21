@@ -121,10 +121,11 @@ impl UblkServer {
         }
 
         // Collect candidate device IDs.
-        let mut candidates: Vec<i32> = Vec::new();
+        let candidates = std::cell::RefCell::new(Vec::<i32>::new());
         libublk::ctrl::UblkCtrl::for_each_dev_id(|dev_id| {
-            candidates.push(dev_id as i32);
+            candidates.borrow_mut().push(dev_id as i32);
         });
+        let candidates = candidates.into_inner();
 
         if candidates.is_empty() {
             return 0;
