@@ -93,13 +93,13 @@ jobs:
         run: cargo build --features ublk,test-utils --verbose
       - name: Test (ublk)
         run: cargo test --features ublk,test-utils --verbose
+      - name: Install fio
+        run: sudo apt-get update && sudo apt-get install -y fio
       - name: Load kernel modules
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
-      - name: Docker integration (ublk)
-        run: sudo -E env "PATH=$PATH" cargo test --features ublk,docker-tests --test docker_integration ublk --verbose
-      - name: Install fio
-        run: sudo apt-get install -y fio
       - name: fio benchmark (ublk)
         run: sudo -E env "PATH=$PATH" cargo test --features fio-bench --test fio_bench -- --nocapture
+      - name: Docker integration (ublk)
+        run: sudo -E env "PATH=$PATH" cargo test --features ublk,docker-tests --test docker_integration ublk --verbose
