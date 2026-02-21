@@ -123,7 +123,7 @@ impl UblkServer {
         // Collect candidate device IDs.
         let mut candidates: Vec<i32> = Vec::new();
         libublk::ctrl::UblkCtrl::for_each_dev_id(|dev_id| {
-            candidates.push(dev_id);
+            candidates.push(dev_id as i32);
         });
 
         if candidates.is_empty() {
@@ -143,7 +143,7 @@ impl UblkServer {
             };
 
             // Only recover devices we own.
-            let name = ctrl.get_name().unwrap_or_default();
+            let name = ctrl.get_name();
             if name != "glidefs" {
                 continue;
             }

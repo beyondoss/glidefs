@@ -34,7 +34,6 @@ const NLM_F_ACK: u16 = 4;
 
 // Netlink message types
 const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
 
 // --- NBD generic netlink constants ---
 
@@ -201,14 +200,14 @@ fn wait_for_ack(fd: RawFd) -> io::Result<()> {
     let (_, msg_type, _, payload) = parse_nlmsghdr(&buf[..n])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated netlink response"))?;
 
-    if msg_type == NLMSG_ERROR {
-        if payload.len() >= 4 {
-            let errno = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            if errno == 0 {
-                return Ok(()); // ACK
-            }
-            return Err(io::Error::from_raw_os_error(-errno));
+    if msg_type == NLMSG_ERROR
+        && payload.len() >= 4
+    {
+        let errno = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        if errno == 0 {
+            return Ok(()); // ACK
         }
+        return Err(io::Error::from_raw_os_error(-errno));
     }
 
     Err(io::Error::new(
@@ -231,19 +230,19 @@ fn resolve_nbd_family(fd: RawFd) -> io::Result<u16> {
     let (_, msg_type, _, payload) = parse_nlmsghdr(&buf[..n])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated response"))?;
 
-    if msg_type == NLMSG_ERROR {
-        if payload.len() >= 4 {
-            let errno = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            if errno != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "nbd generic netlink family not found (errno {}). \
-                         Is the nbd kernel module loaded? Try: modprobe nbd",
-                        -errno
-                    ),
-                ));
-            }
+    if msg_type == NLMSG_ERROR
+        && payload.len() >= 4
+    {
+        let errno = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        if errno != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "nbd generic netlink family not found (errno {}). \
+                     Is the nbd kernel module loaded? Try: modprobe nbd",
+                    -errno
+                ),
+            ));
         }
     }
 
@@ -335,33 +334,33 @@ pub fn connect(
     let (_, msg_type, _, payload) = parse_nlmsghdr(&buf[..n])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated response"))?;
 
-    if msg_type == NLMSG_ERROR {
-        if payload.len() >= 4 {
-            let errno = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            if errno == 0 {
-                // Success — but we used u32::MAX so we need to find the assigned index.
-                // Parse the echoed attributes in the error response.
-                // The kernel echoes back the original message after the error code.
-                if payload.len() >= 4 + 16 + 4 {
-                    // error(4) + nlmsghdr(16) + genlmsghdr(4) + attrs
-                    let echoed_attrs = &payload[4 + 16 + 4..];
-                    for (attr_type, attr_data) in parse_nla(echoed_attrs) {
-                        if attr_type == NBD_ATTR_INDEX && attr_data.len() >= 4 {
-                            let index = u32::from_ne_bytes([
-                                attr_data[0],
-                                attr_data[1],
-                                attr_data[2],
-                                attr_data[3],
-                            ]);
-                            return Ok(index as i32);
-                        }
+    if msg_type == NLMSG_ERROR
+        && payload.len() >= 4
+    {
+        let errno = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        if errno == 0 {
+            // Success — but we used u32::MAX so we need to find the assigned index.
+            // Parse the echoed attributes in the error response.
+            // The kernel echoes back the original message after the error code.
+            if payload.len() >= 4 + 16 + 4 {
+                // error(4) + nlmsghdr(16) + genlmsghdr(4) + attrs
+                let echoed_attrs = &payload[4 + 16 + 4..];
+                for (attr_type, attr_data) in parse_nla(echoed_attrs) {
+                    if attr_type == NBD_ATTR_INDEX && attr_data.len() >= 4 {
+                        let index = u32::from_ne_bytes([
+                            attr_data[0],
+                            attr_data[1],
+                            attr_data[2],
+                            attr_data[3],
+                        ]);
+                        return Ok(index as i32);
                     }
                 }
-                // Fallback: scan /sys/block for the newest nbd device
-                return find_newest_nbd_device();
             }
-            return Err(io::Error::from_raw_os_error(-errno));
+            // Fallback: scan /sys/block for the newest nbd device
+            return find_newest_nbd_device();
         }
+        return Err(io::Error::from_raw_os_error(-errno));
     }
 
     Err(io::Error::new(
@@ -417,19 +416,17 @@ fn find_newest_nbd_device() -> io::Result<i32> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(index_str) = name.strip_prefix("nbd") {
-            if let Ok(index) = index_str.parse::<i32>() {
-                // Check if the device has a pid (is connected)
-                let pid_path = entry.path().join("pid");
-                if pid_path.exists() {
-                    if let Ok(meta) = entry.metadata() {
-                        if let Ok(modified) = meta.modified() {
-                            if best.is_none() || modified > best.as_ref().unwrap().1 {
-                                best = Some((index, modified));
-                            }
-                        }
-                    }
-                }
+        if let Some(index_str) = name.strip_prefix("nbd")
+            && let Ok(index) = index_str.parse::<i32>()
+        {
+            // Check if the device has a pid (is connected)
+            let pid_path = entry.path().join("pid");
+            if pid_path.exists()
+                && let Ok(meta) = entry.metadata()
+                && let Ok(modified) = meta.modified()
+                && (best.is_none() || modified > best.as_ref().unwrap().1)
+            {
+                best = Some((index, modified));
             }
         }
     }

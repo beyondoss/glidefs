@@ -61,6 +61,12 @@ struct NbdDevice {
     shutdown: CancellationToken,
 }
 
+impl Default for NbdDeviceManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NbdDeviceManager {
     pub fn new() -> Self {
         Self {
@@ -345,8 +351,6 @@ async fn client_handshake(
     stream: &UnixStream,
     export_name: &str,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     // 1. Read server handshake: magic(8) + ihaveopt(8) + flags(2) = 18 bytes
     let mut handshake_buf = [0u8; 18];
     stream.readable().await?;
