@@ -33,7 +33,7 @@ use crate::block::state::Draining;
 pub use config::WriteCacheConfig;
 pub use error::CacheError;
 #[cfg(all(target_os = "linux", feature = "ublk"))]
-pub use read::{ChunkPlanEntry, ChunkSource, ReadPlan};
+pub use read::{ChunkSource, ReadPlan};
 use inner::CacheInner;
 
 /// Statistics from a flush operation.

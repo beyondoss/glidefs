@@ -150,8 +150,15 @@ mod fio_bench {
             String::from_utf8_lossy(&output.stderr),
         );
 
+        // fio may prefix stdout with a text banner before the JSON object.
+        // Find the first '{' and parse from there.
+        let stdout = &output.stdout;
+        let json_start = stdout
+            .iter()
+            .position(|&b| b == b'{')
+            .expect("fio output contains no JSON");
         let json: serde_json::Value =
-            serde_json::from_slice(&output.stdout).expect("fio produced invalid JSON");
+            serde_json::from_slice(&stdout[json_start..]).expect("fio produced invalid JSON");
 
         let job = &json["jobs"][0];
 
