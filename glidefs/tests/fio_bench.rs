@@ -126,8 +126,9 @@ mod fio_bench {
             dev,
             "--rw",
             rw,
+            "--ioengine=io_uring",
             "--bs=4k",
-            "--iodepth=32",
+            "--iodepth=64",
             "--numjobs=1",
             "--direct=1",
             "--runtime=15",
@@ -168,10 +169,11 @@ mod fio_bench {
         let write_bw_kib = job["write"]["bw"].as_f64().unwrap_or(0.0);
         let read_lat_avg_ns = job["read"]["lat_ns"]["mean"].as_f64().unwrap_or(0.0);
         let write_lat_avg_ns = job["write"]["lat_ns"]["mean"].as_f64().unwrap_or(0.0);
-        let read_lat_p99_ns = job["read"]["lat_ns"]["percentile"]["99.000000"]
+        // fio 3.x reports percentiles under clat_ns (completion latency).
+        let read_lat_p99_ns = job["read"]["clat_ns"]["percentile"]["99.000000"]
             .as_f64()
             .unwrap_or(0.0);
-        let write_lat_p99_ns = job["write"]["lat_ns"]["percentile"]["99.000000"]
+        let write_lat_p99_ns = job["write"]["clat_ns"]["percentile"]["99.000000"]
             .as_f64()
             .unwrap_or(0.0);
 
