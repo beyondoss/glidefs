@@ -13,6 +13,7 @@ mod nbd_kernel_client;
 mod ublk_client;
 
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -125,6 +126,8 @@ impl TestClient {
     pub async fn read(&mut self, offset: u64, length: u32) -> anyhow::Result<Vec<u8>> {
         match self {
             Self::Nbd(c) => c.read(offset, length).await,
+            #[cfg(target_os = "linux")]
+            Self::NbdKernel(c) => c.read(offset, length).await,
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             Self::Ublk(c) => c.read(offset, length).await,
         }
@@ -133,6 +136,8 @@ impl TestClient {
     pub async fn write(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<()> {
         match self {
             Self::Nbd(c) => c.write(offset, data).await,
+            #[cfg(target_os = "linux")]
+            Self::NbdKernel(c) => c.write(offset, data).await,
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             Self::Ublk(c) => c.write(offset, data).await,
         }
@@ -143,6 +148,8 @@ impl TestClient {
     pub async fn write_raw(&mut self, offset: u64, data: &[u8]) -> anyhow::Result<u32> {
         match self {
             Self::Nbd(c) => c.write_raw(offset, data).await,
+            #[cfg(target_os = "linux")]
+            Self::NbdKernel(c) => c.write_raw(offset, data).await,
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             Self::Ublk(c) => c.write_raw(offset, data).await,
         }
@@ -151,6 +158,8 @@ impl TestClient {
     pub async fn flush(&mut self) -> anyhow::Result<()> {
         match self {
             Self::Nbd(c) => c.flush().await,
+            #[cfg(target_os = "linux")]
+            Self::NbdKernel(c) => c.flush().await,
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             Self::Ublk(c) => c.flush().await,
         }
@@ -159,6 +168,8 @@ impl TestClient {
     pub async fn disconnect(self) -> anyhow::Result<()> {
         match self {
             Self::Nbd(c) => c.disconnect().await,
+            #[cfg(target_os = "linux")]
+            Self::NbdKernel(c) => c.disconnect().await,
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             Self::Ublk(c) => c.disconnect().await,
         }
@@ -167,6 +178,8 @@ impl TestClient {
     pub fn export_size(&self) -> u64 {
         match self {
             Self::Nbd(c) => c.export_size,
+            #[cfg(target_os = "linux")]
+            Self::NbdKernel(c) => c.export_size,
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             Self::Ublk(c) => c.export_size,
         }
@@ -183,6 +196,11 @@ pub enum ConnectInfo {
         addr: SocketAddr,
         export_name: String,
     },
+    #[cfg(target_os = "linux")]
+    NbdKernel {
+        dev_path: PathBuf,
+        export_size: u64,
+    },
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     Ublk {
         dev_path: PathBuf,
@@ -196,6 +214,14 @@ impl ConnectInfo {
             Self::Nbd { addr, export_name } => {
                 let client = nbd_client::NbdClient::connect(*addr, export_name).await?;
                 Ok(TestClient::Nbd(client))
+            }
+            #[cfg(target_os = "linux")]
+            Self::NbdKernel {
+                dev_path,
+                export_size,
+            } => {
+                let client = nbd_kernel_client::NbdKernelClient::open(dev_path, *export_size)?;
+                Ok(TestClient::NbdKernel(client))
             }
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             Self::Ublk {
@@ -263,6 +289,15 @@ impl TestContext {
 }
 
 // ---------------------------------------------------------------------------
+// Kernel NBD state (Linux only)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+struct NbdKernelState {
+    manager: tokio::sync::Mutex<glidefs::block::nbd::NbdDeviceManager>,
+}
+
+// ---------------------------------------------------------------------------
 // Ublk state (Linux + ublk feature only)
 // ---------------------------------------------------------------------------
 
@@ -283,6 +318,8 @@ pub struct TestServer {
     pub shutdown: CancellationToken,
     pub _cache_dir: TempDir,
     _server_handle: tokio::task::JoinHandle<()>,
+    #[cfg(target_os = "linux")]
+    nbd_kernel: Option<NbdKernelState>,
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     ublk: Option<UblkState>,
 }
@@ -337,6 +374,20 @@ impl TestServer {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
+        // Create kernel NBD device manager if requested
+        #[cfg(target_os = "linux")]
+        let nbd_kernel = if matches!(transport, Transport::NbdKernel) {
+            Some(NbdKernelState {
+                manager: tokio::sync::Mutex::new(
+                    glidefs::block::nbd::NbdDeviceManager::new()
+                        .with_cache_dir(cache_dir.path().to_path_buf())
+                        .with_dead_conn_timeout(0),
+                ),
+            })
+        } else {
+            None
+        };
+
         // Create ublk server if requested
         #[cfg(all(target_os = "linux", feature = "ublk"))]
         let ublk = if matches!(transport, Transport::Ublk) {
@@ -355,6 +406,8 @@ impl TestServer {
             shutdown,
             _cache_dir: cache_dir,
             _server_handle: server_handle,
+            #[cfg(target_os = "linux")]
+            nbd_kernel,
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             ublk,
         }
@@ -401,6 +454,44 @@ impl TestServer {
         }
     }
 
+    /// Register a kernel NBD device for an export (no-op for other transports).
+    #[allow(unused_variables)]
+    async fn register_nbd_kernel_device(&self, name: &str) {
+        #[cfg(target_os = "linux")]
+        if let Some(ref nbd) = self.nbd_kernel {
+            let handler = self
+                .router
+                .get_handler(name)
+                .await
+                .unwrap_or_else(|| panic!("no handler for export '{name}'"));
+            let size = handler.device_size();
+            nbd.manager
+                .lock()
+                .await
+                .add_device(name, Arc::clone(&self.router), size)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("failed to register nbd kernel device for '{name}': {e}")
+                });
+        }
+    }
+
+    /// Unregister a kernel NBD device for an export (no-op for other transports).
+    #[allow(unused_variables)]
+    async fn unregister_nbd_kernel_device(&self, name: &str) {
+        #[cfg(target_os = "linux")]
+        if let Some(ref nbd) = self.nbd_kernel {
+            nbd.manager
+                .lock()
+                .await
+                .remove_device(name)
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("failed to unregister nbd kernel device for '{name}': {e}")
+                });
+        }
+    }
+
     /// Create a fresh export on this server (no existing data).
     pub async fn create_export(&self, name: &str, size_gb: f64) {
         let config = ExportConfig {
@@ -416,6 +507,7 @@ impl TestServer {
             .create_export(config, false, None)
             .await
             .unwrap();
+        self.register_nbd_kernel_device(name).await;
         self.register_ublk_device(name).await;
     }
 
@@ -448,6 +540,7 @@ impl TestServer {
             .create_export(config, false, Some(name))
             .await
             .unwrap();
+        self.register_nbd_kernel_device(name).await;
         self.register_ublk_device(name).await;
     }
 
@@ -466,6 +559,7 @@ impl TestServer {
             .create_export(config, false, Some(name))
             .await
             .unwrap();
+        self.register_nbd_kernel_device(name).await;
         self.register_ublk_device(name).await;
     }
 
@@ -489,6 +583,7 @@ impl TestServer {
             .create_export(config, false, Some(source_manifest))
             .await
             .unwrap();
+        self.register_nbd_kernel_device(name).await;
         self.register_ublk_device(name).await;
     }
 
@@ -507,6 +602,7 @@ impl TestServer {
             .create_export(config, true, Some(source_manifest))
             .await
             .unwrap();
+        self.register_nbd_kernel_device(name).await;
         self.register_ublk_device(name).await;
     }
 
@@ -517,10 +613,12 @@ impl TestServer {
 
     /// Resize an export (grow only). Client must reconnect to see new size.
     pub async fn resize_export(&self, name: &str, new_size_gb: f64) {
-        // For ublk: remove the device before resize (router removes+recreates the export).
+        // Remove kernel devices before resize (router removes+recreates the export).
+        self.unregister_nbd_kernel_device(name).await;
         self.unregister_ublk_device(name).await;
         self.router.resize_export(name, new_size_gb).await.unwrap();
         // Re-register with the new handler that has the updated size.
+        self.register_nbd_kernel_device(name).await;
         self.register_ublk_device(name).await;
     }
 
@@ -546,6 +644,28 @@ impl TestServer {
                     .await
                     .unwrap();
                 TestClient::Nbd(client)
+            }
+            #[cfg(target_os = "linux")]
+            Transport::NbdKernel => {
+                let nbd = self.nbd_kernel.as_ref().expect("nbd kernel state missing");
+                let dev_path = {
+                    let manager = nbd.manager.lock().await;
+                    manager
+                        .get_device_path(export_name)
+                        .unwrap_or_else(|| {
+                            panic!("no nbd kernel device for export '{export_name}'")
+                        })
+                        .to_path_buf()
+                };
+                let handler = self
+                    .router
+                    .get_handler(export_name)
+                    .await
+                    .unwrap_or_else(|| panic!("no handler for export '{export_name}'"));
+                let export_size = handler.device_size();
+                TestClient::NbdKernel(
+                    nbd_kernel_client::NbdKernelClient::open(&dev_path, export_size).unwrap(),
+                )
             }
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             Transport::Ublk => {
@@ -573,6 +693,28 @@ impl TestServer {
                 addr: self.addr,
                 export_name: export_name.to_string(),
             },
+            #[cfg(target_os = "linux")]
+            Transport::NbdKernel => {
+                let nbd = self.nbd_kernel.as_ref().expect("nbd kernel state missing");
+                let dev_path = {
+                    let manager = nbd.manager.lock().await;
+                    manager
+                        .get_device_path(export_name)
+                        .unwrap_or_else(|| {
+                            panic!("no nbd kernel device for export '{export_name}'")
+                        })
+                        .to_path_buf()
+                };
+                let handler = self
+                    .router
+                    .get_handler(export_name)
+                    .await
+                    .unwrap_or_else(|| panic!("no handler for export '{export_name}'"));
+                ConnectInfo::NbdKernel {
+                    dev_path,
+                    export_size: handler.device_size(),
+                }
+            }
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             Transport::Ublk => {
                 let ublk = self.ublk.as_ref().expect("ublk state missing");
@@ -596,7 +738,15 @@ impl TestServer {
 
     /// Drain all exports and shut down gracefully.
     pub async fn shutdown(self) {
-        // Shut down ublk devices first (they hold handler refs).
+        // Shut down kernel devices first (they hold handler/router refs).
+        #[cfg(target_os = "linux")]
+        if let Some(nbd) = self.nbd_kernel {
+            let manager = nbd.manager.into_inner();
+            if let Err(e) = manager.shutdown().await {
+                eprintln!("nbd kernel shutdown error: {e}");
+            }
+        }
+
         #[cfg(all(target_os = "linux", feature = "ublk"))]
         if let Some(ublk) = self.ublk {
             let server = ublk.server.into_inner();
