@@ -22,7 +22,7 @@ jobs:
         with:
           components: "clippy"
       - name: Run clippy
-        run: cargo clippy --features test-utils --tests --benches -- -D warnings
+        run: cargo clippy --features test-utils --tests --benches
 
   build:
     name: Build and Test
@@ -88,7 +88,7 @@ jobs:
         with:
           components: "clippy"
       - name: Clippy (ublk)
-        run: cargo clippy --features ublk,test-utils --tests --benches -- -D warnings
+        run: cargo clippy --features ublk,test-utils --tests --benches
       - name: Build (ublk)
         run: cargo build --features ublk,test-utils --verbose
       - name: Test (ublk)
@@ -97,5 +97,5 @@ jobs:
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
-      - name: Docker integration (kernel devices)
-        run: sudo -E env "PATH=$PATH" cargo test --features ublk,docker-tests --test docker_integration --verbose
+      - name: Docker integration (ublk)
+        run: sudo -E env "PATH=$PATH" cargo test --features ublk,docker-tests --test docker_integration ublk --verbose

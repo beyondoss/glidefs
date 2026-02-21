@@ -93,6 +93,16 @@ loom = "0.7"
 # Allow loom and ublk cfg flags
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
+[lints.clippy]
+# Real bugs — deny in CI
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+# Style/pedantic — warn locally, don't block CI
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+
 [[bench]]
 name = "flush_latency"
 harness = false
