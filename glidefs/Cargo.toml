@@ -74,7 +74,7 @@ parking_lot = "0.12"
 chrono = { version = "0.4.43", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libublk = { version = "0.4", optional = true }
+libublk = { git = "https://github.com/paraglidehq/libublk-rs.git", branch = "fix/serde-blk-zone", optional = true }
 smol = { version = "2", optional = true }
 
 [dev-dependencies]

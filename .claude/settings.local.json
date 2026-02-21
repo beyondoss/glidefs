@@ -73,7 +73,8 @@
       "WebFetch(domain:elixir.bootlin.com)",
       "WebFetch(domain:lore.gnuweeb.org)",
       "WebFetch(domain:git.kernel.org)",
-      "WebFetch(domain:lore.kernel.org)"
+      "WebFetch(domain:lore.kernel.org)",
+      "Bash(gh repo:*)"
     ]
   }
 }
