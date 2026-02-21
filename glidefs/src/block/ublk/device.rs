@@ -402,12 +402,12 @@ struct WakeupQueue {
 /// Every waker produced by this executor writes to the eventfd on `wake()`.
 /// This means any `wake()` call from any thread (tokio, io_uring CQE handler,
 /// internal) unblocks `io_uring_enter()` — no wrapper needed.
-struct QueueExecutor {
-    tasks: Vec<Option<Pin<Box<dyn Future<Output = ()>>>>>,
+struct QueueExecutor<'a> {
+    tasks: Vec<Option<Pin<Box<dyn Future<Output = ()> + 'a>>>>,
     wakeups: Arc<WakeupQueue>,
 }
 
-impl QueueExecutor {
+impl<'a> QueueExecutor<'a> {
     fn new(efd: RawFd) -> Self {
         Self {
             tasks: Vec::new(),
@@ -418,7 +418,7 @@ impl QueueExecutor {
         }
     }
 
-    fn spawn(&mut self, future: impl Future<Output = ()> + 'static) {
+    fn spawn(&mut self, future: impl Future<Output = ()> + 'a) {
         let idx = self.tasks.len();
         self.tasks.push(Some(Box::pin(future)));
         // Wake immediately so the task gets its first poll.
