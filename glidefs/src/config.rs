@@ -95,10 +95,10 @@ pub struct UblkConfig {
 }
 
 impl UblkConfig {
-    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    #[allow(dead_code)]
     pub const DEFAULT_NR_QUEUES: u16 = 1;
 
-    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn nr_queues(&self) -> u16 {
         self.nr_queues.unwrap_or(Self::DEFAULT_NR_QUEUES)
     }
