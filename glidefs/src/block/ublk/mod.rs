@@ -1,6 +1,6 @@
 //! ublk transport layer — io_uring-based userspace block device (Linux 6.0+).
 //!
-//! Uses the `libublk` crate to register block devices in the kernel that route
+//! Uses the `ublk_core` crate to register block devices in the kernel that route
 //! I/O through io_uring to our [`BlockHandler`]. One ublk device per export.
 //!
 //! # Architecture
@@ -129,7 +129,7 @@ impl UblkServer {
         // Collect candidate device IDs.
         let candidates = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
         let c = std::sync::Arc::clone(&candidates);
-        libublk::ctrl::UblkCtrl::for_each_dev_id(move |dev_id| {
+        ublk_core::ctrl::UblkCtrl::for_each_dev_id(move |dev_id| {
             c.lock().unwrap().push(dev_id as i32);
         });
         let candidates = std::sync::Arc::try_unwrap(candidates)
@@ -145,7 +145,7 @@ impl UblkServer {
 
         let mut recovered = 0usize;
         for dev_id in candidates {
-            let ctrl = match libublk::ctrl::UblkCtrl::new_simple(dev_id) {
+            let ctrl = match ublk_core::ctrl::UblkCtrl::new_simple(dev_id) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::debug!(dev_id, error = %e, "cannot open ublk ctrl, skipping");
@@ -161,7 +161,7 @@ impl UblkServer {
 
             // Only recover QUIESCED devices.
             let state = ctrl.dev_info().state as u32;
-            if state != libublk::sys::UBLK_S_DEV_QUIESCED {
+            if state != ublk_core::sys::UBLK_S_DEV_QUIESCED {
                 continue;
             }
 
