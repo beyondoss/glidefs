@@ -99,3 +99,7 @@ jobs:
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
       - name: Docker integration (ublk)
         run: sudo -E env "PATH=$PATH" cargo test --features ublk,docker-tests --test docker_integration ublk --verbose
+      - name: Install fio
+        run: sudo apt-get install -y fio
+      - name: fio benchmark (ublk)
+        run: sudo -E env "PATH=$PATH" cargo test --features fio-bench --test fio_bench -- --nocapture
