@@ -259,6 +259,13 @@ pub(crate) struct CacheInner {
 }
 
 impl CacheInner {
+    /// Get the raw file descriptor of the data file (for io_uring registration).
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[inline]
+    pub(crate) fn data_file_fd(&self) -> std::os::unix::io::RawFd {
+        self.data_file.as_raw_fd()
+    }
+
     /// Check if block is present (lock-free read).
     #[allow(dead_code)]
     #[inline]

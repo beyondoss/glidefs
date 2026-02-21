@@ -16,6 +16,8 @@ use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::block::write_cache::ChunkSource;
+
 /// Per-queue I/O depth (max inflight commands per queue).
 const QUEUE_DEPTH: u16 = 128;
 
@@ -24,6 +26,13 @@ const IO_BUF_BYTES: u32 = 512 * 1024;
 
 /// io_uring idle timeout in seconds. Controls worst-case latency from `kill_dev()` to queue exit.
 const URING_IDLE_SECS: u64 = 20;
+
+/// io_uring fixed-file index for the data file.
+///
+/// libublk auto-registers `fds[0]` as the ublk control device fd. We register
+/// the data file at `fds[1]` in `tgt_init`, so io_uring Read/Write ops use
+/// `types::Fixed(DATA_FILE_FD_INDEX)` with `Flags::FIXED_FILE`.
+const DATA_FILE_FD_INDEX: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Kernel feature detection
@@ -52,7 +61,7 @@ pub(crate) fn detect_features() -> KernelFeatures {
     tracing::info!(
         recovery,
         zero_copy,
-        raw_features = format!("{raw:#x}"),
+        raw_features = raw,
         "ublk kernel feature detection"
     );
 
@@ -362,6 +371,13 @@ fn run_device(
         }
     };
 
+    // Extract data file fd for io_uring zero-copy registration.
+    let data_file_fd = if features.zero_copy {
+        Some(handler.data_file_raw_fd())
+    } else {
+        None
+    };
+
     // Target init: set device size, block parameters, and export metadata.
     let tgt_init = move |dev: &mut UblkDev| {
         dev.tgt.dev_size = dev_size;
@@ -390,6 +406,21 @@ fn run_device(
             },
             ..Default::default()
         };
+
+        // Register data file with io_uring for zero-copy I/O.
+        // libublk auto-sets fds[0] = ublk cdev fd. We put the data file
+        // at the next slot → io_uring ops use types::Fixed(DATA_FILE_FD_INDEX).
+        if let Some(fd) = data_file_fd {
+            let idx = dev.tgt.nr_fds as usize;
+            debug_assert_eq!(
+                idx, DATA_FILE_FD_INDEX as usize,
+                "expected data file at fd index {}, but nr_fds is {}",
+                DATA_FILE_FD_INDEX, idx,
+            );
+            dev.tgt.fds[idx] = fd;
+            dev.tgt.nr_fds += 1;
+        }
+
         Ok(())
     };
 
@@ -485,6 +516,7 @@ fn queue_io_loop(
             return;
         }
     };
+    let zero_copy = q_rc.support_auto_buf_zc();
     let exe = smol::LocalExecutor::new();
 
     let mut tasks = Vec::new();
@@ -494,7 +526,12 @@ fn queue_io_loop(
         let tokio_handle = tokio_handle.clone();
 
         tasks.push(exe.spawn(async move {
-            if let Err(e) = io_task(&q, tag, &handler, &tokio_handle).await {
+            let result = if zero_copy {
+                io_task_zc(&q, tag, &handler, &tokio_handle).await
+            } else {
+                io_task(&q, tag, &handler, &tokio_handle).await
+            };
+            if let Err(e) = result {
                 match e {
                     UblkError::QueueIsDown => {} // normal shutdown
                     _ => tracing::error!(qid, tag, error = ?e, "ublk io_task failed"),
@@ -519,43 +556,21 @@ fn queue_io_loop(
     }));
 }
 
-/// Per-tag async I/O task.
+/// Per-tag async I/O task (non-zero-copy path).
 ///
-/// When the kernel supports auto buffer registration (`UBLK_F_AUTO_BUF_REG` +
-/// `UBLK_F_SUPPORT_ZERO_COPY`), we access kernel bio pages directly via
-/// `iod.addr` — eliminating a 128KB memcpy per READ/WRITE. On older kernels
-/// we fall back to `IoBuf`-based I/O.
+/// Allocates a per-tag `IoBuf` for kernel↔userspace data transfer.
+/// The kernel copies data into/out of this buffer on each I/O.
 async fn io_task(
     q: &UblkQueue<'_>,
     tag: u16,
     handler: &BlockHandler,
     tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
-    let zero_copy = q.support_auto_buf_zc();
-
-    // Traditional: allocate IoBuf. Zero-copy: no daemon buffer needed.
-    let mut buffer = if zero_copy {
-        None
-    } else {
-        Some(IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize))
-    };
-
-    let auto_reg = sys::ublk_auto_buf_reg {
-        index: tag,
-        flags: 0,
-        reserved0: 0,
-        reserved1: 0,
-    };
+    let mut buffer = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
     // Initial fetch.
-    if zero_copy {
-        q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_reg), 0, None)
-            .await?;
-    } else {
-        let buf = buffer.as_ref().unwrap();
-        q.submit_io_prep_cmd(tag, BufDesc::Slice(buf.as_slice()), 0, Some(buf))
-            .await?;
-    }
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(buffer.as_slice()), 0, Some(&buffer))
+        .await?;
 
     loop {
         let iod = q.get_iod(tag);
@@ -570,47 +585,215 @@ async fn io_task(
         );
         let length = byte_len as u32;
 
-        let result = if zero_copy {
+        let result = dispatch_io(
+            op, offset, length, fua, &mut buffer, handler, tokio_handle,
+        )
+        .await;
+
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), result)
+            .await?;
+    }
+}
+
+/// Per-tag async I/O task (zero-copy path).
+///
+/// The kernel maps bio pages into our address space via `UBLK_F_AUTO_BUF_REG`
+/// and registers them as io_uring fixed buffers. For READ/WRITE, we submit
+/// io_uring Read/Write SQEs that transfer data directly between bio pages
+/// and the data file fd — no userspace buffer, no memcpy.
+///
+/// For chunks served from clean cache or S3, we fall back to
+/// `ptr::copy_nonoverlapping` into the bio pages (one unavoidable copy).
+async fn io_task_zc(
+    q: &UblkQueue<'_>,
+    tag: u16,
+    handler: &BlockHandler,
+    tokio_handle: &tokio::runtime::Handle,
+) -> Result<(), UblkError> {
+    let auto_reg = sys::ublk_auto_buf_reg {
+        index: tag,
+        flags: 0,
+        reserved0: 0,
+        reserved1: 0,
+    };
+
+    // Initial fetch with auto buffer registration.
+    q.submit_io_prep_cmd(tag, BufDesc::AutoReg(auto_reg), 0, None)
+        .await?;
+
+    loop {
+        let iod = q.get_iod(tag);
+        let op = iod.op_flags & 0xff;
+        let fua = (iod.op_flags & sys::UBLK_IO_F_FUA) != 0;
+        let offset = iod.start_sector << 9;
+        let byte_len = u64::from(iod.nr_sectors) * 512;
+        debug_assert!(
+            byte_len <= u64::from(u32::MAX),
+            "nr_sectors {} exceeds u32 byte range",
+            iod.nr_sectors,
+        );
+        let length = byte_len as u32;
+
+        let result = {
             let _guard = tokio_handle.enter();
-            let needs_data = matches!(op, sys::UBLK_IO_OP_READ | sys::UBLK_IO_OP_WRITE);
-            if needs_data && length > 0 {
-                // SAFETY: The kernel guarantees `iod.addr` points to valid, mapped
-                // bio pages for the duration of this I/O request (from `get_iod` to
-                // `submit_io_commit_cmd`). The smol `LocalExecutor` never moves tasks
-                // between threads, so the pointer stays valid throughout the await.
-                let buf = unsafe {
-                    std::slice::from_raw_parts_mut(iod.addr as *mut u8, length as usize)
-                };
-                handle_io(op, offset, length, fua, buf, handler).await
-            } else {
-                handle_io(op, offset, length, fua, &mut [], handler).await
+            match op {
+                sys::UBLK_IO_OP_WRITE => {
+                    handle_write_zc(q, offset, length, fua, iod.addr, handler).await
+                }
+                sys::UBLK_IO_OP_READ => {
+                    handle_read_zc(q, offset, length, iod.addr, handler).await
+                }
+                sys::UBLK_IO_OP_FLUSH => match handler.flush() {
+                    Ok(()) => 0,
+                    Err(e) => -e.to_linux_errno(),
+                },
+                sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
+                    Ok(()) => 0,
+                    Err(e) => -e.to_linux_errno(),
+                },
+                sys::UBLK_IO_OP_WRITE_ZEROES => {
+                    match handler.write_zeroes(offset, length, fua) {
+                        Ok(()) => 0,
+                        Err(e) => -e.to_linux_errno(),
+                    }
+                }
+                _ => -libc::EINVAL,
             }
-        } else {
-            dispatch_io(
-                op,
-                offset,
-                length,
-                fua,
-                buffer.as_mut().unwrap(),
-                handler,
-                tokio_handle,
-            )
-            .await
         };
 
-        // Commit result and fetch next command.
-        if zero_copy {
-            q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
-                .await?;
-        } else {
-            q.submit_io_commit_cmd(
-                tag,
-                BufDesc::Slice(buffer.as_ref().unwrap().as_slice()),
-                result,
-            )
+        q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
             .await?;
-        }
     }
+}
+
+/// Zero-copy WRITE: bio pages → io_uring Write → data file.
+///
+/// Three-phase protocol:
+/// 1. `pre_write`: mark blocks present, clear CRC32 (metadata prep)
+/// 2. io_uring Write SQE: transfer data from bio pages to data file
+/// 3. `post_write`: mark blocks dirty, append WAL entries
+///
+/// If the io_uring write fails, only phase 1 has run — blocks are marked
+/// present (not dirty) with cleared CRCs. Recovery handles this safely.
+async fn handle_write_zc(
+    q: &UblkQueue<'_>,
+    offset: u64,
+    length: u32,
+    fua: bool,
+    addr: u64,
+    handler: &BlockHandler,
+) -> i32 {
+    if length == 0 {
+        return 0;
+    }
+
+    // Phase 1: prepare metadata before data lands on disk.
+    if let Err(e) = handler.pre_write(offset, length as u64) {
+        return -e.to_linux_errno();
+    }
+
+    // Phase 2: io_uring Write from bio pages to data file.
+    // types::Fixed(1) = data file fd (registered in tgt_init at fds[1]).
+    let sqe = io_uring::opcode::Write::new(
+        io_uring::types::Fixed(DATA_FILE_FD_INDEX),
+        addr as *const u8,
+        length,
+    )
+    .offset(offset)
+    .build()
+    .flags(io_uring::squeue::Flags::FIXED_FILE);
+
+    let cqe_result = q.ublk_submit_sqe(sqe).await;
+    if cqe_result < 0 {
+        return cqe_result;
+    }
+    if cqe_result as u32 != length {
+        return -libc::EIO;
+    }
+
+    // Phase 3: commit metadata after data is on disk.
+    if let Err(e) = handler.post_write(offset, length as u64, fua) {
+        return -e.to_linux_errno();
+    }
+
+    length as i32
+}
+
+/// Zero-copy READ: data file → io_uring Read → bio pages.
+///
+/// Builds a read plan to determine each chunk's data source, then fills
+/// the bio buffer:
+/// - `LocalSsd`: io_uring Read from data file directly into bio pages (zero-copy)
+/// - `InMemory`: ptr::copy_nonoverlapping from clean cache / S3 data (one copy)
+/// - `Zero`: ptr::write_bytes
+async fn handle_read_zc(
+    q: &UblkQueue<'_>,
+    offset: u64,
+    length: u32,
+    addr: u64,
+    handler: &BlockHandler,
+) -> i32 {
+    if length == 0 {
+        return 0;
+    }
+
+    let plan = match handler.resolve_read(offset, length).await {
+        Ok(p) => p,
+        Err(e) => return -e.to_linux_errno(),
+    };
+
+    let mut dst_offset: usize = 0;
+    for entry in &plan.entries {
+        debug_assert!(
+            dst_offset + entry.slice_len <= length as usize,
+            "ReadPlan exceeds I/O length: dst_offset={dst_offset} + slice_len={} > length={length}",
+            entry.slice_len,
+        );
+        let dst_ptr = (addr as usize + dst_offset) as *mut u8;
+
+        match &entry.source {
+            ChunkSource::Zero => {
+                // SAFETY: dst_ptr points into kernel-mapped bio pages, valid for
+                // the duration of this I/O request (between get_iod and commit).
+                unsafe {
+                    std::ptr::write_bytes(dst_ptr, 0, entry.slice_len);
+                }
+            }
+            ChunkSource::LocalSsd { file_offset } => {
+                // io_uring Read from data file directly into bio pages.
+                let read_offset = file_offset + entry.slice_start as u64;
+                let sqe = io_uring::opcode::Read::new(
+                    io_uring::types::Fixed(DATA_FILE_FD_INDEX),
+                    dst_ptr,
+                    entry.slice_len as u32,
+                )
+                .offset(read_offset)
+                .build()
+                .flags(io_uring::squeue::Flags::FIXED_FILE);
+
+                let cqe_result = q.ublk_submit_sqe(sqe).await;
+                if cqe_result < 0 {
+                    return cqe_result;
+                }
+                if cqe_result as u32 != entry.slice_len as u32 {
+                    return -libc::EIO;
+                }
+            }
+            ChunkSource::InMemory(data) => {
+                // memcpy from in-memory buffer to bio pages.
+                let src = &data[entry.slice_start..entry.slice_start + entry.slice_len];
+                // SAFETY: dst_ptr points into kernel-mapped bio pages, src is valid.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, entry.slice_len);
+                }
+            }
+        }
+
+        dst_offset += entry.slice_len;
+    }
+
+    handler.trigger_readahead(offset);
+    length as i32
 }
 
 /// Dispatch a single I/O op to the BlockHandler.

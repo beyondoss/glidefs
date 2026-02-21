@@ -286,6 +286,98 @@ impl WriteCache<Active> {
         false
     }
 
+    /// Phase 1 of a two-phase write: prepare blocks before data lands on disk.
+    ///
+    /// Marks blocks as present and clears CRC32 checksums. This MUST be called
+    /// before the data write (io_uring or pwrite) to prevent prefetch races and
+    /// CRC corruption windows. See `write()` for the full invariant explanation.
+    ///
+    /// After the data write completes, call `post_write()` to finalize metadata.
+    /// If the data write fails, the pre_write changes are harmless: blocks are
+    /// marked present (not dirty) with cleared CRCs — recovery handles this.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn pre_write(&self, offset: u64, len: u64) -> Result<(), CacheError> {
+        if offset + len > self.inner.config.device_size {
+            return Err(CacheError::offset_out_of_bounds(
+                offset + len,
+                self.inner.config.device_size,
+            ));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+
+        let block_size = self.inner.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + len - 1) / block_size;
+
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                self.inner.set_present(idx);
+                self.inner.block_map_clear_crc32(idx);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Phase 2 of a two-phase write: record metadata after data is on disk.
+    ///
+    /// Marks blocks dirty, appends WAL entries, and updates the block map.
+    /// Call ONLY after the data write (io_uring or pwrite) has completed successfully.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn post_write(&self, offset: u64, len: u64) -> Result<(), CacheError> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let block_size = self.inner.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + len - 1) / block_size;
+
+        // Mark affected blocks as dirty (lock-free CAS)
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                self.inner.transition_to_dirty(idx);
+            }
+        }
+
+        // Record dirty blocks in WAL + block map with placeholder hash.
+        {
+            let mut wal = self.inner.wal.lock();
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx >= self.inner.num_blocks {
+                    continue;
+                }
+                let seq = self.inner.sequence.next();
+                self.inner.block_map_set(idx, Blake3Hash::ZERO, seq);
+                self.inner.block_map_clear_crc32(idx);
+
+                let wal_entry = WalEntryRef {
+                    name: &self.inner.export_name,
+                    chunk_index: block,
+                    hash: Blake3Hash::ZERO,
+                    sequence: seq,
+                };
+                wal.append(&wal_entry)?;
+            }
+
+            if self.inner.config.wal_sync {
+                wal.sync()?;
+            } else {
+                wal.flush_buf()?;
+            }
+        }
+
+        self.try_flatten_block_map();
+
+        tracing::debug!(start_block, end_block, "post_write: marked blocks dirty");
+        Ok(())
+    }
+
     /// Mark a range of blocks as dirty and present (lock-free).
     fn mark_range_dirty_and_present(&self, offset: u64, len: u64) {
         let block_size = self.inner.config.block_size as u64;

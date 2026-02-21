@@ -74,7 +74,8 @@
       "WebFetch(domain:lore.gnuweeb.org)",
       "WebFetch(domain:git.kernel.org)",
       "WebFetch(domain:lore.kernel.org)",
-      "Bash(gh repo:*)"
+      "Bash(gh repo:*)",
+      "Bash(rustup target add:*)"
     ]
   }
 }

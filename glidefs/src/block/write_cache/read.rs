@@ -10,6 +10,43 @@ use crate::block::state::Active;
 
 use super::{CacheError, WriteCache};
 
+/// Source of data for a single chunk in a read plan.
+///
+/// Used by the ublk zero-copy path to determine how to fill each chunk
+/// of a read request without going through an intermediate buffer.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+pub enum ChunkSource {
+    /// Block is all zeros — memset the destination.
+    Zero,
+    /// Block is on local SSD at this file offset — io_uring Read from data file.
+    LocalSsd { file_offset: u64 },
+    /// Block data already in memory (clean cache or S3 fetch) — memcpy to destination.
+    InMemory(Bytes),
+}
+
+/// One entry in a read plan: a chunk source plus the slice within that chunk
+/// needed to satisfy the original read request.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+pub struct ChunkPlanEntry {
+    pub source: ChunkSource,
+    /// Byte offset within the chunk to start copying from.
+    pub slice_start: usize,
+    /// Number of bytes to copy from this chunk.
+    pub slice_len: usize,
+}
+
+/// A fully-resolved read plan: a sequence of chunk entries that together
+/// cover the requested byte range.
+///
+/// The caller iterates `entries` in order, writing `slice_len` bytes to the
+/// destination buffer for each entry. For `LocalSsd`, submit an io_uring Read
+/// at `file_offset + slice_start`. For `InMemory`, memcpy from
+/// `data[slice_start..slice_start+slice_len]`. For `Zero`, memset.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+pub struct ReadPlan {
+    pub entries: Vec<ChunkPlanEntry>,
+}
+
 impl WriteCache<Active> {
     /// Read blocks by content hash through tiered storage.
     ///
@@ -526,5 +563,165 @@ impl WriteCache<Active> {
                 .read_exact_at(&mut buf[..valid_bytes], offset)?;
         }
         Ok(Bytes::from(buf))
+    }
+
+    /// Build a read plan for the ublk zero-copy path.
+    ///
+    /// Same resolution order as `read_v2` (block_map → clean_cache → S3 → SSD),
+    /// but instead of copying data into a `Bytes` buffer, returns a plan describing
+    /// where each chunk's data lives. The caller (io_task_zc) uses the plan to
+    /// issue io_uring ops for `LocalSsd` chunks and memcpy for `InMemory` chunks,
+    /// writing directly into the kernel-mapped bio pages.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub async fn resolve_read_plan(
+        &self,
+        offset: u64,
+        len: usize,
+        clean_cache: &dyn BlockCache,
+        pack_index: &HostPackIndex,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) -> Result<ReadPlan, CacheError> {
+        if offset + len as u64 > self.inner.config.device_size {
+            return Err(CacheError::offset_out_of_bounds(
+                offset + len as u64,
+                self.inner.config.device_size,
+            ));
+        }
+
+        if len == 0 {
+            return Ok(ReadPlan {
+                entries: Vec::new(),
+            });
+        }
+
+        let chunk_size = self.inner.config.block_size as u64;
+        let start_chunk = offset / chunk_size;
+        let end_chunk = (offset + len as u64 - 1) / chunk_size;
+        let num_chunks = (end_chunk - start_chunk + 1) as usize;
+
+        // Resolve all chunks concurrently (same pattern as read_v2).
+        let futures: Vec<_> = (start_chunk..=end_chunk)
+            .map(|chunk_idx| {
+                self.resolve_chunk_source(
+                    chunk_idx as usize,
+                    clean_cache,
+                    pack_index,
+                    content_store,
+                    Some(metrics),
+                )
+            })
+            .collect();
+        let sources = futures::future::try_join_all(futures).await?;
+
+        let mut entries = Vec::with_capacity(num_chunks);
+        for (i, source) in sources.into_iter().enumerate() {
+            let chunk_idx = start_chunk + i as u64;
+            let chunk_start_byte = chunk_idx * chunk_size;
+
+            let slice_start = if chunk_idx == start_chunk {
+                (offset - chunk_start_byte) as usize
+            } else {
+                0
+            };
+            let slice_end = if chunk_idx == end_chunk {
+                let end_byte = offset + len as u64;
+                let relative_end = (end_byte - chunk_start_byte) as usize;
+                std::cmp::min(relative_end, self.inner.config.block_size)
+            } else {
+                self.inner.config.block_size
+            };
+
+            entries.push(ChunkPlanEntry {
+                source,
+                slice_start,
+                slice_len: slice_end - slice_start,
+            });
+        }
+
+        Ok(ReadPlan { entries })
+    }
+
+    /// Resolve a single chunk to its source (zero-copy read path).
+    ///
+    /// Same decision tree as `resolve_chunk`, but returns `ChunkSource` instead
+    /// of the actual data for locally-available blocks. This lets the caller
+    /// issue io_uring ops directly to the data file fd.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    async fn resolve_chunk_source(
+        &self,
+        chunk_index: usize,
+        clean_cache: &dyn BlockCache,
+        pack_index: &HostPackIndex,
+        content_store: &ContentStore,
+        metrics: Option<&super::super::metrics::ExportMetrics>,
+    ) -> Result<ChunkSource, CacheError> {
+        let (hash, _seq) = self.inner.block_map_get(chunk_index);
+
+        // ZERO hash on a present block means deferred hash — data is on SSD.
+        if hash.is_zero() {
+            if self.inner.is_present(chunk_index) {
+                let file_offset = chunk_index as u64 * self.inner.config.block_size as u64;
+                return Ok(ChunkSource::LocalSsd { file_offset });
+            }
+            return Ok(ChunkSource::Zero);
+        }
+
+        // Explicit zero-range.
+        if hash == self.inner.zero_block_hash {
+            return Ok(ChunkSource::Zero);
+        }
+
+        // Tier 1: clean_cache (recently written or previously fetched from S3).
+        if let Some(data) = clean_cache.get(&hash).await {
+            if let Some(m) = metrics {
+                m.record_cache_hit();
+            }
+            return Ok(ChunkSource::InMemory(data));
+        }
+
+        // Tier 2: S3 range request (if block exists in a pack).
+        if let Some(pack_loc) = pack_index.get(&hash)? {
+            if let Some(m) = metrics {
+                m.record_cache_miss();
+            }
+            let fetch_start = std::time::Instant::now();
+            let compressed = match content_store
+                .get_block(pack_loc.pack_id, pack_loc.offset, pack_loc.comp_length)
+                .await
+            {
+                Ok(data) => data,
+                Err(e) => {
+                    if let Some(m) = metrics {
+                        m.record_s3_get_error();
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            let decompressed = lz4_decompress(&compressed)
+                .map_err(|e| CacheError::DecompressFailed(e.to_string()))?;
+
+            let actual_hash = blake3_128(&decompressed);
+            if actual_hash != hash {
+                return Err(CacheError::HashMismatch {
+                    expected: format!("{:?}", hash),
+                    actual: format!("{:?}", actual_hash),
+                });
+            }
+
+            if let Some(m) = metrics {
+                m.record_s3_read(compressed.len() as u64);
+                m.record_s3_fetch_latency(fetch_start.elapsed());
+            }
+
+            let data = Bytes::from(decompressed);
+            clean_cache.insert(hash, data.clone());
+            return Ok(ChunkSource::InMemory(data));
+        }
+
+        // Tier 3: SSD pread fallback — dirty block not yet in S3.
+        let file_offset = chunk_index as u64 * self.inner.config.block_size as u64;
+        Ok(ChunkSource::LocalSsd { file_offset })
     }
 }

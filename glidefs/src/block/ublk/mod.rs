@@ -192,11 +192,15 @@ impl UblkServer {
                 }
             };
 
-            tracing::info!(dev_id, export = %export_name, "recovering QUIESCED ublk device");
+            // Use the QUIESCED device's original queue count, not our current
+            // config — the kernel expects recovery to match the original layout.
+            let nr_queues = ctrl.dev_info().nr_hw_queues;
+
+            tracing::info!(dev_id, export = %export_name, nr_queues, "recovering QUIESCED ublk device");
             match device::UblkDevice::recover(
                 dev_id,
                 handler,
-                self.nr_queues,
+                nr_queues,
                 export_name.clone(),
                 &self.features,
             )

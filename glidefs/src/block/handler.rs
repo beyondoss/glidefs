@@ -36,6 +36,10 @@ pub struct BlockDevice {
 /// Reads use read-through caching: if a block isn't present locally,
 /// it's fetched from S3 on demand.
 ///
+/// Reject writes to new blocks when SSD utilization exceeds this ratio.
+/// Overwrites to already-present blocks are allowed (no new SSD space).
+const WRITE_REJECT_THRESHOLD: f64 = 0.95;
+
 /// Transport-agnostic: used by both NBD and ublk frontends.
 pub struct BlockHandler {
     /// The write-behind cache (must be in Active state)
@@ -291,9 +295,6 @@ impl BlockHandler {
             return Ok(());
         }
 
-        // Reject writes to new blocks when SSD is near-full.
-        // Overwrites to already-present blocks are allowed (no new SSD space).
-        const WRITE_REJECT_THRESHOLD: f64 = 0.95;
         let util = f64::from_bits(self.ssd_utilization.load(Ordering::Relaxed));
         if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, data.len()) {
             return Err(CommandError::NoSpace);
@@ -403,6 +404,135 @@ impl BlockHandler {
     /// S3 sync happens asynchronously in the background via the sync worker.
     pub fn flush(&self) -> CommandResult<()> {
         self.cache.flush().map_err(CommandError::from)
+    }
+
+    // ========================================================================
+    // ublk zero-copy bridge methods
+    // ========================================================================
+
+    /// Get the raw fd of the data file (for io_uring fixed-file registration).
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn data_file_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.cache.inner().data_file_fd()
+    }
+
+    /// Phase 1 of ublk zero-copy write: prepare metadata before io_uring write.
+    ///
+    /// Validates the request (readonly, SSD-full, bounds), then marks blocks
+    /// present and clears CRC32. Call BEFORE the io_uring write SQE.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn pre_write(&self, offset: u64, length: u64) -> CommandResult<()> {
+        if self.is_readonly() {
+            return Err(CommandError::ReadOnly);
+        }
+
+        if offset + length > self.device_size() {
+            return Err(CommandError::InvalidArgument);
+        }
+
+        if length == 0 {
+            return Ok(());
+        }
+
+        let util = f64::from_bits(self.ssd_utilization.load(Ordering::Relaxed));
+        if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, length as usize) {
+            return Err(CommandError::NoSpace);
+        }
+
+        self.cache.pre_write(offset, length)?;
+        Ok(())
+    }
+
+    /// Phase 2 of ublk zero-copy write: commit metadata after io_uring write.
+    ///
+    /// Records metrics, marks blocks dirty, appends WAL entries.
+    /// Call ONLY after the io_uring write SQE has completed successfully.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn post_write(&self, offset: u64, length: u64, fua: bool) -> CommandResult<()> {
+        if length == 0 {
+            return Ok(());
+        }
+
+        let start = Instant::now();
+
+        self.metrics.record_guest_write(length);
+        self.cache.post_write(offset, length)?;
+
+        if let Some(ref tracer) = self.write_tracer {
+            tracer.record(offset, length, super::write_trace::TraceOp::Write);
+        }
+        self.check_flush_threshold();
+
+        if fua {
+            self.flush()?;
+        }
+
+        self.metrics.record_write_latency(start.elapsed());
+        Ok(())
+    }
+
+    /// Build a read plan for the ublk zero-copy path.
+    ///
+    /// Returns a `ReadPlan` describing where each chunk's data lives,
+    /// so the caller can issue io_uring reads for local chunks and memcpy
+    /// for in-memory chunks directly into bio pages.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub async fn resolve_read(
+        &self,
+        offset: u64,
+        length: u32,
+    ) -> CommandResult<super::write_cache::ReadPlan> {
+        if offset + length as u64 > self.device_size() {
+            return Err(CommandError::InvalidArgument);
+        }
+
+        if length == 0 {
+            return Ok(super::write_cache::ReadPlan {
+                entries: Vec::new(),
+            });
+        }
+
+        self.metrics.record_guest_read(length as u64);
+
+        let plan = self
+            .cache
+            .resolve_read_plan(
+                offset,
+                length as usize,
+                self.clean_cache.as_ref(),
+                &self.pack_index,
+                &self.content_store,
+                &self.metrics,
+            )
+            .await?;
+
+        Ok(plan)
+    }
+
+    /// Trigger sequential readahead detection and prefetch.
+    ///
+    /// Extracted from the read/read_into methods so the ublk zero-copy path
+    /// can call it after completing the io_uring read.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn trigger_readahead(&self, offset: u64) {
+        let chunk_size = self.cache.block_size() as u64;
+        let chunk_idx = offset / chunk_size;
+        if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
+            let cache = Arc::clone(&self.cache);
+            let clean_cache = Arc::clone(&self.clean_cache);
+            let pack_index = Arc::clone(&self.pack_index);
+            let content_store = Arc::clone(&self.content_store);
+            tokio::spawn(async move {
+                let _ = cache
+                    .prefetch_chunk(
+                        readahead_chunk as usize,
+                        clean_cache.as_ref(),
+                        &pack_index,
+                        &content_store,
+                    )
+                    .await;
+            });
+        }
     }
 }
 
