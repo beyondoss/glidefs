@@ -121,11 +121,15 @@ impl UblkServer {
         }
 
         // Collect candidate device IDs.
-        let candidates = std::cell::RefCell::new(Vec::<i32>::new());
-        libublk::ctrl::UblkCtrl::for_each_dev_id(|dev_id| {
-            candidates.borrow_mut().push(dev_id as i32);
+        let candidates = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+        let c = std::sync::Arc::clone(&candidates);
+        libublk::ctrl::UblkCtrl::for_each_dev_id(move |dev_id| {
+            c.lock().unwrap().push(dev_id as i32);
         });
-        let candidates = candidates.into_inner();
+        let candidates = std::sync::Arc::try_unwrap(candidates)
+            .unwrap()
+            .into_inner()
+            .unwrap();
 
         if candidates.is_empty() {
             return 0;
