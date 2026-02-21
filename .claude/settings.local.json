@@ -68,7 +68,12 @@
       "WebFetch(domain:people.redhat.com)",
       "Skill(architecture-doc)",
       "Bash(RUSTFLAGS=\"\" cargo metadata:*)",
-      "WebFetch(domain:www.kernel.org)"
+      "WebFetch(domain:www.kernel.org)",
+      "WebFetch(domain:users.rust-lang.org)",
+      "WebFetch(domain:elixir.bootlin.com)",
+      "WebFetch(domain:lore.gnuweeb.org)",
+      "WebFetch(domain:git.kernel.org)",
+      "WebFetch(domain:lore.kernel.org)"
     ]
   }
 }

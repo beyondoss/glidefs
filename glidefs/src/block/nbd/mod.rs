@@ -23,7 +23,7 @@ use crate::block::protocol::TRANSMISSION_FLAGS;
 use crate::block::router::ExportRouter;
 use crate::block::server::handle_client_stream;
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixStream;
@@ -202,8 +202,11 @@ impl NbdDeviceManager {
             ));
         }
 
-        // Extract the raw fd before tokio drops it. The kernel takes ownership.
-        let client_fd = client_stream.as_raw_fd();
+        // Convert to std stream now so into_raw_fd() can't fail after the
+        // kernel takes ownership. If the netlink call fails below, std_stream
+        // drops normally and closes the fd (correct — kernel rejected it).
+        let std_stream = client_stream.into_std()?;
+        let client_fd = std_stream.as_raw_fd();
 
         let dev_index = if let Some(index) = existing_index {
             // Hot reload: reconfigure existing device with new socket fd.
@@ -229,10 +232,9 @@ impl NbdDeviceManager {
             .await??
         };
 
-        // The kernel now owns the client_fd. We must not close it.
-        // Leak it from the UnixStream so Drop doesn't close it.
-        let std_stream = client_stream.into_std()?;
-        std::mem::forget(std_stream);
+        // The kernel now owns the client_fd. Release ownership so Drop
+        // doesn't close it.
+        let _ = std_stream.into_raw_fd();
 
         let dev_path = PathBuf::from(format!("/dev/nbd{dev_index}"));
         info!(
@@ -309,11 +311,20 @@ impl NbdDeviceManager {
             info!(export = %name, index = device.dev_index, "shutting down nbd kernel device");
 
             let index = device.dev_index;
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || netlink::disconnect(index)).await
-            {
-                failed.push(format!("{name}: {e}"));
-                continue;
+            match tokio::task::spawn_blocking(move || netlink::disconnect(index)).await {
+                Err(e) => {
+                    failed.push(format!("{name}: task join failed: {e}"));
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        export = %name,
+                        index,
+                        error = %e,
+                        "nbd netlink disconnect failed during shutdown (device may already be gone)"
+                    );
+                }
+                Ok(Ok(())) => {}
             }
 
             device.shutdown.cancel();
