@@ -93,12 +93,14 @@ pub enum RouterError {
     },
 }
 
-/// Information about an export for NBD protocol.
+/// Information about an export.
 #[derive(Clone, Debug)]
 pub struct ExportInfo {
     pub name: String,
     pub size: u64,
     pub readonly: bool,
+    pub transport: String,
+    pub device: Option<PathBuf>,
 }
 
 /// Readiness check result for health endpoint.
@@ -127,6 +129,8 @@ pub struct ExportState {
     pub metrics: Arc<ExportMetrics>,
     /// Original s3_prefix from ExportConfig (None = use export name).
     pub s3_prefix: Option<String>,
+    /// Transport type: "nbd" or "ublk".
+    pub transport: String,
     flush_shutdown_tx: watch::Sender<bool>,
     flush_handle: JoinHandle<()>,
 }
@@ -187,6 +191,13 @@ pub struct RouterConfig {
     pub max_s3_downloads: usize,
     /// Default blocks per pack for new exports (from NbdConfig).
     pub default_blocks_per_pack: usize,
+    /// Number of ublk I/O queues per device (Linux + ublk feature only).
+    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    pub ublk_nr_queues: u16,
+    /// Dead connection timeout for NBD netlink devices (seconds).
+    /// Enables kernel-side I/O queueing during restarts. 0 = disabled.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub nbd_dead_conn_timeout: u32,
 }
 
 /// Multi-tenant export router.
@@ -235,6 +246,14 @@ pub struct ExportRouter {
     /// SSD utilization ratio (0.0–1.0), updated by capacity monitor.
     /// Shared with BlockHandler instances for write rejection at high utilization.
     ssd_utilization: Arc<AtomicU64>, // f64 bits via to_bits()/from_bits()
+
+    /// NBD kernel device manager (Linux only).
+    #[cfg(target_os = "linux")]
+    nbd_devices: tokio::sync::Mutex<crate::block::nbd::NbdDeviceManager>,
+
+    /// ublk device manager (Linux + ublk feature only).
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    ublk_server: tokio::sync::Mutex<crate::block::ublk::UblkServer>,
 }
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
@@ -281,6 +300,19 @@ impl ExportRouter {
                 .map_err(|e| RouterError::Io(std::io::Error::other(e)))?,
         );
 
+        // Build device managers before moving config.cache_dir.
+        #[cfg(target_os = "linux")]
+        let nbd_devices = tokio::sync::Mutex::new(
+            crate::block::nbd::NbdDeviceManager::new()
+                .with_cache_dir(config.cache_dir.clone())
+                .with_dead_conn_timeout(config.nbd_dead_conn_timeout),
+        );
+        #[cfg(all(target_os = "linux", feature = "ublk"))]
+        let ublk_server = tokio::sync::Mutex::new(
+            crate::block::ublk::UblkServer::new()
+                .with_nr_queues(config.ublk_nr_queues),
+        );
+
         Ok(Self {
             exports: RwLock::new(HashMap::new()),
             object_store: config.object_store,
@@ -296,6 +328,10 @@ impl ExportRouter {
             upload_semaphore,
             download_semaphore,
             ssd_utilization: Arc::new(AtomicU64::new(0f64.to_bits())),
+            #[cfg(target_os = "linux")]
+            nbd_devices,
+            #[cfg(all(target_os = "linux", feature = "ublk"))]
+            ublk_server,
         })
     }
 
@@ -751,6 +787,7 @@ impl ExportRouter {
         });
 
         // Store export state
+        let transport = config.transport().to_string();
         let state = ExportState {
             handler,
             cache,
@@ -759,6 +796,7 @@ impl ExportRouter {
             readonly,
             metrics,
             s3_prefix: orig_s3_prefix,
+            transport: transport.clone(),
             flush_shutdown_tx,
             flush_handle,
         };
@@ -777,11 +815,13 @@ impl ExportRouter {
             return Ok(());
         }
         exports.insert(name.clone(), state);
+        drop(exports); // Release write lock before device registration
 
         info!(
             "Export '{}' created successfully (readonly={})",
             name, readonly
         );
+
         Ok(())
     }
 
@@ -829,20 +869,162 @@ impl ExportRouter {
     /// List all exports.
     pub async fn list_exports(&self) -> Vec<ExportInfo> {
         let exports = self.exports.read().await;
-        exports
+        let mut result: Vec<ExportInfo> = exports
             .iter()
             .map(|(name, state)| ExportInfo {
                 name: name.clone(),
                 size: state.handler.device_size(),
                 readonly: state.readonly,
+                transport: state.transport.clone(),
+                device: None,
             })
-            .collect()
+            .collect();
+        drop(exports);
+
+        // Populate device paths from device managers.
+        for info in &mut result {
+            info.device = self.get_device_path(&info.name).await;
+        }
+
+        result
     }
 
     /// Get export names.
     pub async fn list_export_names(&self) -> Vec<String> {
         let exports = self.exports.read().await;
         exports.keys().cloned().collect()
+    }
+
+    // --- Device management (unified across transports) ---
+
+    /// Register a kernel block device for an export.
+    /// Dispatches to NBD netlink or ublk based on transport.
+    /// Call after `create_export` succeeds. No-op for unknown transports.
+    #[cfg(target_os = "linux")]
+    pub async fn register_device(
+        self: &Arc<Self>,
+        name: &str,
+        transport: &str,
+    ) -> Result<(), RouterError> {
+        match transport {
+            "nbd" => {
+                let size = self
+                    .get_handler(name)
+                    .await
+                    .map(|h| h.device_size())
+                    .unwrap_or(0);
+                let mut nbd = self.nbd_devices.lock().await;
+                let path = nbd
+                    .add_device(name, Arc::clone(self), size)
+                    .await
+                    .map_err(|e| RouterError::Io(std::io::Error::other(e)))?;
+                info!(export = %name, path = %path.display(), "nbd device registered");
+                Ok(())
+            }
+            #[cfg(feature = "ublk")]
+            "ublk" => {
+                let handler = self
+                    .get_handler(name)
+                    .await
+                    .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+                let mut ublk = self.ublk_server.lock().await;
+                let path = ublk
+                    .add_device(name, handler)
+                    .await
+                    .map_err(|e| RouterError::Io(std::io::Error::other(e)))?;
+                info!(export = %name, path = %path.display(), "ublk device registered");
+                Ok(())
+            }
+            _ => Ok(()), // unknown transport, no device to register
+        }
+    }
+
+    /// Remove a kernel block device for an export (idempotent).
+    #[cfg(target_os = "linux")]
+    async fn remove_device(&self, name: &str, transport: &str) -> Result<(), RouterError> {
+        match transport {
+            "nbd" => {
+                let mut nbd = self.nbd_devices.lock().await;
+                nbd.remove_device(name)
+                    .await
+                    .map_err(|e| RouterError::Io(std::io::Error::other(e)))
+            }
+            #[cfg(feature = "ublk")]
+            "ublk" => {
+                let mut ublk = self.ublk_server.lock().await;
+                ublk.remove_device(name)
+                    .await
+                    .map_err(|e| RouterError::Io(std::io::Error::other(e)))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Get the device path for an export, if a kernel device is registered.
+    pub async fn get_device_path(&self, name: &str) -> Option<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            // Check NBD first
+            {
+                let nbd = self.nbd_devices.lock().await;
+                if let Some(path) = nbd.get_device_path(name) {
+                    return Some(path.to_path_buf());
+                }
+            }
+            // Check ublk
+            #[cfg(feature = "ublk")]
+            {
+                let ublk = self.ublk_server.lock().await;
+                if let Some(path) = ublk.get_device_path(name) {
+                    return Some(path.to_path_buf());
+                }
+            }
+        }
+        let _ = name;
+        None
+    }
+
+    /// Shutdown all device managers (full shutdown — disconnects kernel devices).
+    ///
+    /// For hot reload, do NOT call this. Let the process exit so devices stay
+    /// alive and the new process can reconfigure them.
+    pub async fn shutdown_devices(&self) -> Result<(), RouterError> {
+        #[cfg(target_os = "linux")]
+        {
+            info!("Shutting down NBD kernel devices...");
+            let nbd = {
+                let mut guard = self.nbd_devices.lock().await;
+                let replacement = crate::block::nbd::NbdDeviceManager::new()
+                    .with_cache_dir(self.cache_dir.clone());
+                std::mem::replace(&mut *guard, replacement)
+            };
+            if let Err(e) = nbd.shutdown().await {
+                warn!("NBD device shutdown failed: {}", e);
+            }
+
+            #[cfg(feature = "ublk")]
+            {
+                info!("Shutting down ublk devices...");
+                let ublk = {
+                    let mut guard = self.ublk_server.lock().await;
+                    std::mem::replace(&mut *guard, crate::block::ublk::UblkServer::new())
+                };
+                if let Err(e) = ublk.shutdown().await {
+                    warn!("ublk device shutdown failed: {}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if a transport is available on this build/platform.
+    #[allow(dead_code)] // Used by API layer (api.rs)
+    pub fn device_available(transport: &str) -> bool {
+        match transport {
+            "nbd" => cfg!(target_os = "linux"),
+            "ublk" => cfg!(all(target_os = "linux", feature = "ublk")),
+            _ => false,
+        }
     }
 
     /// Check readiness: exports exist, cache writable, and S3 reachable.
@@ -969,7 +1151,7 @@ impl ExportRouter {
     pub async fn resize_export(&self, name: &str, new_size_gb: f64) -> Result<(), RouterError> {
         validate_export_name(name)?;
         // Get current export info
-        let (current_size, readonly, block_size, orig_s3_prefix) = {
+        let (current_size, readonly, block_size, orig_s3_prefix, transport) = {
             let exports = self.exports.read().await;
             let state = exports
                 .get(name)
@@ -978,7 +1160,8 @@ impl ExportRouter {
             let readonly = state.readonly;
             let block_size = state.cache.block_size();
             let s3_prefix = state.s3_prefix.clone();
-            (current_size, readonly, block_size, s3_prefix)
+            let transport = state.transport.clone();
+            (current_size, readonly, block_size, s3_prefix, transport)
         };
 
         let new_size_bytes = (new_size_gb * 1_000_000_000.0) as u64;
@@ -1022,7 +1205,7 @@ impl ExportRouter {
             block_size: Some(block_size),
             blocks_per_pack: None,
             flush_mode: None,
-            transport: None,
+            transport: Some(transport),
         };
 
         self.create_export(config.clone(), readonly, Some(name))
@@ -1060,6 +1243,15 @@ impl ExportRouter {
         };
 
         info!("Removing export '{}'...", name);
+
+        // Remove kernel block device before teardown.
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(e) = self.remove_device(name, &state.transport).await {
+                warn!(export = %name, error = %e, "device removal failed (continuing teardown)");
+            }
+        }
+
         let remaining = Self::teardown_export(name, state).await;
 
         // Prune pack index entries no longer referenced by any active export.
@@ -1101,6 +1293,10 @@ impl ExportRouter {
     /// remaining after drain attempts, indicating potential data loss.
     pub async fn shutdown(&self) -> Result<(), RouterError> {
         info!("Shutting down all exports...");
+
+        // NOTE: Does NOT disconnect kernel block devices. For hot reload,
+        // NBD devices must stay alive so the new process can reconfigure them.
+        // Caller is responsible for shutdown_devices() when full teardown is needed.
 
         // Take ownership of all exports
         let mut exports = self.exports.write().await;
@@ -1230,6 +1426,8 @@ impl ExportRouter {
             max_s3_uploads: 0,
             max_s3_downloads: 0,
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
         })
         .expect("failed to create test router")
     }
@@ -1270,6 +1468,8 @@ mod tests {
             max_s3_uploads: 0,
             max_s3_downloads: 0,
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
         })
         .expect("failed to create test router")
     }
@@ -2436,5 +2636,87 @@ mod tests {
             500,
             "falls back to global default"
         );
+    }
+
+    // =========================================================================
+    // Device management / transport tests
+    // =========================================================================
+
+    #[test]
+    fn test_device_available_on_current_platform() {
+        // On macOS: no kernel device support
+        // On Linux: NBD available, ublk depends on feature flag
+        if cfg!(target_os = "linux") {
+            assert!(ExportRouter::device_available("nbd"));
+        } else {
+            assert!(!ExportRouter::device_available("nbd"));
+        }
+
+        if cfg!(all(target_os = "linux", feature = "ublk")) {
+            assert!(ExportRouter::device_available("ublk"));
+        } else {
+            assert!(!ExportRouter::device_available("ublk"));
+        }
+
+        // Invalid transport is never available
+        assert!(!ExportRouter::device_available("scsi"));
+        assert!(!ExportRouter::device_available(""));
+    }
+
+    #[tokio::test]
+    async fn test_get_device_path_returns_none_without_registration() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+        router
+            .create_export(test_export_config("vol1"), false, None)
+            .await
+            .unwrap();
+
+        // Without explicit device registration, get_device_path returns None.
+        assert!(router.get_device_path("vol1").await.is_none());
+        assert!(router.get_device_path("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_export_transport_defaults_to_nbd() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+        router
+            .create_export(test_export_config("vol1"), false, None)
+            .await
+            .unwrap();
+
+        let exports = router.list_exports().await;
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].transport, "nbd");
+        assert!(exports[0].device.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_export_transport_preserved_through_resize() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Create export with explicit transport
+        let mut config = test_export_config("vol1");
+        config.transport = Some("nbd".to_string());
+        router.create_export(config, false, None).await.unwrap();
+
+        // Resize (internally removes + recreates)
+        router.resize_export("vol1", 0.02).await.unwrap();
+
+        // Transport should be preserved
+        let exports = router.list_exports().await;
+        assert_eq!(exports[0].transport, "nbd");
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_devices_is_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Shutdown devices with nothing registered — should be a no-op
+        router.shutdown_devices().await.unwrap();
+        router.shutdown_devices().await.unwrap();
     }
 }

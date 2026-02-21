@@ -9,7 +9,7 @@ use crate::block::handler::BlockHandler;
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::helpers::IoBuf;
 use libublk::io::{UblkDev, UblkQueue};
-use libublk::{BufDesc, UblkError, UblkFlags};
+use libublk::{sys, BufDesc, UblkError, UblkFlags};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use parking_lot::{Condvar, Mutex};
@@ -24,6 +24,53 @@ const IO_BUF_BYTES: u32 = 512 * 1024;
 
 /// io_uring idle timeout in seconds. Controls worst-case latency from `kill_dev()` to queue exit.
 const URING_IDLE_SECS: u64 = 20;
+
+// ---------------------------------------------------------------------------
+// Kernel feature detection
+// ---------------------------------------------------------------------------
+
+/// Kernel ublk capabilities detected at startup.
+#[derive(Debug, Clone)]
+pub(crate) struct KernelFeatures {
+    /// `UBLK_F_USER_RECOVERY` — device survives daemon crash in QUIESCED state.
+    pub recovery: bool,
+    /// `UBLK_F_SUPPORT_ZERO_COPY` + `UBLK_F_AUTO_BUF_REG` — DMA-mapped buffers,
+    /// no kernel↔userspace memcpy.
+    pub zero_copy: bool,
+}
+
+/// Probe the running kernel for supported ublk feature flags.
+///
+/// Returns conservative defaults (all false) on pre-6.5 kernels where
+/// `get_features()` is unavailable.
+pub(crate) fn detect_features() -> KernelFeatures {
+    let raw = UblkCtrl::get_features().unwrap_or(0);
+    let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
+    let zero_copy = (raw & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
+        && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
+
+    tracing::info!(
+        recovery,
+        zero_copy,
+        raw_features = format!("{raw:#x}"),
+        "ublk kernel feature detection"
+    );
+
+    KernelFeatures { recovery, zero_copy }
+}
+
+// ---------------------------------------------------------------------------
+// Device mode
+// ---------------------------------------------------------------------------
+
+/// Whether to create a fresh device or recover a QUIESCED one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum DeviceMode {
+    /// Allocate a new device ID.
+    Add,
+    /// Recover a QUIESCED device with a known ID.
+    Recover { dev_id: i32 },
+}
 
 /// A registered ublk block device.
 ///
@@ -47,9 +94,47 @@ impl UblkDevice {
         handler: Arc<BlockHandler>,
         nr_queues: u16,
         export_name: String,
+        features: &KernelFeatures,
+    ) -> anyhow::Result<Self> {
+        Self::start_worker(handler, nr_queues, export_name, DeviceMode::Add, features).await
+    }
+
+    /// Recover a QUIESCED ublk device after a daemon crash.
+    ///
+    /// Sends `START_USER_RECOVERY`, then re-runs the I/O loop with
+    /// `UBLK_DEV_F_RECOVER_DEV`. The kernel replays in-flight I/Os via
+    /// `UBLK_F_USER_RECOVERY_REISSUE` (safe — our write cache is idempotent).
+    pub async fn recover(
+        dev_id: i32,
+        handler: Arc<BlockHandler>,
+        nr_queues: u16,
+        export_name: String,
+        features: &KernelFeatures,
+    ) -> anyhow::Result<Self> {
+        // Control-plane: tell the kernel we're taking over.
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let ctrl = UblkCtrl::new_simple(dev_id)
+                .map_err(|e| anyhow::anyhow!("UblkCtrl::new_simple({dev_id}) failed: {e}"))?;
+            ctrl.start_user_recover()
+                .map_err(|e| anyhow::anyhow!("start_user_recover({dev_id}) failed: {e}"))?;
+            Ok(())
+        })
+        .await??;
+
+        Self::start_worker(handler, nr_queues, export_name, DeviceMode::Recover { dev_id }, features).await
+    }
+
+    /// Shared helper: spawn the worker thread running `run_device`.
+    async fn start_worker(
+        handler: Arc<BlockHandler>,
+        nr_queues: u16,
+        export_name: String,
+        mode: DeviceMode,
+        features: &KernelFeatures,
     ) -> anyhow::Result<Self> {
         let dev_size = handler.device_size();
         let tokio_handle = tokio::runtime::Handle::current();
+        let features = features.clone();
 
         // The worker thread signals back the dev_id + path once the device is started,
         // or an error if setup fails.
@@ -59,7 +144,7 @@ impl UblkDevice {
         let worker = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                run_device(dev_size, nr_queues, handler, tokio_handle, ready_tx)
+                run_device(dev_size, nr_queues, handler, tokio_handle, ready_tx, export_name, mode, &features)
             })?;
 
         // Wait for device to be ready (or error during setup).
@@ -234,14 +319,38 @@ fn run_device(
     handler: Arc<BlockHandler>,
     tokio_handle: tokio::runtime::Handle,
     ready_tx: tokio::sync::oneshot::Sender<anyhow::Result<(i32, String)>>,
+    export_name: String,
+    mode: DeviceMode,
+    features: &KernelFeatures,
 ) -> anyhow::Result<()> {
+    // Compute device + kernel feature flags from mode + features.
+    let dev_flags = match mode {
+        DeviceMode::Add => UblkFlags::UBLK_DEV_F_ADD_DEV,
+        DeviceMode::Recover { .. } => UblkFlags::UBLK_DEV_F_RECOVER_DEV,
+    };
+    let dev_id: i32 = match mode {
+        DeviceMode::Add => -1,
+        DeviceMode::Recover { dev_id } => dev_id,
+    };
+
+    let mut ctrl_flags: u64 = 0;
+    if features.recovery {
+        ctrl_flags |=
+            sys::UBLK_F_USER_RECOVERY as u64 | sys::UBLK_F_USER_RECOVERY_REISSUE as u64;
+    }
+    if features.zero_copy {
+        ctrl_flags |=
+            sys::UBLK_F_SUPPORT_ZERO_COPY as u64 | sys::UBLK_F_AUTO_BUF_REG as u64;
+    }
+
     let ctrl = match UblkCtrlBuilder::default()
         .name("glidefs")
-        .id(-1_i32)
+        .id(dev_id)
         .nr_queues(nr_queues)
         .depth(QUEUE_DEPTH)
         .io_buf_bytes(IO_BUF_BYTES)
-        .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+        .dev_flags(dev_flags)
+        .ctrl_flags(ctrl_flags)
         .build()
     {
         Ok(c) => c,
@@ -252,15 +361,16 @@ fn run_device(
         }
     };
 
-    // Target init: set device size and block parameters.
+    // Target init: set device size, block parameters, and export metadata.
     let tgt_init = move |dev: &mut UblkDev| {
         dev.tgt.dev_size = dev_size;
-        dev.tgt.params = libublk::sys::ublk_params {
-            types: libublk::sys::UBLK_PARAM_TYPE_BASIC | libublk::sys::UBLK_PARAM_TYPE_DISCARD,
-            basic: libublk::sys::ublk_param_basic {
+        dev.set_target_json(serde_json::json!({ "export_name": export_name }));
+        dev.tgt.params = sys::ublk_params {
+            types: sys::UBLK_PARAM_TYPE_BASIC | sys::UBLK_PARAM_TYPE_DISCARD,
+            basic: sys::ublk_param_basic {
                 // Volatile cache + FUA: writes land in local SSD cache,
                 // FUA forces an fdatasync before returning.
-                attrs: libublk::sys::UBLK_ATTR_VOLATILE_CACHE | libublk::sys::UBLK_ATTR_FUA,
+                attrs: sys::UBLK_ATTR_VOLATILE_CACHE | sys::UBLK_ATTR_FUA,
                 logical_bs_shift: 9,   // 512 bytes (standard sector)
                 physical_bs_shift: 17, // 128KB (our block size)
                 io_opt_shift: 17,      // 128KB optimal I/O
@@ -269,7 +379,7 @@ fn run_device(
                 dev_sectors: dev_size >> 9,
                 ..Default::default()
             },
-            discard: libublk::sys::ublk_param_discard {
+            discard: sys::ublk_param_discard {
                 discard_alignment: 0,
                 discard_granularity: 4096,
                 max_discard_sectors: 1 << 15, // 16MB

@@ -104,6 +104,8 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             max_s3_uploads: nbd_config.max_s3_uploads(),
             max_s3_downloads: nbd_config.max_s3_downloads(),
             default_blocks_per_pack: nbd_config.blocks_per_pack(),
+            ublk_nr_queues: nbd_config.ublk_nr_queues(),
+            nbd_dead_conn_timeout: nbd_config.nbd_dead_conn_timeout(),
         })
         .context("Failed to initialize export router")?,
     );
@@ -121,8 +123,15 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                     let router = Arc::clone(&router);
                     async move {
                         let name = config.name.clone();
+                        let transport = config.transport().to_string();
                         match router.create_export(config, false, None).await {
                             Ok(()) => {
+                                // Register kernel block device on Linux.
+                                #[cfg(target_os = "linux")]
+                                if let Err(e) = router.register_device(&name, &transport).await {
+                                    warn!("Failed to register device for '{}': {}", name, e);
+                                }
+                                let _ = &transport; // suppress unused on non-Linux
                                 info!("Restored export '{}'", name);
                                 1
                             }
@@ -164,6 +173,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                 let router = Arc::clone(&router);
                 async move {
                     let name = config.name.clone();
+                    let transport = config.transport().to_string();
                     info!("Loading static export '{}' ({}GB)", name, config.size_gb);
                     router
                         .create_export(config.clone(), false, None)
@@ -172,6 +182,12 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                     if let Err(e) = router.save_export(&config).await {
                         warn!("Failed to persist export '{}' to S3: {}", name, e);
                     }
+                    // Register kernel block device on Linux.
+                    #[cfg(target_os = "linux")]
+                    if let Err(e) = router.register_device(&name, &transport).await {
+                        warn!("Failed to register device for '{}': {}", name, e);
+                    }
+                    let _ = &transport; // suppress unused on non-Linux
                     Ok(())
                 }
             })
@@ -184,34 +200,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             return Err(first);
         }
     }
-
-    // Start ublk devices for exports that request it
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
-    let ublk_server = {
-        let mut server = crate::block::ublk::UblkServer::new(Arc::clone(&router));
-        if let Some(ref ublk_config) = settings.servers.ublk {
-            server = server.with_nr_queues(ublk_config.nr_queues());
-        }
-
-        for export in router.list_exports().await {
-            // Check if this export's config requests ublk transport.
-            // Discovered exports use the default (nbd) unless overridden.
-            let uses_ublk = nbd_config
-                .exports
-                .iter()
-                .find(|c| c.name == export.name)
-                .is_some_and(|c| c.transport() == "ublk");
-
-            if uses_ublk {
-                let path = server
-                    .add_device(&export.name)
-                    .await
-                    .with_context(|| format!("Failed to register ublk device for '{}'", export.name))?;
-                info!(export = %export.name, path = %path.display(), "ublk device registered");
-            }
-        }
-        server
-    };
 
     let mut handles = Vec::new();
 
@@ -296,15 +284,22 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     info!("GlideFS ready. Available exports:");
     for export in router.list_exports().await {
+        let device_info = export
+            .device
+            .as_ref()
+            .map(|p| format!(", device={}", p.display()))
+            .unwrap_or_default();
         info!(
-            "  - {} ({}GB, {})",
+            "  - {} ({}GB, {}, transport={}{})",
             export.name,
             export.size / 1_000_000_000,
             if export.readonly {
                 "readonly"
             } else {
                 "read-write"
-            }
+            },
+            export.transport,
+            device_info,
         );
     }
     info!("Send SIGUSR1 to drain all exports to S3 (for node maintenance)");
@@ -314,6 +309,11 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     let mut sigusr1 =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
 
+    // Track whether SIGUSR1 was received before shutdown.
+    // SIGUSR1 → SIGTERM = hot reload (keep NBD devices alive for NBD_CMD_RECONFIGURE).
+    // SIGTERM alone = full shutdown (disconnect all devices).
+    let mut hot_reload = false;
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -321,14 +321,19 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                 break;
             }
             _ = sigterm.recv() => {
-                info!("Received SIGTERM, initiating graceful shutdown...");
+                if hot_reload {
+                    info!("Received SIGTERM after SIGUSR1, hot reload shutdown (NBD devices stay alive)...");
+                } else {
+                    info!("Received SIGTERM, initiating full shutdown...");
+                }
                 break;
             }
             _ = sigusr1.recv() => {
-                info!("Received SIGUSR1, draining all exports to S3...");
+                info!("Received SIGUSR1, draining all exports to S3 (preparing for hot reload)...");
+                hot_reload = true;
                 let failed = router.drain_all().await;
                 if failed.is_empty() {
-                    info!("Drain complete - all exports synced to S3");
+                    info!("Drain complete - all exports synced to S3. Send SIGTERM to restart.");
                 } else {
                     tracing::error!(failed = ?failed, "Drain incomplete - {} export(s) failed", failed.len());
                 }
@@ -346,16 +351,15 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             let _ = handle.await;
         }
 
-        // Shutdown ublk devices before draining (removes /dev/ublkbN)
-        #[cfg(all(target_os = "linux", feature = "ublk"))]
-        {
-            info!("Shutting down ublk devices...");
-            if let Err(e) = ublk_server.shutdown().await {
-                tracing::error!("ublk shutdown failed: {}", e);
+        // Full shutdown: disconnect kernel devices.
+        // Hot reload: leave NBD devices alive for NBD_CMD_RECONFIGURE.
+        if !hot_reload {
+            info!("Disconnecting kernel devices...");
+            if let Err(e) = router.shutdown_devices().await {
+                warn!("device shutdown failed: {}", e);
             }
         }
 
-        // Graceful shutdown: drain all exports
         info!("Final drain before shutdown...");
         router.shutdown().await
     })

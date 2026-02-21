@@ -57,16 +57,22 @@ Supports S3, Azure Blob Storage, and GCS. Cloud credentials are configured via `
 
 ## API
 
-Exports are virtual block devices. Manage them over HTTP:
+Exports are virtual block devices. The API creates them, returns a device path, and handles teardown. The orchestrator never touches NBD or ublk directly.
 
 ```sh
-# Create a 500GB export
+# Create a 500GB export — returns device path
 curl -X PUT localhost:8080/api/exports/my-vm \
   -d '{"size_gb": 500}'
+# → {"name":"my-vm","size_bytes":500000000000,"readonly":false,"transport":"nbd","device":"/dev/nbd0"}
 
 # Fork from an existing manifest
 curl -X PUT localhost:8080/api/exports/my-vm-fork \
   -d '{"size_gb": 500, "manifest_name": "my-vm"}'
+
+# Use ublk transport (Linux 6.0+, requires --features ublk)
+curl -X PUT localhost:8080/api/exports/my-vm \
+  -d '{"size_gb": 500, "transport": "ublk"}'
+# → {"name":"my-vm","size_bytes":500000000000,"readonly":false,"transport":"ublk","device":"/dev/ublkb0"}
 
 # Snapshot to S3
 curl -X POST localhost:8080/api/exports/my-vm/snapshot
@@ -74,16 +80,18 @@ curl -X POST localhost:8080/api/exports/my-vm/snapshot
 # Drain (flush all dirty blocks, prepare for migration)
 curl -X POST localhost:8080/api/exports/my-vm/drain
 
-# Delete
+# Delete (removes kernel device + export)
 curl -X DELETE localhost:8080/api/exports/my-vm
 ```
 
+PUT is idempotent. Same size → returns current state. Larger size → grows the export. All endpoints that modify state are idempotent.
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/exports` | GET | List exports |
-| `/api/exports/{name}` | PUT | Create or update export |
+| `/api/exports` | GET | List exports (includes transport + device path) |
+| `/api/exports/{name}` | PUT | Create or resize export (returns device path) |
 | `/api/exports/{name}` | GET | Get export info |
-| `/api/exports/{name}` | DELETE | Remove export |
+| `/api/exports/{name}` | DELETE | Remove export (removes kernel device) |
 | `/api/exports/{name}/drain` | POST | Flush to S3 for shutdown/migration |
 | `/api/exports/{name}/snapshot` | POST | Point-in-time snapshot to S3 |
 | `/api/exports/{name}/promote` | POST | Promote readonly to read-write |
@@ -141,40 +149,54 @@ cargo build --release -p glidefs --features ublk
 
 Requires `CONFIG_BLK_DEV_UBLK=y` in the host kernel. One `/dev/ublkbN` device per export — the block device appears when the export is created. No client tool needed.
 
-### Device Setup (NBD)
+### Device Setup
 
-Three ways to attach `/dev/nbdN` to the server:
-
-| Method | Kernel | Notes |
-|---|---|---|
-| `nbd-client` | Any | External dependency. `nbd-client -N myexport -u /var/run/glidefs.sock /dev/nbd0` |
-| ioctl | Any | `NBD_SET_SOCK` + `NBD_SET_SIZE` + `NBD_DO_IT`. Blocks a thread per device. No reconnect. |
-| Netlink (`NBD_GENL`) | 4.10+ | Preferred. Non-blocking, supports `NBD_CMD_RECONFIGURE` for live resize, multiple sockets per device for failover. No external tools. |
-
-Netlink is the right choice for NBD production. Create the export via HTTP API, configure the kernel device via netlink, connect over UDS — single binary, no moving parts.
-
-ublk devices need no client setup — `/dev/ublkbN` appears when the export registers and disappears when it's removed.
-
-### Binary Upgrades (Zero-Downtime)
-
-GlideFS supports binary upgrades without VM disruption when using netlink-based NBD (`NBD_GENL`). The kernel holds the socket fd and queues I/O during the restart window.
+The API handles kernel device creation automatically. `PUT /api/exports/{name}` returns a `device` path. Pass it to your hypervisor.
 
 ```
-1. Set NBD_ATTR_DEAD_CONN_TIMEOUT on device setup (e.g. 30s)
-2. SIGUSR1 → drain all exports to S3
-3. SIGTERM → graceful shutdown
-4. Start new binary (same config, same cache dir)
-5. New process recovers exports in parallel from local WAL + redb
-6. /health/ready returns 200 → all exports serving
-7. NBD_CMD_RECONFIGURE with new socket fds
-8. Kernel resumes queued I/O
+PUT /api/exports/vm-abc {"size_gb": 500}
+→ {"device": "/dev/nbd0", "transport": "nbd", ...}
+
+Orchestrator passes /dev/nbd0 to Firecracker. Done.
 ```
 
-The block device stays alive throughout. Firecracker never sees a disconnect.
+**NBD** (Linux 4.10+): GlideFS creates `/dev/nbdN` via generic netlink (`NBD_GENL`). Internal socketpair — no external `nbd-client`. The NBD protocol server still accepts external connections over Unix socket / TCP for debugging or cross-host access.
 
-Recovery is local — the new process reads WAL and redb from the same SSD, not S3. Discovery (S3) runs 32-wide parallel, export creation (local I/O) runs 16-wide parallel. No S3 writes on the recovery path. The `/health/ready` endpoint gates on all exports being loaded, cache writable, and S3 reachable.
+**ublk** (Linux 6.0+): GlideFS creates `/dev/ublkbN` via io_uring. No socket, no protocol overhead.
 
-`dead_conn_timeout` must exceed: drain time + process restart + discovery + parallel WAL recovery. 2000 exports recover in ~6 seconds. 30 seconds is conservative.
+Both transports: the orchestrator doesn't know or care which one is in use. It gets a device path from the API and passes it to the VM.
+
+### Restart Behavior
+
+On startup, GlideFS discovers exports from S3, recovers WAL + redb from local SSD, and re-registers kernel devices. Recovery is local — no S3 writes. 2000 exports recover in ~6 seconds.
+
+**NBD (zero-downtime):** The kernel queues I/O during the restart window via `dead_conn_timeout`. VMs never see a disconnect. Device paths (`/dev/nbdN`) stay the same.
+
+```
+1. SIGUSR1 → drain all exports to S3
+2. SIGTERM → graceful shutdown (NBD devices stay alive in kernel)
+3. Start new binary (same config, same cache dir)
+4. New process discovers exports, recovers from WAL + redb
+5. NBD_CMD_RECONFIGURE swaps socket fds on existing /dev/nbdN devices
+6. Kernel resumes queued I/O on new sockets
+7. /health/ready returns 200
+```
+
+`nbd_dead_conn_timeout` must exceed: drain + restart + recovery. Default 30 seconds.
+
+The orchestrator does nothing. Same device paths, same VMs, no reconnection needed.
+
+**ublk (VM restart required):** Kernel removes `/dev/ublkbN` immediately on process exit. VMs get I/O errors.
+
+```
+1. Start new binary
+2. New process discovers exports, creates new /dev/ublkbN devices
+3. /health/ready returns 200
+4. Orchestrator queries GET /api/exports → gets new device paths
+5. Orchestrator re-attaches devices to VMs (or restarts VMs)
+```
+
+**Full compute node reboot:** Everything starts fresh. Orchestrator creates exports via API, gets device paths, starts VMs.
 
 ### Database Workloads
 

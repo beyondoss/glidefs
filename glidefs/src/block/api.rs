@@ -47,15 +47,18 @@ pub struct PutExportRequest {
 }
 
 /// Response for export info.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ExportInfoResponse {
     pub name: String,
     pub size_bytes: u64,
     pub readonly: bool,
+    pub transport: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 /// Response for list exports.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListExportsResponse {
     pub exports: Vec<ExportInfoResponse>,
 }
@@ -140,6 +143,8 @@ where
                     name: e.name,
                     size_bytes: e.size,
                     readonly: e.readonly,
+                    transport: e.transport,
+                    device: e.device.map(|p| p.to_string_lossy().into_owned()),
                 })
                 .collect();
             json_response(StatusCode::OK, &ListExportsResponse { exports: responses })
@@ -218,17 +223,27 @@ where
                 ));
             }
 
-            if let Some(ref t) = put_req.transport
-                && t != "nbd"
-            {
-                return Ok(error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!(
-                        "Invalid transport '{}': only 'nbd' is supported via the API. \
-                         To use ublk, configure it in the server config file",
-                        t
-                    ),
-                ));
+            if let Some(ref t) = put_req.transport {
+                match t.as_str() {
+                    "nbd" => {}
+                    "ublk" => {
+                        if !ExportRouter::device_available("ublk") {
+                            return Ok(error_response(
+                                StatusCode::BAD_REQUEST,
+                                "Transport 'ublk' is not available on this platform/build",
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "Invalid transport '{}': must be 'nbd' or 'ublk'",
+                                t
+                            ),
+                        ));
+                    }
+                }
             }
 
             if let Some(ref prefix) = put_req.s3_prefix
@@ -254,27 +269,47 @@ where
                     if put_req.size_gb > current_size_gb {
                         // Need to grow
                         match router.resize_export(name, put_req.size_gb).await {
-                            Ok(()) => json_response(
-                                StatusCode::OK,
-                                &ApiResponse::success(format!(
-                                    "Export '{}' resized to {:.1}GB",
-                                    name, put_req.size_gb
-                                )),
-                            ),
+                            Ok(()) => {
+                                // Re-register device after resize (device was removed)
+                                let transport = export.transport.as_str();
+                                #[cfg(target_os = "linux")]
+                                if let Err(e) = router.register_device(name, transport).await {
+                                    warn!(export = %name, error = %e, "device re-registration after resize failed");
+                                }
+                                let _ = transport; // suppress unused warning on non-Linux
+                                let device = router.get_device_path(name).await;
+                                json_response(
+                                    StatusCode::OK,
+                                    &ExportInfoResponse {
+                                        name: name.to_string(),
+                                        size_bytes: (put_req.size_gb * 1_000_000_000.0) as u64,
+                                        readonly: export.readonly,
+                                        transport: export.transport,
+                                        device: device.map(|p| p.to_string_lossy().into_owned()),
+                                    },
+                                )
+                            }
                             Err(e) => {
                                 error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
                             }
                         }
                     } else {
-                        // Already at or above requested size - no-op
+                        // Already at or above requested size - return current state
                         json_response(
                             StatusCode::OK,
-                            &ApiResponse::success(format!("Export '{}' ready", name)),
+                            &ExportInfoResponse {
+                                name: export.name,
+                                size_bytes: export.size,
+                                readonly: export.readonly,
+                                transport: export.transport,
+                                device: export.device.map(|p| p.to_string_lossy().into_owned()),
+                            },
                         )
                     }
                 }
                 None => {
                     // Export doesn't exist - create it
+                    let transport = put_req.transport.as_deref().unwrap_or("nbd").to_string();
                     let config = ExportConfig {
                         name: name.to_string(),
                         size_gb: put_req.size_gb,
@@ -300,9 +335,24 @@ where
                                     e
                                 );
                             }
+
+                            // Register kernel block device on Linux.
+                            #[cfg(target_os = "linux")]
+                            if let Err(e) = router.register_device(name, &transport).await {
+                                warn!(export = %name, error = %e, "device registration failed");
+                                // Export still works via NBD protocol, just no /dev/ device.
+                            }
+
+                            let device = router.get_device_path(name).await;
                             json_response(
                                 StatusCode::CREATED,
-                                &ApiResponse::success(format!("Export '{}' created", name)),
+                                &ExportInfoResponse {
+                                    name: name.to_string(),
+                                    size_bytes: config.size_bytes(),
+                                    readonly: put_req.readonly,
+                                    transport,
+                                    device: device.map(|p| p.to_string_lossy().into_owned()),
+                                },
                             )
                         }
                         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -321,6 +371,8 @@ where
                         name: export.name,
                         size_bytes: export.size,
                         readonly: export.readonly,
+                        transport: export.transport,
+                        device: export.device.map(|p| p.to_string_lossy().into_owned()),
                     },
                 ),
                 None => error_response(
@@ -601,6 +653,8 @@ mod tests {
                 max_s3_uploads: 0,
                 max_s3_downloads: 0,
                 default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+                ublk_nr_queues: 1,
+                nbd_dead_conn_timeout: 0,
             })
             .expect("failed to create test router"),
         )
@@ -707,6 +761,14 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Response includes transport (default "nbd") and device fields.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let info: ExportInfoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info.name, "vol1");
+        assert_eq!(info.transport, "nbd");
+        // On macOS, device is None (no kernel device manager).
+        // On Linux, would be Some("/dev/nbdN").
     }
 
     #[tokio::test]
@@ -847,7 +909,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ublk_transport_rejected() {
+    async fn test_ublk_transport_unavailable_returns_400() {
+        // On macOS (test platform), ublk is never available.
+        if ExportRouter::device_available("ublk") {
+            return; // Skip on Linux+ublk builds where it would succeed.
+        }
         let temp = TempDir::new().unwrap();
         let router = create_test_router(&temp);
         let resp = request(
@@ -855,6 +921,20 @@ mod tests {
             Method::PUT,
             "/api/exports/vol1",
             Some(r#"{"size_gb": 0.01, "transport": "ublk"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_transport_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "transport": "scsi"}"#),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -957,5 +1037,84 @@ mod tests {
         let router = create_test_router(&temp);
         let resp = request(&router, Method::POST, "/api/exports/nope/snapshot", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // =========================================================================
+    // Transport / device path response tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_get_export_includes_transport_and_device() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(&router, Method::GET, "/api/exports/vol1", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let info: ExportInfoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info.name, "vol1");
+        assert_eq!(info.transport, "nbd");
+        // On macOS: no kernel device manager, so device is None.
+        // On Linux: would have a device path after registration.
+    }
+
+    #[tokio::test]
+    async fn test_list_exports_includes_transport() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(&router, Method::GET, "/api/exports", None).await;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let list: ListExportsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(list.exports.len(), 1);
+        assert_eq!(list.exports[0].transport, "nbd");
+    }
+
+    #[tokio::test]
+    async fn test_put_idempotent_returns_export_info() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+
+        // First PUT — creates
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let info: ExportInfoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info.transport, "nbd");
+
+        // Second PUT — idempotent, returns ExportInfoResponse too
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let info: ExportInfoResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info.name, "vol1");
+        assert_eq!(info.transport, "nbd");
     }
 }

@@ -171,7 +171,7 @@ impl NBDServer {
     }
 }
 
-async fn handle_client_stream<S>(
+pub(crate) async fn handle_client_stream<S>(
     stream: S,
     router: Arc<ExportRouter>,
     shutdown: CancellationToken,

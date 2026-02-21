@@ -179,6 +179,16 @@ pub struct NbdConfig {
     /// Per-export override available via exports config or API.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub blocks_per_pack: Option<usize>,
+
+    /// Number of ublk I/O queues (default: 1). Only used with transport = "ublk".
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ublk_nr_queues: Option<u16>,
+
+    /// NBD kernel device dead connection timeout in seconds (default: 30).
+    /// Controls how long the kernel queues I/O when the socket disconnects
+    /// (e.g., during a binary upgrade). Set to 0 to disable.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub nbd_dead_conn_timeout: Option<u32>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -302,6 +312,16 @@ impl NbdConfig {
     pub fn blocks_per_pack(&self) -> usize {
         self.blocks_per_pack
             .unwrap_or(crate::block::pack::DEFAULT_BLOCKS_PER_PACK)
+    }
+
+    /// Number of ublk I/O queues (default: 1).
+    pub fn ublk_nr_queues(&self) -> u16 {
+        self.ublk_nr_queues.unwrap_or(1)
+    }
+
+    /// NBD kernel device dead connection timeout in seconds (default: 30).
+    pub fn nbd_dead_conn_timeout(&self) -> u32 {
+        self.nbd_dead_conn_timeout.unwrap_or(30)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -645,6 +665,8 @@ impl Settings {
                     shutdown_timeout_secs: None,
                     max_s3_uploads: None,
                     max_s3_downloads: None,
+                    ublk_nr_queues: None,
+                    nbd_dead_conn_timeout: None,
                 }),
                 ublk: None,
             },

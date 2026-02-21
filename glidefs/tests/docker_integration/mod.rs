@@ -285,6 +285,8 @@ impl TestServer {
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
                 default_blocks_per_pack: glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK,
+                ublk_nr_queues: 1,
+                nbd_dead_conn_timeout: 0,
             })
             .expect("failed to create test router"),
         );
@@ -315,9 +317,7 @@ impl TestServer {
         #[cfg(all(target_os = "linux", feature = "ublk"))]
         let ublk = if matches!(transport, Transport::Ublk) {
             Some(UblkState {
-                server: tokio::sync::Mutex::new(glidefs::block::ublk::UblkServer::new(
-                    Arc::clone(&router),
-                )),
+                server: tokio::sync::Mutex::new(glidefs::block::ublk::UblkServer::new()),
                 dev_paths: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             })
         } else {
@@ -341,11 +341,16 @@ impl TestServer {
     pub async fn register_ublk_device(&self, name: &str) {
         #[cfg(all(target_os = "linux", feature = "ublk"))]
         if let Some(ref ublk) = self.ublk {
+            let handler = self
+                .router
+                .get_handler(name)
+                .await
+                .unwrap_or_else(|| panic!("no handler for export '{name}'"));
             let path = ublk
                 .server
                 .lock()
                 .await
-                .add_device(name)
+                .add_device(name, handler)
                 .await
                 .unwrap_or_else(|e| panic!("failed to register ublk device for '{name}': {e}"));
             ublk.dev_paths

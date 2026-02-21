@@ -23,6 +23,10 @@ pub mod wal;
 pub mod write_cache;
 pub mod write_trace;
 
+// NBD kernel device management via netlink (Linux 4.10+)
+#[cfg(target_os = "linux")]
+pub mod nbd;
+
 // ublk transport (Linux 6.0+, io_uring-based userspace block device)
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 pub mod ublk;

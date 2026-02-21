@@ -5,7 +5,7 @@
 //!
 //! # Architecture
 //!
-//! - **UblkServer** manages per-export ublk devices via `ExportRouter`
+//! - **UblkServer** manages per-export ublk devices
 //! - **UblkDevice** handles a single block device: registration, per-queue
 //!   I/O threads, and graceful teardown
 //! - I/O dispatch reuses the same `BlockHandler` interface as NBD
@@ -20,9 +20,9 @@
 
 mod device;
 
-use crate::block::router::ExportRouter;
+use crate::block::handler::BlockHandler;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Default number of I/O queues per device.
@@ -30,20 +30,18 @@ const DEFAULT_NR_QUEUES: u16 = 1;
 
 /// Manages ublk devices for exports.
 ///
-/// Each export gets its own `/dev/ublkbN` device. The router provides
+/// Each export gets its own `/dev/ublkbN` device. The caller provides
 /// `BlockHandler` instances, and each device runs per-queue I/O threads
 /// that dispatch to the handler.
 pub struct UblkServer {
-    router: Arc<ExportRouter>,
     nr_queues: u16,
     devices: HashMap<String, device::UblkDevice>,
 }
 
 impl UblkServer {
-    /// Create a new ublk server backed by the given router.
-    pub fn new(router: Arc<ExportRouter>) -> Self {
+    /// Create a new ublk server.
+    pub fn new() -> Self {
         Self {
-            router,
             nr_queues: DEFAULT_NR_QUEUES,
             devices: HashMap::new(),
         }
@@ -59,19 +57,17 @@ impl UblkServer {
     ///
     /// Returns an error if a device is already registered for this export.
     /// Call `remove_device` first to replace an existing device.
-    pub async fn add_device(&mut self, export_name: &str) -> anyhow::Result<PathBuf> {
+    pub async fn add_device(
+        &mut self,
+        export_name: &str,
+        handler: Arc<BlockHandler>,
+    ) -> anyhow::Result<PathBuf> {
         if self.devices.contains_key(export_name) {
             anyhow::bail!(
                 "ublk device for export '{}' already registered",
                 export_name
             );
         }
-
-        let handler = self
-            .router
-            .get_handler(export_name)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("export '{}' not found", export_name))?;
 
         let name = export_name.to_string();
         let device =
@@ -81,10 +77,14 @@ impl UblkServer {
         Ok(path)
     }
 
+    /// Get the device path for an export, if registered.
+    pub fn get_device_path(&self, export_name: &str) -> Option<&Path> {
+        self.devices.get(export_name).map(|d| d.dev_path())
+    }
+
     /// Remove a ublk device for an export.
     ///
     /// Idempotent: returns `Ok(())` if no device is registered for this export.
-    #[allow(dead_code)] // used in docker integration tests (resize)
     pub async fn remove_device(&mut self, export_name: &str) -> anyhow::Result<()> {
         if let Some(device) = self.devices.remove(export_name) {
             tracing::info!(export = %export_name, "removing ublk device");
