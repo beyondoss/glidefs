@@ -1189,13 +1189,9 @@ async fn handle_io(
 
 /// Dispatch an I/O command from the io_uring queue to the BlockHandler.
 ///
-/// READ ops are spawned onto the tokio runtime so that S3 fetches (reqwest →
-/// hyper → TcpStream) use tokio's native I/O driver and wakers. Without this,
-/// tokio HTTP futures polled from a non-tokio executor hang because internal
-/// waker propagation doesn't signal the QueueExecutor's eventfd.
-///
-/// Non-read ops (WRITE, FLUSH, DISCARD, WRITE_ZEROES) are purely local (SSD)
-/// and don't need tokio context.
+/// Enters the tokio runtime context so that handler methods can use
+/// `tokio::spawn` for readahead and `tokio::sync::Notify` for flush
+/// signaling.
 async fn dispatch_io(
     op: u32,
     offset: u64,
