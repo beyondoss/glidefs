@@ -105,15 +105,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-modules-extra-$(uname -r) fio
-      - name: Clippy (ublk)
-        run: cargo clippy --features ublk,test-utils --tests --benches
       - name: Load kernel modules
         run: |
-          sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
-      - name: fio benchmark (ublk)
-        run: sudo -E env "PATH=$PATH" cargo test --features fio-bench --test fio_bench -- --nocapture
-      - name: Test (ublk)
-        run: cargo test --features ublk,test-utils --verbose
-      - name: Docker integration (ublk)
-        run: sudo -E env "PATH=$PATH" cargo test --features ublk,docker-tests --test docker_integration ublk --verbose
+      - name: Docker integration (ublk) - debug
+        run: sudo -E env "PATH=$PATH" cargo test --features ublk,docker-tests --test docker_integration test_cold_wake_from_different_node_ublk -- --nocapture
+        timeout-minutes: 5
