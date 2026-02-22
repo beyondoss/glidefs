@@ -1111,7 +1111,7 @@ async fn handle_read_zc(
     let plan = match handler.resolve_read(offset, length).await {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[ublk-read] resolve_read FAILED: {e}");
+            eprintln!("[ublk-read] resolve_read FAILED: {e:?}");
             return -e.to_linux_errno();
         }
     };
