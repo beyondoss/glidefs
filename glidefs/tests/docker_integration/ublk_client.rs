@@ -68,9 +68,17 @@ impl UblkClient {
     pub async fn write_raw(&mut self, offset: u64, data: &[u8]) -> Result<u32> {
         let file = self.file.try_clone()?;
         let data = data.to_vec();
-        tokio::task::spawn_blocking(move || match file.write_all_at(&data, offset) {
-            Ok(()) => Ok(0u32),
-            Err(e) => Ok(e.raw_os_error().unwrap_or(libc::EIO) as u32),
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = file.write_all_at(&data, offset) {
+                return Ok(e.raw_os_error().unwrap_or(libc::EIO) as u32);
+            }
+            // Flush to surface block device errors (e.g., EROFS from readonly handler).
+            // Without this, writes go through the page cache and pwrite() returns
+            // success immediately — the error only surfaces during async writeback.
+            match file.sync_data() {
+                Ok(()) => Ok(0u32),
+                Err(e) => Ok(e.raw_os_error().unwrap_or(libc::EIO) as u32),
+            }
         })
         .await?
     }

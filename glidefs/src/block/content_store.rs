@@ -156,6 +156,12 @@ impl ContentStore {
     /// Returns only the compressed bytes at `[offset..offset+comp_length]` —
     /// typically ~100KB vs ~3MB for the full pack. If a download semaphore is
     /// attached, acquires a permit to bound global S3 read concurrency.
+    ///
+    /// The actual S3 HTTP call is spawned onto the tokio runtime so that
+    /// reqwest/hyper's connection drivers use tokio's native I/O reactor.
+    /// This is required when called from non-tokio executors (ublk's
+    /// QueueExecutor) — without spawning, the HTTP futures hang because
+    /// the reactor isn't driven by the calling thread.
     #[instrument(skip(self), fields(pack_id = %pack_id, offset, comp_length))]
     pub async fn get_block(
         &self,
@@ -164,17 +170,35 @@ impl ContentStore {
         comp_length: u32,
     ) -> Result<bytes::Bytes, ContentStoreError> {
         self.check_circuit()?;
-        let _permit = match &self.download_semaphore {
-            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
-            None => None,
-        };
+        let sem = self.download_semaphore.clone();
+        let store = Arc::clone(&self.object_store);
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
         let path = ObjectPath::from(key);
         let start = offset as u64;
         let end = start + comp_length as u64;
-        let result = self.object_store.get_range(&path, start..end).await;
-        self.record_s3_result(&result);
-        Ok(result?)
+        let s3_result = tokio::spawn(async move {
+            let _permit = match &sem {
+                Some(s) => Some(
+                    s.acquire()
+                        .await
+                        .map_err(|_| object_store::Error::Generic {
+                            store: "semaphore",
+                            source: "download semaphore closed".into(),
+                        })?,
+                ),
+                None => None,
+            };
+            store.get_range(&path, start..end).await
+        })
+        .await
+        .map_err(|e| {
+            ContentStoreError::ObjectStore(object_store::Error::Generic {
+                store: "tokio-spawn",
+                source: Box::new(e),
+            })
+        })?;
+        self.record_s3_result(&s3_result);
+        Ok(s3_result?)
     }
 
     /// Stream a pack from S3 as an async byte stream.

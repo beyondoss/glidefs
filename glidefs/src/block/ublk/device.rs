@@ -6,14 +6,20 @@
 
 use anyhow::Context as _;
 use crate::block::handler::BlockHandler;
-use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
-use libublk::helpers::IoBuf;
-use libublk::io::{UblkDev, UblkQueue};
-use libublk::{sys, BufDesc, UblkError, UblkFlags};
+use ublk_core::ctrl::{UblkCtrl, UblkCtrlBuilder};
+use ublk_core::helpers::IoBuf;
+use ublk_core::io::{UblkDev, UblkQueue};
+use ublk_core::{sys, BufDesc, UblkError, UblkFlags};
+use std::cell::{Cell, UnsafeCell};
+use std::future::Future;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::rc::Rc;
-use parking_lot::{Condvar, Mutex};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context as TaskContext, Poll, Wake, Waker};
+use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::block::write_cache::ChunkSource;
@@ -25,11 +31,15 @@ const QUEUE_DEPTH: u16 = 128;
 const IO_BUF_BYTES: u32 = 512 * 1024;
 
 /// io_uring idle timeout in seconds. Controls worst-case latency from `kill_dev()` to queue exit.
-const URING_IDLE_SECS: u64 = 20;
+///
+/// When a queue has no inflight I/O, the thread blocks in `io_uring_enter()` for up to this
+/// duration. Lower = faster shutdown of idle devices; the idle wakeup cost is negligible
+/// (3 atomic swaps + Cell check).
+const URING_IDLE_SECS: u64 = 2;
 
 /// io_uring fixed-file index for the data file.
 ///
-/// libublk auto-registers `fds[0]` as the ublk control device fd. We register
+/// ublk_core auto-registers `fds[0]` as the ublk control device fd. We register
 /// the data file at `fds[1]` in `tgt_init`, so io_uring Read/Write ops use
 /// `types::Fixed(DATA_FILE_FD_INDEX)` with `Flags::FIXED_FILE`.
 const DATA_FILE_FD_INDEX: u32 = 1;
@@ -317,6 +327,277 @@ impl QueueLatch {
     }
 }
 
+// ---------------------------------------------------------------------------
+// eventfd + QueueExecutor (cross-thread wakeup for tokio → io_uring)
+// ---------------------------------------------------------------------------
+//
+// Problem: tasks awaiting tokio futures (e.g., S3 fetches) get stuck when
+// `io_uring_enter()` blocks the queue thread. When tokio completes a future
+// on its worker thread and calls `wake()`, the executor must unblock
+// `io_uring_enter()` to poll the woken task.
+//
+// Fix: QueueExecutor — a minimal single-threaded executor where EVERY waker
+// writes to an eventfd. The eventfd is registered with io_uring via PollAdd,
+// so any wake() from any source (tokio, io_uring CQE, internal) generates a
+// CQE that unblocks io_uring_enter(). No wrapper or combined waker needed —
+// the eventfd signal is baked into every waker by construction.
+
+/// Wrapper around Linux `eventfd(2)` for cross-thread signaling.
+struct EventFd(RawFd);
+
+impl EventFd {
+    fn new() -> std::io::Result<Self> {
+        // SAFETY: eventfd is a well-defined Linux syscall.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(fd))
+    }
+
+    fn fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+impl Drop for EventFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
+/// Write 1 to an eventfd, waking any io_uring PollAdd watching it.
+///
+/// Called from tokio worker threads via the QueueExecutor waker. The write is
+/// non-blocking (`EFD_NONBLOCK`); failure is silently ignored since it
+/// only means the eventfd counter is already at u64::MAX (practically
+/// impossible).
+fn signal_eventfd(fd: RawFd) {
+    let val: u64 = 1;
+    unsafe {
+        libc::write(fd, &val as *const u64 as *const libc::c_void, 8);
+    }
+}
+
+/// Drain accumulated eventfd signals (non-blocking read).
+fn drain_eventfd(fd: RawFd) {
+    let mut val: u64 = 0;
+    unsafe {
+        libc::read(fd, &mut val as *mut u64 as *mut libc::c_void, 8);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// QueueExecutor: minimal single-threaded executor with eventfd wakers
+// ---------------------------------------------------------------------------
+
+/// Atomic bitmask for task wakeups.
+///
+/// 3 × `AtomicU64` = 192 bits — enough for `QUEUE_DEPTH` (128) + overhead
+/// tasks (eventfd watcher, etc.).
+///
+/// `wake()` sets one bit with a single `fetch_or` + signals the eventfd.
+/// Duplicate wakeups collapse naturally (OR is idempotent).
+/// `drain()` atomically grabs all pending bits in three swaps.
+struct WakeupBits {
+    words: [AtomicU64; 3],
+    efd: RawFd,
+}
+
+impl WakeupBits {
+    fn new(efd: RawFd) -> Self {
+        Self {
+            words: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            efd,
+        }
+    }
+
+    /// Mark a task as needing a poll + signal the eventfd.
+    #[inline]
+    fn wake(&self, idx: usize) {
+        self.words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
+        signal_eventfd(self.efd);
+    }
+
+    /// Atomically drain all pending wakeup bits.
+    ///
+    /// Bits that arrive between word swaps are deferred to the next drain
+    /// (the eventfd signal ensures prompt re-entry to the event loop).
+    fn drain(&self) -> [u64; 3] {
+        [
+            self.words[0].swap(0, Ordering::Acquire),
+            self.words[1].swap(0, Ordering::Acquire),
+            self.words[2].swap(0, Ordering::Acquire),
+        ]
+    }
+}
+
+/// Per-task waker: sets an atomic bit + signals eventfd on `wake()`.
+///
+/// Uses `std::task::Wake` — no raw vtable. Clone = `Arc::clone` (one atomic
+/// increment). Wake = one `fetch_or` + one `write(2)` syscall. Zero heap
+/// allocation on the hot path.
+struct TaskWaker {
+    bits: Arc<WakeupBits>,
+    idx: usize,
+}
+
+impl Wake for TaskWaker {
+    fn wake(self: Arc<Self>) {
+        self.bits.wake(self.idx);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.bits.wake(self.idx);
+    }
+}
+
+/// Minimal single-threaded async executor with atomic-bitmask wakers.
+///
+/// Every waker signals an eventfd, so any `wake()` from any thread (tokio
+/// workers, io_uring CQE handlers, internal) unblocks `io_uring_enter()`.
+/// No wrapper or combined waker needed — the signal is baked into every waker.
+///
+/// Hot-path costs:
+/// - `tick()`: three atomic swaps to drain, then iterate set bits (zero alloc)
+/// - `wake()`: one atomic `fetch_or` + one `write(2)` syscall
+/// - Waker clone: one atomic increment (`Arc::clone`)
+/// - Duplicate wakeups collapse (OR is idempotent → one poll per tick)
+/// - `all_done()`: O(1) counter check
+struct QueueExecutor<'a> {
+    /// Task futures. `UnsafeCell` for interior mutability (single-threaded).
+    tasks: Vec<UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + 'a>>>>>,
+    /// Pre-allocated wakers, one per task. Passed by reference in `tick()` —
+    /// zero atomic ops unless the polled future internally clones the waker.
+    wakers: Vec<Waker>,
+    /// Shared atomic bitmask + eventfd.
+    bits: Arc<WakeupBits>,
+    /// Number of live I/O tasks (excludes daemons). O(1) completion check.
+    alive: Cell<usize>,
+    /// Number of daemon tasks (spawned first, indices 0..num_daemons).
+    /// Daemon tasks don't gate shutdown — when all I/O tasks complete,
+    /// the event loop exits and daemon futures are dropped.
+    num_daemons: usize,
+}
+
+impl<'a> QueueExecutor<'a> {
+    fn new(efd: RawFd) -> Self {
+        Self {
+            tasks: Vec::new(),
+            wakers: Vec::new(),
+            bits: Arc::new(WakeupBits::new(efd)),
+            alive: Cell::new(0),
+            num_daemons: 0,
+        }
+    }
+
+    /// Spawn a daemon task that does NOT count toward `all_done()`.
+    ///
+    /// Must be called before any `spawn()` calls. Used for helper tasks
+    /// (e.g., the eventfd PollAdd watcher) whose lifetime should not gate
+    /// the event loop exit.
+    fn spawn_daemon(&mut self, future: impl Future<Output = ()> + 'a) {
+        debug_assert_eq!(
+            self.alive.get(), 0,
+            "spawn_daemon must be called before spawn"
+        );
+        let idx = self.tasks.len();
+        assert!(idx < 192, "QueueExecutor supports at most 192 tasks");
+        self.tasks.push(UnsafeCell::new(Some(Box::pin(future))));
+        self.wakers.push(Waker::from(Arc::new(TaskWaker {
+            bits: Arc::clone(&self.bits),
+            idx,
+        })));
+        self.num_daemons = idx + 1;
+        // Mark for initial poll.
+        self.bits.words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
+    }
+
+    /// Spawn an I/O task that counts toward `all_done()`.
+    fn spawn(&mut self, future: impl Future<Output = ()> + 'a) {
+        let idx = self.tasks.len();
+        assert!(idx < 192, "QueueExecutor supports at most 192 tasks");
+        self.tasks.push(UnsafeCell::new(Some(Box::pin(future))));
+        self.wakers.push(Waker::from(Arc::new(TaskWaker {
+            bits: Arc::clone(&self.bits),
+            idx,
+        })));
+        self.alive.set(self.alive.get() + 1);
+        // Mark for initial poll.
+        self.bits.words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
+    }
+
+    /// Poll all woken tasks. Called after `io_uring_enter()` returns.
+    ///
+    /// Drains the atomic bitmask in one shot, then iterates set bits.
+    /// Tasks woken during this call are deferred to the next `tick()`
+    /// (the eventfd signal ensures prompt re-entry to the event loop).
+    fn tick(&self) {
+        let words = self.bits.drain();
+        for (word_idx, mut word) in words.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1; // clear lowest set bit
+                let idx = word_idx * 64 + bit;
+                if idx >= self.tasks.len() {
+                    continue;
+                }
+                // SAFETY: single-threaded — only this thread accesses the tasks vec.
+                // Wakers only touch the atomic WakeupBits, never the task storage.
+                let slot = unsafe { &mut *self.tasks[idx].get() };
+                if let Some(task) = slot {
+                    let mut cx = TaskContext::from_waker(&self.wakers[idx]);
+                    if task.as_mut().poll(&mut cx).is_ready() {
+                        *slot = None;
+                        if idx >= self.num_daemons {
+                            self.alive.set(self.alive.get() - 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if all I/O tasks have completed (daemons excluded).
+    fn all_done(&self) -> bool {
+        self.alive.get() == 0
+    }
+}
+
+/// Waker that unparks a thread. Used by `block_on`.
+struct ThreadWaker(std::thread::Thread);
+
+impl Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Minimal `block_on`: parks the current thread and polls a single future.
+///
+/// Used to drive the top-level async event loop on the queue thread.
+/// The future internally calls `io_uring_enter()` which blocks, so this
+/// rarely actually parks — the future drives forward via CQEs.
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut cx = TaskContext::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(val) => return val,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// Run the ublk device lifecycle on a dedicated thread.
 ///
 /// 1. Build the ublk control device (allocates `/dev/ublkbN`)
@@ -408,7 +689,7 @@ fn run_device(
         };
 
         // Register data file with io_uring for zero-copy I/O.
-        // libublk auto-sets fds[0] = ublk cdev fd. We put the data file
+        // ublk_core auto-sets fds[0] = ublk cdev fd. We put the data file
         // at the next slot → io_uring ops use types::Fixed(DATA_FILE_FD_INDEX).
         if let Some(fd) = data_file_fd {
             let idx = dev.tgt.nr_fds as usize;
@@ -492,12 +773,13 @@ fn run_device(
     Ok(())
 }
 
-/// Per-queue async I/O loop using smol.
+/// Per-queue async I/O loop using QueueExecutor.
 ///
-/// Each tag (0..queue_depth) gets its own smol task that loops:
+/// Each tag (0..queue_depth) gets its own task that loops:
 ///   fetch command → dispatch to BlockHandler → commit result
 ///
-/// smol runs on the queue's dedicated thread (CPU-pinned by libublk).
+/// The QueueExecutor's wakers signal an eventfd, ensuring io_uring_enter()
+/// returns whenever a task is woken from any thread (tokio, io_uring, etc.).
 fn queue_io_loop(
     qid: u16,
     dev: &UblkDev,
@@ -509,16 +791,16 @@ fn queue_io_loop(
     // set SINGLE_ISSUER — each queue thread is the sole submitter to its ring.
     let sq_depth = dev.tgt.sq_depth as u32;
     let cq_depth = dev.tgt.cq_depth as u32;
-    if let Err(e) = libublk::ublk_init_task_ring(|cell| {
+    if let Err(e) = ublk_core::ublk_init_task_ring(|cell| {
         if cell.get().is_none() {
             let ring = io_uring::IoUring::builder()
                 .setup_cqsize(cq_depth)
                 .setup_coop_taskrun()
                 .setup_single_issuer()
                 .build(sq_depth)
-                .map_err(libublk::UblkError::IOError)?;
+                .map_err(ublk_core::UblkError::IOError)?;
             cell.set(std::cell::RefCell::new(ring))
-                .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
+                .map_err(|_| ublk_core::UblkError::OtherError(-libc::EEXIST))?;
         }
         Ok(())
     }) {
@@ -528,30 +810,66 @@ fn queue_io_loop(
     }
 
     let q_rc = match UblkQueue::new(qid, dev) {
-        Ok(q) => {
-            latch.signal_ready();
-            Rc::new(q)
-        }
+        Ok(q) => Rc::new(q),
         Err(e) => {
             tracing::error!(qid, error = ?e, "failed to create ublk queue");
             latch.signal_failed();
             return;
         }
     };
-    let zero_copy = q_rc.support_auto_buf_zc();
-    let exe = smol::LocalExecutor::new();
 
-    let mut tasks = Vec::new();
+    // Create eventfd for cross-thread wakeup signaling.
+    let efd = match EventFd::new() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(qid, error = ?e, "failed to create eventfd");
+            latch.signal_failed();
+            return;
+        }
+    };
+    let efd_fd = efd.fd();
+
+    latch.signal_ready();
+    let zero_copy = q_rc.support_auto_buf_zc();
+    let mut exe = QueueExecutor::new(efd_fd);
+
+    // Enter the tokio runtime context once for the entire queue thread.
+    // This must NOT be done per-task because the QueueExecutor polls multiple
+    // futures on the same thread — per-task guards interleave and get dropped
+    // out of LIFO order, causing a tokio panic.
+    let _tokio_guard = tokio_handle.enter();
+
+    // Spawn eventfd watcher as a daemon — it keeps a PollAdd registered on the
+    // eventfd so that eventfd writes (from wakers on tokio threads) generate CQEs
+    // that unblock io_uring_enter(). Daemon: doesn't gate shutdown.
+    {
+        let q = q_rc.clone();
+        exe.spawn_daemon(async move {
+            loop {
+                let sqe = io_uring::opcode::PollAdd::new(
+                    io_uring::types::Fd(efd_fd),
+                    libc::POLLIN as u32,
+                )
+                .build();
+                let result = q.ublk_submit_sqe(sqe).await;
+                if result < 0 {
+                    break;
+                }
+                drain_eventfd(efd_fd);
+            }
+        });
+    }
+
+    // Spawn per-tag I/O tasks.
     for tag in 0..dev.dev_info.queue_depth {
         let q = q_rc.clone();
         let handler = Arc::clone(handler);
-        let tokio_handle = tokio_handle.clone();
 
-        tasks.push(exe.spawn(async move {
+        exe.spawn(async move {
             let result = if zero_copy {
-                io_task_zc(&q, tag, &handler, &tokio_handle).await
+                io_task_zc(&q, tag, &handler).await
             } else {
-                io_task(&q, tag, &handler, &tokio_handle).await
+                io_task(&q, tag, &handler).await
             };
             if let Err(e) = result {
                 match e {
@@ -559,23 +877,23 @@ fn queue_io_loop(
                     _ => tracing::error!(qid, tag, error = ?e, "ublk io_task failed"),
                 }
             }
-        }));
+        });
     }
 
-    // Drive the smol executor via libublk's io_uring event loop.
+    // Drive the QueueExecutor via ublk_core's io_uring event loop.
     let q = q_rc.clone();
-    smol::block_on(exe.run(async {
-        let run_tasks = || while exe.try_tick() {};
-        let all_done = || tasks.iter().all(|t| t.is_finished());
+    block_on(async {
+        let run_tasks = || exe.tick();
+        let all_done = || exe.all_done();
         if let Err(e) =
-            libublk::wait_and_handle_io_events(&q, Some(URING_IDLE_SECS), run_tasks, all_done).await
+            ublk_core::wait_and_handle_io_events(&q, Some(URING_IDLE_SECS), run_tasks, all_done).await
         {
             match e {
                 UblkError::QueueIsDown => {}
                 _ => tracing::error!(qid, error = ?e, "ublk event loop failed"),
             }
         }
-    }));
+    });
 }
 
 /// Per-tag async I/O task (non-zero-copy path).
@@ -586,7 +904,6 @@ async fn io_task(
     q: &UblkQueue<'_>,
     tag: u16,
     handler: &BlockHandler,
-    tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
     let mut buffer = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
@@ -607,10 +924,7 @@ async fn io_task(
         );
         let length = byte_len as u32;
 
-        let result = dispatch_io(
-            op, offset, length, fua, &mut buffer, handler, tokio_handle,
-        )
-        .await;
+        let result = dispatch_io(op, offset, length, fua, &mut buffer, handler).await;
 
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), result)
             .await?;
@@ -630,7 +944,6 @@ async fn io_task_zc(
     q: &UblkQueue<'_>,
     tag: u16,
     handler: &BlockHandler,
-    tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
     let auto_reg = sys::ublk_auto_buf_reg {
         index: tag,
@@ -666,32 +979,30 @@ async fn io_task_zc(
             iod.nr_sectors,
         );
         let length = byte_len as u32;
+        let addr = iod.addr;
 
-        let result = {
-            let _guard = tokio_handle.enter();
-            match op {
-                sys::UBLK_IO_OP_WRITE => {
-                    handle_write_zc(q, offset, length, fua, iod.addr, handler).await
-                }
-                sys::UBLK_IO_OP_READ => {
-                    handle_read_zc(q, offset, length, iod.addr, handler).await
-                }
-                sys::UBLK_IO_OP_FLUSH => match handler.flush() {
-                    Ok(()) => 0,
-                    Err(e) => -e.to_linux_errno(),
-                },
-                sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
-                    Ok(()) => 0,
-                    Err(e) => -e.to_linux_errno(),
-                },
-                sys::UBLK_IO_OP_WRITE_ZEROES => {
-                    match handler.write_zeroes(offset, length, fua) {
-                        Ok(()) => 0,
-                        Err(e) => -e.to_linux_errno(),
-                    }
-                }
-                _ => -libc::EINVAL,
+        let result = match op {
+            sys::UBLK_IO_OP_WRITE => {
+                handle_write_zc(q, offset, length, fua, addr, handler).await
             }
+            sys::UBLK_IO_OP_READ => {
+                handle_read_zc(q, offset, length, addr, handler).await
+            }
+            sys::UBLK_IO_OP_FLUSH => match handler.flush() {
+                Ok(()) => 0,
+                Err(e) => -e.to_linux_errno(),
+            },
+            sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
+                Ok(()) => 0,
+                Err(e) => -e.to_linux_errno(),
+            },
+            sys::UBLK_IO_OP_WRITE_ZEROES => {
+                match handler.write_zeroes(offset, length, fua) {
+                    Ok(()) => 0,
+                    Err(e) => -e.to_linux_errno(),
+                }
+            }
+            _ => -libc::EINVAL,
         };
 
         q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
@@ -845,29 +1156,29 @@ async fn handle_io(
     handler: &BlockHandler,
 ) -> i32 {
     match op {
-        libublk::sys::UBLK_IO_OP_READ => {
+        ublk_core::sys::UBLK_IO_OP_READ => {
             debug_assert!(buf.len() >= length as usize, "read buf too small");
             match handler.read_into(offset, length, buf).await {
                 Ok(n) => i32::try_from(n).unwrap_or(-libc::EIO),
                 Err(e) => -e.to_linux_errno(),
             }
         }
-        libublk::sys::UBLK_IO_OP_WRITE => {
+        ublk_core::sys::UBLK_IO_OP_WRITE => {
             debug_assert_eq!(buf.len(), length as usize, "write buf/length mismatch");
             match handler.write(offset, buf, fua) {
                 Ok(()) => i32::try_from(length).unwrap_or(-libc::EIO),
                 Err(e) => -e.to_linux_errno(),
             }
         }
-        libublk::sys::UBLK_IO_OP_FLUSH => match handler.flush() {
+        ublk_core::sys::UBLK_IO_OP_FLUSH => match handler.flush() {
             Ok(()) => 0,
             Err(e) => -e.to_linux_errno(),
         },
-        libublk::sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
+        ublk_core::sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
             Ok(()) => 0,
             Err(e) => -e.to_linux_errno(),
         },
-        libublk::sys::UBLK_IO_OP_WRITE_ZEROES => match handler.write_zeroes(offset, length, fua) {
+        ublk_core::sys::UBLK_IO_OP_WRITE_ZEROES => match handler.write_zeroes(offset, length, fua) {
             Ok(()) => 0,
             Err(e) => -e.to_linux_errno(),
         },
@@ -877,10 +1188,9 @@ async fn handle_io(
 
 /// Dispatch an I/O command from the io_uring queue to the BlockHandler.
 ///
-/// Installs the tokio runtime context so that tokio-dependent futures
-/// (Notify, tokio::spawn for read-ahead, reqwest for S3) work inside
-/// this smol-polled task. The EnterGuard is !Send, which is fine —
-/// smol's LocalExecutor never moves tasks across threads.
+/// The tokio runtime context is entered once per queue thread in
+/// `queue_io_loop`, so handler methods can use `tokio::spawn` and
+/// `tokio::sync::Notify` without per-call setup.
 async fn dispatch_io(
     op: u32,
     offset: u64,
@@ -888,9 +1198,7 @@ async fn dispatch_io(
     fua: bool,
     buffer: &mut IoBuf<u8>,
     handler: &BlockHandler,
-    tokio_handle: &tokio::runtime::Handle,
 ) -> i32 {
-    let _guard = tokio_handle.enter();
     let buf = &mut buffer.as_mut_slice()[..length as usize];
     handle_io(op, offset, length, fua, buf, handler).await
 }
@@ -954,12 +1262,12 @@ mod tests {
 
         let mut buf = vec![0x42u8; BLOCK_SIZE];
         let result =
-            handle_io(libublk::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
         assert_eq!(result, BLOCK_SIZE as i32);
 
         let mut buf = vec![0u8; BLOCK_SIZE];
         let result =
-            handle_io(libublk::sys::UBLK_IO_OP_READ, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+            handle_io(ublk_core::sys::UBLK_IO_OP_READ, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
         assert_eq!(result, BLOCK_SIZE as i32);
         assert_eq!(buf, vec![0x42u8; BLOCK_SIZE]);
     }
@@ -968,7 +1276,7 @@ mod tests {
     async fn flush_returns_ok() {
         let (handler, _dir) = make_handler(false);
         let result =
-            handle_io(libublk::sys::UBLK_IO_OP_FLUSH, 0, 0, false, &mut [], &handler).await;
+            handle_io(ublk_core::sys::UBLK_IO_OP_FLUSH, 0, 0, false, &mut [], &handler).await;
         assert_eq!(result, 0);
     }
 
@@ -976,7 +1284,7 @@ mod tests {
     async fn discard_returns_ok() {
         let (handler, _dir) = make_handler(false);
         let result =
-            handle_io(libublk::sys::UBLK_IO_OP_DISCARD, 0, BLOCK_SIZE as u32, false, &mut [], &handler).await;
+            handle_io(ublk_core::sys::UBLK_IO_OP_DISCARD, 0, BLOCK_SIZE as u32, false, &mut [], &handler).await;
         assert_eq!(result, 0);
     }
 
@@ -986,16 +1294,16 @@ mod tests {
 
         // Write non-zero data.
         let mut buf = vec![0xFFu8; BLOCK_SIZE];
-        handle_io(libublk::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+        handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
 
         // Write zeroes over it.
         let result =
-            handle_io(libublk::sys::UBLK_IO_OP_WRITE_ZEROES, 0, BLOCK_SIZE as u32, false, &mut [], &handler).await;
+            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE_ZEROES, 0, BLOCK_SIZE as u32, false, &mut [], &handler).await;
         assert_eq!(result, 0);
 
         // Read back — should be zeros.
         let mut buf = vec![0xFFu8; BLOCK_SIZE];
-        handle_io(libublk::sys::UBLK_IO_OP_READ, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+        handle_io(ublk_core::sys::UBLK_IO_OP_READ, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
         assert_eq!(buf, vec![0u8; BLOCK_SIZE]);
     }
 
@@ -1011,7 +1319,7 @@ mod tests {
         let (handler, _dir) = make_handler(false);
         let mut buf = vec![0u8; BLOCK_SIZE];
         let result =
-            handle_io(libublk::sys::UBLK_IO_OP_READ, DEVICE_SIZE, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+            handle_io(ublk_core::sys::UBLK_IO_OP_READ, DEVICE_SIZE, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
         assert!(result < 0, "expected negative errno, got {result}");
     }
 
@@ -1020,7 +1328,7 @@ mod tests {
         let (handler, _dir) = make_handler(false);
         let mut buf = vec![0xABu8; BLOCK_SIZE];
         let result =
-            handle_io(libublk::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, true, &mut buf, &handler).await;
+            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, true, &mut buf, &handler).await;
         assert_eq!(result, BLOCK_SIZE as i32);
     }
 
@@ -1029,7 +1337,7 @@ mod tests {
         let (handler, _dir) = make_handler(true);
         let mut buf = vec![0x42u8; BLOCK_SIZE];
         let result =
-            handle_io(libublk::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
         assert_eq!(result, -libc::EROFS);
     }
 
@@ -1037,7 +1345,7 @@ mod tests {
     async fn zero_length_read_returns_zero() {
         let (handler, _dir) = make_handler(false);
         let result =
-            handle_io(libublk::sys::UBLK_IO_OP_READ, 0, 0, false, &mut [], &handler).await;
+            handle_io(ublk_core::sys::UBLK_IO_OP_READ, 0, 0, false, &mut [], &handler).await;
         assert_eq!(result, 0);
     }
 

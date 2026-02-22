@@ -169,6 +169,14 @@ impl WriteCache<Active> {
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
         let num_chunks = (end_chunk - start_chunk + 1) as usize;
 
+        // Fast path: all chunks present on local SSD → single pread of exact bytes.
+        // Bypasses per-chunk resolution, 128KB allocation, and Bytes wrapping.
+        // One atomic load per chunk + one pread of exactly `len` bytes.
+        if (start_chunk..=end_chunk).all(|i| self.inner.is_present(i as usize)) {
+            self.inner.data_file.read_exact_at(&mut buf[..len], offset)?;
+            return Ok(len);
+        }
+
         // Single chunk fast path — no concurrency overhead.
         if num_chunks == 1 {
             let chunk_data = self
@@ -305,6 +313,12 @@ impl WriteCache<Active> {
         // Explicit zero-range → zeros.
         if hash == self.inner.zero_block_hash {
             return Ok(self.inner.zero_block_bytes.clone());
+        }
+
+        // Fast path: block is present on local SSD — skip cache/index lookups.
+        // The data file is authoritative for any present block (Dirty, Clean, or Syncing).
+        if self.inner.is_present(chunk_index) {
+            return self.sync_read_local_block(chunk_index as u64);
         }
 
         // Tier 1: clean_cache (recently written or previously fetched from S3).
@@ -600,6 +614,18 @@ impl WriteCache<Active> {
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
         let num_chunks = (end_chunk - start_chunk + 1) as usize;
 
+        // Fast path: all chunks present on local SSD → single LocalSsd entry.
+        // Collapses N per-chunk SQEs into one io_uring Read of exact bytes.
+        if (start_chunk..=end_chunk).all(|i| self.inner.is_present(i as usize)) {
+            return Ok(ReadPlan {
+                entries: vec![ChunkPlanEntry {
+                    source: ChunkSource::LocalSsd { file_offset: offset },
+                    slice_start: 0,
+                    slice_len: len,
+                }],
+            });
+        }
+
         // Resolve all chunks concurrently (same pattern as read_v2).
         let futures: Vec<_> = (start_chunk..=end_chunk)
             .map(|chunk_idx| {
@@ -670,6 +696,13 @@ impl WriteCache<Active> {
         // Explicit zero-range.
         if hash == self.inner.zero_block_hash {
             return Ok(ChunkSource::Zero);
+        }
+
+        // Fast path: block is present on local SSD — skip cache/index lookups.
+        // The data file is authoritative for any present block (Dirty, Clean, or Syncing).
+        if self.inner.is_present(chunk_index) {
+            let file_offset = chunk_index as u64 * self.inner.config.block_size as u64;
+            return Ok(ChunkSource::LocalSsd { file_offset });
         }
 
         // Tier 1: clean_cache (recently written or previously fetched from S3).

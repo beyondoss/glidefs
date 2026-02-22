@@ -97,7 +97,7 @@ macro_rules! transport_test {
 
         #[cfg(all(target_os = "linux", feature = "ublk"))]
         paste::paste! {
-            #[tokio::test]
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             async fn [< $name _ublk >]() {
                 if !$crate::ublk_available() {
                     eprintln!("ublk: skipping (ublk_drv not available or insufficient privileges)");

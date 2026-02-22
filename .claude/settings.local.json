@@ -75,7 +75,8 @@
       "WebFetch(domain:git.kernel.org)",
       "WebFetch(domain:lore.kernel.org)",
       "Bash(gh repo:*)",
-      "Bash(rustup target add:*)"
+      "Bash(rustup target add:*)",
+      "Bash(printenv:*)"
     ]
   }
 }

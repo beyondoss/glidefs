@@ -76,6 +76,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "glidefs -> target"
+
       - name: Install cross (Linux only)
         if: matrix.platform == 'linux'
         run: |

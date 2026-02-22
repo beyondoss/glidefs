@@ -32,7 +32,7 @@ docker-tests = ["test-utils"]
 # Expose protocol types for fuzzing
 fuzz = []
 # ublk transport (Linux 6.0+ only, io_uring-based userspace block device)
-ublk = ["dep:libublk", "dep:smol", "dep:io-uring"]
+ublk = ["dep:ublk-core", "dep:io-uring"]
 # End-to-end fio benchmark through ublk block device
 fio-bench = ["ublk", "test-utils"]
 
@@ -76,8 +76,7 @@ parking_lot = "0.12"
 chrono = { version = "0.4.43", features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libublk = { git = "https://github.com/paraglidehq/libublk-rs.git", branch = "fix/serde-blk-zone", optional = true }
-smol = { version = "2", optional = true }
+ublk-core = { path = "ublk-core", optional = true }
 io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]

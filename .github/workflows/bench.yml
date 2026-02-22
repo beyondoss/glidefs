@@ -36,6 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bench -> target"
       - name: Run clippy
         run: cargo clippy
 
@@ -48,12 +51,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: cargo build --verbose
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bench -> target"
       - name: Build release
         run: cargo build --release --verbose
       - name: Verify CLI works
-        run: cargo run -- run --list
+        run: cargo run --release -- run --list
       - name: Upload benchmark binary
         uses: actions/upload-artifact@v4
         with:
@@ -69,6 +73,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bench -> target"
       - name: Build release
         run: cargo build --release --verbose
       - name: Upload benchmark binary
