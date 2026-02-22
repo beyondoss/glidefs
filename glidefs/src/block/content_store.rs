@@ -176,6 +176,7 @@ impl ContentStore {
         let path = ObjectPath::from(key);
         let start = offset as u64;
         let end = start + comp_length as u64;
+        eprintln!("[s3] get_block pack={pack_id} offset={offset} len={comp_length} spawning...");
         let s3_result = tokio::spawn(async move {
             let _permit = match &sem {
                 Some(s) => Some(
@@ -188,7 +189,10 @@ impl ContentStore {
                 ),
                 None => None,
             };
-            store.get_range(&path, start..end).await
+            eprintln!("[s3] get_range starting...");
+            let r = store.get_range(&path, start..end).await;
+            eprintln!("[s3] get_range done: {}", if r.is_ok() { "OK" } else { "ERR" });
+            r
         })
         .await
         .map_err(|e| {
@@ -197,6 +201,7 @@ impl ContentStore {
                 source: Box::new(e),
             })
         })?;
+        eprintln!("[s3] get_block done: {}", if s3_result.is_ok() { "OK" } else { "ERR" });
         self.record_s3_result(&s3_result);
         Ok(s3_result?)
     }

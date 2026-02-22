@@ -920,10 +920,18 @@ async fn io_task(
         );
         let length = byte_len as u32;
 
+        let op_name = match op {
+            ublk_core::sys::UBLK_IO_OP_WRITE => "WRITE",
+            ublk_core::sys::UBLK_IO_OP_READ => "READ",
+            ublk_core::sys::UBLK_IO_OP_FLUSH => "FLUSH",
+            _ => "OTHER",
+        };
+        eprintln!("[ublk] tag={tag} op={op_name} offset={offset} len={length}");
         let result = dispatch_io(
             op, offset, length, fua, &mut buffer, handler, tokio_handle,
         )
         .await;
+        eprintln!("[ublk] tag={tag} {op_name} done result={result}");
 
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), result)
             .await?;
@@ -981,16 +989,31 @@ async fn io_task_zc(
         let length = byte_len as u32;
         let addr = iod.addr;
 
+        let op_name = match op {
+            sys::UBLK_IO_OP_WRITE => "WRITE",
+            sys::UBLK_IO_OP_READ => "READ",
+            sys::UBLK_IO_OP_FLUSH => "FLUSH",
+            sys::UBLK_IO_OP_DISCARD => "DISCARD",
+            sys::UBLK_IO_OP_WRITE_ZEROES => "WRITE_ZEROES",
+            _ => "UNKNOWN",
+        };
+        eprintln!("[ublk-zc] tag={tag} op={op_name} offset={offset} len={length}");
+
         let _guard = tokio_handle.enter();
         let result = match op {
             sys::UBLK_IO_OP_WRITE => {
-                handle_write_zc(q, offset, length, fua, addr, handler).await
+                let r = handle_write_zc(q, offset, length, fua, addr, handler).await;
+                eprintln!("[ublk-zc] tag={tag} WRITE done result={r}");
+                r
             }
             sys::UBLK_IO_OP_READ => {
-                handle_read_zc(q, offset, length, addr, handler).await
+                eprintln!("[ublk-zc] tag={tag} READ starting resolve_read...");
+                let r = handle_read_zc(q, offset, length, addr, handler).await;
+                eprintln!("[ublk-zc] tag={tag} READ done result={r}");
+                r
             }
             sys::UBLK_IO_OP_FLUSH => match handler.flush() {
-                Ok(()) => 0,
+                Ok(()) => { eprintln!("[ublk-zc] tag={tag} FLUSH done"); 0 }
                 Err(e) => -e.to_linux_errno(),
             },
             sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
@@ -1006,8 +1029,10 @@ async fn io_task_zc(
             _ => -libc::EINVAL,
         };
 
+        eprintln!("[ublk-zc] tag={tag} committing result={result}");
         q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
             .await?;
+        eprintln!("[ublk-zc] tag={tag} committed");
     }
 }
 
@@ -1082,10 +1107,18 @@ async fn handle_read_zc(
         return 0;
     }
 
+    eprintln!("[ublk-read] resolve_read offset={offset} len={length}");
     let plan = match handler.resolve_read(offset, length).await {
         Ok(p) => p,
-        Err(e) => return -e.to_linux_errno(),
+        Err(e) => {
+            eprintln!("[ublk-read] resolve_read FAILED: {e}");
+            return -e.to_linux_errno();
+        }
     };
+    eprintln!(
+        "[ublk-read] resolve_read OK, {} entries",
+        plan.entries.len()
+    );
 
     let mut dst_offset: usize = 0;
     for entry in &plan.entries {
