@@ -31,7 +31,11 @@ const QUEUE_DEPTH: u16 = 128;
 const IO_BUF_BYTES: u32 = 512 * 1024;
 
 /// io_uring idle timeout in seconds. Controls worst-case latency from `kill_dev()` to queue exit.
-const URING_IDLE_SECS: u64 = 20;
+///
+/// When a queue has no inflight I/O, the thread blocks in `io_uring_enter()` for up to this
+/// duration. Lower = faster shutdown of idle devices; the idle wakeup cost is negligible
+/// (3 atomic swaps + Cell check).
+const URING_IDLE_SECS: u64 = 2;
 
 /// io_uring fixed-file index for the data file.
 ///
@@ -580,9 +584,8 @@ impl Wake for ThreadWaker {
 /// Used to drive the top-level async event loop on the queue thread.
 /// The future internally calls `io_uring_enter()` which blocks, so this
 /// rarely actually parks — the future drives forward via CQEs.
-fn block_on<F: Future>(mut future: F) -> F::Output {
-    // SAFETY: We never move `future` after pinning.
-    let mut future = unsafe { Pin::new_unchecked(&mut future) };
+fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
     let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
     let mut cx = TaskContext::from_waker(&waker);
     loop {
@@ -895,7 +898,7 @@ fn queue_io_loop(
 async fn io_task(
     q: &UblkQueue<'_>,
     tag: u16,
-    handler: &BlockHandler,
+    handler: &Arc<BlockHandler>,
     tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
     let mut buffer = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
@@ -939,7 +942,7 @@ async fn io_task(
 async fn io_task_zc(
     q: &UblkQueue<'_>,
     tag: u16,
-    handler: &BlockHandler,
+    handler: &Arc<BlockHandler>,
     tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
     let auto_reg = sys::ublk_auto_buf_reg {
@@ -978,13 +981,12 @@ async fn io_task_zc(
         let length = byte_len as u32;
         let addr = iod.addr;
 
-        let _guard = tokio_handle.enter();
         let result = match op {
             sys::UBLK_IO_OP_WRITE => {
                 handle_write_zc(q, offset, length, fua, addr, handler).await
             }
             sys::UBLK_IO_OP_READ => {
-                handle_read_zc(q, offset, length, addr, handler).await
+                handle_read_zc(q, offset, length, addr, handler, tokio_handle).await
             }
             sys::UBLK_IO_OP_FLUSH => match handler.flush() {
                 Ok(()) => 0,
@@ -1063,8 +1065,11 @@ async fn handle_write_zc(
 
 /// Zero-copy READ: data file → io_uring Read → bio pages.
 ///
-/// Builds a read plan to determine each chunk's data source, then fills
-/// the bio buffer:
+/// Phase 1: Resolve read plan on the tokio runtime so that any S3 fetches
+/// use tokio's native I/O driver and wakers (fixes hang when reqwest futures
+/// are polled from a non-tokio executor).
+///
+/// Phase 2: Fill bio pages on the queue thread using the resolved plan:
 /// - `LocalSsd`: io_uring Read from data file directly into bio pages (zero-copy)
 /// - `InMemory`: ptr::copy_nonoverlapping from clean cache / S3 data (one copy)
 /// - `Zero`: ptr::write_bytes
@@ -1073,17 +1078,25 @@ async fn handle_read_zc(
     offset: u64,
     length: u32,
     addr: u64,
-    handler: &BlockHandler,
+    handler: &Arc<BlockHandler>,
+    tokio_handle: &tokio::runtime::Handle,
 ) -> i32 {
     if length == 0 {
         return 0;
     }
 
-    let plan = match handler.resolve_read(offset, length).await {
-        Ok(p) => p,
-        Err(e) => return -e.to_linux_errno(),
+    // Phase 1: Resolve read plan on tokio (S3 fetches use tokio's native wakers).
+    let h = Arc::clone(handler);
+    let plan = match tokio_handle
+        .spawn(async move { h.resolve_read(offset, length).await })
+        .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return -e.to_linux_errno(),
+        Err(_join_err) => return -libc::EIO,
     };
 
+    // Phase 2: Fill bio pages on queue thread (io_uring reads + memcpy).
     let mut dst_offset: usize = 0;
     for entry in &plan.entries {
         debug_assert!(
@@ -1134,6 +1147,8 @@ async fn handle_read_zc(
         dst_offset += entry.slice_len;
     }
 
+    // trigger_readahead calls tokio::spawn internally — needs tokio context.
+    let _guard = tokio_handle.enter();
     handler.trigger_readahead(offset);
     length as i32
 }
@@ -1186,22 +1201,44 @@ async fn handle_io(
 
 /// Dispatch an I/O command from the io_uring queue to the BlockHandler.
 ///
-/// Installs the tokio runtime context so that tokio-dependent futures
-/// (Notify, tokio::spawn for read-ahead, reqwest for S3) work inside
-/// this executor task. The EnterGuard is !Send, which is fine —
-/// the QueueExecutor is single-threaded and never moves tasks.
+/// READ ops are spawned onto the tokio runtime so that S3 fetches (reqwest →
+/// hyper → TcpStream) use tokio's native I/O driver and wakers. Without this,
+/// tokio HTTP futures polled from a non-tokio executor hang because internal
+/// waker propagation doesn't signal the QueueExecutor's eventfd.
+///
+/// Non-read ops (WRITE, FLUSH, DISCARD, WRITE_ZEROES) are purely local (SSD)
+/// and don't need tokio context.
 async fn dispatch_io(
     op: u32,
     offset: u64,
     length: u32,
     fua: bool,
     buffer: &mut IoBuf<u8>,
-    handler: &BlockHandler,
+    handler: &Arc<BlockHandler>,
     tokio_handle: &tokio::runtime::Handle,
 ) -> i32 {
-    let _guard = tokio_handle.enter();
-    let buf = &mut buffer.as_mut_slice()[..length as usize];
-    handle_io(op, offset, length, fua, buf, handler).await
+    if op == ublk_core::sys::UBLK_IO_OP_READ {
+        // Spawn read on tokio so S3 I/O uses tokio's native wakers.
+        let h = Arc::clone(handler);
+        match tokio_handle
+            .spawn(async move { h.read(offset, length).await })
+            .await
+        {
+            Ok(Ok(bytes)) => {
+                let buf = &mut buffer.as_mut_slice()[..length as usize];
+                let n = bytes.len().min(buf.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                // Readahead is already triggered inside handler.read().
+                i32::try_from(n).unwrap_or(-libc::EIO)
+            }
+            Ok(Err(e)) => -e.to_linux_errno(),
+            Err(_join_err) => -libc::EIO,
+        }
+    } else {
+        // Non-read ops are synchronous (no S3, no tokio I/O driver needed).
+        let buf = &mut buffer.as_mut_slice()[..length as usize];
+        handle_io(op, offset, length, fua, buf, handler).await
+    }
 }
 
 #[cfg(all(test, feature = "test-utils"))]
