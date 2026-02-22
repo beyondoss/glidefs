@@ -898,7 +898,7 @@ fn queue_io_loop(
 async fn io_task(
     q: &UblkQueue<'_>,
     tag: u16,
-    handler: &Arc<BlockHandler>,
+    handler: &BlockHandler,
     tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
     let mut buffer = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
@@ -942,7 +942,7 @@ async fn io_task(
 async fn io_task_zc(
     q: &UblkQueue<'_>,
     tag: u16,
-    handler: &Arc<BlockHandler>,
+    handler: &BlockHandler,
     tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
     let auto_reg = sys::ublk_auto_buf_reg {
@@ -981,35 +981,29 @@ async fn io_task_zc(
         let length = byte_len as u32;
         let addr = iod.addr;
 
+        let _guard = tokio_handle.enter();
         let result = match op {
-            sys::UBLK_IO_OP_READ => {
-                // READ spawns resolve_read on tokio — manages its own context.
-                handle_read_zc(q, offset, length, addr, handler, tokio_handle).await
+            sys::UBLK_IO_OP_WRITE => {
+                handle_write_zc(q, offset, length, fua, addr, handler).await
             }
-            other => {
-                // Non-read ops need the tokio context for Notify, metrics, etc.
-                let _guard = tokio_handle.enter();
-                match other {
-                    sys::UBLK_IO_OP_WRITE => {
-                        handle_write_zc(q, offset, length, fua, addr, handler).await
-                    }
-                    sys::UBLK_IO_OP_FLUSH => match handler.flush() {
-                        Ok(()) => 0,
-                        Err(e) => -e.to_linux_errno(),
-                    },
-                    sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
-                        Ok(()) => 0,
-                        Err(e) => -e.to_linux_errno(),
-                    },
-                    sys::UBLK_IO_OP_WRITE_ZEROES => {
-                        match handler.write_zeroes(offset, length, fua) {
-                            Ok(()) => 0,
-                            Err(e) => -e.to_linux_errno(),
-                        }
-                    }
-                    _ => -libc::EINVAL,
+            sys::UBLK_IO_OP_READ => {
+                handle_read_zc(q, offset, length, addr, handler).await
+            }
+            sys::UBLK_IO_OP_FLUSH => match handler.flush() {
+                Ok(()) => 0,
+                Err(e) => -e.to_linux_errno(),
+            },
+            sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
+                Ok(()) => 0,
+                Err(e) => -e.to_linux_errno(),
+            },
+            sys::UBLK_IO_OP_WRITE_ZEROES => {
+                match handler.write_zeroes(offset, length, fua) {
+                    Ok(()) => 0,
+                    Err(e) => -e.to_linux_errno(),
                 }
             }
+            _ => -libc::EINVAL,
         };
 
         q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
@@ -1072,11 +1066,8 @@ async fn handle_write_zc(
 
 /// Zero-copy READ: data file → io_uring Read → bio pages.
 ///
-/// Phase 1: Resolve read plan on the tokio runtime so that any S3 fetches
-/// use tokio's native I/O driver and wakers (fixes hang when reqwest futures
-/// are polled from a non-tokio executor).
-///
-/// Phase 2: Fill bio pages on the queue thread using the resolved plan:
+/// Builds a read plan to determine each chunk's data source, then fills
+/// the bio buffer:
 /// - `LocalSsd`: io_uring Read from data file directly into bio pages (zero-copy)
 /// - `InMemory`: ptr::copy_nonoverlapping from clean cache / S3 data (one copy)
 /// - `Zero`: ptr::write_bytes
@@ -1085,25 +1076,17 @@ async fn handle_read_zc(
     offset: u64,
     length: u32,
     addr: u64,
-    handler: &Arc<BlockHandler>,
-    tokio_handle: &tokio::runtime::Handle,
+    handler: &BlockHandler,
 ) -> i32 {
     if length == 0 {
         return 0;
     }
 
-    // Phase 1: Resolve read plan on tokio (S3 fetches use tokio's native wakers).
-    let h = Arc::clone(handler);
-    let plan = match tokio_handle
-        .spawn(async move { h.resolve_read(offset, length).await })
-        .await
-    {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => return -e.to_linux_errno(),
-        Err(_join_err) => return -libc::EIO,
+    let plan = match handler.resolve_read(offset, length).await {
+        Ok(p) => p,
+        Err(e) => return -e.to_linux_errno(),
     };
 
-    // Phase 2: Fill bio pages on queue thread (io_uring reads + memcpy).
     let mut dst_offset: usize = 0;
     for entry in &plan.entries {
         debug_assert!(
@@ -1154,8 +1137,6 @@ async fn handle_read_zc(
         dst_offset += entry.slice_len;
     }
 
-    // trigger_readahead calls tokio::spawn internally — needs tokio context.
-    let _guard = tokio_handle.enter();
     handler.trigger_readahead(offset);
     length as i32
 }
@@ -1221,32 +1202,12 @@ async fn dispatch_io(
     length: u32,
     fua: bool,
     buffer: &mut IoBuf<u8>,
-    handler: &Arc<BlockHandler>,
+    handler: &BlockHandler,
     tokio_handle: &tokio::runtime::Handle,
 ) -> i32 {
-    if op == ublk_core::sys::UBLK_IO_OP_READ {
-        // Spawn read on tokio so S3 I/O uses tokio's native wakers.
-        let h = Arc::clone(handler);
-        match tokio_handle
-            .spawn(async move { h.read(offset, length).await })
-            .await
-        {
-            Ok(Ok(bytes)) => {
-                let buf = &mut buffer.as_mut_slice()[..length as usize];
-                let n = bytes.len().min(buf.len());
-                buf[..n].copy_from_slice(&bytes[..n]);
-                // Readahead is already triggered inside handler.read().
-                i32::try_from(n).unwrap_or(-libc::EIO)
-            }
-            Ok(Err(e)) => -e.to_linux_errno(),
-            Err(_join_err) => -libc::EIO,
-        }
-    } else {
-        // Non-read ops need the tokio context for Notify, metrics, etc.
-        let _guard = tokio_handle.enter();
-        let buf = &mut buffer.as_mut_slice()[..length as usize];
-        handle_io(op, offset, length, fua, buf, handler).await
-    }
+    let _guard = tokio_handle.enter();
+    let buf = &mut buffer.as_mut_slice()[..length as usize];
+    handle_io(op, offset, length, fua, buf, handler).await
 }
 
 #[cfg(all(test, feature = "test-utils"))]
