@@ -19,7 +19,7 @@ Transport ──► ExportRouter ──► BlockHandler ──► WriteCache<Act
                                                         │
                                                    clear_crc32(0)
                                                         │
-                                                   WAL append(ZERO, seq)
+                                                   WAL append(chunk, seq)
                                                         │
                                                     return OK     ◄── ~5µs
 ```
@@ -135,7 +135,7 @@ Compaction uploads a full manifest and deletes the `.delta` file.
 
 ```
 {db_path}/
-├── nbd/{export_name}/
+├── exports/{export_name}/
 │   ├── export.json                          ← Export definition (name, size_gb, s3_prefix)
 │   ├── manifests/
 │   │   ├── {export_name}                    ← Full manifest snapshot (GLDE format, base)
@@ -382,10 +382,10 @@ S3 key: `manifests/{name}.delta`. Replaced on each sync cycle; deleted on compac
 Append-only on local SSD. Metadata only — block data lives in the cache file.
 
 ```
-[name_len:u16][name][chunk_index:u64][hash:16][sequence:u64][crc32:u32]
+[name_len:u16][name][chunk_index:u64][sequence:u64][crc32:u32]
 ```
 
-CRC32 trailer detects torn writes. On recovery, replay stops at the first corrupt entry — the torn tail is discarded, not an error. WAL is truncated after each block map persistence. (`wal.rs`)
+CRC32 trailer detects torn writes. On recovery, replay stops at the first corrupt entry — the torn tail is discarded, not an error. Hash is not stored in the WAL — recovery re-reads block data from the SSD cache file and recomputes BLAKE3. WAL is truncated after each block map persistence. (`wal.rs`)
 
 ## Background Subsystems
 
@@ -542,7 +542,7 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 
 ### Export Persistence & Discovery
 
-Export definitions are saved to S3 as `{db_path}/nbd/{name}/export.json` by the API and static config paths (not on the recovery path — discovered exports skip the redundant S3 PUT). On startup, `discover_exports()` lists all `export.json` files under the `nbd/` prefix and loads them 32-wide parallel, then `create_export()` recovers each from local WAL + redb 16-wide parallel. No S3 writes on the recovery path. This enables both stateless restarts (new node from S3) and fast binary upgrades (same node, local state intact — 2000 exports in ~6s). (`router.rs:save_export`, `router.rs:discover_exports`, `cli/server.rs`)
+Export definitions are saved to S3 as `{db_path}/exports/{name}/export.json` by the API and static config paths (not on the recovery path — discovered exports skip the redundant S3 PUT). On startup, `discover_exports()` lists all `export.json` files under the `exports/` prefix and loads them 32-wide parallel, then `create_export()` recovers each from local WAL + redb 16-wide parallel. No S3 writes on the recovery path. This enables both stateless restarts (new node from S3) and fast binary upgrades (same node, local state intact — 2000 exports in ~6s). (`router.rs:save_export`, `router.rs:discover_exports`, `cli/server.rs`)
 
 ### Storage Compatibility
 

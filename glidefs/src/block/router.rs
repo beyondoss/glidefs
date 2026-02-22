@@ -459,7 +459,7 @@ impl ExportRouter {
 
     /// S3 path for export definition.
     fn export_json_path(&self, name: &str) -> Path {
-        Path::from(format!("{}/nbd/{}/export.json", self.db_path, name))
+        Path::from(format!("{}/exports/{}/export.json", self.db_path, name))
     }
 
     /// Save export definition to S3 (idempotent).
@@ -506,13 +506,13 @@ impl ExportRouter {
 
     /// Discover all exports from S3.
     ///
-    /// Lists the `{db_path}/nbd/` prefix and loads each `export.json` in parallel.
+    /// Lists the `{db_path}/exports/` prefix and loads each `export.json` in parallel.
     pub async fn discover_exports(&self) -> Result<Vec<ExportConfig>, RouterError> {
         use futures::stream::{self, StreamExt};
 
-        let prefix = Path::from(format!("{}/nbd/", self.db_path));
+        let prefix = Path::from(format!("{}/exports/", self.db_path));
 
-        // List all objects under the nbd prefix
+        // List all objects under the exports prefix
         let mut list_stream = self.object_store.list(Some(&prefix));
 
         // Collect export names from export.json files
@@ -520,7 +520,7 @@ impl ExportRouter {
         while let Some(result) = list_stream.next().await {
             let meta = result?;
             let path_str = meta.location.to_string();
-            // Look for paths like "{db_path}/nbd/{name}/export.json"
+            // Look for paths like "{db_path}/exports/{name}/export.json"
             if path_str.ends_with("/export.json") {
                 // Extract export name from path
                 if let Some(name) = extract_export_name(&path_str, &self.db_path) {
@@ -596,7 +596,7 @@ impl ExportRouter {
         // Use per-export block size if specified, otherwise use global default
         let block_size = config.block_size_or(self.block_size);
 
-        let s3_prefix = format!("{}/nbd/{}", self.db_path, config.s3_prefix());
+        let s3_prefix = format!("{}/exports/{}", self.db_path, config.s3_prefix());
 
         // Content-addressed pack storage with circuit breaker + concurrency limits
         let mut cs = ContentStore::new(Arc::clone(&self.object_store), &s3_prefix)
@@ -1460,10 +1460,10 @@ impl ExportRouter {
     }
 }
 
-/// Extract export name from a path like "{db_path}/nbd/{name}/export.json".
+/// Extract export name from a path like "{db_path}/exports/{name}/export.json".
 fn extract_export_name(path: &str, db_path: &str) -> Option<String> {
-    // Path format: "{db_path}/nbd/{name}/export.json"
-    let prefix = format!("{}/nbd/", db_path);
+    // Path format: "{db_path}/exports/{name}/export.json"
+    let prefix = format!("{}/exports/", db_path);
     let suffix = "/export.json";
 
     if let Some(rest) = path.strip_prefix(&prefix)
@@ -2496,29 +2496,29 @@ mod tests {
     fn test_extract_export_name() {
         // Valid paths
         assert_eq!(
-            super::extract_export_name("test/nbd/vol1/export.json", "test"),
+            super::extract_export_name("test/exports/vol1/export.json", "test"),
             Some("vol1".to_string())
         );
         assert_eq!(
-            super::extract_export_name("my-data/nbd/my-export/export.json", "my-data"),
+            super::extract_export_name("my-data/exports/my-export/export.json", "my-data"),
             Some("my-export".to_string())
         );
 
         // Invalid paths
         assert_eq!(
-            super::extract_export_name("test/nbd/vol1/lease.json", "test"),
+            super::extract_export_name("test/exports/vol1/lease.json", "test"),
             None
         );
         assert_eq!(
-            super::extract_export_name("test/nbd/vol1/batches/000000000000", "test"),
+            super::extract_export_name("test/exports/vol1/batches/000000000000", "test"),
             None
         );
         assert_eq!(
-            super::extract_export_name("other/nbd/vol1/export.json", "test"),
+            super::extract_export_name("other/exports/vol1/export.json", "test"),
             None
         );
         assert_eq!(
-            super::extract_export_name("test/nbd//export.json", "test"),
+            super::extract_export_name("test/exports//export.json", "test"),
             None
         );
     }

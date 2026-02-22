@@ -103,7 +103,6 @@ impl WriteCache<Active> {
                 let wal_entry = WalEntryRef {
                     name: &self.inner.export_name,
                     chunk_index: block,
-                    hash: Blake3Hash::ZERO,
                     sequence: seq,
                 };
                 wal.append(&wal_entry)?;
@@ -221,7 +220,6 @@ impl WriteCache<Active> {
                 let wal_entry = WalEntryRef {
                     name: &self.inner.export_name,
                     chunk_index: block,
-                    hash: zero_hash,
                     sequence: seq,
                 };
                 wal.append(&wal_entry)?;
@@ -359,7 +357,6 @@ impl WriteCache<Active> {
                 let wal_entry = WalEntryRef {
                     name: &self.inner.export_name,
                     chunk_index: block,
-                    hash: Blake3Hash::ZERO,
                     sequence: seq,
                 };
                 wal.append(&wal_entry)?;
