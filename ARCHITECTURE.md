@@ -19,7 +19,7 @@ Transport ──► ExportRouter ──► BlockHandler ──► WriteCache<Act
                                                         │
                                                    clear_crc32(0)
                                                         │
-                                                   WAL append(ZERO, seq)
+                                                   WAL append(chunk, seq)
                                                         │
                                                     return OK     ◄── ~5µs
 ```
@@ -382,10 +382,10 @@ S3 key: `manifests/{name}.delta`. Replaced on each sync cycle; deleted on compac
 Append-only on local SSD. Metadata only — block data lives in the cache file.
 
 ```
-[name_len:u16][name][chunk_index:u64][hash:16][sequence:u64][crc32:u32]
+[name_len:u16][name][chunk_index:u64][sequence:u64][crc32:u32]
 ```
 
-CRC32 trailer detects torn writes. On recovery, replay stops at the first corrupt entry — the torn tail is discarded, not an error. WAL is truncated after each block map persistence. (`wal.rs`)
+CRC32 trailer detects torn writes. On recovery, replay stops at the first corrupt entry — the torn tail is discarded, not an error. Hash is not stored in the WAL — recovery re-reads block data from the SSD cache file and recomputes BLAKE3. WAL is truncated after each block map persistence. (`wal.rs`)
 
 ## Background Subsystems
 

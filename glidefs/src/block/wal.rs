@@ -10,8 +10,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write as IoWrite, Seek, SeekFrom, BufWriter};
 use std::path::{Path, PathBuf};
 
-use super::block_map::Blake3Hash;
-
 /// A single WAL entry: records that a chunk was modified.
 ///
 /// Block data is NOT stored in the WAL — on recovery, the SSD cache file
@@ -23,8 +21,6 @@ use super::block_map::Blake3Hash;
 pub struct WalEntry {
     pub name: String,
     pub chunk_index: u64,
-    #[allow(dead_code)]
-    pub hash: Blake3Hash,
     pub sequence: u64,
 }
 
@@ -32,7 +28,6 @@ pub struct WalEntry {
 pub struct WalEntryRef<'a> {
     pub name: &'a str,
     pub chunk_index: u64,
-    pub hash: Blake3Hash,
     pub sequence: u64,
 }
 
@@ -68,7 +63,7 @@ impl Wal {
 
     /// Serialize and append an entry in wire format.
     ///
-    /// Wire format: [name_len:u16][name][chunk_index:u64][hash:16][sequence:u64][crc32:u32]
+    /// Wire format: [name_len:u16][name][chunk_index:u64][sequence:u64][crc32:u32]
     ///
     /// Does NOT fsync -- the local SSD file provides durability guarantees.
     pub fn append(&mut self, entry: &WalEntryRef<'_>) -> io::Result<()> {
@@ -87,9 +82,6 @@ impl Wal {
         hasher.update(&chunk_index_le);
         self.writer.write_all(&chunk_index_le)?;
 
-        hasher.update(&entry.hash.0);
-        self.writer.write_all(&entry.hash.0)?;
-
         let sequence_le = entry.sequence.to_le_bytes();
         hasher.update(&sequence_le);
         self.writer.write_all(&sequence_le)?;
@@ -97,8 +89,8 @@ impl Wal {
         let crc = hasher.finalize();
         self.writer.write_all(&crc.to_le_bytes())?;
 
-        // 2 + name_len + 8 + 16 + 8 + 4
-        self.offset += 2 + name_len as u64 + 8 + 16 + 8 + 4;
+        // 2 + name_len + 8 + 8 + 4
+        self.offset += 2 + name_len as u64 + 8 + 8 + 4;
 
         Ok(())
     }
@@ -198,12 +190,6 @@ impl Wal {
         hasher.update(&buf8);
         let chunk_index = u64::from_le_bytes(buf8);
 
-        // hash
-        let mut hash_buf = [0u8; 16];
-        reader.read_exact(&mut hash_buf)?;
-        hasher.update(&hash_buf);
-        let hash = Blake3Hash(hash_buf);
-
         // sequence
         reader.read_exact(&mut buf8)?;
         hasher.update(&buf8);
@@ -225,7 +211,6 @@ impl Wal {
         Ok(Some(WalEntry {
             name,
             chunk_index,
-            hash,
             sequence,
         }))
     }
@@ -234,21 +219,14 @@ impl Wal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::block_map::blake3_128;
-    use std::io::{Seek, SeekFrom, Write as IoWrite};
+    use std::io::{Write as IoWrite};
     use tempfile::TempDir;
 
-    fn make_entry_ref(seq: u64, data: &[u8]) -> (Blake3Hash, u64, u64) {
-        (blake3_128(data), seq * 10, seq)
-    }
-
-    fn append_test_entry(wal: &mut Wal, seq: u64, data: &[u8]) {
-        let (hash, chunk_index, sequence) = make_entry_ref(seq, data);
+    fn append_test_entry(wal: &mut Wal, seq: u64) {
         let entry = WalEntryRef {
             name: "test-export",
-            chunk_index,
-            hash,
-            sequence,
+            chunk_index: seq * 10,
+            sequence: seq,
         };
         wal.append(&entry).unwrap();
     }
@@ -261,8 +239,7 @@ mod tests {
         {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=10 {
-                let data = format!("block-data-{i}");
-                append_test_entry(&mut wal, i, data.as_bytes());
+                append_test_entry(&mut wal, i);
             }
             wal.flush_buf().unwrap();
         }
@@ -272,10 +249,8 @@ mod tests {
 
         for (i, entry) in entries.iter().enumerate() {
             let seq = (i + 1) as u64;
-            let expected_data = format!("block-data-{seq}");
             assert_eq!(entry.name, "test-export");
             assert_eq!(entry.chunk_index, seq * 10);
-            assert_eq!(entry.hash, blake3_128(expected_data.as_bytes()));
             assert_eq!(entry.sequence, seq);
         }
     }
@@ -288,7 +263,7 @@ mod tests {
         {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=10 {
-                append_test_entry(&mut wal, i, &[i as u8; 64]);
+                append_test_entry(&mut wal, i);
             }
             wal.flush_buf().unwrap();
         }
@@ -308,7 +283,7 @@ mod tests {
         {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=5 {
-                append_test_entry(&mut wal, i, &[i as u8; 128]);
+                append_test_entry(&mut wal, i);
             }
             wal.flush_buf().unwrap();
         }
@@ -336,7 +311,7 @@ mod tests {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=3u64 {
                 let before = wal.size();
-                append_test_entry(&mut wal, i, &[i as u8; 64]);
+                append_test_entry(&mut wal, i);
                 let after = wal.size();
                 entry_offsets.push((before, after));
             }
@@ -369,7 +344,7 @@ mod tests {
 
         let mut wal = Wal::open(&wal_path).unwrap();
         for i in 1..=5 {
-            append_test_entry(&mut wal, i, &[i as u8; 32]);
+            append_test_entry(&mut wal, i);
         }
         wal.flush_buf().unwrap();
 
@@ -377,7 +352,7 @@ mod tests {
         assert_eq!(wal.size(), 0);
 
         for i in 10..=12 {
-            append_test_entry(&mut wal, i, &[i as u8; 32]);
+            append_test_entry(&mut wal, i);
         }
         wal.flush_buf().unwrap();
         drop(wal);
@@ -399,7 +374,6 @@ mod tests {
             let entry = WalEntryRef {
                 name: "trim-export",
                 chunk_index: 42,
-                hash: blake3_128(&[]),
                 sequence: 1,
             };
             wal.append(&entry).unwrap();
@@ -411,7 +385,6 @@ mod tests {
         assert_eq!(entries[0].name, "trim-export");
         assert_eq!(entries[0].chunk_index, 42);
         assert_eq!(entries[0].sequence, 1);
-        assert_eq!(entries[0].hash, blake3_128(&[]));
     }
 
     #[test]
@@ -423,15 +396,15 @@ mod tests {
         {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=3u64 {
-                append_test_entry(&mut wal, i, &[i as u8; 64]);
+                append_test_entry(&mut wal, i);
             }
             wal.flush_buf().unwrap();
         }
 
         // Corrupt the CRC of entry 1 (the very first entry)
         {
-            // Entry 1: name_len(2) + "test-export"(11) + chunk_index(8) + hash(16) + seq(8) + crc(4) = 49
-            let entry_1_end = 2 + 11 + 8 + 16 + 8 + 4;
+            // Entry 1: name_len(2) + "test-export"(11) + chunk_index(8) + seq(8) + crc(4) = 33
+            let entry_1_end = 2 + 11 + 8 + 8 + 4;
             let crc_offset = entry_1_end - 4;
             let mut file = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
             file.seek(SeekFrom::Start(crc_offset as u64)).unwrap();
@@ -456,7 +429,7 @@ mod tests {
         {
             let mut wal = Wal::open(&wal_path).unwrap();
             for i in 1..=3u64 {
-                append_test_entry(&mut wal, i, &[i as u8; 64]);
+                append_test_entry(&mut wal, i);
             }
             wal.flush_buf().unwrap();
         }
