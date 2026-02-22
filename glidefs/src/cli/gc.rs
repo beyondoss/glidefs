@@ -200,7 +200,7 @@ pub async fn run_gc(
 // S3 prefix discovery
 // ---------------------------------------------------------------------------
 
-/// Discover all unique S3 prefixes under `{db_path}/nbd/` that contain
+/// Discover all unique S3 prefixes under `{db_path}/exports/` that contain
 /// manifests or pack-registries.
 async fn discover_s3_prefixes(
     object_store: &dyn object_store::ObjectStore,
@@ -209,22 +209,22 @@ async fn discover_s3_prefixes(
     use futures::StreamExt;
     use object_store::path::Path as ObjectPath;
 
-    let nbd_prefix = ObjectPath::from(format!("{}/nbd/", db_path.trim_end_matches('/')));
-    let nbd_prefix_str = nbd_prefix.to_string();
+    let exports_prefix = ObjectPath::from(format!("{}/exports/", db_path.trim_end_matches('/')));
+    let exports_prefix_str = exports_prefix.to_string();
     let mut prefixes = HashSet::new();
 
-    let mut stream = object_store.list(Some(&nbd_prefix));
+    let mut stream = object_store.list(Some(&exports_prefix));
     while let Some(result) = stream.next().await {
         let meta = result?;
         let path_str = meta.location.to_string();
 
         // Look for paths containing /manifests/ or /pack-registries/
-        // Pattern: {db_path}/nbd/{s3_prefix}/manifests/{name}
-        // Pattern: {db_path}/nbd/{s3_prefix}/pack-registries/{name}
+        // Pattern: {db_path}/exports/{s3_prefix}/manifests/{name}
+        // Pattern: {db_path}/exports/{s3_prefix}/pack-registries/{name}
         for marker in &["/manifests/", "/pack-registries/"] {
             if let Some(pos) = path_str.find(marker) {
                 let base = &path_str[..pos];
-                if base.starts_with(&nbd_prefix_str) || base.starts_with(db_path) {
+                if base.starts_with(&exports_prefix_str) || base.starts_with(db_path) {
                     prefixes.insert(base.to_string());
                 }
             }
@@ -624,7 +624,7 @@ mod tests {
         use object_store::memory::InMemory;
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let content_store = ContentStore::new(Arc::clone(&s3), "test/nbd/vm1");
+        let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
 
         // Create 3 packs: pack_a (live), pack_b (dead), pack_c (dead)
         let pack_a = Uuid::new_v4();
@@ -710,7 +710,7 @@ mod tests {
         use object_store::memory::InMemory;
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let content_store = ContentStore::new(Arc::clone(&s3), "test/nbd/vm1");
+        let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
 
         let dead_pack = Uuid::new_v4();
         content_store

@@ -36,8 +36,8 @@ transport_test! {
         server.shutdown().await;
 
         // Phase 2: List packs in S3 and corrupt the first one.
-        // Packs are stored at {db_path}/nbd/{export_name}/packs/{prefix}/{uuid}
-        let prefix = ObjPath::from(format!("{}/nbd/vol1/packs/", db_path));
+        // Packs are stored at {db_path}/exports/{export_name}/packs/{prefix}/{uuid}
+        let prefix = ObjPath::from(format!("{}/exports/vol1/packs/", db_path));
         let mut stream = ctx.object_store.list(Some(&prefix));
         let mut pack_paths = Vec::new();
         while let Some(meta) = stream.next().await {
@@ -107,8 +107,8 @@ transport_test! {
         server.shutdown().await;
 
         // Phase 2: Overwrite the manifest with garbage.
-        // Manifest stored at {db_path}/nbd/{export_name}/manifests/{export_name}
-        let manifest_path = ObjPath::from(format!("{}/nbd/vol1/manifests/vol1", db_path));
+        // Manifest stored at {db_path}/exports/{export_name}/manifests/{export_name}
+        let manifest_path = ObjPath::from(format!("{}/exports/vol1/manifests/vol1", db_path));
         ctx.object_store
             .put(&manifest_path, Bytes::from(vec![0xBA, 0xAD]).into())
             .await

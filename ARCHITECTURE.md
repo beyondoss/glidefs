@@ -135,7 +135,7 @@ Compaction uploads a full manifest and deletes the `.delta` file.
 
 ```
 {db_path}/
-├── nbd/{export_name}/
+├── exports/{export_name}/
 │   ├── export.json                          ← Export definition (name, size_gb, s3_prefix)
 │   ├── manifests/
 │   │   ├── {export_name}                    ← Full manifest snapshot (GLDE format, base)
@@ -542,7 +542,7 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 
 ### Export Persistence & Discovery
 
-Export definitions are saved to S3 as `{db_path}/nbd/{name}/export.json` by the API and static config paths (not on the recovery path — discovered exports skip the redundant S3 PUT). On startup, `discover_exports()` lists all `export.json` files under the `nbd/` prefix and loads them 32-wide parallel, then `create_export()` recovers each from local WAL + redb 16-wide parallel. No S3 writes on the recovery path. This enables both stateless restarts (new node from S3) and fast binary upgrades (same node, local state intact — 2000 exports in ~6s). (`router.rs:save_export`, `router.rs:discover_exports`, `cli/server.rs`)
+Export definitions are saved to S3 as `{db_path}/exports/{name}/export.json` by the API and static config paths (not on the recovery path — discovered exports skip the redundant S3 PUT). On startup, `discover_exports()` lists all `export.json` files under the `exports/` prefix and loads them 32-wide parallel, then `create_export()` recovers each from local WAL + redb 16-wide parallel. No S3 writes on the recovery path. This enables both stateless restarts (new node from S3) and fast binary upgrades (same node, local state intact — 2000 exports in ~6s). (`router.rs:save_export`, `router.rs:discover_exports`, `cli/server.rs`)
 
 ### Storage Compatibility
 
