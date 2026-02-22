@@ -982,27 +982,34 @@ async fn io_task_zc(
         let addr = iod.addr;
 
         let result = match op {
-            sys::UBLK_IO_OP_WRITE => {
-                handle_write_zc(q, offset, length, fua, addr, handler).await
-            }
             sys::UBLK_IO_OP_READ => {
+                // READ spawns resolve_read on tokio — manages its own context.
                 handle_read_zc(q, offset, length, addr, handler, tokio_handle).await
             }
-            sys::UBLK_IO_OP_FLUSH => match handler.flush() {
-                Ok(()) => 0,
-                Err(e) => -e.to_linux_errno(),
-            },
-            sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
-                Ok(()) => 0,
-                Err(e) => -e.to_linux_errno(),
-            },
-            sys::UBLK_IO_OP_WRITE_ZEROES => {
-                match handler.write_zeroes(offset, length, fua) {
-                    Ok(()) => 0,
-                    Err(e) => -e.to_linux_errno(),
+            other => {
+                // Non-read ops need the tokio context for Notify, metrics, etc.
+                let _guard = tokio_handle.enter();
+                match other {
+                    sys::UBLK_IO_OP_WRITE => {
+                        handle_write_zc(q, offset, length, fua, addr, handler).await
+                    }
+                    sys::UBLK_IO_OP_FLUSH => match handler.flush() {
+                        Ok(()) => 0,
+                        Err(e) => -e.to_linux_errno(),
+                    },
+                    sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
+                        Ok(()) => 0,
+                        Err(e) => -e.to_linux_errno(),
+                    },
+                    sys::UBLK_IO_OP_WRITE_ZEROES => {
+                        match handler.write_zeroes(offset, length, fua) {
+                            Ok(()) => 0,
+                            Err(e) => -e.to_linux_errno(),
+                        }
+                    }
+                    _ => -libc::EINVAL,
                 }
             }
-            _ => -libc::EINVAL,
         };
 
         q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
@@ -1235,7 +1242,8 @@ async fn dispatch_io(
             Err(_join_err) => -libc::EIO,
         }
     } else {
-        // Non-read ops are synchronous (no S3, no tokio I/O driver needed).
+        // Non-read ops need the tokio context for Notify, metrics, etc.
+        let _guard = tokio_handle.enter();
         let buf = &mut buffer.as_mut_slice()[..length as usize];
         handle_io(op, offset, length, fua, buf, handler).await
     }
