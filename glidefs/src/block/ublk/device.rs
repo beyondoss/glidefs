@@ -833,6 +833,12 @@ fn queue_io_loop(
     let zero_copy = q_rc.support_auto_buf_zc();
     let mut exe = QueueExecutor::new(efd_fd);
 
+    // Enter the tokio runtime context once for the entire queue thread.
+    // This must NOT be done per-task because the QueueExecutor polls multiple
+    // futures on the same thread — per-task guards interleave and get dropped
+    // out of LIFO order, causing a tokio panic.
+    let _tokio_guard = tokio_handle.enter();
+
     // Spawn eventfd watcher as a daemon — it keeps a PollAdd registered on the
     // eventfd so that eventfd writes (from wakers on tokio threads) generate CQEs
     // that unblock io_uring_enter(). Daemon: doesn't gate shutdown.
@@ -858,13 +864,12 @@ fn queue_io_loop(
     for tag in 0..dev.dev_info.queue_depth {
         let q = q_rc.clone();
         let handler = Arc::clone(handler);
-        let tokio_handle = tokio_handle.clone();
 
         exe.spawn(async move {
             let result = if zero_copy {
-                io_task_zc(&q, tag, &handler, &tokio_handle).await
+                io_task_zc(&q, tag, &handler).await
             } else {
-                io_task(&q, tag, &handler, &tokio_handle).await
+                io_task(&q, tag, &handler).await
             };
             if let Err(e) = result {
                 match e {
@@ -899,7 +904,6 @@ async fn io_task(
     q: &UblkQueue<'_>,
     tag: u16,
     handler: &BlockHandler,
-    tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
     let mut buffer = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
@@ -920,18 +924,7 @@ async fn io_task(
         );
         let length = byte_len as u32;
 
-        let op_name = match op {
-            ublk_core::sys::UBLK_IO_OP_WRITE => "WRITE",
-            ublk_core::sys::UBLK_IO_OP_READ => "READ",
-            ublk_core::sys::UBLK_IO_OP_FLUSH => "FLUSH",
-            _ => "OTHER",
-        };
-        eprintln!("[ublk] tag={tag} op={op_name} offset={offset} len={length}");
-        let result = dispatch_io(
-            op, offset, length, fua, &mut buffer, handler, tokio_handle,
-        )
-        .await;
-        eprintln!("[ublk] tag={tag} {op_name} done result={result}");
+        let result = dispatch_io(op, offset, length, fua, &mut buffer, handler).await;
 
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), result)
             .await?;
@@ -951,7 +944,6 @@ async fn io_task_zc(
     q: &UblkQueue<'_>,
     tag: u16,
     handler: &BlockHandler,
-    tokio_handle: &tokio::runtime::Handle,
 ) -> Result<(), UblkError> {
     let auto_reg = sys::ublk_auto_buf_reg {
         index: tag,
@@ -989,31 +981,15 @@ async fn io_task_zc(
         let length = byte_len as u32;
         let addr = iod.addr;
 
-        let op_name = match op {
-            sys::UBLK_IO_OP_WRITE => "WRITE",
-            sys::UBLK_IO_OP_READ => "READ",
-            sys::UBLK_IO_OP_FLUSH => "FLUSH",
-            sys::UBLK_IO_OP_DISCARD => "DISCARD",
-            sys::UBLK_IO_OP_WRITE_ZEROES => "WRITE_ZEROES",
-            _ => "UNKNOWN",
-        };
-        eprintln!("[ublk-zc] tag={tag} op={op_name} offset={offset} len={length}");
-
-        let _guard = tokio_handle.enter();
         let result = match op {
             sys::UBLK_IO_OP_WRITE => {
-                let r = handle_write_zc(q, offset, length, fua, addr, handler).await;
-                eprintln!("[ublk-zc] tag={tag} WRITE done result={r}");
-                r
+                handle_write_zc(q, offset, length, fua, addr, handler).await
             }
             sys::UBLK_IO_OP_READ => {
-                eprintln!("[ublk-zc] tag={tag} READ starting resolve_read...");
-                let r = handle_read_zc(q, offset, length, addr, handler).await;
-                eprintln!("[ublk-zc] tag={tag} READ done result={r}");
-                r
+                handle_read_zc(q, offset, length, addr, handler).await
             }
             sys::UBLK_IO_OP_FLUSH => match handler.flush() {
-                Ok(()) => { eprintln!("[ublk-zc] tag={tag} FLUSH done"); 0 }
+                Ok(()) => 0,
                 Err(e) => -e.to_linux_errno(),
             },
             sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
@@ -1029,10 +1005,8 @@ async fn io_task_zc(
             _ => -libc::EINVAL,
         };
 
-        eprintln!("[ublk-zc] tag={tag} committing result={result}");
         q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
             .await?;
-        eprintln!("[ublk-zc] tag={tag} committed");
     }
 }
 
@@ -1107,18 +1081,10 @@ async fn handle_read_zc(
         return 0;
     }
 
-    eprintln!("[ublk-read] resolve_read offset={offset} len={length}");
     let plan = match handler.resolve_read(offset, length).await {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("[ublk-read] resolve_read FAILED: {e:?}");
-            return -e.to_linux_errno();
-        }
+        Err(e) => return -e.to_linux_errno(),
     };
-    eprintln!(
-        "[ublk-read] resolve_read OK, {} entries",
-        plan.entries.len()
-    );
 
     let mut dst_offset: usize = 0;
     for entry in &plan.entries {
@@ -1222,9 +1188,9 @@ async fn handle_io(
 
 /// Dispatch an I/O command from the io_uring queue to the BlockHandler.
 ///
-/// Enters the tokio runtime context so that handler methods can use
-/// `tokio::spawn` for readahead and `tokio::sync::Notify` for flush
-/// signaling.
+/// The tokio runtime context is entered once per queue thread in
+/// `queue_io_loop`, so handler methods can use `tokio::spawn` and
+/// `tokio::sync::Notify` without per-call setup.
 async fn dispatch_io(
     op: u32,
     offset: u64,
@@ -1232,9 +1198,7 @@ async fn dispatch_io(
     fua: bool,
     buffer: &mut IoBuf<u8>,
     handler: &BlockHandler,
-    tokio_handle: &tokio::runtime::Handle,
 ) -> i32 {
-    let _guard = tokio_handle.enter();
     let buf = &mut buffer.as_mut_slice()[..length as usize];
     handle_io(op, offset, length, fua, buf, handler).await
 }
