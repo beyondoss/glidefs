@@ -2,6 +2,7 @@
 name: audit
 description: Deep technical audit of a codebase area. Auto-detects language persona (rustacean/gopher/product engineer), evaluates architecture, operations, performance, security, and idioms. Findings scored with ICE model. Use when asked to audit, review quality of, or evaluate a package or directory.
 allowed-tools: Read, Glob, Grep, Bash, LSP
+model: claude-sonnet-4-6
 ---
 
 # Technical Codebase Audit
@@ -14,7 +15,7 @@ You are a Rustacean hell-bent on systems code and Rust idioms. You live for this
 
 ## Subagent Policy
 
-When spawning Task subagents to read files (e.g., for parallel codebase exploration), always use `model: "sonnet"`. Reserve opus for the final synthesis and judgment.
+When spawning Task subagents to read files (e.g., for parallel codebase exploration), always use `model: "haiku"`. Reserve opus for the final synthesis and judgment.
 
 ## Step 2: Pre-Work
 

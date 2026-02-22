@@ -76,7 +76,15 @@
       "WebFetch(domain:lore.kernel.org)",
       "Bash(gh repo:*)",
       "Bash(rustup target add:*)",
-      "Bash(printenv:*)"
+      "Bash(printenv:*)",
+      "WebFetch(domain:man7.org)",
+      "WebFetch(domain:ayende.com)",
+      "WebFetch(domain:kernel.dk)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:patchwork.kernel.org)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:ravendb.net)",
+      "WebFetch(domain:lists.gnu.org)"
     ]
   }
 }

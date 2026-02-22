@@ -376,17 +376,16 @@ impl Drop for EventFd {
 /// impossible).
 fn signal_eventfd(fd: RawFd) {
     let val: u64 = 1;
-    unsafe {
-        libc::write(fd, &val as *const u64 as *const libc::c_void, 8);
-    }
+    let ret = unsafe { libc::write(fd, &val as *const u64 as *const libc::c_void, 8) };
+    debug_assert!(ret == 8 || ret == -1, "eventfd write returned unexpected {ret}");
 }
 
 /// Drain accumulated eventfd signals (non-blocking read).
 fn drain_eventfd(fd: RawFd) {
     let mut val: u64 = 0;
-    unsafe {
-        libc::read(fd, &mut val as *mut u64 as *mut libc::c_void, 8);
-    }
+    let ret = unsafe { libc::read(fd, &mut val as *mut u64 as *mut libc::c_void, 8) };
+    // EAGAIN is expected when no signals are pending (EFD_NONBLOCK).
+    debug_assert!(ret == 8 || ret == -1, "eventfd read returned unexpected {ret}");
 }
 
 // ---------------------------------------------------------------------------
@@ -981,28 +980,18 @@ async fn io_task_zc(
         let length = byte_len as u32;
         let addr = iod.addr;
 
-        let result = match op {
-            sys::UBLK_IO_OP_WRITE => {
-                handle_write_zc(q, offset, length, fua, addr, handler).await
-            }
-            sys::UBLK_IO_OP_READ => {
-                handle_read_zc(q, offset, length, addr, handler).await
-            }
-            sys::UBLK_IO_OP_FLUSH => match handler.flush() {
-                Ok(()) => 0,
-                Err(e) => -e.to_linux_errno(),
-            },
-            sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
-                Ok(()) => 0,
-                Err(e) => -e.to_linux_errno(),
-            },
-            sys::UBLK_IO_OP_WRITE_ZEROES => {
-                match handler.write_zeroes(offset, length, fua) {
-                    Ok(()) => 0,
-                    Err(e) => -e.to_linux_errno(),
+        let result = if let Some(r) = dispatch_passthrough(op, offset, length, fua, handler) {
+            r
+        } else {
+            match op {
+                sys::UBLK_IO_OP_WRITE => {
+                    handle_write_zc(q, offset, length, fua, addr, handler).await
                 }
+                sys::UBLK_IO_OP_READ => {
+                    handle_read_zc(q, offset, length, addr, handler).await
+                }
+                _ => -libc::EINVAL,
             }
-            _ => -libc::EINVAL,
         };
 
         q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
@@ -1140,7 +1129,35 @@ async fn handle_read_zc(
     length as i32
 }
 
-/// Dispatch a single I/O op to the BlockHandler.
+/// Dispatch a metadata-only I/O op (FLUSH, DISCARD, WRITE_ZEROES) to the handler.
+///
+/// Returns `Some(result)` if the op was handled, `None` if it requires a
+/// data-path (READ/WRITE) which differs between ZC and non-ZC paths.
+fn dispatch_passthrough(
+    op: u32,
+    offset: u64,
+    length: u32,
+    fua: bool,
+    handler: &BlockHandler,
+) -> Option<i32> {
+    match op {
+        sys::UBLK_IO_OP_FLUSH => Some(match handler.flush() {
+            Ok(()) => 0,
+            Err(e) => -e.to_linux_errno(),
+        }),
+        sys::UBLK_IO_OP_DISCARD => Some(match handler.trim(offset, length, fua) {
+            Ok(()) => 0,
+            Err(e) => -e.to_linux_errno(),
+        }),
+        sys::UBLK_IO_OP_WRITE_ZEROES => Some(match handler.write_zeroes(offset, length, fua) {
+            Ok(()) => 0,
+            Err(e) => -e.to_linux_errno(),
+        }),
+        _ => None,
+    }
+}
+
+/// Dispatch a single I/O op to the BlockHandler (non-zero-copy path).
 ///
 /// `buf` must be pre-sliced to `length` bytes. For WRITE ops, it contains the
 /// data to write (kernel filled it). For READ ops, it will be filled with read
@@ -1155,33 +1172,24 @@ async fn handle_io(
     buf: &mut [u8],
     handler: &BlockHandler,
 ) -> i32 {
+    if let Some(result) = dispatch_passthrough(op, offset, length, fua, handler) {
+        return result;
+    }
     match op {
-        ublk_core::sys::UBLK_IO_OP_READ => {
+        sys::UBLK_IO_OP_READ => {
             debug_assert!(buf.len() >= length as usize, "read buf too small");
             match handler.read_into(offset, length, buf).await {
                 Ok(n) => i32::try_from(n).unwrap_or(-libc::EIO),
                 Err(e) => -e.to_linux_errno(),
             }
         }
-        ublk_core::sys::UBLK_IO_OP_WRITE => {
+        sys::UBLK_IO_OP_WRITE => {
             debug_assert_eq!(buf.len(), length as usize, "write buf/length mismatch");
             match handler.write(offset, buf, fua) {
                 Ok(()) => i32::try_from(length).unwrap_or(-libc::EIO),
                 Err(e) => -e.to_linux_errno(),
             }
         }
-        ublk_core::sys::UBLK_IO_OP_FLUSH => match handler.flush() {
-            Ok(()) => 0,
-            Err(e) => -e.to_linux_errno(),
-        },
-        ublk_core::sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua) {
-            Ok(()) => 0,
-            Err(e) => -e.to_linux_errno(),
-        },
-        ublk_core::sys::UBLK_IO_OP_WRITE_ZEROES => match handler.write_zeroes(offset, length, fua) {
-            Ok(()) => 0,
-            Err(e) => -e.to_linux_errno(),
-        },
         _ => -libc::EINVAL,
     }
 }

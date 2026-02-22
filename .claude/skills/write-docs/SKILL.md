@@ -2,6 +2,7 @@
 name: write-docs
 description: Write documentation in the Paraglide voice. Use when writing API docs, guides, tutorials, or reference material.
 allowed-tools: Read, Glob, Grep, Edit, Write
+model: claude-sonnet-4-6
 ---
 
 ## Before Writing

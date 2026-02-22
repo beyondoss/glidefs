@@ -2,6 +2,7 @@
 name: architecture-doc
 description: Write or improve ARCHITECTURE.md files for packages and systems. Use when creating documentation for a new package, reviewing existing architecture docs, or when asked to document how a system works.
 allowed-tools: Read, Glob, Grep, Write, Edit
+model: claude-sonnet-4-6
 ---
 
 # Writing Excellent Architecture Documentation

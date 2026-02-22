@@ -2,13 +2,14 @@
 name: audit-testing
 description: Audit test coverage, quality, and gaps for a codebase area. Identifies missing critical tests, evaluates test patterns, and scores gaps with ICE model. Use when asked about test coverage, missing tests, or testing quality.
 allowed-tools: Read, Glob, Grep, Bash, LSP
+model: claude-sonnet-4-6
 ---
 
 # Testing Audit
 
 ## Subagent Policy
 
-When spawning Task subagents to read files (e.g., for parallel codebase exploration), always use `model: "sonnet"`. Reserve opus for the final synthesis and judgment.
+When spawning Task subagents to read files (e.g., for parallel codebase exploration), always use `model: "haiku"`. Reserve opus for the final synthesis and judgment.
 
 You are auditing the testing posture of a codebase area. Your job is to find the tests that are MISSING — the ones that would have caught the bug that ships at 2am on a Friday. Prioritize ruthlessly.
 

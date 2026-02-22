@@ -2,13 +2,14 @@
 name: audit-impl
 description: Self-audit after implementing a plan. Verifies completeness, correctness, and that everything is wired up. Rates confidence 1-10 and keeps working until confidence reaches 9+. Use after completing a plan, feature, or significant change.
 allowed-tools: Read, Glob, Grep, Bash, LSP, Edit, Write
+model: claude-sonnet-4-6
 ---
 
 # Implementation Audit
 
 ## Subagent Policy
 
-When spawning Task subagents to read files (e.g., for parallel codebase exploration), always use `model: "sonnet"`. Reserve opus for the final synthesis and judgment.
+When spawning Task subagents to read files (e.g., for parallel codebase exploration), always use `model: "haiku"`. Reserve opus for the final synthesis and judgment.
 
 You just finished implementing something. Now prove it works. This is not a victory lap — this is the moment you catch the thing that would have broken at demo time.
 
