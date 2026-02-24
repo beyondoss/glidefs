@@ -65,17 +65,28 @@ curl -X PUT localhost:8080/api/exports/my-vm \
   -d '{"size_gb": 500}'
 # → {"name":"my-vm","size_bytes":500000000000,"readonly":false,"transport":"nbd","device":"/dev/nbd0"}
 
-# Fork from an existing manifest
+# Fork from the current state of an existing export
 curl -X PUT localhost:8080/api/exports/my-vm-fork \
   -d '{"size_gb": 500, "manifest_name": "my-vm"}'
+
+# Fork from a specific snapshot (returns sequence from POST /snapshot)
+curl -X PUT localhost:8080/api/exports/my-vm-fork \
+  -d '{"size_gb": 500, "manifest_name": "my-vm", "snapshot_sequence": 42}'
 
 # Use ublk transport (Linux 6.0+, requires --features ublk)
 curl -X PUT localhost:8080/api/exports/my-vm \
   -d '{"size_gb": 500, "transport": "ublk"}'
 # → {"name":"my-vm","size_bytes":500000000000,"readonly":false,"transport":"ublk","device":"/dev/ublkb0"}
 
-# Snapshot to S3
+# Snapshot to S3 — returns {"sequence": 42, "manifest_etag": "..."}
 curl -X POST localhost:8080/api/exports/my-vm/snapshot
+
+# List snapshots
+curl localhost:8080/api/exports/my-vm/snapshots
+# → [1, 5, 42]
+
+# Delete a snapshot
+curl -X DELETE localhost:8080/api/exports/my-vm/snapshots/5
 
 # Drain (flush all dirty blocks, prepare for migration)
 curl -X POST localhost:8080/api/exports/my-vm/drain
@@ -89,11 +100,13 @@ PUT is idempotent. Same size → returns current state. Larger size → grows th
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/exports` | GET | List exports (includes transport + device path) |
-| `/api/exports/{name}` | PUT | Create or resize export (returns device path) |
+| `/api/exports/{name}` | PUT | Create or resize export. `manifest_name` + optional `snapshot_sequence` to fork. |
 | `/api/exports/{name}` | GET | Get export info |
-| `/api/exports/{name}` | DELETE | Remove export (removes kernel device) |
-| `/api/exports/{name}/drain` | POST | Flush to S3 for shutdown/migration |
-| `/api/exports/{name}/snapshot` | POST | Point-in-time snapshot to S3 |
+| `/api/exports/{name}` | DELETE | Remove export. `?purge=true` deletes local cache and all S3 snapshots. |
+| `/api/exports/{name}/drain` | POST | Flush all dirty blocks to S3 (no snapshot created) |
+| `/api/exports/{name}/snapshot` | POST | Flush dirty blocks + create versioned snapshot. Returns `{sequence, manifest_etag}`. |
+| `/api/exports/{name}/snapshots` | GET | List snapshot sequences in ascending order |
+| `/api/exports/{name}/snapshots/{seq}` | DELETE | Delete a specific snapshot (idempotent) |
 | `/api/exports/{name}/promote` | POST | Promote readonly to read-write |
 | `/health/ready` | GET | Readiness check |
 | `/api/exports/{name}/metrics` | GET | I/O metrics |
@@ -227,13 +240,59 @@ innodb_log_group_home_dir = /mnt/wal
 
 **Forks:** Fork gets the CoW snapshot of data files but no WAL. The forked DB starts from the last checkpoint — clean state, no in-flight transactions.
 
+### Snapshots
+
+`POST /snapshot` flushes dirty blocks to S3 and writes a versioned manifest at a stable S3 key. Background syncs never touch snapshot keys — they accumulate until you delete them.
+
+```sh
+# Take a snapshot — record the sequence number
+SEQ=$(curl -sX POST localhost:8080/api/exports/my-vm/snapshot | jq .sequence)
+# → 42
+
+# List all snapshots for an export
+curl localhost:8080/api/exports/my-vm/snapshots
+# → [1, 5, 42]
+
+# Fork a new export from snapshot 42 (read-only parent blocks, CoW overlay for writes)
+curl -X PUT localhost:8080/api/exports/my-vm-test \
+  -d "{\"size_gb\": 500, \"manifest_name\": \"my-vm\", \"snapshot_sequence\": $SEQ}"
+
+# Delete a snapshot when done
+curl -X DELETE localhost:8080/api/exports/my-vm/snapshots/5
+```
+
+`snapshot_sequence` is optional. Omit it to fork from the current state.
+
+**GC and snapshots**: GC scans all snapshot manifests before deleting any pack. Packs referenced by a snapshot are kept alive even if they're no longer in the current manifest. Deleting a snapshot unpins its exclusive packs — they become eligible for GC after the grace period (default 24h).
+
+**Rollback**: There is no in-place rollback. To restore an export to a prior snapshot:
+
+```sh
+# 1. Remove the export without purge (snapshots stay in S3)
+curl -X DELETE localhost:8080/api/exports/my-vm
+
+# 2. Fork from the target snapshot into the same name
+curl -X PUT localhost:8080/api/exports/my-vm \
+  -d '{"size_gb": 500, "manifest_name": "my-vm", "snapshot_sequence": 5}'
+```
+
+No data is copied — the new export reads parent blocks from the existing S3 packs via the CoW overlay.
+
+**Blue/green rollback**: Fork to a new name first, verify, then cut over:
+
+```sh
+curl -X PUT localhost:8080/api/exports/my-vm-rollback \
+  -d '{"size_gb": 500, "manifest_name": "my-vm", "snapshot_sequence": 5}'
+# verify my-vm-rollback, then swap at the load balancer
+```
+
 ### Flush and Durability
 
 Writes are durable on local SSD immediately. They are **not** in S3 until flushed. Local disk loss before flush = data loss for unflushed blocks.
 
 - Automatic flush runs on a background schedule (configurable)
-- `POST /api/exports/{name}/drain` forces a full flush before shutdown or migration
-- `POST /api/exports/{name}/snapshot` creates a point-in-time manifest in S3
+- `POST /api/exports/{name}/drain` forces a full flush before shutdown or migration (no snapshot created)
+- `POST /api/exports/{name}/snapshot` flushes + creates a versioned snapshot in S3 (returns `sequence` for forking)
 
 ### Scrubber
 

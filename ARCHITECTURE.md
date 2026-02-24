@@ -130,6 +130,9 @@ Compaction uploads a full manifest and deletes the `.delta` file.
 | Pack Registry | Per-export append-only list of pack IDs created by or inherited by that export | Not a pack index — no hash mappings, just UUIDs for GC enumeration |
 | Hot Set | List of non-zero chunk indices for a base image, used to prefetch blocks on fork boot | Not a cache — it's a prefetch hint |
 | Bless | CLI command that converts a raw disk image into a content-addressed base image in S3 | Not a runtime operation — offline image preparation |
+| Snapshot | An explicit, versioned copy of an export's manifest stored at a stable S3 key. Never overwritten by background syncs. Pinned in S3 until explicitly deleted. | Not the same as a background `sync_manifest` — background syncs update `manifests/{name}` and do NOT create versioned snapshot keys |
+| Fork | A new export whose block map starts from a parent's manifest (or a specific snapshot sequence). Writes go to a sparse overlay; unwritten blocks are served from the parent's data. | Not a full copy — the parent's blocks are never duplicated until written |
+| Snapshot Sequence | A monotonic counter (`u64`) that increments on every flush. Identifies the point in time at which a snapshot was taken and used to fork from a specific historical state. | Not a timestamp — purely an ordering counter |
 
 ## S3 Object Layout
 
@@ -143,6 +146,9 @@ Compaction uploads a full manifest and deletes the `.delta` file.
 │   │   └── bases/
 │   │       ├── {image_name}                 ← Base image manifest (from bless)
 │   │       └── {image_name}.hot-set         ← Boot hot set (chunk indices)
+│   ├── snapshots/
+│   │   └── {export_name}/
+│   │       └── {sequence:020}               ← Versioned snapshot (GLDE format, zero-padded)
 │   ├── packs/
 │   │   └── {first-2-hex-of-uuid}/{uuid}     ← Content-addressed packs (GLPK format)
 │   └── pack-registries/
@@ -269,6 +275,129 @@ When the overlay exceeds 50% of the parent's entries, the fork has diverged enou
 - **Lock-free state transitions**: State ops (`set_present`, `transition_to_dirty`) use direct CAS on `AtomicU8` — no RwLock. Co-locating state inside `AtomicBlockMap` would force every state transition through the block map's read lock.
 - **Independent per-fork state**: Each fork has its own `SparseStateMap` while sharing the parent's hash data through `Arc<BlockMap>`. The parent never needs mutation.
 Created via `open_from_manifest()` when a parent block map is provided. (`block_map.rs:SparseStateMap`, `write_cache/init.rs:open_from_manifest`)
+
+## Snapshots
+
+A snapshot is an explicit, versioned copy of an export's manifest stored at a stable S3 key. Unlike background syncs (which continuously overwrite `manifests/{name}`), snapshots accumulate and are never overwritten by the background flush path. The control plane manages their lifecycle via list/delete APIs.
+
+### Snapshot vs Sync
+
+```
+background sync_manifest() →  manifests/{name}           ← always the current state, overwritten
+explicit snapshot()        →  snapshots/{name}/{seq:020}  ← immutable, accumulates, never touched by sync
+```
+
+Zero-padding the sequence to 20 digits (`{seq:020}`) ensures S3 LIST returns results in lexicographic = numeric order without sorting.
+
+### Snapshot Lifecycle
+
+```
+Control Plane
+    │
+    │  POST /api/exports/{name}/snapshot
+    ▼
+ExportRouter::snapshot_export()
+    │
+    ▼
+WriteCache::snapshot()
+    ├── 1. flush_dirty_inner()          flush all dirty blocks → S3 packs
+    ├── 2. upload_full_manifest()       overwrite manifests/{name} (base manifest)
+    ├── 3. put_snapshot()               write snapshots/{name}/{seq:020}  ← best-effort
+    ├── 4. update_registry()            record new pack IDs               ← best-effort
+    └── 5. checkpoint()                 persist block map, truncate WAL
+    │
+    ▼
+Returns: { sequence, manifest_etag }
+```
+
+Step 3 is best-effort. If the versioned snapshot upload fails, the base manifest (step 2) is already consistent — background flushes continue and the control plane can retry `snapshot()` to get a new versioned key. The sequence returned is the pack-flush sequence, not a separate counter.
+
+### Fork from Snapshot
+
+The control plane forks a VM disk from a specific historical snapshot by specifying `manifest_name` + `snapshot_sequence` on export creation:
+
+```
+PUT /api/exports/fork-vm
+    { "manifest_name": "prod-vm", "snapshot_sequence": 42, "size_gb": 10 }
+    │
+    ▼
+router.create_export(config, readonly=false, manifest_name=Some("prod-vm"), snapshot_sequence=Some(42))
+    │
+    ├── content_store.get_snapshot("prod-vm", 42)   ← download snapshots/prod-vm/00000000000000000042
+    ├── Manifest::deserialize()
+    ├── HostPackIndex::insert_batch()               ← populate local index from snapshot's pack_index
+    ├── BlockMap::from_manifest()                   ← parent block map (immutable Arc<BlockMap>)
+    └── WriteCache::open_from_manifest(config, manifest, Some(parent_block_map))
+            └── ForkedBlockMap { parent, overlay: AtomicBlockMap::empty() }
+    │
+    ▼
+Fork is live — reads serve parent data, writes go to sparse overlay
+```
+
+Omitting `snapshot_sequence` forks from the current effective manifest (`manifests/{name}` + optional delta), which is the "live state" fork path.
+
+### Snapshot API
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/exports/{name}/snapshot` | `POST` | Flush + upload versioned snapshot. Returns `{sequence, manifest_etag}`. |
+| `/api/exports/{name}/snapshots` | `GET` | List snapshot sequences in ascending order. Returns `[seq, ...]`. |
+| `/api/exports/{name}/snapshots/{seq}` | `DELETE` | Delete a specific snapshot (idempotent). |
+| `/api/exports/{name}` | `PUT` | With `manifest_name` + `snapshot_sequence`: fork from a specific snapshot. |
+
+### GC and Snapshot Packs
+
+Packs referenced only by snapshots (not by the current manifest) are kept alive by the GC's snapshot scan. GC extends its live-pack set with every pack referenced by any snapshot manifest before computing dead packs:
+
+```
+GC reconcile_prefix():
+    1. Scan manifests/{name} + manifests/{name}.delta  → live_packs
+    2. Scan snapshots/{name}/* (ALL snapshots)         → extend live_packs   ← critical
+    3. Scan pack-registries/{name}                     → known_packs
+    4. dead = known_packs - live_packs
+    5. Delete packs dead longer than grace period
+```
+
+If the snapshot scan fails (S3 error), GC skips the entire prefix rather than risking deletion of snapshot-pinned packs. (`cli/gc.rs:reconcile_prefix`)
+
+**Deleting a snapshot unpins its exclusive packs** — packs not referenced by any other snapshot or the current manifest become orphaned and eligible for GC after the grace period.
+
+### Snapshot Invariants
+
+| Invariant | Mechanism |
+|-----------|-----------|
+| Background sync never creates snapshot keys | `sync_manifest()` only writes to `manifests/{name}` — snapshot path only reachable via explicit `snapshot()` |
+| Snapshots accumulate (never overwritten) | Each snapshot has a unique `{seq:020}` key; GC only deletes via explicit `delete_snapshot()` |
+| Fork reads parent blocks | `ForkedBlockMap::get()` falls through to parent when overlay entry is `(ZERO, seq=0)` |
+| Snapshot deletion is idempotent | S3 NotFound on delete returns Ok — safe for control plane retry loops |
+| Non-purge remove preserves snapshots | `remove_export(name, purge=false)` does not call `delete_all_snapshots()` — snapshots survive export restart |
+| Snapshot on empty export succeeds | Returns sequence=0 and an empty block map — valid for control plane idempotency |
+
+(`write_cache/flush.rs:snapshot`, `content_store.rs:put_snapshot/list_snapshots/delete_snapshot`, `router.rs:snapshot_export`, `tests/integration/snapshots.rs`)
+
+### Rollback / Restore
+
+There is no in-place rollback primitive. To restore an export to a prior snapshot, the control plane does a **remove-and-refork**:
+
+```
+1. POST /api/exports/prod-vm/snapshot          (optional: snapshot current state before rollback)
+2. DELETE /api/exports/prod-vm                 (remove WITHOUT purge — snapshots survive in S3)
+3. PUT /api/exports/prod-vm                    (fork from target snapshot)
+   { "manifest_name": "prod-vm",
+     "snapshot_sequence": <target_seq>,
+     "size_gb": <original_size> }
+```
+
+Step 2 uses the no-purge path so that all historical snapshots remain in S3. The new export in step 3 starts with the target snapshot's block map as its parent, using the same content-addressed packs (no data is copied). Writes after step 3 go to a fresh overlay.
+
+**Blue/green alternative**: Fork the snapshot to a new name, test it, then cut traffic over. Keeps the original running until confidence is established:
+
+```
+PUT /api/exports/prod-vm-rollback
+    { "manifest_name": "prod-vm", "snapshot_sequence": <target_seq>, "size_gb": ... }
+→ verify prod-vm-rollback is correct
+→ remove prod-vm, rename prod-vm-rollback to prod-vm (or update load balancer)
+```
 
 ## Device Lifecycle (Typestate)
 
@@ -418,15 +547,17 @@ Orphaned packs accumulate in S3 when exports are deleted or blocks are overwritt
 
 ```
 For each S3 prefix:
-    1. List all manifests (full + delta) → extract live pack IDs
-       (conservative union: packs from base + packs from delta)
-    2. List all pack registries → extract known pack IDs
-    3. dead = known - live
-    4. Mark newly dead packs with timestamp in GC state file
-    5. Revive packs that reappeared in live set
-    6. Delete packs dead longer than grace period
-    7. Compact registries (remove deleted pack IDs)
-    8. Delete empty registries for exports with no manifest
+    1a. List all manifests (full + delta) → extract live pack IDs
+        (conservative union: packs from base + packs from delta)
+    1b. List all snapshots/* → extract live pack IDs from every snapshot manifest
+        (if snapshot scan fails → skip entire prefix, delete nothing)
+    2.  List all pack registries → extract known pack IDs
+    3.  dead = known - live
+    4.  Mark newly dead packs with timestamp in GC state file
+    5.  Revive packs that reappeared in live set
+    6.  Delete packs dead longer than grace period
+    7.  Compact registries (remove deleted pack IDs)
+    8.  Delete empty registries for exports with no manifest
 ```
 
 **Grace period**: Dead packs are not deleted immediately. GC records the first-seen-dead timestamp in a local JSON state file (`gc-state.json`). Packs are only eligible for deletion after the grace period (default 24h). This prevents races where a flush creates a pack and uploads it to a registry, but the manifest hasn't been uploaded yet — without the grace period, GC would see the pack as dead and delete it.
@@ -531,12 +662,15 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/exports/{name}` | `PUT` | Create or resize export (idempotent) |
-| `/api/exports/{name}` | `GET` | Get export info (size, readonly) |
-| `/api/exports/{name}` | `DELETE` | Remove export (after drain) |
-| `/api/exports` | `GET` | List all exports |
-| `/api/exports/{name}/snapshot` | `POST` | Drain dirty blocks + upload manifest |
-| `/api/exports/{name}/promote` | `POST` | Toggle readonly flag |
+| `/api/exports/{name}` | `PUT` | Create or resize export (idempotent). With `manifest_name` + optional `snapshot_sequence`: fork from parent or specific snapshot. |
+| `/api/exports/{name}` | `GET` | Get export info (size, readonly, transport, device path) |
+| `/api/exports/{name}` | `DELETE` | Remove export. `?purge=true` also deletes local cache and all S3 snapshots. |
+| `/api/exports` | `GET` | List all active exports |
+| `/api/exports/{name}/snapshot` | `POST` | Flush dirty blocks → S3, upload versioned manifest. Returns `{sequence, manifest_etag}`. |
+| `/api/exports/{name}/snapshots` | `GET` | List snapshot sequences in ascending order |
+| `/api/exports/{name}/snapshots/{seq}` | `DELETE` | Delete a specific snapshot (idempotent) |
+| `/api/exports/{name}/drain` | `POST` | Flush all dirty blocks to S3 (no versioned snapshot) |
+| `/api/exports/{name}/promote` | `POST` | Toggle readonly → read-write |
 | `/api/exports/{name}/metrics` | `GET` | Per-export metrics snapshot (JSON) |
 | `/metrics` | `GET` | Prometheus scrape endpoint (all exports) |
 
@@ -692,6 +826,27 @@ Dense arrays pre-allocate for all blocks: a 1TB export with 128KB blocks has 8M 
 Sparse page tables allocate on first write. The directory (one pointer per page) costs ~530KB. Each 4KB page covers 128 hash entries or 4096 state entries. An empty export: ~530KB. A 1%-written export: ~5MB. The cost is one extra pointer dereference on the hot path — a branch that predicts correctly almost every time and is noise next to the SSD pwrite that follows it.
 
 State is kept in a separate `SparseStateMap` rather than co-located in `HashEntry`. State transitions (`set_present`, `transition_to_dirty`) are direct CAS on `AtomicU8` — fully lock-free. The `AtomicBlockMap` is behind a `RwLock<BlockMapKind>` for fork-overlay swaps, so co-locating state there would force every state transition through a read lock. Two separate sparse structures keep state transitions lock-free while achieving the same memory savings.
+
+### Why explicit versioned snapshots instead of manifest history?
+
+Two alternatives were considered: (1) keep a log of all past manifests (append-only, like a WAL), (2) use S3 versioning to recover old manifests.
+
+We chose explicit versioned snapshots because:
+
+1. **Control plane owns the lifecycle**. The orchestrator decides which checkpoints are worth keeping — not every background sync. A nightly snapshot policy means 365 objects per year, not thousands of unlabeled manifests.
+2. **GC is simple and safe**. With a well-defined `snapshots/{name}/{seq}` namespace, GC knows exactly where to look to determine pack liveness. Implicit manifest history would require GC to scan S3 version metadata, which is expensive and not portable across S3-compatible backends.
+3. **Fork precision**. The `sequence` number is the exact block-flush cutpoint. The orchestrator records it at snapshot time and uses it later to fork — even months later. S3 versioning uses timestamps, which are subject to clock skew and don't map cleanly to GlideFS's internal sequence counter.
+4. **Zero cost for exports that never snapshot**. Exports that only use `sync_manifest` (background flush) don't create any objects under `snapshots/`. GC skips the `snapshots/` prefix if it's empty.
+
+The trade-off: snapshot creation requires an explicit API call. Background flushes don't create snapshots. If the orchestrator crashes between syncs, the latest state is in `manifests/{name}` (recoverable) but there's no new versioned snapshot. Operators must call `POST /snapshot` at the right moment.
+
+### Why best-effort for the versioned snapshot upload?
+
+In `WriteCache::snapshot()`, the critical step is uploading the base manifest (`manifests/{name}`) — this is what S3 recovery uses. The versioned snapshot (`snapshots/{name}/{seq}`) is best-effort because:
+
+1. The base manifest is already consistent after step 2 — background flushes and WAL recovery work correctly without the versioned key.
+2. S3 transient failures shouldn't fail the entire snapshot operation. The control plane can detect the missing snapshot via `GET /snapshots` and retry just the snapshot, not a full flush.
+3. Orphaned base manifest writes (step 2 succeeds, step 3 fails) are harmless — they're idempotent overwrites of the current state.
 
 ### Why SeqLock instead of RwLock for the block map?
 
