@@ -11,6 +11,7 @@ mod delta_manifest;
 mod failure_injection;
 mod gc;
 mod property_tests;
+mod snapshots;
 mod wake_any_node;
 
 use std::sync::Arc;

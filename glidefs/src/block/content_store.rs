@@ -13,7 +13,9 @@ use tokio::sync::Semaphore;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use super::manifest::{delta_manifest_s3_key, manifest_s3_key, Manifest, ManifestDelta};
+use super::manifest::{
+    delta_manifest_s3_key, manifest_s3_key, snapshot_s3_key, Manifest, ManifestDelta,
+};
 use super::pack::pack_s3_key;
 use super::pack_registry::registry_s3_key;
 
@@ -330,6 +332,172 @@ impl ContentStore {
             Err(e) => Err(e.into()),
         }
     }
+
+    // =========================================================================
+    // Snapshot operations (versioned manifests)
+    // =========================================================================
+
+    /// Upload a versioned snapshot manifest to S3.
+    #[instrument(skip(self, data), fields(name = %name, sequence, size = data.len()))]
+    pub async fn put_snapshot(
+        &self,
+        name: &str,
+        sequence: u64,
+        data: Vec<u8>,
+    ) -> Result<Option<String>, ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, snapshot_s3_key(name, sequence));
+        let path = ObjectPath::from(key);
+        let payload = PutPayload::from(data);
+        let result = self.object_store.put(&path, payload).await;
+        self.record_s3_result(&result);
+        let put_result = result?;
+        debug!(sequence, "uploaded snapshot manifest");
+        Ok(put_result.e_tag)
+    }
+
+    /// Download a versioned snapshot manifest from S3. Returns None if not found.
+    #[instrument(skip(self), fields(name = %name, sequence))]
+    pub async fn get_snapshot(
+        &self,
+        name: &str,
+        sequence: u64,
+    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, snapshot_s3_key(name, sequence));
+        let path = ObjectPath::from(key);
+        let result = self.object_store.get(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(response) => {
+                let bytes = response.bytes().await?;
+                Ok(Some(bytes.to_vec()))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// List snapshot sequence numbers for an export, sorted ascending.
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn list_snapshots(&self, name: &str) -> Result<Vec<u64>, ContentStoreError> {
+        self.check_circuit()?;
+        let prefix_str = format!("{}/snapshots/{}/", self.base_path, name);
+        let prefix = ObjectPath::from(prefix_str);
+        let mut sequences = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
+            if let Some(filename) = meta.location.filename() {
+                if let Ok(seq) = filename.parse::<u64>() {
+                    sequences.push(seq);
+                }
+            }
+        }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
+        sequences.sort_unstable();
+        Ok(sequences)
+    }
+
+    /// Delete a versioned snapshot manifest from S3 (idempotent).
+    #[instrument(skip(self), fields(name = %name, sequence))]
+    pub async fn delete_snapshot(
+        &self,
+        name: &str,
+        sequence: u64,
+    ) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, snapshot_s3_key(name, sequence));
+        let path = ObjectPath::from(key);
+        let result = self.object_store.delete(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Delete all snapshot manifests for an export (idempotent, best-effort).
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn delete_all_snapshots(&self, name: &str) -> Result<(), ContentStoreError> {
+        let sequences = self.list_snapshots(name).await?;
+        for seq in sequences {
+            if let Err(e) = self.delete_snapshot(name, seq).await {
+                tracing::warn!(
+                    name = %name, sequence = seq, error = %e,
+                    "failed to delete snapshot during cleanup (continuing)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect all pack IDs referenced by any snapshot manifest in this prefix.
+    ///
+    /// Called by GC to extend the live-pack set. Lists all objects under
+    /// `snapshots/`, fetches and parses each as a Manifest, and collects
+    /// referenced pack_ids.
+    pub async fn collect_snapshot_live_packs(
+        &self,
+    ) -> Result<std::collections::HashSet<Uuid>, ContentStoreError> {
+        let prefix_str = format!("{}/snapshots/", self.base_path);
+        let prefix = ObjectPath::from(prefix_str);
+        let mut live = std::collections::HashSet::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        let mut paths = Vec::new();
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(meta) => paths.push(meta.location),
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            }
+        }
+        for path in paths {
+            let data = match self.object_store.get(&path).await {
+                Ok(response) => match response.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(key = %path, error = %e, "failed to read snapshot manifest bytes");
+                        continue;
+                    }
+                },
+                Err(object_store::Error::NotFound { .. }) => continue,
+                Err(e) => {
+                    tracing::warn!(key = %path, error = %e, "failed to fetch snapshot manifest");
+                    continue;
+                }
+            };
+            match Manifest::deserialize(&data) {
+                Ok(m) => {
+                    for entry in &m.pack_index {
+                        live.insert(entry.pack_id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(key = %path, error = %e, "corrupt snapshot manifest, skipping");
+                }
+            }
+        }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
+        Ok(live)
+    }
+
+    // =========================================================================
+    // Effective manifest (base + delta merge)
+    // =========================================================================
 
     /// Fetch the effective manifest by merging base + optional delta.
     ///

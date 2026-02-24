@@ -504,7 +504,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, false, None)
+            .create_export(config, false, None, None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;
@@ -537,7 +537,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, false, Some(name))
+            .create_export(config, false, Some(name), None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;
@@ -556,7 +556,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, false, Some(name))
+            .create_export(config, false, Some(name), None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;
@@ -580,7 +580,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, false, Some(source_manifest))
+            .create_export(config, false, Some(source_manifest), None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;
@@ -599,7 +599,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, true, Some(source_manifest))
+            .create_export(config, true, Some(source_manifest), None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;

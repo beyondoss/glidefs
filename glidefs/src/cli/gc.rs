@@ -221,7 +221,7 @@ async fn discover_s3_prefixes(
         // Look for paths containing /manifests/ or /pack-registries/
         // Pattern: {db_path}/exports/{s3_prefix}/manifests/{name}
         // Pattern: {db_path}/exports/{s3_prefix}/pack-registries/{name}
-        for marker in &["/manifests/", "/pack-registries/"] {
+        for marker in &["/manifests/", "/pack-registries/", "/snapshots/"] {
             if let Some(pos) = path_str.find(marker) {
                 let base = &path_str[..pos];
                 if base.starts_with(&exports_prefix_str) || base.starts_with(db_path) {
@@ -283,6 +283,24 @@ async fn reconcile_prefix(
     if manifest_failed {
         warn!("skipping GC for prefix due to manifest errors — no packs will be deleted");
         return Ok(0);
+    }
+
+    // 1b. Extend live packs with references from versioned snapshot manifests.
+    //     If snapshot scanning fails, bail out to prevent false-positive deletions.
+    match content_store.collect_snapshot_live_packs().await {
+        Ok(snap_packs) => {
+            if !snap_packs.is_empty() {
+                info!(
+                    snapshot_packs = snap_packs.len(),
+                    "added snapshot-referenced packs to live set"
+                );
+            }
+            live_packs.extend(snap_packs);
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to scan snapshot manifests — treating all packs as live");
+            return Ok(0);
+        }
     }
 
     // 2. List all registries, parse, collect known pack IDs

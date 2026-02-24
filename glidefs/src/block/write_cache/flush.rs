@@ -432,18 +432,15 @@ impl WriteCache<Active> {
         Ok((stats, seq_cutpoint))
     }
 
-    /// Build and upload a full (base) manifest from current state.
+    /// Build a full manifest from current state.
     ///
-    /// After upload, populates `base_manifest_state` for future delta computation
-    /// and deletes any existing `.delta` file from S3.
-    ///
-    /// Returns the S3 ETag if the backend provides one.
-    async fn upload_full_manifest(
+    /// Returns the manifest and its serialized bytes. Does not perform any S3
+    /// operations or update internal state — that's done by `upload_full_manifest`.
+    fn build_manifest(
         &self,
-        content_store: &ContentStore,
         host_pack_index: &HostPackIndex,
         seq_cutpoint: u64,
-    ) -> Result<Option<String>, CacheError> {
+    ) -> Result<(Manifest, Vec<u8>), CacheError> {
         let chunk_size = self.inner.config.block_size as u32;
         let post_flush_snap = self.inner.block_map_snapshot();
         let block_map_entries: Vec<ManifestBlockEntry> = post_flush_snap
@@ -464,13 +461,30 @@ impl WriteCache<Active> {
             block_map: block_map_entries,
             pack_index: pack_entries,
         };
+        let bytes = manifest.serialize();
+        Ok((manifest, bytes))
+    }
+
+    /// Build and upload a full (base) manifest from current state.
+    ///
+    /// After upload, populates `base_manifest_state` for future delta computation
+    /// and deletes any existing `.delta` file from S3.
+    ///
+    /// Returns the S3 ETag if the backend provides one.
+    async fn upload_full_manifest(
+        &self,
+        content_store: &ContentStore,
+        host_pack_index: &HostPackIndex,
+        seq_cutpoint: u64,
+    ) -> Result<Option<String>, CacheError> {
+        let (manifest, bytes) = self.build_manifest(host_pack_index, seq_cutpoint)?;
 
         // Cache the manifest's pack hashes for pack index pruning.
         *self.inner.manifest_pack_hashes.lock() =
             manifest.pack_index.iter().map(|e| e.hash).collect();
 
         let etag = content_store
-            .put_manifest(&self.inner.export_name, manifest.serialize())
+            .put_manifest(&self.inner.export_name, bytes)
             .await?;
 
         // Update base_manifest_state for future delta computation.
@@ -866,6 +880,11 @@ impl WriteCache<Active> {
 
     /// Take a point-in-time snapshot: flush dirty blocks + upload manifest.
     ///
+    /// In addition to uploading the current manifest (overwriting `manifests/{name}`),
+    /// this persists a versioned copy at `snapshots/{name}/{sequence:020}` that is
+    /// never overwritten by background flushes. The control plane manages snapshot
+    /// lifecycle explicitly via list/delete APIs.
+    ///
     /// Returns the manifest ETag and sequence number for the control plane
     /// to use when creating a fork.
     #[instrument(skip(self, content_store, host_pack_index))]
@@ -880,6 +899,19 @@ impl WriteCache<Active> {
         let manifest_etag = self
             .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
             .await?;
+
+        // Persist a versioned snapshot (best-effort — current manifest is already safe).
+        let snapshot_bytes = self.build_manifest(host_pack_index, seq_cutpoint)?.1;
+        if let Err(e) = content_store
+            .put_snapshot(&self.inner.export_name, seq_cutpoint, snapshot_bytes)
+            .await
+        {
+            warn!(
+                error = %e, sequence = seq_cutpoint,
+                "failed to persist versioned snapshot (continuing)"
+            );
+        }
+
         self.update_registry(content_store, &stats.new_pack_ids)
             .await;
         self.checkpoint()?;

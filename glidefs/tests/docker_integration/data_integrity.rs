@@ -128,7 +128,7 @@ transport_test! {
         };
         let result = server2
             .router
-            .create_export(config, false, Some("vol1"))
+            .create_export(config, false, Some("vol1"), None)
             .await;
 
         assert!(result.is_err(), "corrupt manifest should be rejected");

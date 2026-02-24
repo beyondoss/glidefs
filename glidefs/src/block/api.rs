@@ -44,6 +44,9 @@ pub struct PutExportRequest {
     /// Block device transport: "nbd" (default) or "ublk" (Linux 6.0+).
     #[serde(default)]
     pub transport: Option<String>,
+    /// If set (with manifest_name), fork from this specific snapshot sequence.
+    #[serde(default)]
+    pub snapshot_sequence: Option<u64>,
 }
 
 /// Response for export info.
@@ -116,6 +119,21 @@ fn is_valid_export_name(name: &str) -> bool {
     let first = chars.next().unwrap();
     first.is_ascii_alphanumeric()
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Public test wrapper for `handle_request`.
+#[cfg(feature = "test-utils")]
+#[allow(dead_code)]
+pub async fn handle_request_for_test<B>(
+    router: Arc<ExportRouter>,
+    req: Request<B>,
+) -> Result<Response<BoxBody>, Infallible>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: std::fmt::Display,
+{
+    handle_request(router, req).await
 }
 
 /// Handle API requests.
@@ -255,6 +273,13 @@ where
                 ));
             }
 
+            if put_req.snapshot_sequence.is_some() && put_req.manifest_name.is_none() {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "snapshot_sequence requires manifest_name to be set",
+                ));
+            }
+
             // Check if export already exists
             let existing = router
                 .list_exports()
@@ -325,6 +350,7 @@ where
                             config.clone(),
                             put_req.readonly,
                             put_req.manifest_name.as_deref(),
+                            put_req.snapshot_sequence,
                         )
                         .await
                     {
@@ -414,6 +440,52 @@ where
                     &format!("Invalid export name '{}'", name),
                 ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/exports/{name}/snapshots - List snapshot sequences
+        (Method::GET, ["api", "exports", name, "snapshots"]) => {
+            match router.list_export_snapshots(name).await {
+                Ok(sequences) => json_response(StatusCode::OK, &sequences),
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}'", name),
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // DELETE /api/exports/{name}/snapshots/{sequence} - Delete a snapshot
+        (Method::DELETE, ["api", "exports", name, "snapshots", seq_str]) => {
+            match seq_str.parse::<u64>() {
+                Err(_) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    "snapshot sequence must be a valid u64",
+                ),
+                Ok(sequence) => match router.delete_export_snapshot(name, sequence).await {
+                    Ok(()) => json_response(
+                        StatusCode::OK,
+                        &ApiResponse::success(format!(
+                            "Snapshot seq={} deleted for '{}'",
+                            sequence, name
+                        )),
+                    ),
+                    Err(RouterError::ExportNotFound(name)) => error_response(
+                        StatusCode::NOT_FOUND,
+                        &format!("Export '{}' not found", name),
+                    ),
+                    Err(RouterError::InvalidExportName(_)) => error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid export name '{}'", name),
+                    ),
+                    Err(e) => {
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                    }
+                },
             }
         }
 
@@ -1037,6 +1109,73 @@ mod tests {
         let router = create_test_router(&temp);
         let resp = request(&router, Method::POST, "/api/exports/nope/snapshot", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_snapshot_invalid_sequence_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::DELETE,
+            "/api/exports/vol1/snapshots/not-a-number",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_api_fork_from_snapshot_sequence() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+
+        // Create source export
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/source",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        // Snapshot source
+        let resp = request(&router, Method::POST, "/api/exports/source/snapshot", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let snap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let seq = snap["sequence"].as_u64().unwrap();
+
+        // Fork from snapshot_sequence via API
+        let body = format!(
+            r#"{{"size_gb": 0.01, "s3_prefix": "source", "manifest_name": "source", "snapshot_sequence": {}}}"#,
+            seq
+        );
+        let resp = request(&router, Method::PUT, "/api/exports/fork1", Some(&body)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_api_snapshot_sequence_without_manifest_name_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp);
+
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "snapshot_sequence": 1}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // =========================================================================

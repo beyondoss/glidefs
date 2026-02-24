@@ -38,7 +38,7 @@ transport_test! {
             let manifest_name = config.name.clone();
             server2
                 .router
-                .create_export(config, false, Some(&manifest_name))
+                .create_export(config, false, Some(&manifest_name), None)
                 .await
                 .unwrap();
             // Register ublk device for discovered exports (no-op for NBD).

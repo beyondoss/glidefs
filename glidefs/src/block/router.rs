@@ -567,6 +567,7 @@ impl ExportRouter {
         config: ExportConfig,
         readonly: bool,
         manifest_name: Option<&str>,
+        snapshot_sequence: Option<u64>,
     ) -> Result<(), RouterError> {
         let name = config.name.clone();
         let orig_s3_prefix = config.s3_prefix.clone();
@@ -621,13 +622,34 @@ impl ExportRouter {
         };
 
         let cache = if let Some(manifest_name) = manifest_name {
-            // Fork path: load effective manifest (base + optional delta) from S3
-            let manifest = content_store
-                .get_effective_manifest(manifest_name)
-                .await?
-                .ok_or_else(|| {
-                    RouterError::Manifest(format!("manifest '{}' not found in S3", manifest_name))
-                })?;
+            // Fork path: load manifest from S3 (either from a specific snapshot or current state)
+            let manifest = if let Some(seq) = snapshot_sequence {
+                // Fork from a specific versioned snapshot
+                use crate::block::manifest::Manifest;
+                let data = content_store
+                    .get_snapshot(manifest_name, seq)
+                    .await?
+                    .ok_or_else(|| {
+                        RouterError::Manifest(format!(
+                            "snapshot '{}' seq={} not found in S3",
+                            manifest_name, seq
+                        ))
+                    })?;
+                Manifest::deserialize(&data).map_err(|e| {
+                    RouterError::Manifest(format!("failed to deserialize snapshot: {}", e))
+                })?
+            } else {
+                // Fork from current effective manifest (base + optional delta)
+                content_store
+                    .get_effective_manifest(manifest_name)
+                    .await?
+                    .ok_or_else(|| {
+                        RouterError::Manifest(format!(
+                            "manifest '{}' not found in S3",
+                            manifest_name
+                        ))
+                    })?
+            };
 
             // Populate pack index from manifest entries
             let batch: Vec<_> = manifest
@@ -851,6 +873,41 @@ impl ExportRouter {
             manifest_etag: result.manifest_etag,
             sequence: result.sequence,
         })
+    }
+
+    /// List snapshot sequence numbers for an export.
+    pub async fn list_export_snapshots(
+        &self,
+        name: &str,
+    ) -> Result<Vec<u64>, RouterError> {
+        validate_export_name(name)?;
+        let exports = self.exports.read().await;
+        let state = exports
+            .get(name)
+            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+        state
+            .content_store
+            .list_snapshots(name)
+            .await
+            .map_err(RouterError::ContentStore)
+    }
+
+    /// Delete a specific snapshot for an export (idempotent).
+    pub async fn delete_export_snapshot(
+        &self,
+        name: &str,
+        sequence: u64,
+    ) -> Result<(), RouterError> {
+        validate_export_name(name)?;
+        let exports = self.exports.read().await;
+        let state = exports
+            .get(name)
+            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+        state
+            .content_store
+            .delete_snapshot(name, sequence)
+            .await
+            .map_err(RouterError::ContentStore)
     }
 
     /// Get handler for an export (used during NBD negotiation).
@@ -1235,7 +1292,7 @@ impl ExportRouter {
             transport: Some(transport),
         };
 
-        self.create_export(config.clone(), readonly, Some(name))
+        self.create_export(config.clone(), readonly, Some(name), None)
             .await?;
         self.save_export(&config).await?;
 
@@ -1271,6 +1328,13 @@ impl ExportRouter {
 
         info!("Removing export '{}'...", name);
 
+        // Retain a handle to the content store for snapshot cleanup after teardown.
+        let snapshot_cs = if purge {
+            Some(Arc::clone(&state.content_store))
+        } else {
+            None
+        };
+
         // Remove kernel block device before teardown.
         #[cfg(target_os = "linux")]
         {
@@ -1296,6 +1360,13 @@ impl ExportRouter {
             // Also delete export definition from S3
             if let Err(e) = self.delete_export_definition(name).await {
                 warn!("Failed to delete export definition from S3: {}", e);
+            }
+
+            // Delete all versioned snapshots from S3 (best-effort).
+            if let Some(cs) = snapshot_cs {
+                if let Err(e) = cs.delete_all_snapshots(name).await {
+                    warn!("Failed to delete snapshots from S3: {}", e);
+                }
             }
         }
 
@@ -1519,7 +1590,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         let result = router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await;
         assert!(result.is_ok(), "Should create export successfully");
 
@@ -1535,11 +1606,11 @@ mod tests {
 
         // Create export twice
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
         let result = router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await;
 
         // Second create should succeed (idempotent)
@@ -1556,7 +1627,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), true, None)
+            .create_export(test_export_config("vol1"), true, None, None)
             .await
             .unwrap();
 
@@ -1571,7 +1642,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
 
@@ -1609,15 +1680,15 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
         router
-            .create_export(test_export_config("vol2"), true, None)
+            .create_export(test_export_config("vol2"), true, None, None)
             .await
             .unwrap();
         router
-            .create_export(test_export_config("vol3"), false, None)
+            .create_export(test_export_config("vol3"), false, None, None)
             .await
             .unwrap();
 
@@ -1636,7 +1707,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
 
@@ -1670,7 +1741,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
         assert_eq!(router.list_exports().await.len(), 1);
@@ -1700,7 +1771,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
 
@@ -1713,7 +1784,7 @@ mod tests {
 
         // Cache files should be deleted (we can verify by trying to re-create)
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
         // Should succeed without "file exists" errors
@@ -1726,7 +1797,7 @@ mod tests {
 
         // Create readonly export
         router
-            .create_export(test_export_config("vol1"), true, None)
+            .create_export(test_export_config("vol1"), true, None, None)
             .await
             .unwrap();
 
@@ -1759,7 +1830,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
 
@@ -1789,11 +1860,11 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
         router
-            .create_export(test_export_config("vol2"), false, None)
+            .create_export(test_export_config("vol2"), false, None, None)
             .await
             .unwrap();
 
@@ -1811,11 +1882,11 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
         router
-            .create_export(test_export_config("vol2"), false, None)
+            .create_export(test_export_config("vol2"), false, None, None)
             .await
             .unwrap();
 
@@ -1956,7 +2027,7 @@ mod tests {
         // Create export and persist to S3
         let config = test_export_config("auto-persist");
         router
-            .create_export(config.clone(), false, None)
+            .create_export(config.clone(), false, None, None)
             .await
             .unwrap();
         router.save_export(&config).await.unwrap();
@@ -1974,7 +2045,7 @@ mod tests {
         // Create export and persist
         let config = test_export_config("purge-vol");
         router
-            .create_export(config.clone(), false, None)
+            .create_export(config.clone(), false, None, None)
             .await
             .unwrap();
         router.save_export(&config).await.unwrap();
@@ -2001,7 +2072,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("snap-vol"), false, None)
+            .create_export(test_export_config("snap-vol"), false, None, None)
             .await
             .unwrap();
 
@@ -2045,7 +2116,7 @@ mod tests {
 
         // Create source export and write data
         router
-            .create_export(test_export_config("source"), false, None)
+            .create_export(test_export_config("source"), false, None, None)
             .await
             .unwrap();
         let handler = router.get_handler("source").await.unwrap();
@@ -2067,7 +2138,7 @@ mod tests {
             transport: None,
         };
         router
-            .create_export(fork_config, false, Some("source"))
+            .create_export(fork_config, false, Some("source"), None)
             .await
             .unwrap();
 
@@ -2088,7 +2159,7 @@ mod tests {
 
         // Create and snapshot source
         router
-            .create_export(test_export_config("src"), false, None)
+            .create_export(test_export_config("src"), false, None, None)
             .await
             .unwrap();
         let src_handler = router.get_handler("src").await.unwrap();
@@ -2106,7 +2177,7 @@ mod tests {
             transport: None,
         };
         router
-            .create_export(fork_config, false, Some("src"))
+            .create_export(fork_config, false, Some("src"), None)
             .await
             .unwrap();
 
@@ -2130,6 +2201,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fork_reads_unmodified_parent_blocks() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir);
+
+        // Create source and write two blocks
+        router
+            .create_export(test_export_config("src"), false, None, None)
+            .await
+            .unwrap();
+        let src_handler = router.get_handler("src").await.unwrap();
+        src_handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
+        src_handler
+            .write(128 * 1024, &[0xBB; 128 * 1024], false)
+            .unwrap();
+        router.snapshot_export("src").await.unwrap();
+
+        // Fork
+        let fork_config = ExportConfig {
+            name: "fork-read".to_string(),
+            size_gb: 0.01,
+            s3_prefix: Some("src".to_string()),
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router
+            .create_export(fork_config, false, Some("src"), None)
+            .await
+            .unwrap();
+
+        // Read both blocks from fork WITHOUT writing anything to the fork
+        let fork_handler = router.get_handler("fork-read").await.unwrap();
+        let block0 = fork_handler.read(0, 128 * 1024).await.unwrap();
+        assert!(
+            block0.iter().all(|&b| b == 0xAA),
+            "fork should transparently serve parent's block 0"
+        );
+        let block1 = fork_handler.read(128 * 1024, 128 * 1024).await.unwrap();
+        assert!(
+            block1.iter().all(|&b| b == 0xBB),
+            "fork should transparently serve parent's block 1"
+        );
+    }
+
+    #[tokio::test]
     async fn test_fork_from_missing_manifest() {
         let temp_dir = TempDir::new().unwrap();
         let router = create_test_router(&temp_dir);
@@ -2145,7 +2262,7 @@ mod tests {
         };
 
         let result = router
-            .create_export(config, false, Some("does-not-exist"))
+            .create_export(config, false, Some("does-not-exist"), None)
             .await;
         assert!(result.is_err(), "Fork from missing manifest should fail");
     }
@@ -2160,7 +2277,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
 
@@ -2181,7 +2298,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
 
@@ -2196,7 +2313,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
 
@@ -2232,7 +2349,7 @@ mod tests {
 
         // Create source, write data, snapshot
         router
-            .create_export(test_export_config("parent"), false, None)
+            .create_export(test_export_config("parent"), false, None, None)
             .await
             .unwrap();
         let parent_handler = router.get_handler("parent").await.unwrap();
@@ -2250,7 +2367,7 @@ mod tests {
             transport: None,
         };
         router
-            .create_export(fork_config, false, Some("parent"))
+            .create_export(fork_config, false, Some("parent"), None)
             .await
             .unwrap();
 
@@ -2296,7 +2413,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("resize-vol"), false, None)
+            .create_export(test_export_config("resize-vol"), false, None, None)
             .await
             .unwrap();
 
@@ -2344,7 +2461,7 @@ mod tests {
 
         // Create as readonly
         router
-            .create_export(test_export_config("ro-resize"), true, None)
+            .create_export(test_export_config("ro-resize"), true, None, None)
             .await
             .unwrap();
 
@@ -2370,7 +2487,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("retry-vol"), false, None)
+            .create_export(test_export_config("retry-vol"), false, None, None)
             .await
             .unwrap();
         let handler = router.get_handler("retry-vol").await.unwrap();
@@ -2416,7 +2533,7 @@ mod tests {
         let router = create_test_router(&temp_dir);
 
         router
-            .create_export(test_export_config("resize-dirty"), false, None)
+            .create_export(test_export_config("resize-dirty"), false, None, None)
             .await
             .unwrap();
 
@@ -2542,7 +2659,7 @@ mod tests {
             flush_mode: Some("manual".to_string()),
             transport: None,
         };
-        router.create_export(config, false, None).await.unwrap();
+        router.create_export(config, false, None, None).await.unwrap();
 
         // Write many blocks — well above DEFAULT_BLOCKS_PER_PACK
         let handler = router.get_handler("manual-vm").await.unwrap();
@@ -2590,7 +2707,7 @@ mod tests {
             flush_mode: Some("manual".to_string()),
             transport: None,
         };
-        router.create_export(config, false, None).await.unwrap();
+        router.create_export(config, false, None, None).await.unwrap();
 
         // Write some dirty blocks
         let handler = router.get_handler("manual-pressure").await.unwrap();
@@ -2695,7 +2812,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let router = create_test_router(&temp_dir);
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
 
@@ -2709,7 +2826,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let router = create_test_router(&temp_dir);
         router
-            .create_export(test_export_config("vol1"), false, None)
+            .create_export(test_export_config("vol1"), false, None, None)
             .await
             .unwrap();
 
@@ -2727,7 +2844,7 @@ mod tests {
         // Create export with explicit transport
         let mut config = test_export_config("vol1");
         config.transport = Some("nbd".to_string());
-        router.create_export(config, false, None).await.unwrap();
+        router.create_export(config, false, None, None).await.unwrap();
 
         // Resize (internally removes + recreates)
         router.resize_export("vol1", 0.02).await.unwrap();

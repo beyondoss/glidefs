@@ -124,7 +124,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                     let router = Arc::clone(&router);
                     async move {
                         let name = config.name.clone();
-                        match router.create_export(config, false, None).await {
+                        match router.create_export(config, false, None, None).await {
                             Ok(()) => {
                                 info!("Restored export '{}'", name);
                                 1
@@ -170,7 +170,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                     let name = config.name.clone();
                     info!("Loading static export '{}' ({}GB)", name, config.size_gb);
                     router
-                        .create_export(config.clone(), false, None)
+                        .create_export(config.clone(), false, None, None)
                         .await
                         .with_context(|| format!("Failed to create export '{}'", name))?;
                     if let Err(e) = router.save_export(&config).await {

@@ -514,6 +514,13 @@ pub fn delta_manifest_s3_key(name: &str) -> String {
     format!("manifests/{name}.delta")
 }
 
+/// Generate S3 key for a versioned snapshot: "snapshots/{name}/{sequence:020}"
+///
+/// Zero-padded to 20 digits so S3 LIST returns lexicographic = numeric order.
+pub fn snapshot_s3_key(name: &str, sequence: u64) -> String {
+    format!("snapshots/{name}/{sequence:020}")
+}
+
 // ============================================================================
 // Boot Hot Set — list of chunk indices needed during boot
 // ============================================================================
