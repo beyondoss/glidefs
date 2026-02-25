@@ -507,24 +507,42 @@ impl ExportRouter {
     ///
     /// Does NOT free SSD space — data files retain physical allocation.
     /// Purpose: ensure data reaches S3 (portability) before potential disk full.
+    ///
+    /// Acquires the per-export `flush_lock` via `try_lock` to serialize with
+    /// the flush scheduler and drain paths. Skips exports where a flush is
+    /// already in progress. Syncs the manifest after flushing so uploaded
+    /// packs are always referenced (prevents orphaned packs on crash).
     pub async fn pressure_flush(&self) {
-        let exports = self.exports.read().await;
-        let mut targets: Vec<_> = exports
-            .iter()
-            .filter(|(_, s)| s.cache.dirty_block_count() > 0)
-            .collect();
-        targets.sort_by(|a, b| {
-            b.1.cache
-                .dirty_block_count()
-                .cmp(&a.1.cache.dirty_block_count())
-        });
-        for (name, state) in targets.iter().take(8) {
-            match state
-                .cache
-                .flush_packs(&state.content_store, &state.chunk_meta_cache, &state.volume_manifest)
-                .await
-            {
+        // Clone Arc'd components under read lock, then release it so we don't
+        // block export lifecycle operations (create/remove/shutdown) during flush.
+        let mut targets: Vec<_> = {
+            let exports = self.exports.read().await;
+            exports
+                .iter()
+                .filter(|(_, s)| s.cache.dirty_block_count() > 0)
+                .map(|(name, s)| {
+                    (
+                        name.clone(),
+                        s.cache.dirty_block_count(),
+                        Arc::clone(&s.cache),
+                        Arc::clone(&s.content_store),
+                        Arc::clone(&s.chunk_meta_cache),
+                        Arc::clone(&s.volume_manifest),
+                    )
+                })
+                .collect()
+        };
+        targets.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, _, cache, cs, cmc, vm) in targets.iter().take(8) {
+            // Skip exports already being flushed (drain, snapshot, scheduler).
+            let Ok(_flush_guard) = cache.flush_lock().try_lock() else {
+                continue;
+            };
+            match cache.flush_packs(cs, cmc, vm).await {
                 Ok((stats, _)) if stats.packs_uploaded > 0 => {
+                    if let Err(e) = cache.sync_manifest(cs, vm).await {
+                        warn!(export = %name, error = %e, "pressure flush manifest sync failed");
+                    }
                     info!(export = %name, packs = stats.packs_uploaded, "pressure flush");
                 }
                 Err(e) => warn!(export = %name, error = %e, "pressure flush failed"),
@@ -910,15 +928,25 @@ impl ExportRouter {
         if let Some(t) = tag {
             validate_export_name(t)?;
         }
-        let exports = self.exports.read().await;
-        let state = exports
-            .get(name)
-            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+
+        // Clone Arc'd components under read lock, then release it so we don't
+        // block export lifecycle operations (create/remove/shutdown) during flush.
+        let (cache, content_store, chunk_meta_cache, volume_manifest) = {
+            let exports = self.exports.read().await;
+            let state = exports
+                .get(name)
+                .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            (
+                Arc::clone(&state.cache),
+                Arc::clone(&state.content_store),
+                Arc::clone(&state.chunk_meta_cache),
+                Arc::clone(&state.volume_manifest),
+            )
+        };
 
         info!("Taking snapshot of export '{}'...", name);
-        let result: SnapshotResult = state
-            .cache
-            .snapshot(&state.content_store, &state.chunk_meta_cache, &state.volume_manifest)
+        let result: SnapshotResult = cache
+            .snapshot(&content_store, &chunk_meta_cache, &volume_manifest)
             .await
             .map_err(RouterError::Cache)?;
 
@@ -929,9 +957,8 @@ impl ExportRouter {
 
         // If a tag was provided, publish the manifest under that name too.
         if let Some(tag) = tag {
-            let manifest_bytes = state.volume_manifest.read().serialize();
-            state
-                .content_store
+            let manifest_bytes = volume_manifest.read().serialize();
+            content_store
                 .put_manifest(tag, manifest_bytes)
                 .await
                 .map_err(RouterError::ContentStore)?;

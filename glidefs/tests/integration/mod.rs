@@ -9,6 +9,7 @@
 mod chunk_prefetch;
 mod crash_recovery;
 mod failure_injection;
+mod flush_safety;
 mod gc;
 mod property_tests;
 mod snapshots;
