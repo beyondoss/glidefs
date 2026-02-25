@@ -25,8 +25,8 @@ async fn test_wake_from_different_node() {
 
     // === NODE A: Write data and flush to S3 ===
     let node_a_dir = TempDir::new().unwrap();
-    let (cache_a, content_store_a, pack_index_a, clean_cache_a, _metrics_a) =
-        create_v2_test_cache(&node_a_dir, "vol1", Arc::clone(&s3) as _);
+    let (cache_a, content_store_a, chunk_meta_cache_a, volume_manifest_a, clean_cache_a, _metrics_a) =
+        create_v2_test_cache(&node_a_dir, "vol1", Arc::clone(&s3) as _).await;
 
     // Write test pattern: blocks 0, 1, 5 with distinct data
     let block_0_data: Vec<u8> = (0..128 * 1024).map(|i| (i % 256) as u8).collect();
@@ -39,7 +39,7 @@ async fn test_wake_from_different_node() {
 
     // Flush to S3 (simulates graceful shutdown)
     cache_a
-        .flush_to_s3(&content_store_a, &pack_index_a)
+        .flush_to_s3(&content_store_a, &chunk_meta_cache_a, &volume_manifest_a)
         .await
         .unwrap();
 
@@ -48,9 +48,9 @@ async fn test_wake_from_different_node() {
     drop(node_a_dir);
 
     // === NODE B: Fresh node with empty cache, same S3 ===
-    // Cold reader: block_map and pack_index are populated from the S3 manifest
+    // Cold reader: volume_manifest is populated from the S3 manifest
     let node_b_dir = TempDir::new().unwrap();
-    let (cache_b, content_store_b, pack_index_b, clean_cache_b, metrics_b) =
+    let (cache_b, content_store_b, chunk_meta_cache_b, volume_manifest_b, clean_cache_b, metrics_b) =
         create_v2_cold_reader(&node_b_dir, "vol1", Arc::clone(&s3) as _).await;
 
     // Read data - should fetch from S3 (read-through)
@@ -59,7 +59,8 @@ async fn test_wake_from_different_node() {
             0,
             128 * 1024,
             clean_cache_b.as_ref(),
-            &pack_index_b,
+            &chunk_meta_cache_b,
+            &volume_manifest_b,
             &content_store_b,
             &metrics_b,
         )
@@ -70,7 +71,8 @@ async fn test_wake_from_different_node() {
             128 * 1024,
             128 * 1024,
             clean_cache_b.as_ref(),
-            &pack_index_b,
+            &chunk_meta_cache_b,
+            &volume_manifest_b,
             &content_store_b,
             &metrics_b,
         )
@@ -81,7 +83,8 @@ async fn test_wake_from_different_node() {
             5 * 128 * 1024,
             128 * 1024,
             clean_cache_b.as_ref(),
-            &pack_index_b,
+            &chunk_meta_cache_b,
+            &volume_manifest_b,
             &content_store_b,
             &metrics_b,
         )
@@ -106,16 +109,17 @@ async fn test_wake_from_different_node() {
 async fn test_unwritten_blocks_return_zeros() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, metrics) =
-        create_v2_test_cache(&temp_dir, "sparse", Arc::clone(&s3) as _);
+    let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, metrics) =
+        create_v2_test_cache(&temp_dir, "sparse", Arc::clone(&s3) as _).await;
 
-    // Read block 50 (within 10MB device) that was never written
+    // Read block 50 (within 256MB device) that was never written
     let data = cache
         .read_v2(
             50 * 128 * 1024,
             128 * 1024,
             clean_cache.as_ref(),
-            &pack_index,
+            &chunk_meta_cache,
+            &volume_manifest,
             &content_store,
             &metrics,
         )
@@ -136,21 +140,21 @@ async fn test_unwritten_blocks_return_zeros() {
 async fn test_cache_hit_on_second_read() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        create_v2_test_cache(&temp_dir, "vol1", Arc::clone(&s3) as _);
+    let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, _metrics) =
+        create_v2_test_cache(&temp_dir, "vol1", Arc::clone(&s3) as _).await;
 
     // Write some data
     let data: Vec<u8> = (0..128 * 1024).map(|i| (i % 256) as u8).collect();
     cache.write(0, &data, clean_cache.as_ref()).unwrap();
     cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
         .await
         .unwrap();
 
-    // Create cold reader from manifest (block_map populated from S3)
+    // Create cold reader from manifest (volume_manifest populated from S3)
     drop(cache);
     let temp_dir2 = TempDir::new().unwrap();
-    let (cache2, content_store2, pack_index2, clean_cache2, metrics2) =
+    let (cache2, content_store2, chunk_meta_cache2, volume_manifest2, clean_cache2, metrics2) =
         create_v2_cold_reader(&temp_dir2, "vol1", Arc::clone(&s3) as _).await;
 
     // First read - fetches from S3, populates clean_cache
@@ -159,7 +163,8 @@ async fn test_cache_hit_on_second_read() {
             0,
             128 * 1024,
             clean_cache2.as_ref(),
-            &pack_index2,
+            &chunk_meta_cache2,
+            &volume_manifest2,
             &content_store2,
             &metrics2,
         )
@@ -173,7 +178,8 @@ async fn test_cache_hit_on_second_read() {
             0,
             128 * 1024,
             clean_cache2.as_ref(),
-            &pack_index2,
+            &chunk_meta_cache2,
+            &volume_manifest2,
             &content_store2,
             &metrics2,
         )
@@ -197,22 +203,22 @@ async fn test_batch_prefetch_optimization() {
 
     // Write blocks 0-9 (all in same batch)
     let writer_dir = TempDir::new().unwrap();
-    let (writer_cache, writer_content_store, writer_pack_index, writer_clean_cache, _) =
-        create_v2_test_cache(&writer_dir, "vol1", Arc::clone(&s3) as _);
+    let (writer_cache, writer_content_store, writer_chunk_meta_cache, writer_volume_manifest, writer_clean_cache, _) =
+        create_v2_test_cache(&writer_dir, "vol1", Arc::clone(&s3) as _).await;
 
     for i in 0..10u64 {
         let data: Vec<u8> = vec![i as u8; 128 * 1024];
         writer_cache.write(i * 128 * 1024, &data, writer_clean_cache.as_ref()).unwrap();
     }
     writer_cache
-        .flush_to_s3(&writer_content_store, &writer_pack_index)
+        .flush_to_s3(&writer_content_store, &writer_chunk_meta_cache, &writer_volume_manifest)
         .await
         .unwrap();
     drop(writer_cache);
 
     // Cold reader from manifest
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+    let (reader_cache, reader_content_store, reader_chunk_meta_cache, reader_volume_manifest, reader_clean_cache, reader_metrics) =
         create_v2_cold_reader(&reader_dir, "vol1", Arc::clone(&s3) as _).await;
 
     // Read all 10 blocks and verify data integrity
@@ -222,7 +228,8 @@ async fn test_batch_prefetch_optimization() {
                 i * 128 * 1024,
                 128 * 1024,
                 reader_clean_cache.as_ref(),
-                &reader_pack_index,
+                &reader_chunk_meta_cache,
+                &reader_volume_manifest,
                 &reader_content_store,
                 &reader_metrics,
             )
@@ -257,8 +264,8 @@ async fn test_recovery_after_pack_flush_without_drain() {
 
     // === NODE A: Write data, flush packs + sync manifest (no drain) ===
     let node_a_dir = TempDir::new().unwrap();
-    let (cache_a, content_store_a, pack_index_a, clean_cache_a, _metrics_a) =
-        create_v2_test_cache(&node_a_dir, "vol1", Arc::clone(&s3));
+    let (cache_a, content_store_a, chunk_meta_cache_a, volume_manifest_a, clean_cache_a, _metrics_a) =
+        create_v2_test_cache(&node_a_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write 3 blocks with distinct patterns
     let block_0_data: Vec<u8> = vec![0xAA; BLOCK_SIZE];
@@ -273,14 +280,14 @@ async fn test_recovery_after_pack_flush_without_drain() {
     // Critically, we do NOT call flush_to_s3 or drain — this is what happens
     // when the host dies after the scheduler fires but before drain.
     let (stats, seq_cutpoint) = cache_a
-        .flush_packs(&content_store_a, &pack_index_a)
+        .flush_packs(&content_store_a, &chunk_meta_cache_a, &volume_manifest_a)
         .await
         .unwrap();
     assert!(stats.packs_uploaded > 0, "should have uploaded packs");
 
     // sync_manifest: this is the fix — without it, cold wake would lose data
     cache_a
-        .sync_manifest(&content_store_a, &pack_index_a, seq_cutpoint)
+        .sync_manifest(&content_store_a, &volume_manifest_a, seq_cutpoint)
         .await
         .unwrap();
 
@@ -290,20 +297,20 @@ async fn test_recovery_after_pack_flush_without_drain() {
 
     // === NODE B: Cold wake from S3 manifest (different host, empty cache) ===
     let node_b_dir = TempDir::new().unwrap();
-    let (cache_b, content_store_b, pack_index_b, clean_cache_b, metrics_b) =
+    let (cache_b, content_store_b, chunk_meta_cache_b, volume_manifest_b, clean_cache_b, metrics_b) =
         create_v2_cold_reader(&node_b_dir, "vol1", Arc::clone(&s3)).await;
 
     // Read all 3 blocks — should succeed via S3 read-through
     let read_0 = cache_b
-        .read_v2(0, BLOCK_SIZE, clean_cache_b.as_ref(), &pack_index_b, &content_store_b, &metrics_b)
+        .read_v2(0, BLOCK_SIZE, clean_cache_b.as_ref(), &chunk_meta_cache_b, &volume_manifest_b, &content_store_b, &metrics_b)
         .await
         .unwrap();
     let read_1 = cache_b
-        .read_v2(BLOCK_SIZE as u64, BLOCK_SIZE, clean_cache_b.as_ref(), &pack_index_b, &content_store_b, &metrics_b)
+        .read_v2(BLOCK_SIZE as u64, BLOCK_SIZE, clean_cache_b.as_ref(), &chunk_meta_cache_b, &volume_manifest_b, &content_store_b, &metrics_b)
         .await
         .unwrap();
     let read_2 = cache_b
-        .read_v2(2 * BLOCK_SIZE as u64, BLOCK_SIZE, clean_cache_b.as_ref(), &pack_index_b, &content_store_b, &metrics_b)
+        .read_v2(2 * BLOCK_SIZE as u64, BLOCK_SIZE, clean_cache_b.as_ref(), &chunk_meta_cache_b, &volume_manifest_b, &content_store_b, &metrics_b)
         .await
         .unwrap();
 

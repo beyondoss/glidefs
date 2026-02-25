@@ -1,9 +1,9 @@
 //! Garbage collection CLI command.
 //!
 //! Identifies and deletes orphaned packs in S3. Operates by comparing
-//! pack registries (what packs exist) against manifests (what packs are live).
-//! Packs referenced by no manifest are dead and eligible for deletion after
-//! a grace period.
+//! known packs (listed from S3) against live packs (referenced by volume
+//! manifests and their chunk metas). Packs referenced by no manifest are
+//! dead and eligible for deletion after a grace period.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -15,8 +15,9 @@ use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::block::chunk_meta::ChunkMeta;
 use crate::block::content_store::ContentStore;
-use crate::block::pack_registry::PackRegistry;
+use crate::block::volume_manifest::VolumeManifest;
 use crate::config::Settings;
 use crate::parse_object_store::parse_url_opts;
 
@@ -26,7 +27,7 @@ use crate::parse_object_store::parse_url_opts;
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct GcState {
-    /// Pack ID (UUID string) → first-seen-dead ISO 8601 timestamp.
+    /// Pack ID (UUID string) -> first-seen-dead ISO 8601 timestamp.
     pub(crate) dead_packs: HashMap<String, String>,
 }
 
@@ -87,14 +88,11 @@ struct GcStats {
     prefixes_scanned: usize,
     manifests_scanned: usize,
     manifest_errors: usize,
-    registries_scanned: usize,
     live_packs: usize,
     known_packs: usize,
     dead_found: usize,
     eligible_for_deletion: usize,
     packs_deleted: usize,
-    registries_compacted: usize,
-    registries_deleted: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +143,7 @@ pub async fn run_gc(
     let mut state = GcState::load(&state_file)?;
     let mut stats = GcStats::default();
 
-    // Discover all S3 prefixes that contain manifests or registries
+    // Discover all S3 prefixes that contain manifests or chunks
     let prefixes = discover_s3_prefixes(&*object_store, &db_path).await?;
     info!(count = prefixes.len(), "discovered S3 prefixes");
 
@@ -184,14 +182,11 @@ pub async fn run_gc(
     println!("Prefixes scanned:        {}", stats.prefixes_scanned);
     println!("Manifests scanned:       {}", stats.manifests_scanned);
     println!("Manifest parse errors:   {}", stats.manifest_errors);
-    println!("Registries scanned:      {}", stats.registries_scanned);
     println!("Live packs:              {}", stats.live_packs);
-    println!("Known packs (registry):  {}", stats.known_packs);
+    println!("Known packs:             {}", stats.known_packs);
     println!("Dead packs found:        {}", stats.dead_found);
     println!("Eligible for deletion:   {}", stats.eligible_for_deletion);
     println!("Packs deleted:           {}", stats.packs_deleted);
-    println!("Registries compacted:    {}", stats.registries_compacted);
-    println!("Registries deleted:      {}", stats.registries_deleted);
 
     Ok(())
 }
@@ -201,7 +196,7 @@ pub async fn run_gc(
 // ---------------------------------------------------------------------------
 
 /// Discover all unique S3 prefixes under `{db_path}/exports/` that contain
-/// manifests or pack-registries.
+/// manifests, chunks, or snapshots.
 async fn discover_s3_prefixes(
     object_store: &dyn object_store::ObjectStore,
     db_path: &str,
@@ -218,10 +213,8 @@ async fn discover_s3_prefixes(
         let meta = result?;
         let path_str = meta.location.to_string();
 
-        // Look for paths containing /manifests/ or /pack-registries/
-        // Pattern: {db_path}/exports/{s3_prefix}/manifests/{name}
-        // Pattern: {db_path}/exports/{s3_prefix}/pack-registries/{name}
-        for marker in &["/manifests/", "/pack-registries/", "/snapshots/"] {
+        // Look for paths containing /manifests/, /chunks/, or /snapshots/
+        for marker in &["/manifests/", "/chunks/", "/snapshots/"] {
             if let Some(pos) = path_str.find(marker) {
                 let base = &path_str[..pos];
                 if base.starts_with(&exports_prefix_str) || base.starts_with(db_path) {
@@ -234,6 +227,52 @@ async fn discover_s3_prefixes(
     let mut result: Vec<String> = prefixes.into_iter().collect();
     result.sort();
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Collect live packs from a VolumeManifest
+// ---------------------------------------------------------------------------
+
+/// Resolve all pack IDs referenced by a VolumeManifest by fetching and parsing
+/// each chunk's ChunkMeta.
+async fn collect_packs_from_volume_manifest(
+    content_store: &ContentStore,
+    vm: &VolumeManifest,
+) -> Result<HashSet<Uuid>, anyhow::Error> {
+    let mut packs = HashSet::new();
+    for (&chunk_idx, chunk_hash_hex) in &vm.chunks {
+        match content_store.get_chunk_meta(chunk_idx, chunk_hash_hex).await {
+            Ok(Some(meta_bytes)) => match ChunkMeta::deserialize(&meta_bytes) {
+                Ok(meta) => {
+                    packs.extend(meta.pack_ids());
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "corrupt chunk meta for chunk {} hash {}: {}",
+                        chunk_idx,
+                        chunk_hash_hex,
+                        e
+                    );
+                }
+            },
+            Ok(None) => {
+                warn!(
+                    chunk_idx,
+                    chunk_hash = %chunk_hash_hex,
+                    "chunk meta not found (may have been cleaned up)"
+                );
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "failed to fetch chunk meta for chunk {} hash {}: {}",
+                    chunk_idx,
+                    chunk_hash_hex,
+                    e
+                );
+            }
+        }
+    }
+    Ok(packs)
 }
 
 // ---------------------------------------------------------------------------
@@ -251,34 +290,45 @@ async fn reconcile_prefix(
     max_deletes: usize,
     dry_run: bool,
 ) -> Result<usize> {
-    // 1. List all manifests, load effective (base + optional delta), collect live pack IDs.
-    //    list_all_manifests() filters .delta and .hot-set files, returning only base names.
-    //    get_effective_manifest() merges base + delta, producing a conservative union of
-    //    all referenced packs — safe for GC liveness.
+    // 1. Discover live packs from all manifests (VolumeManifest -> ChunkMeta -> pack_ids).
     let mut live_packs: HashSet<Uuid> = HashSet::new();
     let manifest_names = content_store.list_all_manifests().await?;
     let mut manifest_failed = false;
 
     for name in &manifest_names {
-        match content_store.get_effective_manifest(name).await {
-            Ok(Some(manifest)) => {
-                for entry in &manifest.pack_index {
-                    live_packs.insert(entry.pack_id);
+        match content_store.get_volume_manifest(name).await {
+            Ok(Some(data)) => match VolumeManifest::deserialize(&data) {
+                Ok(vm) => {
+                    match collect_packs_from_volume_manifest(content_store, &vm).await {
+                        Ok(packs) => {
+                            live_packs.extend(packs);
+                            stats.manifests_scanned += 1;
+                        }
+                        Err(e) => {
+                            warn!(manifest = %name, error = %e, "failed to resolve chunk metas — treating all packs in prefix as live");
+                            stats.manifest_errors += 1;
+                            manifest_failed = true;
+                        }
+                    }
                 }
-                stats.manifests_scanned += 1;
-            }
+                Err(e) => {
+                    warn!(manifest = %name, error = %e, "failed to parse volume manifest — treating all packs in prefix as live");
+                    stats.manifest_errors += 1;
+                    manifest_failed = true;
+                }
+            },
             Ok(None) => {
                 warn!(manifest = %name, "manifest disappeared during GC");
             }
             Err(e) => {
-                warn!(manifest = %name, error = %e, "failed to fetch/parse manifest — treating all packs in prefix as live");
+                warn!(manifest = %name, error = %e, "failed to fetch manifest — treating all packs in prefix as live");
                 stats.manifest_errors += 1;
                 manifest_failed = true;
             }
         }
     }
 
-    // If any manifest failed to parse, we cannot determine liveness accurately.
+    // If any manifest failed to parse/resolve, we cannot determine liveness accurately.
     // Skip this prefix entirely to avoid deleting packs that might be live.
     if manifest_failed {
         warn!("skipping GC for prefix due to manifest errors — no packs will be deleted");
@@ -303,36 +353,21 @@ async fn reconcile_prefix(
         }
     }
 
-    // 2. List all registries, parse, collect known pack IDs
+    // 2. Discover known packs by listing all .pack files in S3 (chunk packs + legacy flat packs).
+    //    This replaces the old registry-based approach.
+    let all_known = content_store.list_all_known_packs().await?;
     let mut known_packs: HashSet<Uuid> = HashSet::new();
-    let mut registry_data: Vec<(String, PackRegistry)> = Vec::new();
-    let registry_names = content_store.list_registries().await?;
-
-    for name in &registry_names {
-        match content_store.get_registry(name).await {
-            Ok(Some(data)) => match PackRegistry::deserialize(&data) {
-                Ok(reg) => {
-                    known_packs.extend(&reg.pack_ids);
-                    registry_data.push((name.clone(), reg));
-                    stats.registries_scanned += 1;
-                }
-                Err(e) => {
-                    warn!(registry = %name, error = %e, "skipping corrupt registry");
-                }
-            },
-            Ok(None) => {
-                warn!(registry = %name, "registry disappeared during GC");
-            }
-            Err(e) => {
-                warn!(registry = %name, error = %e, "failed to fetch registry");
-            }
-        }
+    // Track chunk_idx for each pack so we can delete from the right location.
+    let mut pack_locations: HashMap<Uuid, u32> = HashMap::new();
+    for (chunk_idx, pack_id) in &all_known {
+        known_packs.insert(*pack_id);
+        pack_locations.insert(*pack_id, *chunk_idx);
     }
 
     stats.live_packs += live_packs.len();
     stats.known_packs += known_packs.len();
 
-    // 3. Compute dead packs
+    // 3. Compute dead packs = known - live
     let dead_packs: HashSet<Uuid> = known_packs.difference(&live_packs).copied().collect();
     stats.dead_found += dead_packs.len();
 
@@ -360,16 +395,22 @@ async fn reconcile_prefix(
 
     // 6. Delete eligible packs (capped)
     let to_delete: Vec<Uuid> = eligible.into_iter().take(max_deletes).collect();
-    let mut deleted_set: HashSet<Uuid> = HashSet::new();
 
     for &pack_id in &to_delete {
         if dry_run {
             info!(pack_id = %pack_id, "would delete orphaned pack (dry-run)");
         } else {
-            match content_store.delete_pack(pack_id).await {
+            let chunk_idx = pack_locations.get(&pack_id).copied().unwrap_or(u32::MAX);
+            let result = if chunk_idx == u32::MAX {
+                // Legacy flat pack
+                content_store.delete_pack(pack_id).await
+            } else {
+                // Chunk-scoped pack
+                content_store.delete_chunk_pack(chunk_idx, pack_id).await
+            };
+            match result {
                 Ok(()) => {
                     state.mark_deleted(&pack_id);
-                    deleted_set.insert(pack_id);
                     stats.packs_deleted += 1;
                 }
                 Err(e) => {
@@ -381,73 +422,6 @@ async fn reconcile_prefix(
 
     if dry_run {
         stats.packs_deleted += to_delete.len();
-    }
-
-    // 7. Compact registries: remove deleted pack IDs
-    if !deleted_set.is_empty() || dry_run {
-        let remove_set = if dry_run {
-            to_delete.iter().copied().collect::<HashSet<_>>()
-        } else {
-            deleted_set.clone()
-        };
-
-        for (name, mut reg) in registry_data {
-            let before = reg.pack_ids.len();
-            reg.compact(&remove_set);
-            let after = reg.pack_ids.len();
-
-            if before != after {
-                if !dry_run {
-                    if reg.is_empty() {
-                        // Check if the export still has a manifest
-                        let has_manifest = manifest_names.contains(&name);
-                        if !has_manifest {
-                            // No manifest = deleted VM, delete empty registry
-                            if let Err(e) = content_store.delete_registry(&name).await {
-                                warn!(registry = %name, error = %e, "failed to delete empty registry");
-                            } else {
-                                stats.registries_deleted += 1;
-                            }
-                            continue;
-                        }
-                    }
-                    if let Err(e) = content_store.put_registry(&name, reg.serialize()).await {
-                        warn!(registry = %name, error = %e, "failed to compact registry");
-                    } else {
-                        stats.registries_compacted += 1;
-                    }
-                } else {
-                    stats.registries_compacted += 1;
-                }
-            }
-        }
-    }
-
-    // 8. Delete registries for VMs that no longer have manifests and no packs left
-    //    (even if no packs were deleted this run)
-    let manifest_name_set: HashSet<&String> = manifest_names.iter().collect();
-    for name in &registry_names {
-        if !manifest_name_set.contains(name) {
-            // Registry exists but no manifest — check if it was already handled above
-            if !dry_run {
-                // Only delete if the registry is empty (all packs cleaned)
-                // We already checked this above during compaction.
-                // For registries not compacted (no deleted packs this run), check separately.
-                if deleted_set.is_empty() {
-                    // No packs were deleted this run, so check if registry is already empty
-                    if let Ok(Some(data)) = content_store.get_registry(name).await
-                        && let Ok(reg) = PackRegistry::deserialize(&data)
-                        && reg.is_empty()
-                    {
-                        if let Err(e) = content_store.delete_registry(name).await {
-                            warn!(registry = %name, error = %e, "failed to delete empty orphan registry");
-                        } else {
-                            stats.registries_deleted += 1;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     Ok(to_delete.len())
@@ -534,9 +508,6 @@ impl GcTestReport {
     pub fn manifest_errors(&self) -> usize {
         self.stats.manifest_errors
     }
-    pub fn registries_scanned(&self) -> usize {
-        self.stats.registries_scanned
-    }
     pub fn live_packs(&self) -> usize {
         self.stats.live_packs
     }
@@ -551,12 +522,6 @@ impl GcTestReport {
     }
     pub fn packs_deleted(&self) -> usize {
         self.stats.packs_deleted
-    }
-    pub fn registries_compacted(&self) -> usize {
-        self.stats.registries_compacted
-    }
-    pub fn registries_deleted(&self) -> usize {
-        self.stats.registries_deleted
     }
     pub fn deleted_count(&self) -> usize {
         self.deleted
@@ -620,7 +585,7 @@ mod tests {
         let mut state = GcState::default();
         let id = Uuid::new_v4();
 
-        // Not in state → not eligible
+        // Not in state -> not eligible
         assert!(!state.is_eligible(&id, Duration::from_secs(3600)));
 
         // Mark dead with a timestamp in the past
@@ -636,9 +601,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_reconciliation_deletes_orphaned_packs() {
-        use crate::block::block_map::Blake3Hash;
+        use crate::block::chunk_meta::{ChunkMeta, ChunkMetaEntry};
         use crate::block::content_store::ContentStore;
-        use crate::block::manifest::{Manifest, ManifestPackEntry};
         use object_store::memory::InMemory;
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -649,49 +613,56 @@ mod tests {
         let pack_b = Uuid::new_v4();
         let pack_c = Uuid::new_v4();
 
-        // Upload packs to S3
+        let chunk_idx = 0u32;
+
+        // Upload chunk packs to S3
         content_store
-            .put_pack(pack_a, vec![0u8; 100])
+            .put_chunk_pack(chunk_idx, pack_a, vec![0u8; 100])
             .await
             .unwrap();
         content_store
-            .put_pack(pack_b, vec![0u8; 100])
+            .put_chunk_pack(chunk_idx, pack_b, vec![0u8; 100])
             .await
             .unwrap();
         content_store
-            .put_pack(pack_c, vec![0u8; 100])
+            .put_chunk_pack(chunk_idx, pack_c, vec![0u8; 100])
             .await
             .unwrap();
 
-        // Create a manifest that only references pack_a
-        let manifest = Manifest {
-            name: "vm1".to_string(),
-            sequence: 1,
-            chunk_size: 131072,
-            device_size: 1024 * 1024 * 1024,
-            block_map: vec![],
-            pack_index: vec![ManifestPackEntry {
-                hash: Blake3Hash::from_bytes([1; 16]),
-                pack_id: pack_a,
+        // Create a chunk meta that only references pack_a
+        let chunk_meta = ChunkMeta {
+            chunk_idx,
+            chunk_size: 10 * 1024 * 1024 * 1024,
+            block_size: 131072,
+            entries: vec![ChunkMetaEntry {
                 offset: 0,
+                hash: crate::block::block_map::Blake3Hash([1; 16]),
+                pack_id: pack_a,
+                pack_offset: 0,
                 comp_length: 100,
             }],
         };
+        let chunk_hash_hex = chunk_meta
+            .content_hash()
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
         content_store
-            .put_manifest("vm1", manifest.serialize())
+            .put_chunk_meta(chunk_idx, &chunk_hash_hex, chunk_meta.serialize())
             .await
             .unwrap();
 
-        // Create a registry that references all 3 packs
-        let registry = PackRegistry {
-            pack_ids: vec![pack_a, pack_b, pack_c],
-        };
+        // Create a VolumeManifest referencing this chunk
+        let mut vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        vm.chunks.insert(chunk_idx, chunk_hash_hex);
         content_store
-            .put_registry("vm1", registry.serialize())
+            .put_manifest("vm1", vm.serialize())
             .await
             .unwrap();
 
-        // Run GC with zero grace period
+        // Run GC with 1h grace period
         let mut state = new_gc_state_for_test();
         // Pre-inject dead packs with old timestamp so they're eligible
         let old_ts = Utc::now() - chrono::Duration::hours(25);
@@ -709,9 +680,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.manifests_scanned(), 1);
-        assert_eq!(report.registries_scanned(), 1);
         assert_eq!(report.live_packs(), 1, "only pack_a is live");
-        assert_eq!(report.known_packs(), 3, "all 3 in registry");
+        assert_eq!(report.known_packs(), 3, "all 3 chunk packs known");
         assert_eq!(report.dead_found(), 2, "pack_b and pack_c are dead");
         assert_eq!(report.eligible_for_deletion(), 2, "both past grace period");
         assert_eq!(report.packs_deleted(), 2, "both should be deleted");
@@ -723,38 +693,38 @@ mod tests {
 
     #[tokio::test]
     async fn test_gc_dry_run_doesnt_delete() {
+        use crate::block::chunk_meta::ChunkMeta;
         use crate::block::content_store::ContentStore;
-        use crate::block::manifest::Manifest;
         use object_store::memory::InMemory;
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
 
         let dead_pack = Uuid::new_v4();
+        let chunk_idx = 0u32;
         content_store
-            .put_pack(dead_pack, vec![0u8; 100])
+            .put_chunk_pack(chunk_idx, dead_pack, vec![0u8; 100])
             .await
             .unwrap();
 
-        // Manifest with no pack references
-        let manifest = Manifest {
-            name: "vm1".to_string(),
-            sequence: 1,
-            chunk_size: 131072,
-            device_size: 1024 * 1024 * 1024,
-            block_map: vec![],
-            pack_index: vec![],
-        };
+        // Create an empty chunk meta (no entries -> no live packs from manifest)
+        let chunk_meta = ChunkMeta::new(chunk_idx, 10 * 1024 * 1024 * 1024, 131072);
+        let chunk_hash_hex = chunk_meta
+            .content_hash()
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         content_store
-            .put_manifest("vm1", manifest.serialize())
+            .put_chunk_meta(chunk_idx, &chunk_hash_hex, chunk_meta.serialize())
             .await
             .unwrap();
 
-        let registry = PackRegistry {
-            pack_ids: vec![dead_pack],
-        };
+        // VolumeManifest referencing the empty chunk
+        let mut vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        vm.chunks.insert(chunk_idx, chunk_hash_hex);
         content_store
-            .put_registry("vm1", registry.serialize())
+            .put_manifest("vm1", vm.serialize())
             .await
             .unwrap();
 
@@ -779,8 +749,12 @@ mod tests {
         );
 
         // But the pack should still exist in S3
-        let pack_data = content_store.get_pack(dead_pack).await;
-        assert!(pack_data.is_ok(), "pack should still exist after dry run");
+        // Check via list to verify
+        let packs = content_store.list_chunk_packs(chunk_idx).await.unwrap();
+        assert!(
+            packs.iter().any(|p| p.contains(&dead_pack.to_string())),
+            "pack should still exist after dry run"
+        );
     }
 
     #[test]

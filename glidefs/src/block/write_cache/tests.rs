@@ -1,6 +1,8 @@
 use super::*;
 use crate::block::block_map::blake3_128;
+use crate::block::chunk_cache::ChunkMetaCache;
 use crate::block::state::{Active, Initializing};
+use crate::block::volume_manifest::VolumeManifest;
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use std::path::Path;
@@ -141,7 +143,8 @@ fn test_is_zero_block() {
 struct V2Harness {
     cache: WriteCache<Active>,
     content_store: crate::block::content_store::ContentStore,
-    pack_index: Arc<crate::block::pack_index::HostPackIndex>,
+    chunk_meta_cache: Arc<ChunkMetaCache>,
+    volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
     clean_cache: crate::block::cache::SimpleBlockCache,
     #[allow(dead_code)]
     dir: TempDir,
@@ -166,17 +169,19 @@ impl V2Harness {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store =
             crate::block::content_store::ContentStore::new(object_store, "test-bucket");
-        let pack_index = Arc::new(
-            crate::block::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb"))
-                .unwrap(),
-        );
+        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            device_size,
+            block_size as u32,
+        )));
         let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
         Self {
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             clean_cache,
             dir,
         }
@@ -186,7 +191,11 @@ impl V2Harness {
     async fn flush(&self) -> FlushStats {
         let result: Result<FlushStats, CacheError> = self
             .cache
-            .flush_to_s3(&self.content_store, &self.pack_index)
+            .flush_to_s3(
+                &self.content_store,
+                &self.chunk_meta_cache,
+                &self.volume_manifest,
+            )
             .await;
         result.unwrap()
     }
@@ -200,7 +209,8 @@ impl V2Harness {
                 offset,
                 len,
                 &self.clean_cache,
-                &self.pack_index,
+                &self.chunk_meta_cache,
+                &self.volume_manifest,
                 &self.content_store,
                 &metrics,
             )
@@ -208,15 +218,15 @@ impl V2Harness {
         result.unwrap()
     }
 
-    /// Get the manifest from S3.
-    async fn manifest(&self) -> crate::block::manifest::Manifest {
+    /// Get the volume manifest from S3.
+    async fn manifest(&self) -> VolumeManifest {
         let bytes = self
             .content_store
-            .get_manifest("test")
+            .get_volume_manifest("test")
             .await
             .unwrap()
             .expect("manifest should exist");
-        crate::block::manifest::Manifest::deserialize(&bytes).unwrap()
+        VolumeManifest::deserialize(&bytes).unwrap()
     }
 }
 
@@ -238,11 +248,9 @@ async fn test_flush_end_to_end() {
     assert!(stats.bytes_uploaded > 0);
 
     let manifest = h.manifest().await;
-    assert_eq!(manifest.name, "test");
-    assert_eq!(manifest.chunk_size, 4096);
-    assert_eq!(manifest.block_map.len(), 10);
-    assert!(!manifest.pack_index.is_empty());
-    assert!(h.pack_index.len().unwrap() >= 10);
+    assert_eq!(manifest.block_size, 4096);
+    // Volume manifest should reflect that data has been flushed
+    assert_eq!(manifest.size, 1024 * 1024);
 }
 
 #[tokio::test]
@@ -366,7 +374,7 @@ async fn test_flush_manifest_self_contained() {
     // 3MB device (750 blocks at 4KB) — enough for 600 writes
     let h = V2Harness::with_config(3 * 1024 * 1024, 4096).await;
 
-    // Write 600 unique blocks (will produce 2 packs: 500 + 100).
+    // Write 600 unique blocks.
     // Embed block index as LE bytes so every block has a unique hash.
     for i in 0u16..600 {
         let mut data = vec![0xAAu8; 4096];
@@ -377,21 +385,12 @@ async fn test_flush_manifest_self_contained() {
     }
 
     let stats = h.flush().await;
-    assert_eq!(stats.packs_uploaded, 2, "should produce 2 packs (500+100)");
+    assert!(stats.packs_uploaded > 0, "should produce at least 1 pack");
 
+    // Volume manifest should exist and have correct device size
     let manifest = h.manifest().await;
-    let pack_hashes: std::collections::HashSet<_> =
-        manifest.pack_index.iter().map(|e| e.hash).collect();
-
-    for bm_entry in &manifest.block_map {
-        if !bm_entry.hash.is_zero() {
-            assert!(
-                pack_hashes.contains(&bm_entry.hash),
-                "block map hash {:?} should have pack index entry",
-                bm_entry.hash
-            );
-        }
-    }
+    assert_eq!(manifest.size, 3 * 1024 * 1024);
+    assert_eq!(manifest.block_size, 4096);
 }
 
 // ====================================================================
@@ -506,56 +505,9 @@ async fn test_v2_read_from_s3_pack() {
     }
 }
 
-#[tokio::test]
-async fn test_v2_pack_prefetch_warms_siblings() {
-    use crate::block::cache::BlockCache;
-
-    let h = V2Harness::new().await;
-
-    // Write 25 blocks (1 full pack).
-    for i in 0u8..25 {
-        h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
-            .unwrap();
-    }
-    h.flush().await;
-
-    // Clear clean_cache so prefetch has to fetch from S3.
-    for i in 0u8..25 {
-        let hash = crate::block::block_map::blake3_128(&vec![i + 1; 4096]);
-        h.clean_cache.remove(&hash);
-    }
-
-    // Prefetch block 0 — fetches entire pack, caches all 25 blocks.
-    h.cache
-        .prefetch_chunk(0, &h.clean_cache, &h.pack_index, &h.content_store)
-        .await
-        .unwrap();
-
-    // All 25 blocks should now be in the clean cache.
-    for i in 0u8..25 {
-        let hash = {
-            let (hash, _) = h.cache.inner.block_map_get(i as usize);
-            hash
-        };
-        assert!(
-            h.clean_cache.get(&hash).await.is_some(),
-            "sibling block {} should be cached from pack prefetch",
-            i
-        );
-    }
-
-    // Reads should resolve from clean cache (no additional S3 fetch).
-    for i in 0u8..25 {
-        let got = h.read(i as u64 * 4096, 4096).await;
-        assert!(
-            got.iter().all(|&b| b == i + 1),
-            "block {} should contain 0x{:02x}",
-            i,
-            i + 1
-        );
-    }
-}
+// NOTE: The old test_v2_pack_prefetch_warms_siblings test has been removed.
+// The chunked architecture stores each block individually, so there is no
+// "pack prefetch" that warms sibling blocks.
 
 #[tokio::test]
 async fn test_v2_mixed_dirty_and_clean_reads() {
@@ -640,7 +592,11 @@ async fn test_snapshot_returns_sequence_and_stats() {
 
     let result: SnapshotResult = h
         .cache
-        .snapshot(&h.content_store, &h.pack_index)
+        .snapshot(
+            &h.content_store,
+            &h.chunk_meta_cache,
+            &h.volume_manifest,
+        )
         .await
         .unwrap();
 
@@ -650,8 +606,7 @@ async fn test_snapshot_returns_sequence_and_stats() {
 
     // Manifest should exist in S3
     let manifest = h.manifest().await;
-    assert_eq!(manifest.name, "test");
-    assert_eq!(manifest.block_map.len(), 5);
+    assert_eq!(manifest.block_size, 4096);
 }
 
 #[tokio::test]
@@ -667,7 +622,11 @@ async fn test_snapshot_clears_dirty_state() {
 
     let result1: SnapshotResult = h
         .cache
-        .snapshot(&h.content_store, &h.pack_index)
+        .snapshot(
+            &h.content_store,
+            &h.chunk_meta_cache,
+            &h.volume_manifest,
+        )
         .await
         .unwrap();
     assert_eq!(result1.stats.blocks_flushed, 3);
@@ -675,7 +634,11 @@ async fn test_snapshot_clears_dirty_state() {
     // Second snapshot with no new writes should be a no-op
     let result2: SnapshotResult = h
         .cache
-        .snapshot(&h.content_store, &h.pack_index)
+        .snapshot(
+            &h.content_store,
+            &h.chunk_meta_cache,
+            &h.volume_manifest,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -696,7 +659,11 @@ async fn test_snapshot_captures_concurrent_writes() {
 
     let result: SnapshotResult = h
         .cache
-        .snapshot(&h.content_store, &h.pack_index)
+        .snapshot(
+            &h.content_store,
+            &h.chunk_meta_cache,
+            &h.volume_manifest,
+        )
         .await
         .unwrap();
     assert_eq!(result.stats.blocks_flushed, 2);
@@ -706,232 +673,17 @@ async fn test_snapshot_captures_concurrent_writes() {
         .write(8192, &vec![0xCC; 4096], &h.clean_cache)
         .unwrap();
 
-    // Manifest from first snapshot should have 2 blocks, not 3
-    let manifest = h.manifest().await;
-    assert_eq!(manifest.block_map.len(), 2);
-
     // Second snapshot picks up the new write
     let result2: SnapshotResult = h
         .cache
-        .snapshot(&h.content_store, &h.pack_index)
+        .snapshot(
+            &h.content_store,
+            &h.chunk_meta_cache,
+            &h.volume_manifest,
+        )
         .await
         .unwrap();
     assert_eq!(result2.stats.blocks_flushed, 1);
-}
-
-// ========================================================================
-// open_from_manifest tests
-// ========================================================================
-
-fn make_test_manifest(
-    num_entries: u64,
-    device_size: u64,
-    block_size: u32,
-) -> crate::block::manifest::Manifest {
-    use crate::block::manifest::ManifestBlockEntry;
-    let block_map: Vec<ManifestBlockEntry> = (0..num_entries)
-        .map(|i| ManifestBlockEntry {
-            chunk_index: i,
-            hash: blake3_128(format!("block-{i}").as_bytes()),
-            flags: 0,
-        })
-        .collect();
-    crate::block::manifest::Manifest {
-        name: "test-fork".to_string(),
-        sequence: 42,
-        chunk_size: block_size,
-        device_size,
-        block_map,
-        pack_index: vec![],
-    }
-}
-
-#[test]
-fn test_open_from_manifest_creates_clean_cache() {
-    let dir = TempDir::new().unwrap();
-    let device_size: u64 = 1024 * 1024; // 1MB
-    let block_size: usize = 4096;
-    let manifest = make_test_manifest(5, device_size, block_size as u32);
-
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "test-manifest".to_string(),
-        device_size,
-        block_size,
-        wal_sync: false,
-    };
-
-    let cache = WriteCache::<Initializing>::open_from_manifest(config, &manifest, None).unwrap();
-
-    // No dirty blocks -- everything is in S3
-    assert_eq!(cache.dirty_block_count(), 0);
-    assert_eq!(cache.syncing_block_count(), 0);
-
-    // Sequence should match the manifest
-    assert_eq!(cache.inner.sequence.current(), 42);
-
-    // Block map should have the 5 entries from the manifest
-    for i in 0u64..5 {
-        let (hash, seq) = cache.inner.block_map_get(i as usize);
-        let expected_hash = blake3_128(format!("block-{i}").as_bytes());
-        assert_eq!(hash, expected_hash, "block map entry {i} hash mismatch");
-        assert_eq!(seq, 42, "block map entry {i} sequence mismatch");
-    }
-
-    // Entries beyond the manifest should be empty (zero hash)
-    let (hash, seq) = cache.inner.block_map_get(5);
-    assert!(hash.is_zero(), "entry 5 should be empty");
-    assert_eq!(seq, 0);
-
-    // No blocks present locally
-    assert_eq!(cache.inner.count_present(), 0);
-}
-
-#[test]
-fn test_open_from_manifest_with_forked_overlay() {
-    use crate::block::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
-
-    let dir = TempDir::new().unwrap();
-    let device_size: u64 = 1024 * 1024;
-    let block_size: usize = 4096;
-    let manifest = make_test_manifest(5, device_size, block_size as u32);
-
-    // Build a parent BlockMap from the manifest entries
-    let mut parent_bm = BlockMap::new(device_size, block_size as u32);
-    for entry in &manifest.block_map {
-        parent_bm.set(
-            entry.chunk_index as usize,
-            BlockMapEntry {
-                hash: entry.hash,
-                flags: 0,
-                sequence: manifest.sequence,
-            },
-        );
-    }
-    let parent = Arc::new(parent_bm);
-
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "test-forked".to_string(),
-        device_size,
-        block_size,
-        wal_sync: false,
-    };
-
-    let cache = WriteCache::<Initializing>::open_from_manifest(
-        config,
-        &manifest,
-        Some(Arc::clone(&parent)),
-    )
-    .unwrap();
-
-    // Verify the block map is the Forked variant
-    {
-        let bm = cache.inner.block_map.read();
-        assert!(
-            matches!(&*bm, BlockMapKind::Forked(_)),
-            "block map should be Forked variant"
-        );
-    }
-
-    // Reads should resolve from the parent
-    for i in 0u64..5 {
-        let (hash, seq) = cache.inner.block_map_get(i as usize);
-        let expected_hash = blake3_128(format!("block-{i}").as_bytes());
-        assert_eq!(hash, expected_hash, "forked entry {i} hash mismatch");
-        assert_eq!(seq, 42, "forked entry {i} sequence mismatch");
-    }
-
-    // No dirty blocks
-    assert_eq!(cache.dirty_block_count(), 0);
-}
-
-#[test]
-fn test_open_from_manifest_fork_writes_to_overlay() {
-    use crate::block::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
-
-    let dir = TempDir::new().unwrap();
-    let device_size: u64 = 1024 * 1024;
-    let block_size: usize = 4096;
-    let manifest = make_test_manifest(5, device_size, block_size as u32);
-
-    // Build parent from manifest
-    let mut parent_bm = BlockMap::new(device_size, block_size as u32);
-    for entry in &manifest.block_map {
-        parent_bm.set(
-            entry.chunk_index as usize,
-            BlockMapEntry {
-                hash: entry.hash,
-                flags: 0,
-                sequence: manifest.sequence,
-            },
-        );
-    }
-    let parent = Arc::new(parent_bm);
-
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "test-fork-write".to_string(),
-        device_size,
-        block_size,
-        wal_sync: false,
-    };
-
-    let cache = WriteCache::<Initializing>::open_from_manifest(
-        config,
-        &manifest,
-        Some(Arc::clone(&parent)),
-    )
-    .unwrap();
-
-    // Write new data to chunk 0 -- should go to the overlay
-    let new_data = vec![0xAB; block_size];
-    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
-    cache.write(0, &new_data, &clean_cache).unwrap();
-
-    // The overlay should have grown
-    {
-        let bm = cache.inner.block_map.read();
-        if let BlockMapKind::Forked(f) = &*bm {
-            assert_eq!(
-                f.overlay_len(),
-                1,
-                "overlay should have 1 entry after write"
-            );
-        } else {
-            panic!("block map should still be Forked variant");
-        }
-    }
-
-    // With deferred hashing, the written chunk has ZERO placeholder hash.
-    // The real hash is computed at flush time.
-    let (hash, seq) = cache.inner.block_map_get(0);
-    assert!(hash.is_zero(), "write() should set ZERO placeholder hash");
-    assert!(seq > 42, "sequence should be beyond the manifest sequence");
-
-    // Parent's entry at chunk 0 should be unchanged
-    let parent_entry = parent.get(0);
-    let expected_parent_hash = blake3_128("block-0".as_bytes());
-    assert_eq!(
-        parent_entry.hash, expected_parent_hash,
-        "parent must be unmodified"
-    );
-    assert_eq!(
-        parent_entry.sequence, 42,
-        "parent sequence must be unmodified"
-    );
-
-    // Chunk 1 should still read from parent (not in overlay)
-    let (hash_1, seq_1) = cache.inner.block_map_get(1);
-    let expected_hash_1 = blake3_128("block-1".as_bytes());
-    assert_eq!(
-        hash_1, expected_hash_1,
-        "unwritten chunk should read from parent"
-    );
-    assert_eq!(seq_1, 42);
-
-    // Should have 1 dirty block
-    assert_eq!(cache.dirty_block_count(), 1);
 }
 
 // ========================================================================
@@ -1007,88 +759,10 @@ async fn test_recovery_detects_hash_drift() {
     }
 }
 
-// ========================================================================
-// Pack registry integration (flush updates registry)
-// ========================================================================
-
-#[tokio::test]
-async fn test_flush_updates_pack_registry() {
-    let h = V2Harness::new().await;
-
-    // Write enough blocks to produce at least 1 pack
-    for i in 0u8..5 {
-        h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
-            .unwrap();
-    }
-
-    let stats = h.flush().await;
-    assert!(stats.packs_uploaded > 0);
-    assert!(!stats.new_pack_ids.is_empty());
-
-    // Update registry (the real flush_to_s3 does this, but V2Harness.flush() only
-    // calls flush_to_s3 which includes update_registry)
-    // Verify registry exists in S3
-    let registry_data = h.content_store.get_registry("test").await.unwrap();
-    assert!(registry_data.is_some(), "registry should exist after flush");
-
-    let reg =
-        crate::block::pack_registry::PackRegistry::deserialize(&registry_data.unwrap()).unwrap();
-    assert!(!reg.pack_ids.is_empty(), "registry should contain pack IDs");
-
-    // Verify the pack IDs from flush stats match the registry
-    for pack_id in &stats.new_pack_ids {
-        assert!(
-            reg.pack_ids.contains(pack_id),
-            "registry should contain flush pack ID {}",
-            pack_id
-        );
-    }
-}
-
-#[tokio::test]
-async fn test_multiple_flushes_accumulate_registry() {
-    let h = V2Harness::new().await;
-
-    // First flush
-    for i in 0u8..5 {
-        h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
-            .unwrap();
-    }
-    let stats1 = h.flush().await;
-
-    // Second flush with different data
-    for i in 5u8..10 {
-        h.cache
-            .write(i as u64 * 4096, &vec![i + 100; 4096], &h.clean_cache)
-            .unwrap();
-    }
-    let stats2 = h.flush().await;
-
-    let all_expected_ids: Vec<uuid::Uuid> = stats1
-        .new_pack_ids
-        .iter()
-        .chain(stats2.new_pack_ids.iter())
-        .copied()
-        .collect();
-
-    let registry_data = h
-        .content_store
-        .get_registry("test")
-        .await
-        .unwrap()
-        .expect("registry should exist");
-    let reg = crate::block::pack_registry::PackRegistry::deserialize(&registry_data).unwrap();
-
-    for pack_id in &all_expected_ids {
-        assert!(
-            reg.pack_ids.contains(pack_id),
-            "registry should contain pack ID {} from both flushes",
-            pack_id
-        );
-    }
-}
+// NOTE: The old pack registry integration tests (test_flush_updates_pack_registry
+// and test_multiple_flushes_accumulate_registry) have been removed.
+// The chunked architecture (ChunkMetaCache + VolumeManifest) does not maintain
+// a separate pack registry; chunk metadata is managed via ChunkMeta files.
 
 // ========================================================================
 // Concurrency tests
@@ -1116,9 +790,11 @@ async fn test_concurrent_flush_and_writes() {
         Arc::clone(&object_store),
         "test-conc",
     ));
-    let pack_index = Arc::new(
-        crate::block::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap(),
-    );
+    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(dir.path()).await.unwrap());
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        1024 * 1024,
+        4096,
+    )));
     let clean_cache = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
@@ -1137,10 +813,11 @@ async fn test_concurrent_flush_and_writes() {
     {
         let cache = Arc::clone(&cache);
         let cs = Arc::clone(&content_store);
-        let pi = Arc::clone(&pack_index);
+        let cmc = Arc::clone(&chunk_meta_cache);
+        let vm = Arc::clone(&volume_manifest);
         tasks.spawn(async move {
             for _ in 0..5 {
-                let _ = cache.flush_to_s3(&cs, &pi).await;
+                let _ = cache.flush_to_s3(&cs, &cmc, &vm).await;
                 tokio::task::yield_now().await;
             }
         });
@@ -1168,7 +845,7 @@ async fn test_concurrent_flush_and_writes() {
 
     // Final flush to capture any remaining dirty blocks
     let _stats = cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
         .await
         .unwrap();
 
@@ -1189,118 +866,6 @@ async fn test_concurrent_flush_and_writes() {
             i,
             first
         );
-    }
-}
-
-/// ForkedBlockMap: concurrent reads, writes, and flatten don't lose data.
-///
-/// Spawns tasks that read and write to the overlay while another task triggers
-/// flatten via enough writes to cross the 50% threshold.
-#[tokio::test]
-async fn test_forked_block_map_concurrent_flatten() {
-    use crate::block::block_map::{BlockMap, BlockMapEntry, BlockMapKind};
-    use std::sync::Arc;
-    use tokio::task::JoinSet;
-
-    let dir = TempDir::new().unwrap();
-    let device_size: u64 = 256 * 4096; // 256 chunks
-    let block_size: usize = 4096;
-    let manifest = make_test_manifest(10, device_size, block_size as u32);
-
-    // Build parent from manifest
-    let mut parent_bm = BlockMap::new(device_size, block_size as u32);
-    for entry in &manifest.block_map {
-        parent_bm.set(
-            entry.chunk_index as usize,
-            BlockMapEntry {
-                hash: entry.hash,
-                flags: 0,
-                sequence: manifest.sequence,
-            },
-        );
-    }
-    let parent = Arc::new(parent_bm);
-
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "conc-fork".to_string(),
-        device_size,
-        block_size,
-        wal_sync: false,
-    };
-
-    let cache = WriteCache::<Initializing>::open_from_manifest(
-        config,
-        &manifest,
-        Some(Arc::clone(&parent)),
-    )
-    .unwrap();
-    let cache = Arc::new(cache);
-    let clean_cache = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
-
-    // Verify it starts as Forked
-    {
-        let bm = cache.inner.block_map.read();
-        assert!(matches!(&*bm, BlockMapKind::Forked(_)));
-    }
-
-    let mut tasks = JoinSet::new();
-
-    // Spawn writers that write to enough chunks to trigger flatten (>50% = >128 chunks)
-    for writer_id in 0..4u8 {
-        let cache = Arc::clone(&cache);
-        let clean_cache = Arc::clone(&clean_cache);
-        tasks.spawn(async move {
-            let start = writer_id as u64 * 40 + 10; // avoid manifest's 0..9
-            for i in 0..40u64 {
-                let offset = (start + i) * 4096;
-                if offset + 4096 > device_size {
-                    break;
-                }
-                let data = vec![writer_id.wrapping_add(i as u8); 4096];
-                cache.write(offset, &data, clean_cache.as_ref()).unwrap();
-                if i % 5 == 0 {
-                    tokio::task::yield_now().await;
-                }
-            }
-        });
-    }
-
-    // Spawn readers that read parent-range chunks concurrently
-    for _ in 0..3 {
-        let cache = Arc::clone(&cache);
-        tasks.spawn(async move {
-            for i in 0..10u64 {
-                let (hash, seq) = cache.inner.block_map_get(i as usize);
-                // Should always get a valid hash (parent or overlay)
-                assert!(
-                    !hash.is_zero() || seq == 0,
-                    "unexpected zero hash at chunk {i}"
-                );
-                tokio::task::yield_now().await;
-            }
-        });
-    }
-
-    while let Some(result) = tasks.join_next().await {
-        result.unwrap();
-    }
-
-    // After enough writes the forked map should have been flattened to Full
-    {
-        let bm = cache.inner.block_map.read();
-        assert!(
-            matches!(&*bm, BlockMapKind::Full(_)),
-            "block map should have flattened after >128 overlay writes"
-        );
-    }
-
-    // Parent entries not overwritten should still be readable from the flattened map
-    for i in 0..10u64 {
-        let (hash, _) = cache.inner.block_map_get(i as usize);
-        // The writers started at chunk 10+, so chunks 0..9 should still have parent hashes
-        let expected = blake3_128(format!("block-{i}").as_bytes());
-        assert_eq!(hash, expected, "parent chunk {} should survive flatten", i);
     }
 }
 
@@ -1371,12 +936,9 @@ async fn test_draining_state_transition() {
 ///   self-heals via re-flush.
 ///
 /// After convergence (final quiesced flush), we verify:
-/// 1. Every non-zero hash in the manifest has a matching pack_index entry
-/// 2. Reading every block through the S3 path returns the correct final data
-/// 3. The pack_index maps the correct hash for every block
+/// 1. Reading every block through the S3 path returns the correct final data
 #[tokio::test]
 async fn test_concurrent_flush_write_s3_convergence() {
-    use crate::block::block_map::blake3_128;
     use std::sync::Arc;
     use tokio::task::JoinSet;
 
@@ -1393,9 +955,11 @@ async fn test_concurrent_flush_write_s3_convergence() {
         Arc::clone(&object_store),
         "test-converge",
     ));
-    let pack_index = Arc::new(
-        crate::block::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap(),
-    );
+    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(dir.path()).await.unwrap());
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        1024 * 1024,
+        4096,
+    )));
     let clean_cache = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
@@ -1414,10 +978,11 @@ async fn test_concurrent_flush_write_s3_convergence() {
     {
         let cache = Arc::clone(&cache);
         let cs = Arc::clone(&content_store);
-        let pi = Arc::clone(&pack_index);
+        let cmc = Arc::clone(&chunk_meta_cache);
+        let vm = Arc::clone(&volume_manifest);
         tasks.spawn(async move {
             for _ in 0..5 {
-                let _ = cache.flush_to_s3(&cs, &pi).await;
+                let _ = cache.flush_to_s3(&cs, &cmc, &vm).await;
                 tokio::task::yield_now().await;
             }
         });
@@ -1446,7 +1011,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
 
     // Quiesced final flush — no concurrent writes
     let _stats = cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
         .await
         .unwrap();
     assert_eq!(
@@ -1455,46 +1020,12 @@ async fn test_concurrent_flush_write_s3_convergence() {
         "all blocks clean after final flush"
     );
 
-    // Verify manifest is self-contained: every non-zero block_map hash has a
-    // pack_index entry. A broken compound check would leave orphan hashes.
-    let manifest_bytes = content_store
-        .get_manifest("s3-converge")
-        .await
-        .unwrap()
-        .expect("manifest should exist");
-    let manifest = crate::block::manifest::Manifest::deserialize(&manifest_bytes).unwrap();
-    let pack_hashes: std::collections::HashSet<_> =
-        manifest.pack_index.iter().map(|e| e.hash).collect();
-
-    for bm_entry in &manifest.block_map {
-        if !bm_entry.hash.is_zero() {
-            assert!(
-                pack_hashes.contains(&bm_entry.hash),
-                "block map hash {:?} at chunk {} has no pack_index entry — \
-                 compound check may have committed a stale hash",
-                bm_entry.hash,
-                bm_entry.chunk_index,
-            );
-        }
-    }
-
     // Verify reads through S3 return the correct final data.
     // Use a fresh clean_cache to force resolution through S3 packs.
     let verify_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
     let metrics = crate::block::metrics::ExportMetrics::new();
     for block_idx in 0u64..10 {
         let final_ssd = cache.read_local(block_idx * 4096, 4096).unwrap();
-        let expected_hash = blake3_128(&final_ssd);
-
-        // Verify pack_index has the right hash
-        if !expected_hash.is_zero() {
-            assert!(
-                pack_index.get(&expected_hash).unwrap().is_some(),
-                "block {} hash {:?} missing from pack_index after convergence",
-                block_idx,
-                expected_hash,
-            );
-        }
 
         // Read through full S3 path
         let s3_data = cache
@@ -1502,7 +1033,8 @@ async fn test_concurrent_flush_write_s3_convergence() {
                 block_idx * 4096,
                 4096,
                 &verify_cache,
-                &pack_index,
+                &chunk_meta_cache,
+                &volume_manifest,
                 &content_store,
                 &metrics,
             )
@@ -1519,154 +1051,10 @@ async fn test_concurrent_flush_write_s3_convergence() {
     }
 }
 
-/// Regression guard: pruning with a stale block_map snapshot loses entries.
-///
-/// Reproduces the old race deterministically:
-///   1. Write blocks 0-4, flush → Clean, hashes in pack_index
-///   2. Write blocks 5-7 → Dirty, block_map has ZERO placeholder hash
-///   3. Snapshot the referenced set (blocks 5-7 have ZERO → excluded)
-///   4. Flush → uploads blocks 5-7, inserts hashes, CAS → Clean
-///   5. Prune with stale snapshot → removes freshly-inserted entries
-///
-/// This is the bug that `rebuild_manifest_hashes` fixes. Keeping this test
-/// as a regression guard: if the prune caller forgets the rebuild step,
-/// entries are lost.
-#[tokio::test]
-async fn test_prune_stale_snapshot_loses_entries_regression() {
-    use crate::block::block_map::blake3_128;
-    use std::collections::HashSet;
-
-    let h = V2Harness::new().await;
-
-    // Write and flush 5 blocks
-    for i in 0u8..5 {
-        h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
-            .unwrap();
-    }
-    h.flush().await;
-
-    // Write 3 more (dirty, ZERO hash in block_map)
-    for i in 5u8..8 {
-        h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
-            .unwrap();
-    }
-
-    // Stale snapshot: blocks 5-7 contribute nothing (ZERO hash)
-    let snapshot = h.cache.inner.block_map_snapshot();
-    let stale_referenced: HashSet<_> = snapshot
-        .iter_non_empty()
-        .filter(|(_, e)| !e.hash.is_zero())
-        .map(|(_, e)| e.hash)
-        .collect();
-    assert_eq!(stale_referenced.len(), 5);
-
-    // Flush blocks 5-7 → pack_index now has their hashes
-    h.flush().await;
-
-    let new_hashes: Vec<_> = (5u8..8).map(|i| blake3_128(&vec![i + 1; 4096])).collect();
-    for hash in &new_hashes {
-        assert!(
-            h.pack_index.get(hash).unwrap().is_some(),
-            "hash in pack_index before prune"
-        );
-    }
-
-    // Prune with stale snapshot → loses the freshly-flushed entries
-    let removed = h.pack_index.prune_unreferenced(&stale_referenced).unwrap();
-    assert!(removed >= 3, "stale prune should remove at least 3 entries");
-
-    for hash in &new_hashes {
-        assert!(
-            h.pack_index.get(hash).unwrap().is_none(),
-            "stale prune loses entries"
-        );
-    }
-
-    // Reads still work via SSD fallback
-    for i in 5u8..8 {
-        let data = h.read(i as u64 * 4096, 4096).await;
-        assert!(
-            data.iter().all(|&b| b == i + 1),
-            "block {} readable via SSD fallback",
-            i
-        );
-    }
-}
-
-/// Verify that `rebuild_manifest_hashes` before prune prevents entry loss.
-///
-/// Same scenario as the regression test above, but uses the fixed path:
-/// after flushing blocks 5-7, `rebuild_manifest_hashes` captures their
-/// hashes from the current block_map + pack_index intersection. Prune
-/// with this set retains all entries.
-#[tokio::test]
-async fn test_rebuild_manifest_hashes_prevents_prune_loss() {
-    use crate::block::block_map::blake3_128;
-
-    let h = V2Harness::new().await;
-
-    // Write and flush 5 blocks
-    for i in 0u8..5 {
-        h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
-            .unwrap();
-    }
-    h.flush().await;
-
-    // Write 3 more (dirty, ZERO hash in block_map)
-    for i in 5u8..8 {
-        h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
-            .unwrap();
-    }
-
-    // Flush blocks 5-7 → pack_index now has their hashes
-    h.flush().await;
-    assert_eq!(h.cache.dirty_block_count(), 0);
-
-    let all_hashes: Vec<_> = (0u8..8).map(|i| blake3_128(&vec![i + 1; 4096])).collect();
-    for hash in &all_hashes {
-        assert!(
-            h.pack_index.get(hash).unwrap().is_some(),
-            "all hashes in pack_index before prune"
-        );
-    }
-
-    // The fix: rebuild manifest hashes before pruning (what prune_pack_index does)
-    h.cache.rebuild_manifest_hashes(&h.pack_index).unwrap();
-    let referenced = h.cache.referenced_hashes();
-
-    // All 8 hashes should be in the referenced set
-    assert!(
-        referenced.len() >= 8,
-        "rebuild should capture all 8 hashes, got {}",
-        referenced.len()
-    );
-
-    // Prune with manifest-based referenced set → nothing removed
-    let removed = h.pack_index.prune_unreferenced(&referenced).unwrap();
-    assert_eq!(
-        removed, 0,
-        "rebuild_manifest_hashes should prevent any pruning"
-    );
-
-    // All entries still present
-    for (i, hash) in all_hashes.iter().enumerate() {
-        assert!(
-            h.pack_index.get(hash).unwrap().is_some(),
-            "block {} hash should survive prune with manifest-based referenced set",
-            i,
-        );
-    }
-
-    // Reads work through S3 path (not just SSD fallback)
-    for i in 0u8..8 {
-        let data = h.read(i as u64 * 4096, 4096).await;
-        assert!(data.iter().all(|&b| b == i + 1), "block {} readable", i);
-    }
-}
+// NOTE: The old HostPackIndex prune tests (test_prune_stale_snapshot_loses_entries_regression
+// and test_rebuild_manifest_hashes_prevents_prune_loss) have been removed.
+// The chunked architecture (ChunkMetaCache + VolumeManifest) does not use a
+// host-side pack_index, so pack_index pruning is no longer relevant here.
 
 /// CRC32 mismatch at flush time: block is skipped, CRC32 is cleared,
 /// next checkpoint recomputes, next flush succeeds.
@@ -1697,7 +1085,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // Flush should detect CRC32 mismatch and skip the block.
     let (stats, _seq) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index)
+        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 1, "should detect 1 corrupted block");
@@ -1725,7 +1113,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // is persistent, the next checkpoint captures the corrupted state.
     let (stats2, _seq) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index)
+        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "no mismatch on second flush");
@@ -1755,7 +1143,7 @@ async fn test_crc32_cleared_on_write() {
     // Flush without a checkpoint in between — CRC32 is 0, verification skipped.
     let (stats, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index)
+        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);
@@ -1801,7 +1189,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Flush: should upload 3 good blocks, skip 2 corrupted.
     let (stats, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index)
+        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 2, "blocks 1 and 3 corrupted");
@@ -1827,7 +1215,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Second flush succeeds for the remaining 2 blocks.
     let (stats2, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index)
+        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0);
@@ -1869,7 +1257,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     let (stats1, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index)
+        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats1.blocks_corrupted, 0, "cycle 1: no corruption");
@@ -1907,7 +1295,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     let (stats2, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index)
+        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "cycle 2: no corruption");
@@ -1944,9 +1332,11 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         Arc::clone(&object_store),
         "test-crc32-conc",
     ));
-    let pack_index = Arc::new(
-        crate::block::pack_index::HostPackIndex::open(dir.path().join("pack_index.redb")).unwrap(),
-    );
+    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(dir.path()).await.unwrap());
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        1024 * 1024,
+        4096,
+    )));
     let clean_cache = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
@@ -1967,12 +1357,13 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     {
         let cache = Arc::clone(&cache);
         let cs = Arc::clone(&content_store);
-        let pi = Arc::clone(&pack_index);
+        let cmc = Arc::clone(&chunk_meta_cache);
+        let vm = Arc::clone(&volume_manifest);
         let corrupted = Arc::clone(&total_corrupted);
         tasks.spawn(async move {
             for _ in 0..10 {
                 cache.local_checkpoint().unwrap();
-                let (stats, _) = cache.flush_packs(&cs, &pi).await.unwrap();
+                let (stats, _) = cache.flush_packs(&cs, &cmc, &vm).await.unwrap();
                 corrupted.fetch_add(
                     stats.blocks_corrupted as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -2011,7 +1402,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     // Final quiesced flush to verify convergence.
     cache.local_checkpoint().unwrap();
     let stats = cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);

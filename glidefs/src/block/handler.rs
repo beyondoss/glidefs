@@ -5,12 +5,13 @@
 //! - `BlockDevice`: Device descriptor used during transmission phase
 
 use super::cache::BlockCache;
+use super::chunk_cache::ChunkMetaCache;
 use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
 use super::metrics::ExportMetrics;
-use super::pack_index::HostPackIndex;
 use super::readahead::SequentialDetector;
 use super::state::Active;
+use super::volume_manifest::VolumeManifest;
 use super::write_cache::WriteCache;
 use super::write_trace::WriteTracer;
 use bytes::Bytes;
@@ -51,8 +52,11 @@ pub struct BlockHandler {
     /// v2 clean block cache (decompressed blocks from S3 packs)
     clean_cache: Arc<dyn BlockCache>,
 
-    /// Host-level pack index for hash→pack location lookup
-    pack_index: Arc<HostPackIndex>,
+    /// Host-level chunk meta cache for hash→pack location lookup
+    chunk_meta_cache: Arc<ChunkMetaCache>,
+
+    /// Volume manifest mapping chunk indices to content hashes
+    volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
 
     /// Device size in bytes (atomic for live resize)
     device_size: AtomicU64,
@@ -95,7 +99,8 @@ impl BlockHandler {
         cache: Arc<WriteCache<Active>>,
         content_store: Arc<ContentStore>,
         clean_cache: Arc<dyn BlockCache>,
-        pack_index: Arc<HostPackIndex>,
+        chunk_meta_cache: Arc<ChunkMetaCache>,
+        volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
         device_size: u64,
         readonly: bool,
         metrics: Arc<ExportMetrics>,
@@ -108,7 +113,8 @@ impl BlockHandler {
             cache,
             content_store,
             clean_cache,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             device_size: AtomicU64::new(device_size),
             readonly: AtomicBool::new(readonly),
             metrics,
@@ -180,27 +186,30 @@ impl BlockHandler {
                 offset,
                 length as usize,
                 self.clean_cache.as_ref(),
-                &self.pack_index,
+                &self.chunk_meta_cache,
+                &self.volume_manifest,
                 &self.content_store,
                 &self.metrics,
             )
             .await?;
 
-        // Sequential read-ahead: detect patterns and prefetch next pack
+        // Sequential read-ahead: detect patterns and prefetch next block
         {
             let chunk_size = self.cache.block_size() as u64;
             let chunk_idx = offset / chunk_size;
             if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
                 let cache = Arc::clone(&self.cache);
                 let clean_cache = Arc::clone(&self.clean_cache);
-                let pack_index = Arc::clone(&self.pack_index);
+                let chunk_meta_cache = Arc::clone(&self.chunk_meta_cache);
+                let volume_manifest = Arc::clone(&self.volume_manifest);
                 let content_store = Arc::clone(&self.content_store);
                 tokio::spawn(async move {
                     let _ = cache
                         .prefetch_chunk(
                             readahead_chunk as usize,
                             clean_cache.as_ref(),
-                            &pack_index,
+                            &chunk_meta_cache,
+                            &volume_manifest,
                             &content_store,
                         )
                         .await;
@@ -243,27 +252,30 @@ impl BlockHandler {
                 length as usize,
                 buf,
                 self.clean_cache.as_ref(),
-                &self.pack_index,
+                &self.chunk_meta_cache,
+                &self.volume_manifest,
                 &self.content_store,
                 &self.metrics,
             )
             .await?;
 
-        // Sequential read-ahead: detect patterns and prefetch next pack
+        // Sequential read-ahead: detect patterns and prefetch next block
         {
             let chunk_size = self.cache.block_size() as u64;
             let chunk_idx = offset / chunk_size;
             if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
                 let cache = Arc::clone(&self.cache);
                 let clean_cache = Arc::clone(&self.clean_cache);
-                let pack_index = Arc::clone(&self.pack_index);
+                let chunk_meta_cache = Arc::clone(&self.chunk_meta_cache);
+                let volume_manifest = Arc::clone(&self.volume_manifest);
                 let content_store = Arc::clone(&self.content_store);
                 tokio::spawn(async move {
                     let _ = cache
                         .prefetch_chunk(
                             readahead_chunk as usize,
                             clean_cache.as_ref(),
-                            &pack_index,
+                            &chunk_meta_cache,
+                            &volume_manifest,
                             &content_store,
                         )
                         .await;
@@ -500,7 +512,8 @@ impl BlockHandler {
                 offset,
                 length as usize,
                 self.clean_cache.as_ref(),
-                &self.pack_index,
+                &self.chunk_meta_cache,
+                &self.volume_manifest,
                 &self.content_store,
                 &self.metrics,
             )
@@ -520,14 +533,16 @@ impl BlockHandler {
         if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
             let cache = Arc::clone(&self.cache);
             let clean_cache = Arc::clone(&self.clean_cache);
-            let pack_index = Arc::clone(&self.pack_index);
+            let chunk_meta_cache = Arc::clone(&self.chunk_meta_cache);
+            let volume_manifest = Arc::clone(&self.volume_manifest);
             let content_store = Arc::clone(&self.content_store);
             tokio::spawn(async move {
                 let _ = cache
                     .prefetch_chunk(
                         readahead_chunk as usize,
                         clean_cache.as_ref(),
-                        &pack_index,
+                        &chunk_meta_cache,
+                        &volume_manifest,
                         &content_store,
                     )
                     .await;
@@ -545,11 +560,11 @@ mod tests {
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
-    fn test_handler() -> (BlockHandler, TempDir) {
-        test_handler_with_readonly(false)
+    async fn test_handler() -> (BlockHandler, TempDir) {
+        test_handler_with_readonly(false).await
     }
 
-    fn test_handler_with_readonly(readonly: bool) -> (BlockHandler, TempDir) {
+    async fn test_handler_with_readonly(readonly: bool) -> (BlockHandler, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let config = WriteCacheConfig {
             cache_dir: temp_dir.path().to_path_buf(),
@@ -565,8 +580,10 @@ mod tests {
         // v2 read path components
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index =
-            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(1024 * 1024, 4096),
+        ));
 
         // Create metrics for this handler
         let metrics = Arc::new(ExportMetrics::new());
@@ -579,7 +596,8 @@ mod tests {
             Arc::new(cache),
             content_store,
             clean_cache,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             1024 * 1024,
             readonly,
             metrics,
@@ -594,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_write() {
-        let (handler, _temp) = test_handler();
+        let (handler, _temp) = test_handler().await;
 
         let data = vec![42u8; 4096];
         handler.write(0, &data, false).unwrap();
@@ -605,42 +623,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_unwritten_returns_zeros() {
-        let (handler, _temp) = test_handler();
+        let (handler, _temp) = test_handler().await;
 
         // Unwritten blocks should fetch from S3 (empty) and return zeros
         let data = handler.read(0, 1024).await.unwrap();
         assert!(data.iter().all(|&b| b == 0));
     }
 
-    #[test]
-    fn test_write_beyond_device_size() {
-        let (handler, _temp) = test_handler();
+    #[tokio::test]
+    async fn test_write_beyond_device_size() {
+        let (handler, _temp) = test_handler().await;
 
         let data = vec![42u8; 4096];
         let result = handler.write(1024 * 1024, &data, false);
         assert!(matches!(result, Err(CommandError::InvalidArgument)));
     }
 
-    #[test]
-    fn test_readonly_rejects_write() {
-        let (handler, _temp) = test_handler_with_readonly(true);
+    #[tokio::test]
+    async fn test_readonly_rejects_write() {
+        let (handler, _temp) = test_handler_with_readonly(true).await;
 
         let data = vec![42u8; 4096];
         let result = handler.write(0, &data, false);
         assert!(matches!(result, Err(CommandError::ReadOnly)));
     }
 
-    #[test]
-    fn test_readonly_rejects_trim() {
-        let (handler, _temp) = test_handler_with_readonly(true);
+    #[tokio::test]
+    async fn test_readonly_rejects_trim() {
+        let (handler, _temp) = test_handler_with_readonly(true).await;
 
         let result = handler.trim(0, 4096, false);
         assert!(matches!(result, Err(CommandError::ReadOnly)));
     }
 
-    #[test]
-    fn test_readonly_rejects_write_zeroes() {
-        let (handler, _temp) = test_handler_with_readonly(true);
+    #[tokio::test]
+    async fn test_readonly_rejects_write_zeroes() {
+        let (handler, _temp) = test_handler_with_readonly(true).await;
 
         let result = handler.write_zeroes(0, 4096, false);
         assert!(matches!(result, Err(CommandError::ReadOnly)));
@@ -648,16 +666,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_readonly_allows_read() {
-        let (handler, _temp) = test_handler_with_readonly(true);
+        let (handler, _temp) = test_handler_with_readonly(true).await;
 
         // Reads should still work on readonly exports
         let result = handler.read(0, 1024).await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_promote_readonly_to_readwrite() {
-        let (handler, _temp) = test_handler_with_readonly(true);
+    #[tokio::test]
+    async fn test_promote_readonly_to_readwrite() {
+        let (handler, _temp) = test_handler_with_readonly(true).await;
 
         // Initially readonly - writes fail
         let data = vec![42u8; 4096];
@@ -676,7 +694,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_beyond_device_size() {
-        let (handler, _temp) = test_handler();
+        let (handler, _temp) = test_handler().await;
 
         let result = handler.read(1024 * 1024, 4096).await;
         assert!(matches!(result, Err(CommandError::InvalidArgument)));
@@ -684,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_flush() {
-        let (handler, _temp) = test_handler();
+        let (handler, _temp) = test_handler().await;
 
         let data = vec![42u8; 4096];
         handler.write(0, &data, false).unwrap();
@@ -697,7 +715,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_with_fua() {
-        let (handler, _temp) = test_handler();
+        let (handler, _temp) = test_handler().await;
 
         let data = vec![42u8; 4096];
         // FUA flag should trigger flush
@@ -709,7 +727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_zeroes() {
-        let (handler, _temp) = test_handler();
+        let (handler, _temp) = test_handler().await;
 
         // Write some data
         let data = vec![42u8; 4096];
@@ -725,7 +743,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_trim() {
-        let (handler, _temp) = test_handler();
+        let (handler, _temp) = test_handler().await;
 
         // Write some data
         let data = vec![42u8; 4096];
@@ -745,7 +763,7 @@ mod tests {
 
     /// Helper: create a handler with a specific blocks_per_pack and a shared
     /// Notify so we can observe whether auto-flush was triggered.
-    fn test_handler_with_flush_config(
+    async fn test_handler_with_flush_config(
         blocks_per_pack: usize,
     ) -> (BlockHandler, Arc<Notify>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
@@ -761,8 +779,10 @@ mod tests {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index =
-            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(1024 * 1024, 4096),
+        ));
         let metrics = Arc::new(ExportMetrics::new());
         let flush_notify = Arc::new(Notify::new());
 
@@ -772,7 +792,8 @@ mod tests {
             Arc::new(cache),
             content_store,
             clean_cache,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             1024 * 1024,
             false,
             metrics,
@@ -785,10 +806,10 @@ mod tests {
         (handler, flush_notify, temp_dir)
     }
 
-    #[test]
-    fn test_manual_mode_never_notifies() {
+    #[tokio::test]
+    async fn test_manual_mode_never_notifies() {
         // blocks_per_pack = 0 → manual mode, no auto-flush
-        let (handler, flush_notify, _temp) = test_handler_with_flush_config(0);
+        let (handler, flush_notify, _temp) = test_handler_with_flush_config(0).await;
 
         // Write 200 blocks — well above any reasonable threshold
         for i in 0..200u64 {
@@ -797,69 +818,55 @@ mod tests {
 
         // flush_notify should NOT have been triggered.
         // Notify doesn't have try_recv, so we check via a zero-timeout wait.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        let was_notified = rt.block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                flush_notify.notified(),
-            )
-            .await
-            .is_ok()
-        });
+        let was_notified = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            flush_notify.notified(),
+        )
+        .await
+        .is_ok();
         assert!(
             !was_notified,
             "manual mode (blocks_per_pack=0) should never notify flush scheduler"
         );
     }
 
-    #[test]
-    fn test_custom_threshold_triggers_at_configured_value() {
+    #[tokio::test]
+    async fn test_custom_threshold_triggers_at_configured_value() {
         // blocks_per_pack = 5 → auto-flush after 5 dirty blocks
-        let (handler, flush_notify, _temp) = test_handler_with_flush_config(5);
+        let (handler, flush_notify, _temp) = test_handler_with_flush_config(5).await;
 
         // Write 4 blocks — below threshold, should NOT notify
         for i in 0..4u64 {
             handler.write(i * 4096, &[0xBB; 4096], false).unwrap();
         }
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        let notified_early = rt.block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                flush_notify.notified(),
-            )
-            .await
-            .is_ok()
-        });
+        let notified_early = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            flush_notify.notified(),
+        )
+        .await
+        .is_ok();
         assert!(!notified_early, "should not notify below threshold (4 < 5)");
 
         // Write the 5th block — reaches threshold, SHOULD notify
         handler.write(4 * 4096, &[0xCC; 4096], false).unwrap();
 
-        let notified_at_threshold = rt.block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                flush_notify.notified(),
-            )
-            .await
-            .is_ok()
-        });
+        let notified_at_threshold = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            flush_notify.notified(),
+        )
+        .await
+        .is_ok();
         assert!(
             notified_at_threshold,
             "should notify when dirty blocks reach threshold (5 >= 5)"
         );
     }
 
-    #[test]
-    fn test_default_threshold_matches_default_blocks_per_pack() {
+    #[tokio::test]
+    async fn test_default_threshold_matches_default_blocks_per_pack() {
         // Verify the default handler uses DEFAULT_BLOCKS_PER_PACK
-        let (handler, _temp) = test_handler();
+        let (handler, _temp) = test_handler().await;
         assert_eq!(
             handler.blocks_per_pack, DEFAULT_BLOCKS_PER_PACK,
             "default handler should use DEFAULT_BLOCKS_PER_PACK"

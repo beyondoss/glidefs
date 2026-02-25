@@ -66,7 +66,6 @@ shellexpand = "3.1"
 clap = { version = "4.5", features = ["derive"] }
 crossbeam = "0.8"
 dashmap = "6.1"
-redb = "2"
 blake3 = "1.8"
 lz4_flex = "0.12"
 crc32fast = "1.5"
@@ -124,10 +123,6 @@ required-features = ["test-utils"]
 name = "cold_read"
 harness = false
 required-features = ["test-utils"]
-
-[[bench]]
-name = "manifest_serde"
-harness = false
 
 [[bin]]
 name = "dedup_measure"

@@ -1,17 +1,16 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info, instrument, warn};
 
-use crate::block::block_map::{
-    Blake3Hash, BlockMapKind, SparseBlockState, blake3_128, lz4_compress,
-};
+use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
+use crate::block::chunk_cache::ChunkMetaCache;
+use crate::block::chunk_meta::{ChunkMeta, ChunkMetaEntry};
 use crate::block::content_store::ContentStore;
-use crate::block::manifest::{Manifest, ManifestBlockEntry, ManifestDelta};
-use crate::block::pack::{self, DEFAULT_BLOCKS_PER_PACK, PackLocation};
-use crate::block::pack_index::HostPackIndex;
-use crate::block::pack_registry::PackRegistry;
+use crate::block::pack::{self, DEFAULT_BLOCKS_PER_PACK};
 use crate::block::state::{Active, Draining};
+use crate::block::volume_manifest::VolumeManifest;
 
 use super::inner::CacheInner;
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
@@ -36,8 +35,8 @@ enum BlockResult {
         chunk_index: usize,
         snapshot_seq: u64,
         hash: Blake3Hash,
-        /// `Some(compressed)` if block is new (not zero, not in pack index).
-        /// `None` if deduped (zero block or already in pack index).
+        /// `Some(compressed)` if block is new (not zero, not already known).
+        /// `None` if deduped (zero block or already in chunk meta).
         compressed: Option<Vec<u8>>,
     },
     /// Block skipped due to CRC mismatch or concurrent write.
@@ -47,12 +46,12 @@ enum BlockResult {
 /// CPU-heavy flush computation: read blocks from SSD, verify CRC32, hash, compress, dedup.
 ///
 /// Runs on a blocking thread via `spawn_blocking` to avoid starving the async runtime.
-/// Phase 1 (rayon parallel): pread + crc32 + blake3 + pack-index check + lz4 per block.
+/// Phase 1 (rayon parallel): pread + crc32 + blake3 + known-hash check + lz4 per block.
 /// Phase 2 (sequential): within-batch dedup via seen_hashes (cheap hash-set insertions).
 fn compute_flush_batch(
     inner: &CacheInner,
     snapshot: &[(usize, u64)],
-    host_pack_index: &HostPackIndex,
+    known_hashes: &HashSet<Blake3Hash>,
     zero_hash: Blake3Hash,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
@@ -60,7 +59,7 @@ fn compute_flush_batch(
     let block_size = inner.config.block_size;
     let device_size = inner.config.device_size;
 
-    // Phase 1: parallel per-block compute (pread + crc32 + blake3 + pack-index + lz4).
+    // Phase 1: parallel per-block compute (pread + crc32 + blake3 + dedup + lz4).
     // Each rayon task allocates its own read buffer; peak memory = num_threads × block_size.
     let per_block: Vec<Result<BlockResult, CacheError>> = snapshot
         .par_iter()
@@ -107,8 +106,8 @@ fn compute_flush_batch(
 
             let hash = blake3_128(&chunk_buf);
 
-            // Zero block or already in pack index → deduped, no upload needed.
-            let compressed = if hash == zero_hash || host_pack_index.contains(&hash)? {
+            // Zero block or already known in chunk meta → deduped, no upload needed.
+            let compressed = if hash == zero_hash || known_hashes.contains(&hash) {
                 None
             } else {
                 Some(lz4_compress(&chunk_buf[..]))
@@ -126,7 +125,7 @@ fn compute_flush_batch(
     // Phase 2: sequential aggregation — within-batch dedup + stats.
     let mut stats = FlushStats::default();
     let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
-    let mut seen_hashes = std::collections::HashSet::new();
+    let mut seen_hashes = HashSet::new();
     let mut computed: Vec<(usize, u64, Blake3Hash)> = Vec::new();
 
     for result in per_block {
@@ -155,7 +154,7 @@ fn compute_flush_batch(
 
                 match compressed {
                     None => {
-                        // Zero block or already in pack index.
+                        // Zero block or already in chunk meta.
                         stats.blocks_deduped += 1;
                     }
                     Some(data) => {
@@ -176,6 +175,11 @@ fn compute_flush_batch(
         computed,
         stats,
     })
+}
+
+/// Format a Blake3Hash as lowercase hex string for S3 keys.
+fn format_hash(hash: &Blake3Hash) -> String {
+    hash.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl WriteCache<Active> {
@@ -216,37 +220,6 @@ impl WriteCache<Active> {
         self.inner.config.block_size
     }
 
-    /// Return the cached manifest pack hashes.
-    ///
-    /// These are the hashes from the most recent manifest build (either from
-    /// `upload_manifest` or `rebuild_manifest_hashes`). Used by pack index
-    /// pruning — the manifest is the durable reference, not the live block_map
-    /// which has ZERO placeholders for in-flight flushes.
-    pub fn referenced_hashes(&self) -> std::collections::HashSet<Blake3Hash> {
-        self.inner.manifest_pack_hashes.lock().clone()
-    }
-
-    /// Force-rebuild the cached manifest pack hashes from current state.
-    ///
-    /// Snapshots the block map and derives pack hashes via `derive_for_block_map`,
-    /// capturing everything flushed up to this moment. No S3 round-trip.
-    ///
-    /// Called by `prune_pack_index` immediately before pruning to close the
-    /// timing window between the last manifest upload and the prune call.
-    pub fn rebuild_manifest_hashes(
-        &self,
-        host_pack_index: &HostPackIndex,
-    ) -> Result<(), CacheError> {
-        let snap = self.inner.block_map_snapshot();
-        let hashes = host_pack_index
-            .derive_for_block_map(&snap)?
-            .into_iter()
-            .map(|e| e.hash)
-            .collect();
-        *self.inner.manifest_pack_hashes.lock() = hashes;
-        Ok(())
-    }
-
     /// Save metadata to disk.
     #[allow(dead_code)]
     pub fn save_metadata(&self) -> Result<(), CacheError> {
@@ -255,7 +228,7 @@ impl WriteCache<Active> {
 
     /// Graceful shutdown: save metadata and transition to Draining.
     ///
-    /// The v2 flush scheduler is responsible for ensuring dirty blocks are
+    /// The flush scheduler is responsible for ensuring dirty blocks are
     /// flushed to S3 before shutdown. This method only persists local metadata
     /// and transitions the cache state.
     #[instrument(skip(self))]
@@ -272,31 +245,22 @@ impl WriteCache<Active> {
         })
     }
 
-    /// Shared inner logic for flush/snapshot: collect dirty entries, dedup,
-    /// compress, pack upload, CAS-clear dirty flags.
-    ///
-    /// Optimizations vs naive approach:
-    /// - **Targeted dirty scan**: reads `block_states` (cheap byte loads) then
-    ///   only reads block_map entries for dirty blocks. Cost is O(dirty_count)
-    ///   SeqLock reads instead of O(device_size).
-    /// - **Concurrent S3 uploads**: packs are uploaded in parallel via
-    ///   `try_join_all` instead of sequentially.
+    /// Chunked flush: collect dirty blocks, partition by volume chunk, per-chunk
+    /// dedup/compress/upload, update ChunkMetaCache and VolumeManifest.
     ///
     /// Returns (stats, seq_cutpoint) on success.
     async fn flush_dirty_inner(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &Arc<HostPackIndex>,
+        chunk_meta_cache: &Arc<ChunkMetaCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
     ) -> Result<(FlushStats, u64), CacheError> {
-        let chunk_size = self.inner.config.block_size as u32;
+        let block_size = self.inner.config.block_size as u32;
 
         // 1. Capture sequence cut point
         let seq_cutpoint = self.inner.sequence.current();
 
-        // 2. Targeted dirty scan: collect dirty block indices with their
-        //    snapshot sequence number (used for concurrent-write detection).
-        //    Hashes are computed lazily from SSD in step 3.
-        //    Uses SparseStateMap::iter_with_state for O(allocated_pages) scan.
+        // 2. Targeted dirty scan
         let snapshot: Vec<(usize, u64)> = {
             let mut dirty = Vec::new();
             for idx in self
@@ -305,7 +269,6 @@ impl WriteCache<Active> {
                 .iter_with_state(SparseBlockState::DIRTY)
             {
                 let (_hash, seq) = self.inner.block_map_get(idx);
-                // Skip entries written after our cutpoint
                 if seq > seq_cutpoint {
                     continue;
                 }
@@ -324,87 +287,207 @@ impl WriteCache<Active> {
             seq_cutpoint, "starting flush"
         );
 
-        // 3. Offload CPU-heavy work (pread + crc32 + blake3 + lz4) to blocking thread pool.
-        //    This prevents flush computation from starving the async runtime under
-        //    high tenant count (~240μs/block × thousands of blocks = seconds of CPU).
-        let zero_hash = self.inner.zero_block_hash;
-        let inner = Arc::clone(&self.inner);
-        let pack_index_clone = Arc::clone(host_pack_index);
-        let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
-            compute_flush_batch(&inner, &snapshot, &pack_index_clone, zero_hash)
-        })
-        .await
-        .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
-
-        let mut stats = batch.stats;
-
-        // 4. Pipeline: assemble packs + upload with bounded concurrency.
-        //    Each pack is assembled (consuming its compressed blocks) then uploaded.
-        //    buffer_unordered(4) keeps at most 4 packs in flight, freeing memory
-        //    as uploads complete instead of holding all packs at once.
-        use futures::stream::{self, StreamExt};
-
-        let to_upload = std::mem::take(&mut batch.to_upload);
-        let mut owned_chunks: Vec<Vec<(Blake3Hash, Vec<u8>)>> = Vec::new();
+        // 3. Partition dirty blocks by volume chunk
+        let mut per_chunk: BTreeMap<u32, Vec<(usize, u64)>> = BTreeMap::new();
         {
-            let mut iter = to_upload.into_iter().peekable();
-            while iter.peek().is_some() {
-                owned_chunks.push(iter.by_ref().take(DEFAULT_BLOCKS_PER_PACK).collect());
+            let vm = volume_manifest.read();
+            for &(block_index, seq) in &snapshot {
+                let chunk_idx = vm.chunk_idx_for_block(block_index as u64);
+                per_chunk.entry(chunk_idx).or_default().push((block_index, seq));
             }
         }
 
-        #[allow(clippy::type_complexity)]
-        let pack_results: Vec<
-            Result<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>), CacheError>,
-        > = stream::iter(owned_chunks)
-            .map(|chunk| {
-                let cs = content_store;
-                async move {
-                    let pack_id = uuid::Uuid::new_v4();
-                    let (pack_bytes, index_entries) = pack::assemble_pack(chunk, chunk_size)?;
-                    let pack_size = pack_bytes.len() as u64;
-                    cs.put_pack(pack_id, pack_bytes).await?;
-                    Ok((pack_id, pack_size, index_entries))
+        // 4. Pre-fetch existing ChunkMeta for all affected chunks
+        for &chunk_idx in per_chunk.keys() {
+            let chunk_hash = volume_manifest.read().get_chunk_hash(chunk_idx);
+            if let Some(chunk_hash) = chunk_hash {
+                if chunk_meta_cache.get(&chunk_hash).await.is_none() {
+                    let hash_hex = format_hash(&chunk_hash);
+                    match content_store.get_chunk_meta(chunk_idx, &hash_hex).await {
+                        Ok(Some(data)) => match ChunkMeta::deserialize(&data) {
+                            Ok(meta) => {
+                                chunk_meta_cache.insert(chunk_hash, Arc::new(meta));
+                            }
+                            Err(e) => {
+                                warn!(chunk_idx, error = %e, "failed to deserialize chunk meta from S3");
+                            }
+                        },
+                        Ok(None) => {
+                            warn!(chunk_idx, "chunk meta not found in S3");
+                        }
+                        Err(e) => {
+                            warn!(chunk_idx, error = %e, "failed to fetch chunk meta from S3");
+                        }
+                    }
                 }
-            })
-            .buffer_unordered(4)
-            .collect()
-            .await;
-
-        // Register in host pack index for future dedup
-        let mut batch_entries = Vec::new();
-        for result in pack_results {
-            let (pack_id, pack_size, index_entries) = result?;
-            stats.packs_uploaded += 1;
-            stats.bytes_uploaded += pack_size;
-            stats.new_pack_ids.push(pack_id);
-            for entry in &index_entries {
-                batch_entries.push((
-                    entry.hash,
-                    PackLocation {
-                        pack_id,
-                        offset: entry.offset,
-                        comp_length: entry.comp_length,
-                    },
-                ));
             }
         }
-        host_pack_index.insert_batch(&batch_entries)?;
 
-        // 5. Set real hashes in block_map + clear dirty flags.
-        //    Sequence number serves as version token: if a concurrent write
-        //    changed the sequence, leave the block dirty for the next flush.
-        for &(chunk_index, snapshot_seq, actual_hash) in &batch.computed {
+        let mut total_stats = FlushStats::default();
+        let mut all_computed: Vec<(usize, u64, Blake3Hash)> = Vec::new();
+        let mut chunk_updates: Vec<(u32, Blake3Hash)> = Vec::new();
+
+        // 5. Per-chunk flush
+        for (chunk_idx, chunk_blocks) in per_chunk {
+            let existing_chunk_hash = volume_manifest.read().get_chunk_hash(chunk_idx);
+            let existing_meta = match existing_chunk_hash {
+                Some(h) => chunk_meta_cache.get(&h).await,
+                None => None,
+            };
+
+            // Build dedup HashSet from existing entries
+            let known_hashes: HashSet<Blake3Hash> = existing_meta
+                .as_ref()
+                .map(|m| m.block_hashes())
+                .unwrap_or_default();
+
+            // Build existing hash→pack_location map (for reusing pack locations of deduped blocks)
+            let existing_hash_locs: HashMap<Blake3Hash, (uuid::Uuid, u32, u32)> = existing_meta
+                .as_ref()
+                .map(|m| {
+                    m.entries
+                        .iter()
+                        .map(|e| (e.hash, (e.pack_id, e.pack_offset, e.comp_length)))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // Compute batch for this chunk's blocks
+            let zero_hash = self.inner.zero_block_hash;
+            let inner = Arc::clone(&self.inner);
+            let known = known_hashes;
+            let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
+                compute_flush_batch(&inner, &chunk_blocks, &known, zero_hash)
+            })
+            .await
+            .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
+
+            total_stats.blocks_flushed += batch.stats.blocks_flushed;
+            total_stats.blocks_deduped += batch.stats.blocks_deduped;
+            total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
+            total_stats.blocks_corrupted += batch.stats.blocks_corrupted;
+
+            // Assemble and upload packs (chunk-scoped)
+            use futures::stream::{self, StreamExt};
+
+            let to_upload = std::mem::take(&mut batch.to_upload);
+            let mut owned_chunks: Vec<Vec<(Blake3Hash, Vec<u8>)>> = Vec::new();
+            {
+                let mut iter = to_upload.into_iter().peekable();
+                while iter.peek().is_some() {
+                    owned_chunks
+                        .push(iter.by_ref().take(DEFAULT_BLOCKS_PER_PACK).collect());
+                }
+            }
+
+            // Build hash→pack_location map from upload results
+            let mut hash_to_pack_loc: HashMap<Blake3Hash, (uuid::Uuid, u32, u32)> = HashMap::new();
+
+            if !owned_chunks.is_empty() {
+                #[allow(clippy::type_complexity)]
+                let pack_results: Vec<
+                    Result<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>), CacheError>,
+                > = stream::iter(owned_chunks)
+                    .map(|chunk| {
+                        let cs = content_store;
+                        let cidx = chunk_idx;
+                        async move {
+                            let pack_id = uuid::Uuid::new_v4();
+                            let (pack_bytes, index_entries) =
+                                pack::assemble_pack(chunk, block_size)?;
+                            let pack_size = pack_bytes.len() as u64;
+                            cs.put_chunk_pack(cidx, pack_id, pack_bytes).await?;
+                            Ok((pack_id, pack_size, index_entries))
+                        }
+                    })
+                    .buffer_unordered(4)
+                    .collect()
+                    .await;
+
+                for result in pack_results {
+                    let (pack_id, pack_size, index_entries) = result?;
+                    total_stats.packs_uploaded += 1;
+                    total_stats.bytes_uploaded += pack_size;
+                    total_stats.new_pack_ids.push(pack_id);
+                    for entry in &index_entries {
+                        hash_to_pack_loc
+                            .insert(entry.hash, (pack_id, entry.offset, entry.comp_length));
+                    }
+                }
+            }
+
+            // Build new ChunkMetaEntry list from computed results
+            let mut new_entries: Vec<ChunkMetaEntry> = Vec::new();
+            {
+                let vm = volume_manifest.read();
+                for &(block_index, _, hash) in &batch.computed {
+                    if hash == zero_hash || hash == self.inner.zero_block_hash {
+                        continue; // zero blocks don't need entries
+                    }
+                    let block_offset = vm.block_offset_in_chunk(block_index as u64);
+
+                    // Try newly uploaded packs first, then existing entries
+                    let pack_loc = hash_to_pack_loc
+                        .get(&hash)
+                        .or_else(|| existing_hash_locs.get(&hash));
+
+                    if let Some(&(pack_id, pack_offset, comp_length)) = pack_loc {
+                        new_entries.push(ChunkMetaEntry {
+                            offset: block_offset,
+                            hash,
+                            pack_id,
+                            pack_offset,
+                            comp_length,
+                        });
+                    }
+                }
+            }
+
+            // Read chunk geometry from VolumeManifest
+            let (chunk_size_bytes, device_block_size) = {
+                let vm = volume_manifest.read();
+                (vm.chunk_size, vm.block_size)
+            };
+
+            // Merge with existing ChunkMeta to produce new version
+            let new_meta = if let Some(ref old_meta) = existing_meta {
+                ChunkMeta::merge(old_meta, &new_entries)
+            } else {
+                let mut entries = new_entries;
+                entries.sort_by_key(|e| e.offset);
+                ChunkMeta {
+                    chunk_idx,
+                    chunk_size: chunk_size_bytes,
+                    block_size: device_block_size,
+                    entries,
+                }
+            };
+
+            // Compute new content hash and upload
+            let new_chunk_hash = new_meta.content_hash();
+            let meta_bytes = new_meta.serialize();
+            let hash_hex = format_hash(&new_chunk_hash);
+            content_store
+                .put_chunk_meta(chunk_idx, &hash_hex, meta_bytes)
+                .await?;
+
+            // Update cache
+            chunk_meta_cache.insert(new_chunk_hash, Arc::new(new_meta));
+            chunk_updates.push((chunk_idx, new_chunk_hash));
+
+            // Collect all computed entries for block_map update
+            all_computed.extend(batch.computed);
+        }
+
+        // 6. Set real hashes in block_map + clear dirty flags
+        for &(chunk_index, snapshot_seq, actual_hash) in &all_computed {
             let (_hash, current_seq) = self.inner.block_map_get(chunk_index);
             if current_seq != snapshot_seq {
-                // Concurrent write changed this block — leave dirty.
-                stats.blocks_cas_failed += 1;
+                total_stats.blocks_cas_failed += 1;
                 continue;
             }
-            // Replace ZERO placeholder with real content hash.
             self.inner
                 .block_map_set(chunk_index, actual_hash, snapshot_seq);
-            // CAS Dirty(2) -> Clean(1) on the state map.
             if self
                 .inner
                 .state_map
@@ -419,277 +502,29 @@ impl WriteCache<Active> {
             }
         }
 
+        // 7. Update VolumeManifest with new chunk hashes
+        {
+            let mut vm = volume_manifest.write();
+            for &(chunk_idx, ref chunk_hash) in &chunk_updates {
+                vm.set_chunk_hash(chunk_idx, *chunk_hash);
+            }
+        }
+
         info!(
-            blocks_flushed = stats.blocks_flushed,
-            blocks_deduped = stats.blocks_deduped,
-            blocks_cas_failed = stats.blocks_cas_failed,
-            blocks_corrupted = stats.blocks_corrupted,
-            packs_uploaded = stats.packs_uploaded,
-            bytes_uploaded = stats.bytes_uploaded,
+            blocks_flushed = total_stats.blocks_flushed,
+            blocks_deduped = total_stats.blocks_deduped,
+            blocks_cas_failed = total_stats.blocks_cas_failed,
+            blocks_corrupted = total_stats.blocks_corrupted,
+            packs_uploaded = total_stats.packs_uploaded,
+            bytes_uploaded = total_stats.bytes_uploaded,
+            chunks_updated = chunk_updates.len(),
             "flush dirty inner complete"
         );
 
-        Ok((stats, seq_cutpoint))
+        Ok((total_stats, seq_cutpoint))
     }
 
-    /// Build a full manifest from current state.
-    ///
-    /// Returns the manifest and its serialized bytes. Does not perform any S3
-    /// operations or update internal state — that's done by `upload_full_manifest`.
-    fn build_manifest(
-        &self,
-        host_pack_index: &HostPackIndex,
-        seq_cutpoint: u64,
-    ) -> Result<(Manifest, Vec<u8>), CacheError> {
-        let chunk_size = self.inner.config.block_size as u32;
-        let post_flush_snap = self.inner.block_map_snapshot();
-        let block_map_entries: Vec<ManifestBlockEntry> = post_flush_snap
-            .iter_non_empty()
-            .map(|(idx, entry)| ManifestBlockEntry {
-                chunk_index: idx as u64,
-                hash: entry.hash,
-                flags: entry.flags,
-            })
-            .collect();
-        let pack_entries = host_pack_index.derive_for_block_map(&post_flush_snap)?;
-
-        let manifest = Manifest {
-            name: self.inner.export_name.clone(),
-            sequence: seq_cutpoint,
-            chunk_size,
-            device_size: self.inner.config.device_size,
-            block_map: block_map_entries,
-            pack_index: pack_entries,
-        };
-        let bytes = manifest.serialize();
-        Ok((manifest, bytes))
-    }
-
-    /// Build and upload a full (base) manifest from current state.
-    ///
-    /// After upload, populates `base_manifest_state` for future delta computation
-    /// and deletes any existing `.delta` file from S3.
-    ///
-    /// Returns the S3 ETag if the backend provides one.
-    async fn upload_full_manifest(
-        &self,
-        content_store: &ContentStore,
-        host_pack_index: &HostPackIndex,
-        seq_cutpoint: u64,
-    ) -> Result<Option<String>, CacheError> {
-        let (manifest, bytes) = self.build_manifest(host_pack_index, seq_cutpoint)?;
-
-        // Cache the manifest's pack hashes for pack index pruning.
-        *self.inner.manifest_pack_hashes.lock() =
-            manifest.pack_index.iter().map(|e| e.hash).collect();
-
-        let etag = content_store
-            .put_manifest(&self.inner.export_name, bytes)
-            .await?;
-
-        // Update base_manifest_state for future delta computation.
-        {
-            use super::inner::BaseManifestState;
-            let base_block_map = manifest
-                .block_map
-                .iter()
-                .map(|e| (e.chunk_index, e.hash))
-                .collect();
-            *self.inner.base_manifest_state.lock() = Some(BaseManifestState {
-                sequence: seq_cutpoint,
-                block_map: base_block_map,
-                syncs_since_base: 0,
-            });
-        }
-
-        // Delete any existing delta (we just compacted).
-        if let Err(e) = content_store
-            .delete_delta_manifest(&self.inner.export_name)
-            .await
-        {
-            warn!(error = %e, "failed to delete delta manifest after compaction (harmless)");
-        }
-
-        info!(sequence = seq_cutpoint, "uploaded full manifest");
-        Ok(etag)
-    }
-
-    /// Build and upload a delta manifest if possible, otherwise fall back to full.
-    ///
-    /// Compaction triggers (fall back to full):
-    /// 1. No base_manifest_state (first sync)
-    /// 2. Delta size > 50% of estimated full manifest size
-    /// 3. syncs_since_base >= 10
-    async fn upload_delta_or_full_manifest(
-        &self,
-        content_store: &ContentStore,
-        host_pack_index: &HostPackIndex,
-        seq_cutpoint: u64,
-    ) -> Result<Option<String>, CacheError> {
-        use super::inner::BaseManifestState;
-
-        // Check compaction triggers while borrowing (no take yet).
-        // Extract decision before any .await to avoid holding MutexGuard across await.
-        let needs_full = {
-            let guard = self.inner.base_manifest_state.lock();
-            match guard.as_ref() {
-                None => Some("no base manifest state"),
-                Some(s) if s.syncs_since_base >= 10 => Some("compaction trigger: sync count"),
-                Some(_) => None, // proceed to delta path
-            }
-        };
-        if let Some(reason) = needs_full {
-            debug!("{reason}, uploading full manifest");
-            return self
-                .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
-                .await;
-        }
-
-        // Take ownership for delta computation. From here, any error must
-        // restore the state before propagating.
-        let Some(base_state) = self.inner.base_manifest_state.lock().take() else {
-            // Shouldn't happen (we just checked), but fall back to full upload.
-            return self
-                .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
-                .await;
-        };
-
-        // Run the fallible delta logic, restoring base_state on error.
-        let result = self
-            .try_upload_delta(content_store, host_pack_index, seq_cutpoint, &base_state)
-            .await;
-
-        match result {
-            Ok(compacted) => {
-                if compacted {
-                    // Full manifest was uploaded (size trigger) — upload_full_manifest
-                    // already set new base_manifest_state, nothing to restore.
-                } else {
-                    // Delta uploaded — put back with incremented sync count.
-                    *self.inner.base_manifest_state.lock() = Some(BaseManifestState {
-                        sequence: base_state.sequence,
-                        block_map: base_state.block_map,
-                        syncs_since_base: base_state.syncs_since_base + 1,
-                    });
-                }
-                Ok(None)
-            }
-            Err(e) => {
-                // Restore state so next sync can retry delta.
-                *self.inner.base_manifest_state.lock() = Some(base_state);
-                Err(e)
-            }
-        }
-    }
-
-    /// Inner delta upload logic. Returns Ok(true) if compaction was triggered
-    /// (full manifest uploaded instead), Ok(false) if delta was uploaded.
-    async fn try_upload_delta(
-        &self,
-        content_store: &ContentStore,
-        host_pack_index: &HostPackIndex,
-        seq_cutpoint: u64,
-        base_state: &super::inner::BaseManifestState,
-    ) -> Result<bool, CacheError> {
-        use crate::block::manifest::MANIFEST_BLOCK_ENTRY_SIZE;
-
-        // Snapshot current block map and compute delta.
-        let chunk_size = self.inner.config.block_size as u32;
-        let post_flush_snap = self.inner.block_map_snapshot();
-        let current_entries: Vec<ManifestBlockEntry> = post_flush_snap
-            .iter_non_empty()
-            .map(|(idx, entry)| ManifestBlockEntry {
-                chunk_index: idx as u64,
-                hash: entry.hash,
-                flags: entry.flags,
-            })
-            .collect();
-
-        // Compute upserts: entries that differ from base.
-        let mut upserted = Vec::new();
-        let mut current_map = std::collections::HashMap::new();
-        for entry in &current_entries {
-            current_map.insert(entry.chunk_index, entry);
-            match base_state.block_map.get(&entry.chunk_index) {
-                Some(&base_hash) if base_hash == entry.hash => {
-                    // Unchanged — skip.
-                }
-                _ => {
-                    // New or changed — upsert.
-                    upserted.push(entry.clone());
-                }
-            }
-        }
-
-        // Compute deletes: entries in base but not in current.
-        let deleted_chunks: Vec<u64> = base_state
-            .block_map
-            .keys()
-            .filter(|k| !current_map.contains_key(k))
-            .copied()
-            .collect();
-
-        // Derive pack entries once for the full current state. We need
-        // them both for filtering (delta) and for caching (pruning).
-        let all_pack_entries = host_pack_index.derive_for_block_map(&post_flush_snap)?;
-
-        // Filter to only upserted hashes for the delta manifest.
-        let upserted_hashes: std::collections::HashSet<Blake3Hash> =
-            upserted.iter().map(|e| e.hash).collect();
-        let new_pack_entries: Vec<_> = all_pack_entries
-            .iter()
-            .filter(|e| upserted_hashes.contains(&e.hash))
-            .cloned()
-            .collect();
-
-        // Size-based compaction trigger: delta block changes > 50% of full block map.
-        // Compare block-level sizes only (pack entries scale proportionally).
-        let delta_block_size =
-            upserted.len() * MANIFEST_BLOCK_ENTRY_SIZE + deleted_chunks.len() * 8;
-        let full_block_size = current_entries.len() * MANIFEST_BLOCK_ENTRY_SIZE;
-        if full_block_size > 0 && delta_block_size * 2 > full_block_size {
-            debug!(
-                delta_entries = upserted.len(),
-                deleted = deleted_chunks.len(),
-                full_entries = current_entries.len(),
-                "compaction trigger: delta > 50% of full, uploading full manifest"
-            );
-            self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
-                .await?;
-            return Ok(true); // compacted
-        }
-
-        // Build and upload delta.
-        let delta = ManifestDelta {
-            name: self.inner.export_name.clone(),
-            base_sequence: base_state.sequence,
-            sequence: seq_cutpoint,
-            chunk_size,
-            device_size: self.inner.config.device_size,
-            upserted,
-            deleted_chunks,
-            new_pack_entries,
-        };
-
-        // Cache the full manifest's pack hashes for pack index pruning.
-        *self.inner.manifest_pack_hashes.lock() = all_pack_entries.iter().map(|e| e.hash).collect();
-
-        content_store
-            .put_delta_manifest(&self.inner.export_name, delta.serialize())
-            .await?;
-
-        info!(
-            sequence = seq_cutpoint,
-            base_sequence = base_state.sequence,
-            upserts = delta.upserted.len(),
-            deletes = delta.deleted_chunks.len(),
-            new_packs = delta.new_pack_entries.len(),
-            "uploaded delta manifest"
-        );
-        Ok(false) // delta, not compacted
-    }
-
-    /// Flush dirty blocks to S3 as packs (no manifest upload).
+    /// Flush dirty blocks to S3 as chunk-scoped packs (no manifest upload).
     ///
     /// Returns flush statistics and the sequence cutpoint for a subsequent
     /// `sync_manifest()` call. Used by the flush scheduler to separate
@@ -697,23 +532,26 @@ impl WriteCache<Active> {
     pub async fn flush_packs(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &Arc<HostPackIndex>,
+        chunk_meta_cache: &Arc<ChunkMetaCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
     ) -> Result<(FlushStats, u64), CacheError> {
-        self.flush_dirty_inner(content_store, host_pack_index).await
+        self.flush_dirty_inner(content_store, chunk_meta_cache, volume_manifest)
+            .await
     }
 
-    /// Upload a manifest reflecting the current block map state.
+    /// Upload the VolumeManifest to S3.
     ///
     /// Call after `flush_packs()` with the returned `seq_cutpoint` to persist
-    /// a recovery manifest. Uses delta manifests when possible to reduce S3
-    /// bandwidth, falling back to full on compaction triggers.
+    /// a recovery manifest.
     pub async fn sync_manifest(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &Arc<HostPackIndex>,
-        seq_cutpoint: u64,
+        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+        _seq_cutpoint: u64,
     ) -> Result<(), CacheError> {
-        self.upload_delta_or_full_manifest(content_store, host_pack_index, seq_cutpoint)
+        let manifest_bytes = volume_manifest.read().serialize();
+        content_store
+            .put_volume_manifest(&self.inner.export_name, manifest_bytes)
             .await?;
         self.checkpoint()?;
         Ok(())
@@ -738,7 +576,6 @@ impl WriteCache<Active> {
     /// where S3 flushes may be infrequent. Should run every ~5s when
     /// there are dirty blocks.
     pub fn local_checkpoint(&self) -> Result<(), CacheError> {
-        // Compute CRC32 for dirty blocks that don't have one yet.
         self.compute_dirty_crc32s();
         self.checkpoint()?;
         debug!("local checkpoint complete");
@@ -746,10 +583,6 @@ impl WriteCache<Active> {
     }
 
     /// Compute CRC32 checksums for dirty blocks that don't have one yet.
-    ///
-    /// Reads each block from SSD and computes CRC32. Uses a sequence-number
-    /// guard to avoid storing stale checksums when a concurrent write changes
-    /// the block data during the read.
     fn compute_dirty_crc32s(&self) {
         let block_size = self.inner.config.block_size;
         let device_size = self.inner.config.device_size;
@@ -761,12 +594,10 @@ impl WriteCache<Active> {
             .state_map
             .iter_with_state(SparseBlockState::DIRTY)
         {
-            // Only compute for blocks without a CRC32.
             if self.inner.block_map_get_crc32(idx) != 0 {
                 continue;
             }
 
-            // Seq guard: capture sequence before and after reading data.
             let (_, seq_before) = self.inner.block_map_get(idx);
 
             let offset = idx as u64 * block_size as u64;
@@ -794,12 +625,10 @@ impl WriteCache<Active> {
 
             let (_, seq_after) = self.inner.block_map_get(idx);
             if seq_before != seq_after {
-                // Concurrent write changed this block — skip.
                 continue;
             }
 
             let crc = crc32fast::hash(&buf);
-            // CAS: only store if still 0 (write may have cleared it).
             let _ = self.inner.block_map_cas_crc32(idx, 0, crc);
             computed += 1;
         }
@@ -809,101 +638,62 @@ impl WriteCache<Active> {
         }
     }
 
-    /// Update the pack registry after a flush. Best-effort: warn on failure.
+    /// Flush dirty blocks to S3 as chunk-scoped packs + volume manifest.
     ///
-    /// This is off the critical I/O path — the manifest is already uploaded.
-    /// If the registry PUT fails, the packs become untracked orphans (harmless).
-    pub(crate) async fn update_registry(
-        &self,
-        content_store: &ContentStore,
-        new_pack_ids: &[uuid::Uuid],
-    ) {
-        if new_pack_ids.is_empty() {
-            return;
-        }
-        let name = &self.inner.export_name;
-        let result: Result<(), crate::block::content_store::ContentStoreError> = async {
-            let mut registry = match content_store.get_registry(name).await? {
-                Some(data) => {
-                    PackRegistry::deserialize(&data).map_err(|e| object_store::Error::Generic {
-                        store: "registry",
-                        source: Box::new(e),
-                    })?
-                }
-                None => PackRegistry::new(),
-            };
-            registry.append(new_pack_ids);
-            content_store
-                .put_registry(name, registry.serialize())
-                .await?;
-            Ok(())
-        }
-        .await;
-
-        if let Err(e) = result {
-            warn!(
-                error = %e,
-                export = %name,
-                packs = new_pack_ids.len(),
-                "failed to update pack registry (packs are harmless orphans)"
-            );
-        }
-    }
-
-    /// Flush dirty blocks to S3 as content-addressed packs + manifest.
-    ///
-    /// This is the v2 flush path:
+    /// This is the v3 chunked flush path:
     /// 1. Scan block_states for dirty blocks (targeted, not full-device snapshot)
-    /// 2. Dedup against the host pack index (blocks already in S3)
-    /// 3. LZ4-compress new blocks and assemble into 25-block packs
-    /// 4. Upload packs to S3 concurrently
-    /// 5. Clear dirty flags (with concurrent-write safety)
-    /// 6. Upload a self-contained manifest
-    /// 7. Update pack registry (best-effort)
-    /// 8. Checkpoint: persist block map (outside lock) + block states (under lock) + truncate WAL
-    #[instrument(skip(self, content_store, host_pack_index))]
+    /// 2. Partition by volume chunk, dedup against chunk meta
+    /// 3. LZ4-compress new blocks and assemble into packs per chunk
+    /// 4. Upload packs to S3 concurrently as chunks/{idx}/{uuid}.pack
+    /// 5. Build new ChunkMeta, upload as chunks/{idx}/{hash}.meta
+    /// 6. Clear dirty flags (with concurrent-write safety)
+    /// 7. Upload VolumeManifest
+    /// 8. Checkpoint: persist block map + block states + truncate WAL
+    #[instrument(skip(self, content_store, chunk_meta_cache, volume_manifest))]
     pub async fn flush_to_s3(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &Arc<HostPackIndex>,
+        chunk_meta_cache: &Arc<ChunkMetaCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
     ) -> Result<FlushStats, CacheError> {
-        let (stats, seq_cutpoint) = self
-            .flush_dirty_inner(content_store, host_pack_index)
+        let (stats, _seq_cutpoint) = self
+            .flush_dirty_inner(content_store, chunk_meta_cache, volume_manifest)
             .await?;
-        self.upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
+        // Upload VolumeManifest
+        let manifest_bytes = volume_manifest.read().serialize();
+        content_store
+            .put_volume_manifest(&self.inner.export_name, manifest_bytes)
             .await?;
-        self.update_registry(content_store, &stats.new_pack_ids)
-            .await;
         self.checkpoint()?;
         Ok(stats)
     }
 
-    /// Take a point-in-time snapshot: flush dirty blocks + upload manifest.
+    /// Take a point-in-time snapshot: flush dirty blocks + upload volume manifest.
     ///
-    /// In addition to uploading the current manifest (overwriting `manifests/{name}`),
-    /// this persists a versioned copy at `snapshots/{name}/{sequence:020}` that is
-    /// never overwritten by background flushes. The control plane manages snapshot
-    /// lifecycle explicitly via list/delete APIs.
-    ///
-    /// Returns the manifest ETag and sequence number for the control plane
-    /// to use when creating a fork.
-    #[instrument(skip(self, content_store, host_pack_index))]
+    /// In addition to uploading the current volume manifest (overwriting
+    /// `manifests/{name}`), this persists a versioned copy at
+    /// `snapshots/{name}/{sequence:020}` that is never overwritten by
+    /// background flushes.
+    #[instrument(skip(self, content_store, chunk_meta_cache, volume_manifest))]
     pub async fn snapshot(
         &self,
         content_store: &ContentStore,
-        host_pack_index: &Arc<HostPackIndex>,
+        chunk_meta_cache: &Arc<ChunkMetaCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
     ) -> Result<SnapshotResult, CacheError> {
         let (stats, seq_cutpoint) = self
-            .flush_dirty_inner(content_store, host_pack_index)
-            .await?;
-        let manifest_etag = self
-            .upload_full_manifest(content_store, host_pack_index, seq_cutpoint)
+            .flush_dirty_inner(content_store, chunk_meta_cache, volume_manifest)
             .await?;
 
-        // Persist a versioned snapshot (best-effort — current manifest is already safe).
-        let snapshot_bytes = self.build_manifest(host_pack_index, seq_cutpoint)?.1;
+        // Upload current volume manifest
+        let manifest_bytes = volume_manifest.read().serialize();
+        let manifest_etag = content_store
+            .put_volume_manifest(&self.inner.export_name, manifest_bytes.clone())
+            .await?;
+
+        // Persist versioned snapshot (best-effort)
         if let Err(e) = content_store
-            .put_snapshot(&self.inner.export_name, seq_cutpoint, snapshot_bytes)
+            .put_snapshot(&self.inner.export_name, seq_cutpoint, manifest_bytes)
             .await
         {
             warn!(
@@ -912,39 +702,12 @@ impl WriteCache<Active> {
             );
         }
 
-        self.update_registry(content_store, &stats.new_pack_ids)
-            .await;
         self.checkpoint()?;
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,
             stats,
         })
-    }
-
-    /// Check if a forked block map should be flattened, and do so.
-    ///
-    /// Flatten replaces a ForkedBlockMap (sparse overlay) with a full AtomicBlockMap
-    /// when the overlay exceeds 50% of total chunks. Takes a write lock briefly.
-    pub(super) fn try_flatten_block_map(&self) {
-        let needs_flatten = {
-            let bm = self.inner.block_map.read();
-            match &*bm {
-                BlockMapKind::Forked(f) => f.should_flatten(),
-                BlockMapKind::Full(_) => false,
-            }
-        };
-        if needs_flatten {
-            let mut bm = self.inner.block_map.write();
-            // Re-check under write lock (another thread may have flattened)
-            if let BlockMapKind::Forked(f) = &*bm
-                && f.should_flatten()
-            {
-                let full = f.flatten();
-                *bm = BlockMapKind::Full(full);
-                info!("flattened forked block map");
-            }
-        }
     }
 
     /// Get a clone of the inner Arc for sharing with the sync worker.

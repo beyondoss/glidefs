@@ -607,14 +607,7 @@ where
                 writeln!(output, "# TYPE glidefs_s3_circuit_breaker_state gauge").unwrap();
                 writeln!(output, "glidefs_s3_circuit_breaker_state {cb_value}").unwrap();
             }
-            // Host-level pack index size (content-addressed dedup entries)
-            {
-                use std::fmt::Write;
-                let entries = router.pack_index().len().unwrap_or(0);
-                writeln!(output, "# HELP glidefs_pack_index_entries Number of entries in the host-level pack index").unwrap();
-                writeln!(output, "# TYPE glidefs_pack_index_entries gauge").unwrap();
-                writeln!(output, "glidefs_pack_index_entries {entries}").unwrap();
-            }
+            // (pack index metric removed — replaced by ChunkMetaCache)
             // SSD capacity
             {
                 use std::fmt::Write;
@@ -711,7 +704,7 @@ mod tests {
     use crate::block::router::RouterConfig;
     use tempfile::TempDir;
 
-    fn create_test_router(temp_dir: &TempDir) -> Arc<ExportRouter> {
+    async fn create_test_router(temp_dir: &TempDir) -> Arc<ExportRouter> {
         let s3: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         Arc::new(
@@ -728,6 +721,7 @@ mod tests {
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
             })
+            .await
             .expect("failed to create test router"),
         )
     }
@@ -797,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_endpoint() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/health", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -805,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn test_readiness_endpoint() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/health/ready", None).await;
         // May be OK or SERVICE_UNAVAILABLE depending on state
         assert!(
@@ -816,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_route_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/nonexistent", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -824,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_creates_export() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -846,7 +840,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_existing_export_is_noop() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         // Create
         request(
             &router,
@@ -869,7 +863,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_existing_export() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -885,7 +879,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_missing_export_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/api/exports/nope", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -893,7 +887,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_exports() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -909,7 +903,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_export() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -925,7 +919,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_with_purge() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -947,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_missing_export_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::POST, "/api/exports/nope/drain", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -955,7 +949,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_export_name_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -969,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_size_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -987,7 +981,7 @@ mod tests {
             return; // Skip on Linux+ublk builds where it would succeed.
         }
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -1001,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_transport_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -1015,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn test_nbd_transport_accepted() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -1029,7 +1023,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_json_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::PUT, "/api/exports/vol1", Some("not json")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
@@ -1037,7 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_endpoint() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/metrics", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -1049,7 +1043,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_export_success() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -1065,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn test_promote_export_success() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         // Create a readonly export
         request(
             &router,
@@ -1082,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn test_promote_nonexistent_export_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::POST, "/api/exports/nope/promote", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -1090,7 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_export_success() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -1106,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_nonexistent_export_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::POST, "/api/exports/nope/snapshot", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -1114,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_snapshot_invalid_sequence_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -1136,7 +1130,7 @@ mod tests {
     #[tokio::test]
     async fn test_api_fork_from_snapshot_sequence() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
 
         // Create source export
         request(
@@ -1166,7 +1160,7 @@ mod tests {
     #[tokio::test]
     async fn test_api_snapshot_sequence_without_manifest_name_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
 
         let resp = request(
             &router,
@@ -1185,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_export_includes_transport_and_device() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -1208,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_exports_includes_transport() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -1227,7 +1221,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_idempotent_returns_export_info() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
 
         // First PUT — creates
         let resp = request(

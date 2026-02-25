@@ -116,9 +116,6 @@ impl WriteCache<Active> {
             }
         }
 
-        // If using a forked block map, check if overlay is large enough to flatten
-        self.try_flatten_block_map();
-
         debug!(
             start_block = start_block,
             end_block = end_block,
@@ -231,9 +228,6 @@ impl WriteCache<Active> {
                 wal.flush_buf()?;
             }
         }
-
-        // If using a forked block map, check if overlay is large enough to flatten
-        self.try_flatten_block_map();
 
         Ok(())
     }
@@ -368,8 +362,6 @@ impl WriteCache<Active> {
                 wal.flush_buf()?;
             }
         }
-
-        self.try_flatten_block_map();
 
         tracing::debug!(start_block, end_block, "post_write: marked blocks dirty");
         Ok(())

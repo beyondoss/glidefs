@@ -17,10 +17,11 @@ use rand::Rng;
 use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
+use crate::block::chunk_cache::ChunkMetaCache;
 use crate::block::content_store::ContentStore;
 use crate::block::metrics::ExportMetrics;
-use crate::block::pack_index::HostPackIndex;
 use crate::block::state::Active;
+use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::WriteCache;
 
 /// Run the flush scheduler for a single export.
@@ -31,7 +32,8 @@ use crate::block::write_cache::WriteCache;
 pub async fn flush_scheduler(
     cache: Arc<WriteCache<Active>>,
     content_store: Arc<ContentStore>,
-    pack_index: Arc<HostPackIndex>,
+    chunk_meta_cache: Arc<ChunkMetaCache>,
+    volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
     flush_notify: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<ExportMetrics>,
@@ -83,7 +85,7 @@ pub async fn flush_scheduler(
                 }
 
                 let start = Instant::now();
-                match cache.flush_packs(&content_store, &pack_index).await {
+                match cache.flush_packs(&content_store, &chunk_meta_cache, &volume_manifest).await {
                     Ok((stats, seq_cutpoint)) => {
                         flush_backoff = Duration::ZERO;
                         metrics.record_s3_put_latency(start.elapsed());
@@ -101,7 +103,7 @@ pub async fn flush_scheduler(
                             // Retry up to 3 times; if all fail, defer to checkpoint tick.
                             let mut synced = false;
                             for attempt in 0..3 {
-                                match cache.sync_manifest(&content_store, &pack_index, seq_cutpoint).await {
+                                match cache.sync_manifest(&content_store, &volume_manifest, seq_cutpoint).await {
                                     Ok(()) => { synced = true; break; }
                                     Err(e) => {
                                         metrics.record_manifest_sync_error();
@@ -144,7 +146,7 @@ pub async fn flush_scheduler(
             _ = checkpoint_ticker.tick() => {
                 // Retry manifest sync that failed after a previous pack flush.
                 if let Some(seq) = manifest_pending {
-                    match cache.sync_manifest(&content_store, &pack_index, seq).await {
+                    match cache.sync_manifest(&content_store, &volume_manifest, seq).await {
                         Ok(()) => {
                             info!("deferred manifest sync succeeded");
                             manifest_pending = None;
@@ -171,7 +173,6 @@ mod tests {
     use crate::block::cache::{BlockCache, SimpleBlockCache};
     use crate::block::content_store::ContentStore;
     use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
-    use crate::block::pack_index::HostPackIndex;
     use crate::block::state::Initializing;
     use crate::block::write_cache::WriteCacheConfig;
     use async_trait::async_trait;
@@ -281,11 +282,16 @@ mod tests {
         }
     }
 
+    fn device_size() -> u64 {
+        128 * 1024 * (DEFAULT_BLOCKS_PER_PACK as u64 + 10)
+    }
+
     #[allow(clippy::type_complexity)]
-    fn test_scheduler_components() -> (
+    async fn test_scheduler_components() -> (
         Arc<WriteCache<Active>>,
         Arc<ContentStore>,
-        Arc<HostPackIndex>,
+        Arc<ChunkMetaCache>,
+        Arc<parking_lot::RwLock<VolumeManifest>>,
         Arc<Notify>,
         watch::Receiver<bool>,
         watch::Sender<bool>,
@@ -297,15 +303,18 @@ mod tests {
         let config = WriteCacheConfig {
             cache_dir: temp_dir.path().to_path_buf(),
             device_name: "sched-test".to_string(),
-            device_size: 128 * 1024 * (DEFAULT_BLOCKS_PER_PACK as u64 + 10), // enough for DEFAULT_BLOCKS_PER_PACK + headroom
+            device_size: device_size(),
             block_size: 128 * 1024,
             wal_sync: false,
         };
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = Arc::new(ContentStore::new(s3, "test"));
-        let pack_index =
-            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            device_size(),
+            128 * 1024,
+        )));
         let metrics = Arc::new(ExportMetrics::new());
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
@@ -318,7 +327,8 @@ mod tests {
         (
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
@@ -330,12 +340,13 @@ mod tests {
 
     /// Like test_scheduler_components but with a custom object store.
     #[allow(clippy::type_complexity)]
-    fn test_scheduler_components_with_store(
+    async fn test_scheduler_components_with_store(
         s3: Arc<dyn object_store::ObjectStore>,
     ) -> (
         Arc<WriteCache<Active>>,
         Arc<ContentStore>,
-        Arc<HostPackIndex>,
+        Arc<ChunkMetaCache>,
+        Arc<parking_lot::RwLock<VolumeManifest>>,
         Arc<Notify>,
         watch::Receiver<bool>,
         watch::Sender<bool>,
@@ -347,14 +358,17 @@ mod tests {
         let config = WriteCacheConfig {
             cache_dir: temp_dir.path().to_path_buf(),
             device_name: "sched-backoff".to_string(),
-            device_size: 128 * 1024 * (DEFAULT_BLOCKS_PER_PACK as u64 + 10),
+            device_size: device_size(),
             block_size: 128 * 1024,
             wal_sync: false,
         };
 
         let content_store = Arc::new(ContentStore::new(s3, "test"));
-        let pack_index =
-            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            device_size(),
+            128 * 1024,
+        )));
         let metrics = Arc::new(ExportMetrics::new());
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
@@ -367,7 +381,8 @@ mod tests {
         (
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
@@ -379,14 +394,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_shutdown() {
-        let (cache, content_store, pack_index, flush_notify, shutdown_rx, shutdown_tx, metrics, ..) =
-            test_scheduler_components();
+        let (cache, content_store, chunk_meta_cache, volume_manifest, flush_notify, shutdown_rx, shutdown_tx, metrics, ..) =
+            test_scheduler_components().await;
 
         let handle = tokio::spawn(async move {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                chunk_meta_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,
@@ -409,14 +425,15 @@ mod tests {
         let (
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
             metrics,
             clean_cache,
             _temp,
-        ) = test_scheduler_components();
+        ) = test_scheduler_components().await;
 
         let cache_check = Arc::clone(&cache);
         let flush_notify_clone = Arc::clone(&flush_notify);
@@ -437,7 +454,8 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                chunk_meta_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,
@@ -475,14 +493,15 @@ mod tests {
         let (
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
             metrics,
             clean_cache,
             _temp,
-        ) = test_scheduler_components_with_store(failing_s3.clone() as _);
+        ) = test_scheduler_components_with_store(failing_s3.clone() as _).await;
 
         let metrics_check = Arc::clone(&metrics);
         let flush_notify_clone = Arc::clone(&flush_notify);
@@ -499,7 +518,8 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                chunk_meta_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,
@@ -557,14 +577,15 @@ mod tests {
         let (
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
             metrics,
             clean_cache,
             _temp,
-        ) = test_scheduler_components_with_store(failing_s3.clone() as _);
+        ) = test_scheduler_components_with_store(failing_s3.clone() as _).await;
 
         let metrics_check = Arc::clone(&metrics);
         let cache_check = Arc::clone(&cache);
@@ -582,7 +603,8 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                chunk_meta_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,
@@ -639,14 +661,15 @@ mod tests {
         let (
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
             metrics,
             clean_cache,
             _temp,
-        ) = test_scheduler_components_with_store(failing_s3 as _);
+        ) = test_scheduler_components_with_store(failing_s3 as _).await;
 
         let flush_notify_clone = Arc::clone(&flush_notify);
 
@@ -662,7 +685,8 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                chunk_meta_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,

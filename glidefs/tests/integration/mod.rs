@@ -6,8 +6,8 @@
 //! 3. Failure recovery - graceful handling of S3/network failures
 //! 4. Crash recovery - dirty blocks survive process crashes
 
+mod chunk_prefetch;
 mod crash_recovery;
-mod delta_manifest;
 mod failure_injection;
 mod gc;
 mod property_tests;
@@ -20,27 +20,29 @@ use object_store::ObjectStore;
 use tempfile::TempDir;
 
 use glidefs::block::cache::SimpleBlockCache;
+use glidefs::block::chunk_cache::ChunkMetaCache;
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::metrics::ExportMetrics;
-use glidefs::block::pack_index::HostPackIndex;
 use glidefs::block::state::Active;
+use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 const DEVICE_SIZE: u64 = 256 * 1024 * 1024; // 256MB (enough for multi-pack tests at 500 blocks/pack)
 
-/// Shared v2 test harness: creates a WriteCache with ContentStore + HostPackIndex + SimpleBlockCache.
+/// Shared v2 test harness: creates a WriteCache with ContentStore + ChunkMetaCache + VolumeManifest + SimpleBlockCache.
 ///
 /// Returns all components needed for the v2 flush/read API.
 #[allow(clippy::type_complexity)]
-pub fn create_v2_test_cache(
+pub async fn create_v2_test_cache(
     temp_dir: &TempDir,
     name: &str,
     s3: Arc<dyn ObjectStore>,
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    Arc<HostPackIndex>,
+    Arc<ChunkMetaCache>,
+    Arc<parking_lot::RwLock<VolumeManifest>>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
 ) {
@@ -54,8 +56,10 @@ pub fn create_v2_test_cache(
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(s3, "test");
-    let pack_index =
-        Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(
+        VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
+    ));
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
@@ -64,18 +68,18 @@ pub fn create_v2_test_cache(
     (
         Arc::new(cache),
         content_store,
-        pack_index,
+        chunk_meta_cache,
+        volume_manifest,
         clean_cache,
         metrics,
     )
 }
 
-/// Cold reader: creates a WriteCache whose block_map is populated from the S3 manifest.
+/// Cold reader: creates a WriteCache whose reads go through VolumeManifest + ChunkMetaCache + S3.
 ///
-/// After a writer calls `flush_to_s3`, the manifest in S3 contains the block map and
-/// pack entries. This helper downloads the effective manifest (base + optional delta),
-/// opens a WriteCache via `open_from_manifest` (populating the block_map), and rebuilds
-/// the HostPackIndex so `read_v2` can resolve blocks through S3.
+/// After a writer calls `flush_to_s3`, the VolumeManifest in S3 contains chunk hashes.
+/// This helper downloads the VolumeManifest, opens a fresh WriteCache (local SSD starts
+/// empty), and `read_v2` resolves blocks through VolumeManifest -> ChunkMetaCache -> S3.
 pub async fn create_v2_cold_reader(
     temp_dir: &TempDir,
     name: &str,
@@ -83,23 +87,23 @@ pub async fn create_v2_cold_reader(
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    Arc<HostPackIndex>,
+    Arc<ChunkMetaCache>,
+    Arc<parking_lot::RwLock<VolumeManifest>>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
 ) {
     let content_store = ContentStore::new(Arc::clone(&s3), "test");
 
-    // Fetch effective manifest (base + optional delta) from S3
-    let manifest = content_store
-        .get_effective_manifest(name)
-        .await
-        .expect("manifest fetch failed")
-        .expect("manifest should exist in S3");
+    // Fetch VolumeManifest from S3
+    let volume_manifest = match content_store.get_volume_manifest(name).await {
+        Ok(Some(data)) => Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::deserialize(&data).expect("failed to deserialize volume manifest"),
+        )),
+        Ok(None) => panic!("volume manifest should exist in S3 for cold reader"),
+        Err(e) => panic!("failed to fetch volume manifest: {}", e),
+    };
 
-    // Rebuild pack_index from manifest
-    let pack_index =
-        Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
-    pack_index.rebuild(std::slice::from_ref(&manifest)).unwrap();
+    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
 
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
@@ -112,13 +116,14 @@ pub async fn create_v2_cold_reader(
     let metrics = Arc::new(ExportMetrics::new());
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
-    let cache = WriteCache::open_from_manifest(config, &manifest, None)
-        .expect("Failed to open cache from manifest");
+    let cache = WriteCache::open_fresh_active(config)
+        .expect("Failed to open fresh cache for cold reader");
 
     (
         Arc::new(cache),
         content_store,
-        pack_index,
+        chunk_meta_cache,
+        volume_manifest,
         clean_cache,
         metrics,
     )

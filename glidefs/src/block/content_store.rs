@@ -13,11 +13,8 @@ use tokio::sync::Semaphore;
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
-use super::manifest::{
-    delta_manifest_s3_key, manifest_s3_key, snapshot_s3_key, Manifest, ManifestDelta,
-};
+use super::manifest::{manifest_s3_key, snapshot_s3_key};
 use super::pack::pack_s3_key;
-use super::pack_registry::registry_s3_key;
 
 #[derive(Error, Debug)]
 pub enum ContentStoreError {
@@ -120,39 +117,6 @@ impl ContentStore {
 
     /// Upload a pack to S3.
     ///
-    /// If an upload semaphore is attached, acquires a permit before uploading
-    /// to bound global S3 upload concurrency across all exports.
-    #[instrument(skip(self, data), fields(pack_id = %pack_id, size = data.len()))]
-    pub async fn put_pack(&self, pack_id: Uuid, data: Vec<u8>) -> Result<(), ContentStoreError> {
-        self.check_circuit()?;
-        let _permit = match &self.upload_semaphore {
-            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
-            None => None,
-        };
-        let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
-        let path = ObjectPath::from(key);
-        let payload = PutPayload::from(data);
-        let result = self.object_store.put(&path, payload).await;
-        self.record_s3_result(&result);
-        result?;
-        debug!("uploaded pack");
-        Ok(())
-    }
-
-    /// Download a pack from S3 (buffered).
-    #[allow(dead_code)]
-    #[instrument(skip(self), fields(pack_id = %pack_id))]
-    pub async fn get_pack(&self, pack_id: Uuid) -> Result<Vec<u8>, ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
-        let path = ObjectPath::from(key);
-        let result = self.object_store.get(&path).await;
-        self.record_s3_result(&result);
-        let response = result?;
-        let bytes = response.bytes().await?;
-        Ok(bytes.to_vec())
-    }
-
     /// Fetch a single compressed block from a pack via S3 range request.
     ///
     /// Returns only the compressed bytes at `[offset..offset+comp_length]` —
@@ -203,39 +167,6 @@ impl ContentStore {
         Ok(s3_result?)
     }
 
-    /// Stream a pack from S3 as an async byte stream.
-    ///
-    /// Returns a stream of `Bytes` chunks. The caller can parse the header/index
-    /// from early chunks and decompress blocks incrementally as data arrives,
-    /// avoiding buffering the full ~3MB pack in memory.
-    ///
-    /// If a download semaphore is attached, a permit is held for the duration of
-    /// the stream (dropped when the returned stream is dropped).
-    #[instrument(skip(self), fields(pack_id = %pack_id))]
-    pub async fn get_pack_stream(
-        &self,
-        pack_id: Uuid,
-    ) -> Result<
-        impl futures::Stream<Item = Result<bytes::Bytes, ContentStoreError>> + Send + Unpin,
-        ContentStoreError,
-    > {
-        self.check_circuit()?;
-        let permit = match &self.download_semaphore {
-            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
-            None => None,
-        };
-        let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
-        let path = ObjectPath::from(key);
-        let result = self.object_store.get(&path).await;
-        self.record_s3_result(&result);
-        let response = result?;
-        let stream = response.into_stream().map(move |r| {
-            let _permit = &permit; // hold permit until stream is consumed/dropped
-            r.map_err(ContentStoreError::from)
-        });
-        Ok(Box::pin(stream))
-    }
-
     /// Upload a manifest to S3. Returns the S3 ETag if the backend provides one.
     #[instrument(skip(self, data), fields(name = %name, size = data.len()))]
     pub async fn put_manifest(
@@ -271,64 +202,6 @@ impl ContentStore {
                 Ok(Some(bytes.to_vec()))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    // =========================================================================
-    // Delta manifest operations
-    // =========================================================================
-
-    /// Upload a delta manifest to S3.
-    #[instrument(skip(self, data), fields(name = %name, size = data.len()))]
-    pub async fn put_delta_manifest(
-        &self,
-        name: &str,
-        data: Vec<u8>,
-    ) -> Result<(), ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/{}", self.base_path, delta_manifest_s3_key(name));
-        let path = ObjectPath::from(key);
-        let payload = PutPayload::from(data);
-        let result = self.object_store.put(&path, payload).await;
-        self.record_s3_result(&result);
-        result?;
-        debug!("uploaded delta manifest");
-        Ok(())
-    }
-
-    /// Download a delta manifest from S3. Returns None if not found.
-    #[instrument(skip(self), fields(name = %name))]
-    pub async fn get_delta_manifest(
-        &self,
-        name: &str,
-    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/{}", self.base_path, delta_manifest_s3_key(name));
-        let path = ObjectPath::from(key);
-        let result = self.object_store.get(&path).await;
-        self.record_s3_result(&result);
-        match result {
-            Ok(response) => {
-                let bytes = response.bytes().await?;
-                Ok(Some(bytes.to_vec()))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Delete a delta manifest from S3 (idempotent).
-    #[instrument(skip(self), fields(name = %name))]
-    pub async fn delete_delta_manifest(&self, name: &str) -> Result<(), ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/{}", self.base_path, delta_manifest_s3_key(name));
-        let path = ObjectPath::from(key);
-        let result = self.object_store.delete(&path).await;
-        self.record_s3_result(&result);
-        match result {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(e.into()),
         }
     }
@@ -444,11 +317,14 @@ impl ContentStore {
     /// Collect all pack IDs referenced by any snapshot manifest in this prefix.
     ///
     /// Called by GC to extend the live-pack set. Lists all objects under
-    /// `snapshots/`, fetches and parses each as a Manifest, and collects
-    /// referenced pack_ids.
+    /// `snapshots/`, fetches and parses each as a VolumeManifest, resolves
+    /// chunk metas, and collects referenced pack_ids.
     pub async fn collect_snapshot_live_packs(
         &self,
     ) -> Result<std::collections::HashSet<Uuid>, ContentStoreError> {
+        use super::chunk_meta::ChunkMeta;
+        use super::volume_manifest::VolumeManifest;
+
         let prefix_str = format!("{}/snapshots/", self.base_path);
         let prefix = ObjectPath::from(prefix_str);
         let mut live = std::collections::HashSet::new();
@@ -478,10 +354,36 @@ impl ContentStore {
                     continue;
                 }
             };
-            match Manifest::deserialize(&data) {
-                Ok(m) => {
-                    for entry in &m.pack_index {
-                        live.insert(entry.pack_id);
+            match VolumeManifest::deserialize(&data) {
+                Ok(vm) => {
+                    // For each chunk in the volume manifest, fetch the chunk meta
+                    // and collect pack IDs.
+                    for (&chunk_idx, chunk_hash_hex) in &vm.chunks {
+                        match self.get_chunk_meta(chunk_idx, chunk_hash_hex).await {
+                            Ok(Some(meta_bytes)) => match ChunkMeta::deserialize(&meta_bytes) {
+                                Ok(meta) => {
+                                    live.extend(meta.pack_ids());
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        key = %path, chunk_idx, chunk_hash = %chunk_hash_hex,
+                                        error = %e, "corrupt chunk meta in snapshot, skipping"
+                                    );
+                                }
+                            },
+                            Ok(None) => {
+                                tracing::warn!(
+                                    key = %path, chunk_idx, chunk_hash = %chunk_hash_hex,
+                                    "chunk meta not found for snapshot chunk"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    key = %path, chunk_idx, chunk_hash = %chunk_hash_hex,
+                                    error = %e, "failed to fetch chunk meta for snapshot"
+                                );
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -496,57 +398,248 @@ impl ContentStore {
     }
 
     // =========================================================================
-    // Effective manifest (base + delta merge)
+    // Chunk operations (v3 chunked block index)
     // =========================================================================
 
-    /// Fetch the effective manifest by merging base + optional delta.
+    /// Upload a chunk .meta file to S3.
     ///
-    /// 1. Fetch base manifest via `get_manifest()`
-    /// 2. Fetch delta via `get_delta_manifest()` (may not exist)
-    /// 3. If delta exists and `delta.base_sequence == base.sequence`, apply delta
-    /// 4. If delta is stale (wrong base_sequence), warn and return base only
-    /// 5. If no delta, return base
-    #[instrument(skip(self), fields(name = %name))]
-    pub async fn get_effective_manifest(
+    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{hex_hash}.meta`
+    #[instrument(skip(self, data), fields(chunk_idx, size = data.len()))]
+    pub async fn put_chunk_meta(
         &self,
-        name: &str,
-    ) -> Result<Option<Manifest>, ContentStoreError> {
-        let base_data = match self.get_manifest(name).await? {
-            Some(d) => d,
-            None => return Ok(None),
+        chunk_idx: u32,
+        chunk_hash: &str,
+        data: Vec<u8>,
+    ) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let _permit = match &self.upload_semaphore {
+            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
+            None => None,
         };
+        let key = format!("{}/chunks/{:04}/{}.meta", self.base_path, chunk_idx, chunk_hash);
+        let path = ObjectPath::from(key);
+        let payload = PutPayload::from(data);
+        let result = self.object_store.put(&path, payload).await;
+        self.record_s3_result(&result);
+        result?;
+        debug!("uploaded chunk meta");
+        Ok(())
+    }
 
-        let base = Manifest::deserialize(&base_data).map_err(|e| {
+    /// Download a chunk .meta file from S3. Returns None if not found.
+    #[instrument(skip(self), fields(chunk_idx))]
+    pub async fn get_chunk_meta(
+        &self,
+        chunk_idx: u32,
+        chunk_hash: &str,
+    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        self.check_circuit()?;
+        let _permit = match &self.download_semaphore {
+            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
+            None => None,
+        };
+        let key = format!("{}/chunks/{:04}/{}.meta", self.base_path, chunk_idx, chunk_hash);
+        let path = ObjectPath::from(key);
+        let result = self.object_store.get(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(response) => {
+                let bytes = response.bytes().await?;
+                Ok(Some(bytes.to_vec()))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Upload a chunk pack to S3.
+    ///
+    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_uuid}.pack`
+    #[instrument(skip(self, data), fields(chunk_idx, pack_id = %pack_id, size = data.len()))]
+    pub async fn put_chunk_pack(
+        &self,
+        chunk_idx: u32,
+        pack_id: Uuid,
+        data: Vec<u8>,
+    ) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let _permit = match &self.upload_semaphore {
+            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
+            None => None,
+        };
+        let key = format!("{}/chunks/{:04}/{}.pack", self.base_path, chunk_idx, pack_id);
+        let path = ObjectPath::from(key);
+        let payload = PutPayload::from(data);
+        let result = self.object_store.put(&path, payload).await;
+        self.record_s3_result(&result);
+        result?;
+        debug!("uploaded chunk pack");
+        Ok(())
+    }
+
+    /// Fetch a single compressed block from a chunk pack via S3 range request.
+    ///
+    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_uuid}.pack`
+    #[instrument(skip(self), fields(chunk_idx, pack_id = %pack_id, offset, comp_length))]
+    pub async fn get_chunk_block(
+        &self,
+        chunk_idx: u32,
+        pack_id: Uuid,
+        offset: u32,
+        comp_length: u32,
+    ) -> Result<bytes::Bytes, ContentStoreError> {
+        self.check_circuit()?;
+
+        // Try chunk-scoped path first: chunks/{idx:04}/{pack_id}.pack
+        let chunk_key = format!("{}/chunks/{:04}/{}.pack", self.base_path, chunk_idx, pack_id);
+        match self.get_range_from_key(&chunk_key, offset, comp_length).await {
+            Ok(data) => return Ok(data),
+            Err(ContentStoreError::ObjectStore(object_store::Error::NotFound { .. })) => {
+                // Fallback: try legacy pack path (packs/{pack_id})
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Legacy fallback: packs/{pack_id} (pre-v3 format)
+        self.get_block(pack_id, offset, comp_length).await
+    }
+
+    /// Fetch a byte range from an S3 key. Used internally by get_chunk_block.
+    async fn get_range_from_key(
+        &self,
+        key: &str,
+        offset: u32,
+        comp_length: u32,
+    ) -> Result<bytes::Bytes, ContentStoreError> {
+        let sem = self.download_semaphore.clone();
+        let store = Arc::clone(&self.object_store);
+        let path = ObjectPath::from(key.to_string());
+        let start = offset as u64;
+        let end = start + comp_length as u64;
+        let s3_result = tokio::spawn(async move {
+            let _permit = match &sem {
+                Some(s) => Some(
+                    s.acquire()
+                        .await
+                        .map_err(|_| object_store::Error::Generic {
+                            store: "semaphore",
+                            source: "download semaphore closed".into(),
+                        })?,
+                ),
+                None => None,
+            };
+            store.get_range(&path, start..end).await
+        })
+        .await
+        .map_err(|e| {
             ContentStoreError::ObjectStore(object_store::Error::Generic {
-                store: "manifest",
+                store: "tokio-spawn",
                 source: Box::new(e),
             })
         })?;
+        self.record_s3_result(&s3_result);
+        Ok(s3_result?)
+    }
 
-        let delta_data = match self.get_delta_manifest(name).await? {
-            Some(d) => d,
-            None => return Ok(Some(base)),
-        };
+    /// Upload a volume manifest (JSON) to S3.
+    ///
+    /// Uses the same `manifests/{name}` key as the old binary manifest.
+    #[instrument(skip(self, data), fields(name = %name, size = data.len()))]
+    pub async fn put_volume_manifest(
+        &self,
+        name: &str,
+        data: Vec<u8>,
+    ) -> Result<Option<String>, ContentStoreError> {
+        // Reuse the existing put_manifest path (same S3 key).
+        self.put_manifest(name, data).await
+    }
 
-        let delta = match ManifestDelta::deserialize(&delta_data) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::warn!(name = %name, error = %e, "failed to deserialize delta manifest, using base only");
-                return Ok(Some(base));
+    /// Download a volume manifest (JSON) from S3. Returns None if not found.
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn get_volume_manifest(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        // Reuse the existing get_manifest path (same S3 key).
+        self.get_manifest(name).await
+    }
+
+    /// List all .meta files for a given chunk index.
+    pub async fn list_chunk_metas(
+        &self,
+        chunk_idx: u32,
+    ) -> Result<Vec<String>, ContentStoreError> {
+        self.check_circuit()?;
+        let prefix_str = format!("{}/chunks/{:04}/", self.base_path, chunk_idx);
+        let prefix = ObjectPath::from(prefix_str);
+        let mut names = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
+            if let Some(filename) = meta.location.filename() {
+                if filename.ends_with(".meta") {
+                    names.push(filename.to_string());
+                }
             }
-        };
-
-        if delta.base_sequence != base.sequence {
-            tracing::warn!(
-                name = %name,
-                delta_base_seq = delta.base_sequence,
-                base_seq = base.sequence,
-                "stale delta manifest (base_sequence mismatch), using base only"
-            );
-            return Ok(Some(base));
         }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
+        Ok(names)
+    }
 
-        Ok(Some(delta.apply_to(&base)))
+    /// List all .pack files for a given chunk index.
+    pub async fn list_chunk_packs(
+        &self,
+        chunk_idx: u32,
+    ) -> Result<Vec<String>, ContentStoreError> {
+        self.check_circuit()?;
+        let prefix_str = format!("{}/chunks/{:04}/", self.base_path, chunk_idx);
+        let prefix = ObjectPath::from(prefix_str);
+        let mut names = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
+            if let Some(filename) = meta.location.filename() {
+                if filename.ends_with(".pack") {
+                    names.push(filename.to_string());
+                }
+            }
+        }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
+        Ok(names)
+    }
+
+    /// Delete a chunk file (meta or pack) from S3 (idempotent).
+    pub async fn delete_chunk_file(
+        &self,
+        chunk_idx: u32,
+        filename: &str,
+    ) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/chunks/{:04}/{}", self.base_path, chunk_idx, filename);
+        let path = ObjectPath::from(key);
+        let result = self.object_store.delete(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// List all base manifest names under `manifests/bases/`.
@@ -603,90 +696,10 @@ impl ContentStore {
         }
     }
 
-    // =========================================================================
-    // Pack registry operations (for GC)
-    // =========================================================================
-
-    /// Upload a pack registry to S3.
-    pub async fn put_registry(
-        &self,
-        name: &str,
-        data: Vec<u8>,
-    ) -> Result<(), ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/{}", self.base_path, registry_s3_key(name));
-        let path = ObjectPath::from(key);
-        let payload = PutPayload::from(data);
-        let result = self.object_store.put(&path, payload).await;
-        self.record_s3_result(&result);
-        result?;
-        debug!(name = %name, "uploaded pack registry");
-        Ok(())
-    }
-
-    /// Download a pack registry from S3. Returns None if not found.
-    pub async fn get_registry(
-        &self,
-        name: &str,
-    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/{}", self.base_path, registry_s3_key(name));
-        let path = ObjectPath::from(key);
-        let result = self.object_store.get(&path).await;
-        self.record_s3_result(&result);
-        match result {
-            Ok(response) => {
-                let bytes = response.bytes().await?;
-                Ok(Some(bytes.to_vec()))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// List all registry names under `pack-registries/`.
-    pub async fn list_registries(&self) -> Result<Vec<String>, ContentStoreError> {
-        self.check_circuit()?;
-        let prefix = ObjectPath::from(format!("{}/pack-registries/", self.base_path));
-        let mut names = Vec::new();
-        let mut stream = self.object_store.list(Some(&prefix));
-        while let Some(result) = stream.next().await {
-            let meta = match result {
-                Ok(m) => m,
-                Err(e) => {
-                    self.record_s3_list_error(&e);
-                    return Err(e.into());
-                }
-            };
-            if let Some(name) = meta.location.filename() {
-                names.push(name.to_string());
-            }
-        }
-        if let Some(cb) = &self.circuit_breaker {
-            cb.record_success();
-        }
-        Ok(names)
-    }
-
-    /// Delete a pack registry from S3 (idempotent).
-    pub async fn delete_registry(&self, name: &str) -> Result<(), ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/{}", self.base_path, registry_s3_key(name));
-        let path = ObjectPath::from(key);
-        let result = self.object_store.delete(&path).await;
-        self.record_s3_result(&result);
-        match result {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// List all manifest names under `manifests/` (not just bases).
     ///
     /// Returns paths relative to `manifests/`, e.g. `"vm1"`, `"bases/ubuntu-22.04"`.
-    /// Filters out `.hot-set` and `.delta` files (delta manifests are accessed via
-    /// `get_delta_manifest` using the deterministic key pattern).
+    /// Filters out `.hot-set` files.
     pub async fn list_all_manifests(&self) -> Result<Vec<String>, ContentStoreError> {
         self.check_circuit()?;
         let prefix_str = format!("{}/manifests/", self.base_path);
@@ -704,8 +717,7 @@ impl ContentStore {
             let path_str = meta.location.to_string();
             // Extract path relative to manifests/
             if let Some(relative) = path_str.strip_prefix(&prefix_str) {
-                // Skip hot-set and delta files
-                if relative.ends_with(".hot-set") || relative.ends_with(".delta") {
+                if relative.ends_with(".hot-set") {
                     continue;
                 }
                 if !relative.is_empty() {
@@ -717,6 +729,85 @@ impl ContentStore {
             cb.record_success();
         }
         Ok(names)
+    }
+
+    /// List ALL pack files across all chunk directories and the legacy flat `packs/` prefix.
+    ///
+    /// Returns a set of `(chunk_idx, pack_id)` tuples for chunk packs, plus `(u32::MAX, pack_id)`
+    /// for legacy flat packs. Used by GC to discover known packs without registries.
+    pub async fn list_all_known_packs(
+        &self,
+    ) -> Result<Vec<(u32, Uuid)>, ContentStoreError> {
+        self.check_circuit()?;
+        let mut packs = Vec::new();
+
+        // 1. List chunk-scoped packs: chunks/*//*.pack
+        let chunks_prefix_str = format!("{}/chunks/", self.base_path);
+        let chunks_prefix = ObjectPath::from(chunks_prefix_str.clone());
+        let mut stream = self.object_store.list(Some(&chunks_prefix));
+        while let Some(result) = stream.next().await {
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
+            if let Some(filename) = meta.location.filename() {
+                if let Some(uuid_str) = filename.strip_suffix(".pack") {
+                    if let Ok(pack_id) = Uuid::parse_str(uuid_str) {
+                        // Extract chunk_idx from path: .../chunks/{idx:04}/{uuid}.pack
+                        let path_str = meta.location.to_string();
+                        if let Some(rel) = path_str.strip_prefix(&chunks_prefix_str) {
+                            // rel = "{idx:04}/{uuid}.pack"
+                            if let Some(slash_pos) = rel.find('/') {
+                                if let Ok(chunk_idx) = rel[..slash_pos].parse::<u32>() {
+                                    packs.push((chunk_idx, pack_id));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. List legacy flat packs: packs/{uuid}
+        let packs_prefix_str = format!("{}/packs/", self.base_path);
+        let packs_prefix = ObjectPath::from(packs_prefix_str);
+        let mut stream = self.object_store.list(Some(&packs_prefix));
+        while let Some(result) = stream.next().await {
+            let meta = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            };
+            if let Some(filename) = meta.location.filename() {
+                if let Ok(pack_id) = Uuid::parse_str(filename) {
+                    packs.push((u32::MAX, pack_id));
+                }
+            }
+        }
+
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
+        Ok(packs)
+    }
+
+    /// Delete a chunk pack from S3 by chunk_idx and pack_id (idempotent).
+    pub async fn delete_chunk_pack(&self, chunk_idx: u32, pack_id: Uuid) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/chunks/{:04}/{}.pack", self.base_path, chunk_idx, pack_id);
+        let path = ObjectPath::from(key);
+        let result = self.object_store.delete(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Delete a pack from S3 by pack_id (idempotent).
@@ -754,25 +845,6 @@ mod tests {
     fn test_store(base_path: &str) -> ContentStore {
         let object_store = Arc::new(InMemory::new());
         ContentStore::new(object_store, base_path)
-    }
-
-    #[tokio::test]
-    async fn test_put_get_pack() {
-        let store = test_store("test-bucket");
-        let pack_id = Uuid::new_v4();
-        let data = b"compressed pack data with multiple blocks inside".to_vec();
-
-        store
-            .put_pack(pack_id, data.clone())
-            .await
-            .expect("put_pack should succeed");
-
-        let got = store
-            .get_pack(pack_id)
-            .await
-            .expect("get_pack should succeed");
-
-        assert_eq!(got, data);
     }
 
     #[tokio::test]
@@ -828,12 +900,6 @@ mod tests {
         cb.record_failure();
 
         // All operations should fail with CircuitOpen
-        let err = store.put_pack(Uuid::new_v4(), vec![1, 2, 3]).await.unwrap_err();
-        assert!(matches!(err, ContentStoreError::CircuitOpen), "put_pack should fail: {err}");
-
-        let err = store.get_pack(Uuid::new_v4()).await.unwrap_err();
-        assert!(matches!(err, ContentStoreError::CircuitOpen), "get_pack should fail: {err}");
-
         let err = store.get_manifest("test").await.unwrap_err();
         assert!(matches!(err, ContentStoreError::CircuitOpen), "get_manifest should fail: {err}");
 
@@ -859,9 +925,8 @@ mod tests {
         let store = ContentStore::new(object_store, "test-bucket").with_circuit_breaker(Arc::clone(&cb));
 
         // Successful operation should record success
-        let pack_id = Uuid::new_v4();
-        store.put_pack(pack_id, vec![1, 2, 3]).await.unwrap();
-        store.get_pack(pack_id).await.unwrap();
+        store.put_manifest("test", vec![1, 2, 3]).await.unwrap();
+        let _ = store.get_manifest("test").await.unwrap();
 
         // CB should still be closed
         assert!(matches!(cb.state(), CircuitState::Closed { .. }));
@@ -930,5 +995,124 @@ mod tests {
             parts1[2].contains(&id1.to_string()),
             "pack key should contain the UUID"
         );
+    }
+
+    #[tokio::test]
+    async fn test_put_get_chunk_meta() {
+        let store = test_store("test-bucket");
+        let data = b"fake chunk meta bytes".to_vec();
+
+        store
+            .put_chunk_meta(0, "abcdef1234567890", data.clone())
+            .await
+            .expect("put_chunk_meta should succeed");
+
+        let got = store
+            .get_chunk_meta(0, "abcdef1234567890")
+            .await
+            .expect("get_chunk_meta should succeed")
+            .expect("chunk meta should exist");
+
+        assert_eq!(got, data);
+    }
+
+    #[tokio::test]
+    async fn test_get_missing_chunk_meta() {
+        let store = test_store("test-bucket");
+        let result = store
+            .get_chunk_meta(99, "nonexistent")
+            .await
+            .expect("should not error for missing chunk meta");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_put_get_chunk_pack() {
+        let store = test_store("test-bucket");
+        let pack_id = Uuid::new_v4();
+        let data = b"fake pack data".to_vec();
+
+        store
+            .put_chunk_pack(3, pack_id, data.clone())
+            .await
+            .expect("put_chunk_pack should succeed");
+
+        // Verify via range read
+        let block = store
+            .get_chunk_block(3, pack_id, 0, data.len() as u32)
+            .await
+            .expect("get_chunk_block should succeed");
+
+        assert_eq!(&block[..], &data[..]);
+    }
+
+    #[tokio::test]
+    async fn test_list_chunk_metas_and_packs() {
+        let store = test_store("test-bucket");
+
+        // Upload some chunk files
+        store
+            .put_chunk_meta(5, "hash_a", b"meta_a".to_vec())
+            .await
+            .unwrap();
+        store
+            .put_chunk_meta(5, "hash_b", b"meta_b".to_vec())
+            .await
+            .unwrap();
+        let pack_id = Uuid::new_v4();
+        store
+            .put_chunk_pack(5, pack_id, b"pack_data".to_vec())
+            .await
+            .unwrap();
+
+        let metas = store.list_chunk_metas(5).await.unwrap();
+        assert_eq!(metas.len(), 2);
+        assert!(metas.iter().all(|n| n.ends_with(".meta")));
+
+        let packs = store.list_chunk_packs(5).await.unwrap();
+        assert_eq!(packs.len(), 1);
+        assert!(packs[0].ends_with(".pack"));
+    }
+
+    #[tokio::test]
+    async fn test_delete_chunk_file() {
+        let store = test_store("test-bucket");
+        store
+            .put_chunk_meta(2, "todelete", b"data".to_vec())
+            .await
+            .unwrap();
+
+        store
+            .delete_chunk_file(2, "todelete.meta")
+            .await
+            .expect("delete should succeed");
+
+        let result = store.get_chunk_meta(2, "todelete").await.unwrap();
+        assert!(result.is_none());
+
+        // Idempotent: deleting again should not error
+        store
+            .delete_chunk_file(2, "todelete.meta")
+            .await
+            .expect("idempotent delete should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_volume_manifest_round_trip() {
+        let store = test_store("test-bucket");
+        let data = br#"{"size":1073741824,"version":3,"chunk_size":10737418240,"block_size":131072,"chunks":{}}"#.to_vec();
+
+        store
+            .put_volume_manifest("test-vm", data.clone())
+            .await
+            .expect("put_volume_manifest should succeed");
+
+        let got = store
+            .get_volume_manifest("test-vm")
+            .await
+            .expect("get_volume_manifest should succeed")
+            .expect("volume manifest should exist");
+
+        assert_eq!(got, data);
     }
 }

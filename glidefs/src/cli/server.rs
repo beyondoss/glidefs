@@ -107,6 +107,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             ublk_nr_queues: nbd_config.ublk_nr_queues(),
             nbd_dead_conn_timeout: nbd_config.nbd_dead_conn_timeout(),
         })
+        .await
         .context("Failed to initialize export router")?,
     );
 
@@ -189,6 +190,16 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         }
     }
 
+    // Prefetch chunk metadata from S3 into ChunkMetaCache.
+    // On a warm restart (same SSD), this is mostly a no-op (SSD cache already has the files).
+    // On a cold start (new host), this hides S3 latency before VMs issue their first reads.
+    {
+        let prefetched = router.prefetch_chunk_metas().await;
+        if prefetched > 0 {
+            info!("Prefetched {} chunk meta(s) from S3", prefetched);
+        }
+    }
+
     // Recover QUIESCED ublk devices from a previous daemon crash.
     // Must happen after all exports are created so handlers exist for matching.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
@@ -221,24 +232,26 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     let mut handles = Vec::new();
 
-    // Start background scrubber (integrity verification)
+    // Background scrubber: verifies cached blocks by re-hashing.
     {
-        use crate::block::scrubber::{ScrubberConfig, scrubber};
+        use crate::block::scrubber::{RouterHashSource, ScrubberConfig, scrubber};
+
         let bps = nbd_config.scrubber_blocks_per_second();
         if bps > 0 {
             info!("Starting background scrubber ({} blocks/sec)", bps);
-            let cc = Arc::clone(router.clean_cache());
-            let pi = Arc::clone(router.pack_index());
-            let sm = Arc::clone(router.scrubber_metrics());
+            let hash_source: Arc<dyn crate::block::scrubber::HashSource> =
+                Arc::new(RouterHashSource::new(Arc::clone(&router)));
+            let clean_cache = Arc::clone(router.clean_cache());
+            let metrics = Arc::clone(router.scrubber_metrics());
             let shutdown_clone = shutdown.clone();
             handles.push(spawn_named("scrubber", async move {
                 scrubber(
-                    cc,
-                    pi,
+                    clean_cache,
+                    hash_source,
                     ScrubberConfig {
                         blocks_per_second: bps,
                     },
-                    sm,
+                    metrics,
                     shutdown_clone,
                 )
                 .await;

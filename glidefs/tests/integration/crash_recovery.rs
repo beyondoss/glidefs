@@ -14,7 +14,9 @@ use object_store::ObjectStore;
 use tempfile::TempDir;
 
 use glidefs::block::cache::SimpleBlockCache;
+use glidefs::block::chunk_cache::ChunkMetaCache;
 use glidefs::block::state::Initializing;
+use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 use super::{BLOCK_SIZE, DEVICE_SIZE, create_v2_cold_reader};
@@ -397,14 +399,12 @@ async fn test_write_after_recovery_overwrites() {
         // Flush to S3 via v2 pack path
         let content_store =
             glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
-        let pack_index = Arc::new(
-            glidefs::block::pack_index::HostPackIndex::open(
-                temp_dir.path().join("pack_index.redb"),
-            )
-            .unwrap(),
-        );
+        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
+        ));
         cache
-            .flush_to_s3(&content_store, &pack_index)
+            .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
             .await
             .unwrap();
     }
@@ -412,7 +412,7 @@ async fn test_write_after_recovery_overwrites() {
     // Verify: new data should be in S3, not old data
     {
         let cold_dir = TempDir::new().unwrap();
-        let (cold_cache, content_store, pack_index, clean_cache, metrics) =
+        let (cold_cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, metrics) =
             create_v2_cold_reader(&cold_dir, "write_during_recovery", Arc::clone(&s3_backend))
                 .await;
 
@@ -422,7 +422,8 @@ async fn test_write_after_recovery_overwrites() {
                 0,
                 BLOCK_SIZE,
                 clean_cache.as_ref(),
-                &pack_index,
+                &chunk_meta_cache,
+                &volume_manifest,
                 &content_store,
                 &metrics,
             )
@@ -499,14 +500,12 @@ async fn test_wal_recovery_without_metadata_save() {
         // so flush_dirty_inner picks them up even though v1 block_states says Clean.
         let content_store =
             glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
-        let pack_index = Arc::new(
-            glidefs::block::pack_index::HostPackIndex::open(
-                temp_dir.path().join("pack_index.redb"),
-            )
-            .unwrap(),
-        );
+        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
+        ));
         let stats = cache
-            .flush_to_s3(&content_store, &pack_index)
+            .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
             .await
             .unwrap();
         assert!(stats.packs_uploaded > 0, "should upload recovered blocks");
@@ -519,7 +518,7 @@ async fn test_wal_recovery_without_metadata_save() {
     // Session 3: Verify from a cold reader that the data made it to S3
     {
         let cold_dir = TempDir::new().unwrap();
-        let (cold_cache, content_store, pack_index, clean_cache, metrics) =
+        let (cold_cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, metrics) =
             create_v2_cold_reader(&cold_dir, "wal_recovery", Arc::clone(&s3_backend)).await;
 
         let data_0 = cold_cache
@@ -527,7 +526,8 @@ async fn test_wal_recovery_without_metadata_save() {
                 0,
                 BLOCK_SIZE,
                 clean_cache.as_ref(),
-                &pack_index,
+                &chunk_meta_cache,
+                &volume_manifest,
                 &content_store,
                 &metrics,
             )
@@ -544,7 +544,8 @@ async fn test_wal_recovery_without_metadata_save() {
                 BLOCK_SIZE as u64,
                 BLOCK_SIZE,
                 clean_cache.as_ref(),
-                &pack_index,
+                &chunk_meta_cache,
+                &volume_manifest,
                 &content_store,
                 &metrics,
             )
@@ -630,31 +631,29 @@ async fn test_wal_recovery_multiple_crash_cycles() {
         // block 1 from WAL only (both have FLAG_DIRTY in v2 block map).
         let content_store =
             glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
-        let pack_index = Arc::new(
-            glidefs::block::pack_index::HostPackIndex::open(
-                temp_dir.path().join("pack_index.redb"),
-            )
-            .unwrap(),
-        );
+        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
+        ));
         let stats = cache
-            .flush_to_s3(&content_store, &pack_index)
+            .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
             .await
             .unwrap();
         assert_eq!(stats.blocks_flushed, 2, "both blocks should flush to S3");
 
         // Verify from cold reader
         let cold_dir = TempDir::new().unwrap();
-        let (cold_cache, cs, pi, cc, m) =
+        let (cold_cache, cs, cmc, vm, cc, m) =
             create_v2_cold_reader(&cold_dir, "wal_multi_crash", Arc::clone(&s3_backend)).await;
 
         let s3_data_0 = cold_cache
-            .read_v2(0, BLOCK_SIZE, cc.as_ref(), &pi, &cs, &m)
+            .read_v2(0, BLOCK_SIZE, cc.as_ref(), &cmc, &vm, &cs, &m)
             .await
             .unwrap();
         assert_eq!(s3_data_0.as_ref(), &data_session_1[..], "block 0 in S3");
 
         let s3_data_1 = cold_cache
-            .read_v2(BLOCK_SIZE as u64, BLOCK_SIZE, cc.as_ref(), &pi, &cs, &m)
+            .read_v2(BLOCK_SIZE as u64, BLOCK_SIZE, cc.as_ref(), &cmc, &vm, &cs, &m)
             .await
             .unwrap();
         assert_eq!(s3_data_1.as_ref(), &data_session_2[..], "block 1 in S3");

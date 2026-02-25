@@ -7,12 +7,11 @@ use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
 use crate::block::flush_scheduler::flush_scheduler;
 use crate::block::handler::BlockHandler;
+use crate::block::chunk_cache::ChunkMetaCache;
 use crate::block::manifest::deserialize_hot_set;
 use crate::block::metrics::{ExportMetrics, MetricsSnapshot};
-use crate::block::pack::PackLocation;
-use crate::block::pack_index::HostPackIndex;
-use crate::block::pack_registry::PackRegistry;
 use crate::block::state::Active;
+use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::{CacheError, SnapshotResult, WriteCache, WriteCacheConfig};
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 use crate::config::ExportConfig;
@@ -71,9 +70,6 @@ pub enum RouterError {
     #[error("Content store error: {0}")]
     ContentStore(#[from] crate::block::content_store::ContentStoreError),
 
-    #[error("Pack index error: {0}")]
-    PackIndex(#[from] crate::block::pack_index::PackIndexError),
-
     #[error("Manifest error: {0}")]
     Manifest(String),
 
@@ -124,7 +120,8 @@ pub struct ExportState {
     pub handler: Arc<BlockHandler>,
     pub cache: Arc<WriteCache<Active>>,
     pub content_store: Arc<ContentStore>,
-    pub pack_index: Arc<HostPackIndex>,
+    pub chunk_meta_cache: Arc<ChunkMetaCache>,
+    pub volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
     pub readonly: bool,
     pub metrics: Arc<ExportMetrics>,
     /// Original s3_prefix from ExportConfig (None = use export name).
@@ -151,7 +148,7 @@ impl ExportState {
         for _ in 0..MAX_DRAIN_ITERATIONS {
             let stats = self
                 .cache
-                .flush_to_s3(&self.content_store, &self.pack_index)
+                .flush_to_s3(&self.content_store, &self.chunk_meta_cache, &self.volume_manifest)
                 .await
                 .map_err(RouterError::Cache)?;
             if stats.blocks_flushed == 0 {
@@ -219,8 +216,8 @@ pub struct ExportRouter {
     /// Block size for all exports (default, can be overridden per-export)
     block_size: usize,
 
-    /// Host-level pack index shared across all exports (content-addressed dedup)
-    pack_index: Arc<HostPackIndex>,
+    /// Host-level chunk meta cache shared across all exports
+    chunk_meta_cache: Arc<ChunkMetaCache>,
 
     /// Shared clean cache across all exports (content-addressed dedup)
     clean_cache: Arc<dyn BlockCache>,
@@ -275,7 +272,7 @@ fn validate_export_name(name: &str) -> Result<(), RouterError> {
 
 impl ExportRouter {
     /// Create a new export router.
-    pub fn new(config: RouterConfig) -> Result<Self, RouterError> {
+    pub async fn new(config: RouterConfig) -> Result<Self, RouterError> {
         let s3_circuit_breaker = Arc::new(CircuitBreaker::new(
             CircuitBreakerConfig::consecutive(5)
                 .reset_timeout(Duration::from_secs(30))
@@ -295,9 +292,10 @@ impl ExportRouter {
             None
         };
 
-        let pack_index = Arc::new(
-            HostPackIndex::open(config.cache_dir.join("pack_index.redb"))
-                .map_err(|e| RouterError::Io(std::io::Error::other(e)))?,
+        let chunk_meta_cache = Arc::new(
+            ChunkMetaCache::open(&config.cache_dir)
+                .await
+                .map_err(|e| RouterError::Manifest(format!("chunk meta cache: {e}")))?,
         );
 
         // Build device managers before moving config.cache_dir.
@@ -319,7 +317,7 @@ impl ExportRouter {
             db_path: config.db_path,
             cache_dir: config.cache_dir,
             block_size: config.block_size,
-            pack_index,
+            chunk_meta_cache,
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
             default_blocks_per_pack: config.default_blocks_per_pack,
@@ -335,63 +333,6 @@ impl ExportRouter {
         })
     }
 
-    /// Get a reference to the shared pack index (for scrubber).
-    pub fn pack_index(&self) -> &Arc<HostPackIndex> {
-        &self.pack_index
-    }
-
-    /// Prune pack index entries not referenced by any active export.
-    ///
-    /// Forces a manifest-hash rebuild on all remaining exports first to
-    /// capture everything flushed up to this moment, then prunes. This
-    /// closes the timing window where a flush inserts into the pack index
-    /// but the block_map still holds ZERO (deferred hash).
-    ///
-    /// Cost: O(present_blocks + pack_index_entries). Runs only on export removal.
-    async fn prune_pack_index(&self) {
-        let exports = self.exports.read().await;
-        if exports.is_empty() {
-            // No active exports — clear everything.
-            match self.pack_index.len() {
-                Ok(removed) if removed > 0 => {
-                    if let Err(e) = self.pack_index.rebuild(&[]) {
-                        warn!("Failed to clear pack index: {e}");
-                        return;
-                    }
-                    info!(removed, "pruned all pack index entries (no active exports)");
-                }
-                Err(e) => warn!("Failed to read pack index length: {e}"),
-                _ => {}
-            }
-            return;
-        }
-
-        // Force manifest-hash rebuild on all remaining exports to capture
-        // everything flushed up to this moment. No S3 round-trip.
-        for state in exports.values() {
-            if let Err(e) = state.cache.rebuild_manifest_hashes(&self.pack_index) {
-                warn!("Failed to rebuild manifest hashes: {e}");
-                return;
-            }
-        }
-
-        // Union of all manifest-referenced hashes across active exports.
-        let mut referenced = std::collections::HashSet::new();
-        for state in exports.values() {
-            referenced.extend(state.cache.referenced_hashes());
-        }
-        drop(exports);
-
-        match self.pack_index.prune_unreferenced(&referenced) {
-            Ok(removed) if removed > 0 => {
-                let remaining = self.pack_index.len().unwrap_or(0);
-                info!(removed, remaining, "pruned unreferenced pack index entries");
-            }
-            Err(e) => warn!("Failed to prune pack index: {e}"),
-            _ => {}
-        }
-    }
-
     /// Get a reference to the shared clean cache (for scrubber).
     pub fn clean_cache(&self) -> &Arc<dyn BlockCache> {
         &self.clean_cache
@@ -400,6 +341,137 @@ impl ExportRouter {
     /// Get the shared scrubber metrics (for scrubber + prometheus).
     pub fn scrubber_metrics(&self) -> &Arc<crate::block::scrubber::ScrubberMetrics> {
         &self.scrubber_metrics
+    }
+
+    /// Collect all known block hashes from active exports.
+    ///
+    /// Walks VolumeManifest → ChunkMetaCache for each export, collecting the
+    /// unique block hashes that should be present in the clean cache. Used by
+    /// the background scrubber to know which cached blocks to verify.
+    pub async fn collect_block_hashes(&self) -> Vec<crate::block::block_map::Blake3Hash> {
+        use std::collections::HashSet;
+
+        // Snapshot the Arc references under the async lock, then drop it.
+        let snapshots: Vec<_> = {
+            let exports = self.exports.read().await;
+            exports
+                .values()
+                .map(|state| {
+                    (
+                        Arc::clone(&state.volume_manifest),
+                        Arc::clone(&state.chunk_meta_cache),
+                    )
+                })
+                .collect()
+        };
+
+        // Collect chunk hashes under sync lock (no await while guard held).
+        let mut chunk_hashes = Vec::new();
+        for (vm_lock, _cmc) in &snapshots {
+            let vm = vm_lock.read();
+            for chunk_idx in vm.chunks.keys() {
+                if let Some(chunk_hash) = vm.get_chunk_hash(*chunk_idx) {
+                    chunk_hashes.push(chunk_hash);
+                }
+            }
+        }
+
+        // Async cache lookups (chunk_meta_cache is global, shared across exports).
+        let mut all_hashes = HashSet::new();
+        for chunk_hash in &chunk_hashes {
+            if let Some(meta) = self.chunk_meta_cache.get(chunk_hash).await {
+                for entry in &meta.entries {
+                    all_hashes.insert(entry.hash);
+                }
+            }
+        }
+        all_hashes.into_iter().collect()
+    }
+
+    /// Prefetch chunk metadata from S3 into ChunkMetaCache.
+    ///
+    /// Walks all active exports' VolumeManifests, collects unique chunk hashes
+    /// not already in cache, and fetches them from S3 in parallel. This warms
+    /// the cache on cold start (new host or SSD wipe) so the first VM reads
+    /// hit local cache instead of blocking on S3 .meta fetches.
+    ///
+    /// Content-addressed: forks sharing chunks with their parent deduplicate
+    /// naturally — each unique chunk_hash is fetched at most once.
+    pub async fn prefetch_chunk_metas(&self) -> usize {
+        use std::collections::HashMap;
+
+        // Snapshot VolumeManifest + ContentStore refs under the async lock, then drop it.
+        let export_data: Vec<_> = {
+            let exports = self.exports.read().await;
+            exports
+                .values()
+                .map(|state| {
+                    (
+                        Arc::clone(&state.volume_manifest),
+                        Arc::clone(&state.content_store),
+                    )
+                })
+                .collect()
+        };
+
+        // Collect unique chunk_hashes not already in cache.
+        // For each, remember (chunk_idx, content_store) so we can fetch from the right S3 prefix.
+        let mut to_fetch: HashMap<crate::block::block_map::Blake3Hash, (u32, Arc<ContentStore>)> =
+            HashMap::new();
+        for (vm_lock, cs) in &export_data {
+            let vm = vm_lock.read();
+            for (&chunk_idx, _) in &vm.chunks {
+                if let Some(chunk_hash) = vm.get_chunk_hash(chunk_idx) {
+                    if self.chunk_meta_cache.get(&chunk_hash).await.is_none() {
+                        to_fetch
+                            .entry(chunk_hash)
+                            .or_insert_with(|| (chunk_idx, Arc::clone(cs)));
+                    }
+                }
+            }
+        }
+
+        if to_fetch.is_empty() {
+            return 0;
+        }
+
+        info!(count = to_fetch.len(), "prefetching chunk metas from S3");
+
+        use futures::stream::StreamExt;
+        let cmc = Arc::clone(&self.chunk_meta_cache);
+        let fetched: usize = futures::stream::iter(to_fetch)
+            .map(|(chunk_hash, (chunk_idx, cs))| {
+                let cmc = Arc::clone(&cmc);
+                async move {
+                    let hash_hex: String =
+                        chunk_hash.0.iter().map(|b| format!("{b:02x}")).collect();
+                    match cs.get_chunk_meta(chunk_idx, &hash_hex).await {
+                        Ok(Some(data)) => {
+                            match crate::block::chunk_meta::ChunkMeta::deserialize(&data) {
+                                Ok(meta) => {
+                                    cmc.insert(chunk_hash, Arc::new(meta));
+                                    1usize
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "chunk meta prefetch: deserialize failed");
+                                    0
+                                }
+                            }
+                        }
+                        Ok(None) => 0,
+                        Err(e) => {
+                            warn!(error = %e, "chunk meta prefetch: S3 fetch failed");
+                            0
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(32)
+            .fold(0usize, |acc, n| async move { acc + n })
+            .await;
+
+        info!(fetched, "chunk meta prefetch complete");
+        fetched
     }
 
     /// Get the current S3 circuit breaker state for observability.
@@ -441,7 +513,7 @@ impl ExportRouter {
         for (name, state) in targets.iter().take(8) {
             match state
                 .cache
-                .flush_packs(&state.content_store, &state.pack_index)
+                .flush_packs(&state.content_store, &state.chunk_meta_cache, &state.volume_manifest)
                 .await
             {
                 Ok((stats, _)) if stats.packs_uploaded > 0 => {
@@ -610,7 +682,7 @@ impl ExportRouter {
         }
         let content_store = Arc::new(cs);
         let clean_cache = Arc::clone(&self.clean_cache);
-        let pack_index = Arc::clone(&self.pack_index);
+        let chunk_meta_cache = Arc::clone(&self.chunk_meta_cache);
 
         // Create write cache — either from manifest (fork) or fresh (normal)
         let cache_config = WriteCacheConfig {
@@ -621,113 +693,79 @@ impl ExportRouter {
             wal_sync: self.wal_sync,
         };
 
-        let cache = if let Some(manifest_name) = manifest_name {
-            // Fork path: load manifest from S3 (either from a specific snapshot or current state)
-            let manifest = if let Some(seq) = snapshot_sequence {
+        let (cache, volume_manifest) = if let Some(manifest_name) = manifest_name {
+            // Fork path: try to load VolumeManifest from S3
+            let fork_vm = if let Some(seq) = snapshot_sequence {
                 // Fork from a specific versioned snapshot
-                use crate::block::manifest::Manifest;
-                let data = content_store
-                    .get_snapshot(manifest_name, seq)
-                    .await?
-                    .ok_or_else(|| {
-                        RouterError::Manifest(format!(
-                            "snapshot '{}' seq={} not found in S3",
+                match content_store.get_snapshot(manifest_name, seq).await {
+                    Ok(Some(data)) => VolumeManifest::deserialize(&data)
+                        .map_err(|e| RouterError::Manifest(format!("failed to deserialize snapshot volume manifest: {}", e)))?,
+                    Ok(None) => {
+                        return Err(RouterError::Manifest(format!(
+                            "snapshot '{}' seq={} not found",
                             manifest_name, seq
-                        ))
-                    })?;
-                Manifest::deserialize(&data).map_err(|e| {
-                    RouterError::Manifest(format!("failed to deserialize snapshot: {}", e))
-                })?
-            } else {
-                // Fork from current effective manifest (base + optional delta)
-                content_store
-                    .get_effective_manifest(manifest_name)
-                    .await?
-                    .ok_or_else(|| {
-                        RouterError::Manifest(format!(
-                            "manifest '{}' not found in S3",
-                            manifest_name
-                        ))
-                    })?
-            };
-
-            // Populate pack index from manifest entries
-            let batch: Vec<_> = manifest
-                .pack_index
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.hash,
-                        PackLocation {
-                            pack_id: entry.pack_id,
-                            offset: entry.offset,
-                            comp_length: entry.comp_length,
-                        },
-                    )
-                })
-                .collect();
-            pack_index.insert_batch(&batch)?;
-
-            info!(
-                "Loaded manifest '{}': {} block entries, {} pack entries, seq={}",
-                manifest_name,
-                manifest.block_map.len(),
-                manifest.pack_index.len(),
-                manifest.sequence,
-            );
-
-            // Build parent BlockMap from manifest for ForkedBlockMap overlay
-            let parent_block_map = {
-                use crate::block::block_map::{BlockMap, BlockMapEntry};
-                let mut bm = BlockMap::new(config.size_bytes(), block_size as u32);
-                for entry in &manifest.block_map {
-                    bm.set(
-                        entry.chunk_index as usize,
-                        BlockMapEntry {
-                            hash: entry.hash,
-                            flags: 0,
-                            sequence: 0, // sequence doesn't matter for parent — it's immutable
-                        },
-                    );
-                }
-                Arc::new(bm)
-            };
-
-            let cache =
-                WriteCache::open_from_manifest(cache_config, &manifest, Some(parent_block_map))?;
-
-            // Create child pack registry from parent manifest's pack IDs (best-effort).
-            // This ensures GC can track all packs referenced by this fork.
-            {
-                let fork_pack_ids: Vec<uuid::Uuid> = manifest
-                    .pack_index
-                    .iter()
-                    .map(|e| e.pack_id)
-                    .collect::<std::collections::HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                if !fork_pack_ids.is_empty() {
-                    let child_registry = PackRegistry {
-                        pack_ids: fork_pack_ids,
-                    };
-                    if let Err(e) = content_store
-                        .put_registry(&name, child_registry.serialize())
-                        .await
-                    {
-                        warn!("Failed to create pack registry for fork '{}': {}", name, e);
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(RouterError::Manifest(format!(
+                            "snapshot '{}' seq={} fetch error: {}",
+                            manifest_name, seq, e
+                        )));
                     }
                 }
-            }
+            } else {
+                // Fork from current manifest
+                match content_store.get_volume_manifest(manifest_name).await {
+                    Ok(Some(data)) => VolumeManifest::deserialize(&data)
+                        .map_err(|e| RouterError::Manifest(format!("failed to deserialize volume manifest: {}", e)))?,
+                    Ok(None) => {
+                        return Err(RouterError::Manifest(format!(
+                            "manifest '{}' not found",
+                            manifest_name
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(RouterError::Manifest(format!(
+                            "manifest '{}' fetch error: {}",
+                            manifest_name, e
+                        )));
+                    }
+                }
+            };
+
+            // Resize if the fork config has a different size
+            let mut vm = fork_vm;
+            vm.size = config.size_bytes();
+
+            // Store the volume manifest for this export
+            let volume_manifest = Arc::new(parking_lot::RwLock::new(vm));
+
+            // Open a fresh cache (local SSD starts empty, reads go through VolumeManifest → ChunkMetaCache → S3)
+            let cache = WriteCache::open_fresh_active(cache_config)?;
 
             info!("Export '{}' created from manifest (fork)", name);
-            Arc::new(cache)
+            (Arc::new(cache), volume_manifest)
         } else {
             // Normal path: open cache, recover from WAL
             let cache = WriteCache::open(cache_config)?;
             info!("Recovering write cache for export '{}'...", name);
             let cache = cache.finish_recovery().await?;
             info!("Export '{}' cache ready", name);
-            Arc::new(cache)
+
+            // Empty volume manifest for new exports
+            let volume_manifest = Arc::new(parking_lot::RwLock::new(
+                VolumeManifest::new(config.size_bytes(), block_size as u32),
+            ));
+
+            // Try to load existing volume manifest from S3
+            if let Ok(Some(data)) = content_store.get_volume_manifest(&name).await {
+                if let Ok(vm) = VolumeManifest::deserialize(&data) {
+                    *volume_manifest.write() = vm;
+                    info!("Loaded existing volume manifest for '{}'", name);
+                }
+            }
+
+            (Arc::new(cache), volume_manifest)
         };
 
         // Record any recovery issues in metrics
@@ -750,11 +788,12 @@ impl ExportRouter {
                         info!(chunks = chunks.len(), "prefetching boot hot set");
                         let cache_clone = Arc::clone(&cache);
                         let cc = Arc::clone(&clean_cache);
-                        let pi = Arc::clone(&pack_index);
+                        let cmc = Arc::clone(&chunk_meta_cache);
+                        let vm = Arc::clone(&volume_manifest);
                         let cs = Arc::clone(&content_store);
                         spawn_named("hot-set-prefetch", async move {
                             cache_clone
-                                .prefetch_chunks(&chunks, cc.as_ref(), &pi, &cs)
+                                .prefetch_chunks(&chunks, cc.as_ref(), &cmc, &vm, &cs)
                                 .await;
                             info!("boot hot set prefetch complete");
                         });
@@ -778,7 +817,8 @@ impl ExportRouter {
             Arc::clone(&cache),
             Arc::clone(&content_store),
             Arc::clone(&clean_cache),
-            Arc::clone(&pack_index),
+            Arc::clone(&chunk_meta_cache),
+            Arc::clone(&volume_manifest),
             config.size_bytes(),
             readonly,
             Arc::clone(&metrics),
@@ -792,14 +832,16 @@ impl ExportRouter {
         let (flush_shutdown_tx, flush_shutdown_rx) = watch::channel(false);
         let flush_cache = Arc::clone(&cache);
         let flush_cs = Arc::clone(&content_store);
-        let flush_pi = Arc::clone(&pack_index);
+        let flush_cmc = Arc::clone(&chunk_meta_cache);
+        let flush_vm = Arc::clone(&volume_manifest);
         let export_name = name.clone();
         let flush_metrics = Arc::clone(&metrics);
         let flush_handle = spawn_named(&format!("flush-{}", name), async move {
             flush_scheduler(
                 flush_cache,
                 flush_cs,
-                flush_pi,
+                flush_cmc,
+                flush_vm,
                 flush_notify,
                 flush_shutdown_rx,
                 flush_metrics,
@@ -814,7 +856,8 @@ impl ExportRouter {
             handler,
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             readonly,
             metrics,
             s3_prefix: orig_s3_prefix,
@@ -860,7 +903,7 @@ impl ExportRouter {
         info!("Taking snapshot of export '{}'...", name);
         let result: SnapshotResult = state
             .cache
-            .snapshot(&state.content_store, &state.pack_index)
+            .snapshot(&state.content_store, &state.chunk_meta_cache, &state.volume_manifest)
             .await
             .map_err(RouterError::Cache)?;
 
@@ -1345,11 +1388,6 @@ impl ExportRouter {
 
         let remaining = Self::teardown_export(name, state).await;
 
-        // Prune pack index entries no longer referenced by any active export.
-        // Must run after teardown (which drops the removed export's cache) so
-        // that only remaining exports contribute to the referenced set.
-        self.prune_pack_index().await;
-
         if purge {
             let cache_file = self.cache_dir.join(format!("{}.cache", name));
             let meta_file = self.cache_dir.join(format!("{}.meta", name));
@@ -1435,7 +1473,8 @@ impl ExportRouter {
             handler,
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             metrics,
             flush_shutdown_tx,
             flush_handle,
@@ -1455,7 +1494,7 @@ impl ExportRouter {
         //    breaking — matches the public ExportState::drain() behavior.
         let mut drain_done = false;
         for _ in 0..MAX_DRAIN_ITERATIONS {
-            match cache.flush_to_s3(&content_store, &pack_index).await {
+            match cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await {
                 Ok(stats) if stats.blocks_flushed == 0 => {
                     drain_done = true;
                     break;
@@ -1508,7 +1547,7 @@ impl ExportRouter {
     /// Create a minimal router for testing protocol handling.
     /// Uses a temporary directory and in-memory S3.
     #[cfg(test)]
-    pub(crate) fn new_for_test() -> Self {
+    pub(crate) async fn new_for_test() -> Self {
         use crate::block::cache::SimpleBlockCache;
         let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let temp_dir = std::env::temp_dir().join(format!("glidefs-test-{}", uuid::Uuid::new_v4()));
@@ -1527,6 +1566,7 @@ impl ExportRouter {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
+        .await
         .expect("failed to create test router")
     }
 }
@@ -1554,7 +1594,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn create_test_router(temp_dir: &TempDir) -> ExportRouter {
+    async fn create_test_router(temp_dir: &TempDir) -> ExportRouter {
         let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         ExportRouter::new(RouterConfig {
             object_store: s3,
@@ -1569,6 +1609,7 @@ mod tests {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
+        .await
         .expect("failed to create test router")
     }
 
@@ -1587,7 +1628,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_export_success() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let result = router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -1602,7 +1643,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_export_idempotent() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create export twice
         router
@@ -1624,7 +1665,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_export_readonly() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), true, None, None)
@@ -1639,7 +1680,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_handler_existing() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -1656,7 +1697,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_handler_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let handler = router.get_handler("nonexistent").await;
         assert!(
@@ -1668,7 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_exports_empty() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let exports = router.list_exports().await;
         assert!(exports.is_empty(), "Should return empty list");
@@ -1677,7 +1718,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_exports_multiple() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -1704,7 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_export_success() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -1724,7 +1765,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_export_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let result = router.drain_export("nonexistent").await;
         assert!(result.is_err(), "Drain should fail for nonexistent export");
@@ -1738,7 +1779,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_export_success() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -1755,7 +1796,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_export_idempotent() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Remove nonexistent export should succeed (idempotent)
         let result = router.remove_export("nonexistent", false).await;
@@ -1768,7 +1809,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_export_with_purge() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -1793,7 +1834,7 @@ mod tests {
     #[tokio::test]
     async fn test_promote_export_success() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create readonly export
         router
@@ -1815,7 +1856,7 @@ mod tests {
     #[tokio::test]
     async fn test_promote_export_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let result = router.promote_export("nonexistent").await;
         assert!(
@@ -1827,7 +1868,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_export_metrics() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -1848,7 +1889,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_export_metrics_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let metrics = router.get_export_metrics("nonexistent").await;
         assert!(metrics.is_none(), "Should return None for nonexistent");
@@ -1857,7 +1898,7 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_all_exports() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -1879,7 +1920,7 @@ mod tests {
     #[tokio::test]
     async fn test_export_isolation() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -1912,7 +1953,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_and_load_export() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let config = test_export_config("persist-vol");
 
@@ -1931,7 +1972,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_export_not_found() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let loaded = router.load_export("nonexistent").await.unwrap();
         assert!(loaded.is_none(), "Should return None for nonexistent");
@@ -1940,7 +1981,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_export_definition_idempotent() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Delete nonexistent should succeed (idempotent)
         let result = router.delete_export_definition("nonexistent").await;
@@ -1963,7 +2004,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_exports_empty() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let discovered = router.discover_exports().await.unwrap();
         assert!(discovered.is_empty(), "Should discover no exports");
@@ -1972,7 +2013,7 @@ mod tests {
     #[tokio::test]
     async fn test_discover_exports_multiple() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Save multiple export definitions directly to S3
         let configs = vec![
@@ -2022,7 +2063,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_export_persists_to_s3() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create export and persist to S3
         let config = test_export_config("auto-persist");
@@ -2040,7 +2081,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_export_with_purge_deletes_from_s3() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create export and persist
         let config = test_export_config("purge-vol");
@@ -2069,7 +2110,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_export() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("snap-vol"), false, None, None)
@@ -2096,7 +2137,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_nonexistent_export() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let result = router.snapshot_export("nonexistent").await;
         assert!(
@@ -2112,7 +2153,7 @@ mod tests {
     #[tokio::test]
     async fn test_fork_from_snapshot() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create source export and write data
         router
@@ -2155,7 +2196,7 @@ mod tests {
     #[tokio::test]
     async fn test_fork_isolation() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create and snapshot source
         router
@@ -2203,7 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn test_fork_reads_unmodified_parent_blocks() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create source and write two blocks
         router
@@ -2249,7 +2290,7 @@ mod tests {
     #[tokio::test]
     async fn test_fork_from_missing_manifest() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let config = ExportConfig {
             name: "bad-fork".to_string(),
@@ -2274,7 +2315,7 @@ mod tests {
     #[tokio::test]
     async fn test_resize_export_grow() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -2295,7 +2336,7 @@ mod tests {
     #[tokio::test]
     async fn test_resize_export_same_size_noop() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -2310,7 +2351,7 @@ mod tests {
     #[tokio::test]
     async fn test_resize_export_shrink_rejected() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("vol1"), false, None, None)
@@ -2328,7 +2369,7 @@ mod tests {
     #[tokio::test]
     async fn test_resize_export_nonexistent() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         let result = router.resize_export("nonexistent", 0.02).await;
         assert!(result.is_err(), "Resize of nonexistent should fail");
@@ -2345,7 +2386,7 @@ mod tests {
     #[tokio::test]
     async fn test_fork_snapshot_does_not_modify_parent_manifest() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create source, write data, snapshot
         router
@@ -2410,7 +2451,7 @@ mod tests {
     #[tokio::test]
     async fn test_resize_grows_export_and_allows_writes() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("resize-vol"), false, None, None)
@@ -2457,7 +2498,7 @@ mod tests {
     #[tokio::test]
     async fn test_resize_preserves_readonly_flag() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create as readonly
         router
@@ -2484,7 +2525,7 @@ mod tests {
         // write more data, second flush succeeds — verifying the pack index correctly
         // deduplicates across flushes and manifests accumulate.
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("retry-vol"), false, None, None)
@@ -2530,7 +2571,7 @@ mod tests {
     #[tokio::test]
     async fn test_resize_with_dirty_blocks() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         router
             .create_export(test_export_config("resize-dirty"), false, None, None)
@@ -2647,7 +2688,7 @@ mod tests {
     #[tokio::test]
     async fn test_manual_mode_export_no_auto_flush() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create export with flush_mode = "manual"
         let config = ExportConfig {
@@ -2695,7 +2736,7 @@ mod tests {
     #[tokio::test]
     async fn test_pressure_flush_works_in_manual_mode() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create manual-mode export
         let config = ExportConfig {
@@ -2810,7 +2851,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_device_path_returns_none_without_registration() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
         router
             .create_export(test_export_config("vol1"), false, None, None)
             .await
@@ -2824,7 +2865,7 @@ mod tests {
     #[tokio::test]
     async fn test_export_transport_defaults_to_nbd() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
         router
             .create_export(test_export_config("vol1"), false, None, None)
             .await
@@ -2839,7 +2880,7 @@ mod tests {
     #[tokio::test]
     async fn test_export_transport_preserved_through_resize() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Create export with explicit transport
         let mut config = test_export_config("vol1");
@@ -2857,7 +2898,7 @@ mod tests {
     #[tokio::test]
     async fn test_shutdown_devices_is_idempotent() {
         let temp_dir = TempDir::new().unwrap();
-        let router = create_test_router(&temp_dir);
+        let router = create_test_router(&temp_dir).await;
 
         // Shutdown devices with nothing registered — should be a no-op
         router.shutdown_devices().await.unwrap();

@@ -1,17 +1,14 @@
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tracing::{error, info, instrument, warn};
 
-use super::inner::BaseManifestState;
 use crate::block::block_map::{
-    AtomicBlockMap, Blake3Hash, BlockMap, BlockMapEntry, BlockMapKind, ForkedBlockMap,
-    SequenceNumber, SparseBlockState, SparseStateMap, blake3_128, zero_block_hash,
+    AtomicBlockMap, BlockMap, BlockMapEntry, SequenceNumber,
+    SparseBlockState, SparseStateMap, blake3_128, zero_block_hash,
 };
-use crate::block::manifest::Manifest;
 use crate::block::state::{Active, Initializing, Recovering};
 use crate::block::wal::Wal;
 
@@ -174,14 +171,12 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
-            block_map: RwLock::new(BlockMapKind::Full(atomic_block_map)),
+            block_map: RwLock::new(atomic_block_map),
             sequence,
             wal: Mutex::new(wal),
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
-            manifest_pack_hashes: Mutex::new(HashSet::new()),
-            base_manifest_state: Mutex::new(None),
             recovery_warnings: AtomicU64::new(recovery_warning_count),
         });
 
@@ -198,66 +193,28 @@ impl WriteCache<Initializing> {
         })
     }
 
-    /// Create a write cache from a manifest (for forked VMs).
+    /// Create a fresh write cache in Active state (for forks).
     ///
-    /// Unlike `open()`, this skips WAL replay and local metadata loading.
-    /// All block data is in S3, so the local cache starts empty.
-    /// Goes directly to Active state (nothing to recover).
-    pub fn open_from_manifest(
-        config: WriteCacheConfig,
-        manifest: &Manifest,
-        parent_block_map: Option<Arc<BlockMap>>,
-    ) -> Result<WriteCache<Active>, CacheError> {
+    /// Unlike `open()`, this skips WAL replay and goes directly to Active.
+    /// The local cache starts empty (all blocks NOT_PRESENT). Reads resolve
+    /// through VolumeManifest + ChunkMetaCache for remote data.
+    pub fn open_fresh_active(config: WriteCacheConfig) -> Result<WriteCache<Active>, CacheError> {
         config.validate()?;
         std::fs::create_dir_all(&config.cache_dir)?;
 
         let data_file =
             super::inner::SyncFile::open(&config.data_path(), true, config.device_size)?;
-
         let num_blocks = config.num_blocks();
-
-        // Fresh state map: all NOT_PRESENT (data is in S3, not local)
         let state_map = SparseStateMap::new(num_blocks);
-
-        // Build BlockMapKind from manifest or parent
-        let block_map_kind = if let Some(parent) = parent_block_map {
-            BlockMapKind::Forked(ForkedBlockMap::new(parent))
-        } else {
-            let mut bm = BlockMap::new(config.device_size, config.block_size as u32);
-            for entry in &manifest.block_map {
-                bm.set(
-                    entry.chunk_index as usize,
-                    BlockMapEntry {
-                        hash: entry.hash,
-                        flags: 0,
-                        sequence: manifest.sequence,
-                    },
-                );
-            }
-            BlockMapKind::Full(AtomicBlockMap::from_block_map(&bm))
-        };
-
-        let sequence = SequenceNumber::new(manifest.sequence);
+        let block_size = config.block_size;
+        let chunk_size = block_size as u32;
+        let bm = BlockMap::new(config.device_size, chunk_size);
+        let block_map = AtomicBlockMap::from_block_map(&bm);
+        let sequence = SequenceNumber::new(0);
         let wal = Wal::open(&config.wal_path())?;
         let export_name = config.device_name.clone();
-        let block_size = config.block_size;
         let zbh = zero_block_hash(block_size);
         let zbb = Bytes::from(vec![0u8; block_size]);
-
-        let manifest_hashes = manifest.pack_index.iter().map(|e| e.hash).collect();
-
-        // Initialize base_manifest_state from the manifest we're restoring from.
-        // This allows delta manifests to work immediately after restore.
-        let base_block_map: std::collections::HashMap<u64, Blake3Hash> = manifest
-            .block_map
-            .iter()
-            .map(|e| (e.chunk_index, e.hash))
-            .collect();
-        let base_state = BaseManifestState {
-            sequence: manifest.sequence,
-            block_map: base_block_map,
-            syncs_since_base: 0,
-        };
 
         let inner = Arc::new(CacheInner {
             config,
@@ -266,22 +223,21 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
             syncing_block_count: AtomicU64::new(0),
-            block_map: RwLock::new(block_map_kind),
+            block_map: RwLock::new(block_map),
             sequence,
             wal: Mutex::new(wal),
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
-            manifest_pack_hashes: Mutex::new(manifest_hashes),
-            base_manifest_state: Mutex::new(Some(base_state)),
             recovery_warnings: AtomicU64::new(0),
         });
 
-        info!("cache opened from manifest, directly Active");
+        info!("cache opened fresh for fork, directly Active");
 
         Ok(WriteCache {
             inner,
             _state: PhantomData,
         })
     }
+
 }

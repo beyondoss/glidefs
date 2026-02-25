@@ -5,21 +5,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
-use std::collections::{HashMap, HashSet};
-
 use crate::block::block_map::{
-    Blake3Hash, BlockMap, BlockMapKind, SequenceNumber, SparseBlockState, SparseStateMap,
+    AtomicBlockMap, Blake3Hash, BlockMap, SequenceNumber, SparseBlockState, SparseStateMap,
 };
 
-/// Cached state from the most recent full (base) manifest upload.
-///
-/// Used to compute delta manifests: diff current block_map against
-/// this cached snapshot to produce upserts and deletes.
-pub(super) struct BaseManifestState {
-    pub sequence: u64,
-    pub block_map: HashMap<u64, Blake3Hash>,
-    pub syncs_since_base: u32,
-}
 use crate::block::wal::Wal;
 
 use super::config::WriteCacheConfig;
@@ -213,11 +202,10 @@ pub(crate) struct CacheInner {
     // === v2 content-addressed structures ===
     /// Content-addressed block map: chunk_index -> (Blake3Hash, sequence).
     ///
-    /// Wrapped in RwLock<BlockMapKind> to support both full (AtomicBlockMap)
-    /// and forked (ForkedBlockMap with DashMap overlay) variants.
-    /// All normal reads/writes take a read lock (interior mutability handles
-    /// the actual mutation). Write lock is only taken during rare flatten ops.
-    pub(super) block_map: RwLock<BlockMapKind>,
+    /// Lock-free `AtomicBlockMap` using per-entry SeqLocks. The `RwLock`
+    /// wrapper is only used for snapshot serialization; all normal reads
+    /// and writes use interior mutability through the read lock.
+    pub(super) block_map: RwLock<AtomicBlockMap>,
 
     /// Monotonic sequence counter for snapshot consistency.
     /// Lock-free AtomicU64.
@@ -237,21 +225,6 @@ pub(crate) struct CacheInner {
     /// Pre-computed zero-block bytes for this export's block_size.
     /// Avoids a heap allocation on every sparse read.
     pub(super) zero_block_bytes: Bytes,
-
-    /// Cached set of hashes from the most recent manifest build.
-    ///
-    /// Updated on every `upload_full_manifest()` and on-demand via
-    /// `rebuild_manifest_hashes()`. Used by pack index pruning to
-    /// determine which entries are still needed — the manifest is the
-    /// durable reference, not the live block_map (which has ZERO
-    /// placeholders for in-flight flushes).
-    pub(super) manifest_pack_hashes: Mutex<HashSet<Blake3Hash>>,
-
-    /// Cached state from the last full (base) manifest upload.
-    ///
-    /// Used to compute delta manifests by diffing the current block_map
-    /// against this snapshot. None until the first full manifest upload.
-    pub(super) base_manifest_state: Mutex<Option<BaseManifestState>>,
 
     /// Number of recovery issues encountered during cache open (WAL replay
     /// failure, block map load failure). Exposed via metrics for monitoring.

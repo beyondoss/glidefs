@@ -35,8 +35,8 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index, clean_cache, _metrics) =
-                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+            let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, _metrics) =
+                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let offset = block_idx * BLOCK_SIZE as u64;
 
@@ -48,16 +48,16 @@ proptest! {
             prop_assert_eq!(read_data.as_ref(), &data[..], "Local read mismatch");
 
             // Flush to S3
-            cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+            cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await.unwrap();
 
             // Read from fresh cache (S3 fetch)
             drop(cache);
             let temp_dir2 = TempDir::new().unwrap();
-            let (cache2, content_store2, pack_index2, clean_cache2, metrics2) =
+            let (cache2, content_store2, chunk_meta_cache2, volume_manifest2, clean_cache2, metrics2) =
                 super::create_v2_cold_reader(&temp_dir2, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let s3_data = cache2
-                .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &pack_index2, &content_store2, &metrics2)
+                .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &chunk_meta_cache2, &volume_manifest2, &content_store2, &metrics2)
                 .await
                 .unwrap();
             prop_assert_eq!(s3_data.as_ref(), &data[..], "S3 read mismatch");
@@ -79,8 +79,8 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index, clean_cache, _metrics) =
-                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+            let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, _metrics) =
+                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let offset = block_idx * BLOCK_SIZE as u64;
 
@@ -95,15 +95,15 @@ proptest! {
             prop_assert_eq!(read_data.as_ref(), &expected[..], "Last write should win");
 
             // Also verify after S3 roundtrip
-            cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+            cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await.unwrap();
 
             drop(cache);
             let temp_dir2 = TempDir::new().unwrap();
-            let (cache2, content_store2, pack_index2, clean_cache2, metrics2) =
+            let (cache2, content_store2, chunk_meta_cache2, volume_manifest2, clean_cache2, metrics2) =
                 super::create_v2_cold_reader(&temp_dir2, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let s3_data = cache2
-                .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &pack_index2, &content_store2, &metrics2)
+                .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &chunk_meta_cache2, &volume_manifest2, &content_store2, &metrics2)
                 .await
                 .unwrap();
             prop_assert_eq!(s3_data.as_ref(), &expected[..], "S3 should have last write");
@@ -126,8 +126,8 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index, clean_cache, _metrics) =
-                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+            let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, _metrics) =
+                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             // Write all blocks
             for (&block_idx, data) in &block_data {
@@ -148,17 +148,17 @@ proptest! {
             }
 
             // Verify after S3 roundtrip
-            cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+            cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await.unwrap();
 
             drop(cache);
             let temp_dir2 = TempDir::new().unwrap();
-            let (cache2, content_store2, pack_index2, clean_cache2, metrics2) =
+            let (cache2, content_store2, chunk_meta_cache2, volume_manifest2, clean_cache2, metrics2) =
                 super::create_v2_cold_reader(&temp_dir2, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             for (&block_idx, expected) in &block_data {
                 let offset = block_idx * BLOCK_SIZE as u64;
                 let s3_data = cache2
-                    .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &pack_index2, &content_store2, &metrics2)
+                    .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &chunk_meta_cache2, &volume_manifest2, &content_store2, &metrics2)
                     .await
                     .unwrap();
                 prop_assert_eq!(
@@ -190,8 +190,8 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index, clean_cache, _metrics) =
-                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+            let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, _metrics) =
+                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let block_idx = batch_idx * BLOCKS_PER_BATCH + position;
             let offset = block_idx * BLOCK_SIZE as u64;
@@ -205,15 +205,15 @@ proptest! {
             cache.write(offset, &data, clean_cache.as_ref()).unwrap();
 
             // Flush and verify
-            cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+            cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await.unwrap();
 
             drop(cache);
             let temp_dir2 = TempDir::new().unwrap();
-            let (cache2, content_store2, pack_index2, clean_cache2, metrics2) =
+            let (cache2, content_store2, chunk_meta_cache2, volume_manifest2, clean_cache2, metrics2) =
                 super::create_v2_cold_reader(&temp_dir2, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let s3_data = cache2
-                .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &pack_index2, &content_store2, &metrics2)
+                .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &chunk_meta_cache2, &volume_manifest2, &content_store2, &metrics2)
                 .await
                 .unwrap();
             prop_assert_eq!(
@@ -235,10 +235,11 @@ proptest! {
             1..=15
         ),
     ) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let s3 = Arc::new(object_store::memory::InMemory::new());
         let temp_dir = TempDir::new().unwrap();
-        let (cache, _content_store, _pack_index, clean_cache, _metrics) =
-            super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+        let (cache, _content_store, _chunk_meta_cache, _volume_manifest, clean_cache, _metrics) =
+            rt.block_on(super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>));
 
         let data = vec![0xAB; BLOCK_SIZE];
 
@@ -270,14 +271,14 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index, clean_cache, metrics) =
-                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+            let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, metrics) =
+                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let offset = block_idx * BLOCK_SIZE as u64;
 
             // Read unwritten block
             let data = cache
-                .read_v2(offset, BLOCK_SIZE, clean_cache.as_ref(), &pack_index, &content_store, &metrics)
+                .read_v2(offset, BLOCK_SIZE, clean_cache.as_ref(), &chunk_meta_cache, &volume_manifest, &content_store, &metrics)
                 .await
                 .unwrap();
 
@@ -300,8 +301,8 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index, clean_cache, _metrics) =
-                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+            let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, _metrics) =
+                super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let offset = block_idx * BLOCK_SIZE as u64;
             let zeros = vec![0u8; BLOCK_SIZE];
@@ -310,16 +311,16 @@ proptest! {
             cache.write(offset, &zeros, clean_cache.as_ref()).unwrap();
 
             // Flush (zero-block optimization may skip S3 write)
-            cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+            cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await.unwrap();
 
             // Read from fresh cache
             drop(cache);
             let temp_dir2 = TempDir::new().unwrap();
-            let (cache2, content_store2, pack_index2, clean_cache2, metrics2) =
+            let (cache2, content_store2, chunk_meta_cache2, volume_manifest2, clean_cache2, metrics2) =
                 super::create_v2_cold_reader(&temp_dir2, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let read_data = cache2
-                .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &pack_index2, &content_store2, &metrics2)
+                .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &chunk_meta_cache2, &volume_manifest2, &content_store2, &metrics2)
                 .await
                 .unwrap();
 
@@ -342,8 +343,8 @@ proptest! {
 async fn test_multi_batch_writes() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+    let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, _metrics) =
+        super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
     // Write blocks across 3 batches
     let mut expected: HashMap<u64, Vec<u8>> = HashMap::new();
@@ -365,18 +366,18 @@ async fn test_multi_batch_writes() {
     }
 
     // Flush all
-    cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+    cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await.unwrap();
 
     // Verify from fresh cache
     drop(cache);
     let temp_dir2 = TempDir::new().unwrap();
-    let (cache2, content_store2, pack_index2, clean_cache2, metrics2) =
+    let (cache2, content_store2, chunk_meta_cache2, volume_manifest2, clean_cache2, metrics2) =
         super::create_v2_cold_reader(&temp_dir2, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
     for (block_idx, data) in &expected {
         let offset = block_idx * BLOCK_SIZE as u64;
         let read_data = cache2
-            .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &pack_index2, &content_store2, &metrics2)
+            .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &chunk_meta_cache2, &volume_manifest2, &content_store2, &metrics2)
             .await
             .unwrap();
         assert_eq!(
@@ -393,8 +394,8 @@ async fn test_multi_batch_writes() {
 async fn test_alternating_read_write() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, metrics) =
-        super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+    let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, metrics) =
+        super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
     for i in 0..20 {
         let offset = (i % 5) * BLOCK_SIZE as u64;
@@ -406,14 +407,14 @@ async fn test_alternating_read_write() {
         } else {
             // Read (should get last written value or zeros)
             let _ = cache
-                .read_v2(offset, BLOCK_SIZE, clean_cache.as_ref(), &pack_index, &content_store, &metrics)
+                .read_v2(offset, BLOCK_SIZE, clean_cache.as_ref(), &chunk_meta_cache, &volume_manifest, &content_store, &metrics)
                 .await
                 .unwrap();
         }
     }
 
     // Final verification
-    cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+    cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await.unwrap();
     assert_eq!(cache.dirty_block_count(), 0);
 }
 
@@ -422,8 +423,8 @@ async fn test_alternating_read_write() {
 async fn test_device_boundary() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>);
+    let (cache, content_store, chunk_meta_cache, volume_manifest, clean_cache, _metrics) =
+        super::create_v2_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
     let last_block = (DEVICE_SIZE / BLOCK_SIZE as u64) - 1;
     let offset = last_block * BLOCK_SIZE as u64;
@@ -433,15 +434,15 @@ async fn test_device_boundary() {
     cache.write(offset, &data, clean_cache.as_ref()).unwrap();
 
     // Flush and verify
-    cache.flush_to_s3(&content_store, &pack_index).await.unwrap();
+    cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await.unwrap();
 
     drop(cache);
     let temp_dir2 = TempDir::new().unwrap();
-    let (cache2, content_store2, pack_index2, clean_cache2, metrics2) =
+    let (cache2, content_store2, chunk_meta_cache2, volume_manifest2, clean_cache2, metrics2) =
         super::create_v2_cold_reader(&temp_dir2, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
     let read_data = cache2
-        .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &pack_index2, &content_store2, &metrics2)
+        .read_v2(offset, BLOCK_SIZE, clean_cache2.as_ref(), &chunk_meta_cache2, &volume_manifest2, &content_store2, &metrics2)
         .await
         .unwrap();
     assert_eq!(read_data.as_ref(), &data[..]);

@@ -36,9 +36,6 @@ pub enum Commands {
         /// Config file (for storage URL + credentials)
         #[arg(short, long)]
         config: PathBuf,
-        /// Chunk size in bytes (must be power of two, 4096..=1048576)
-        #[arg(long, default_value = "131072", value_parser = clap::value_parser!(u32).range(4096..=1048576))]
-        chunk_size: u32,
     },
     /// Run garbage collection to clean up orphaned packs in S3
     Gc {
