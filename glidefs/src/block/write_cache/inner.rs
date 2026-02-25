@@ -227,6 +227,15 @@ pub(crate) struct CacheInner {
     /// flush are sequential in the same select loop). DashMap for safety since
     /// pressure-flush from capacity_monitor may run on a different task.
     pub(super) crc_map: DashMap<usize, u32>,
+
+    /// Per-export flush serialization lock.
+    ///
+    /// Serializes flush + manifest upload operations to prevent concurrent
+    /// callers (drain, flush_scheduler, snapshot) from uploading stale
+    /// manifests. Without this, two concurrent `flush_to_s3` calls can each
+    /// serialize the in-memory VolumeManifest at different points, and
+    /// last-writer-wins on S3 can overwrite a correct manifest with a stale one.
+    pub(crate) flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl CacheInner {

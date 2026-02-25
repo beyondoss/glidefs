@@ -98,9 +98,7 @@ transport_test! {
                 client.flush().await.unwrap();
             }
 
-            // Drop without NBD_DISCONNECT to avoid triggering a server-side
-            // drain that would race with the explicit drain_all() below.
-            drop(client);
+            client.disconnect().await.unwrap();
         });
 
         // Drain: wait for first batch, then drain concurrently with second batch
@@ -128,9 +126,7 @@ transport_test! {
                 i + 1,
             );
         }
-        // Drop without NBD_DISCONNECT to avoid triggering a server-side
-        // drain that would race with the explicit drain_all() below.
-        drop(reader);
+        reader.disconnect().await.unwrap();
 
         // Second drain catches any blocks written after the first drain
         server.drain_all().await;

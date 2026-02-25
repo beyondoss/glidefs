@@ -959,6 +959,8 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing, 2-bit packed)
 crc_map: DashMap<usize, u32>  — only populated during flush window
 ├── Populated by checkpoint (every 5s) for dirty blocks not yet flushed
 ├── Consumed by flush (remove-and-verify per block)
+├── Hard cap: 10M entries (~240MB) — covers a fully-dirty 1TB device (8M blocks)
+│   Beyond the cap, new blocks skip CRC verification (SYNCING state still guarantees correctness)
 └── At idle: 0 entries, 0 bytes
     At max dirty rate (10GB/s writes, 5s interval): ~80K entries × ~12B = ~1MB
 ```
@@ -966,7 +968,7 @@ crc_map: DashMap<usize, u32>  — only populated during flush window
 | Component | Per-Export (fixed) | Per-Written-Page | Shared | Notes |
 |-----------|-------------------|-----------------|--------|-------|
 | `SparseStateMap` directory | ~4 KB | 4 KB per 16,384 blocks written | — | 2 bits/entry × 16,384 entries/page |
-| `crc_map` | 0 (transient) | — | — | DashMap entry per dirty block between checkpoint and flush; ~12B each |
+| `crc_map` | 0 (transient) | — | — | DashMap entry per dirty block between checkpoint and flush; ~12B each. Hard cap: 10M entries (~240MB) |
 | `ChunkMetaCache` | — | — | ~32 entries × ~4MB/entry max | LRU, disk-resident for persistence; shared across all exports by content hash |
 | `CleanCache` (memory) | — | — | `memory_size_gb` | Configured, default 1GB |
 | `CleanCache` (SSD) | — | — | `ssd_cache_size_gb` | Configured, default 10GB |

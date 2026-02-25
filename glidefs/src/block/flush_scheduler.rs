@@ -85,6 +85,9 @@ pub async fn flush_scheduler(
                 }
 
                 let start = Instant::now();
+                // Acquire per-export flush lock to serialize with concurrent
+                // drain/snapshot operations. Prevents stale manifest uploads.
+                let _flush_guard = cache.flush_lock().lock().await;
                 match cache.flush_packs(&content_store, &chunk_meta_cache, &volume_manifest).await {
                     Ok((stats, seq_cutpoint)) => {
                         flush_backoff = Duration::ZERO;
@@ -140,12 +143,14 @@ pub async fn flush_scheduler(
                         }
                     }
                 }
+                drop(_flush_guard);
             }
 
             // Periodic: checkpoint every 5s + retry pending manifest sync.
             _ = checkpoint_ticker.tick() => {
                 // Retry manifest sync that failed after a previous pack flush.
                 if let Some(seq) = manifest_pending {
+                    let _flush_guard = cache.flush_lock().lock().await;
                     match cache.sync_manifest(&content_store, &volume_manifest, seq).await {
                         Ok(()) => {
                             info!("deferred manifest sync succeeded");

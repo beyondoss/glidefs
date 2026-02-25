@@ -694,6 +694,7 @@ impl WriteCache<Active> {
         chunk_meta_cache: &Arc<ChunkMetaCache>,
         volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
     ) -> Result<FlushStats, CacheError> {
+        let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, _seq_cutpoint) = self
             .flush_dirty_inner(content_store, chunk_meta_cache, volume_manifest)
             .await?;
@@ -719,6 +720,7 @@ impl WriteCache<Active> {
         chunk_meta_cache: &Arc<ChunkMetaCache>,
         volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
     ) -> Result<SnapshotResult, CacheError> {
+        let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, seq_cutpoint) = self
             .flush_dirty_inner(content_store, chunk_meta_cache, volume_manifest)
             .await?;
@@ -746,6 +748,15 @@ impl WriteCache<Active> {
             sequence: seq_cutpoint,
             stats,
         })
+    }
+
+    /// Reference to the per-export flush serialization lock.
+    ///
+    /// The flush_scheduler must acquire this lock around the
+    /// `flush_packs` + `sync_manifest` sequence to prevent concurrent
+    /// manifest uploads from racing with `flush_to_s3` (drain path).
+    pub(crate) fn flush_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.flush_lock
     }
 
     /// Get a clone of the inner Arc for sharing with the sync worker.

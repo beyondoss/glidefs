@@ -126,6 +126,7 @@ impl WriteCache<Initializing> {
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(recovery_warning_count),
             crc_map: DashMap::new(),
+            flush_lock: tokio::sync::Mutex::new(()),
         });
 
         info!(
@@ -175,6 +176,7 @@ impl WriteCache<Initializing> {
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(0),
             crc_map: DashMap::new(),
+            flush_lock: tokio::sync::Mutex::new(()),
         });
 
         info!("cache opened fresh for fork, directly Active");
