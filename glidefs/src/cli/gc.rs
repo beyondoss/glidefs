@@ -311,41 +311,65 @@ async fn reconcile_prefix(
         "deduplicated chunk meta lookups"
     );
 
-    // Phase 2: Fetch each unique ChunkMeta once, collect live pack IDs.
-    let mut live_packs: HashSet<Uuid> = HashSet::new();
+    // Phase 2: Fetch each unique ChunkMeta, collect live pack IDs.
+    // Parallel fetch with bounded concurrency (same pattern as prefetch_chunk_metas).
+    use futures::StreamExt;
 
-    for (chunk_idx, chunk_hash_hex) in &unique_chunks {
-        match content_store.get_chunk_meta(*chunk_idx, chunk_hash_hex).await {
-            Ok(Some(meta_bytes)) => match ChunkMeta::deserialize(&meta_bytes) {
-                Ok(meta) => {
-                    live_packs.extend(meta.pack_ids());
+    enum ChunkMetaResult {
+        Packs(HashSet<Uuid>),
+        NotFound,
+        Failed,
+    }
+
+    let results: Vec<ChunkMetaResult> = futures::stream::iter(unique_chunks.iter())
+        .map(|(chunk_idx, chunk_hash_hex)| {
+            let cs = &content_store;
+            let chunk_idx = *chunk_idx;
+            let chunk_hash_hex = chunk_hash_hex.clone();
+            async move {
+                match cs.get_chunk_meta(chunk_idx, &chunk_hash_hex).await {
+                    Ok(Some(meta_bytes)) => match ChunkMeta::deserialize(&meta_bytes) {
+                        Ok(meta) => ChunkMetaResult::Packs(meta.pack_ids()),
+                        Err(e) => {
+                            warn!(
+                                chunk_idx,
+                                chunk_hash = %chunk_hash_hex,
+                                error = %e,
+                                "corrupt chunk meta — treating all packs in prefix as live"
+                            );
+                            ChunkMetaResult::Failed
+                        }
+                    },
+                    Ok(None) => {
+                        warn!(
+                            chunk_idx,
+                            chunk_hash = %chunk_hash_hex,
+                            "chunk meta not found (may have been cleaned up)"
+                        );
+                        ChunkMetaResult::NotFound
+                    }
+                    Err(e) => {
+                        warn!(
+                            chunk_idx,
+                            chunk_hash = %chunk_hash_hex,
+                            error = %e,
+                            "failed to fetch chunk meta — treating all packs in prefix as live"
+                        );
+                        ChunkMetaResult::Failed
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        chunk_idx,
-                        chunk_hash = %chunk_hash_hex,
-                        error = %e,
-                        "corrupt chunk meta — treating all packs in prefix as live"
-                    );
-                    manifest_failed = true;
-                }
-            },
-            Ok(None) => {
-                warn!(
-                    chunk_idx,
-                    chunk_hash = %chunk_hash_hex,
-                    "chunk meta not found (may have been cleaned up)"
-                );
             }
-            Err(e) => {
-                warn!(
-                    chunk_idx,
-                    chunk_hash = %chunk_hash_hex,
-                    error = %e,
-                    "failed to fetch chunk meta — treating all packs in prefix as live"
-                );
-                manifest_failed = true;
-            }
+        })
+        .buffer_unordered(32)
+        .collect()
+        .await;
+
+    let mut live_packs: HashSet<Uuid> = HashSet::new();
+    for result in results {
+        match result {
+            ChunkMetaResult::Packs(packs) => live_packs.extend(packs),
+            ChunkMetaResult::NotFound => {}
+            ChunkMetaResult::Failed => manifest_failed = true,
         }
     }
 

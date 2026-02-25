@@ -116,19 +116,10 @@ impl ContentStore {
         }
     }
 
-    /// Upload a pack to S3.
-    ///
-    /// Fetch a single compressed block from a pack via S3 range request.
+    /// Fetch a single compressed block from a legacy pack via S3 range request.
     ///
     /// Returns only the compressed bytes at `[offset..offset+comp_length]` —
-    /// typically ~100KB vs ~3MB for the full pack. If a download semaphore is
-    /// attached, acquires a permit to bound global S3 read concurrency.
-    ///
-    /// The actual S3 HTTP call is spawned onto the tokio runtime so that
-    /// reqwest/hyper's connection drivers use tokio's native I/O reactor.
-    /// This is required when called from non-tokio executors (ublk's
-    /// QueueExecutor) — without spawning, the HTTP futures hang because
-    /// the reactor isn't driven by the calling thread.
+    /// typically ~100KB vs ~3MB for the full pack.
     #[instrument(skip(self), fields(pack_id = %pack_id, offset, comp_length))]
     pub async fn get_block(
         &self,
@@ -136,36 +127,8 @@ impl ContentStore {
         offset: u32,
         comp_length: u32,
     ) -> Result<bytes::Bytes, ContentStoreError> {
-        self.check_circuit()?;
-        let sem = self.download_semaphore.clone();
-        let store = Arc::clone(&self.object_store);
         let key = format!("{}/{}", self.base_path, pack_s3_key(pack_id));
-        let path = ObjectPath::from(key);
-        let start = offset as u64;
-        let end = start + comp_length as u64;
-        let s3_result = tokio::spawn(async move {
-            let _permit = match &sem {
-                Some(s) => Some(
-                    s.acquire()
-                        .await
-                        .map_err(|_| object_store::Error::Generic {
-                            store: "semaphore",
-                            source: "download semaphore closed".into(),
-                        })?,
-                ),
-                None => None,
-            };
-            store.get_range(&path, start..end).await
-        })
-        .await
-        .map_err(|e| {
-            ContentStoreError::ObjectStore(object_store::Error::Generic {
-                store: "tokio-spawn",
-                source: Box::new(e),
-            })
-        })?;
-        self.record_s3_result(&s3_result);
-        Ok(s3_result?)
+        self.get_range_from_key(&key, offset, comp_length).await
     }
 
     /// Upload a manifest to S3. Returns the S3 ETag if the backend provides one.
@@ -473,8 +436,6 @@ impl ContentStore {
         offset: u32,
         comp_length: u32,
     ) -> Result<bytes::Bytes, ContentStoreError> {
-        self.check_circuit()?;
-
         // Try chunk-scoped path first: chunks/{idx:04}/{pack_id}.pack
         let chunk_key = format!("{}/chunks/{:04}/{}.pack", self.base_path, chunk_idx, pack_id);
         match self.get_range_from_key(&chunk_key, offset, comp_length).await {
@@ -489,13 +450,19 @@ impl ContentStore {
         self.get_block(pack_id, offset, comp_length).await
     }
 
-    /// Fetch a byte range from an S3 key. Used internally by get_chunk_block.
+    /// Fetch a byte range from an S3 key.
+    ///
+    /// Core implementation for all range-read operations. Checks the circuit
+    /// breaker, acquires a download semaphore permit, spawns the S3 call onto
+    /// the tokio runtime (required for non-tokio executors like ublk), and
+    /// records the result to the circuit breaker.
     async fn get_range_from_key(
         &self,
         key: &str,
         offset: u32,
         comp_length: u32,
     ) -> Result<bytes::Bytes, ContentStoreError> {
+        self.check_circuit()?;
         let sem = self.download_semaphore.clone();
         let store = Arc::clone(&self.object_store);
         let path = ObjectPath::from(key.to_string());

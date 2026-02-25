@@ -193,29 +193,7 @@ impl BlockHandler {
             )
             .await?;
 
-        // Sequential read-ahead: detect patterns and prefetch next block
-        {
-            let chunk_size = self.cache.block_size() as u64;
-            let chunk_idx = offset / chunk_size;
-            if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
-                let cache = Arc::clone(&self.cache);
-                let clean_cache = Arc::clone(&self.clean_cache);
-                let chunk_meta_cache = Arc::clone(&self.chunk_meta_cache);
-                let volume_manifest = Arc::clone(&self.volume_manifest);
-                let content_store = Arc::clone(&self.content_store);
-                tokio::spawn(async move {
-                    let _ = cache
-                        .prefetch_chunk(
-                            readahead_chunk as usize,
-                            clean_cache.as_ref(),
-                            &chunk_meta_cache,
-                            &volume_manifest,
-                            &content_store,
-                        )
-                        .await;
-                });
-            }
-        }
+        self.trigger_readahead(offset);
 
         self.metrics.record_read_latency(start.elapsed());
         Ok(data)
@@ -259,29 +237,7 @@ impl BlockHandler {
             )
             .await?;
 
-        // Sequential read-ahead: detect patterns and prefetch next block
-        {
-            let chunk_size = self.cache.block_size() as u64;
-            let chunk_idx = offset / chunk_size;
-            if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
-                let cache = Arc::clone(&self.cache);
-                let clean_cache = Arc::clone(&self.clean_cache);
-                let chunk_meta_cache = Arc::clone(&self.chunk_meta_cache);
-                let volume_manifest = Arc::clone(&self.volume_manifest);
-                let content_store = Arc::clone(&self.content_store);
-                tokio::spawn(async move {
-                    let _ = cache
-                        .prefetch_chunk(
-                            readahead_chunk as usize,
-                            clean_cache.as_ref(),
-                            &chunk_meta_cache,
-                            &volume_manifest,
-                            &content_store,
-                        )
-                        .await;
-                });
-            }
-        }
+        self.trigger_readahead(offset);
 
         self.metrics.record_read_latency(start.elapsed());
         Ok(n)
@@ -524,9 +480,8 @@ impl BlockHandler {
 
     /// Trigger sequential readahead detection and prefetch.
     ///
-    /// Extracted from the read/read_into methods so the ublk zero-copy path
-    /// can call it after completing the io_uring read.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    /// Detects sequential access patterns and spawns a background prefetch
+    /// for the next chunk. Used by the NBD read path and ublk zero-copy path.
     pub fn trigger_readahead(&self, offset: u64) {
         let chunk_size = self.cache.block_size() as u64;
         let chunk_idx = offset / chunk_size;
