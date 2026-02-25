@@ -574,7 +574,7 @@ Every layer has a verification mechanism. The goal: corruption is detected befor
 
 Dirty blocks sit on local SSD between guest writes and S3 flush — up to ~100 blocks per export (pack-size trigger). During this window, SSD bit rot or firmware bugs could silently corrupt the data. Without verification, the flush path would compute BLAKE3 over corrupted data, producing a valid-looking but wrong hash, and upload it to S3 — permanently laundering the corruption.
 
-CRC32 is stored in `crc_map: DashMap<usize, u32>` on `CacheInner` — sized proportional to dirty blocks, not device size. At 10GB/s write rate with 5s flush interval: max ~80K dirty blocks × ~12 bytes = ~1MB. At idle: 0 bytes.
+CRC32 is stored in `crc_map: DashMap<usize, u32>` on `CacheInner` — sized proportional to dirty blocks, not device size. At 10GB/s write rate with 5s flush interval: max ~80K dirty blocks × ~20 bytes (DashMap overhead: bucket metadata + alignment + load factor) = ~1.6MB. At idle: 0 bytes.
 
 **Key difference from the write path**: the write path does NOT touch the CRC map. SYNCING state (not sequence numbers) discriminates corruption from concurrent writes:
 
@@ -791,7 +791,7 @@ Dense arrays pre-allocate for all blocks: a 1TB export with 128KB blocks has 8M 
 
 Sparse page tables allocate on first write. With 2-bit packing (4 entries per `AtomicU8`), each 4KB page holds 16,384 entries — 4× denser than a naive 1-byte-per-entry layout. The directory (one pointer per page) costs ~4KB for a 1TB export (512 entries). An empty export: ~4KB. A fully-written 1TB export: ~2MB. The cost is one extra pointer dereference on the hot path — a branch that predicts correctly almost every time.
 
-After removing `AtomicBlockMap`, only `SparseStateMap` (2 bits/block) remains for per-block metadata. CRC32 is now in a `DashMap<usize, u32>` sized to dirty blocks (~0 at idle, ~1MB at 80K dirty blocks). No per-block hashes stored anywhere — hashes are computed fresh from SSD at flush time.
+After removing `AtomicBlockMap`, only `SparseStateMap` (2 bits/block) remains for per-block metadata. CRC32 is now in a `DashMap<usize, u32>` sized to dirty blocks (~0 at idle, ~1.6MB at 80K dirty blocks). No per-block hashes stored anywhere — hashes are computed fresh from SSD at flush time.
 
 ### Why explicit versioned snapshots instead of manifest history?
 
@@ -999,16 +999,16 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing, 2-bit packed)
 crc_map: DashMap<usize, u32>  — only populated during flush window
 ├── Populated by checkpoint (every 5s) for dirty blocks not yet flushed
 ├── Consumed by flush (remove-and-verify per block)
-├── Hard cap: 10M entries (~240MB) — covers a fully-dirty 1TB device (8M blocks)
+├── Hard cap: 10M entries (~200MB) — covers a fully-dirty 1TB device (8M blocks)
 │   Beyond the cap, new blocks skip CRC verification (SYNCING state still guarantees correctness)
 └── At idle: 0 entries, 0 bytes
-    At max dirty rate (10GB/s writes, 5s interval): ~80K entries × ~12B = ~1MB
+    At max dirty rate (10GB/s writes, 5s interval): ~80K entries × ~20B = ~1.6MB
 ```
 
 | Component | Per-Export (fixed) | Per-Written-Page | Shared | Notes |
 |-----------|-------------------|-----------------|--------|-------|
 | `SparseStateMap` directory | ~4 KB | 4 KB per 16,384 blocks written | — | 2 bits/entry × 16,384 entries/page |
-| `crc_map` | 0 (transient) | — | — | DashMap entry per dirty block between checkpoint and flush; ~12B each. Hard cap: 10M entries (~240MB) |
+| `crc_map` | 0 (transient) | — | — | DashMap entry per dirty block between checkpoint and flush; ~20B each (bucket metadata + alignment + load factor). Hard cap: 10M entries (~200MB) |
 | `ChunkMetaCache` | — | — | ~32 entries × ~4MB/entry max | LRU, disk-resident for persistence; shared across all exports by content hash |
 | `CleanCache` (memory) | — | — | `memory_size_gb` | Configured, default 1GB |
 | `CleanCache` (SSD) | — | — | `ssd_cache_size_gb` | Configured, default 10GB |

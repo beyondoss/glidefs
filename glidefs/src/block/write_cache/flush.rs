@@ -612,7 +612,8 @@ impl WriteCache<Active> {
     /// guarantees correctness; we just lose SSD corruption detection for those
     /// blocks.
     fn compute_dirty_crc32s(&self) {
-        /// Maximum crc_map entries per export. 10M entries × ~24 bytes ≈ 240MB.
+        /// Maximum crc_map entries per export. 10M entries × ~20 bytes
+        /// (DashMap overhead: bucket metadata + alignment + load factor) ≈ 200MB.
         /// Covers a fully-dirty 1TB device (8M blocks of 128KB) with headroom.
         /// Prevents unbounded growth if device_size is ever misconfigured.
         const MAX_CRC_ENTRIES: usize = 10_000_000;

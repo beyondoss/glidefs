@@ -51,12 +51,18 @@ pub enum Commands {
         /// Grace period before deleting dead packs (e.g., "24h", "1h", "7d")
         #[arg(long, default_value = "24h")]
         grace_period: String,
-        /// Maximum number of packs to delete per run
-        #[arg(long, default_value = "10000")]
+        /// Maximum number of objects (packs + metas) to delete per run
+        #[arg(long, default_value = "100000")]
         max_deletes: usize,
         /// Path to GC state file for grace period tracking
         #[arg(long, default_value = "gc-state.json")]
         state_file: PathBuf,
+        /// Directory for on-disk chunk meta cache (avoids redundant S3 GETs across runs)
+        #[arg(long, default_value = "gc-meta-cache")]
+        meta_cache_dir: PathBuf,
+        /// Delete snapshots older than this (e.g., "30d", "7d"). Disabled if omitted.
+        #[arg(long)]
+        snapshot_retention: Option<String>,
     },
 }
 

@@ -116,6 +116,17 @@ impl VolumeManifest {
         if manifest.block_size == 0 || manifest.chunk_size == 0 {
             return Err(VolumeManifestError::InvalidConfig);
         }
+        // Validate all chunk hashes: exactly 32 lowercase hex characters.
+        // Catches corrupted/truncated hashes at load time instead of silently
+        // zero-filling at read time (which would cause wrong cache lookups).
+        for (&chunk_idx, hex) in &manifest.chunks {
+            if !validate_hex_hash(hex) {
+                return Err(VolumeManifestError::InvalidChunkHash {
+                    chunk_idx,
+                    len: hex.len(),
+                });
+            }
+        }
         Ok(manifest)
     }
 }
@@ -126,15 +137,22 @@ fn blake3_to_hex(hash: &Blake3Hash) -> String {
 }
 
 /// Convert hex string to Blake3Hash.
+///
+/// Panics on invalid input — callers must validate via `validate_hex_hash`
+/// (enforced by `VolumeManifest::deserialize`).
 fn hex_to_blake3(hex: &str) -> Blake3Hash {
     let mut bytes = [0u8; 16];
     for (i, byte) in bytes.iter_mut().enumerate() {
         let start = i * 2;
-        if start + 2 <= hex.len() {
-            *byte = u8::from_str_radix(&hex[start..start + 2], 16).unwrap_or(0);
-        }
+        *byte = u8::from_str_radix(&hex[start..start + 2], 16)
+            .expect("hex_to_blake3 called with unvalidated input");
     }
     Blake3Hash(bytes)
+}
+
+/// Validate that a hex string is exactly 32 lowercase hex characters.
+fn validate_hex_hash(hex: &str) -> bool {
+    hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -145,6 +163,8 @@ pub enum VolumeManifestError {
     UnsupportedVersion(u32),
     #[error("invalid config: block_size and chunk_size must be non-zero")]
     InvalidConfig,
+    #[error("invalid chunk hash for chunk {chunk_idx}: expected 32 hex chars, got {len} chars")]
+    InvalidChunkHash { chunk_idx: u32, len: usize },
 }
 
 #[cfg(test)]
@@ -249,6 +269,30 @@ mod tests {
         let bytes = serde_json::to_vec(&m).unwrap();
         let err = VolumeManifest::deserialize(&bytes).unwrap_err();
         assert!(matches!(err, VolumeManifestError::InvalidConfig));
+    }
+
+    #[test]
+    fn test_rejects_truncated_chunk_hash() {
+        let mut m = VolumeManifest::new(10 * 1024 * 1024 * 1024, 131072);
+        m.chunks.insert(0, "abcdef".to_string()); // too short
+        let bytes = serde_json::to_vec(&m).unwrap();
+        let err = VolumeManifest::deserialize(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            VolumeManifestError::InvalidChunkHash { chunk_idx: 0, len: 6 }
+        ));
+    }
+
+    #[test]
+    fn test_rejects_invalid_hex_in_chunk_hash() {
+        let mut m = VolumeManifest::new(10 * 1024 * 1024 * 1024, 131072);
+        m.chunks.insert(5, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string()); // 32 chars but not hex
+        let bytes = serde_json::to_vec(&m).unwrap();
+        let err = VolumeManifest::deserialize(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            VolumeManifestError::InvalidChunkHash { chunk_idx: 5, len: 32 }
+        ));
     }
 
     #[test]

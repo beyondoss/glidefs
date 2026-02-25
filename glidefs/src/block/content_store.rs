@@ -44,6 +44,24 @@ fn is_connectivity_error(e: &object_store::Error) -> bool {
     )
 }
 
+/// Object type within a chunk directory.
+#[derive(Debug, Clone)]
+pub enum ChunkObjectKind {
+    /// A pack file: `{uuid}.pack`
+    Pack(Uuid),
+    /// A chunk meta file: `{hash}.meta`
+    Meta(String),
+}
+
+/// An object discovered in a chunk directory (or legacy packs/ prefix).
+#[derive(Debug, Clone)]
+pub struct ChunkObject {
+    /// Chunk index (4-digit zero-padded in S3). `u32::MAX` for legacy flat packs.
+    pub chunk_idx: u32,
+    /// Whether this is a .pack or .meta file.
+    pub kind: ChunkObjectKind,
+}
+
 pub struct ContentStore {
     object_store: Arc<dyn ObjectStore>,
     base_path: String,
@@ -291,11 +309,45 @@ impl ContentStore {
         Ok(())
     }
 
-    /// Collect all pack IDs referenced by any snapshot manifest in this prefix.
-    ///
-    /// Called by GC to extend the live-pack set. Lists all objects under
-    /// `snapshots/`, fetches and parses each as a VolumeManifest, resolves
-    /// chunk metas, and collects referenced pack_ids.
+    /// List all snapshot objects with their S3 last_modified timestamps.
+    /// Returns (path, last_modified) for each snapshot in this prefix.
+    pub async fn list_all_snapshots_with_dates(
+        &self,
+    ) -> Result<Vec<(ObjectPath, chrono::DateTime<chrono::Utc>)>, ContentStoreError> {
+        let prefix_str = format!("{}/snapshots/", self.base_path);
+        let prefix = ObjectPath::from(prefix_str);
+        let mut results = Vec::new();
+        let mut stream = self.object_store.list(Some(&prefix));
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(meta) => results.push((meta.location, meta.last_modified)),
+                Err(e) => {
+                    self.record_s3_list_error(&e);
+                    return Err(e.into());
+                }
+            }
+        }
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
+        Ok(results)
+    }
+
+    /// Delete a snapshot by its S3 path (idempotent).
+    pub async fn delete_snapshot_by_path(
+        &self,
+        path: &ObjectPath,
+    ) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let result = self.object_store.delete(path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// List and parse all snapshot VolumeManifests in this prefix.
     /// Corrupt or missing snapshots are warned and skipped.
     pub async fn list_snapshot_manifests(
@@ -634,17 +686,18 @@ impl ContentStore {
         Ok(names)
     }
 
-    /// List ALL pack files across all chunk directories and the legacy flat `packs/` prefix.
+    /// List ALL objects (.pack and .meta) across chunk directories, plus legacy flat packs.
     ///
-    /// Returns a set of `(chunk_idx, pack_id)` tuples for chunk packs, plus `(u32::MAX, pack_id)`
-    /// for legacy flat packs. Used by GC to discover known packs without registries.
-    pub async fn list_all_known_packs(
+    /// Single-pass listing: GC uses this to discover both known packs and known metas
+    /// without a second LIST scan. Returns `ChunkObject` variants for each file type.
+    /// Legacy flat packs (pre-v3) are returned as `Pack` with `chunk_idx = u32::MAX`.
+    pub async fn list_all_chunk_objects(
         &self,
-    ) -> Result<Vec<(u32, Uuid)>, ContentStoreError> {
+    ) -> Result<Vec<ChunkObject>, ContentStoreError> {
         self.check_circuit()?;
-        let mut packs = Vec::new();
+        let mut objects = Vec::new();
 
-        // 1. List chunk-scoped packs: chunks/*//*.pack
+        // 1. List everything under chunks/
         let chunks_prefix_str = format!("{}/chunks/", self.base_path);
         let chunks_prefix = ObjectPath::from(chunks_prefix_str.clone());
         let mut stream = self.object_store.list(Some(&chunks_prefix));
@@ -656,18 +709,33 @@ impl ContentStore {
                     return Err(e.into());
                 }
             };
-            if let Some(filename) = meta.location.filename()
-                && let Some(uuid_str) = filename.strip_suffix(".pack")
+            let Some(filename) = meta.location.filename() else {
+                continue;
+            };
+            let path_str = meta.location.to_string();
+            let Some(rel) = path_str.strip_prefix(&chunks_prefix_str) else {
+                continue;
+            };
+            // rel = "{idx:04}/{filename}"
+            let Some(slash_pos) = rel.find('/') else {
+                continue;
+            };
+            let Ok(chunk_idx) = rel[..slash_pos].parse::<u32>() else {
+                continue;
+            };
+
+            if let Some(uuid_str) = filename.strip_suffix(".pack")
                 && let Ok(pack_id) = Uuid::parse_str(uuid_str)
             {
-                // Extract chunk_idx from path: .../chunks/{idx:04}/{uuid}.pack
-                let path_str = meta.location.to_string();
-                if let Some(rel) = path_str.strip_prefix(&chunks_prefix_str) {
-                    // rel = "{idx:04}/{uuid}.pack"
-                    if let Some(slash_pos) = rel.find('/') && let Ok(chunk_idx) = rel[..slash_pos].parse::<u32>() {
-                        packs.push((chunk_idx, pack_id));
-                    }
-                }
+                objects.push(ChunkObject {
+                    chunk_idx,
+                    kind: ChunkObjectKind::Pack(pack_id),
+                });
+            } else if let Some(hash_hex) = filename.strip_suffix(".meta") {
+                objects.push(ChunkObject {
+                    chunk_idx,
+                    kind: ChunkObjectKind::Meta(hash_hex.to_string()),
+                });
             }
         }
 
@@ -683,15 +751,51 @@ impl ContentStore {
                     return Err(e.into());
                 }
             };
-            if let Some(filename) = meta.location.filename() && let Ok(pack_id) = Uuid::parse_str(filename) {
-                packs.push((u32::MAX, pack_id));
+            if let Some(filename) = meta.location.filename()
+                && let Ok(pack_id) = Uuid::parse_str(filename)
+            {
+                objects.push(ChunkObject {
+                    chunk_idx: u32::MAX,
+                    kind: ChunkObjectKind::Pack(pack_id),
+                });
             }
         }
 
         if let Some(cb) = &self.circuit_breaker {
             cb.record_success();
         }
-        Ok(packs)
+        Ok(objects)
+    }
+
+    /// List ALL pack files across all chunk directories and the legacy flat `packs/` prefix.
+    ///
+    /// Returns a set of `(chunk_idx, pack_id)` tuples for chunk packs, plus `(u32::MAX, pack_id)`
+    /// for legacy flat packs. Thin wrapper around `list_all_chunk_objects` for backward compat.
+    pub async fn list_all_known_packs(
+        &self,
+    ) -> Result<Vec<(u32, Uuid)>, ContentStoreError> {
+        let objects = self.list_all_chunk_objects().await?;
+        Ok(objects
+            .into_iter()
+            .filter_map(|obj| match obj.kind {
+                ChunkObjectKind::Pack(pack_id) => Some((obj.chunk_idx, pack_id)),
+                ChunkObjectKind::Meta(_) => None,
+            })
+            .collect())
+    }
+
+    /// Delete a chunk .meta file from S3 by chunk_idx and chunk_hash (idempotent).
+    pub async fn delete_chunk_meta(&self, chunk_idx: u32, chunk_hash: &str) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/chunks/{:04}/{}.meta", self.base_path, chunk_idx, chunk_hash);
+        let path = ObjectPath::from(key);
+        let result = self.object_store.delete(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Delete a chunk pack from S3 by chunk_idx and pack_id (idempotent).
