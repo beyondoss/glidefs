@@ -50,9 +50,10 @@ pub struct ReadPlan {
 }
 
 impl WriteCache<Active> {
-    /// Read blocks by content hash through tiered storage.
+    /// Read blocks through tiered storage.
     ///
-    /// Resolution order per chunk: block_map → clean_cache → S3 → SSD pread fallback.
+    /// Resolution order per chunk: is_present → pread, else VolumeManifest →
+    /// ChunkMeta → clean_cache → S3.
     /// Chunks are resolved concurrently — a multi-block read that spans multiple packs
     /// fetches them in parallel rather than serially.
     #[instrument(skip(self, clean_cache, chunk_meta_cache, volume_manifest, content_store, metrics), fields(offset = offset, len = len))]
@@ -140,9 +141,9 @@ impl WriteCache<Active> {
 
     /// Read blocks directly into a caller-provided buffer.
     ///
-    /// Same resolution order as `read_v2` (block_map → clean_cache → S3 → SSD),
-    /// but copies chunk data directly into `buf` instead of building an intermediate
-    /// `Vec<u8>` + `Bytes`. Eliminates one allocation in the multi-chunk path.
+    /// Same resolution order as `read_v2`, but copies chunk data directly
+    /// into `buf` instead of building an intermediate `Vec<u8>` + `Bytes`.
+    /// Eliminates one allocation in the multi-chunk path.
     ///
     /// Returns the number of bytes written to `buf`.
     #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
@@ -245,7 +246,8 @@ impl WriteCache<Active> {
 
     /// Prefetch a single chunk into the clean cache.
     ///
-    /// Fetches the block from S3 if not already cached locally.
+    /// For non-present blocks, fetches through VolumeManifest → ChunkMeta → S3.
+    /// For present blocks, this is a no-op (data is already on SSD).
     pub async fn prefetch_chunk(
         &self,
         chunk_index: usize,
@@ -254,11 +256,8 @@ impl WriteCache<Active> {
         volume_manifest: &parking_lot::RwLock<VolumeManifest>,
         content_store: &ContentStore,
     ) -> Result<(), CacheError> {
-        let (hash, _seq) = self.inner.block_map_get(chunk_index);
-        if hash.is_zero() || hash == self.inner.zero_block_hash {
-            return Ok(());
-        }
-        if clean_cache.get(&hash).await.is_some() {
+        // If block is already on local SSD, nothing to prefetch.
+        if self.inner.is_present(chunk_index) {
             return Ok(());
         }
         if let Err(e) = self
@@ -308,10 +307,10 @@ impl WriteCache<Active> {
 
     /// Resolve a single chunk through the tier hierarchy (hot path).
     ///
-    /// 1. block_map lookup → if zero hash, return zeros
-    /// 2. clean_cache → bounded in-memory/SSD cache (~100ns mem, ~100μs SSD)
+    /// 1. is_present → pread (local SSD, fast)
+    /// 2. VolumeManifest → ChunkMetaCache → clean_cache (memory/SSD cache)
     /// 3. VolumeManifest → ChunkMetaCache → S3 range request
-    /// 4. SSD pread fallback → dirty block not yet in S3 (OS page cache: ~μs)
+    /// 4. Unwritten block → zeros
     async fn resolve_chunk(
         &self,
         chunk_index: usize,
@@ -321,40 +320,14 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<Bytes, CacheError> {
-        let (hash, _seq) = self.inner.block_map_get(chunk_index);
-
-        // ZERO hash on a present block means the hash is deferred (not yet
-        // computed). Read directly from SSD — the data is there.
-        if hash.is_zero() {
-            if self.inner.is_present(chunk_index) {
-                return self.sync_read_local_block(chunk_index as u64);
-            }
-            // Don't return zeros yet — fall through to Tier 2.
-            // For forks, the VolumeManifest may have remote data for this block.
+        // Hot path: block is present on local SSD — pread directly.
+        // Covers Dirty, Clean, and Syncing blocks.
+        if self.inner.is_present(chunk_index) {
+            return self.sync_read_local_block(chunk_index as u64);
         }
 
-        if !hash.is_zero() {
-            // Explicit zero-range → zeros.
-            if hash == self.inner.zero_block_hash {
-                return Ok(self.inner.zero_block_bytes.clone());
-            }
-
-            // Fast path: block is present on local SSD — skip cache/index lookups.
-            // The data file is authoritative for any present block (Dirty, Clean, or Syncing).
-            if self.inner.is_present(chunk_index) {
-                return self.sync_read_local_block(chunk_index as u64);
-            }
-
-            // Tier 1: clean_cache (recently written or previously fetched from S3).
-            if let Some(data) = clean_cache.get(&hash).await {
-                if let Some(m) = metrics {
-                    m.record_cache_hit();
-                }
-                return Ok(data);
-            }
-        }
-
-        // Tier 2: VolumeManifest → ChunkMetaCache → S3 range request.
+        // Cold path: block is not on local SSD.
+        // Resolve via VolumeManifest → ChunkMeta → clean_cache / S3.
         let (vol_chunk_idx, block_offset, chunk_hash) = {
             let vm = volume_manifest.read();
             let ci = vm.chunk_idx_for_block(chunk_index as u64);
@@ -364,8 +337,7 @@ impl WriteCache<Active> {
         };
 
         if let Some(chunk_hash) = chunk_hash {
-            // Resolve block via cache (memory LRU → SSD → S3 fetch on miss).
-            // Keep block_hash from ChunkMeta — needed for verification when local hash is zero (fork).
+            // Resolve block via ChunkMeta cache (memory LRU → SSD → S3 fetch on miss).
             let resolved = match chunk_meta_cache.resolve_block(&chunk_hash, block_offset).await {
                 Some((block_hash, pl)) => Some((block_hash, pl)),
                 None => {
@@ -394,6 +366,14 @@ impl WriteCache<Active> {
             };
 
             if let Some((expected_hash, pack_loc)) = resolved {
+                // Check clean_cache first (block may have been fetched earlier).
+                if let Some(data) = clean_cache.get(&expected_hash).await {
+                    if let Some(m) = metrics {
+                        m.record_cache_hit();
+                    }
+                    return Ok(data);
+                }
+
                 if let Some(m) = metrics {
                     m.record_cache_miss();
                 }
@@ -439,14 +419,7 @@ impl WriteCache<Active> {
         }
 
         // Block not found in VolumeManifest — truly unwritten → zeros.
-        if hash.is_zero() {
-            return Ok(self.inner.zero_block_bytes.clone());
-        }
-
-        // Tier 3: SSD pread fallback — block is locally dirty, not yet in S3.
-        // OS page cache makes this ~μs for recently written blocks.
-        let data = self.sync_read_local_block(chunk_index as u64)?;
-        Ok(data)
+        Ok(self.inner.zero_block_bytes.clone())
     }
 
     /// Read data from local cache only (no S3 fetch).
@@ -524,11 +497,11 @@ impl WriteCache<Active> {
 
     /// Build a read plan for the ublk zero-copy path.
     ///
-    /// Same resolution order as `read_v2` (block_map → clean_cache → S3 → SSD),
-    /// but instead of copying data into a `Bytes` buffer, returns a plan describing
-    /// where each chunk's data lives. The caller (io_task_zc) uses the plan to
-    /// issue io_uring ops for `LocalSsd` chunks and memcpy for `InMemory` chunks,
-    /// writing directly into the kernel-mapped bio pages.
+    /// Same resolution order as `read_v2`, but instead of copying data into a
+    /// `Bytes` buffer, returns a plan describing where each chunk's data lives.
+    /// The caller (io_task_zc) uses the plan to issue io_uring ops for `LocalSsd`
+    /// chunks and memcpy for `InMemory` chunks, writing directly into the
+    /// kernel-mapped bio pages.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     pub async fn resolve_read_plan(
         &self,
@@ -628,39 +601,13 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<ChunkSource, CacheError> {
-        let (hash, _seq) = self.inner.block_map_get(chunk_index);
-
-        // ZERO hash on a present block means deferred hash — data is on SSD.
-        if hash.is_zero() {
-            if self.inner.is_present(chunk_index) {
-                let file_offset = chunk_index as u64 * self.inner.config.block_size as u64;
-                return Ok(ChunkSource::LocalSsd { file_offset });
-            }
-            // Don't return Zero yet — fall through to Tier 2 for fork/remote resolution.
+        // Hot path: block is present on local SSD.
+        if self.inner.is_present(chunk_index) {
+            let file_offset = chunk_index as u64 * self.inner.config.block_size as u64;
+            return Ok(ChunkSource::LocalSsd { file_offset });
         }
 
-        if !hash.is_zero() {
-            // Explicit zero-range.
-            if hash == self.inner.zero_block_hash {
-                return Ok(ChunkSource::Zero);
-            }
-
-            // Fast path: block is present on local SSD.
-            if self.inner.is_present(chunk_index) {
-                let file_offset = chunk_index as u64 * self.inner.config.block_size as u64;
-                return Ok(ChunkSource::LocalSsd { file_offset });
-            }
-
-            // Tier 1: clean_cache.
-            if let Some(data) = clean_cache.get(&hash).await {
-                if let Some(m) = metrics {
-                    m.record_cache_hit();
-                }
-                return Ok(ChunkSource::InMemory(data));
-            }
-        }
-
-        // Tier 2: VolumeManifest → ChunkMetaCache → S3 range request.
+        // Cold path: resolve via VolumeManifest → ChunkMeta → clean_cache / S3.
         let (vol_chunk_idx, block_offset, chunk_hash) = {
             let vm = volume_manifest.read();
             let ci = vm.chunk_idx_for_block(chunk_index as u64);
@@ -690,6 +637,14 @@ impl WriteCache<Active> {
             };
 
             if let Some((expected_hash, pack_loc)) = resolved {
+                // Check clean_cache first.
+                if let Some(data) = clean_cache.get(&expected_hash).await {
+                    if let Some(m) = metrics {
+                        m.record_cache_hit();
+                    }
+                    return Ok(ChunkSource::InMemory(data));
+                }
+
                 if let Some(m) = metrics {
                     m.record_cache_miss();
                 }
@@ -735,13 +690,7 @@ impl WriteCache<Active> {
         }
 
         // Block not found in VolumeManifest — truly unwritten → zeros.
-        if hash.is_zero() {
-            return Ok(ChunkSource::Zero);
-        }
-
-        // Tier 3: SSD pread fallback — dirty block not yet in S3.
-        let file_offset = chunk_index as u64 * self.inner.config.block_size as u64;
-        Ok(ChunkSource::LocalSsd { file_offset })
+        Ok(ChunkSource::Zero)
     }
 }
 

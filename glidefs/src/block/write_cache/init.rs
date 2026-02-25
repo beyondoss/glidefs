@@ -1,13 +1,13 @@
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tracing::{error, info, instrument, warn};
 
 use crate::block::block_map::{
-    AtomicBlockMap, BlockMap, BlockMapEntry, SequenceNumber,
-    SparseBlockState, SparseStateMap, blake3_128, zero_block_hash,
+    SequenceNumber, SparseBlockState, SparseStateMap, zero_block_hash,
 };
 use crate::block::state::{Active, Initializing, Recovering};
 use crate::block::wal::Wal;
@@ -37,36 +37,15 @@ impl WriteCache<Initializing> {
 
         // Load block states (or create fresh)
         let num_blocks = config.num_blocks();
-        let (state_map, mut dirty_count) = CacheInner::load_metadata(&config)?;
+        let (state_map, mut dirty_count, persisted_max_seq) =
+            CacheInner::load_metadata(&config)?;
         let present_count = state_map.count_present();
 
-        // === v2 initialization ===
-        let block_map_path = config.block_map_path();
         let wal_path = config.wal_path();
         let export_name = config.device_name.clone();
-        let chunk_size = config.block_size as u32;
 
         // Track recovery issues for metrics
         let mut recovery_warning_count: u64 = 0;
-
-        // Load persisted block map (or create empty)
-        let mut persisted_bm = if block_map_path.exists() {
-            match BlockMap::load_from_file(&block_map_path) {
-                Ok(bm) => {
-                    info!(path = %block_map_path.display(), entries = bm.non_empty_count(), "loaded v2 block map");
-                    bm
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to load v2 block map, starting fresh — dedup will be unavailable until next full flush");
-                    recovery_warning_count += 1;
-                    BlockMap::new(config.device_size, chunk_size)
-                }
-            }
-        } else {
-            BlockMap::new(config.device_size, chunk_size)
-        };
-
-        let persisted_max_seq = persisted_bm.max_sequence();
 
         // Replay WAL entries after persisted sequence
         let wal_entries = match Wal::replay(&wal_path, persisted_max_seq) {
@@ -81,53 +60,25 @@ impl WriteCache<Initializing> {
                 entries
             }
             Err(e) => {
-                error!(error = %e, "WAL replay failed — dirty blocks since last checkpoint may be lost, continuing with persisted block map");
+                error!(error = %e, "WAL replay failed — dirty blocks since last checkpoint may be lost");
                 recovery_warning_count += 1;
                 vec![]
             }
         };
 
-        // Apply WAL entries to block map.
+        // Apply WAL entries: mark blocks dirty in SparseStateMap.
         // WAL stores metadata only — block data lives on the SSD cache file
         // (which was pwrite'd before the WAL entry was appended).
         let mut max_wal_seq = persisted_max_seq;
-        let chunk_size_u64 = chunk_size as u64;
 
         for entry in &wal_entries {
             if entry.name != export_name {
                 continue; // Skip entries for other exports (shouldn't happen with per-export WAL)
             }
             let chunk_index = entry.chunk_index as usize;
-
-            // Re-read block data from SSD and re-hash for consistency.
-            // The SSD may have been overwritten by a later write that didn't
-            // make it to the WAL, so we trust the SSD state over the WAL hash.
-            let chunk_offset = entry.chunk_index * chunk_size_u64;
-            let valid_bytes = std::cmp::min(
-                chunk_size_u64,
-                config.device_size.saturating_sub(chunk_offset),
-            ) as usize;
-            let mut chunk_buf = vec![0u8; chunk_size as usize];
-            if valid_bytes > 0
-                && let Err(e) = data_file.read_exact_at(&mut chunk_buf[..valid_bytes], chunk_offset)
-            {
-                warn!(chunk_index, error = %e, "WAL recovery: SSD read failed, skipping entry (block reverts to last checkpoint state)");
-                continue;
-            }
-
-            let hash = blake3_128(&chunk_buf);
-            persisted_bm.set(
-                chunk_index,
-                BlockMapEntry {
-                    hash,
-                    flags: BlockMapEntry::FLAG_DIRTY,
-                    sequence: entry.sequence,
-                },
-            );
             max_wal_seq = max_wal_seq.max(entry.sequence);
 
-            // Synchronize state_map with WAL replay: mark as Dirty so
-            // that flush's targeted scan sees the correct dirty state.
+            // Mark block as dirty in state_map
             if chunk_index < num_blocks {
                 let old = state_map.get(chunk_index);
                 if old != SparseBlockState::DIRTY {
@@ -142,9 +93,6 @@ impl WriteCache<Initializing> {
                 }
             }
         }
-
-        // Build AtomicBlockMap from the merged block map
-        let atomic_block_map = AtomicBlockMap::from_block_map(&persisted_bm);
 
         // Initialize sequence counter
         let initial_seq = persisted_max_seq.max(max_wal_seq);
@@ -171,13 +119,13 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
-            block_map: RwLock::new(atomic_block_map),
             sequence,
             wal: Mutex::new(wal),
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(recovery_warning_count),
+            crc_map: DashMap::new(),
         });
 
         info!(
@@ -207,9 +155,6 @@ impl WriteCache<Initializing> {
         let num_blocks = config.num_blocks();
         let state_map = SparseStateMap::new(num_blocks);
         let block_size = config.block_size;
-        let chunk_size = block_size as u32;
-        let bm = BlockMap::new(config.device_size, chunk_size);
-        let block_map = AtomicBlockMap::from_block_map(&bm);
         let sequence = SequenceNumber::new(0);
         let wal = Wal::open(&config.wal_path())?;
         let export_name = config.device_name.clone();
@@ -223,13 +168,13 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
             syncing_block_count: AtomicU64::new(0),
-            block_map: RwLock::new(block_map),
             sequence,
             wal: Mutex::new(wal),
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(0),
+            crc_map: DashMap::new(),
         });
 
         info!("cache opened fresh for fork, directly Active");

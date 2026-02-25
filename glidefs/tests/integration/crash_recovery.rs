@@ -444,12 +444,9 @@ async fn test_write_after_recovery_overwrites() {
 /// Test: WAL recovery reconstructs block map when metadata was never saved.
 ///
 /// Scenario: Write blocks (WAL entries written), crash before save_metadata().
-/// On reopen, finish_recovery() replays the WAL, re-reads blocks from SSD,
-/// and reconstructs the v2 block map. Data should then flush to S3 correctly.
-///
-/// Note: dirty_block_count() tracks the v1 block_states metadata, which is
-/// NOT updated by WAL replay. The v2 block_map (FLAG_DIRTY)
-/// is populated by WAL replay, so flush_to_s3 picks up the blocks correctly.
+/// On reopen, finish_recovery() replays the WAL, marks blocks dirty in
+/// SparseStateMap, and verifies they are readable from SSD.
+/// Data should then flush to S3 correctly.
 #[tokio::test]
 async fn test_wal_recovery_without_metadata_save() {
     let s3_backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());

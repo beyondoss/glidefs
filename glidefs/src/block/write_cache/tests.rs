@@ -1,5 +1,4 @@
 use super::*;
-use crate::block::block_map::blake3_128;
 use crate::block::chunk_cache::ChunkMetaCache;
 use crate::block::state::{Active, Initializing};
 use crate::block::volume_manifest::VolumeManifest;
@@ -690,13 +689,18 @@ async fn test_snapshot_captures_concurrent_writes() {
 // Recovery hash drift
 // ========================================================================
 
+/// Recovery verifies dirty blocks are readable from SSD.
+///
+/// After a crash, dirty blocks must be readable so the flush path can
+/// compute fresh blake3 hashes. This test writes data, persists metadata,
+/// then reopens — recovery should succeed with 0 warnings.
 #[tokio::test]
-async fn test_recovery_detects_hash_drift() {
+async fn test_recovery_verifies_dirty_blocks_readable() {
     let dir = TempDir::new().unwrap();
     let block_size = 4096;
     let config = WriteCacheConfig {
         cache_dir: dir.path().to_path_buf(),
-        device_name: "test-drift".to_string(),
+        device_name: "test-recovery".to_string(),
         device_size: 1024 * 1024,
         block_size,
         wal_sync: false,
@@ -704,58 +708,26 @@ async fn test_recovery_detects_hash_drift() {
 
     let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
     let original_data = vec![0xAAu8; block_size];
-    let modified_data = vec![0xBBu8; block_size];
-    let original_hash = blake3_128(&original_data);
 
-    // Session 1: write data, persist block map + metadata, then corrupt SSD
+    // Session 1: write data and persist metadata
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
         cache.write(0, &original_data, &clean_cache).unwrap();
-
-        // With deferred hashing, write() sets ZERO placeholder in block_map.
-        // The real hash is computed at flush-to-S3 time.
-        let (hash, _) = cache.inner.block_map_get(0);
-        assert!(hash.is_zero(), "write() should set ZERO placeholder hash");
-
-        // Persist both v1 metadata (block states) and v2 block map file
         cache.save_metadata().unwrap();
-        let bm_snapshot = cache.inner.block_map_snapshot();
-        bm_snapshot
-            .persist_to_file(&config.block_map_path())
-            .unwrap();
-
-        // Simulate "SSD data drifted" by overwriting the data file directly
-        cache
-            .inner
-            .data_file
-            .write_all_at(&modified_data, 0)
-            .unwrap();
-
-        // Truncate WAL so recovery has to re-read from SSD (no WAL entries)
-        cache.inner.wal.lock().truncate().unwrap();
     }
 
-    // Session 2: reopen with recovery — should detect hash drift
+    // Session 2: reopen — recovery should verify dirty blocks are readable
     {
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
 
-        // The block_map should now have the hash of modified_data, not original_data
-        let expected_hash = blake3_128(&modified_data);
-        let (hash, _) = cache.inner.block_map_get(0);
-        assert_eq!(
-            hash, expected_hash,
-            "block_map should reflect SSD contents after recovery drift detection"
-        );
-        assert_ne!(
-            hash, original_hash,
-            "hash should differ from pre-drift value"
-        );
+        // No recovery warnings (SSD data is readable)
+        assert_eq!(cache.inner.recovery_warnings.load(Ordering::Relaxed), 0);
 
-        // Read should return the modified data
+        // Read should return the original data
         let data = cache.read(0, block_size).unwrap();
-        assert_eq!(&data[..], &modified_data[..]);
+        assert_eq!(&data[..], &original_data[..]);
     }
 }
 
@@ -928,12 +900,12 @@ async fn test_draining_state_transition() {
 ///
 /// The existing `test_concurrent_flush_and_writes` verifies no torn data on
 /// local SSD, but doesn't check that S3 packs and the manifest converge to
-/// the correct final state. This test exercises the compound-check interleaving:
+/// the correct final state. This test exercises the SYNCING-based interleaving:
 ///
-///   Flush snapshots (block_idx, old_seq), a concurrent write lands (pwrite +
-///   block_map_set(ZERO, new_seq)), flush reads SSD (may get new data with old
-///   seq), hash check in step 5 either catches the mismatch or the system
-///   self-heals via re-flush.
+///   Flush claims blocks via CAS DIRTY→SYNCING. A concurrent write transitions
+///   SYNCING→DIRTY (via transition_to_dirty). Flush's CAS SYNCING→CLEAN fails,
+///   leaving the block dirty for the next cycle. After quiescence (no concurrent
+///   writes), the final flush cycle converges.
 ///
 /// After convergence (final quiesced flush), we verify:
 /// 1. Reading every block through the S3 path returns the correct final data
@@ -1056,7 +1028,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
 // The chunked architecture (ChunkMetaCache + VolumeManifest) does not use a
 // host-side pack_index, so pack_index pruning is no longer relevant here.
 
-/// CRC32 mismatch at flush time: block is skipped, CRC32 is cleared,
+/// CRC32 mismatch at flush time: block is skipped, CRC consumed from crc_map,
 /// next checkpoint recomputes, next flush succeeds.
 #[tokio::test]
 async fn test_crc32_mismatch_skips_block_then_heals() {
@@ -1070,13 +1042,10 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // Run local checkpoint — computes CRC32 for the dirty block.
     h.cache.local_checkpoint().unwrap();
 
-    // Verify CRC32 was computed (non-zero).
+    // Verify CRC32 was computed (present in crc_map).
     let inner = h.cache.inner();
-    let crc_after_checkpoint = inner.block_map_get_crc32(0);
-    assert_ne!(
-        crc_after_checkpoint, 0,
-        "checkpoint should have computed CRC32"
-    );
+    let crc_after_checkpoint = *inner.crc_map.get(&0).expect("checkpoint should compute CRC32");
+    assert_ne!(crc_after_checkpoint, 0);
 
     // Corrupt the block on SSD (simulate bit rot after checkpoint).
     let corrupted_data = vec![0xFFu8; 4096];
@@ -1095,14 +1064,12 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     );
     assert_eq!(h.cache.dirty_block_count(), 1, "block should remain dirty");
 
-    // CRC32 should have been cleared so next checkpoint can recompute.
-    let crc_after_flush = inner.block_map_get_crc32(0);
-    assert_eq!(crc_after_flush, 0, "CRC32 should be cleared after mismatch");
+    // CRC32 consumed by flush (crc_take removes it).
+    assert!(inner.crc_map.get(&0).is_none(), "CRC32 consumed after flush");
 
     // Next checkpoint recomputes CRC32 from the (still corrupted) SSD data.
     h.cache.local_checkpoint().unwrap();
-    let crc_recomputed = inner.block_map_get_crc32(0);
-    assert_ne!(crc_recomputed, 0, "checkpoint should recompute CRC32");
+    let crc_recomputed = *inner.crc_map.get(&0).expect("checkpoint should recompute CRC32");
     assert_ne!(
         crc_recomputed, crc_after_checkpoint,
         "new CRC32 should differ (different data)"
@@ -1120,7 +1087,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     assert_eq!(stats2.blocks_flushed, 1);
 }
 
-/// CRC32 is cleared on new writes, so stale checksums don't cause false positives.
+/// CRC32 is invalidated on new writes, so stale checksums don't cause false positives.
 #[tokio::test]
 async fn test_crc32_cleared_on_write() {
     let h = V2Harness::new().await;
@@ -1132,15 +1099,15 @@ async fn test_crc32_cleared_on_write() {
     h.cache.local_checkpoint().unwrap();
 
     let inner = h.cache.inner();
-    assert_ne!(inner.block_map_get_crc32(0), 0);
+    assert!(inner.crc_map.get(&0).is_some(), "checkpoint should set CRC32");
 
-    // Write new data to the same block — CRC32 should be cleared.
+    // Write new data to the same block — CRC32 should be invalidated.
     h.cache
         .write(0, &vec![0xBBu8; 4096], &h.clean_cache)
         .unwrap();
-    assert_eq!(inner.block_map_get_crc32(0), 0, "write should clear CRC32");
+    assert!(inner.crc_map.get(&0).is_none(), "write should clear CRC32");
 
-    // Flush without a checkpoint in between — CRC32 is 0, verification skipped.
+    // Flush without a checkpoint in between — no CRC32, verification skipped.
     let (stats, _) = h
         .cache
         .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
@@ -1168,10 +1135,9 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     h.cache.local_checkpoint().unwrap();
 
     let inner = h.cache.inner();
-    for i in 0..5 {
-        assert_ne!(
-            inner.block_map_get_crc32(i),
-            0,
+    for i in 0usize..5 {
+        assert!(
+            inner.crc_map.get(&i).is_some(),
             "block {i} should have CRC32"
         );
     }
@@ -1203,14 +1169,14 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
         "corrupted blocks remain dirty"
     );
 
-    // CRC32 cleared on corrupted blocks so next checkpoint recomputes.
-    assert_eq!(inner.block_map_get_crc32(1), 0);
-    assert_eq!(inner.block_map_get_crc32(3), 0);
+    // CRC32 consumed by flush for all blocks.
+    assert!(inner.crc_map.get(&1).is_none(), "CRC consumed by flush");
+    assert!(inner.crc_map.get(&3).is_none(), "CRC consumed by flush");
 
     // Heal: checkpoint recomputes CRC32 from (still corrupted) SSD data.
     h.cache.local_checkpoint().unwrap();
-    assert_ne!(inner.block_map_get_crc32(1), 0);
-    assert_ne!(inner.block_map_get_crc32(3), 0);
+    assert!(inner.crc_map.get(&1).is_some(), "checkpoint recomputed CRC for block 1");
+    assert!(inner.crc_map.get(&3).is_some(), "checkpoint recomputed CRC for block 3");
 
     // Second flush succeeds for the remaining 2 blocks.
     let (stats2, _) = h
@@ -1232,8 +1198,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
 ///
 /// Also verifies the full CRC32 lifecycle across multiple cycles: write →
 /// checkpoint → flush → write more → checkpoint → flush. CRC32 must be
-/// properly cleared after flush (block transitions to CLEAN) and fresh
-/// writes get new CRC32s.
+/// properly invalidated on write and fresh CRC32s computed at checkpoint.
 #[tokio::test]
 async fn test_crc32_happy_path_multi_cycle() {
     let h = V2Harness::new().await;
@@ -1247,10 +1212,9 @@ async fn test_crc32_happy_path_multi_cycle() {
     h.cache.local_checkpoint().unwrap();
 
     let inner = h.cache.inner();
-    for i in 0..3 {
-        assert_ne!(
-            inner.block_map_get_crc32(i),
-            0,
+    for i in 0usize..3 {
+        assert!(
+            inner.crc_map.get(&i).is_some(),
             "cycle 1: block {i} should have CRC32"
         );
     }
@@ -1276,19 +1240,17 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     assert_eq!(h.cache.dirty_block_count(), 3);
 
-    // Block 0's CRC32 should be cleared by the overwrite.
-    assert_eq!(
-        inner.block_map_get_crc32(0),
-        0,
+    // Block 0's CRC32 should be invalidated by the overwrite.
+    assert!(
+        inner.crc_map.get(&0).is_none(),
         "overwrite should clear CRC32"
     );
 
     h.cache.local_checkpoint().unwrap();
 
-    for idx in [0, 3, 4] {
-        assert_ne!(
-            inner.block_map_get_crc32(idx),
-            0,
+    for idx in [0usize, 3, 4] {
+        assert!(
+            inner.crc_map.get(&idx).is_some(),
             "cycle 2: block {idx} should have CRC32"
         );
     }
@@ -1306,9 +1268,9 @@ async fn test_crc32_happy_path_multi_cycle() {
 /// Concurrent writes during flush with CRC32 enabled must never produce
 /// false corruption reports.
 ///
-/// When a write lands during flush, the CRC32 from a prior checkpoint
-/// won't match the new SSD data. The seq-number check in the CRC32
-/// mismatch branch disambiguates: if seq changed → CAS failure (retry),
+/// When a write lands during flush, it transitions SYNCING→DIRTY and
+/// invalidates the stale CRC. The state discrimination in the CRC mismatch
+/// branch detects that the block is no longer SYNCING → concurrent write,
 /// not corruption. This test verifies that invariant under stress.
 ///
 /// The assertion: across all flush cycles with concurrent writers,

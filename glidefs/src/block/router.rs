@@ -414,20 +414,26 @@ impl ExportRouter {
                 .collect()
         };
 
-        // Collect unique chunk_hashes not already in cache.
-        // For each, remember (chunk_idx, content_store) so we can fetch from the right S3 prefix.
-        let mut to_fetch: HashMap<crate::block::block_map::Blake3Hash, (u32, Arc<ContentStore>)> =
+        // Collect all (chunk_hash, chunk_idx, content_store) under the synchronous
+        // RwLock, then filter against the async cache after releasing the lock.
+        let mut candidates: HashMap<crate::block::block_map::Blake3Hash, (u32, Arc<ContentStore>)> =
             HashMap::new();
         for (vm_lock, cs) in &export_data {
             let vm = vm_lock.read();
             for (&chunk_idx, _) in &vm.chunks {
                 if let Some(chunk_hash) = vm.get_chunk_hash(chunk_idx) {
-                    if self.chunk_meta_cache.get(&chunk_hash).await.is_none() {
-                        to_fetch
-                            .entry(chunk_hash)
-                            .or_insert_with(|| (chunk_idx, Arc::clone(cs)));
-                    }
+                    candidates
+                        .entry(chunk_hash)
+                        .or_insert_with(|| (chunk_idx, Arc::clone(cs)));
                 }
+            }
+        }
+
+        // Filter out chunks already in cache (async cache lookup, no lock held).
+        let mut to_fetch = HashMap::with_capacity(candidates.len());
+        for (chunk_hash, val) in candidates {
+            if self.chunk_meta_cache.get(&chunk_hash).await.is_none() {
+                to_fetch.insert(chunk_hash, val);
             }
         }
 
@@ -758,11 +764,9 @@ impl ExportRouter {
             ));
 
             // Try to load existing volume manifest from S3
-            if let Ok(Some(data)) = content_store.get_volume_manifest(&name).await {
-                if let Ok(vm) = VolumeManifest::deserialize(&data) {
-                    *volume_manifest.write() = vm;
-                    info!("Loaded existing volume manifest for '{}'", name);
-                }
+            if let Ok(Some(data)) = content_store.get_volume_manifest(&name).await && let Ok(vm) = VolumeManifest::deserialize(&data) {
+                *volume_manifest.write() = vm;
+                info!("Loaded existing volume manifest for '{}'", name);
             }
 
             (Arc::new(cache), volume_manifest)
@@ -1401,10 +1405,8 @@ impl ExportRouter {
             }
 
             // Delete all versioned snapshots from S3 (best-effort).
-            if let Some(cs) = snapshot_cs {
-                if let Err(e) = cs.delete_all_snapshots(name).await {
-                    warn!("Failed to delete snapshots from S3: {}", e);
-                }
+            if let Some(cs) = snapshot_cs && let Err(e) = cs.delete_all_snapshots(name).await {
+                warn!("Failed to delete snapshots from S3: {}", e);
             }
         }
 

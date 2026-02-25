@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use tracing::{info, instrument, warn};
 
-use crate::block::block_map::{SparseBlockState, blake3_128};
+use crate::block::block_map::SparseBlockState;
 use crate::block::state::{Active, Recovering};
 
 use super::{CacheError, WriteCache};
@@ -22,9 +22,9 @@ impl WriteCache<Recovering> {
 
     /// Recover from a previous session and transition to Active.
     ///
-    /// Verifies dirty block hashes against SSD data and corrects block_map
-    /// entries where the SSD state has drifted (e.g. due to writes that made
-    /// it to SSD but not to the WAL before crash). This is purely local I/O.
+    /// Verifies dirty blocks are readable from SSD (confirms SSD integrity
+    /// before entering Active state). The flush path always computes fresh
+    /// blake3 hashes from SSD, so no stored hash needs to be verified.
     #[instrument(skip(self))]
     pub async fn finish_recovery(self) -> Result<WriteCache<Active>, CacheError> {
         let dirty_count = self.inner.dirty_block_count.load(Ordering::Relaxed);
@@ -34,10 +34,13 @@ impl WriteCache<Recovering> {
         } else {
             info!(dirty_blocks = dirty_count, "starting recovery");
 
-            // Verify dirty block hashes against SSD data and correct any drift.
-            let corrected = self.verify_dirty_block_hashes()?;
-            if corrected > 0 {
-                info!(corrected, "corrected dirty block hashes from SSD");
+            // Verify dirty blocks are readable from SSD
+            let warnings = self.verify_dirty_blocks_readable()?;
+            if warnings > 0 {
+                warn!(warnings, "some dirty blocks had SSD read errors");
+                self.inner
+                    .recovery_warnings
+                    .fetch_add(warnings as u64, Ordering::Relaxed);
             }
 
             // Save metadata after recovery
@@ -51,61 +54,42 @@ impl WriteCache<Recovering> {
         })
     }
 
-    /// Verify dirty block hashes against SSD data.
+    /// Verify dirty blocks are readable from SSD.
     ///
-    /// Re-reads each dirty block from SSD and re-hashes. If the hash doesn't
-    /// match the block_map entry (e.g. a write made it to SSD but the WAL
-    /// entry was lost), update the block_map with the correct hash.
+    /// For each DIRTY block, pread from SSD to confirm the data is intact.
+    /// The flush path computes fresh blake3 hashes from SSD, so no stored
+    /// hash comparison is needed. This only checks SSD readability.
     ///
-    /// Returns the number of blocks whose hashes were corrected.
-    fn verify_dirty_block_hashes(&self) -> Result<usize, CacheError> {
+    /// Returns the number of blocks with read errors.
+    fn verify_dirty_blocks_readable(&self) -> Result<usize, CacheError> {
         let block_size = self.inner.config.block_size;
         let device_size = self.inner.config.device_size;
-        let zero_hash = self.inner.zero_block_hash;
-        let mut corrected = 0;
+        let mut warnings = 0;
 
         for idx in self
             .inner
             .state_map
             .iter_with_state(SparseBlockState::DIRTY)
         {
-            let (hash, _seq) = self.inner.block_map_get(idx);
-
-            // Zero-block hash entries are known content — no verification needed.
-            // But ZERO sentinel (deferred hash) must be computed from SSD.
-            if hash == zero_hash {
-                continue;
-            }
-
-            // Re-read block from SSD and verify hash
             let offset = idx as u64 * block_size as u64;
             let valid_bytes =
                 std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
 
-            let mut buf = vec![0u8; block_size];
-            if valid_bytes > 0
-                && let Err(e) = self
-                    .inner
-                    .data_file
-                    .read_exact_at(&mut buf[..valid_bytes], offset)
-            {
-                warn!(
-                    chunk_index = idx,
-                    error = %e,
-                    "recovery: failed to read block from SSD, leaving dirty for retry"
-                );
+            if valid_bytes == 0 {
                 continue;
             }
 
-            let actual_hash = blake3_128(&buf);
-            if actual_hash != hash {
-                // SSD state drifted — update block_map with correct hash
-                let seq = self.inner.sequence.next();
-                self.inner.block_map_set(idx, actual_hash, seq);
-                corrected += 1;
+            let mut buf = vec![0u8; valid_bytes];
+            if let Err(e) = self.inner.data_file.read_exact_at(&mut buf, offset) {
+                warn!(
+                    chunk_index = idx,
+                    error = %e,
+                    "recovery: failed to read dirty block from SSD"
+                );
+                warnings += 1;
             }
         }
 
-        Ok(corrected)
+        Ok(warnings)
     }
 }

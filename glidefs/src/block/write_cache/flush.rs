@@ -22,8 +22,11 @@ use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
 struct FlushBatch {
     /// Compressed blocks ready for S3 upload: (hash, compressed_bytes).
     to_upload: Vec<(Blake3Hash, Vec<u8>)>,
-    /// Computed hashes for CAS-clearing dirty flags: (chunk_index, snapshot_seq, hash).
-    computed: Vec<(usize, u64, Blake3Hash)>,
+    /// Computed hashes for post-upload CAS clearing: (chunk_index, hash).
+    computed: Vec<(usize, Blake3Hash)>,
+    /// Blocks skipped due to CRC mismatch or concurrent write.
+    /// These need to be transitioned back SYNCING→DIRTY.
+    skipped: Vec<usize>,
     /// Partial statistics from the computation phase.
     stats: FlushStats,
 }
@@ -33,14 +36,17 @@ enum BlockResult {
     /// Successfully computed hash; may include compressed data for upload.
     Computed {
         chunk_index: usize,
-        snapshot_seq: u64,
         hash: Blake3Hash,
         /// `Some(compressed)` if block is new (not zero, not already known).
         /// `None` if deduped (zero block or already in chunk meta).
         compressed: Option<Vec<u8>>,
     },
     /// Block skipped due to CRC mismatch or concurrent write.
-    Skipped { cas_failed: bool, corrupted: bool },
+    Skipped {
+        chunk_index: usize,
+        cas_failed: bool,
+        corrupted: bool,
+    },
 }
 
 /// CPU-heavy flush computation: read blocks from SSD, verify CRC32, hash, compress, dedup.
@@ -48,9 +54,14 @@ enum BlockResult {
 /// Runs on a blocking thread via `spawn_blocking` to avoid starving the async runtime.
 /// Phase 1 (rayon parallel): pread + crc32 + blake3 + known-hash check + lz4 per block.
 /// Phase 2 (sequential): within-batch dedup via seen_hashes (cheap hash-set insertions).
+///
+/// All blocks in `snapshot` have already been claimed (CAS DIRTY→SYNCING).
+/// CRC verification uses the crc_map (DashMap) and state discrimination:
+/// - CRC mismatch + state == SYNCING → real SSD corruption
+/// - CRC mismatch + state != SYNCING → concurrent write re-dirtied the block
 fn compute_flush_batch(
     inner: &CacheInner,
-    snapshot: &[(usize, u64)],
+    snapshot: &[usize],
     known_hashes: &HashSet<Blake3Hash>,
     zero_hash: Blake3Hash,
 ) -> Result<FlushBatch, CacheError> {
@@ -63,7 +74,7 @@ fn compute_flush_batch(
     // Each rayon task allocates its own read buffer; peak memory = num_threads × block_size.
     let per_block: Vec<Result<BlockResult, CacheError>> = snapshot
         .par_iter()
-        .map(|&(chunk_index, snapshot_seq)| {
+        .map(|&chunk_index| {
             let mut chunk_buf = vec![0u8; block_size];
 
             let offset = chunk_index as u64 * block_size as u64;
@@ -79,25 +90,32 @@ fn compute_flush_batch(
             }
 
             // Verify CRC32 if available (detects SSD corruption before BLAKE3).
-            let stored_crc = inner.block_map_get_crc32(chunk_index);
-            if stored_crc != 0 {
+            // CRC was stored at checkpoint time. Use state discrimination to
+            // distinguish corruption from concurrent writes:
+            // - Block still SYNCING → no concurrent write → real corruption
+            // - Block now DIRTY → write re-dirtied it → stale CRC, not corruption
+            if let Some(stored_crc) = inner.crc_take(chunk_index) {
                 let computed_crc = crc32fast::hash(&chunk_buf);
                 if computed_crc != stored_crc {
-                    let (_, current_seq) = inner.block_map_get(chunk_index);
-                    if current_seq != snapshot_seq {
+                    let current_state = inner.state_map.get(chunk_index);
+                    if current_state != SparseBlockState::SYNCING {
+                        // Block was re-dirtied by a concurrent write between
+                        // checkpoint and flush. CRC is stale, not corruption.
                         return Ok(BlockResult::Skipped {
+                            chunk_index,
                             cas_failed: true,
                             corrupted: false,
                         });
                     }
+                    // Still SYNCING + CRC mismatch → real SSD corruption.
                     warn!(
                         chunk_index,
                         stored_crc,
                         computed_crc,
                         "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
                     );
-                    inner.block_map_clear_crc32(chunk_index);
                     return Ok(BlockResult::Skipped {
+                        chunk_index,
                         cas_failed: false,
                         corrupted: true,
                     });
@@ -115,7 +133,6 @@ fn compute_flush_batch(
 
             Ok(BlockResult::Computed {
                 chunk_index,
-                snapshot_seq,
                 hash,
                 compressed,
             })
@@ -126,16 +143,19 @@ fn compute_flush_batch(
     let mut stats = FlushStats::default();
     let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
     let mut seen_hashes = HashSet::new();
-    let mut computed: Vec<(usize, u64, Blake3Hash)> = Vec::new();
+    let mut computed: Vec<(usize, Blake3Hash)> = Vec::new();
+    let mut skipped: Vec<usize> = Vec::new();
 
     for result in per_block {
         let result = result?;
         match result {
             BlockResult::Skipped {
+                chunk_index,
                 cas_failed,
                 corrupted,
             } => {
                 stats.blocks_flushed += 1;
+                skipped.push(chunk_index);
                 if cas_failed {
                     stats.blocks_cas_failed += 1;
                 }
@@ -145,12 +165,11 @@ fn compute_flush_batch(
             }
             BlockResult::Computed {
                 chunk_index,
-                snapshot_seq,
                 hash,
                 compressed,
             } => {
                 stats.blocks_flushed += 1;
-                computed.push((chunk_index, snapshot_seq, hash));
+                computed.push((chunk_index, hash));
 
                 match compressed {
                     None => {
@@ -173,6 +192,7 @@ fn compute_flush_batch(
     Ok(FlushBatch {
         to_upload,
         computed,
+        skipped,
         stats,
     })
 }
@@ -245,10 +265,11 @@ impl WriteCache<Active> {
         })
     }
 
-    /// Chunked flush: collect dirty blocks, partition by volume chunk, per-chunk
-    /// dedup/compress/upload, update ChunkMetaCache and VolumeManifest.
+    /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by
+    /// volume chunk, per-chunk dedup/compress/upload, CAS SYNCING→CLEAN.
     ///
-    /// Returns (stats, seq_cutpoint) on success.
+    /// Returns (stats, seq_cutpoint) on success. seq_cutpoint is used for
+    /// snapshot versioning only (not for per-block CAS).
     async fn flush_dirty_inner(
         &self,
         content_store: &ContentStore,
@@ -257,25 +278,17 @@ impl WriteCache<Active> {
     ) -> Result<(FlushStats, u64), CacheError> {
         let block_size = self.inner.config.block_size as u32;
 
-        // 1. Capture sequence cut point
+        // Capture sequence for snapshot versioning (not per-block CAS).
         let seq_cutpoint = self.inner.sequence.current();
 
-        // 2. Targeted dirty scan
-        let snapshot: Vec<(usize, u64)> = {
-            let mut dirty = Vec::new();
-            for idx in self
-                .inner
-                .state_map
-                .iter_with_state(SparseBlockState::DIRTY)
-            {
-                let (_hash, seq) = self.inner.block_map_get(idx);
-                if seq > seq_cutpoint {
-                    continue;
-                }
-                dirty.push((idx, seq));
-            }
-            dirty
-        };
+        // Claim dirty blocks: CAS DIRTY→SYNCING.
+        // Only blocks that successfully transition are included in the flush.
+        let snapshot: Vec<usize> = self
+            .inner
+            .state_map
+            .iter_with_state(SparseBlockState::DIRTY)
+            .filter(|&idx| self.inner.transition_dirty_to_syncing(idx))
+            .collect();
 
         if snapshot.is_empty() {
             debug!("flush: no dirty blocks to flush");
@@ -287,23 +300,49 @@ impl WriteCache<Active> {
             seq_cutpoint, "starting flush"
         );
 
+        // Run the flush body. If any error occurs after claiming blocks,
+        // revert all SYNCING blocks back to DIRTY so they're retried.
+        let result = self
+            .flush_dirty_body(&snapshot, block_size, content_store, chunk_meta_cache, volume_manifest)
+            .await;
+
+        if result.is_err() {
+            for &idx in &snapshot {
+                // transition_to_dirty handles SYNCING→DIRTY correctly
+                // (decrements syncing_count, increments dirty_count).
+                // No-op if already transitioned by a concurrent write.
+                self.inner.transition_to_dirty(idx);
+            }
+        }
+
+        result.map(|stats| (stats, seq_cutpoint))
+    }
+
+    /// Inner body of flush_dirty_inner, factored out for error recovery.
+    async fn flush_dirty_body(
+        &self,
+        snapshot: &[usize],
+        block_size: u32,
+        content_store: &ContentStore,
+        chunk_meta_cache: &Arc<ChunkMetaCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+    ) -> Result<FlushStats, CacheError> {
         // 3. Partition dirty blocks by volume chunk
-        let mut per_chunk: BTreeMap<u32, Vec<(usize, u64)>> = BTreeMap::new();
+        let mut per_chunk: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
         {
             let vm = volume_manifest.read();
-            for &(block_index, seq) in &snapshot {
+            for &block_index in snapshot {
                 let chunk_idx = vm.chunk_idx_for_block(block_index as u64);
-                per_chunk.entry(chunk_idx).or_default().push((block_index, seq));
+                per_chunk.entry(chunk_idx).or_default().push(block_index);
             }
         }
 
         // 4. Pre-fetch existing ChunkMeta for all affected chunks
         for &chunk_idx in per_chunk.keys() {
             let chunk_hash = volume_manifest.read().get_chunk_hash(chunk_idx);
-            if let Some(chunk_hash) = chunk_hash {
-                if chunk_meta_cache.get(&chunk_hash).await.is_none() {
-                    let hash_hex = format_hash(&chunk_hash);
-                    match content_store.get_chunk_meta(chunk_idx, &hash_hex).await {
+            if let Some(chunk_hash) = chunk_hash && chunk_meta_cache.get(&chunk_hash).await.is_none() {
+                let hash_hex = format_hash(&chunk_hash);
+                match content_store.get_chunk_meta(chunk_idx, &hash_hex).await {
                         Ok(Some(data)) => match ChunkMeta::deserialize(&data) {
                             Ok(meta) => {
                                 chunk_meta_cache.insert(chunk_hash, Arc::new(meta));
@@ -324,7 +363,7 @@ impl WriteCache<Active> {
         }
 
         let mut total_stats = FlushStats::default();
-        let mut all_computed: Vec<(usize, u64, Blake3Hash)> = Vec::new();
+        let mut all_computed: Vec<(usize, Blake3Hash)> = Vec::new();
         let mut chunk_updates: Vec<(u32, Blake3Hash)> = Vec::new();
 
         // 5. Per-chunk flush
@@ -366,6 +405,12 @@ impl WriteCache<Active> {
             total_stats.blocks_deduped += batch.stats.blocks_deduped;
             total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
             total_stats.blocks_corrupted += batch.stats.blocks_corrupted;
+
+            // Transition skipped blocks back SYNCING→DIRTY so they're
+            // picked up by the next flush cycle.
+            for &idx in &batch.skipped {
+                self.inner.transition_to_dirty(idx);
+            }
 
             // Assemble and upload packs (chunk-scoped)
             use futures::stream::{self, StreamExt};
@@ -420,7 +465,7 @@ impl WriteCache<Active> {
             let mut new_entries: Vec<ChunkMetaEntry> = Vec::new();
             {
                 let vm = volume_manifest.read();
-                for &(block_index, _, hash) in &batch.computed {
+                for &(block_index, hash) in &batch.computed {
                     if hash == zero_hash || hash == self.inner.zero_block_hash {
                         continue; // zero blocks don't need entries
                     }
@@ -475,30 +520,16 @@ impl WriteCache<Active> {
             chunk_meta_cache.insert(new_chunk_hash, Arc::new(new_meta));
             chunk_updates.push((chunk_idx, new_chunk_hash));
 
-            // Collect all computed entries for block_map update
+            // Collect all computed entries for post-upload CAS
             all_computed.extend(batch.computed);
         }
 
-        // 6. Set real hashes in block_map + clear dirty flags
-        for &(chunk_index, snapshot_seq, actual_hash) in &all_computed {
-            let (_hash, current_seq) = self.inner.block_map_get(chunk_index);
-            if current_seq != snapshot_seq {
+        // 6. CAS SYNCING→CLEAN for successfully flushed blocks.
+        // If a concurrent write transitioned SYNCING→DIRTY, the CAS fails
+        // and the block stays DIRTY for the next flush cycle.
+        for &(chunk_index, _actual_hash) in &all_computed {
+            if !self.inner.transition_syncing_to_clean(chunk_index) {
                 total_stats.blocks_cas_failed += 1;
-                continue;
-            }
-            self.inner
-                .block_map_set(chunk_index, actual_hash, snapshot_seq);
-            if self
-                .inner
-                .state_map
-                .cas(
-                    chunk_index,
-                    SparseBlockState::DIRTY,
-                    SparseBlockState::CLEAN,
-                )
-                .is_ok()
-            {
-                self.inner.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
 
@@ -521,7 +552,7 @@ impl WriteCache<Active> {
             "flush dirty inner complete"
         );
 
-        Ok((total_stats, seq_cutpoint))
+        Ok(total_stats)
     }
 
     /// Flush dirty blocks to S3 as chunk-scoped packs (no manifest upload).
@@ -557,13 +588,8 @@ impl WriteCache<Active> {
         Ok(())
     }
 
-    /// Persist block map + block states and truncate WAL.
-    ///
-    /// Block map is persisted outside the WAL lock (safe: clean blocks
-    /// don't change), then the WAL lock is held only for the fast
-    /// block-states save + truncate.
+    /// Persist block states and truncate WAL.
     fn checkpoint(&self) -> Result<(), CacheError> {
-        self.inner.persist_block_map()?;
         let mut wal = self.inner.wal.lock();
         self.inner.save_block_states()?;
         wal.truncate()?;
@@ -583,6 +609,10 @@ impl WriteCache<Active> {
     }
 
     /// Compute CRC32 checksums for dirty blocks that don't have one yet.
+    ///
+    /// Stores CRCs in the crc_map (DashMap) for later verification by the
+    /// flush path. Only runs on the flush scheduler thread. Writes invalidate
+    /// stale CRCs via crc_map.remove in their hot path.
     fn compute_dirty_crc32s(&self) {
         let block_size = self.inner.config.block_size;
         let device_size = self.inner.config.device_size;
@@ -594,11 +624,10 @@ impl WriteCache<Active> {
             .state_map
             .iter_with_state(SparseBlockState::DIRTY)
         {
-            if self.inner.block_map_get_crc32(idx) != 0 {
+            // Skip blocks that already have a CRC
+            if self.inner.crc_map.contains_key(&idx) {
                 continue;
             }
-
-            let (_, seq_before) = self.inner.block_map_get(idx);
 
             let offset = idx as u64 * block_size as u64;
             let valid_bytes =
@@ -623,13 +652,8 @@ impl WriteCache<Active> {
                 buf[valid_bytes..].fill(0);
             }
 
-            let (_, seq_after) = self.inner.block_map_get(idx);
-            if seq_before != seq_after {
-                continue;
-            }
-
             let crc = crc32fast::hash(&buf);
-            let _ = self.inner.block_map_cas_crc32(idx, 0, crc);
+            self.inner.crc_store(idx, crc);
             computed += 1;
         }
 
@@ -641,14 +665,14 @@ impl WriteCache<Active> {
     /// Flush dirty blocks to S3 as chunk-scoped packs + volume manifest.
     ///
     /// This is the v3 chunked flush path:
-    /// 1. Scan block_states for dirty blocks (targeted, not full-device snapshot)
+    /// 1. Claim dirty blocks via CAS DIRTY→SYNCING
     /// 2. Partition by volume chunk, dedup against chunk meta
     /// 3. LZ4-compress new blocks and assemble into packs per chunk
     /// 4. Upload packs to S3 concurrently as chunks/{idx}/{uuid}.pack
     /// 5. Build new ChunkMeta, upload as chunks/{idx}/{hash}.meta
-    /// 6. Clear dirty flags (with concurrent-write safety)
+    /// 6. CAS SYNCING→CLEAN (fails if concurrent write re-dirtied)
     /// 7. Upload VolumeManifest
-    /// 8. Checkpoint: persist block map + block states + truncate WAL
+    /// 8. Checkpoint: persist block states + truncate WAL
     #[instrument(skip(self, content_store, chunk_meta_cache, volume_manifest))]
     pub async fn flush_to_s3(
         &self,

@@ -440,11 +440,11 @@ Immutable binary index for one 10GB volume chunk. Stores a sorted array of block
 ```
 ┌─────────────────────────── ChunkMeta ───────────────────────────┐
 │ Header (32 bytes)                                               │
-│   magic: "GLCM"  version: 1  chunk_idx: u32  block_count: u32  │
-│   chunk_size: u64  block_size: u32  _reserved: u32             │
+│   magic: "GLCM"  version: 1  chunk_idx: u32  block_count: u32   │
+│   chunk_size: u64  block_size: u32  _reserved: u32              │
 ├─────────────────────────────────────────────────────────────────┤
 │ Entries (44 bytes × block_count, sorted by block offset)        │
-│   [offset:u32][hash:16][pack_id:16][pack_offset:u32][comp_len:u32] │
+│   [offset:u32][hash:16][pack_id:16][pack_offset:u32][comp_len:u32] 
 ├─────────────────────────────────────────────────────────────────┤
 │ Trailing CRC32 (4 bytes)                                        │
 └─────────────────────────────────────────────────────────────────┘

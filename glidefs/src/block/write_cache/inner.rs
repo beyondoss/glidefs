@@ -1,13 +1,12 @@
-use parking_lot::{Mutex, RwLock};
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
-use crate::block::block_map::{
-    AtomicBlockMap, Blake3Hash, BlockMap, SequenceNumber, SparseBlockState, SparseStateMap,
-};
+use crate::block::block_map::{Blake3Hash, SequenceNumber, SparseBlockState, SparseStateMap};
 
 use crate::block::wal::Wal;
 
@@ -18,8 +17,8 @@ use bytes::Bytes;
 
 /// Magic bytes for cache metadata file
 pub(super) const METADATA_MAGIC: &[u8; 8] = b"ZFSCACHE";
-/// Version 4: sparse state map (only non-zero entries persisted)
-pub(super) const METADATA_VERSION: u32 = 4;
+/// Version 5: sparse state map + trailing max_sequence u64
+pub(super) const METADATA_VERSION: u32 = 5;
 
 /// A file handle safe for concurrent positional I/O.
 ///
@@ -199,15 +198,7 @@ pub(crate) struct CacheInner {
     pub(super) dirty_block_count: AtomicU64,
     pub(super) syncing_block_count: AtomicU64,
 
-    // === v2 content-addressed structures ===
-    /// Content-addressed block map: chunk_index -> (Blake3Hash, sequence).
-    ///
-    /// Lock-free `AtomicBlockMap` using per-entry SeqLocks. The `RwLock`
-    /// wrapper is only used for snapshot serialization; all normal reads
-    /// and writes use interior mutability through the read lock.
-    pub(super) block_map: RwLock<AtomicBlockMap>,
-
-    /// Monotonic sequence counter for snapshot consistency.
+    /// Monotonic sequence counter for WAL replay ordering and snapshot versioning.
     /// Lock-free AtomicU64.
     pub(super) sequence: SequenceNumber,
 
@@ -229,6 +220,13 @@ pub(crate) struct CacheInner {
     /// Number of recovery issues encountered during cache open (WAL replay
     /// failure, block map load failure). Exposed via metrics for monitoring.
     pub(super) recovery_warnings: AtomicU64,
+
+    /// CRC32 checksums for dirty blocks, used to detect SSD corruption between
+    /// checkpoint and flush. Sized proportional to currently dirty blocks, not
+    /// device size. Only accessed by the flush scheduler thread (checkpoint +
+    /// flush are sequential in the same select loop). DashMap for safety since
+    /// pressure-flush from capacity_monitor may run on a different task.
+    pub(super) crc_map: DashMap<usize, u32>,
 }
 
 impl CacheInner {
@@ -298,46 +296,42 @@ impl CacheInner {
         }
     }
 
-    /// Get a block map entry (takes read lock, effectively zero overhead).
+    /// Atomically claim a dirty block for flushing: CAS DIRTY→SYNCING.
+    ///
+    /// Returns true if the CAS succeeded (block claimed for this flush cycle).
+    /// Returns false if the block is no longer DIRTY (already claimed or cleaned).
     #[inline]
-    pub(super) fn block_map_get(&self, chunk_index: usize) -> (Blake3Hash, u64) {
-        self.block_map.read().get(chunk_index)
+    pub(super) fn transition_dirty_to_syncing(&self, idx: usize) -> bool {
+        if self
+            .state_map
+            .cas(idx, SparseBlockState::DIRTY, SparseBlockState::SYNCING)
+            .is_ok()
+        {
+            self.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
+            self.syncing_block_count.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Set a block map entry (takes read lock — interior mutability handles the write).
+    /// Atomically finalize a flushed block: CAS SYNCING→CLEAN.
+    ///
+    /// Returns true if the CAS succeeded (block is now clean).
+    /// Returns false if a concurrent write transitioned SYNCING→DIRTY,
+    /// meaning the block must be re-flushed in the next cycle.
     #[inline]
-    pub(super) fn block_map_set(&self, chunk_index: usize, hash: Blake3Hash, seq: u64) {
-        self.block_map.read().set(chunk_index, hash, seq);
-    }
-
-    /// Snapshot the block map (takes read lock).
-    pub(super) fn block_map_snapshot(&self) -> BlockMap {
-        self.block_map.read().snapshot(&self.state_map)
-    }
-
-    // -- CRC32 dirty-block integrity ------------------------------------------
-
-    /// Load the CRC32 checksum for a chunk (takes read lock).
-    #[inline]
-    pub(super) fn block_map_get_crc32(&self, chunk_index: usize) -> u32 {
-        self.block_map.read().get_crc32(chunk_index)
-    }
-
-    /// Clear the CRC32 checksum for a chunk (takes read lock).
-    #[inline]
-    pub(super) fn block_map_clear_crc32(&self, chunk_index: usize) {
-        self.block_map.read().clear_crc32(chunk_index)
-    }
-
-    /// CAS the CRC32 checksum (takes read lock).
-    #[inline]
-    pub(super) fn block_map_cas_crc32(
-        &self,
-        chunk_index: usize,
-        expected: u32,
-        new: u32,
-    ) -> Result<u32, u32> {
-        self.block_map.read().cas_crc32(chunk_index, expected, new)
+    pub(super) fn transition_syncing_to_clean(&self, idx: usize) -> bool {
+        if self
+            .state_map
+            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::CLEAN)
+            .is_ok()
+        {
+            self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Count present blocks (for metrics/logging).
@@ -346,11 +340,26 @@ impl CacheInner {
         self.state_map.count_present()
     }
 
-    /// Persist block states to metadata file (fast path).
+    // -- CRC32 DashMap methods (for dirty-block corruption detection) ----------
+
+    /// Store a CRC32 checksum for a dirty block (checkpoint path).
+    /// Only inserts if no entry exists — a concurrent write that re-dirtied
+    /// the block should not overwrite a fresh CRC.
+    #[inline]
+    pub(super) fn crc_store(&self, idx: usize, crc: u32) {
+        self.crc_map.entry(idx).or_insert(crc);
+    }
+
+    /// Remove and return the CRC32 checksum for a block (flush path).
+    #[inline]
+    pub(super) fn crc_take(&self, idx: usize) -> Option<u32> {
+        self.crc_map.remove(&idx).map(|(_, v)| v)
+    }
+
+    /// Persist block states to metadata file.
     ///
-    /// v4 sparse format: only writes entries with non-zero state (present blocks).
-    /// Does NOT persist the block map -- call `persist_block_map()` separately
-    /// (outside the WAL lock) for that. Uses atomic write pattern: temp file ->
+    /// v5 sparse format: only writes entries with non-zero state (present blocks),
+    /// plus a trailing max_sequence u64. Uses atomic write pattern: temp file ->
     /// fsync -> rename.
     pub(super) fn save_block_states(&self) -> Result<(), CacheError> {
         let path = self.config.metadata_path();
@@ -386,6 +395,9 @@ impl CacheInner {
             file.write_all(&[state])?;
         }
 
+        // v5: append max_sequence as trailing u64 LE
+        file.write_all(&self.sequence.current().to_le_bytes())?;
+
         // Fsync temp file to ensure data is on disk
         file.sync_all()?;
         drop(file);
@@ -403,47 +415,28 @@ impl CacheInner {
         Ok(())
     }
 
-    /// Persist the v2 block map (content hashes) to disk.
-    ///
-    /// Safe to call outside the WAL lock: the block map file only needs to be
-    /// accurate for clean blocks (which don't change), and dirty blocks are
-    /// re-hashed from SSD during crash recovery regardless.
-    pub(super) fn persist_block_map(&self) -> Result<(), CacheError> {
-        let block_map_path = self.config.block_map_path();
-        let bm_snapshot = self.block_map_snapshot();
-        if let Err(e) = bm_snapshot.persist_to_file(&block_map_path) {
-            warn!(error = %e, "failed to persist block map");
-            return Err(CacheError::Io(e));
-        }
-        Ok(())
-    }
-
-    /// Persist block states, presence, and block map.
-    ///
-    /// Convenience method that calls both `save_block_states` and
-    /// `persist_block_map`. Used by callers that don't need to split
-    /// these operations around a WAL lock.
+    /// Persist block states and presence.
     pub(super) fn save_metadata(&self) -> Result<(), CacheError> {
-        self.save_block_states()?;
-        self.persist_block_map()
+        self.save_block_states()
     }
 
     /// Load block states and presence from metadata file.
     ///
-    /// Returns `(SparseStateMap, dirty_count)`. Handles legacy v1/v2/v3 formats
-    /// by converting the old encoding (Clean=0, Dirty=1, Syncing=2) plus
-    /// separate presence bitmap into the new sparse encoding (NotPresent=0,
-    /// Clean=1, Dirty=2, Syncing=3).
+    /// Returns `(SparseStateMap, dirty_count, max_sequence)`. Handles legacy
+    /// v1/v2/v3/v4 formats by converting the old encoding (Clean=0, Dirty=1,
+    /// Syncing=2) plus separate presence bitmap into the new sparse encoding
+    /// (NotPresent=0, Clean=1, Dirty=2, Syncing=3). max_sequence is 0 for
+    /// formats prior to v5.
     pub(super) fn load_metadata(
         config: &WriteCacheConfig,
-    ) -> Result<(SparseStateMap, usize), CacheError> {
+    ) -> Result<(SparseStateMap, usize, u64), CacheError> {
         let path = config.metadata_path();
         let num_blocks = config.num_blocks();
 
         if !path.exists() {
             // No metadata file -- all blocks are NOT_PRESENT
             debug!(path = %path.display(), "no metadata file, starting fresh");
-            return Ok((SparseStateMap::new(num_blocks), 0));
+            return Ok((SparseStateMap::new(num_blocks), 0, 0));
         }
 
         let mut file = File::open(&path)?;
@@ -494,8 +487,11 @@ impl CacheInner {
         let state_map = SparseStateMap::new(num_blocks);
         let mut dirty_count = 0;
 
+        // max_sequence persisted in v5+, defaults to 0 for older formats
+        let mut persisted_max_seq: u64 = 0;
+
         if version >= 4 {
-            // v4: sparse format -- entry_count(u64) + entries of index(u32) + state(u8)
+            // v4/v5: sparse format -- entry_count(u64) + entries of index(u32) + state(u8)
             let mut count_buf = [0u8; 8];
             file.read_exact(&mut count_buf)?;
             let entry_count = u64::from_le_bytes(count_buf) as usize;
@@ -524,6 +520,13 @@ impl CacheInner {
                 if state != SparseBlockState::CLEAN {
                     let _ = state_map.cas(idx, SparseBlockState::CLEAN, state);
                 }
+            }
+
+            // v5: read trailing max_sequence
+            if version >= 5 {
+                let mut seq_buf = [0u8; 8];
+                file.read_exact(&mut seq_buf)?;
+                persisted_max_seq = u64::from_le_bytes(seq_buf);
             }
         } else {
             // Legacy v1/v2/v3: dense block_states + presence bitmap
@@ -606,6 +609,6 @@ impl CacheInner {
             "loaded cache metadata"
         );
 
-        Ok((state_map, dirty_count))
+        Ok((state_map, dirty_count, persisted_max_seq))
     }
 }

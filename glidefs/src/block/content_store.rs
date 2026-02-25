@@ -267,10 +267,8 @@ impl ContentStore {
                     return Err(e.into());
                 }
             };
-            if let Some(filename) = meta.location.filename() {
-                if let Ok(seq) = filename.parse::<u64>() {
-                    sequences.push(seq);
-                }
+            if let Some(filename) = meta.location.filename() && let Ok(seq) = filename.parse::<u64>() {
+                sequences.push(seq);
             }
         }
         if let Some(cb) = &self.circuit_breaker {
@@ -582,10 +580,8 @@ impl ContentStore {
                     return Err(e.into());
                 }
             };
-            if let Some(filename) = meta.location.filename() {
-                if filename.ends_with(".meta") {
-                    names.push(filename.to_string());
-                }
+            if let Some(filename) = meta.location.filename() && filename.ends_with(".meta") {
+                names.push(filename.to_string());
             }
         }
         if let Some(cb) = &self.circuit_breaker {
@@ -612,10 +608,8 @@ impl ContentStore {
                     return Err(e.into());
                 }
             };
-            if let Some(filename) = meta.location.filename() {
-                if filename.ends_with(".pack") {
-                    names.push(filename.to_string());
-                }
+            if let Some(filename) = meta.location.filename() && filename.ends_with(".pack") {
+                names.push(filename.to_string());
             }
         }
         if let Some(cb) = &self.circuit_breaker {
@@ -753,19 +747,16 @@ impl ContentStore {
                     return Err(e.into());
                 }
             };
-            if let Some(filename) = meta.location.filename() {
-                if let Some(uuid_str) = filename.strip_suffix(".pack") {
-                    if let Ok(pack_id) = Uuid::parse_str(uuid_str) {
-                        // Extract chunk_idx from path: .../chunks/{idx:04}/{uuid}.pack
-                        let path_str = meta.location.to_string();
-                        if let Some(rel) = path_str.strip_prefix(&chunks_prefix_str) {
-                            // rel = "{idx:04}/{uuid}.pack"
-                            if let Some(slash_pos) = rel.find('/') {
-                                if let Ok(chunk_idx) = rel[..slash_pos].parse::<u32>() {
-                                    packs.push((chunk_idx, pack_id));
-                                }
-                            }
-                        }
+            if let Some(filename) = meta.location.filename()
+                && let Some(uuid_str) = filename.strip_suffix(".pack")
+                && let Ok(pack_id) = Uuid::parse_str(uuid_str)
+            {
+                // Extract chunk_idx from path: .../chunks/{idx:04}/{uuid}.pack
+                let path_str = meta.location.to_string();
+                if let Some(rel) = path_str.strip_prefix(&chunks_prefix_str) {
+                    // rel = "{idx:04}/{uuid}.pack"
+                    if let Some(slash_pos) = rel.find('/') && let Ok(chunk_idx) = rel[..slash_pos].parse::<u32>() {
+                        packs.push((chunk_idx, pack_id));
                     }
                 }
             }
@@ -783,10 +774,8 @@ impl ContentStore {
                     return Err(e.into());
                 }
             };
-            if let Some(filename) = meta.location.filename() {
-                if let Ok(pack_id) = Uuid::parse_str(filename) {
-                    packs.push((u32::MAX, pack_id));
-                }
+            if let Some(filename) = meta.location.filename() && let Ok(pack_id) = Uuid::parse_str(filename) {
+                packs.push((u32::MAX, pack_id));
             }
         }
 

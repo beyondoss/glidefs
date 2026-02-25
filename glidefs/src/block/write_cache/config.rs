@@ -40,11 +40,6 @@ impl WriteCacheConfig {
         self.cache_dir.join(format!("{}.meta", self.device_name))
     }
 
-    /// Path to the v2 block map persistence file.
-    pub fn block_map_path(&self) -> PathBuf {
-        self.cache_dir.join(format!("{}.blockmap", self.device_name))
-    }
-
     /// Path to the v2 WAL file.
     pub fn wal_path(&self) -> PathBuf {
         self.cache_dir.join(format!("{}.wal", self.device_name))
