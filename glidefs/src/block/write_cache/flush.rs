@@ -612,7 +612,17 @@ impl WriteCache<Active> {
     /// Stores CRCs in the crc_map (DashMap) for later verification by the
     /// flush path. Only runs on the flush scheduler thread. Writes invalidate
     /// stale CRCs via crc_map.remove in their hot path.
+    ///
+    /// Capped at MAX_CRC_ENTRIES to bound memory. Blocks beyond the cap skip
+    /// CRC verification at flush time — the SYNCING state machine still
+    /// guarantees correctness; we just lose SSD corruption detection for those
+    /// blocks.
     fn compute_dirty_crc32s(&self) {
+        /// Maximum crc_map entries per export. 10M entries × ~24 bytes ≈ 240MB.
+        /// Covers a fully-dirty 1TB device (8M blocks of 128KB) with headroom.
+        /// Prevents unbounded growth if device_size is ever misconfigured.
+        const MAX_CRC_ENTRIES: usize = 10_000_000;
+
         let block_size = self.inner.config.block_size;
         let device_size = self.inner.config.device_size;
         let mut buf = vec![0u8; block_size];
@@ -623,6 +633,11 @@ impl WriteCache<Active> {
             .state_map
             .iter_with_state(SparseBlockState::DIRTY)
         {
+            // Bound memory: stop computing CRCs once we hit the cap.
+            if self.inner.crc_map.len() >= MAX_CRC_ENTRIES {
+                break;
+            }
+
             // Skip blocks that already have a CRC
             if self.inner.crc_map.contains_key(&idx) {
                 continue;

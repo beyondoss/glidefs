@@ -14,19 +14,17 @@ Transport ──► ExportRouter ──► BlockHandler ──► WriteCache<Act
                                                         │
                                             ┌───────────┼───────────┐
                                             ▼           ▼           ▼
-                                       pwrite()   block_map_set  transition_to_dirty
-                                      (local SSD)  (ZERO, seq)    (CAS on SparseStateMap)
-                                                        │
-                                                   clear_crc32(0)
+                                       set_present   pwrite()   transition_to_dirty
+                                      (SparseStateMap)(local SSD) (CAS on SparseStateMap)
                                                         │
                                                    WAL append(block_index, seq)
                                                         │
                                                     return OK     ◄── ~5µs
 ```
 
-Hash computation is **deferred to flush time**. The write path stores `Blake3Hash::ZERO`
-as a placeholder — it never reads back from SSD, never hashes, never touches the clean
-cache. See [Deferred Hashing](#deferred-hashing).
+Hash computation is **deferred to flush time**. The write path does zero hash or CRC work —
+it only claims the blocks (set_present), writes data, marks them dirty, and appends to the WAL.
+BLAKE3 is computed at flush time when the block is read from SSD anyway.
 
 ### Read Path (tiered, ~100ns to ~300ms)
 
@@ -34,32 +32,31 @@ cache. See [Deferred Hashing](#deferred-hashing).
 Guest VM
     │ READ (NBD or ublk)
     ▼
-WriteCache ──► AtomicBlockMap lookup
+WriteCache ──► is_present(block_idx)?
                       │
-              ┌── ZERO hash + state≠0? ──► SSD pread   (dirty, hash deferred)
-              ├── ZERO hash + state=0? ──► return zeros (never written, NotPresent)
-              ├── zero_block_hash? ──► return zeros          (trimmed)
+              ┌── YES ──► SSD pread                          ~5µs  (hot path: dirty or clean-SSD)
               │
-              ├── Tier 1: CleanCache memory (Foyer)           ~100ns
-              │           ├─ hit → return
-              │           └─ miss ▼
-              │
-              ├── Tier 2: CleanCache SSD (Foyer)              ~100µs
-              │           ├─ hit → return
-              │           └─ miss ▼
-              │
-              ├── Tier 3: S3 chunk fetch                      50-300ms
-              │           ├─ VolumeManifest: block_idx → chunk_idx → chunk_hash
-              │           ├─ ChunkMetaCache: chunk_hash → pack location
-              │           │   (memory LRU → SSD flat file → miss → S3 GET .meta)
-              │           ├─ ContentStore::get_chunk_block() (S3 range GET, semaphore-gated)
-              │           ├─ LZ4 decompress
-              │           ├─ Verify BLAKE3 hash
-              │           ├─ Insert into CleanCache
-              │           └─ return
-              │
-              └── Tier 4: SSD pread fallback (dirty block)    ~500µs
-                          └─ block present locally but not yet in S3
+              └── NO (not yet written / fork from S3)
+                      │
+                      ├── VolumeManifest: block_idx → chunk_idx → chunk_hash
+                      │   (if chunk_hash missing → block never written → return zeros)
+                      │
+                      ├── Tier 1: CleanCache memory (Foyer)           ~100ns
+                      │           ├─ hit → return
+                      │           └─ miss ▼
+                      │
+                      ├── Tier 2: CleanCache SSD (Foyer)              ~100µs
+                      │           ├─ hit → return
+                      │           └─ miss ▼
+                      │
+                      └── Tier 3: S3 chunk fetch                      50-300ms
+                                  ├─ ChunkMetaCache: chunk_hash → pack location
+                                  │   (memory LRU → SSD flat file → miss → S3 GET .meta)
+                                  ├─ ContentStore::get_chunk_block() (S3 range GET, semaphore-gated)
+                                  ├─ LZ4 decompress
+                                  ├─ Verify BLAKE3 hash
+                                  ├─ Insert into CleanCache
+                                  └─ return
 ```
 
 Multi-block reads fan out with `futures::future::try_join_all()`. Sequential access (3+ consecutive blocks) triggers prefetch to hide S3 latency. (`readahead.rs`)
@@ -70,27 +67,28 @@ Multi-block reads fan out with `futures::future::try_join_all()`. Sequential acc
 FlushScheduler (event-driven: Notify from write path when dirty_count ≥ 100)
     │
     ▼
-Scan SparseStateMap for Dirty pages (skip unallocated pages)
-    │
+Phase 1 — Claim: CAS DIRTY→SYNCING for each dirty block (atomic snapshot)
+    │           └─ Concurrent guest writes CAS SYNCING→DIRTY (blocks re-dirtied)
     ▼
-Partition dirty blocks by volume chunk (block_index / blocks_per_chunk)
+Partition claimed (SYNCING) blocks by volume chunk (block_index / blocks_per_chunk)
     │
     ▼
 For each volume chunk (parallel, spawn_blocking for CPU work):
     ├── Load current ChunkMeta from ChunkMetaCache
     │   (memory LRU → SSD flat file → S3 GET if miss)
     ├── Build HashSet<Blake3Hash> of known entries (within-chunk dedup)
-    ├── For each dirty block in this chunk:
-    │   ├── Record (block_index, sequence) at snapshot time
-    │   ├── Skip: zero_block_hash entries, blocks already in ChunkMeta
-    │   ├── Read block data from SSD → CRC32 verify → BLAKE3-128 hash → LZ4 compress
+    ├── For each SYNCING block in this chunk:
+    │   ├── CRC32 verify from crc_map (if available): state==SYNCING → corruption; state==DIRTY → concurrent write
+    │   ├── Skip: zero_block_hash entries, blocks already in ChunkMeta, CRC-failed blocks
+    │   ├── Read block data from SSD → BLAKE3-128 hash → LZ4 compress
     │   └── Accumulate into pack buffer
     ├── ContentStore::put_chunk_pack() ──► S3 PUT at chunks/{idx:04}/{uuid}.pack
     ├── ChunkMeta::merge(old_entries, new_entries) → new ChunkMeta
     ├── content_hash = BLAKE3-128 of sorted (offset, block_hash) pairs
     ├── ContentStore::put_chunk_meta() ──► S3 PUT at chunks/{idx:04}/{hash}.meta
     ├── Update ChunkMetaCache (memory + SSD)
-    └── CAS-clear Dirty flags (only if sequence unchanged since snapshot)
+    └── Phase 3 — Release: CAS SYNCING→CLEAN for each uploaded block
+        └─ CAS fails if block was re-dirtied (SYNCING→DIRTY) → stays Dirty for next cycle
     │
     ▼
 Atomic commit: PUT VolumeManifest with updated chunk_hashes
@@ -110,14 +108,14 @@ Ensures all flushed chunks are discoverable on cross-host recovery.
 | VolumeManifest | JSON file (~1KB) mapping `chunk_idx → chunk_content_hash`. The root of an export's metadata. Synced to S3 after every flush. | Not the full block index — it only records which chunks have data and their content hash |
 | ChunkMeta (GLCM) | Immutable binary file listing every block in a volume chunk: block offset → pack location. Content-addressed: the file name IS its BLAKE3-128 hash. | Not mutable — each flush writes a NEW file with a new hash |
 | ChunkMetaCache | Two-tier (memory LRU + SSD flat files) cache of loaded ChunkMeta objects, keyed by chunk_hash. Shared across all exports on a host — forks that share chunks share the same ChunkMeta. | Not per-export — global content-addressed cache |
-| Block Map | Per-block metadata: BLAKE3-128 hash, dirty flag, sequence number. In-memory sparse page table. | Not the data itself |
+| Block State Map | Per-block state (NotPresent / Clean / Dirty / Syncing). Lock-free sparse page table with 2-bit packed `AtomicU8` (4 entries per byte, 16,384 entries per 4KB page). | Not the data itself — no hashes stored per-block; hashes are computed at flush time from SSD |
 | Drain | Flush all dirty blocks to S3 so the export can be stopped or migrated | Not a delete — S3 data is preserved |
 | Clean Cache | Read-through Foyer HybridCache (memory + SSD tiers) for blocks fetched from S3 | Not the write cache (dirty blocks on local SSD) |
 | Circuit Breaker | Lock-free S3 failure detector that fast-fails requests during outages | Not a retry mechanism — it prevents retries |
 | Hot Set | List of non-zero block indices for a base image, used to prefetch blocks on fork boot | Not a cache — it's a prefetch hint |
 | Bless | CLI command that converts a raw disk image into a content-addressed base image in S3 | Not a runtime operation — offline image preparation |
 | Snapshot | An explicit, versioned copy of an export's VolumeManifest stored at a stable S3 key. Never overwritten by background syncs. Pinned in S3 until explicitly deleted. | Not the same as a background `sync_manifest` — background syncs update `manifests/{name}` and do NOT create versioned snapshot keys |
-| Fork | A new export whose VolumeManifest is copied from a parent's. The fork starts with an empty local block map; unwritten blocks are served through VolumeManifest → ChunkMetaCache → S3. | Not a full copy — the parent's ChunkMeta and pack files are never duplicated |
+| Fork | A new export whose VolumeManifest is copied from a parent's. The fork starts with an empty local SparseStateMap; unwritten blocks resolve through VolumeManifest → ChunkMetaCache → S3. | Not a full copy — the parent's ChunkMeta and pack files are never duplicated |
 | Snapshot Sequence | A monotonic counter (`u64`) that increments on every flush. Identifies the point in time at which a snapshot was taken and used to fork from a specific historical state. | Not a timestamp — purely an ordering counter |
 
 ## S3 Object Layout
@@ -148,9 +146,9 @@ The write path avoids all locks. Three techniques make this possible:
 
 1. **Positional I/O** (`pread`/`pwrite`): The `SyncFile` wrapper uses POSIX positional I/O, which is atomic per-syscall and doesn't use the file position pointer. No locking needed for concurrent block reads and writes. (`write_cache/inner.rs:SyncFile`)
 
-2. **Atomic block map** (SeqLock + page table): `AtomicBlockMap` stores per-block metadata in a two-level page table. A directory of `AtomicPtr<HashPage>` points to 4KB pages, each holding 128 `HashEntry` structs (version + hash + sequence). Pages are allocated on first write via CAS — empty exports use ~530KB. Each entry uses a per-entry `AtomicU32` version counter (SeqLock); readers spin-retry if the version is odd. (`block_map.rs:AtomicBlockMap`)
+2. **Sparse state map** (CAS + sparse page table): `SparseStateMap` stores per-block state in a two-level page table with 2-bit packing — 4 entries per `AtomicU8`, 16,384 entries per 4KB page. Pages are allocated on first write via CAS — empty exports use ~4KB for the directory. State transitions (`set_present`, `transition_to_dirty`, `transition_dirty_to_syncing`, `transition_syncing_to_clean`) are CAS-on-byte loops with no global lock. When a CAS on one 2-bit field fails because an adjacent field in the same byte was modified concurrently, the loop retries — this costs nanoseconds against pwrite latency. (`block_map.rs:SparseStateMap`)
 
-3. **Sequence numbers**: A monotonic `AtomicU64` counter provides snapshot consistency and race detection. Each write bumps the sequence; flush captures the sequence at snapshot time and only clears dirty flags on blocks whose sequence hasn't changed (no concurrent write). (`block_map.rs:SequenceNumber`)
+3. **Sequence numbers**: A monotonic `AtomicU64` counter (`SequenceNumber`) provides WAL ordering. Each write bumps the sequence; the max sequence is persisted in `block_states` metadata so it survives crash recovery. (`block_map.rs:SequenceNumber`)
 
 ### Content Addressing
 
@@ -160,7 +158,7 @@ Every block is identified by its BLAKE3-128 hash (16 bytes, truncated from 256-b
 - **Integrity verification**: Read path verifies hash after S3 fetch and LZ4 decompression. Optional background scrubber can re-hash cached blocks to detect bit rot.
 - **Sparse manifests**: VolumeManifest only stores chunks that have been written — a 500GB export with 2GB of data has a ~1KB manifest with ~200 entries.
 
-The well-known hash of a 128KB zero block (`ZERO_BLOCK_HASH`) lets unwritten regions return zeros without any storage or S3 interaction. (`block_map.rs:77`)
+The well-known hash of a 128KB zero block (`zero_block_hash()`) lets the flush path skip blocks that are all-zeros — they're deduplicated against the well-known sentinel without storage or S3 interaction. (`block_map.rs`)
 
 ### Circuit Breaker (S3 Resilience)
 
@@ -192,24 +190,26 @@ Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N 
 
 ## Block State Machine
 
-Stored in `SparseStateMap` — a sparse page table of `AtomicU8` values, lock-free, outside the block map's `RwLock`. Encoding: `NotPresent=0, Clean=1, Dirty=2, Syncing=3`. NotPresent=0 means unallocated pages are implicitly "never written" with no memory cost.
+Stored in `SparseStateMap` — a sparse page table with 2-bit packed `AtomicU8` values (4 entries per byte), fully lock-free. Encoding: `NotPresent=0, Clean=1, Dirty=2, Syncing=3`. NotPresent=0 means unallocated pages (and zero bytes within allocated pages) are implicitly "never written" with no memory cost.
 
 ```
-NotPresent ───[write]───► Dirty ───[flush + seq match]───► Clean
-                            ▲                                 │
-                            └────────[write]──────────────────┘
+NotPresent ──[write]──► Dirty ──[flush claim]──► Syncing ──[upload OK + no concurrent write]──► Clean
+                           ▲                         │                                              │
+                           └──────[write]────────────┘ (CAS SYNCING→DIRTY)                         │
+                           └──────────────────────────────────[write]──────────────────────────────┘
 ```
 
-The flush path uses **sequence-number CAS** instead of a Syncing intermediate state: when a block is flushed, `CAS(Dirty→Clean)` succeeds only if the block's sequence number hasn't changed since the flush snapshot. If a concurrent write changed the sequence, the CAS is skipped and the block stays Dirty for the next flush cycle. This eliminates the Dirty→Syncing→Clean three-phase dance.
+The flush path uses **SYNCING-based CAS**: a dirty block is atomically claimed (`CAS DIRTY→SYNCING`) before CPU work begins. After upload, `CAS SYNCING→CLEAN` releases it. If a guest write lands during the flush, `transition_to_dirty()` CAS-loops `SYNCING→DIRTY` — the flush's final `CAS SYNCING→CLEAN` then fails, and the block stays Dirty for the next cycle.
 
 | From | Event | To | Encoding | Notes |
 |------|-------|----|----------|-------|
-| NotPresent | Guest write | Dirty | 0 → 2 | Page allocated on first touch, SSD pwrite, WAL appended |
+| NotPresent | Guest write | Dirty | 0 → 2 | Page allocated on first touch, set_present + SSD pwrite, WAL appended |
 | Clean | Guest write | Dirty | 1 → 2 | Block already on SSD, re-dirtied |
-| Dirty | Flush success + seq match | Clean | 2 → 1 | Sequence guard: skip if block was rewritten during flush |
-| Dirty | Flush success + seq mismatch | Dirty | — | Concurrent write changed the block; stays dirty for next cycle |
-
-The `Syncing=3` constant exists and is handled defensively (crash recovery converts Syncing→Dirty, `transition_to_dirty` handles Syncing→Dirty for writes during sync), but no current code path transitions a block INTO the Syncing state. It is reserved for future use.
+| Dirty | Flush claim | Syncing | 2 → 3 | `transition_dirty_to_syncing()` — atomic snapshot of dirty block |
+| Syncing | Concurrent guest write | Dirty | 3 → 2 | `transition_to_dirty()` CAS loop; flush's SYNCING→CLEAN will fail |
+| Syncing | Upload success, no concurrent write | Clean | 3 → 1 | `transition_syncing_to_clean()` — CAS fails if write re-dirtied |
+| Syncing | Upload success, concurrent write | Dirty | — | Final CAS fails; block stays dirty (re-flushed next cycle) |
+| Any | Crash recovery load | Dirty | — | `load_metadata()` converts Syncing→Dirty on startup |
 
 Presence is derived: `is_present = state != 0`. This eliminates the separate `present_chunks` bitmap. (`block_map.rs:SparseStateMap`)
 
@@ -222,23 +222,22 @@ router.create_export(config, fork_from="parent-vm")
     │
     ├── ContentStore::get_manifest("parent-vm")   ← GET manifests/parent-vm (~1KB)
     ├── ContentStore::put_manifest("fork-vm", manifest_bytes)  ← PUT manifests/fork-vm
-    └── WriteCache::open_fresh_active(config)      ← empty AtomicBlockMap
+    └── WriteCache::open_fresh_active(config)      ← empty SparseStateMap (all NotPresent)
     │
     ▼
 Fork is live:
-  - Writes: land on fork's local SSD, flushed to chunks/ as new .meta and .pack files
-  - Reads for blocks never written by the fork:
-      AtomicBlockMap miss → VolumeManifest lookup (chunk_hash) → ChunkMetaCache lookup
-      → S3 range GET from parent's chunks/{idx}/{uuid}.pack
+  - Writes: set_present + pwrite to fork's local SSD; flushed to chunks/ as new .meta and .pack files
+  - Reads for blocks never written by the fork (is_present = false):
+      VolumeManifest lookup (chunk_hash) → ChunkMetaCache → S3 range GET from parent's chunks/{idx}/{uuid}.pack
 ```
 
 **Content-addressed sharing**: Chunks the fork hasn't modified share their ChunkMeta files with the parent. The ChunkMetaCache is global and keyed by content hash, so if a chunk hash appears in both the parent's and fork's VolumeManifest, it loads and caches once on the host. 180 forks from the same base image load each common chunk's .meta exactly once.
 
 **No in-memory overlay**: Forks don't need `ForkedBlockMap` because reads fall through to S3 via the VolumeManifest — the parent's pack files are still in S3 under their original `chunks/` paths.
 
-### State Is Separate
+### State Map
 
-`SparseStateMap` (dirty/syncing/clean/not-present) lives outside `AtomicBlockMap` in `CacheInner`, using the same sparse page-table pattern but with 4096 `AtomicU8` entries per page. State transitions (`set_present`, `transition_to_dirty`) use direct CAS on `AtomicU8` — no RwLock. (`block_map.rs:SparseStateMap`)
+`SparseStateMap` (NotPresent / Clean / Dirty / Syncing) lives in `CacheInner`. It uses a sparse page-table with 2-bit packed `AtomicU8` entries — 4 states per byte, 16,384 entries per 4KB page. State transitions (`set_present`, `transition_to_dirty`, `transition_dirty_to_syncing`, `transition_syncing_to_clean`) are CAS-on-byte loops — fully lock-free, no `RwLock`. (`block_map.rs:SparseStateMap`)
 
 ## Snapshots
 
@@ -267,7 +266,7 @@ WriteCache::snapshot()
     ├── 1. flush_dirty_inner()          flush all dirty blocks → S3 chunks
     ├── 2. upload_volume_manifest()     overwrite manifests/{name} (current state)
     ├── 3. put_snapshot()               write snapshots/{name}/{seq:020}  ← best-effort
-    └── 4. checkpoint()                 persist block map, truncate WAL
+    └── 4. checkpoint()                 persist block_states + max_seq, truncate WAL
     │
     ▼
 Returns: { sequence, manifest_etag }
@@ -531,50 +530,53 @@ Every layer has a verification mechanism. The goal: corruption is detected befor
 | VolumeManifest | Chunk metadata root | (JSON, no checksum — content-addressed chain below) | On deserialization | Reject manifest, return error |
 | ChunkMeta | Block location index | CRC32 trailer | On deserialization (load from S3 or SSD cache) | Reject ChunkMeta, return error |
 | WAL entries | Per-entry metadata | CRC32 trailer | On replay (crash recovery) | Stop replay at first corrupt entry, discard torn tail |
-| Dirty blocks (SSD) | Block data between write and flush | CRC32 in `HashEntry` | Flush time: before BLAKE3 computation | Skip block (stays dirty), do NOT launder to S3 |
+| Dirty blocks (SSD) | Block data between write and flush | CRC32 in `crc_map` | Flush time: before BLAKE3 computation, using block state to discriminate | Skip block (stays dirty), do NOT launder to S3 |
 
 ### Dirty Block CRC32
 
 Dirty blocks sit on local SSD between guest writes and S3 flush — up to ~100 blocks per export (pack-size trigger). During this window, SSD bit rot or firmware bugs could silently corrupt the data. Without verification, the flush path would compute BLAKE3 over corrupted data, producing a valid-looking but wrong hash, and upload it to S3 — permanently laundering the corruption.
 
-The `crc32` field in `HashEntry` (repurposed from `_pad`) catches this:
+CRC32 is stored in `crc_map: DashMap<usize, u32>` on `CacheInner` — sized proportional to dirty blocks, not device size. At 10GB/s write rate with 5s flush interval: max ~80K dirty blocks × ~12 bytes = ~1MB. At idle: 0 bytes.
+
+**Key difference from the write path**: the write path does NOT touch the CRC map. SYNCING state (not sequence numbers) discriminates corruption from concurrent writes:
 
 ```
 Write path (~5µs):
-    pwrite(data) → block_map_set(ZERO, seq) → clear_crc32(0)
-                                                     │
-                                              AtomicU32 store, negligible
+    set_present(idx) → pwrite(data) → transition_to_dirty(idx) → WAL append
+    ↑ zero CRC map interaction
 
 Checkpoint (background, every ~5s):
-    for each dirty block where crc32 == 0:
-        seq_before = block_map_get(idx).seq
-        data = pread(block from SSD)
-        seq_after = block_map_get(idx).seq
-        if seq_before != seq_after → skip (concurrent write)
-        crc32 = crc32fast::hash(data)
-        CAS(0, crc32)                        ← only store if still 0
-
-Flush (background):
     for each dirty block:
         data = pread(block from SSD)
-        stored_crc = get_crc32(idx)
-        if stored_crc != 0:
-            computed_crc = crc32fast::hash(data)
+        crc_map.entry(idx).or_insert(crc32fast::hash(data))  ← store only if not already set
+
+Flush (background):
+    Phase 1: CAS DIRTY→SYNCING for each dirty block (claims the block)
+
+    Phase 2: for each SYNCING block:
+        if let Some(stored_crc) = crc_map.remove(&idx):
+            computed_crc = crc32fast::hash(pread(data))
             if computed_crc != stored_crc:
-                if seq changed → concurrent write, skip (CAS failure)
-                else → SSD corruption detected, skip block
-        hash = blake3_128(data)              ← only reached if CRC32 passes
-        ... pack, upload, clear dirty
+                if state_map.get(idx) != SYNCING:
+                    → block was re-dirtied by concurrent write (state is DIRTY now)
+                    → skip (not corruption — stale CRC)
+                else:
+                    → still SYNCING, no concurrent write → real SSD corruption
+                    → skip block (stays in Syncing, reverted to Dirty by error handler)
+        hash = blake3_128(data)   ← only reached if CRC32 passes
+        ... pack, upload
+
+    Phase 3: CAS SYNCING→CLEAN for successfully uploaded blocks
 ```
 
-Each dirty block gets CRC32 computed **once** (at first checkpoint after write) and verified **once** (at flush before BLAKE3). No redundant hashing. Not on the read or write hot paths.
+Each dirty block gets CRC32 computed **once** (at checkpoint) and verified **once** (at flush before BLAKE3). No CRC work on the write hot path. SYNCING state provides unambiguous discrimination: a mismatch when still SYNCING = corruption; a mismatch when now DIRTY = concurrent write rewrote the block.
 
 ### What Is NOT Verified
 
 | Gap | Why Acceptable |
 |-----|---------------|
 | Dirty block reads (guest reads dirty data from SSD) | Read path returns raw pread data — no checksum. The guest sees whatever is on disk. If SSD corrupts a dirty block and the guest reads it before checkpoint, the guest gets corrupt data. Mitigation: checkpoint runs every ~5s, so the window is small. Adding CRC32 verification on the read path would cause false positives from concurrent write races (write changes data between CRC32 compute and pread). |
-| SSD data file between flush cycles | Once a block is flushed (Dirty → Clean), its CRC32 is cleared. The block remains on SSD but is only served as a fallback — reads prefer the clean cache or S3. If the SSD corrupts a clean block, the scrubber catches it in the clean cache; if the block isn't in the clean cache, the next read fetches from S3. |
+| SSD data file between flush cycles | Once a block is flushed (Dirty/Syncing → Clean), its CRC32 is removed from `crc_map`. The block remains on SSD but reads prefer the clean cache or S3. If the SSD corrupts a clean block, the scrubber catches it in the clean cache; if not in cache, the next read fetches from S3. |
 | ChunkMetaCache SSD files | Derived data — rebuildable from S3 `.meta` files. If a cached `.meta` file is corrupted, the CRC32 check on deserialization detects it; the cache falls back to fetching from S3. |
 
 ## CLI Commands
@@ -684,7 +686,7 @@ Write-behind trades durability for latency: data between the last FLUSH and the 
 
 ### Why defer hashing to flush time?
 
-The previous design computed BLAKE3 on every write. For a 4KB write to a 128KB block:
+An earlier design computed BLAKE3 on every write. For a 4KB write to a 128KB block:
 
 | Operation | Cost |
 |-----------|------|
@@ -693,11 +695,11 @@ The previous design computed BLAKE3 on every write. For a 4KB write to a 128KB b
 | Bytes::copy_from_slice(128KB) into clean cache | ~5-10µs |
 | **Total overhead** | **~50-65µs** |
 
-None of this work is needed until flush time. With deferred hashing, the write path is ~5µs for 4KB random writes (just pwrite + atomics + WAL). The hash computation moves to the flush path, which already reads every dirty block from SSD to build packs — so the work happens exactly once.
+None of this work is needed until flush time. With deferred hashing, the write path is ~5µs for 4KB random writes (just `set_present` + `pwrite` + `transition_to_dirty` + WAL). The hash computation moves to the flush path, which already reads every dirty block from SSD to build packs — so the work happens exactly once.
 
 **Write coalescing is free**: write the same block 100 times before flush, hash it once. Previously: 100 hashes, 99 thrown away.
 
-The read path distinguishes ZERO-placeholder from never-written using the **state map**: ZERO hash + state != NotPresent = deferred hash (SSD pread), ZERO hash + NotPresent = never written (return zeros).
+The read path uses `is_present(idx)` to decide between paths: present → pread from SSD (hot path, ~5µs); not-present → VolumeManifest → ChunkMetaCache → S3. No per-block hash is stored; the SSD is always authoritative for present blocks.
 
 ### Why chunked block index instead of a flat manifest?
 
@@ -727,7 +729,7 @@ Trade-off: read amplification. A cache miss fetches the entire pack (up to ~12.8
 
 ### Why BLAKE3-128 instead of full BLAKE3-256?
 
-128-bit collision resistance is sufficient for content deduplication (birthday bound: 2^64 operations). 16 bytes fits in two `AtomicU64`s for lock-free storage in the block map. Halves per-entry metadata cost vs full 256-bit hash.
+128-bit collision resistance is sufficient for content deduplication (birthday bound: 2^64 operations). 16 bytes fits in two `u64`s and is compact in ChunkMeta entries. Halves per-entry metadata cost vs full 256-bit hash.
 
 ### Why 128KB block size?
 
@@ -745,11 +747,11 @@ We use a consecutive-failure policy (not windowed) by default because S3 outages
 
 ### Why sparse page tables instead of dense arrays?
 
-Dense arrays pre-allocate for all blocks: a 1TB export with 128KB blocks has 8M entries. `AtomicBlockMap` alone cost ~224MB per export — at 2,000 VMs per compute node, that's 448GB just for hash metadata. Impossible.
+Dense arrays pre-allocate for all blocks: a 1TB export with 128KB blocks has 8M entries. At 1 byte per block state, that's 8MB per export — manageable. But the old `AtomicBlockMap` (32 bytes per block for hash + sequence + CRC32) cost 256MB per 1TB export. At 10,000 exports: 2.5TB just for hash metadata. The directories alone (needed even for empty exports) cost 5.1GB at that scale.
 
-Sparse page tables allocate on first write. The directory (one pointer per page) costs ~530KB. Each 4KB page covers 128 hash entries or 4096 state entries. An empty export: ~530KB. A 1%-written export: ~5MB. The cost is one extra pointer dereference on the hot path — a branch that predicts correctly almost every time and is noise next to the SSD pwrite that follows it.
+Sparse page tables allocate on first write. With 2-bit packing (4 entries per `AtomicU8`), each 4KB page holds 16,384 entries — 4× denser than a naive 1-byte-per-entry layout. The directory (one pointer per page) costs ~4KB for a 1TB export (512 entries). An empty export: ~4KB. A fully-written 1TB export: ~2MB. The cost is one extra pointer dereference on the hot path — a branch that predicts correctly almost every time.
 
-State is kept in a separate `SparseStateMap` rather than co-located in `HashEntry`. State transitions (`set_present`, `transition_to_dirty`) are direct CAS on `AtomicU8` — fully lock-free. The `AtomicBlockMap` is behind a `RwLock` for safety, so co-locating state there would force every state transition through a read lock. Two separate sparse structures keep state transitions lock-free while achieving the same memory savings.
+After removing `AtomicBlockMap`, only `SparseStateMap` (2 bits/block) remains for per-block metadata. CRC32 is now in a `DashMap<usize, u32>` sized to dirty blocks (~0 at idle, ~1MB at 80K dirty blocks). No per-block hashes stored anywhere — hashes are computed fresh from SSD at flush time.
 
 ### Why explicit versioned snapshots instead of manifest history?
 
@@ -772,13 +774,29 @@ In `WriteCache::snapshot()`, the critical step is uploading the VolumeManifest (
 2. S3 transient failures shouldn't fail the entire snapshot operation. The control plane can detect the missing snapshot via `GET /snapshots` and retry just the snapshot, not a full flush.
 3. Orphaned base manifest writes (step 2 succeeds, step 3 fails) are harmless — they're idempotent overwrites of the current state.
 
-### Why SeqLock instead of RwLock for the block map?
+### Why SYNCING-based flush instead of sequence-number CAS?
 
-Each block's metadata (hash + sequence) spans multiple `AtomicU64`s. A torn read (seeing half-old, half-new) would produce a wrong hash. SeqLock solves this with per-entry version counters — readers spin-retry if the version changed during read. Cost: near-zero, because writes to a specific block are rare relative to reads, and each block has its own version counter.
+The previous design used per-block sequence numbers to detect concurrent writes during flush:
 
-We considered `RwLock` but rejected it: even uncontended lock/unlock has ~25ns overhead per operation. At 28K IOPS with multi-block reads, that's significant. SeqLock adds ~2ns on the reader fast path.
+1. At snapshot time: record `(block_idx, seq)` for each dirty block.
+2. After upload: only clear dirty if `current_seq == snapshot_seq`.
 
-**C11 memory ordering**: The writer stores data fields with `Release` ordering, not `Relaxed`. Under the C11 model (which matters on ARM/Graviton), a `Relaxed` data store can be observed by a reader via a `Relaxed` load without establishing any happens-before relationship — the reader's subsequent `Relaxed` v2 load might miss the writer's version change entirely, producing a torn read. With `Release` data stores, the reader's `Acquire` fence (between data loads and v2 load) synchronizes-with the observed Release, making the writer's odd version visible to v2 and forcing a retry. Loom tests exhaustively verify this property. SeqLock is single-writer by design; concurrent writers break the version parity invariant.
+This required storing 8 bytes per block (the sequence) in the block map, plus a global sequence counter bump on every write.
+
+SYNCING-based flush achieves the **same guarantee with zero per-block sequence storage**:
+
+1. **Claim**: `CAS DIRTY→SYNCING` atomically snapshots the block into the flush pipeline.
+2. **Concurrent write**: `transition_to_dirty()` CAS-loops `SYNCING→DIRTY` — the write always succeeds regardless of ordering.
+3. **Release**: `CAS SYNCING→CLEAN` fails if state is now DIRTY (concurrent write happened).
+
+The no-ABA guarantee: the flush scheduler is sequential per export (one `tokio::select!` loop). There are never two concurrent flush cycles for the same export, so a block can't transition `SYNCING→DIRTY→SYNCING` from two different flushes.
+
+**CRC32 state discrimination**: The SYNCING state also replaces the sequence-based CRC discrimination:
+- Old: `computed_crc != stored_crc` AND `current_seq == snapshot_seq` → corruption.
+- New: `computed_crc != stored_crc` AND `state == SYNCING` → corruption (no write happened).
+  `computed_crc != stored_crc` AND `state == DIRTY` → concurrent write (stale CRC, not corruption).
+
+This eliminates all per-block sequence storage and all CRC clearing on the write path — two hot-path atomic operations removed per write.
 
 ### S3 Concurrency Limits
 
@@ -826,14 +844,14 @@ The pressure flush directly flushes dirty packs from the exports with the most d
 | `block/handler.rs` | Transport-agnostic block I/O dispatch (read/write/flush/trim) with SSD write rejection at 95% |
 | `block/write_cache/mod.rs` | `WriteCache<S>` typestate wrapper, `FlushStats`, `SnapshotResult` |
 | `block/write_cache/inner.rs` | `CacheInner`: shared state, `SyncFile`, `SparseStateMap` integration, metadata persistence |
-| `block/write_cache/write.rs` | Write path: pwrite + ZERO placeholder + WAL (deferred hash) |
-| `block/write_cache/read.rs` | Read path: tiered cache resolution (CleanCache → VolumeManifest/ChunkMetaCache → S3 → SSD fallback) |
-| `block/write_cache/flush.rs` | Dirty block scan, CRC32 checkpoint compute + flush verify (spawn_blocking), pack assembly, chunk-scoped S3 upload, VolumeManifest sync |
-| `block/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading |
-| `block/write_cache/recovery.rs` | WAL replay, dirty block verification after crash |
+| `block/write_cache/write.rs` | Write path: set_present + pwrite + transition_to_dirty + WAL (no hash, no CRC on write) |
+| `block/write_cache/read.rs` | Read path: `is_present` → pread (hot path); else VolumeManifest → ChunkMetaCache → S3 |
+| `block/write_cache/flush.rs` | SYNCING-based flush: CAS DIRTY→SYNCING (claim), rayon CRC32+BLAKE3+LZ4, S3 upload, CAS SYNCING→CLEAN; VolumeManifest sync |
+| `block/write_cache/init.rs` | Cache file creation, pre-allocation, metadata loading (v5 format: block_states + max_seq) |
+| `block/write_cache/recovery.rs` | WAL replay, `verify_dirty_blocks_readable()` (SSD readability check, no hash comparison) |
 | `block/write_cache/config.rs` | `WriteCacheConfig` with per-export overrides |
 | `block/write_cache/error.rs` | `CacheError` type |
-| `block/block_map.rs` | `Blake3Hash`, `AtomicBlockMap` (sparse page-table + SeqLock + per-entry CRC32), `SparseStateMap`, `SequenceNumber`, LZ4 helpers |
+| `block/block_map.rs` | `Blake3Hash`, `SparseStateMap` (lock-free sparse page-table, 2-bit packed, 4 entries/byte), `SequenceNumber`, LZ4 helpers |
 | `block/volume_manifest.rs` | `VolumeManifest`: JSON root mapping chunk_idx → chunk_hash, address translation helpers |
 | `block/chunk_meta.rs` | `ChunkMeta` (GLCM): binary block location index; serialize/deserialize/merge/lookup/content_hash |
 | `block/chunk_cache.rs` | `ChunkMetaCache`: two-tier LRU + SSD cache for `ChunkMeta` objects, keyed by content hash |
@@ -922,40 +940,44 @@ At 2K microVMs per node: max ~25GB dirty data node-wide (99 blocks × 128KB × 2
 
 ## Memory Overhead
 
-Both `AtomicBlockMap` and `SparseStateMap` use sparse page tables — pages are allocated on first write, not upfront. An empty export costs only its directory arrays (~530KB). Memory grows proportionally to blocks actually written.
-
-Previously, three dense arrays were pre-allocated for all 8M blocks regardless of usage: `AtomicBlockMap` (4 parallel arrays of AtomicU64/AtomicU32 = ~224MB), `block_states` (1 byte × 8M = 8MB), and `present_chunks` (1 bit × 8M = 1MB) — **~233MB per export**. At 2,000 VMs: 466GB. The sparse page tables replace all three with allocate-on-write directories: **~530KB per empty export** — a 450× reduction.
+`SparseStateMap` uses a sparse page table with 2-bit packing — 4 entries per `AtomicU8`, 16,384 entries per 4KB page. Pages are allocated on first write, not upfront. An empty export costs only its directory (~4KB). CRC32 is stored in a `DashMap` sized to dirty blocks, not device size.
 
 ```
-AtomicBlockMap (hash + sequence storage)
-├── directory: Box<[AtomicPtr<HashPage>]>    512 KB  (65536 entries for 8M blocks)
-│   ├── [0] → HashPage { entries: [HashEntry; 128] }  4096 bytes
+SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing, 2-bit packed)
+├── directory: Box<[AtomicPtr<StatePage>]>    4 KB  (512 entries for 8M blocks)
+│   ├── [0] → StatePage { data: [AtomicU8; 4096] }  4096 bytes (16,384 entries)
 │   ├── [1] → null  (unwritten — zero cost)
 │   └── ...
-│   HashEntry: 32 bytes (#[repr(C)]): version(u32) + crc32(u32) + hash_lo(u64) + hash_hi(u64) + seq(u64)
+│
+│   Byte layout within StatePage:
+│   ┌─────────────────────────────────────────────┐
+│   │ bits [7:6]=entry3 [5:4]=entry2 [3:2]=entry1 [1:0]=entry0 │
+│   └─────────────────────────────────────────────┘
+│   CAS on one entry may spuriously fail if an adjacent entry in the
+│   same byte was modified concurrently — the CAS loop retries (~ns).
 
-SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
-├── directory: Box<[AtomicPtr<StatePage>]>    16 KB  (2048 entries for 8M blocks)
-│   ├── [0] → StatePage { states: [AtomicU8; 4096] }  4096 bytes
-│   ├── [1] → null  (unwritten — zero cost)
-│   └── ...
+crc_map: DashMap<usize, u32>  — only populated during flush window
+├── Populated by checkpoint (every 5s) for dirty blocks not yet flushed
+├── Consumed by flush (remove-and-verify per block)
+└── At idle: 0 entries, 0 bytes
+    At max dirty rate (10GB/s writes, 5s interval): ~80K entries × ~12B = ~1MB
 ```
 
 | Component | Per-Export (fixed) | Per-Written-Page | Shared | Notes |
 |-----------|-------------------|-----------------|--------|-------|
-| `AtomicBlockMap` directory | ~512 KB | 4 KB per 128 blocks written | — | 32 bytes/entry × 128 entries/page |
-| `SparseStateMap` directory | ~16 KB | 4 KB per 4096 blocks written | — | 1 byte/entry × 4096 entries/page |
+| `SparseStateMap` directory | ~4 KB | 4 KB per 16,384 blocks written | — | 2 bits/entry × 16,384 entries/page |
+| `crc_map` | 0 (transient) | — | — | DashMap entry per dirty block between checkpoint and flush; ~12B each |
 | `ChunkMetaCache` | — | — | ~32 entries × ~4MB/entry max | LRU, disk-resident for persistence; shared across all exports by content hash |
 | `CleanCache` (memory) | — | — | `memory_size_gb` | Configured, default 1GB |
 | `CleanCache` (SSD) | — | — | `ssd_cache_size_gb` | Configured, default 10GB |
 
-| Scenario (1TB/128KB = 8M blocks) | Memory |
-|---|---|
-| Empty export | ~530 KB |
-| 1% written (84K blocks) | ~5 MB |
-| 100% written | ~260 MB |
-| 2,000 empty exports | ~1 GB |
-| 2,000 exports, 1% written | ~10 GB |
+| Scenario (1TB/128KB = 8M blocks) | Before (AtomicBlockMap era) | After (2-bit packed) | Savings |
+|---|---|---|---|
+| Empty export | ~530 KB | ~4 KB | 132× |
+| 1% written (84K blocks) | ~5 MB | ~24 KB | 208× |
+| 100% written | **~260 MB** | **~2 MB** | **130×** |
+| 10,000 empty exports | **~5.1 GB** (directories alone) | **~40 MB** | **128×** |
+| 10,000 exports, 100% written | **~2.5 TB** | **~20 GB** | **128×** |
 
 ## Failure Modes
 
@@ -980,4 +1002,4 @@ SparseStateMap (block state: NotPresent/Clean/Dirty/Syncing)
 | Unit | `cargo test --features test-utils --lib` | ~330 | Lock-free atomics, wire format round-trips (GLPK/GLCM), state transitions, sparse page tables, CRC32 integrity, VolumeManifest + ChunkMeta serde |
 | Integration | `cargo test --features test-utils --test integration` | ~52 | Crash recovery, concurrent writes, flush consistency, chunked S3 layout, snapshot + fork correctness (no Docker) |
 | Docker | `cargo test --features docker-tests --test docker_integration` | ~20 | Real S3 via MinIO (testcontainers-rs), end-to-end via `TestServer.connect()` (transport-agnostic client abstraction) |
-| Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free algorithms (AtomicBlockMap, SeqLock) |
+| Loom | `cd loom-tests && cargo test --release` | — | Exhaustive interleaving of lock-free CAS algorithms (SparseStateMap DIRTY↔SYNCING↔CLEAN transitions) |

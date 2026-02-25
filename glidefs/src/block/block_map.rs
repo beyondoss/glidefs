@@ -96,14 +96,25 @@ impl SparseBlockState {
     pub const SYNCING: u8 = 3;
 }
 
-const STATE_PAGE_BITS: usize = 12;
-const STATE_PAGE_SIZE: usize = 1 << STATE_PAGE_BITS; // 4096 entries per page
-const STATE_PAGE_MASK: usize = STATE_PAGE_SIZE - 1;
+/// Number of 2-bit entries packed into each `AtomicU8`.
+const ENTRIES_PER_BYTE: usize = 4;
+/// Size of one state page in bytes (one OS page).
+const STATE_PAGE_BYTES: usize = 4096;
+/// Number of block state entries per page (4096 bytes × 4 entries/byte).
+const STATE_PAGE_ENTRIES: usize = STATE_PAGE_BYTES * ENTRIES_PER_BYTE; // 16384
+const STATE_PAGE_BITS: usize = 14; // log2(16384)
+const STATE_PAGE_MASK: usize = STATE_PAGE_ENTRIES - 1;
 
-/// A page of 4096 block state entries (4096 bytes = one OS page).
+/// A page of 16,384 block state entries packed into 4,096 bytes (one OS page).
+///
+/// Each `AtomicU8` holds 4 entries at 2 bits each:
+/// - bits [1:0] = entry 0
+/// - bits [3:2] = entry 1
+/// - bits [5:4] = entry 2
+/// - bits [7:6] = entry 3
 #[repr(C, align(4096))]
 struct StatePage {
-    states: [AtomicU8; STATE_PAGE_SIZE],
+    data: [AtomicU8; STATE_PAGE_BYTES],
 }
 
 impl StatePage {
@@ -114,18 +125,17 @@ impl StatePage {
     }
 }
 
-/// Sparse block state map using a two-level page table.
+/// Sparse block state map using a two-level page table with 2-bit packing.
 ///
 /// Only allocates 4 KB pages on first write to a block range. Unallocated
-/// pages implicitly contain `NOT_PRESENT` (0) for all entries.
+/// pages implicitly contain `NOT_PRESENT` (0) for all entries. Each page
+/// holds 16,384 entries (4 entries per `AtomicU8` × 4,096 bytes).
 ///
-/// State encoding folds presence into the state byte:
+/// State encoding (2 bits per entry):
 /// - `0` = NotPresent (never written to SSD)
 /// - `1` = Clean (present on SSD, synced to S3)
 /// - `2` = Dirty (present on SSD, needs flush)
 /// - `3` = Syncing (present on SSD, upload in progress)
-///
-/// This eliminates the need for a separate presence bitmap.
 pub struct SparseStateMap {
     directory: Box<[AtomicPtr<StatePage>]>,
     num_pages: usize,
@@ -154,7 +164,7 @@ impl Drop for SparseStateMap {
 impl SparseStateMap {
     /// Create a new sparse state map with no pages allocated.
     pub fn new(num_entries: usize) -> Self {
-        let num_pages = num_entries.div_ceil(STATE_PAGE_SIZE);
+        let num_pages = num_entries.div_ceil(STATE_PAGE_ENTRIES);
         let directory = (0..num_pages)
             .map(|_| AtomicPtr::new(ptr::null_mut()))
             .collect::<Vec<_>>()
@@ -196,12 +206,19 @@ impl SparseStateMap {
         dir_bytes + page_bytes
     }
 
-    // -- Page access helpers --------------------------------------------------
+    // -- Index decomposition --------------------------------------------------
 
+    /// Decompose a block index into (page_idx, byte_idx_within_page, bit_shift).
     #[inline(always)]
-    fn split_index(idx: usize) -> (usize, usize) {
-        (idx >> STATE_PAGE_BITS, idx & STATE_PAGE_MASK)
+    fn split_index(idx: usize) -> (usize, usize, u32) {
+        let page_idx = idx >> STATE_PAGE_BITS;
+        let entry_in_page = idx & STATE_PAGE_MASK;
+        let byte_idx = entry_in_page / ENTRIES_PER_BYTE;
+        let shift = ((idx % ENTRIES_PER_BYTE) * 2) as u32;
+        (page_idx, byte_idx, shift)
     }
+
+    // -- Page access helpers --------------------------------------------------
 
     #[inline]
     fn load_page(&self, page_idx: usize) -> Option<&StatePage> {
@@ -209,6 +226,8 @@ impl SparseStateMap {
         if ptr.is_null() {
             None
         } else {
+            // SAFETY: Non-null pointers in the directory are valid Box<StatePage>
+            // allocations that live for the lifetime of this SparseStateMap.
             Some(unsafe { &*ptr })
         }
     }
@@ -252,9 +271,9 @@ impl SparseStateMap {
     /// not allocated.
     #[inline]
     pub fn get(&self, idx: usize) -> u8 {
-        let (page_idx, entry_idx) = Self::split_index(idx);
+        let (page_idx, byte_idx, shift) = Self::split_index(idx);
         match self.load_page(page_idx) {
-            Some(page) => page.states[entry_idx].load(Ordering::Acquire),
+            Some(page) => (page.data[byte_idx].load(Ordering::Acquire) >> shift) & 0x3,
             None => SparseBlockState::NOT_PRESENT,
         }
     }
@@ -271,80 +290,96 @@ impl SparseStateMap {
     /// Allocates the page if needed.
     #[inline]
     pub fn set_present(&self, idx: usize) {
-        let (page_idx, entry_idx) = Self::split_index(idx);
+        let (page_idx, byte_idx, shift) = Self::split_index(idx);
         let page = self.ensure_page(page_idx);
-        // Only transition NOT_PRESENT → CLEAN. If already present, no-op.
-        let _ = page.states[entry_idx].compare_exchange(
-            SparseBlockState::NOT_PRESENT,
-            SparseBlockState::CLEAN,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        let mask = 0x3u8 << shift;
+        loop {
+            let old = page.data[byte_idx].load(Ordering::Acquire);
+            if (old >> shift) & 0x3 != SparseBlockState::NOT_PRESENT {
+                break; // already present
+            }
+            let new = (old & !mask) | (SparseBlockState::CLEAN << shift);
+            if page.data[byte_idx]
+                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 
     /// Compare-and-swap the state for a block.
     ///
     /// Returns `Ok(old)` on success, `Err(actual)` on failure.
-    /// Allocates the page if needed (only when `new != NOT_PRESENT`).
+    /// If the page doesn't exist, the current state is NOT_PRESENT.
     #[inline]
     pub fn cas(&self, idx: usize, expected: u8, new: u8) -> Result<u8, u8> {
-        let (page_idx, entry_idx) = Self::split_index(idx);
-        // For transitions to NOT_PRESENT, the page might not exist.
-        let page = if new == SparseBlockState::NOT_PRESENT {
-            match self.load_page(page_idx) {
-                Some(p) => p,
-                None => {
-                    // Page doesn't exist, so current state is NOT_PRESENT.
-                    return if expected == SparseBlockState::NOT_PRESENT {
-                        Ok(SparseBlockState::NOT_PRESENT)
-                    } else {
-                        Err(SparseBlockState::NOT_PRESENT)
-                    };
-                }
-            }
-        } else {
-            // Page allocation can't fail here because we only enforce budget
-            // on set_present (the first write). Subsequent state transitions
-            // hit already-allocated pages.
-            match self.load_page(page_idx) {
-                Some(p) => p,
-                None => {
-                    // Page doesn't exist → current is NOT_PRESENT.
-                    return Err(SparseBlockState::NOT_PRESENT);
-                }
+        let (page_idx, byte_idx, shift) = Self::split_index(idx);
+        let mask = 0x3u8 << shift;
+
+        let page = match self.load_page(page_idx) {
+            Some(p) => p,
+            None => {
+                // Page doesn't exist → current state is NOT_PRESENT.
+                return if expected == SparseBlockState::NOT_PRESENT {
+                    Ok(SparseBlockState::NOT_PRESENT)
+                } else {
+                    Err(SparseBlockState::NOT_PRESENT)
+                };
             }
         };
-        match page.states[entry_idx].compare_exchange(
-            expected,
-            new,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => Ok(expected),
-            Err(actual) => Err(actual),
+
+        loop {
+            let old = page.data[byte_idx].load(Ordering::Acquire);
+            let current = (old >> shift) & 0x3;
+            if current != expected {
+                return Err(current);
+            }
+            let updated = (old & !mask) | (new << shift);
+            match page.data[byte_idx].compare_exchange(
+                old,
+                updated,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(expected),
+                Err(_) => continue, // another entry in same byte was modified, retry
+            }
         }
     }
 
-    /// Iterate over all allocated pages, yielding `(block_index, state)` for
-    /// entries matching the given `target_state`.
+    /// Iterate over all allocated pages, yielding block indices for entries
+    /// matching the given `target_state`.
     ///
-    /// Only visits allocated pages — O(allocated_pages × PAGE_SIZE), not
-    /// O(total_blocks). This is a major win for sparse exports.
+    /// Only visits allocated pages — O(allocated_pages × PAGE_BYTES), not
+    /// O(total_blocks). Bytes where all 4 entries are NOT_PRESENT (0x00) are
+    /// skipped with a single comparison.
     pub fn iter_with_state(&self, target_state: u8) -> impl Iterator<Item = usize> + '_ {
+        let num_entries = self.num_entries;
         (0..self.num_pages).flat_map(move |page_idx| {
             let page = self.load_page(page_idx);
-            let page_start = page_idx << STATE_PAGE_BITS;
-            let page_end = std::cmp::min(page_start + STATE_PAGE_SIZE, self.num_entries);
-            let count = page_end - page_start;
+            let page_start = page_idx * STATE_PAGE_ENTRIES;
 
-            (0..count).filter_map(move |entry_idx| {
-                let page = page?;
-                let state = page.states[entry_idx].load(Ordering::Acquire);
-                if state == target_state {
-                    Some(page_start + entry_idx)
-                } else {
-                    None
-                }
+            (0..STATE_PAGE_BYTES).flat_map(move |byte_idx| {
+                let val = page
+                    .map(|p| p.data[byte_idx].load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                let base = page_start + byte_idx * ENTRIES_PER_BYTE;
+                (0..ENTRIES_PER_BYTE as u32).filter_map(move |slot| {
+                    if val == 0 {
+                        return None; // all 4 entries NOT_PRESENT
+                    }
+                    let idx = base + slot as usize;
+                    if idx >= num_entries {
+                        return None;
+                    }
+                    let state = (val >> (slot * 2)) & 0x3;
+                    if state == target_state {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
             })
         })
     }
@@ -352,23 +387,34 @@ impl SparseStateMap {
     /// Iterate over all allocated pages, yielding `(block_index, state)` for
     /// entries with a non-zero state (present blocks).
     ///
-    /// Only visits allocated pages — O(allocated_pages × PAGE_SIZE), not
-    /// O(total_blocks). This is a major win for sparse exports.
+    /// Only visits allocated pages. Bytes where all 4 entries are NOT_PRESENT
+    /// (0x00) are skipped with a single comparison.
     pub fn iter_present(&self) -> impl Iterator<Item = (usize, u8)> + '_ {
+        let num_entries = self.num_entries;
         (0..self.num_pages).flat_map(move |page_idx| {
             let page = self.load_page(page_idx);
-            let page_start = page_idx << STATE_PAGE_BITS;
-            let page_end = std::cmp::min(page_start + STATE_PAGE_SIZE, self.num_entries);
-            let count = page_end - page_start;
+            let page_start = page_idx * STATE_PAGE_ENTRIES;
 
-            (0..count).filter_map(move |entry_idx| {
-                let page = page?;
-                let state = page.states[entry_idx].load(Ordering::Acquire);
-                if state != SparseBlockState::NOT_PRESENT {
-                    Some((page_start + entry_idx, state))
-                } else {
-                    None
-                }
+            (0..STATE_PAGE_BYTES).flat_map(move |byte_idx| {
+                let val = page
+                    .map(|p| p.data[byte_idx].load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                let base = page_start + byte_idx * ENTRIES_PER_BYTE;
+                (0..ENTRIES_PER_BYTE as u32).filter_map(move |slot| {
+                    if val == 0 {
+                        return None;
+                    }
+                    let idx = base + slot as usize;
+                    if idx >= num_entries {
+                        return None;
+                    }
+                    let state = (val >> (slot * 2)) & 0x3;
+                    if state != SparseBlockState::NOT_PRESENT {
+                        Some((idx, state))
+                    } else {
+                        None
+                    }
+                })
             })
         })
     }
@@ -378,29 +424,25 @@ impl SparseStateMap {
         let mut count = 0;
         for page_idx in 0..self.num_pages {
             if let Some(page) = self.load_page(page_idx) {
-                let page_end =
-                    std::cmp::min((page_idx + 1) << STATE_PAGE_BITS, self.num_entries);
-                let page_start = page_idx << STATE_PAGE_BITS;
-                for entry_idx in 0..(page_end - page_start) {
-                    if page.states[entry_idx].load(Ordering::Relaxed)
-                        != SparseBlockState::NOT_PRESENT
-                    {
-                        count += 1;
+                let page_start = page_idx * STATE_PAGE_ENTRIES;
+                for byte_idx in 0..STATE_PAGE_BYTES {
+                    let val = page.data[byte_idx].load(Ordering::Relaxed);
+                    if val == 0 {
+                        continue;
+                    }
+                    for slot in 0..ENTRIES_PER_BYTE as u32 {
+                        let idx = page_start + byte_idx * ENTRIES_PER_BYTE + slot as usize;
+                        if idx >= self.num_entries {
+                            break;
+                        }
+                        if (val >> (slot * 2)) & 0x3 != SparseBlockState::NOT_PRESENT {
+                            count += 1;
+                        }
                     }
                 }
             }
         }
         count
-    }
-
-    /// Load state for a block, returning the `AtomicU8` reference if the page
-    /// exists. Used by snapshot to read flags without allocating.
-    #[allow(dead_code)]
-    #[inline]
-    pub fn load_atomic(&self, idx: usize) -> Option<&AtomicU8> {
-        let (page_idx, entry_idx) = Self::split_index(idx);
-        self.load_page(page_idx)
-            .map(|page| &page.states[entry_idx])
     }
 }
 
@@ -589,5 +631,280 @@ mod tests {
         let compressed = lz4_compress(&data);
         let decompressed = lz4_decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    // ========================================================================
+    // SparseStateMap tests
+    // ========================================================================
+
+    #[test]
+    fn test_sparse_state_map_initial_state() {
+        let map = SparseStateMap::new(1000);
+        assert_eq!(map.len(), 1000);
+        assert!(!map.is_empty());
+        assert_eq!(map.allocated_pages(), 0);
+        // All entries start as NOT_PRESENT
+        for i in [0, 1, 2, 3, 500, 999] {
+            assert_eq!(map.get(i), SparseBlockState::NOT_PRESENT);
+            assert!(!map.is_present(i));
+        }
+    }
+
+    #[test]
+    fn test_sparse_state_map_packing_all_slots() {
+        // Verify each 2-bit slot position (0-3) within a byte works correctly
+        let map = SparseStateMap::new(8);
+
+        for slot in 0..4u8 {
+            let idx = slot as usize;
+            map.set_present(idx);
+            assert_eq!(map.get(idx), SparseBlockState::CLEAN);
+            assert!(map.is_present(idx));
+
+            // Transition through all states
+            assert!(map
+                .cas(idx, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
+                .is_ok());
+            assert_eq!(map.get(idx), SparseBlockState::DIRTY);
+
+            assert!(map
+                .cas(idx, SparseBlockState::DIRTY, SparseBlockState::SYNCING)
+                .is_ok());
+            assert_eq!(map.get(idx), SparseBlockState::SYNCING);
+
+            assert!(map
+                .cas(idx, SparseBlockState::SYNCING, SparseBlockState::CLEAN)
+                .is_ok());
+            assert_eq!(map.get(idx), SparseBlockState::CLEAN);
+        }
+    }
+
+    #[test]
+    fn test_sparse_state_map_slot_isolation() {
+        // Modifying one slot must NOT affect adjacent slots in the same byte
+        let map = SparseStateMap::new(8);
+
+        // Set slot 0 to DIRTY, slot 1 to CLEAN, slot 2 to SYNCING, slot 3 stays NOT_PRESENT
+        map.set_present(0);
+        map.cas(0, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
+            .unwrap();
+        map.set_present(1);
+        map.set_present(2);
+        map.cas(2, SparseBlockState::CLEAN, SparseBlockState::SYNCING)
+            .unwrap();
+
+        assert_eq!(map.get(0), SparseBlockState::DIRTY);
+        assert_eq!(map.get(1), SparseBlockState::CLEAN);
+        assert_eq!(map.get(2), SparseBlockState::SYNCING);
+        assert_eq!(map.get(3), SparseBlockState::NOT_PRESENT);
+
+        // Now modify slot 1 → should not touch 0, 2, 3
+        map.cas(1, SparseBlockState::CLEAN, SparseBlockState::SYNCING)
+            .unwrap();
+        assert_eq!(map.get(0), SparseBlockState::DIRTY);
+        assert_eq!(map.get(1), SparseBlockState::SYNCING);
+        assert_eq!(map.get(2), SparseBlockState::SYNCING);
+        assert_eq!(map.get(3), SparseBlockState::NOT_PRESENT);
+    }
+
+    #[test]
+    fn test_sparse_state_map_cas_failure() {
+        let map = SparseStateMap::new(4);
+        map.set_present(0);
+        // Expect DIRTY but actual is CLEAN → should fail
+        let result = map.cas(0, SparseBlockState::DIRTY, SparseBlockState::SYNCING);
+        assert_eq!(result, Err(SparseBlockState::CLEAN));
+    }
+
+    #[test]
+    fn test_sparse_state_map_cas_not_present_page() {
+        let map = SparseStateMap::new(STATE_PAGE_ENTRIES * 2);
+        // CAS on unallocated page with expected=NOT_PRESENT → Ok
+        let result = map.cas(
+            STATE_PAGE_ENTRIES + 5,
+            SparseBlockState::NOT_PRESENT,
+            SparseBlockState::NOT_PRESENT,
+        );
+        assert_eq!(result, Ok(SparseBlockState::NOT_PRESENT));
+
+        // CAS on unallocated page with expected=CLEAN → Err(NOT_PRESENT)
+        let result = map.cas(
+            STATE_PAGE_ENTRIES + 5,
+            SparseBlockState::CLEAN,
+            SparseBlockState::DIRTY,
+        );
+        assert_eq!(result, Err(SparseBlockState::NOT_PRESENT));
+    }
+
+    #[test]
+    fn test_sparse_state_map_set_present_idempotent() {
+        let map = SparseStateMap::new(4);
+        map.set_present(0);
+        assert_eq!(map.get(0), SparseBlockState::CLEAN);
+
+        // CAS to DIRTY
+        map.cas(0, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
+            .unwrap();
+        assert_eq!(map.get(0), SparseBlockState::DIRTY);
+
+        // set_present again should be a no-op (state is not NOT_PRESENT)
+        map.set_present(0);
+        assert_eq!(map.get(0), SparseBlockState::DIRTY);
+    }
+
+    #[test]
+    fn test_sparse_state_map_cross_page_boundary() {
+        let n = STATE_PAGE_ENTRIES + 4;
+        let map = SparseStateMap::new(n);
+
+        // Set entries at page boundary
+        let last_on_page0 = STATE_PAGE_ENTRIES - 1;
+        let first_on_page1 = STATE_PAGE_ENTRIES;
+
+        map.set_present(last_on_page0);
+        map.set_present(first_on_page1);
+
+        assert_eq!(map.get(last_on_page0), SparseBlockState::CLEAN);
+        assert_eq!(map.get(first_on_page1), SparseBlockState::CLEAN);
+        assert_eq!(map.allocated_pages(), 2);
+    }
+
+    #[test]
+    fn test_sparse_state_map_iter_with_state() {
+        let map = SparseStateMap::new(32);
+
+        map.set_present(0);
+        map.set_present(5);
+        map.set_present(10);
+        map.set_present(20);
+
+        // Mark some dirty
+        map.cas(5, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
+            .unwrap();
+        map.cas(20, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
+            .unwrap();
+
+        let clean: Vec<usize> = map.iter_with_state(SparseBlockState::CLEAN).collect();
+        assert_eq!(clean, vec![0, 10]);
+
+        let dirty: Vec<usize> = map.iter_with_state(SparseBlockState::DIRTY).collect();
+        assert_eq!(dirty, vec![5, 20]);
+
+        let syncing: Vec<usize> = map.iter_with_state(SparseBlockState::SYNCING).collect();
+        assert!(syncing.is_empty());
+    }
+
+    #[test]
+    fn test_sparse_state_map_iter_present() {
+        let map = SparseStateMap::new(16);
+        map.set_present(1);
+        map.set_present(3);
+        map.set_present(7);
+
+        map.cas(3, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
+            .unwrap();
+        map.cas(7, SparseBlockState::CLEAN, SparseBlockState::SYNCING)
+            .unwrap();
+
+        let present: Vec<(usize, u8)> = map.iter_present().collect();
+        assert_eq!(
+            present,
+            vec![
+                (1, SparseBlockState::CLEAN),
+                (3, SparseBlockState::DIRTY),
+                (7, SparseBlockState::SYNCING),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_sparse_state_map_count_present() {
+        let map = SparseStateMap::new(100);
+        assert_eq!(map.count_present(), 0);
+
+        map.set_present(0);
+        map.set_present(50);
+        map.set_present(99);
+        assert_eq!(map.count_present(), 3);
+    }
+
+    #[test]
+    fn test_sparse_state_map_memory_usage_4x_smaller() {
+        // Verify the directory is 4x smaller than a naive 1-byte-per-entry approach.
+        // Use entry counts that divide evenly by both 4096 and 16384 for clean math.
+        let n = STATE_PAGE_ENTRIES * 10; // 163,840 entries
+        let map = SparseStateMap::new(n);
+
+        let old_num_pages = n / 4096;  // 1 byte per entry, 4096 entries/page = 40
+        let new_num_pages = n / 16384; // 2 bits per entry, 16384 entries/page = 10
+        assert_eq!(map.num_pages, new_num_pages);
+        assert_eq!(old_num_pages, new_num_pages * 4); // exactly 4x fewer pages
+
+        // Also verify the constants are correct
+        assert_eq!(ENTRIES_PER_BYTE, 4);
+        assert_eq!(STATE_PAGE_ENTRIES, STATE_PAGE_BYTES * ENTRIES_PER_BYTE);
+        assert_eq!(STATE_PAGE_ENTRIES, 1 << STATE_PAGE_BITS);
+    }
+
+    #[test]
+    fn test_sparse_state_map_concurrent_cas_adjacent_slots() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let map = Arc::new(SparseStateMap::new(1024));
+
+        // Pre-populate entries across multiple groups of 4
+        for i in 0..128 {
+            map.set_present(i);
+        }
+
+        // Spawn threads that CAS adjacent entries (same byte) concurrently
+        let mut handles = Vec::new();
+        for slot_offset in 0..4 {
+            let map = Arc::clone(&map);
+            handles.push(thread::spawn(move || {
+                // Each thread works on one slot position across many bytes
+                for byte_group in 0..32 {
+                    let idx = byte_group * 4 + slot_offset;
+                    // CLEAN → DIRTY
+                    loop {
+                        match map.cas(idx, SparseBlockState::CLEAN, SparseBlockState::DIRTY) {
+                            Ok(_) => break,
+                            Err(SparseBlockState::CLEAN) => continue, // spurious CAS failure from adjacent slot
+                            Err(other) => panic!("unexpected state {} at idx {}", other, idx),
+                        }
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify all entries transitioned to DIRTY
+        for i in 0..128 {
+            assert_eq!(
+                map.get(i),
+                SparseBlockState::DIRTY,
+                "entry {} should be DIRTY",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_sparse_state_map_iter_respects_num_entries() {
+        // num_entries doesn't align to page boundary — iterator must not yield
+        // phantom entries beyond num_entries
+        let n = 10; // much less than STATE_PAGE_ENTRIES
+        let map = SparseStateMap::new(n);
+        for i in 0..n {
+            map.set_present(i);
+        }
+
+        let present: Vec<(usize, u8)> = map.iter_present().collect();
+        assert_eq!(present.len(), n);
+        assert!(present.iter().all(|&(idx, _)| idx < n));
     }
 }
