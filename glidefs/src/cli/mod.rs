@@ -33,6 +33,9 @@ pub enum Commands {
         /// Base image name (e.g., "ubuntu-22.04-node20-v3")
         #[arg(long)]
         name: String,
+        /// S3 prefix (export namespace) to write the blessed image into
+        #[arg(long)]
+        s3_prefix: String,
         /// Config file (for storage URL + credentials)
         #[arg(short, long)]
         config: PathBuf,

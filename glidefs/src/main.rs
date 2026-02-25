@@ -30,9 +30,10 @@ async fn main() -> Result<()> {
         cli::Commands::Bless {
             image,
             name,
+            s3_prefix,
             config,
         } => {
-            cli::bless::run_bless(image, name, config).await?;
+            cli::bless::run_bless(image, name, s3_prefix, config).await?;
         }
         cli::Commands::Gc {
             config,

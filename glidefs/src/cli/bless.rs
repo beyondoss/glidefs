@@ -2,7 +2,7 @@ use crate::block::block_map::{blake3_128, lz4_compress, zero_block_hash, Blake3H
 use crate::block::chunk_meta::{ChunkMeta, ChunkMetaEntry};
 use crate::block::content_store::ContentStore;
 use crate::block::manifest::serialize_hot_set;
-use crate::block::pack::{assemble_pack, DEFAULT_BLOCKS_PER_PACK};
+use crate::block::pack::assemble_pack;
 use crate::block::volume_manifest::{VolumeManifest, DEFAULT_CHUNK_SIZE};
 use crate::config::Settings;
 use crate::parse_object_store::parse_url_opts;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 /// Fixed block size for the chunked architecture: 128KB.
 const BLOCK_SIZE: u32 = 131_072;
 
-pub async fn run_bless(image_path: PathBuf, name: String, config_path: PathBuf) -> Result<()> {
+pub async fn run_bless(image_path: PathBuf, name: String, s3_prefix: String, config_path: PathBuf) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -44,7 +44,8 @@ pub async fn run_bless(image_path: PathBuf, name: String, config_path: PathBuf) 
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
     let db_path = path_from_url.to_string();
 
-    let content_store = ContentStore::new(Arc::clone(&object_store), &db_path);
+    let base = format!("{}/exports/{}", db_path, s3_prefix);
+    let content_store = ContentStore::new(Arc::clone(&object_store), &base);
 
     info!(image = %image_path.display(), name = %name, "starting bless");
 
@@ -128,13 +129,16 @@ pub async fn run_bless(image_path: PathBuf, name: String, config_path: PathBuf) 
             }
         }
 
-        // Assemble and upload packs for new blocks
+        // Assemble all new blocks in this chunk as a single pack (1-chunk packs).
+        // Base images are known upfront and read-only — fewer, larger packs mean
+        // fewer S3 objects, faster ingestion, and less GC work with no read penalty
+        // (blocks are fetched via S3 range GET regardless of pack size).
         let mut hash_to_pack_loc: HashMap<Blake3Hash, (Uuid, u32, u32)> = HashMap::new();
 
-        for pack_batch in new_blocks.chunks(DEFAULT_BLOCKS_PER_PACK) {
+        if !new_blocks.is_empty() {
             let pack_id = Uuid::new_v4();
             let (pack_bytes, index_entries) =
-                assemble_pack(pack_batch.to_vec(), BLOCK_SIZE)?;
+                assemble_pack(new_blocks, BLOCK_SIZE)?;
             let pack_size = pack_bytes.len() as u64;
 
             content_store
@@ -444,10 +448,10 @@ mod tests {
 
             let mut hash_to_pack_loc: HashMap<Blake3Hash, (Uuid, u32, u32)> = HashMap::new();
 
-            for pack_batch in new_blocks.chunks(DEFAULT_BLOCKS_PER_PACK) {
+            if !new_blocks.is_empty() {
                 let pack_id = Uuid::new_v4();
                 let (pack_bytes, index_entries) =
-                    assemble_pack(pack_batch.to_vec(), BLOCK_SIZE)?;
+                    assemble_pack(new_blocks, BLOCK_SIZE)?;
                 let pack_size = pack_bytes.len() as u64;
 
                 content_store

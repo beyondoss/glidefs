@@ -104,10 +104,12 @@ PUT is idempotent. Same size → returns current state. Larger size → grows th
 | `/api/exports/{name}` | GET | Get export info |
 | `/api/exports/{name}` | DELETE | Remove export. `?purge=true` deletes local cache and all S3 snapshots. |
 | `/api/exports/{name}/drain` | POST | Flush all dirty blocks to S3 (no snapshot created) |
-| `/api/exports/{name}/snapshot` | POST | Flush dirty blocks + create versioned snapshot. Returns `{sequence, manifest_etag}`. |
+| `/api/exports/{name}/snapshot` | POST | Flush dirty blocks + create versioned snapshot. Optional body `{"tag": "..."}`. Returns `{sequence, manifest_etag, tag}`. |
 | `/api/exports/{name}/snapshots` | GET | List snapshot sequences in ascending order |
 | `/api/exports/{name}/snapshots/{seq}` | DELETE | Delete a specific snapshot (idempotent) |
+| `/api/exports/{name}/tag` | POST | Tag the current manifest without flushing. Body: `{"tag": "..."}`. |
 | `/api/exports/{name}/promote` | POST | Promote readonly to read-write |
+| `/api/manifests/{s3_prefix}/{name}` | HEAD | 200 if manifest exists, 404 if not. No running export required. |
 | `/health/ready` | GET | Readiness check |
 | `/api/exports/{name}/metrics` | GET | I/O metrics |
 | `/health` | GET | Health check |
@@ -118,10 +120,102 @@ PUT is idempotent. Same size → returns current state. Larger size → grows th
 Create content-addressed base images from raw disk files:
 
 ```sh
-glidefs bless --image ubuntu-22.04.raw --name ubuntu-22.04-v1 --config glidefs.toml
+glidefs bless --image ubuntu-22.04.raw --name ubuntu-22.04-v1 --s3-prefix bases --config glidefs.toml
 ```
 
 Exports forked from base images share blocks via content addressing. Identical data is stored once.
+
+Fork from a blessed image using `manifest_name: "bases/{name}"`:
+
+```sh
+curl -X PUT localhost:8080/api/exports/vm-1 \
+  -d '{"size_gb": 50, "manifest_name": "bases/ubuntu-22.04-v1"}'
+```
+
+## Deployments
+
+Fork is instant — parent blocks are copy-on-write, not copied. Two flows.
+
+### Code deploy (setup unchanged)
+
+Parent VM already has OS + runtime. Deploy is just new app code.
+
+```sh
+# 1. Snapshot production (safety net + rollback point)
+curl -sX POST localhost:8080/api/exports/prod/snapshot \
+  -d '{"tag": "pre-deploy-7"}'
+# → {"sequence": 42, "manifest_etag": "...", "tag": "pre-deploy-7"}
+
+# 2. Fork — instant CoW, no data copied
+curl -X PUT localhost:8080/api/exports/vm-deploy-7 \
+  -d '{"size_gb": 50, "manifest_name": "prod"}'
+# → {"device": "/dev/nbd1", ...}
+
+# 3. Mount + sync code + start
+mount /dev/nbd1 /mnt
+rsync -a ./dist/ /mnt/app/code/
+systemctl start my-app
+
+# 4. Health check → swap traffic → delete old export
+curl localhost:8080/api/exports/vm-deploy-7/metrics  # verify
+curl -X DELETE localhost:8080/api/exports/prod-old
+```
+
+Setup is untouched. Deploy is seconds.
+
+### Setup change (new dependency or runtime bump)
+
+Compute a content-derived hash from image + deps. Tag IS the cache key — no external state needed.
+
+```
+hash = blake3(image_id + lockfile_hash)
+
+HEAD /api/manifests/bases/setup-{hash}
+              │
+         ┌────┴────┐
+        200        404
+         │          │
+   fork from    fork from base
+   cached       → run setup
+   setup        → snapshot+tag("setup-{hash}")
+         │          │
+         └────┬─────┘
+              │
+    sync code → deploy → swap traffic
+```
+
+```sh
+SETUP_HASH=$(echo "${IMAGE_ID}:${LOCKFILE_HASH}" | blake3)
+
+# Check if this setup was already built
+STATUS=$(curl -so /dev/null -w "%{http_code}" \
+  -X HEAD localhost:8080/api/manifests/bases/setup-${SETUP_HASH})
+
+if [ "$STATUS" -eq 200 ]; then
+  # Hit: fork from cached setup, skip straight to code sync
+  SOURCE="setup-${SETUP_HASH}"
+else
+  # Miss: fork from base, run setup, tag result
+  curl -X PUT localhost:8080/api/exports/setup-work \
+    -d '{"size_gb": 50, "manifest_name": "bases/ubuntu-24.04-v1"}'
+
+  mount /dev/nbd1 /mnt
+  mise install node@22 && npm ci --prefix /mnt/app
+  umount /mnt
+
+  curl -X POST localhost:8080/api/exports/setup-work/snapshot \
+    -d "{\"tag\": \"setup-${SETUP_HASH}\"}"
+  curl -X DELETE localhost:8080/api/exports/setup-work
+
+  SOURCE="setup-${SETUP_HASH}"
+fi
+
+# Fork from setup state, sync code, deploy
+curl -X PUT localhost:8080/api/exports/vm-deploy-8 \
+  -d "{\"size_gb\": 50, \"manifest_name\": \"${SOURCE}\"}"
+```
+
+Same `IMAGE_ID + LOCKFILE_HASH` next deploy → HEAD returns 200 → setup is skipped entirely.
 
 ## Operations
 

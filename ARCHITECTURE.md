@@ -123,17 +123,15 @@ Ensures all flushed chunks are discoverable on cross-host recovery.
 
 ```
 {db_path}/
-├── exports/{export_name}/
-│   └── export.json                              ← Export definition (name, size_gb, s3_prefix)
-├── manifests/{export_name}                      ← VolumeManifest JSON (chunk_idx → chunk_hash)
-├── manifests/{tag_name}                         ← Named manifest tag (same format, arbitrary name)
-├── snapshots/{export_name}/{sequence:020}       ← Versioned VolumeManifest (zero-padded)
-├── chunks/{chunk_idx:04}/
-│   ├── {hex_chunk_hash}.meta                    ← ChunkMeta (GLCM binary, content-addressed)
-│   └── {uuid}.pack                              ← Block data packs (GLPK binary)
-└── bases/{image_name}
-    ├── manifests/{image_name}                   ← Blessed base image VolumeManifest
-    └── manifests/{image_name}.hot-set           ← Boot hot set (block indices)
+└── exports/{s3_prefix}/                         ← ContentStore root (shared by exports + bless)
+    ├── manifests/{export_name}                  ← VolumeManifest JSON (chunk_idx → chunk_hash)
+    ├── manifests/{tag_name}                     ← Named manifest tag (same format, arbitrary name)
+    ├── manifests/bases/{image_name}             ← Blessed base image VolumeManifest (glidefs bless)
+    ├── manifests/bases/{image_name}.hot-set     ← Boot hot set for base image (block indices)
+    ├── snapshots/{export_name}/{sequence:020}   ← Versioned VolumeManifest (zero-padded)
+    └── chunks/{chunk_idx:04}/
+        ├── {hex_chunk_hash}.meta                ← ChunkMeta (GLCM binary, content-addressed)
+        └── {uuid}.pack                          ← Block data packs (GLPK binary)
 ```
 
 Chunk directories use 4-digit zero-padded indices (`chunks/0000/`, `chunks/0001/`, ...). A 1TB device with 128KB blocks has up to 98 volume chunks (10GB each). Manifests are atomic overwrites — the latest is always consistent. ChunkMeta files are immutable and content-addressed — their filename IS their BLAKE3-128 hash, so old files are orphaned (not overwritten) when chunks are updated and reclaimed by GC.
@@ -625,12 +623,12 @@ Each dirty block gets CRC32 computed **once** (at checkpoint) and verified **onc
 |---------|---------|
 | `glidefs init [path]` | Generate a default `glidefs.toml` config file |
 | `glidefs run -c glidefs.toml` | Start the block server (NBD + optional ublk) with HTTP management API |
-| `glidefs bless --image disk.raw --name ubuntu-22.04 -c glidefs.toml` | Convert a raw disk image into a content-addressed base image in S3 |
+| `glidefs bless --image disk.raw --name ubuntu-22.04 --s3-prefix bases -c glidefs.toml` | Convert a raw disk image into a content-addressed base image in S3 |
 | `glidefs gc -c glidefs.toml [--dry-run] [--grace-period 24h]` | Delete orphaned packs and .meta files in S3 |
 
 ### Bless Pipeline
 
-`glidefs bless` reads a raw disk image sequentially, partitions 128KB blocks by 10GB volume chunk, deduplicates against existing ChunkMeta files in S3, compresses unique blocks into chunk-scoped packs, uploads them, and builds a VolumeManifest. Output: a VolumeManifest at `bases/manifests/{name}` and a hot set at `bases/manifests/{name}.hot-set`.
+`glidefs bless` reads a raw disk image sequentially, partitions 128KB blocks by 10GB volume chunk, deduplicates against existing ChunkMeta files in S3, compresses unique blocks into chunk-scoped packs (one pack per volume chunk), uploads them, and builds a VolumeManifest. Output: a VolumeManifest at `exports/{s3_prefix}/manifests/bases/{name}` and a hot set at `exports/{s3_prefix}/manifests/bases/{name}.hot-set`. Bless shares the same ContentStore namespace as runtime exports, so forks from base images work via `manifest_name: "bases/{name}"` with no cross-namespace copying.
 
 Cross-image dedup: if blessing `ubuntu-22.04-node20-v3` after `ubuntu-22.04-node20-v2`, shared volume chunks produce identical ChunkMeta content hashes — the existing `.meta` files are reused and only delta blocks are uploaded. (`cli/bless.rs`)
 
