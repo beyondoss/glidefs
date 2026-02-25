@@ -54,7 +54,7 @@ pub async fn flush_scheduler(
     // Pending manifest sync: if sync_manifest fails after a successful pack
     // flush, we retry on the next checkpoint tick to close the window where
     // packs are on S3 but not referenced by any manifest.
-    let mut manifest_pending: Option<u64> = None;
+    let mut manifest_pending = false;
 
     loop {
         tokio::select! {
@@ -89,10 +89,11 @@ pub async fn flush_scheduler(
                 // drain/snapshot operations. Prevents stale manifest uploads.
                 let _flush_guard = cache.flush_lock().lock().await;
                 match cache.flush_packs(&content_store, &chunk_meta_cache, &volume_manifest).await {
-                    Ok((stats, seq_cutpoint)) => {
+                    Ok((stats, _seq_cutpoint)) => {
                         flush_backoff = Duration::ZERO;
                         metrics.record_s3_put_latency(start.elapsed());
                         metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
+                        metrics.record_flush_blocks_corrupted(stats.blocks_corrupted);
                         if stats.packs_uploaded > 0 {
                             info!(
                                 packs = stats.packs_uploaded,
@@ -106,7 +107,7 @@ pub async fn flush_scheduler(
                             // Retry up to 3 times; if all fail, defer to checkpoint tick.
                             let mut synced = false;
                             for attempt in 0..3 {
-                                match cache.sync_manifest(&content_store, &volume_manifest, seq_cutpoint).await {
+                                match cache.sync_manifest(&content_store, &volume_manifest).await {
                                     Ok(()) => { synced = true; break; }
                                     Err(e) => {
                                         metrics.record_manifest_sync_error();
@@ -115,9 +116,14 @@ pub async fn flush_scheduler(
                                 }
                             }
                             if synced {
-                                manifest_pending = None;
+                                manifest_pending = false;
                             } else {
-                                manifest_pending = Some(seq_cutpoint);
+                                // Checkpoint locally to bound WAL growth even
+                                // when manifest sync is failing.
+                                if let Err(e) = cache.local_checkpoint() {
+                                    warn!(error = %e, "checkpoint after failed manifest sync");
+                                }
+                                manifest_pending = true;
                             }
                         } else {
                             // No packs uploaded — still checkpoint to persist
@@ -149,12 +155,12 @@ pub async fn flush_scheduler(
             // Periodic: checkpoint every 5s + retry pending manifest sync.
             _ = checkpoint_ticker.tick() => {
                 // Retry manifest sync that failed after a previous pack flush.
-                if let Some(seq) = manifest_pending {
+                if manifest_pending {
                     let _flush_guard = cache.flush_lock().lock().await;
-                    match cache.sync_manifest(&content_store, &volume_manifest, seq).await {
+                    match cache.sync_manifest(&content_store, &volume_manifest).await {
                         Ok(()) => {
                             info!("deferred manifest sync succeeded");
-                            manifest_pending = None;
+                            manifest_pending = false;
                         }
                         Err(e) => {
                             metrics.record_manifest_sync_error();

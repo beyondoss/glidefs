@@ -71,6 +71,7 @@ pub struct ChunkMeta {
 
 impl ChunkMeta {
     /// Create an empty chunk meta for a given chunk.
+    #[allow(dead_code)]
     pub fn new(chunk_idx: u32, chunk_size: u64, block_size: u32) -> Self {
         Self {
             chunk_idx,
@@ -81,6 +82,7 @@ impl ChunkMeta {
     }
 
     /// Number of block entries.
+    #[allow(dead_code)]
     pub fn block_count(&self) -> u32 {
         self.entries.len() as u32
     }

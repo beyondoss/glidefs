@@ -113,6 +113,8 @@ pub struct ReadinessStatus {
 pub struct SnapshotResponse {
     pub manifest_etag: Option<String>,
     pub sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
 }
 
 /// State for a single export.
@@ -897,8 +899,17 @@ impl ExportRouter {
     /// Snapshot an export: flush dirty blocks to S3 and upload a manifest.
     ///
     /// Returns the manifest ETag and sequence number for use by the control plane.
-    pub async fn snapshot_export(&self, name: &str) -> Result<SnapshotResponse, RouterError> {
+    /// If `tag` is provided, also publishes the manifest under that name within
+    /// the export's S3 namespace (for content-addressed lookup by orchestrators).
+    pub async fn snapshot_export(
+        &self,
+        name: &str,
+        tag: Option<&str>,
+    ) -> Result<SnapshotResponse, RouterError> {
         validate_export_name(name)?;
+        if let Some(t) = tag {
+            validate_export_name(t)?;
+        }
         let exports = self.exports.read().await;
         let state = exports
             .get(name)
@@ -916,10 +927,61 @@ impl ExportRouter {
             name, result.sequence, result.stats.blocks_flushed, result.stats.packs_uploaded,
         );
 
+        // If a tag was provided, publish the manifest under that name too.
+        if let Some(tag) = tag {
+            let manifest_bytes = state.volume_manifest.read().serialize();
+            state
+                .content_store
+                .put_manifest(tag, manifest_bytes)
+                .await
+                .map_err(RouterError::ContentStore)?;
+            info!("Tagged snapshot of '{}' as '{}'", name, tag);
+        }
+
         Ok(SnapshotResponse {
             manifest_etag: result.manifest_etag,
             sequence: result.sequence,
+            tag: tag.map(|t| t.to_string()),
         })
+    }
+
+    /// Publish the current VolumeManifest under a tag name (without re-flushing).
+    ///
+    /// The tag is stored within the export's S3 namespace, so it can be used
+    /// as `manifest_name` when forking. Caller should snapshot first if they
+    /// want the tag to include all dirty data.
+    pub async fn tag_export(&self, name: &str, tag: &str) -> Result<(), RouterError> {
+        validate_export_name(name)?;
+        validate_export_name(tag)?;
+        let exports = self.exports.read().await;
+        let state = exports
+            .get(name)
+            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+        let manifest_bytes = state.volume_manifest.read().serialize();
+        state
+            .content_store
+            .put_manifest(tag, manifest_bytes)
+            .await
+            .map_err(RouterError::ContentStore)?;
+        info!("Tagged export '{}' as '{}'", name, tag);
+        Ok(())
+    }
+
+    /// Check if a manifest exists in S3 (HEAD request, no data transfer).
+    ///
+    /// Does not require a running export — resolves the manifest path from
+    /// `s3_prefix` and `manifest_name` against the router's object store.
+    pub async fn head_manifest(
+        &self,
+        s3_prefix: &str,
+        manifest_name: &str,
+    ) -> Result<bool, RouterError> {
+        let base = format!("{}/exports/{}", self.db_path, s3_prefix);
+        let cs = ContentStore::new(Arc::clone(&self.object_store), &base)
+            .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker));
+        cs.head_manifest(manifest_name)
+            .await
+            .map_err(RouterError::ContentStore)
     }
 
     /// List snapshot sequence numbers for an export.
@@ -2125,7 +2187,7 @@ mod tests {
         handler.write(128 * 1024, &[0xBB; 4096], false).unwrap();
 
         // Take snapshot
-        let result = router.snapshot_export("snap-vol").await;
+        let result = router.snapshot_export("snap-vol", None).await;
         assert!(
             result.is_ok(),
             "Snapshot should succeed: {:?}",
@@ -2141,7 +2203,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let router = create_test_router(&temp_dir).await;
 
-        let result = router.snapshot_export("nonexistent").await;
+        let result = router.snapshot_export("nonexistent", None).await;
         assert!(
             result.is_err(),
             "Snapshot should fail for nonexistent export"
@@ -2167,7 +2229,7 @@ mod tests {
         handler.write(0, &data, false).unwrap();
 
         // Snapshot source
-        let snap = router.snapshot_export("source").await.unwrap();
+        let snap = router.snapshot_export("source", None).await.unwrap();
         assert!(snap.sequence > 0);
 
         // Fork from snapshot
@@ -2207,7 +2269,7 @@ mod tests {
             .unwrap();
         let src_handler = router.get_handler("src").await.unwrap();
         src_handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
-        router.snapshot_export("src").await.unwrap();
+        router.snapshot_export("src", None).await.unwrap();
 
         // Fork
         let fork_config = ExportConfig {
@@ -2258,7 +2320,7 @@ mod tests {
         src_handler
             .write(128 * 1024, &[0xBB; 128 * 1024], false)
             .unwrap();
-        router.snapshot_export("src").await.unwrap();
+        router.snapshot_export("src", None).await.unwrap();
 
         // Fork
         let fork_config = ExportConfig {
@@ -2397,7 +2459,7 @@ mod tests {
             .unwrap();
         let parent_handler = router.get_handler("parent").await.unwrap();
         parent_handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
-        let _parent_snap = router.snapshot_export("parent").await.unwrap();
+        let _parent_snap = router.snapshot_export("parent", None).await.unwrap();
 
         // Fork from parent
         let fork_config = ExportConfig {
@@ -2422,10 +2484,10 @@ mod tests {
             .unwrap();
 
         // Snapshot the fork
-        router.snapshot_export("child").await.unwrap();
+        router.snapshot_export("child", None).await.unwrap();
 
         // Re-snapshot the parent — its manifest should be unchanged
-        let _parent_snap2 = router.snapshot_export("parent").await.unwrap();
+        let _parent_snap2 = router.snapshot_export("parent", None).await.unwrap();
         // No new writes to parent, so sequence should be the same or
         // flushed blocks should be 0
         // The important thing: parent data is unaffected
@@ -2553,7 +2615,7 @@ mod tests {
         assert!(data2.iter().all(|&b| b == 0x22), "second block after retry");
 
         // Snapshot should capture both blocks
-        let snap = router.snapshot_export("retry-vol").await.unwrap();
+        let snap = router.snapshot_export("retry-vol", None).await.unwrap();
         assert!(snap.sequence > 0);
     }
 

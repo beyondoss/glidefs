@@ -117,6 +117,7 @@ Ensures all flushed chunks are discoverable on cross-host recovery.
 | Snapshot | An explicit, versioned copy of an export's VolumeManifest stored at a stable S3 key. Never overwritten by background syncs. Pinned in S3 until explicitly deleted. | Not the same as a background `sync_manifest` — background syncs update `manifests/{name}` and do NOT create versioned snapshot keys |
 | Fork | A new export whose VolumeManifest is copied from a parent's. The fork starts with an empty local SparseStateMap; unwritten blocks resolve through VolumeManifest → ChunkMetaCache → S3. | Not a full copy — the parent's ChunkMeta and pack files are never duplicated |
 | Snapshot Sequence | A monotonic counter (`u64`) that increments on every flush. Identifies the point in time at which a snapshot was taken and used to fork from a specific historical state. | Not a timestamp — purely an ordering counter |
+| Manifest Tag | A named alias for a VolumeManifest, stored at `manifests/{tag}` within an export's S3 namespace. Created via `snapshot(tag=...)` or `tag_export(tag)`. Forkable by name; used by stateless orchestrators as a content-derived skip key. | Not a snapshot sequence — not versioned or immutable; overwriting the tag name updates the pointer |
 
 ## S3 Object Layout
 
@@ -125,6 +126,7 @@ Ensures all flushed chunks are discoverable on cross-host recovery.
 ├── exports/{export_name}/
 │   └── export.json                              ← Export definition (name, size_gb, s3_prefix)
 ├── manifests/{export_name}                      ← VolumeManifest JSON (chunk_idx → chunk_hash)
+├── manifests/{tag_name}                         ← Named manifest tag (same format, arbitrary name)
 ├── snapshots/{export_name}/{sequence:020}       ← Versioned VolumeManifest (zero-padded)
 ├── chunks/{chunk_idx:04}/
 │   ├── {hex_chunk_hash}.meta                    ← ChunkMeta (GLCM binary, content-addressed)
@@ -268,8 +270,11 @@ WriteCache::snapshot()
     ├── 3. put_snapshot()               write snapshots/{name}/{seq:020}  ← best-effort
     └── 4. checkpoint()                 persist block_states + max_seq, truncate WAL
     │
+    ▼ (if tag provided)
+put_manifest(tag)                       write manifests/{tag}  ← same bytes, named alias
+    │
     ▼
-Returns: { sequence, manifest_etag }
+Returns: { sequence, manifest_etag, tag? }
 ```
 
 Step 3 is best-effort. If the versioned snapshot upload fails, the base manifest (step 2) is already consistent — background flushes continue and the control plane can retry `snapshot()` to get a new versioned key. The sequence returned is the pack-flush sequence, not a separate counter.
@@ -301,10 +306,12 @@ Omitting `snapshot_sequence` forks from the current effective manifest (`manifes
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/exports/{name}/snapshot` | `POST` | Flush + upload versioned snapshot. Returns `{sequence, manifest_etag}`. |
+| `/api/exports/{name}/snapshot` | `POST` | Flush + upload versioned snapshot. Optional body `{"tag":"name"}` also publishes as named alias. Returns `{sequence, manifest_etag, tag?}`. |
 | `/api/exports/{name}/snapshots` | `GET` | List snapshot sequences in ascending order. Returns `[seq, ...]`. |
 | `/api/exports/{name}/snapshots/{seq}` | `DELETE` | Delete a specific snapshot (idempotent). |
-| `/api/exports/{name}` | `PUT` | With `manifest_name` + optional `snapshot_sequence`: fork from parent or specific snapshot. |
+| `/api/exports/{name}/tag` | `POST` | Publish current manifest under a tag name without re-flushing. Body: `{"tag":"name"}`. |
+| `/api/manifests/{s3_prefix}/{name}` | `HEAD` | Check if a named manifest exists (200/404). No data transfer. Does not require a running export. |
+| `/api/exports/{name}` | `PUT` | With `manifest_name` + optional `snapshot_sequence`: fork from parent, specific snapshot, or named tag. |
 
 ### GC and Snapshot Packs
 
@@ -326,6 +333,39 @@ GC reconcile_prefix():
 If the snapshot scan fails (S3 error), GC skips the entire export rather than risking deletion of snapshot-pinned data. (`cli/gc.rs:reconcile_prefix`)
 
 **Deleting a snapshot unpins its exclusive chunks** — .meta and .pack files not referenced by any other snapshot or the current manifest become orphaned and eligible for GC after the grace period.
+
+### Manifest Tags
+
+A manifest tag is a named alias for a VolumeManifest — stored at `manifests/{tag}` within the export's S3 namespace alongside the regular `manifests/{export_name}`. Tags are forkable by name (pass as `manifest_name` on export creation) and support a lightweight `HEAD` existence check.
+
+**Primary use case: stateless skip-ahead for orchestrators.** An orchestrator that has no database computes a content-derived hash:
+
+```
+setup_hash = blake3(image_id || setup_command || lockfile_hash)
+```
+
+Then:
+
+```
+HEAD /api/manifests/{s3_prefix}/setup-{hash}
+  → 200: fork from tag directly, skip setup entirely
+  → 404: build from base, run setup_command, then:
+         POST /api/exports/{name}/snapshot {"tag": "setup-{hash}"}
+         → tags the result for future deploys
+```
+
+The naming convention is the index. No external database. No drift. The tag lives next to the manifest data in S3.
+
+**Tag vs Snapshot sequence:**
+
+| | Snapshot Sequence | Manifest Tag |
+|---|---|---|
+| Identity | Monotonic `u64` per export | Arbitrary string |
+| Mutable | No — immutable once written | Yes — overwriting the tag updates the alias |
+| GC pinning | Yes — GC scans all snapshot keys | No — tags are `manifests/` keys, same as live manifest |
+| Use case | Rollback to historical state | Content-derived fork key for stateless orchestrators |
+
+(`router.rs:tag_export`, `router.rs:head_manifest`, `content_store.rs:head_manifest`, `api.rs:POST /tag`, `api.rs:HEAD /manifests`)
 
 ### Snapshot Invariants
 
@@ -604,9 +644,11 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 | `/api/exports/{name}` | `GET` | Get export info (size, readonly, transport, device path) |
 | `/api/exports/{name}` | `DELETE` | Remove export. `?purge=true` also deletes local cache and all S3 snapshots. |
 | `/api/exports` | `GET` | List all active exports |
-| `/api/exports/{name}/snapshot` | `POST` | Flush dirty blocks → S3, upload versioned manifest. Returns `{sequence, manifest_etag}`. |
+| `/api/exports/{name}/snapshot` | `POST` | Flush dirty blocks → S3, upload versioned manifest. Optional body `{"tag":"name"}` also publishes named alias. Returns `{sequence, manifest_etag, tag?}`. |
 | `/api/exports/{name}/snapshots` | `GET` | List snapshot sequences in ascending order |
 | `/api/exports/{name}/snapshots/{seq}` | `DELETE` | Delete a specific snapshot (idempotent) |
+| `/api/exports/{name}/tag` | `POST` | Publish current manifest under a named alias without re-flushing. Body: `{"tag":"name"}`. |
+| `/api/manifests/{s3_prefix}/{name}` | `HEAD` | Check manifest existence (200/404). No data transfer, no running export required. |
 | `/api/exports/{name}/drain` | `POST` | Flush all dirty blocks to S3 (no versioned snapshot) |
 | `/api/exports/{name}/promote` | `POST` | Toggle readonly → read-write |
 | `/api/exports/{name}/metrics` | `GET` | Per-export metrics snapshot (JSON) |

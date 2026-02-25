@@ -66,6 +66,7 @@ impl VolumeManifest {
     }
 
     /// Total number of chunks needed to cover the device.
+    #[allow(dead_code)]
     pub fn num_chunks(&self) -> u32 {
         self.size.div_ceil(self.chunk_size) as u32
     }
@@ -95,6 +96,7 @@ impl VolumeManifest {
     }
 
     /// Remove a chunk (mark as unwritten). Returns whether it was present.
+    #[allow(dead_code)]
     pub fn remove_chunk(&mut self, chunk_idx: u32) -> bool {
         self.chunks.remove(&chunk_idx).is_some()
     }

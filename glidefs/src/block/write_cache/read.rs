@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use tracing::{debug, instrument, warn};
 
-use crate::block::block_map::{Blake3Hash, blake3_128, lz4_decompress};
+use crate::block::block_map::{blake3_128, format_hash, lz4_decompress};
 use crate::block::cache::BlockCache;
 use crate::block::chunk_cache::ChunkMetaCache;
 use crate::block::chunk_meta::ChunkMeta;
@@ -694,7 +694,3 @@ impl WriteCache<Active> {
     }
 }
 
-/// Format a Blake3Hash as a hex string (for S3 keys).
-fn format_hash(hash: &Blake3Hash) -> String {
-    hash.0.iter().map(|b| format!("{b:02x}")).collect()
-}

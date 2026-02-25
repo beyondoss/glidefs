@@ -111,8 +111,8 @@ async fn test_sync_manifest_does_not_create_snapshots() {
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
 
     // flush_packs + sync_manifest (the background flush path)
-    let (_stats, seq) = cache.flush_packs(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
-    cache.sync_manifest(&cs, &volume_manifest, seq).await.unwrap();
+    let (_stats, _seq) = cache.flush_packs(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    cache.sync_manifest(&cs, &volume_manifest).await.unwrap();
 
     // No snapshot should be created by sync_manifest
     let snapshots = cs.list_snapshots("vm1").await.unwrap();
@@ -161,11 +161,11 @@ async fn test_fork_from_snapshot() {
     // Write block 0 with seed 0xAA and snapshot
     let handler = router.get_handler("vm1").await.unwrap();
     handler.write(0, &[0xAA; BLOCK_SIZE], false).unwrap();
-    let snap1 = router.snapshot_export("vm1").await.unwrap();
+    let snap1 = router.snapshot_export("vm1", None).await.unwrap();
 
     // Overwrite block 0 with seed 0xBB and snapshot again
     handler.write(0, &[0xBB; BLOCK_SIZE], false).unwrap();
-    let _snap2 = router.snapshot_export("vm1").await.unwrap();
+    let _snap2 = router.snapshot_export("vm1", None).await.unwrap();
 
     // Fork from snap1 — should see 0xAA, not 0xBB
     let fork_config = ExportConfig {
@@ -336,7 +336,7 @@ async fn test_purge_export_deletes_snapshots() {
         .unwrap();
 
     // Write and snapshot
-    router.snapshot_export("vm1").await.unwrap();
+    router.snapshot_export("vm1", None).await.unwrap();
 
     // Verify snapshot exists
     let cs = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
@@ -506,7 +506,7 @@ async fn test_remove_without_purge_preserves_snapshots() {
         .await
         .unwrap();
 
-    router.snapshot_export("vm1").await.unwrap();
+    router.snapshot_export("vm1", None).await.unwrap();
 
     let cs = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
     assert_eq!(cs.list_snapshots("vm1").await.unwrap().len(), 1);
@@ -520,4 +520,165 @@ async fn test_remove_without_purge_preserves_snapshots() {
         1,
         "non-purge remove should preserve snapshots in S3"
     );
+}
+
+/// Snapshot with tag publishes manifest under the tag name, fork from tag works.
+#[tokio::test]
+async fn test_snapshot_tag_and_fork() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    // Create export, write known data, snapshot with tag
+    let config = ExportConfig {
+        name: "vm1".to_string(),
+        size_gb: 0.01,
+        s3_prefix: None,
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router.create_export(config, false, None, None).await.unwrap();
+
+    let handler = router.get_handler("vm1").await.unwrap();
+    handler.write(0, &[0xCC; BLOCK_SIZE], false).unwrap();
+
+    let snap = router.snapshot_export("vm1", Some("setup-abc123")).await.unwrap();
+    assert_eq!(snap.tag.as_deref(), Some("setup-abc123"));
+
+    // Head check: tagged manifest exists, nonexistent doesn't
+    assert!(router.head_manifest("vm1", "setup-abc123").await.unwrap());
+    assert!(!router.head_manifest("vm1", "nonexistent").await.unwrap());
+
+    // Fork from tag — should see 0xCC
+    let fork_config = ExportConfig {
+        name: "fork1".to_string(),
+        size_gb: 0.01,
+        s3_prefix: Some("vm1".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(fork_config, false, Some("setup-abc123"), None)
+        .await
+        .unwrap();
+
+    let fork_handler = router.get_handler("fork1").await.unwrap();
+    let data = fork_handler.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert_eq!(data[0], 0xCC, "fork from tag should see tagged data");
+}
+
+/// Standalone tag_export publishes manifest without re-flushing.
+#[tokio::test]
+async fn test_standalone_tag() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    let config = ExportConfig {
+        name: "vm1".to_string(),
+        size_gb: 0.01,
+        s3_prefix: None,
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router.create_export(config, false, None, None).await.unwrap();
+
+    let handler = router.get_handler("vm1").await.unwrap();
+    handler.write(0, &[0xDD; BLOCK_SIZE], false).unwrap();
+
+    // Snapshot first (to flush data), then tag separately
+    router.snapshot_export("vm1", None).await.unwrap();
+    router.tag_export("vm1", "my-tag").await.unwrap();
+
+    // Tag should exist
+    assert!(router.head_manifest("vm1", "my-tag").await.unwrap());
+
+    // Fork from standalone tag
+    let fork_config = ExportConfig {
+        name: "fork2".to_string(),
+        size_gb: 0.01,
+        s3_prefix: Some("vm1".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(fork_config, false, Some("my-tag"), None)
+        .await
+        .unwrap();
+
+    let fork_handler = router.get_handler("fork2").await.unwrap();
+    let data = fork_handler.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert_eq!(data[0], 0xDD, "fork from standalone tag should see data");
+}
+
+/// head_manifest returns false for nonexistent manifest in nonexistent prefix.
+#[tokio::test]
+async fn test_head_manifest_not_found() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    // No exports, no manifests — should return false, not error
+    assert!(!router.head_manifest("nonexistent-prefix", "nonexistent-tag").await.unwrap());
 }

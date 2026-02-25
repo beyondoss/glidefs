@@ -185,6 +185,21 @@ impl ContentStore {
         Ok(put_result.e_tag)
     }
 
+    /// Check if a manifest exists in S3 (HEAD request, no data transfer).
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn head_manifest(&self, name: &str) -> Result<bool, ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, manifest_s3_key(name));
+        let path = ObjectPath::from(key);
+        let result = self.object_store.head(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Download a manifest from S3. Returns None if not found.
     #[instrument(skip(self), fields(name = %name))]
     pub async fn get_manifest(
@@ -562,35 +577,8 @@ impl ContentStore {
         self.get_manifest(name).await
     }
 
-    /// List all .meta files for a given chunk index.
-    pub async fn list_chunk_metas(
-        &self,
-        chunk_idx: u32,
-    ) -> Result<Vec<String>, ContentStoreError> {
-        self.check_circuit()?;
-        let prefix_str = format!("{}/chunks/{:04}/", self.base_path, chunk_idx);
-        let prefix = ObjectPath::from(prefix_str);
-        let mut names = Vec::new();
-        let mut stream = self.object_store.list(Some(&prefix));
-        while let Some(result) = stream.next().await {
-            let meta = match result {
-                Ok(m) => m,
-                Err(e) => {
-                    self.record_s3_list_error(&e);
-                    return Err(e.into());
-                }
-            };
-            if let Some(filename) = meta.location.filename() && filename.ends_with(".meta") {
-                names.push(filename.to_string());
-            }
-        }
-        if let Some(cb) = &self.circuit_breaker {
-            cb.record_success();
-        }
-        Ok(names)
-    }
-
     /// List all .pack files for a given chunk index.
+    #[allow(dead_code)]
     pub async fn list_chunk_packs(
         &self,
         chunk_idx: u32,
@@ -616,24 +604,6 @@ impl ContentStore {
             cb.record_success();
         }
         Ok(names)
-    }
-
-    /// Delete a chunk file (meta or pack) from S3 (idempotent).
-    pub async fn delete_chunk_file(
-        &self,
-        chunk_idx: u32,
-        filename: &str,
-    ) -> Result<(), ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/chunks/{:04}/{}", self.base_path, chunk_idx, filename);
-        let path = ObjectPath::from(key);
-        let result = self.object_store.delete(&path).await;
-        self.record_s3_result(&result);
-        match result {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
     }
 
     /// List all base manifest names under `manifests/bases/`.
@@ -1033,57 +1003,6 @@ mod tests {
             .expect("get_chunk_block should succeed");
 
         assert_eq!(&block[..], &data[..]);
-    }
-
-    #[tokio::test]
-    async fn test_list_chunk_metas_and_packs() {
-        let store = test_store("test-bucket");
-
-        // Upload some chunk files
-        store
-            .put_chunk_meta(5, "hash_a", b"meta_a".to_vec())
-            .await
-            .unwrap();
-        store
-            .put_chunk_meta(5, "hash_b", b"meta_b".to_vec())
-            .await
-            .unwrap();
-        let pack_id = Uuid::new_v4();
-        store
-            .put_chunk_pack(5, pack_id, b"pack_data".to_vec())
-            .await
-            .unwrap();
-
-        let metas = store.list_chunk_metas(5).await.unwrap();
-        assert_eq!(metas.len(), 2);
-        assert!(metas.iter().all(|n| n.ends_with(".meta")));
-
-        let packs = store.list_chunk_packs(5).await.unwrap();
-        assert_eq!(packs.len(), 1);
-        assert!(packs[0].ends_with(".pack"));
-    }
-
-    #[tokio::test]
-    async fn test_delete_chunk_file() {
-        let store = test_store("test-bucket");
-        store
-            .put_chunk_meta(2, "todelete", b"data".to_vec())
-            .await
-            .unwrap();
-
-        store
-            .delete_chunk_file(2, "todelete.meta")
-            .await
-            .expect("delete should succeed");
-
-        let result = store.get_chunk_meta(2, "todelete").await.unwrap();
-        assert!(result.is_none());
-
-        // Idempotent: deleting again should not error
-        store
-            .delete_chunk_file(2, "todelete.meta")
-            .await
-            .expect("idempotent delete should succeed");
     }
 
     #[tokio::test]

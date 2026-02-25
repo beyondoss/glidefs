@@ -72,9 +72,6 @@ impl WriteCache<Initializing> {
         let mut max_wal_seq = persisted_max_seq;
 
         for entry in &wal_entries {
-            if entry.name != export_name {
-                continue; // Skip entries for other exports (shouldn't happen with per-export WAL)
-            }
             let chunk_index = entry.chunk_index as usize;
             max_wal_seq = max_wal_seq.max(entry.sequence);
 

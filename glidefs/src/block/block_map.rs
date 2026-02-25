@@ -26,9 +26,11 @@ pub struct Blake3Hash(pub(crate) [u8; 16]);
 
 impl Blake3Hash {
     /// Sentinel value for entries that were never populated.
+    #[allow(dead_code)]
     pub const ZERO: Blake3Hash = Blake3Hash([0u8; 16]);
 
     /// Construct from raw bytes.
+    #[allow(dead_code)]
     #[inline]
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
         Blake3Hash(bytes)
@@ -41,6 +43,7 @@ impl Blake3Hash {
     }
 
     /// Returns true if this is the zero sentinel (entry never populated).
+    #[allow(dead_code)]
     #[inline]
     pub fn is_zero(&self) -> bool {
         self.0 == [0u8; 16]
@@ -73,6 +76,11 @@ pub fn blake3_128(data: &[u8]) -> Blake3Hash {
 /// to identify trimmed/unwritten chunks for dedup (zero blocks are never uploaded).
 pub fn zero_block_hash(block_size: usize) -> Blake3Hash {
     blake3_128(&vec![0u8; block_size])
+}
+
+/// Format a Blake3Hash as lowercase hex string (for S3 keys).
+pub fn format_hash(hash: &Blake3Hash) -> String {
+    hash.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ============================================================================

@@ -276,6 +276,12 @@ impl CacheInner {
         loop {
             let current = self.state_map.get(idx);
 
+            debug_assert_ne!(
+                current,
+                SparseBlockState::NOT_PRESENT,
+                "transition_to_dirty called on NOT_PRESENT block {idx}"
+            );
+
             if current == SparseBlockState::DIRTY {
                 break;
             }
@@ -413,6 +419,14 @@ impl CacheInner {
 
         // Atomic rename (POSIX guarantees this is atomic)
         std::fs::rename(&tmp_path, &path)?;
+
+        // Fsync the parent directory so the rename is durable across power loss.
+        // Without this, the directory entry update can be lost on crash.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
 
         let present_count = sparse_entries.len();
         debug!(

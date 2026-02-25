@@ -64,6 +64,9 @@ pub struct ExportMetrics {
     /// Blocks left dirty per flush due to concurrent-write CAS failures
     pub flush_blocks_cas_failed: AtomicU64,
 
+    /// Blocks skipped due to SSD corruption (CRC mismatch while still SYNCING)
+    pub flush_blocks_corrupted: AtomicU64,
+
     /// Failed manifest syncs after successful pack flush
     pub manifest_sync_errors: AtomicU64,
 
@@ -258,6 +261,7 @@ impl Default for ExportMetrics {
             s3_get_errors: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
             flush_blocks_cas_failed: AtomicU64::new(0),
+            flush_blocks_corrupted: AtomicU64::new(0),
             manifest_sync_errors: AtomicU64::new(0),
             recovery_warnings: AtomicU64::new(0),
             read_latencies: SampledHistogram::new(),
@@ -385,6 +389,15 @@ impl ExportMetrics {
         }
     }
 
+    /// Record blocks skipped due to SSD corruption during flush.
+    #[inline]
+    pub fn record_flush_blocks_corrupted(&self, count: usize) {
+        if count > 0 {
+            self.flush_blocks_corrupted
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
+    }
+
     /// Record a failed manifest sync after successful pack flush.
     #[inline]
     pub fn record_manifest_sync_error(&self) {
@@ -457,6 +470,7 @@ impl ExportMetrics {
             s3_get_errors: self.s3_get_errors.load(Ordering::Relaxed),
             flush_errors: self.flush_errors.load(Ordering::Relaxed),
             flush_blocks_cas_failed: self.flush_blocks_cas_failed.load(Ordering::Relaxed),
+            flush_blocks_corrupted: self.flush_blocks_corrupted.load(Ordering::Relaxed),
             manifest_sync_errors: self.manifest_sync_errors.load(Ordering::Relaxed),
             recovery_warnings: self.recovery_warnings.load(Ordering::Relaxed),
             dirty_blocks: None,
@@ -493,6 +507,7 @@ pub struct MetricsSnapshot {
     pub s3_get_errors: u64,
     pub flush_errors: u64,
     pub flush_blocks_cas_failed: u64,
+    pub flush_blocks_corrupted: u64,
     pub manifest_sync_errors: u64,
     pub recovery_warnings: u64,
 
@@ -576,6 +591,7 @@ impl MetricsSnapshot {
         let _ = writeln!(out, "glidefs_s3_get_errors_total{{{label}}} {}", self.s3_get_errors);
         let _ = writeln!(out, "glidefs_flush_errors_total{{{label}}} {}", self.flush_errors);
         let _ = writeln!(out, "glidefs_flush_blocks_cas_failed_total{{{label}}} {}", self.flush_blocks_cas_failed);
+        let _ = writeln!(out, "glidefs_flush_blocks_corrupted_total{{{label}}} {}", self.flush_blocks_corrupted);
         let _ = writeln!(out, "glidefs_manifest_sync_errors_total{{{label}}} {}", self.manifest_sync_errors);
         let _ = writeln!(out, "glidefs_recovery_warnings_total{{{label}}} {}", self.recovery_warnings);
 
@@ -695,6 +711,8 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_flush_errors_total counter
 # HELP glidefs_flush_blocks_cas_failed_total Blocks left dirty per flush due to concurrent-write CAS failures
 # TYPE glidefs_flush_blocks_cas_failed_total counter
+# HELP glidefs_flush_blocks_corrupted_total Blocks skipped due to SSD corruption (CRC mismatch while SYNCING)
+# TYPE glidefs_flush_blocks_corrupted_total counter
 # HELP glidefs_manifest_sync_errors_total Failed manifest syncs after successful pack flush
 # TYPE glidefs_manifest_sync_errors_total counter
 # HELP glidefs_recovery_warnings_total Recovery issues (WAL replay failure, block map load failure)

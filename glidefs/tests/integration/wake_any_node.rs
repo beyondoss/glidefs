@@ -279,7 +279,7 @@ async fn test_recovery_after_pack_flush_without_drain() {
     // Simulate what the flush scheduler does: flush_packs + sync_manifest.
     // Critically, we do NOT call flush_to_s3 or drain — this is what happens
     // when the host dies after the scheduler fires but before drain.
-    let (stats, seq_cutpoint) = cache_a
+    let (stats, _seq_cutpoint) = cache_a
         .flush_packs(&content_store_a, &chunk_meta_cache_a, &volume_manifest_a)
         .await
         .unwrap();
@@ -287,7 +287,7 @@ async fn test_recovery_after_pack_flush_without_drain() {
 
     // sync_manifest: this is the fix — without it, cold wake would lose data
     cache_a
-        .sync_manifest(&content_store_a, &volume_manifest_a, seq_cutpoint)
+        .sync_manifest(&content_store_a, &volume_manifest_a)
         .await
         .unwrap();
 

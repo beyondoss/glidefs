@@ -566,7 +566,7 @@ impl TestServer {
 
     /// Snapshot an export (flush dirty blocks + upload manifest).
     pub async fn snapshot_export(&self, name: &str) -> SnapshotResponse {
-        self.router.snapshot_export(name).await.unwrap()
+        self.router.snapshot_export(name, None).await.unwrap()
     }
 
     /// Fork an export from a source manifest (read-write).

@@ -42,15 +42,6 @@ pub struct PackLocation {
     pub comp_length: u32,
 }
 
-/// A parsed pack header and block index (metadata only, no decompressed data).
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct PackIndex {
-    pub block_count: u16,
-    pub chunk_size: u32,
-    pub entries: Vec<PackIndexEntry>,
-}
-
 /// One entry in the pack's block index.
 #[derive(Debug, Clone)]
 pub struct PackIndexEntry {
@@ -125,10 +116,20 @@ pub fn assemble_pack(
     Ok((buf, entries))
 }
 
+/// A parsed pack header and block index (metadata only, no decompressed data).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct PackIndex {
+    pub block_count: u16,
+    pub chunk_size: u32,
+    pub entries: Vec<PackIndexEntry>,
+}
+
 /// Parse a pack's header and block index from raw bytes.
 ///
 /// Validates the magic bytes and version. Does NOT decompress any block data;
 /// only reads the metadata needed to locate blocks within the pack.
+#[allow(dead_code)]
 pub fn parse_pack_index(data: &[u8]) -> io::Result<PackIndex> {
     if data.len() < PACK_HEADER_SIZE {
         return Err(io::Error::new(
@@ -205,6 +206,7 @@ pub fn parse_pack_index(data: &[u8]) -> io::Result<PackIndex> {
 ///
 /// Returns a slice into `pack_data` at `[offset..offset+comp_length]`,
 /// or `None` if the range is out of bounds.
+#[allow(dead_code)]
 pub fn extract_block(pack_data: &[u8], offset: u32, comp_length: u32) -> Option<&[u8]> {
     let start = offset as usize;
     let end = start.checked_add(comp_length as usize)?;

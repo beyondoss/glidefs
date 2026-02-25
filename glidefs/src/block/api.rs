@@ -49,6 +49,21 @@ pub struct PutExportRequest {
     pub snapshot_sequence: Option<u64>,
 }
 
+/// Optional request body for POST /api/exports/{name}/snapshot.
+#[derive(Debug, Deserialize)]
+pub struct SnapshotRequest {
+    /// If set, also publish the manifest under this tag name.
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+/// Request body for POST /api/exports/{name}/tag.
+#[derive(Debug, Deserialize)]
+pub struct TagRequest {
+    /// Tag name to publish the manifest under.
+    pub tag: String,
+}
+
 /// Response for export info.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExportInfoResponse {
@@ -429,7 +444,27 @@ where
 
         // POST /api/exports/{name}/snapshot - Snapshot export to S3 manifest
         (Method::POST, ["api", "exports", name, "snapshot"]) => {
-            match router.snapshot_export(name).await {
+            // Parse optional body for tag
+            let tag = match req.into_body().collect().await {
+                Ok(b) => {
+                    let bytes = b.to_bytes();
+                    if bytes.is_empty() {
+                        None
+                    } else {
+                        match serde_json::from_slice::<SnapshotRequest>(&bytes) {
+                            Ok(r) => r.tag,
+                            Err(e) => {
+                                return Ok(error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    &format!("Invalid JSON: {}", e),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(_) => None,
+            };
+            match router.snapshot_export(name, tag.as_deref()).await {
                 Ok(result) => json_response(StatusCode::OK, &result),
                 Err(RouterError::ExportNotFound(name)) => error_response(
                     StatusCode::NOT_FOUND,
@@ -438,6 +473,41 @@ where
                 Err(RouterError::InvalidExportName(_)) => error_response(
                     StatusCode::BAD_REQUEST,
                     &format!("Invalid export name '{}'", name),
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // POST /api/exports/{name}/tag - Tag export manifest under a name
+        (Method::POST, ["api", "exports", name, "tag"]) => {
+            let body = match req.into_body().collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            let tag_req: TagRequest = match serde_json::from_slice(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid JSON: {}", e),
+                    ));
+                }
+            };
+            match router.tag_export(name, &tag_req.tag).await {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    &ApiResponse::success(format!(
+                        "Tagged '{}' as '{}'",
+                        name, tag_req.tag
+                    )),
+                ),
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid export or tag name",
                 ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -543,6 +613,25 @@ where
                     StatusCode::BAD_REQUEST,
                     &format!("Invalid export name '{}'", name),
                 ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // HEAD /api/manifests/{s3_prefix}/{name} - Check manifest existence
+        (Method::HEAD, ["api", "manifests", s3_prefix, manifest_name]) => {
+            // Reject path traversal
+            if s3_prefix.contains("..") || manifest_name.contains("..") {
+                return Ok(error_response(StatusCode::BAD_REQUEST, "Invalid path"));
+            }
+            match router.head_manifest(s3_prefix, manifest_name).await {
+                Ok(true) => Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+                Ok(false) => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }

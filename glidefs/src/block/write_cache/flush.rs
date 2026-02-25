@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info, instrument, warn};
 
-use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
+use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, format_hash, lz4_compress};
 use crate::block::chunk_cache::ChunkMetaCache;
 use crate::block::chunk_meta::{ChunkMeta, ChunkMetaEntry};
 use crate::block::content_store::ContentStore;
@@ -195,11 +195,6 @@ fn compute_flush_batch(
         skipped,
         stats,
     })
-}
-
-/// Format a Blake3Hash as lowercase hex string for S3 keys.
-fn format_hash(hash: &Blake3Hash) -> String {
-    hash.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl WriteCache<Active> {
@@ -577,7 +572,6 @@ impl WriteCache<Active> {
         &self,
         content_store: &ContentStore,
         volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
-        _seq_cutpoint: u64,
     ) -> Result<(), CacheError> {
         let manifest_bytes = volume_manifest.read().serialize();
         content_store
