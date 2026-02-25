@@ -422,10 +422,10 @@ impl CacheInner {
 
         // Fsync the parent directory so the rename is durable across power loss.
         // Without this, the directory entry update can be lost on crash.
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
 
         let present_count = sparse_entries.len();

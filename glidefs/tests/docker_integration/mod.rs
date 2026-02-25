@@ -249,7 +249,23 @@ impl TestContext {
     pub async fn new() -> Self {
         let minio = MinIO::default().start().await.unwrap();
         let host = minio.get_host().await.unwrap();
-        let port = minio.get_host_port_ipv4(9000).await.unwrap();
+
+        // Retry port lookup — Docker can race between container start and
+        // port mapping visibility, causing PortNotExposed on loaded machines.
+        let port = {
+            let mut last_err = None;
+            let mut port = None;
+            for _ in 0..10 {
+                match minio.get_host_port_ipv4(9000).await {
+                    Ok(p) => { port = Some(p); break; }
+                    Err(e) => {
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+            }
+            port.unwrap_or_else(|| panic!("MinIO port 9000 not available after retries: {:?}", last_err))
+        };
         let endpoint = format!("http://{}:{}", host, port);
 
         // Create bucket using curl with AWS SigV4 auth inside the container
