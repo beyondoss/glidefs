@@ -230,56 +230,16 @@ async fn discover_s3_prefixes(
 }
 
 // ---------------------------------------------------------------------------
-// Collect live packs from a VolumeManifest
-// ---------------------------------------------------------------------------
-
-/// Resolve all pack IDs referenced by a VolumeManifest by fetching and parsing
-/// each chunk's ChunkMeta.
-async fn collect_packs_from_volume_manifest(
-    content_store: &ContentStore,
-    vm: &VolumeManifest,
-) -> Result<HashSet<Uuid>, anyhow::Error> {
-    let mut packs = HashSet::new();
-    for (&chunk_idx, chunk_hash_hex) in &vm.chunks {
-        match content_store.get_chunk_meta(chunk_idx, chunk_hash_hex).await {
-            Ok(Some(meta_bytes)) => match ChunkMeta::deserialize(&meta_bytes) {
-                Ok(meta) => {
-                    packs.extend(meta.pack_ids());
-                }
-                Err(e) => {
-                    anyhow::bail!(
-                        "corrupt chunk meta for chunk {} hash {}: {}",
-                        chunk_idx,
-                        chunk_hash_hex,
-                        e
-                    );
-                }
-            },
-            Ok(None) => {
-                warn!(
-                    chunk_idx,
-                    chunk_hash = %chunk_hash_hex,
-                    "chunk meta not found (may have been cleaned up)"
-                );
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "failed to fetch chunk meta for chunk {} hash {}: {}",
-                    chunk_idx,
-                    chunk_hash_hex,
-                    e
-                );
-            }
-        }
-    }
-    Ok(packs)
-}
-
-// ---------------------------------------------------------------------------
 // Reconciliation
 // ---------------------------------------------------------------------------
 
 /// Reconcile a single S3 prefix: find and delete orphaned packs.
+///
+/// Uses two-phase chunk dedup: first collects unique (chunk_idx, chunk_hash)
+/// pairs across all manifests and snapshots, then fetches each ChunkMeta once.
+/// For fork-heavy workloads this is dramatically cheaper — 2000 VMs forked
+/// from the same base share most chunk hashes, reducing ChunkMeta fetches
+/// from O(M×C) to O(unique_chunks).
 ///
 /// Returns the number of packs deleted (or that would be deleted in dry-run).
 async fn reconcile_prefix(
@@ -290,8 +250,9 @@ async fn reconcile_prefix(
     max_deletes: usize,
     dry_run: bool,
 ) -> Result<usize> {
-    // 1. Discover live packs from all manifests (VolumeManifest -> ChunkMeta -> pack_ids).
-    let mut live_packs: HashSet<Uuid> = HashSet::new();
+    // Phase 1: Read all manifests + snapshots, collect unique (chunk_idx, chunk_hash) pairs.
+    let mut unique_chunks: HashSet<(u32, String)> = HashSet::new();
+    let mut total_chunk_refs: usize = 0;
     let manifest_names = content_store.list_all_manifests().await?;
     let mut manifest_failed = false;
 
@@ -299,17 +260,11 @@ async fn reconcile_prefix(
         match content_store.get_volume_manifest(name).await {
             Ok(Some(data)) => match VolumeManifest::deserialize(&data) {
                 Ok(vm) => {
-                    match collect_packs_from_volume_manifest(content_store, &vm).await {
-                        Ok(packs) => {
-                            live_packs.extend(packs);
-                            stats.manifests_scanned += 1;
-                        }
-                        Err(e) => {
-                            warn!(manifest = %name, error = %e, "failed to resolve chunk metas — treating all packs in prefix as live");
-                            stats.manifest_errors += 1;
-                            manifest_failed = true;
-                        }
+                    for (&chunk_idx, chunk_hash) in &vm.chunks {
+                        unique_chunks.insert((chunk_idx, chunk_hash.clone()));
+                        total_chunk_refs += 1;
                     }
+                    stats.manifests_scanned += 1;
                 }
                 Err(e) => {
                     warn!(manifest = %name, error = %e, "failed to parse volume manifest — treating all packs in prefix as live");
@@ -328,29 +283,75 @@ async fn reconcile_prefix(
         }
     }
 
-    // If any manifest failed to parse/resolve, we cannot determine liveness accurately.
-    // Skip this prefix entirely to avoid deleting packs that might be live.
     if manifest_failed {
         warn!("skipping GC for prefix due to manifest errors — no packs will be deleted");
         return Ok(0);
     }
 
-    // 1b. Extend live packs with references from versioned snapshot manifests.
-    //     If snapshot scanning fails, bail out to prevent false-positive deletions.
-    match content_store.collect_snapshot_live_packs().await {
-        Ok(snap_packs) => {
-            if !snap_packs.is_empty() {
-                info!(
-                    snapshot_packs = snap_packs.len(),
-                    "added snapshot-referenced packs to live set"
-                );
+    // Snapshot manifests — collect unique chunks from them too.
+    match content_store.list_snapshot_manifests().await {
+        Ok(snapshot_vms) => {
+            for vm in &snapshot_vms {
+                for (&chunk_idx, chunk_hash) in &vm.chunks {
+                    unique_chunks.insert((chunk_idx, chunk_hash.clone()));
+                    total_chunk_refs += 1;
+                }
             }
-            live_packs.extend(snap_packs);
+            stats.manifests_scanned += snapshot_vms.len();
         }
         Err(e) => {
             warn!(error = %e, "failed to scan snapshot manifests — treating all packs as live");
             return Ok(0);
         }
+    }
+
+    info!(
+        total_chunk_refs,
+        unique_chunk_metas = unique_chunks.len(),
+        "deduplicated chunk meta lookups"
+    );
+
+    // Phase 2: Fetch each unique ChunkMeta once, collect live pack IDs.
+    let mut live_packs: HashSet<Uuid> = HashSet::new();
+
+    for (chunk_idx, chunk_hash_hex) in &unique_chunks {
+        match content_store.get_chunk_meta(*chunk_idx, chunk_hash_hex).await {
+            Ok(Some(meta_bytes)) => match ChunkMeta::deserialize(&meta_bytes) {
+                Ok(meta) => {
+                    live_packs.extend(meta.pack_ids());
+                }
+                Err(e) => {
+                    warn!(
+                        chunk_idx,
+                        chunk_hash = %chunk_hash_hex,
+                        error = %e,
+                        "corrupt chunk meta — treating all packs in prefix as live"
+                    );
+                    manifest_failed = true;
+                }
+            },
+            Ok(None) => {
+                warn!(
+                    chunk_idx,
+                    chunk_hash = %chunk_hash_hex,
+                    "chunk meta not found (may have been cleaned up)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    chunk_idx,
+                    chunk_hash = %chunk_hash_hex,
+                    error = %e,
+                    "failed to fetch chunk meta — treating all packs in prefix as live"
+                );
+                manifest_failed = true;
+            }
+        }
+    }
+
+    if manifest_failed {
+        warn!("skipping GC for prefix due to chunk meta errors — no packs will be deleted");
+        return Ok(0);
     }
 
     // 2. Discover known packs by listing all .pack files in S3 (chunk packs + legacy flat packs).

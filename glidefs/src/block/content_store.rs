@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use super::manifest::{manifest_s3_key, snapshot_s3_key};
 use super::pack::pack_s3_key;
+use super::volume_manifest::VolumeManifest;
 
 #[derive(Error, Debug)]
 pub enum ContentStoreError {
@@ -332,15 +333,14 @@ impl ContentStore {
     /// Called by GC to extend the live-pack set. Lists all objects under
     /// `snapshots/`, fetches and parses each as a VolumeManifest, resolves
     /// chunk metas, and collects referenced pack_ids.
-    pub async fn collect_snapshot_live_packs(
+    /// List and parse all snapshot VolumeManifests in this prefix.
+    /// Corrupt or missing snapshots are warned and skipped.
+    pub async fn list_snapshot_manifests(
         &self,
-    ) -> Result<std::collections::HashSet<Uuid>, ContentStoreError> {
-        use super::chunk_meta::ChunkMeta;
-        use super::volume_manifest::VolumeManifest;
-
+    ) -> Result<Vec<VolumeManifest>, ContentStoreError> {
         let prefix_str = format!("{}/snapshots/", self.base_path);
         let prefix = ObjectPath::from(prefix_str);
-        let mut live = std::collections::HashSet::new();
+        let mut manifests = Vec::new();
         let mut stream = self.object_store.list(Some(&prefix));
         let mut paths = Vec::new();
         while let Some(result) = stream.next().await {
@@ -369,35 +369,7 @@ impl ContentStore {
             };
             match VolumeManifest::deserialize(&data) {
                 Ok(vm) => {
-                    // For each chunk in the volume manifest, fetch the chunk meta
-                    // and collect pack IDs.
-                    for (&chunk_idx, chunk_hash_hex) in &vm.chunks {
-                        match self.get_chunk_meta(chunk_idx, chunk_hash_hex).await {
-                            Ok(Some(meta_bytes)) => match ChunkMeta::deserialize(&meta_bytes) {
-                                Ok(meta) => {
-                                    live.extend(meta.pack_ids());
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        key = %path, chunk_idx, chunk_hash = %chunk_hash_hex,
-                                        error = %e, "corrupt chunk meta in snapshot, skipping"
-                                    );
-                                }
-                            },
-                            Ok(None) => {
-                                tracing::warn!(
-                                    key = %path, chunk_idx, chunk_hash = %chunk_hash_hex,
-                                    "chunk meta not found for snapshot chunk"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    key = %path, chunk_idx, chunk_hash = %chunk_hash_hex,
-                                    error = %e, "failed to fetch chunk meta for snapshot"
-                                );
-                            }
-                        }
-                    }
+                    manifests.push(vm);
                 }
                 Err(e) => {
                     tracing::warn!(key = %path, error = %e, "corrupt snapshot manifest, skipping");
@@ -407,7 +379,7 @@ impl ContentStore {
         if let Some(cb) = &self.circuit_breaker {
             cb.record_success();
         }
-        Ok(live)
+        Ok(manifests)
     }
 
     // =========================================================================
