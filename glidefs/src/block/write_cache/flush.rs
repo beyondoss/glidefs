@@ -343,20 +343,19 @@ impl WriteCache<Active> {
             if let Some(chunk_hash) = chunk_hash && chunk_meta_cache.get(&chunk_hash).await.is_none() {
                 let hash_hex = format_hash(&chunk_hash);
                 match content_store.get_chunk_meta(chunk_idx, &hash_hex).await {
-                        Ok(Some(data)) => match ChunkMeta::deserialize(&data) {
-                            Ok(meta) => {
-                                chunk_meta_cache.insert(chunk_hash, Arc::new(meta));
-                            }
-                            Err(e) => {
-                                warn!(chunk_idx, error = %e, "failed to deserialize chunk meta from S3");
-                            }
-                        },
-                        Ok(None) => {
-                            warn!(chunk_idx, "chunk meta not found in S3");
+                    Ok(Some(data)) => match ChunkMeta::deserialize(&data) {
+                        Ok(meta) => {
+                            chunk_meta_cache.insert(chunk_hash, Arc::new(meta));
                         }
                         Err(e) => {
-                            warn!(chunk_idx, error = %e, "failed to fetch chunk meta from S3");
+                            warn!(chunk_idx, error = %e, "failed to deserialize chunk meta from S3");
                         }
+                    },
+                    Ok(None) => {
+                        warn!(chunk_idx, "chunk meta not found in S3");
+                    }
+                    Err(e) => {
+                        warn!(chunk_idx, error = %e, "failed to fetch chunk meta from S3");
                     }
                 }
             }
