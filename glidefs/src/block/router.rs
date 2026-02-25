@@ -422,7 +422,7 @@ impl ExportRouter {
             HashMap::new();
         for (vm_lock, cs) in &export_data {
             let vm = vm_lock.read();
-            for (&chunk_idx, _) in &vm.chunks {
+            for &chunk_idx in vm.chunks.keys() {
                 if let Some(chunk_hash) = vm.get_chunk_hash(chunk_idx) {
                     candidates
                         .entry(chunk_hash)

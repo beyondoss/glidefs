@@ -420,7 +420,7 @@ async fn test_api_list_and_delete_snapshots() {
     // Delete snapshot via API
     let req = Request::builder()
         .method(Method::DELETE)
-        .uri(&format!("/api/exports/vm1/snapshots/{}", seq))
+        .uri(format!("/api/exports/vm1/snapshots/{}", seq))
         .body(Full::new(Bytes::new()))
         .unwrap();
     let resp = glidefs::block::api::handle_request_for_test(Arc::clone(&router), req)

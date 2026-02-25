@@ -1,4 +1,4 @@
-//! Benchmark for v2 cold-read path (cache miss -> pack index -> S3 -> LZ4 decompress -> BLAKE3 verify).
+//! Benchmark for v2 cold-read path (cache miss -> chunk meta -> S3 -> LZ4 decompress -> BLAKE3 verify).
 //!
 //! Measures read throughput under two conditions:
 //! - **Cold read**: clean_cache is empty, every read goes through the full
@@ -12,14 +12,16 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use object_store::ObjectStore;
+use parking_lot::RwLock;
 use rand::Rng;
 use tempfile::TempDir;
 
 use glidefs::block::cache::{BlockCache, SimpleBlockCache};
+use glidefs::block::chunk_cache::ChunkMetaCache;
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::metrics::ExportMetrics;
-use glidefs::block::pack_index::HostPackIndex;
 use glidefs::block::state::Active;
+use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128 KB (production block size)
@@ -27,7 +29,8 @@ const BLOCK_SIZE: usize = 128 * 1024; // 128 KB (production block size)
 struct ReadBenchHarness {
     cache: WriteCache<Active>,
     content_store: ContentStore,
-    pack_index: Arc<HostPackIndex>,
+    chunk_meta_cache: Arc<ChunkMetaCache>,
+    volume_manifest: Arc<RwLock<VolumeManifest>>,
     metrics: ExportMetrics,
     num_blocks: u64,
     #[allow(dead_code)]
@@ -50,8 +53,11 @@ impl ReadBenchHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3_backend), "bench");
-        let pack_index =
-            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let chunk_meta_cache =
+            Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(RwLock::new(
+            VolumeManifest::new(device_size_bytes, BLOCK_SIZE as u32),
+        ));
         let metrics = ExportMetrics::new();
 
         let cache = WriteCache::open(config).expect("Failed to open cache");
@@ -70,13 +76,17 @@ impl ReadBenchHarness {
                 .unwrap();
         }
 
-        // Flush to S3 so the pack index and content store are populated.
-        cache.snapshot(&content_store, &pack_index).await.unwrap();
+        // Flush to S3 so the chunk meta cache and content store are populated.
+        cache
+            .snapshot(&content_store, &chunk_meta_cache, &volume_manifest)
+            .await
+            .unwrap();
 
         Self {
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             metrics,
             num_blocks,
             temp_dir,
@@ -94,7 +104,8 @@ impl ReadBenchHarness {
                     offset,
                     BLOCK_SIZE,
                     clean_cache,
-                    &self.pack_index,
+                    &self.chunk_meta_cache,
+                    &self.volume_manifest,
                     &self.content_store,
                     &self.metrics,
                 )
@@ -109,7 +120,7 @@ impl ReadBenchHarness {
 /// Benchmark: cold read -- every read is a cache miss.
 ///
 /// Measures the full pipeline per block:
-///   block_map lookup -> pack_index lookup -> S3 fetch -> LZ4 decompress -> BLAKE3 verify -> cache insert
+///   block_map lookup -> chunk meta lookup -> S3 fetch -> LZ4 decompress -> BLAKE3 verify -> cache insert
 fn bench_cold_read(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("cold_read");

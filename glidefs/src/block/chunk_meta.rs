@@ -279,7 +279,7 @@ mod tests {
     }
 
     /// Helper to fix CRC after mutating serialized bytes.
-    fn fix_crc(bytes: &mut Vec<u8>) {
+    fn fix_crc(bytes: &mut [u8]) {
         let crc_offset = bytes.len() - 4;
         let crc = crc32fast::hash(&bytes[..crc_offset]);
         bytes[crc_offset..].copy_from_slice(&crc.to_le_bytes());

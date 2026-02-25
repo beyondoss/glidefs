@@ -21,14 +21,16 @@ fn is_verbose() -> bool {
         .unwrap_or(false)
 }
 use object_store::ObjectStore;
+use parking_lot::RwLock;
 use rand::{Rng, thread_rng};
 use tempfile::TempDir;
 
 use glidefs::block::cache::{BlockCache, SimpleBlockCache};
+use glidefs::block::chunk_cache::ChunkMetaCache;
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::metrics::ExportMetrics;
-use glidefs::block::pack_index::HostPackIndex;
 use glidefs::block::state::Active;
+use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
@@ -38,7 +40,8 @@ const DEVICE_SIZE_MB: u64 = 256; // 256MB test device
 struct TestHarness {
     cache: WriteCache<Active>,
     content_store: ContentStore,
-    pack_index: Arc<HostPackIndex>,
+    chunk_meta_cache: Arc<ChunkMetaCache>,
+    volume_manifest: Arc<RwLock<VolumeManifest>>,
     clean_cache: Arc<dyn BlockCache>,
     metrics: Arc<ExportMetrics>,
     #[allow(dead_code)]
@@ -46,22 +49,26 @@ struct TestHarness {
 }
 
 impl TestHarness {
-    fn new() -> Self {
+    async fn new() -> Self {
         let temp_dir = TempDir::new().unwrap();
         let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let metrics = Arc::new(ExportMetrics::new());
+        let device_size = DEVICE_SIZE_MB * 1024 * 1024;
 
         let config = WriteCacheConfig {
             cache_dir: temp_dir.path().to_path_buf(),
             device_name: "bench".to_string(),
-            device_size: DEVICE_SIZE_MB * 1024 * 1024,
+            device_size,
             block_size: BLOCK_SIZE,
             wal_sync: false,
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3), "bench");
-        let pack_index =
-            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let chunk_meta_cache =
+            Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(RwLock::new(
+            VolumeManifest::new(device_size, BLOCK_SIZE as u32),
+        ));
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         let cache = WriteCache::open(config).expect("Failed to open cache");
@@ -70,7 +77,8 @@ impl TestHarness {
         Self {
             cache,
             content_store,
-            pack_index,
+            chunk_meta_cache,
+            volume_manifest,
             clean_cache,
             metrics,
             temp_dir,
@@ -111,6 +119,7 @@ impl TestHarness {
 
 /// Benchmark: Random 4KB writes (simulates database random I/O).
 fn bench_random_writes(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("random_writes");
 
     for write_size in [4096usize, 16384, 65536] {
@@ -120,7 +129,7 @@ fn bench_random_writes(c: &mut Criterion) {
             BenchmarkId::new("random", format!("{}KB", write_size / 1024)),
             &write_size,
             |b, &size| {
-                let harness = TestHarness::new();
+                let harness = rt.block_on(TestHarness::new());
                 let mut rng = rand::thread_rng();
                 let data = vec![0xABu8; size];
                 let max_offset = harness.device_blocks() * BLOCK_SIZE as u64 - size as u64;
@@ -153,7 +162,7 @@ fn bench_sequential_reads(c: &mut Criterion) {
             let mut total = Duration::ZERO;
 
             for _ in 0..iters {
-                let harness = TestHarness::new();
+                let harness = TestHarness::new().await;
                 // Pre-populate S3 with data
                 for i in 0..10 {
                     let data = vec![i as u8; BLOCK_SIZE];
@@ -168,7 +177,11 @@ fn bench_sequential_reads(c: &mut Criterion) {
                 }
                 harness
                     .cache
-                    .flush_to_s3(&harness.content_store, &harness.pack_index)
+                    .flush_to_s3(
+                        &harness.content_store,
+                        &harness.chunk_meta_cache,
+                        &harness.volume_manifest,
+                    )
                     .await
                     .unwrap();
 
@@ -184,7 +197,8 @@ fn bench_sequential_reads(c: &mut Criterion) {
                             i as u64 * BLOCK_SIZE as u64,
                             BLOCK_SIZE,
                             cold_cache.as_ref(),
-                            &harness.pack_index,
+                            &harness.chunk_meta_cache,
+                            &harness.volume_manifest,
                             &harness.content_store,
                             &harness.metrics,
                         )
@@ -200,7 +214,7 @@ fn bench_sequential_reads(c: &mut Criterion) {
 
     // Warm cache (local reads)
     group.bench_function("warm_cache_128kb", |b| {
-        let harness = TestHarness::new();
+        let harness = rt.block_on(TestHarness::new());
         // Pre-populate local cache
         for i in 0..100 {
             let data = vec![i as u8; BLOCK_SIZE];
@@ -226,12 +240,13 @@ fn bench_sequential_reads(c: &mut Criterion) {
 
 /// Benchmark: Mixed read/write IOPS without background flush (baseline).
 fn bench_mixed_iops_baseline(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("mixed_iops_baseline");
     group.throughput(Throughput::Elements(1));
 
     // 70% read, 30% write (typical VM ratio)
     group.bench_function("70r_30w", |b| {
-        let harness = TestHarness::new();
+        let harness = rt.block_on(TestHarness::new());
         let mut rng = thread_rng();
 
         // Pre-populate some data
@@ -267,7 +282,7 @@ fn bench_mixed_iops_baseline(c: &mut Criterion) {
 
     // 50% read, 50% write
     group.bench_function("50r_50w", |b| {
-        let harness = TestHarness::new();
+        let harness = rt.block_on(TestHarness::new());
         let mut rng = thread_rng();
 
         for i in 0..50 {
@@ -319,7 +334,7 @@ fn bench_mixed_iops_during_flush(c: &mut Criterion) {
             b.to_async(&rt).iter_custom(|iters| {
                 async move {
                     let read_ratio = read_ratio;
-                    let harness = Arc::new(TestHarness::new());
+                    let harness = Arc::new(TestHarness::new().await);
                     let max_block = 200u64;
 
                     // Pre-populate data so reads hit local cache
@@ -344,7 +359,8 @@ fn bench_mixed_iops_during_flush(c: &mut Criterion) {
                                 .cache
                                 .flush_to_s3(
                                     &flush_harness.content_store,
-                                    &flush_harness.pack_index,
+                                    &flush_harness.chunk_meta_cache,
+                                    &flush_harness.volume_manifest,
                                 )
                                 .await;
                         }
@@ -398,7 +414,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
     // Overwrite same block repeatedly (best case - 100% coalesce)
     group.bench_function("same_block_overwrite", |b| {
         b.to_async(&rt).iter_custom(|iters| async move {
-            let harness = TestHarness::new();
+            let harness = TestHarness::new().await;
             let data = vec![0x11u8; BLOCK_SIZE];
 
             let start = Instant::now();
@@ -413,7 +429,11 @@ fn bench_write_coalescing(c: &mut Criterion) {
             // Flush to S3
             harness
                 .cache
-                .flush_to_s3(&harness.content_store, &harness.pack_index)
+                .flush_to_s3(
+                    &harness.content_store,
+                    &harness.chunk_meta_cache,
+                    &harness.volume_manifest,
+                )
                 .await
                 .unwrap();
             let elapsed = start.elapsed();
@@ -427,7 +447,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
     // Sequential writes to different blocks (no coalesce opportunity)
     group.bench_function("sequential_different_blocks", |b| {
         b.to_async(&rt).iter_custom(|iters| async move {
-            let harness = TestHarness::new();
+            let harness = TestHarness::new().await;
 
             let start = Instant::now();
             // Write 100 different blocks
@@ -445,7 +465,11 @@ fn bench_write_coalescing(c: &mut Criterion) {
             }
             harness
                 .cache
-                .flush_to_s3(&harness.content_store, &harness.pack_index)
+                .flush_to_s3(
+                    &harness.content_store,
+                    &harness.chunk_meta_cache,
+                    &harness.volume_manifest,
+                )
                 .await
                 .unwrap();
             let elapsed = start.elapsed();
@@ -471,7 +495,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
             let mut total = Duration::ZERO;
 
             for _ in 0..iters {
-                let harness = TestHarness::new();
+                let harness = TestHarness::new().await;
                 let mut rng = thread_rng();
 
                 // Pre-populate "disk image" - 64MB of data
@@ -488,7 +512,11 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                 }
                 harness
                     .cache
-                    .flush_to_s3(&harness.content_store, &harness.pack_index)
+                    .flush_to_s3(
+                        &harness.content_store,
+                        &harness.chunk_meta_cache,
+                        &harness.volume_manifest,
+                    )
                     .await
                     .unwrap();
 
@@ -522,7 +550,11 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                 // Flush to get S3 metrics
                 harness
                     .cache
-                    .flush_to_s3(&harness.content_store, &harness.pack_index)
+                    .flush_to_s3(
+                        &harness.content_store,
+                        &harness.chunk_meta_cache,
+                        &harness.volume_manifest,
+                    )
                     .await
                     .unwrap();
 
@@ -539,7 +571,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
             let mut total = Duration::ZERO;
 
             for _ in 0..iters {
-                let harness = TestHarness::new();
+                let harness = TestHarness::new().await;
                 let mut rng = thread_rng();
                 let data = vec![0xDBu8; 8192]; // 8KB database pages
 
@@ -567,7 +599,11 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                 // Flush to S3 to get write amplification metrics
                 harness
                     .cache
-                    .flush_to_s3(&harness.content_store, &harness.pack_index)
+                    .flush_to_s3(
+                        &harness.content_store,
+                        &harness.chunk_meta_cache,
+                        &harness.volume_manifest,
+                    )
                     .await
                     .unwrap();
 
@@ -584,7 +620,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
             let mut total = Duration::ZERO;
 
             for _ in 0..iters {
-                let harness = TestHarness::new();
+                let harness = TestHarness::new().await;
                 let mut rng = thread_rng();
 
                 let start = Instant::now();
@@ -620,7 +656,11 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                 // Flush to get S3 metrics
                 harness
                     .cache
-                    .flush_to_s3(&harness.content_store, &harness.pack_index)
+                    .flush_to_s3(
+                        &harness.content_store,
+                        &harness.chunk_meta_cache,
+                        &harness.volume_manifest,
+                    )
                     .await
                     .unwrap();
 
@@ -654,7 +694,7 @@ fn bench_flush_to_s3_latency(c: &mut Criterion) {
                     let mut total = Duration::ZERO;
 
                     for _ in 0..iters {
-                        let harness = TestHarness::new();
+                        let harness = TestHarness::new().await;
 
                         // Write dirty blocks
                         for i in 0..blocks {
@@ -669,7 +709,11 @@ fn bench_flush_to_s3_latency(c: &mut Criterion) {
                         let start = Instant::now();
                         harness
                             .cache
-                            .flush_to_s3(&harness.content_store, &harness.pack_index)
+                            .flush_to_s3(
+                                &harness.content_store,
+                                &harness.chunk_meta_cache,
+                                &harness.volume_manifest,
+                            )
                             .await
                             .unwrap();
                         total += start.elapsed();
@@ -701,6 +745,7 @@ fn bench_flush_to_s3_latency(c: &mut Criterion) {
 fn bench_concurrent_access(c: &mut Criterion) {
     use std::thread;
 
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("concurrent");
 
     for num_threads in [2usize, 4, 8] {
@@ -709,7 +754,7 @@ fn bench_concurrent_access(c: &mut Criterion) {
             &num_threads,
             |b, &threads| {
                 b.iter_custom(|iters| {
-                    let harness = Arc::new(TestHarness::new());
+                    let harness = Arc::new(rt.block_on(TestHarness::new()));
                     let iterations_per_thread = (iters as usize / threads).max(1);
 
                     let start = Instant::now();
@@ -749,7 +794,7 @@ fn bench_concurrent_access(c: &mut Criterion) {
     // Mixed concurrent read/write
     group.bench_function("mixed_4_threads", |b| {
         b.iter_custom(|iters| {
-            let harness = Arc::new(TestHarness::new());
+            let harness = Arc::new(rt.block_on(TestHarness::new()));
 
             // Pre-populate
             for i in 0..100 {
@@ -804,12 +849,13 @@ fn bench_concurrent_access(c: &mut Criterion) {
 
 /// Benchmark: Large sequential writes (like dd).
 fn bench_sequential_writes(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("sequential_writes");
 
     // 1MB sequential write
     group.throughput(Throughput::Bytes(1024 * 1024));
     group.bench_function("1mb_sequential", |b| {
-        let harness = TestHarness::new();
+        let harness = rt.block_on(TestHarness::new());
         let data = vec![0xAAu8; BLOCK_SIZE];
         let blocks_per_mb = 1024 * 1024 / BLOCK_SIZE;
 
@@ -830,7 +876,7 @@ fn bench_sequential_writes(c: &mut Criterion) {
     // 10MB sequential write
     group.throughput(Throughput::Bytes(10 * 1024 * 1024));
     group.bench_function("10mb_sequential", |b| {
-        let harness = TestHarness::new();
+        let harness = rt.block_on(TestHarness::new());
         let data = vec![0xBBu8; BLOCK_SIZE];
         let blocks_per_10mb = 10 * 1024 * 1024 / BLOCK_SIZE;
 

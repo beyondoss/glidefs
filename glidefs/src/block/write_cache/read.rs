@@ -56,6 +56,7 @@ impl WriteCache<Active> {
     /// ChunkMeta → clean_cache → S3.
     /// Chunks are resolved concurrently — a multi-block read that spans multiple packs
     /// fetches them in parallel rather than serially.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(skip(self, clean_cache, chunk_meta_cache, volume_manifest, content_store, metrics), fields(offset = offset, len = len))]
     pub async fn read_v2(
         &self,

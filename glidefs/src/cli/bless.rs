@@ -435,10 +435,10 @@ mod tests {
             let mut within_batch_seen: HashSet<Blake3Hash> = HashSet::new();
 
             for block in blocks {
-                if let Some(ref compressed) = block.compressed {
-                    if within_batch_seen.insert(block.hash) {
-                        new_blocks.push((block.hash, compressed.clone()));
-                    }
+                if let Some(ref compressed) = block.compressed
+                    && within_batch_seen.insert(block.hash)
+                {
+                    new_blocks.push((block.hash, compressed.clone()));
                 }
             }
 
