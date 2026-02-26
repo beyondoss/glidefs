@@ -387,7 +387,7 @@ impl WriteCache<Active> {
         // Iterate packs newest-first (last element = newest)
         // First, try to resolve from cached pack indices
         let mut resolved = None;
-        let mut had_cache_miss = false;
+        let mut uncached_packs: Vec<crate::block::pack::PackId> = Vec::new();
 
         for &pack_id in pack_ids.iter().rev() {
             match pack_index_cache.lookup_block(pack_id, block_offset).await {
@@ -402,24 +402,32 @@ impl WriteCache<Active> {
                         continue;
                     }
                     // Index not cached — need to fetch
-                    had_cache_miss = true;
+                    uncached_packs.push(pack_id);
                 }
             }
         }
 
-        // On cache miss: parallel prefetch ALL pack indices for this chunk
-        if resolved.is_none() && had_cache_miss {
-            let mut fetch_futures = Vec::new();
+        // On cache miss: parallel prefetch ALL uncached pack indices for this chunk
+        if resolved.is_none() && !uncached_packs.is_empty() {
+            // Also check packs we didn't reach in the first loop (oldest packs
+            // that were skipped because we found a cache miss on a newer one first).
             for &pack_id in &pack_ids {
-                if pack_index_cache.get_entries(pack_id).await.is_none() {
-                    let cs = content_store;
-                    let ci = chunk_idx;
-                    let pid = pack_id;
-                    fetch_futures.push(async move {
-                        let result = cs.get_pack_index(ci, pid).await;
-                        (pid, result)
-                    });
+                if !uncached_packs.contains(&pack_id)
+                    && pack_index_cache.get_entries(pack_id).await.is_none()
+                {
+                    uncached_packs.push(pack_id);
                 }
+            }
+
+            let mut fetch_futures = Vec::new();
+            for &pack_id in &uncached_packs {
+                let cs = content_store;
+                let ci = chunk_idx;
+                let pid = pack_id;
+                fetch_futures.push(async move {
+                    let result = cs.get_pack_index(ci, pid).await;
+                    (pid, result)
+                });
             }
 
             let results = futures::future::join_all(fetch_futures).await;

@@ -311,20 +311,25 @@ Step 3 is best-effort. If the versioned snapshot upload fails, the base manifest
 
 ### GC and Snapshot Packs
 
-After compaction, old pack_ids are removed from the live manifest via `replace_packs`. If a snapshot was taken before compaction, that snapshot's manifest still references the old pack_ids. GC detects this:
+After compaction, old pack_ids are removed from the live manifest via `replace_packs`. If a snapshot was taken before compaction, that snapshot's manifest still references the old pack_ids. GC handles this with a two-pass algorithm that keeps memory independent of snapshot count:
 
 ```
 GC reconcile_prefix():
-    1. Load manifests/{name}             → live pack_ids via all_pack_ids()
-    2. Load ALL snapshots/{name}/*       → extend live pack_ids
-       (if snapshot scan fails → skip entire prefix, delete nothing)
-    3. List .pack files under chunks/
-    4. dead_packs = listed .pack files - live_packs
-    5. Mark newly-dead packs with first-seen timestamp
-    6. Delete packs dead longer than grace period
+  Pass 1a: Load live manifests/{name}        → live_packs via all_pack_ids()
+  Pass 1b: Stream .pack files from S3        → classify:
+           in live_packs? → revive if previously dead
+           not in live_packs? → maybe_dead set
+           drop(live_packs)                  ← free memory before pass 2
+
+  Pass 2:  Stream snapshot manifests one at a time:
+           for each: remove referenced packs from maybe_dead, then drop manifest
+           early exit if maybe_dead empties
+           if any snapshot fails to load → abort, delete nothing
+
+  Survivors in maybe_dead are truly dead → grace period check → delete
 ```
 
-**Deleting a snapshot unpins its exclusive packs** — packs not referenced by any other snapshot or the current manifest become orphaned and eligible for GC after the grace period.
+**Deleting a snapshot unpins its exclusive packs** — packs not referenced by any other snapshot or the current manifest become orphaned and eligible for GC after the grace period. Snapshot lifecycle is managed by the orchestrator, not GC.
 
 ### Fork from Snapshot
 
@@ -346,7 +351,7 @@ router.create_export(config, readonly=false, manifest_name=Some("prod-vm"), snap
 | Invariant | Mechanism |
 |-----------|-----------|
 | Background sync never creates snapshot keys | `sync_manifest()` only writes to `manifests/{name}` |
-| Snapshots accumulate | Each snapshot has unique `{seq:020}` key; GC only deletes via explicit `delete_snapshot()` |
+| Snapshots accumulate | Each snapshot has unique `{seq:020}` key; deleted only by the orchestrator via `DELETE /api/exports/{name}/snapshots/{seq}` |
 | Fork reads parent blocks | VolumeManifest → PackIndexCache → S3 range GET on parent's pack files |
 | Snapshot deletion is idempotent | S3 NotFound on delete returns Ok |
 | Non-purge remove preserves snapshots | `remove_export(name, purge=false)` does not call `delete_all_snapshots()` |
@@ -410,7 +415,7 @@ Self-describing S3 object. Each pack is scoped to one volume chunk. The block in
 
 S3 key: `chunks/{chunk_idx:04}/{pack_id:016x}.pack` (`content_store.rs:put_chunk_pack`)
 
-**Fetching the pack index**: `ContentStore::get_pack_index()` does 2 range-reads — 16 bytes for the header (to get `block_count`), then `16 + block_count × 28` bytes for header+index. For a full chunk (1,024 blocks): 16 + 28,672 = 28,688 bytes (~28 KB). (`content_store.rs:get_pack_index`)
+**Fetching the pack index**: `ContentStore::get_pack_index()` does a single range-read of up to 28,688 bytes (16-byte header + 1,024 × 28-byte entries). `parse_pack_index` reads `block_count` from the header and uses only the relevant entries — trailing bytes are ignored. One S3 round trip regardless of pack size. (`content_store.rs:get_pack_index`)
 
 ### VolumeManifest (GLVM)
 
@@ -450,23 +455,42 @@ CRC32 trailer detects torn writes. On recovery, replay stops at the first corrup
 
 ## Garbage Collection (`glidefs gc`)
 
-Pack IDs are read directly from binary manifests via `VolumeManifest::all_pack_ids()` — no extra S3 fetches beyond the manifest itself.
+Pack IDs are read directly from binary manifests via `VolumeManifest::all_pack_ids()` — no extra S3 fetches beyond the manifests themselves.
+
+Two-pass algorithm with memory independent of snapshot count:
 
 ```
-For each export prefix in S3:
-    1.  Load manifests/{name}            → live (chunk_idx, pack_id) pairs
-    2.  Load ALL snapshots/{name}/*      → extend live pairs
-        (if snapshot scan fails → skip entire prefix, delete nothing)
-    3.  List chunks/{chunk_idx:04}/*.pack for each chunk
-    4.  dead_packs = listed .pack files - live (chunk_idx, pack_id) pairs
-    5.  Mark newly-dead packs with first-seen timestamp in GC state file
-    6.  Revive packs that reappeared in live set (manifest was updated)
-    7.  Delete packs dead longer than grace period
+For each export prefix in S3 (16-wide parallel):
+
+  Pass 1a — Build live set from live manifests only:
+    Load manifests/{name} → live_packs HashSet<(chunk_idx, pack_id)>
+    (bounded by current volume pack count, not snapshot count)
+
+  Pass 1b — Stream S3 pack list, classify against live set:
+    Stream chunks/{chunk_idx:04}/*.pack
+    In live_packs? → revive if previously marked dead in state file
+    Not in live_packs? → add to maybe_dead HashSet
+    drop(live_packs)  ← free memory before pass 2
+
+  Pass 2 — Stream snapshot manifests one at a time:
+    For each snapshots/{name}/{seq}:
+      Deserialize → remove referenced packs from maybe_dead → drop manifest
+      Early exit if maybe_dead empties
+      If any snapshot fails to load → abort prefix, delete nothing
+
+  Survivors in maybe_dead are truly dead:
+    Mark newly-dead with first-seen timestamp in state file
+    Check grace period eligibility
+    Delete up to max_deletes (32-wide parallel)
 ```
+
+**Memory**: O(live_manifest_packs + maybe_dead + max_deletes). Snapshot manifests are never held simultaneously — each is deserialized, used to shrink `maybe_dead`, and dropped. 1,000 snapshots use the same memory as 1.
 
 **Grace period**: Dead packs are not deleted immediately. GC records the first-seen-dead timestamp in a local JSON state file (`gc-state.json`). Packs are only eligible for deletion after the grace period (default 24h). This prevents races where a flush uploads a pack but the manifest hasn't been committed yet.
 
-**Safety controls**: `--dry-run` reports without deleting. `--max-deletes` caps deletions per run. Corrupt manifests are skipped. (`cli/gc.rs`)
+**Snapshot lifecycle**: GC never creates or deletes snapshots. Snapshot retention is the orchestrator's responsibility — `DELETE /api/exports/{name}/snapshots/{seq}`. Once a snapshot is deleted, its exclusive packs become orphaned and eligible for GC after the grace period.
+
+**Safety controls**: `--dry-run` reports without deleting. `--max-deletes` caps deletions per run (default 100,000). Corrupt or unreadable manifests cause the entire prefix to be skipped — no packs deleted when uncertain. (`cli/gc.rs`)
 
 ## Background Subsystems
 
@@ -527,7 +551,7 @@ CRC32 is stored in `crc_map: DashMap<usize, u32>` on `CacheInner`. At checkpoint
 | `glidefs init [path]` | Generate a default `glidefs.toml` config file |
 | `glidefs run -c glidefs.toml` | Start the block server (NBD + optional ublk) with HTTP management API |
 | `glidefs bless --image disk.raw --name ubuntu-22.04 --s3-prefix bases -c glidefs.toml` | Convert a raw disk image into a content-addressed base image in S3 |
-| `glidefs gc -c glidefs.toml [--dry-run] [--grace-period 24h]` | Delete orphaned packs in S3 |
+| `glidefs gc -c glidefs.toml [--dry-run] [--grace-period 24h] [--max-deletes 100000] [--state-file gc-state.json]` | Delete orphaned packs in S3 |
 
 ### Bless Pipeline
 
@@ -611,7 +635,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/flush_scheduler.rs` | Per-export flush scheduling: event-driven (dirty count threshold), periodic checkpoint |
 | `block/handler.rs` | `BlockHandler`: transport-agnostic read/write/flush/trim/write_zeroes |
 | `block/manifest.rs` | S3 key helpers: `manifest_s3_key`, `snapshot_s3_key` |
-| `cli/gc.rs` | GC: `all_pack_ids()` from binary manifests, grace period, max-delete cap |
+| `cli/gc.rs` | GC: two-pass algorithm (live manifests → stream S3 → stream snapshots), grace period, max-delete cap |
 | `cli/bless.rs` | Base image preparation: raw disk → GLPK packs + GLVM manifest + hot set |
 | `router.rs` | `ExportRouter`: export lifecycle, fork, snapshot, drain |
 | `circuit_breaker.rs` | Lock-free S3 circuit breaker (`AtomicU64` packed state) |
@@ -689,7 +713,7 @@ We considered inline deletion (delete old packs immediately after `replace_packs
 1. **Redundant with GC**: GC already handles orphaned packs safely. Inline deletion duplicates that logic with fewer safety mechanisms.
 2. **No grace period**: GC has a configurable grace period (default 24h). Inline deletion would immediately delete packs that a recently-uploaded-but-not-yet-visible manifest might reference.
 3. **No max-delete cap**: GC limits deletions per run. Inline deletion on a heavily-fragmented volume could issue thousands of DELETE requests synchronously on the flush path.
-4. **Snapshot scanning cost**: Safe inline deletion requires scanning all snapshot manifests (N S3 GETs) per compaction cycle, inline on the flush path. GC amortizes this across all exports once per run.
+4. **Snapshot safety**: Old packs may be pinned by snapshots. Safe inline deletion would require checking all snapshot manifests per compaction. GC already does this efficiently with its two-pass streaming algorithm, amortized across all exports.
 
 The insight: compaction's job is to reorganize pack layout and update the manifest. Cleanup is GC's job.
 
@@ -733,4 +757,4 @@ Background syncs continuously overwrite `manifests/{name}` — there's no histor
 
 Each snapshot gets a unique `snapshots/{name}/{seq:020}` key. The sequence is zero-padded so S3 LIST returns results in chronological order. Background sync never writes to the `snapshots/` prefix — it's a separate namespace.
 
-This also means snapshot retention is explicit: each versioned key exists until explicitly deleted by the control plane. GC scans all snapshot keys before deleting packs — packs pinned by any snapshot are preserved.
+This also means snapshot retention is the orchestrator's responsibility: each versioned key exists until explicitly deleted via the management API. GC streams snapshot manifests to check for pinned packs — packs referenced by any snapshot are preserved, with memory independent of snapshot count.

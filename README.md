@@ -275,7 +275,7 @@ Both transports: the orchestrator doesn't know or care which one is in use. It g
 
 ### Restart Behavior
 
-On startup, GlideFS discovers exports from S3, recovers WAL + redb from local SSD, and re-registers kernel devices. Recovery is local — no S3 writes. 2000 exports recover in ~6 seconds.
+On startup, GlideFS discovers exports from S3, recovers from the WAL on local SSD, and re-registers kernel devices. Recovery is local — no S3 writes. 2000 exports recover in ~6 seconds.
 
 **NBD (zero-downtime):** The kernel queues I/O during the restart window via `dead_conn_timeout`. VMs never see a disconnect. Device paths (`/dev/nbdN`) stay the same.
 
@@ -283,7 +283,7 @@ On startup, GlideFS discovers exports from S3, recovers WAL + redb from local SS
 1. SIGUSR1 → drain all exports to S3
 2. SIGTERM → graceful shutdown (NBD devices stay alive in kernel)
 3. Start new binary (same config, same cache dir)
-4. New process discovers exports, recovers from WAL + redb
+4. New process discovers exports, recovers from WAL
 5. NBD_CMD_RECONFIGURE swaps socket fds on existing /dev/nbdN devices
 6. Kernel resumes queued I/O on new sockets
 7. /health/ready returns 200
@@ -299,7 +299,7 @@ The orchestrator does nothing. Same device paths, same VMs, no reconnection need
 1. SIGUSR1 → drain all exports to S3
 2. SIGTERM → graceful shutdown (ublk devices enter QUIESCED state)
 3. Start new binary (same config, same cache dir)
-4. New process discovers exports, recovers from WAL + redb
+4. New process discovers exports, recovers from WAL
 5. Scans for QUIESCED glidefs devices, resumes them via START_USER_RECOVERY
 6. Kernel reissues queued I/O to new process
 7. /health/ready returns 200
@@ -380,6 +380,28 @@ curl -X PUT localhost:8080/api/exports/my-vm-rollback \
 # verify my-vm-rollback, then swap at the load balancer
 ```
 
+### Garbage Collection
+
+Writes accumulate new packs in S3. Run GC periodically to delete packs no longer referenced by any manifest or snapshot.
+
+```sh
+glidefs gc --config glidefs.toml
+```
+
+GC reads pack IDs from all current and snapshot manifests, lists packs in S3, and deletes anything unreferenced. State is persisted between runs (default `gc-state.json`) to enforce the grace period.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dry-run` | false | Report what would be deleted without deleting |
+| `--grace-period` | `24h` | Protect recently-dead packs from deletion |
+| `--max-deletes` | `100000` | Cap deletes per run |
+| `--state-file` | `gc-state.json` | Path to grace period state file |
+| `--snapshot-retention` | disabled | Auto-delete snapshots older than this (e.g. `30d`) |
+
+**When to run:** Daily cron is sufficient. Run immediately after bulk snapshot deletion to reclaim space faster.
+
+**Grace period:** Packs marked dead for less than `--grace-period` are never deleted. Protects against races between concurrent writes and GC. The grace period must be longer than your longest flush cycle.
+
 ### Flush and Durability
 
 Writes are durable on local SSD immediately. They are **not** in S3 until flushed. Local disk loss before flush = data loss for unflushed blocks.
@@ -401,7 +423,7 @@ At 1,000 blocks/sec with 128KB blocks: ~2% of one core for BLAKE3 hashing, ~128M
 
 ## Key Design Choices
 
-- **128KB blocks** match ZFS recordsize. One S3 object holds 25 compressed blocks (~3.2MB).
+- **128KB blocks** match ZFS recordsize. Each flush creates one LZ4-compressed pack per modified 128MiB chunk.
 - **BLAKE3-128 hashing** for content addressing and integrity verification. Truncated from 256-bit; 128-bit collision resistance is sufficient for dedup.
 - **Lock-free write path** using `pread`/`pwrite`, atomic block map with CAS, and monotonic sequence numbers.
 - **Typestate pattern** enforces valid lifecycle transitions at compile time. Can't write to a recovering cache.

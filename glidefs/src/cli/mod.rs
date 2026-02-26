@@ -57,9 +57,6 @@ pub enum Commands {
         /// Path to GC state file for grace period tracking
         #[arg(long, default_value = "gc-state.json")]
         state_file: PathBuf,
-        /// Delete snapshots older than this (e.g., "30d", "7d"). Disabled if omitted.
-        #[arg(long)]
-        snapshot_retention: Option<String>,
     },
 }
 

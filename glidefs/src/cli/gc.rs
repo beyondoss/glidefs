@@ -139,9 +139,7 @@ struct GcStats {
     dead_found: usize,
     eligible_for_deletion: usize,
     packs_deleted: usize,
-    // Snapshot retention stats
-    snapshots_scanned: usize,
-    snapshots_deleted: usize,
+    snapshots_checked: usize,
 }
 
 impl GcStats {
@@ -154,8 +152,7 @@ impl GcStats {
         self.dead_found += other.dead_found;
         self.eligible_for_deletion += other.eligible_for_deletion;
         self.packs_deleted += other.packs_deleted;
-        self.snapshots_scanned += other.snapshots_scanned;
-        self.snapshots_deleted += other.snapshots_deleted;
+        self.snapshots_checked += other.snapshots_checked;
     }
 }
 
@@ -169,7 +166,6 @@ pub async fn run_gc(
     grace_period_str: String,
     max_deletes: usize,
     state_file: PathBuf,
-    snapshot_retention_str: Option<String>,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -209,46 +205,9 @@ pub async fn run_gc(
     let mut state = GcState::load(&state_file)?;
     let mut stats = GcStats::default();
 
-    // Parse snapshot retention if provided.
-    let snapshot_retention = snapshot_retention_str
-        .as_deref()
-        .map(parse_duration)
-        .transpose()?;
-
     // Discover all S3 prefixes that contain manifests or chunks
     let prefixes = discover_s3_prefixes(&*object_store, &db_path).await?;
     info!(count = prefixes.len(), "discovered S3 prefixes");
-
-    // Phase 0: Snapshot retention (runs BEFORE pack reconciliation).
-    // Fewer live snapshots = smaller live set = more dead packs eligible for cleanup.
-    if let Some(retention) = snapshot_retention {
-        let now = Utc::now();
-        let mut snapshots_deleted: usize = 0;
-        let mut snapshots_total: usize = 0;
-
-        let retention_results: Vec<Result<(usize, usize)>> =
-            futures::stream::iter(prefixes.iter())
-                .map(|prefix| {
-                    let store = std::sync::Arc::clone(&object_store);
-                    async move {
-                        let content_store = ContentStore::new(store, prefix);
-                        enforce_snapshot_retention(&content_store, retention, now, dry_run).await
-                    }
-                })
-                .buffer_unordered(16)
-                .collect()
-                .await;
-
-        for result in retention_results {
-            let (total, deleted) = result?;
-            snapshots_total += total;
-            snapshots_deleted += deleted;
-        }
-
-        info!(snapshots_total, snapshots_deleted, "snapshot retention complete");
-        stats.snapshots_scanned = snapshots_total;
-        stats.snapshots_deleted = snapshots_deleted;
-    }
 
     // Process prefixes in parallel. Each prefix is an independent S3 namespace.
     let per_prefix_budget = max_deletes / prefixes.len().max(1);
@@ -291,14 +250,11 @@ pub async fn run_gc(
     println!("Manifests scanned:       {}", stats.manifests_scanned);
     println!("Manifest parse errors:   {}", stats.manifest_errors);
     println!("Live packs:              {}", stats.live_packs);
+    println!("Snapshots checked:       {}", stats.snapshots_checked);
     println!("Known packs:             {}", stats.known_packs);
     println!("Dead packs found:        {}", stats.dead_found);
     println!("Eligible for deletion:   {}", stats.eligible_for_deletion);
     println!("Packs deleted:           {}", stats.packs_deleted);
-    if stats.snapshots_scanned > 0 || stats.snapshots_deleted > 0 {
-        println!("Snapshots scanned:       {}", stats.snapshots_scanned);
-        println!("Snapshots deleted:       {}", stats.snapshots_deleted);
-    }
 
     Ok(())
 }
@@ -330,48 +286,7 @@ async fn discover_s3_prefixes(
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot retention
-// ---------------------------------------------------------------------------
-
-/// Delete snapshots older than `retention` for a single prefix.
-/// Returns (total_snapshots, deleted_snapshots).
-async fn enforce_snapshot_retention(
-    content_store: &ContentStore,
-    retention: Duration,
-    now: DateTime<Utc>,
-    dry_run: bool,
-) -> Result<(usize, usize)> {
-    let snapshots = content_store.list_all_snapshots_with_dates().await?;
-    let total = snapshots.len();
-    let mut deleted = 0;
-
-    let cutoff = now
-        - chrono::TimeDelta::from_std(retention).unwrap_or(chrono::TimeDelta::MAX);
-
-    for (path, last_modified) in &snapshots {
-        if *last_modified < cutoff {
-            if dry_run {
-                info!(path = %path, age_days = (now - *last_modified).num_days(), "would delete expired snapshot (dry-run)");
-            } else {
-                match content_store.delete_snapshot_by_path(path).await {
-                    Ok(()) => {
-                        info!(path = %path, "deleted expired snapshot");
-                    }
-                    Err(e) => {
-                        warn!(path = %path, error = %e, "failed to delete expired snapshot");
-                        continue;
-                    }
-                }
-            }
-            deleted += 1;
-        }
-    }
-
-    Ok((total, deleted))
-}
-
-// ---------------------------------------------------------------------------
-// S3 pack listing
+// S3 pack listing (test-only, reconcile_prefix streams inline)
 // ---------------------------------------------------------------------------
 
 /// List all v4 pack files across chunk directories.
@@ -395,7 +310,6 @@ async fn list_all_packs(
         let Some(rel) = path_str.strip_prefix(&chunks_prefix_str) else {
             continue;
         };
-        // rel = "{idx:04}/{pack_id:016x}.pack"
         let Some(slash_pos) = rel.find('/') else {
             continue;
         };
@@ -415,70 +329,35 @@ async fn list_all_packs(
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot manifest loading
+// Reconciliation (two-pass, snapshot-count-independent memory)
 // ---------------------------------------------------------------------------
 
-/// Stream snapshot manifests for a prefix, inserting live pack IDs directly
-/// into the provided set. Each manifest is deserialized and dropped before
-/// fetching the next, avoiding O(snapshots) memory for manifests.
-///
-/// Returns the number of snapshot manifests successfully scanned.
-async fn collect_snapshot_pack_ids(
-    content_store: &ContentStore,
-    live_packs: &mut HashSet<(u32, PackId)>,
-) -> Result<usize> {
-    let base = content_store.base_path();
-    let prefix_str = format!("{}/snapshots/", base);
-    let prefix = ObjectPath::from(prefix_str);
-
-    let mut paths = Vec::new();
-    let mut stream = content_store.object_store().list(Some(&prefix));
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(meta) => paths.push(meta.location),
-            Err(e) => return Err(e.into()),
-        }
+/// Parse a pack path relative to the chunks prefix.
+/// Returns `(chunk_idx, pack_id)` or None if the path doesn't match.
+fn parse_pack_path(rel: &str) -> Option<(u32, PackId)> {
+    let slash_pos = rel.find('/')?;
+    let chunk_idx = rel[..slash_pos].parse::<u32>().ok()?;
+    let filename = &rel[slash_pos + 1..];
+    let hex_str = filename.strip_suffix(".pack")?;
+    if hex_str.len() != 16 {
+        return None;
     }
-
-    let mut scanned = 0usize;
-    for path in paths {
-        let data = match content_store.object_store().get(&path).await {
-            Ok(response) => match response.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(key = %path, error = %e, "failed to read snapshot manifest bytes");
-                    continue;
-                }
-            },
-            Err(object_store::Error::NotFound { .. }) => continue,
-            Err(e) => {
-                warn!(key = %path, error = %e, "failed to fetch snapshot manifest");
-                continue;
-            }
-        };
-        match VolumeManifest::deserialize(&data) {
-            Ok(vm) => {
-                live_packs.extend(vm.all_pack_ids());
-                scanned += 1;
-            }
-            Err(e) => {
-                warn!(key = %path, error = %e, "corrupt snapshot manifest, skipping");
-            }
-        }
-    }
-
-    Ok(scanned)
+    let pack_id = u64::from_str_radix(hex_str, 16).ok()?;
+    Some((chunk_idx, pack_id))
 }
-
-// ---------------------------------------------------------------------------
-// Reconciliation
-// ---------------------------------------------------------------------------
 
 /// Reconcile a single S3 prefix: find and delete orphaned packs.
 ///
-/// Reads all manifests + snapshots as binary VolumeManifest and extracts live
-/// pack IDs directly via `all_pack_ids()`. Lists pack files from S3 to get
-/// the known set. Dead = known - live. Grace period and deletion cap apply.
+/// Two-pass algorithm with memory independent of snapshot count:
+///
+/// **Pass 1**: Build live set from live manifests only (bounded by volume size).
+/// Stream S3 pack list, collect packs not in live set → `maybe_dead` HashSet.
+///
+/// **Pass 2**: Stream snapshot manifests one at a time. For each, remove any
+/// referenced packs from `maybe_dead`. Whatever survives is truly dead.
+///
+/// Memory: O(live_manifest_packs + maybe_dead + max_deletes).
+/// Snapshot manifests are never held simultaneously.
 async fn reconcile_prefix(
     content_store: &ContentStore,
     state: &GcState,
@@ -490,7 +369,8 @@ async fn reconcile_prefix(
     let mut delta = GcStateDelta::default();
     let mut manifest_failed = false;
 
-    // Phase 1: Read all manifests, collect live (chunk_idx, pack_id) pairs.
+    // Pass 1a: Read live manifests, collect live (chunk_idx, pack_id) pairs.
+    // This is bounded by the volume's current pack count, not snapshot count.
     let mut live_packs: HashSet<(u32, PackId)> = HashSet::new();
 
     let manifest_names = content_store.list_all_manifests().await?;
@@ -524,26 +404,12 @@ async fn reconcile_prefix(
         return Ok((delta, stats));
     }
 
-    // Snapshot manifests — stream pack IDs directly into live_packs.
-    // Each manifest is deserialized and dropped before the next, avoiding
-    // O(snapshots) memory for manifest bodies.
-    match collect_snapshot_pack_ids(content_store, &mut live_packs).await {
-        Ok(count) => {
-            stats.manifests_scanned += count;
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to scan snapshot manifests — treating all packs as live");
-            return Ok((delta, stats));
-        }
-    }
-
     stats.live_packs += live_packs.len();
 
-    // Phase 2+3: Stream S3 pack list, classify each pack inline.
-    // No `known_packs` HashSet — each pack is checked against `live_packs`
-    // as it arrives from the LIST stream, keeping memory at O(live + dead).
-    let now_ts = Utc::now().to_rfc3339();
-    let mut dead_packs: Vec<(u32, PackId)> = Vec::new();
+    // Pass 1b: Stream S3 pack list, classify against live manifests.
+    // Packs in live set → revive if previously dead.
+    // Packs NOT in live set → maybe_dead (needs snapshot check).
+    let mut maybe_dead: HashSet<(u32, PackId)> = HashSet::new();
 
     let base = content_store.base_path();
     let chunks_prefix_str = format!("{}/chunks/", base);
@@ -556,66 +422,120 @@ async fn reconcile_prefix(
         let Some(rel) = path_str.strip_prefix(&chunks_prefix_str) else {
             continue;
         };
-        let Some(slash_pos) = rel.find('/') else {
-            continue;
-        };
-        let Ok(chunk_idx) = rel[..slash_pos].parse::<u32>() else {
-            continue;
-        };
-        let filename = &rel[slash_pos + 1..];
-        let Some(hex_str) = filename.strip_suffix(".pack") else {
-            continue;
-        };
-        if hex_str.len() != 16 {
-            continue;
-        }
-        let Ok(pack_id) = u64::from_str_radix(hex_str, 16) else {
+        let Some((chunk_idx, pack_id)) = parse_pack_path(rel) else {
             continue;
         };
 
         stats.known_packs += 1;
 
         if live_packs.contains(&(chunk_idx, pack_id)) {
-            // Live pack — check if it was previously marked dead (revive it)
+            // Definitely live — revive if previously marked dead
             let key = pack_key(chunk_idx, pack_id);
             if state.dead_packs.contains_key(&key) {
                 delta.revived_packs.push(key);
             }
         } else {
-            // Dead pack — record in delta
-            let key = pack_key(chunk_idx, pack_id);
-            if !state.dead_packs.contains_key(&key) {
-                delta.newly_dead_packs.push((key, now_ts.clone()));
-            }
-            dead_packs.push((chunk_idx, pack_id));
+            maybe_dead.insert((chunk_idx, pack_id));
         }
     }
 
-    stats.dead_found += dead_packs.len();
+    // Drop the live set — no longer needed, free memory before pass 2.
+    drop(live_packs);
 
-    // Phase 4: Filter by grace period.
-    let eligible: Vec<(u32, PackId)> = dead_packs
-        .iter()
-        .filter(|(ci, pi)| {
-            state.is_pack_eligible(*ci, *pi, grace_period)
-                || (grace_period.is_zero()
-                    && !state.dead_packs.contains_key(&pack_key(*ci, *pi)))
-        })
-        .copied()
-        .collect();
-    stats.eligible_for_deletion += eligible.len();
+    if maybe_dead.is_empty() {
+        stats.prefixes_scanned += 1;
+        return Ok((delta, stats));
+    }
 
-    // Phase 6: Delete eligible packs (capped, parallel)
-    let to_delete: Vec<(u32, PackId)> = eligible.into_iter().take(max_deletes).collect();
+    info!(
+        maybe_dead = maybe_dead.len(),
+        "pass 1 complete, checking snapshot manifests"
+    );
 
+    // Pass 2: Stream snapshot manifests one at a time.
+    // For each, remove referenced packs from maybe_dead. The manifest is
+    // deserialized and dropped before loading the next → O(1) per manifest.
+    let snap_prefix_str = format!("{}/snapshots/", base);
+    let snap_prefix = ObjectPath::from(snap_prefix_str);
+
+    let mut snap_paths = Vec::new();
+    let mut snap_stream = content_store.object_store().list(Some(&snap_prefix));
+    while let Some(result) = snap_stream.next().await {
+        match result {
+            Ok(meta) => snap_paths.push(meta.location),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    for path in snap_paths {
+        if maybe_dead.is_empty() {
+            break; // All candidates accounted for, no need to check more snapshots
+        }
+
+        let data = match content_store.object_store().get(&path).await {
+            Ok(response) => match response.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(key = %path, error = %e, "failed to read snapshot manifest bytes");
+                    continue;
+                }
+            },
+            Err(object_store::Error::NotFound { .. }) => continue,
+            Err(e) => {
+                warn!(key = %path, error = %e, "failed to fetch snapshot manifest — treating remaining maybe_dead as live");
+                // Safety: if we can't read a snapshot, we can't be sure its packs are dead.
+                stats.prefixes_scanned += 1;
+                return Ok((delta, stats));
+            }
+        };
+
+        match VolumeManifest::deserialize(&data) {
+            Ok(vm) => {
+                for (chunk_idx, pack_id) in vm.all_pack_ids() {
+                    maybe_dead.remove(&(chunk_idx, pack_id));
+                }
+                stats.snapshots_checked += 1;
+            }
+            Err(e) => {
+                warn!(key = %path, error = %e, "corrupt snapshot manifest — treating remaining maybe_dead as live");
+                stats.prefixes_scanned += 1;
+                return Ok((delta, stats));
+            }
+        }
+        // vm is dropped here — O(1) snapshot memory
+    }
+
+    // Whatever survives pass 2 is truly dead.
+    let now_ts = Utc::now().to_rfc3339();
+    stats.dead_found += maybe_dead.len();
+
+    let mut eligible: Vec<(u32, PackId)> = Vec::new();
+    for &(chunk_idx, pack_id) in &maybe_dead {
+        let key = pack_key(chunk_idx, pack_id);
+        let is_new = !state.dead_packs.contains_key(&key);
+        if is_new {
+            delta.newly_dead_packs.push((key, now_ts.clone()));
+        }
+
+        let is_eligible = state.is_pack_eligible(chunk_idx, pack_id, grace_period)
+            || (grace_period.is_zero() && is_new);
+        if is_eligible {
+            stats.eligible_for_deletion += 1;
+            if eligible.len() < max_deletes {
+                eligible.push((chunk_idx, pack_id));
+            }
+        }
+    }
+
+    // Delete eligible packs (already capped at max_deletes, parallel)
     if dry_run {
-        for &(chunk_idx, pack_id) in &to_delete {
+        for &(chunk_idx, pack_id) in &eligible {
             info!(chunk_idx, pack_id, "would delete orphaned pack (dry-run)");
         }
-        stats.packs_deleted += to_delete.len();
+        stats.packs_deleted += eligible.len();
     } else {
         let delete_results: Vec<((u32, PackId), Result<(), _>)> =
-            futures::stream::iter(to_delete.iter().copied())
+            futures::stream::iter(eligible.iter().copied())
                 .map(|(chunk_idx, pack_id)| {
                     let cs = &content_store;
                     async move {
@@ -1194,84 +1114,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gc_snapshot_retention() {
-        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
-
-        // Create snapshots: both with "now" timestamps (InMemory behavior).
-        let vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        content_store
-            .put_snapshot("vm1", 1, vm.serialize())
-            .await
-            .unwrap();
-        content_store
-            .put_snapshot("vm1", 2, vm.serialize())
-            .await
-            .unwrap();
-
-        // Verify both exist.
-        let snapshots = content_store
-            .list_all_snapshots_with_dates()
-            .await
-            .unwrap();
-        assert_eq!(snapshots.len(), 2);
-
-        // With InMemory, all objects have "now" timestamps.
-        // Use a retention of 0s so everything is "expired".
-        let now = Utc::now();
-        let (total, deleted) = enforce_snapshot_retention(
-            &content_store,
-            Duration::from_secs(0), // everything expired
-            now,
-            false,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(total, 2);
-        assert_eq!(deleted, 2);
-
-        // Verify snapshots are gone.
-        let snapshots = content_store
-            .list_all_snapshots_with_dates()
-            .await
-            .unwrap();
-        assert_eq!(snapshots.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_gc_snapshot_retention_dry_run() {
-        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-        let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
-
-        let vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        content_store
-            .put_snapshot("vm1", 1, vm.serialize())
-            .await
-            .unwrap();
-
-        let now = Utc::now();
-        let (total, deleted) = enforce_snapshot_retention(
-            &content_store,
-            Duration::from_secs(0),
-            now,
-            true, // dry run
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(total, 1);
-        assert_eq!(deleted, 1, "dry run reports as deleted");
-
-        // But snapshot should still exist.
-        let snapshots = content_store
-            .list_all_snapshots_with_dates()
-            .await
-            .unwrap();
-        assert_eq!(snapshots.len(), 1, "snapshot should survive dry run");
-    }
-
-    #[tokio::test]
     async fn test_gc_snapshot_packs_are_live() {
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
@@ -1316,9 +1158,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Both packs are live (one from manifest, one from snapshot).
-        assert_eq!(report.live_packs(), 2);
-        assert_eq!(report.dead_found(), 0);
+        // pack_main is live from manifest, pack_snap is saved by snapshot.
+        assert_eq!(report.live_packs(), 1, "only pack_main from live manifest");
+        assert_eq!(report.dead_found(), 0, "snapshot removed pack_snap from maybe_dead");
         assert_eq!(report.packs_deleted(), 0);
     }
 
