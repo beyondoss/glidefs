@@ -1,11 +1,32 @@
+use std::collections::HashMap;
+
 use bytes::Bytes;
 use tracing::{debug, instrument, warn};
 
 use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
+use crate::block::pack::PackId;
 use crate::block::state::Active;
 
 use super::{CacheError, WriteCache};
+
+/// Where a block lives after resolution (before S3 fetch).
+enum BlockLocation {
+    /// Block is on local SSD — data already read.
+    Local(Bytes),
+    /// Block is in clean_cache — data already available.
+    Cached(Bytes),
+    /// Block is unwritten — all zeros.
+    Zero,
+    /// Block needs to be fetched from S3.
+    NeedsFetch {
+        pack_id: PackId,
+        chunk_idx: u32,
+        expected_hash: crate::block::block_map::Blake3Hash,
+        pack_offset: u32,
+        comp_length: u32,
+    },
+}
 
 /// Source of data for a single chunk in a read plan.
 ///
@@ -166,32 +187,102 @@ impl WriteCache<Active> {
             });
         }
 
-        // Resolve all blocks concurrently (same pattern as read).
-        let futures: Vec<_> = (start_chunk..=end_chunk)
+        // Locate all blocks concurrently, then coalesce S3 fetches.
+        let locate_futures: Vec<_> = (start_chunk..=end_chunk)
             .map(|block_idx| {
-                self.resolve_chunk_source(
-                    block_idx as usize,
-                    clean_cache,
-                    pack_index_cache,
-                    volume_manifest,
-                    content_store,
-                    Some(metrics),
-                )
+                let is_local = self.inner.is_present(block_idx as usize);
+                let file_offset = block_idx * chunk_size;
+                async move {
+                    if is_local {
+                        // Return LocalSsd directly — no data read needed.
+                        return Ok((block_idx, None, Some(file_offset)));
+                    }
+                    let loc = self.locate_block(
+                        block_idx as usize,
+                        clean_cache,
+                        pack_index_cache,
+                        volume_manifest,
+                        content_store,
+                        Some(metrics),
+                    ).await?;
+                    Ok::<_, CacheError>((block_idx, Some(loc), None))
+                }
             })
             .collect();
-        let sources = futures::future::try_join_all(futures).await?;
+        let located = futures::future::try_join_all(locate_futures).await?;
 
+        // Partition into sources and NeedsFetch entries
+        let mut sources: HashMap<usize, ChunkSource> = HashMap::new();
+        let mut fetch_entries = Vec::new();
+
+        for (i, (block_idx, location, local_offset)) in located.into_iter().enumerate() {
+            if let Some(file_offset) = local_offset {
+                sources.insert(i, ChunkSource::LocalSsd { file_offset });
+                continue;
+            }
+            match location.unwrap() {
+                BlockLocation::Local(data) => {
+                    if data.iter().all(|&b| b == 0) {
+                        sources.insert(i, ChunkSource::Zero);
+                    } else {
+                        sources.insert(i, ChunkSource::InMemory(data));
+                    }
+                }
+                BlockLocation::Cached(data) => {
+                    if data.iter().all(|&b| b == 0) {
+                        sources.insert(i, ChunkSource::Zero);
+                    } else {
+                        sources.insert(i, ChunkSource::InMemory(data));
+                    }
+                }
+                BlockLocation::Zero => {
+                    sources.insert(i, ChunkSource::Zero);
+                }
+                BlockLocation::NeedsFetch {
+                    pack_id,
+                    chunk_idx,
+                    expected_hash,
+                    pack_offset,
+                    comp_length,
+                } => {
+                    fetch_entries.push((i, pack_id, chunk_idx, expected_hash, pack_offset, comp_length));
+                }
+            }
+        }
+
+        // Coalesced S3 fetch for NeedsFetch blocks
+        if !fetch_entries.is_empty() {
+            let fetched = Self::fetch_coalesced(
+                &fetch_entries,
+                content_store,
+                clean_cache,
+                Some(metrics),
+            )
+            .await?;
+            for (i, data) in fetched {
+                if data.iter().all(|&b| b == 0) {
+                    sources.insert(i, ChunkSource::Zero);
+                } else {
+                    sources.insert(i, ChunkSource::InMemory(data));
+                }
+            }
+        }
+
+        // Build plan entries in order
         let mut entries = Vec::with_capacity(num_chunks);
-        for (i, source) in sources.into_iter().enumerate() {
-            let chunk_idx = start_chunk + i as u64;
-            let chunk_start_byte = chunk_idx * chunk_size;
+        for i in 0..num_chunks {
+            let source = sources.remove(&i).ok_or_else(|| {
+                CacheError::DecompressFailed("missing block in coalesced read plan".to_string())
+            })?;
+            let block_idx = start_chunk + i as u64;
+            let chunk_start_byte = block_idx * chunk_size;
 
-            let slice_start = if chunk_idx == start_chunk {
+            let slice_start = if block_idx == start_chunk {
                 (offset - chunk_start_byte) as usize
             } else {
                 0
             };
-            let slice_end = if chunk_idx == end_chunk {
+            let slice_end = if block_idx == end_chunk {
                 let end_byte = offset + len as u64;
                 let relative_end = (end_byte - chunk_start_byte) as usize;
                 std::cmp::min(relative_end, self.inner.config.block_size)
@@ -207,54 +298,6 @@ impl WriteCache<Active> {
         }
 
         Ok(ReadPlan { entries })
-    }
-
-    /// Resolve a single chunk to its source (zero-copy read path).
-    ///
-    /// Same decision tree as `resolve_chunk`, but returns `ChunkSource` instead
-    /// of the actual data for locally-available blocks. This lets the caller
-    /// issue io_uring ops directly to the data file fd.
-    /// Resolve a single block to its source (ublk zero-copy path).
-    ///
-    /// Same decision tree as `resolve_block`, but returns `ChunkSource`
-    /// instead of the actual data for locally-available blocks.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
-    async fn resolve_chunk_source(
-        &self,
-        block_index: usize,
-        clean_cache: &dyn BlockCache,
-        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
-        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
-        content_store: &ContentStore,
-        metrics: Option<&super::super::metrics::ExportMetrics>,
-    ) -> Result<ChunkSource, CacheError> {
-        use crate::block::block_map::blake3_128;
-
-        // Hot path: block is present on local SSD.
-        if self.inner.is_present(block_index) {
-            let file_offset = block_index as u64 * self.inner.config.block_size as u64;
-            return Ok(ChunkSource::LocalSsd { file_offset });
-        }
-
-        // Cold path: resolve via VolumeManifest → PackIndexCache → S3.
-        // Delegate to resolve_block and wrap result as InMemory.
-        let data = self
-            .resolve_block(
-                block_index,
-                clean_cache,
-                pack_index_cache,
-                volume_manifest,
-                content_store,
-                metrics,
-            )
-            .await?;
-
-        // If all zeros, return Zero source to let ublk memset the page.
-        if data.iter().all(|&b| b == 0) {
-            return Ok(ChunkSource::Zero);
-        }
-
-        Ok(ChunkSource::InMemory(data))
     }
 
     /// Read via VolumeManifest → PackIndexCache → clean_cache → S3.
@@ -307,10 +350,10 @@ impl WriteCache<Active> {
             return Ok(block_data.slice(slice_start..std::cmp::min(slice_end, block_data.len())));
         }
 
-        // Multi-block: resolve all concurrently
-        let futures: Vec<_> = (start_block..=end_block)
+        // Multi-block: locate all blocks concurrently, then coalesce S3 fetches
+        let locate_futures: Vec<_> = (start_block..=end_block)
             .map(|block_idx| {
-                self.resolve_block(
+                self.locate_block(
                     block_idx as usize,
                     clean_cache,
                     pack_index_cache,
@@ -320,10 +363,51 @@ impl WriteCache<Active> {
                 )
             })
             .collect();
-        let blocks = futures::future::try_join_all(futures).await?;
+        let locations = futures::future::try_join_all(locate_futures).await?;
 
+        // Partition: resolved blocks go directly into results,
+        // NeedsFetch blocks get coalesced S3 fetches
+        let mut resolved_blocks: HashMap<usize, Bytes> = HashMap::new();
+        let mut fetch_entries = Vec::new();
+
+        for (i, location) in locations.into_iter().enumerate() {
+            match location {
+                BlockLocation::Local(data) | BlockLocation::Cached(data) => {
+                    resolved_blocks.insert(i, data);
+                }
+                BlockLocation::Zero => {
+                    resolved_blocks.insert(i, self.inner.zero_block_bytes.clone());
+                }
+                BlockLocation::NeedsFetch {
+                    pack_id,
+                    chunk_idx,
+                    expected_hash,
+                    pack_offset,
+                    comp_length,
+                } => {
+                    fetch_entries.push((i, pack_id, chunk_idx, expected_hash, pack_offset, comp_length));
+                }
+            }
+        }
+
+        // Coalesced S3 fetch for all NeedsFetch blocks
+        if !fetch_entries.is_empty() {
+            let fetched = Self::fetch_coalesced(
+                &fetch_entries,
+                content_store,
+                clean_cache,
+                Some(metrics),
+            )
+            .await?;
+            resolved_blocks.extend(fetched);
+        }
+
+        // Assemble result in block order
         let mut result = Vec::with_capacity(len);
-        for (i, block_data) in blocks.into_iter().enumerate() {
+        for i in 0..num_blocks {
+            let block_data = resolved_blocks.get(&i).ok_or_else(|| {
+                CacheError::DecompressFailed("missing block in coalesced read".to_string())
+            })?;
             let block_idx = start_block + i as u64;
             let block_start_byte = block_idx * block_size;
             let slice_start = if block_idx == start_block {
@@ -345,13 +429,15 @@ impl WriteCache<Active> {
         Ok(Bytes::from(result))
     }
 
-    /// Resolve a single block through the tier hierarchy.
+    /// Locate where a block lives without fetching from S3.
     ///
-    /// 1. is_present → pread (local SSD)
-    /// 2. VolumeManifest → PackIndexCache → clean_cache (memory/SSD)
-    /// 3. PackIndexCache miss → parallel prefetch ALL pack indices for chunk → S3
-    /// 4. Block not in any pack → zeros
-    async fn resolve_block(
+    /// Resolution order:
+    /// 1. is_present → Local (pread from SSD)
+    /// 2. VolumeManifest → PackIndexCache → clean_cache → Cached
+    /// 3. PackIndexCache miss → parallel prefetch ALL pack indices for chunk
+    /// 4. Block found → NeedsFetch (S3 coordinates)
+    /// 5. Block not in any pack → Zero
+    async fn locate_block(
         &self,
         block_index: usize,
         clean_cache: &dyn BlockCache,
@@ -359,15 +445,14 @@ impl WriteCache<Active> {
         volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
-    ) -> Result<Bytes, CacheError> {
-        use crate::block::block_map::{blake3_128, lz4_decompress};
-
+    ) -> Result<BlockLocation, CacheError> {
         // Hot path: block is present on local SSD
         if self.inner.is_present(block_index) {
-            return self.sync_read_local_block(block_index as u64);
+            let data = self.sync_read_local_block(block_index as u64)?;
+            return Ok(BlockLocation::Local(data));
         }
 
-        // Cold path: resolve via VolumeManifest → PackIndexCache → S3
+        // Cold path: resolve via VolumeManifest → PackIndexCache
         let (chunk_idx, block_offset, pack_ids) = {
             let vm = volume_manifest.read();
             let ci = vm.chunk_idx_for_block(block_index as u64);
@@ -380,14 +465,12 @@ impl WriteCache<Active> {
         };
 
         if pack_ids.is_empty() {
-            // No packs for this chunk — unwritten → zeros
-            return Ok(self.inner.zero_block_bytes.clone());
+            return Ok(BlockLocation::Zero);
         }
 
         // Iterate packs newest-first (last element = newest)
-        // First, try to resolve from cached pack indices
         let mut resolved = None;
-        let mut uncached_packs: Vec<crate::block::pack::PackId> = Vec::new();
+        let mut uncached_packs: Vec<PackId> = Vec::new();
 
         for &pack_id in pack_ids.iter().rev() {
             match pack_index_cache.lookup_block(pack_id, block_offset).await {
@@ -396,12 +479,9 @@ impl WriteCache<Active> {
                     break;
                 }
                 None => {
-                    // Check if pack index is cached at all
                     if pack_index_cache.get_entries(pack_id).await.is_some() {
-                        // Index is cached but block not in this pack — try next
                         continue;
                     }
-                    // Index not cached — need to fetch
                     uncached_packs.push(pack_id);
                 }
             }
@@ -409,8 +489,6 @@ impl WriteCache<Active> {
 
         // On cache miss: parallel prefetch ALL uncached pack indices for this chunk
         if resolved.is_none() && !uncached_packs.is_empty() {
-            // Also check packs we didn't reach in the first loop (oldest packs
-            // that were skipped because we found a cache miss on a newer one first).
             for &pack_id in &pack_ids {
                 if !uncached_packs.contains(&pack_id)
                     && pack_index_cache.get_entries(pack_id).await.is_none()
@@ -448,7 +526,6 @@ impl WriteCache<Active> {
                 }
             }
 
-            // Retry resolution after prefetch
             for &pack_id in pack_ids.iter().rev() {
                 if let Some((hash, pack_offset, comp_length)) =
                     pack_index_cache.lookup_block(pack_id, block_offset).await
@@ -458,33 +535,98 @@ impl WriteCache<Active> {
                 }
             }
 
-            // If the block is still unresolved and any fetch failed, propagate
-            // the S3 error rather than silently returning zeros. A transient
-            // failure for the pack containing this block should surface as EIO,
-            // not as a zero-read that silently corrupts the guest's data.
             if resolved.is_none() && let Some(e) = last_fetch_error {
                 return Err(e.into());
             }
         }
 
         let Some((pack_id, expected_hash, pack_offset, comp_length)) = resolved else {
-            // Block not in any pack — unwritten → zeros
-            return Ok(self.inner.zero_block_bytes.clone());
+            return Ok(BlockLocation::Zero);
         };
 
-        // Check clean_cache first (block may have been fetched earlier)
+        // Check clean_cache (block may have been fetched earlier)
         if let Some(data) = clean_cache.get(&expected_hash).await {
             if let Some(m) = metrics {
                 m.record_cache_hit();
             }
-            return Ok(data);
+            return Ok(BlockLocation::Cached(data));
         }
 
         if let Some(m) = metrics {
             m.record_cache_miss();
         }
 
-        // Fetch compressed block from S3 via range request
+        Ok(BlockLocation::NeedsFetch {
+            pack_id,
+            chunk_idx,
+            expected_hash,
+            pack_offset,
+            comp_length,
+        })
+    }
+
+    /// Resolve a single block through the full tier hierarchy (single-block path).
+    ///
+    /// Calls `locate_block`, then fetches from S3 if needed.
+    async fn resolve_block(
+        &self,
+        block_index: usize,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: Option<&super::super::metrics::ExportMetrics>,
+    ) -> Result<Bytes, CacheError> {
+        let location = self
+            .locate_block(
+                block_index,
+                clean_cache,
+                pack_index_cache,
+                volume_manifest,
+                content_store,
+                metrics,
+            )
+            .await?;
+
+        match location {
+            BlockLocation::Local(data) | BlockLocation::Cached(data) => Ok(data),
+            BlockLocation::Zero => Ok(self.inner.zero_block_bytes.clone()),
+            BlockLocation::NeedsFetch {
+                pack_id,
+                chunk_idx,
+                expected_hash,
+                pack_offset,
+                comp_length,
+            } => {
+                Self::fetch_single_block(
+                    content_store,
+                    clean_cache,
+                    metrics,
+                    chunk_idx,
+                    pack_id,
+                    expected_hash,
+                    pack_offset,
+                    comp_length,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Fetch, decompress, verify, and cache a single block from S3.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_single_block(
+        content_store: &ContentStore,
+        clean_cache: &dyn BlockCache,
+        metrics: Option<&super::super::metrics::ExportMetrics>,
+        chunk_idx: u32,
+        pack_id: PackId,
+        expected_hash: crate::block::block_map::Blake3Hash,
+        pack_offset: u32,
+        comp_length: u32,
+    ) -> Result<Bytes, CacheError> {
+        use crate::block::block_map::{blake3_128, lz4_decompress};
+
         let fetch_start = std::time::Instant::now();
         let compressed = match content_store
             .get_chunk_block(chunk_idx, pack_id, pack_offset, comp_length)
@@ -518,6 +660,104 @@ impl WriteCache<Active> {
         let data = Bytes::from(decompressed);
         clean_cache.insert(expected_hash, data.clone());
         Ok(data)
+    }
+
+    /// Fetch multiple blocks from S3 with coalesced range requests.
+    ///
+    /// Groups blocks by (chunk_idx, pack_id), fetches each group as a single
+    /// S3 range request covering all blocks in the group, then splits, decompresses,
+    /// verifies, and caches each block individually.
+    ///
+    /// `entries`: Vec of (original_index, NeedsFetch fields)
+    async fn fetch_coalesced(
+        entries: &[(usize, PackId, u32, crate::block::block_map::Blake3Hash, u32, u32)],
+        content_store: &ContentStore,
+        clean_cache: &dyn BlockCache,
+        metrics: Option<&super::super::metrics::ExportMetrics>,
+    ) -> Result<HashMap<usize, Bytes>, CacheError> {
+        use crate::block::block_map::{blake3_128, lz4_decompress};
+
+        if entries.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Group by (chunk_idx, pack_id)
+        type FetchGroup = Vec<(usize, crate::block::block_map::Blake3Hash, u32, u32)>;
+        let mut groups: HashMap<(u32, PackId), FetchGroup> = HashMap::new();
+        for &(idx, pack_id, chunk_idx, hash, offset, comp_len) in entries {
+            groups
+                .entry((chunk_idx, pack_id))
+                .or_default()
+                .push((idx, hash, offset, comp_len));
+        }
+
+        // Fetch each group (potentially in parallel)
+        let mut group_futures = Vec::new();
+        for ((chunk_idx, pack_id), mut blocks) in groups {
+            let cs = content_store;
+            let cc = clean_cache;
+            group_futures.push(async move {
+                // Sort by pack_offset for contiguous range
+                blocks.sort_by_key(|&(_, _, offset, _)| offset);
+
+                let range_start = blocks.first().unwrap().2;
+                let last = blocks.last().unwrap();
+                let range_end = last.2 + last.3;
+                let range_len = range_end - range_start;
+
+                let fetch_start = std::time::Instant::now();
+                let coalesced = match cs
+                    .get_chunk_block(chunk_idx, pack_id, range_start, range_len)
+                    .await
+                {
+                    Ok(data) => data,
+                    Err(e) => {
+                        if let Some(m) = metrics {
+                            m.record_s3_get_error();
+                        }
+                        return Err(CacheError::from(e));
+                    }
+                };
+
+                if let Some(m) = metrics {
+                    m.record_s3_read(coalesced.len() as u64);
+                    m.record_s3_fetch_latency(fetch_start.elapsed());
+                }
+
+                // Split coalesced response into individual blocks
+                let mut results: Vec<(usize, Bytes)> = Vec::with_capacity(blocks.len());
+                for (idx, expected_hash, offset, comp_len) in blocks {
+                    let local_start = (offset - range_start) as usize;
+                    let local_end = local_start + comp_len as usize;
+                    let compressed = coalesced.slice(local_start..local_end);
+
+                    let decompressed = lz4_decompress(&compressed)
+                        .map_err(|e| CacheError::DecompressFailed(e.to_string()))?;
+
+                    let actual_hash = blake3_128(&decompressed);
+                    if actual_hash != expected_hash {
+                        return Err(CacheError::HashMismatch {
+                            expected: format!("{:?}", expected_hash),
+                            actual: format!("{:?}", actual_hash),
+                        });
+                    }
+
+                    let data = Bytes::from(decompressed);
+                    cc.insert(expected_hash, data.clone());
+                    results.push((idx, data));
+                }
+                Ok(results)
+            });
+        }
+
+        let group_results = futures::future::try_join_all(group_futures).await?;
+        let mut map = HashMap::new();
+        for results in group_results {
+            for (idx, data) in results {
+                map.insert(idx, data);
+            }
+        }
+        Ok(map)
     }
 
     /// Warm the PackIndexCache for a chunk (readahead/prefetch).

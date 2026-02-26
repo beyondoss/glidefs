@@ -29,6 +29,7 @@ use crate::block::write_cache::WriteCache;
 /// Loops until `shutdown` signals true. Two select branches:
 /// 1. `flush_notify` — event-driven pack flush when dirty count crosses threshold
 /// 2. Checkpoint ticker — periodic WAL truncation every 5s
+#[allow(clippy::too_many_arguments)]
 pub async fn flush_scheduler(
     cache: Arc<WriteCache<Active>>,
     content_store: Arc<ContentStore>,
@@ -37,6 +38,7 @@ pub async fn flush_scheduler(
     flush_notify: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<ExportMetrics>,
+    flush_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     info!("flush scheduler started");
 
@@ -86,6 +88,13 @@ pub async fn flush_scheduler(
 
                 let start = Instant::now();
                 let mut packs_uploaded = 0usize;
+
+                // Acquire global flush semaphore to limit how many exports
+                // prepare + upload pack data simultaneously (memory bound).
+                let _flush_permit = match &flush_semaphore {
+                    Some(sem) => Some(sem.acquire().await),
+                    None => None,
+                };
 
                 // Acquire per-export flush lock to serialize with concurrent
                 // drain/snapshot operations. Prevents stale manifest uploads.
@@ -469,6 +478,7 @@ mod tests {
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });
@@ -522,6 +532,7 @@ mod tests {
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });
@@ -586,6 +597,7 @@ mod tests {
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });
@@ -671,6 +683,7 @@ mod tests {
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });
@@ -753,6 +766,7 @@ mod tests {
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });

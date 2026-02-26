@@ -140,6 +140,7 @@ async fn test_fork_from_snapshot() {
         default_blocks_per_pack: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
     })
     .await
     .unwrap();
@@ -320,6 +321,7 @@ async fn test_purge_export_deletes_snapshots() {
         default_blocks_per_pack: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
     })
     .await
     .unwrap();
@@ -376,6 +378,7 @@ async fn test_api_list_and_delete_snapshots() {
             default_blocks_per_pack: 500,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
         })
         .await
         .unwrap(),
@@ -491,6 +494,7 @@ async fn test_remove_without_purge_preserves_snapshots() {
         default_blocks_per_pack: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
     })
     .await
     .unwrap();
@@ -546,6 +550,7 @@ async fn test_snapshot_tag_and_fork() {
         default_blocks_per_pack: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
     })
     .await
     .unwrap();
@@ -613,6 +618,7 @@ async fn test_standalone_tag() {
         default_blocks_per_pack: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
     })
     .await
     .unwrap();
@@ -776,6 +782,7 @@ async fn test_head_manifest_not_found() {
         default_blocks_per_pack: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
     })
     .await
     .unwrap();

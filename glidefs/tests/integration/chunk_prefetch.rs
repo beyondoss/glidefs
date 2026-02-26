@@ -33,6 +33,7 @@ async fn test_prefetch_chunk_metas_cold_start() {
             default_blocks_per_pack: 500,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
         })
         .await
         .unwrap(),
@@ -84,6 +85,7 @@ async fn test_prefetch_chunk_metas_cold_start() {
         default_blocks_per_pack: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
     })
     .await
     .unwrap();
@@ -147,6 +149,7 @@ async fn test_prefetch_empty_router() {
         default_blocks_per_pack: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
     })
     .await
     .unwrap();

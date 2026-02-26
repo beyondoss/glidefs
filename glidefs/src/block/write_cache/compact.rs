@@ -2,7 +2,7 @@
 //!
 //! Runs inline after flush when a chunk's pack count exceeds the threshold.
 //! Reads all live blocks from existing packs (newest wins per chunk_offset),
-//! assembles a new GLPK v2 base pack, uploads it, and replaces the chunk's
+//! assembles a new GLPK v3 base pack, uploads it, and replaces the chunk's
 //! pack list in the manifest. Old packs are returned for deletion by the caller.
 //!
 //! Key property: no decompress/recompress cycle. Compressed block data is
@@ -48,7 +48,7 @@ pub struct CompactionResult {
 /// 1. Load all pack indices (from cache or S3)
 /// 2. Build merged block map: newest entry wins per chunk_offset
 /// 3. For each live block: S3 range-read compressed data from source pack
-/// 4. Assemble new GLPK v2 base pack (no decompress/recompress)
+/// 4. Assemble new GLPK v3 base pack (no decompress/recompress)
 /// 5. Upload base pack
 /// 6. Update manifest: replace_packs(chunk_idx, [new_pack_id])
 /// 7. Update PackIndexCache with new base pack entries

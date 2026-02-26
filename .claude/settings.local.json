@@ -87,7 +87,8 @@
       "WebFetch(domain:lists.gnu.org)",
       "Skill(write-docs)",
       "WebFetch(domain:madebyevan.com)",
-      "Skill(audit)"
+      "Skill(audit)",
+      "WebFetch(domain:)"
     ]
   }
 }

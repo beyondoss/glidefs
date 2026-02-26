@@ -189,6 +189,12 @@ pub struct NbdConfig {
     /// (e.g., during a binary upgrade). Set to 0 to disable.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub nbd_dead_conn_timeout: Option<u32>,
+
+    /// Max concurrent flush operations across all exports (default: 16, 0 = unlimited).
+    /// Bounds how many exports can prepare + upload pack data simultaneously,
+    /// limiting aggregate memory usage from compressed block buffers.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_concurrent_flushes: Option<usize>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -322,6 +328,14 @@ impl NbdConfig {
     /// NBD kernel device dead connection timeout in seconds (default: 30).
     pub fn nbd_dead_conn_timeout(&self) -> u32 {
         self.nbd_dead_conn_timeout.unwrap_or(30)
+    }
+
+    pub const DEFAULT_MAX_CONCURRENT_FLUSHES: usize = 16;
+
+    /// Max concurrent flush operations across all exports (default: 16, 0 = unlimited).
+    pub fn max_concurrent_flushes(&self) -> usize {
+        self.max_concurrent_flushes
+            .unwrap_or(Self::DEFAULT_MAX_CONCURRENT_FLUSHES)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -667,6 +681,7 @@ impl Settings {
                     max_s3_downloads: None,
                     ublk_nr_queues: None,
                     nbd_dead_conn_timeout: None,
+                    max_concurrent_flushes: None,
                 }),
                 ublk: None,
             },

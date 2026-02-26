@@ -1,7 +1,7 @@
 //! Two-tier pack index cache backed by foyer HybridCache.
 //!
 //! V4 replacement for ChunkMetaCache (v3). Keyed by PackId (u64) instead of
-//! chunk content hash. Each entry stores the serialized GLPK v2 index for one
+//! chunk content hash. Each entry stores the serialized GLPK v3 index for one
 //! pack, enabling block-level resolution without round-tripping to S3.
 //!
 //! Tiers:

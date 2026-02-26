@@ -233,21 +233,19 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
         }
 
         // Skip blocks that already have a valid CRC.
-        // Sentinel entries are cleared and recomputed below.
-        let is_sentinel = inner
-            .crc_map
-            .get(&idx)
-            .map(|v| *v == CRC_SENTINEL)
-            .unwrap_or(false);
-        if inner.crc_map.contains_key(&idx) && !is_sentinel {
-            continue;
-        }
-
-        // Clear sentinel before reading. If a concurrent write arrives
-        // between this remove and our or_insert below, the write will
-        // insert a fresh sentinel that prevents our (potentially stale)
-        // CRC from being stored.
-        if is_sentinel {
+        // If a sentinel is present (invalidated by a concurrent write),
+        // clear it and recompute. A single DashMap lookup replaces the
+        // prior two-step get + contains_key pattern.
+        if let Some(existing) = inner.crc_map.get(&idx) {
+            if *existing != CRC_SENTINEL {
+                continue; // valid CRC exists, skip
+            }
+            // Drop the read guard before removing (different shard lock).
+            drop(existing);
+            // Clear sentinel before reading. If a concurrent write arrives
+            // between this remove and our or_insert below, the write will
+            // insert a fresh sentinel that prevents our (potentially stale)
+            // CRC from being stored.
             inner.crc_map.remove(&idx);
         }
 
@@ -392,7 +390,7 @@ impl WriteCache<Active> {
     }
 
     /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by
-    /// chunk (128 MiB), per-chunk dedup/compress/upload as GLPK v2 packs,
+    /// chunk (128 MiB), per-chunk dedup/compress/upload as GLPK v3 packs,
     /// append pack_id to VolumeManifest, CAS SYNCING→CLEAN.
     ///
     /// Returns (stats, seq_cutpoint) on success.
@@ -435,7 +433,7 @@ impl WriteCache<Active> {
     /// Inner body of flush_dirty_inner, factored out for error recovery.
     ///
     /// Per-chunk: warm PackIndexCache, compute_flush_batch (rayon: pread +
-    /// CRC32 + BLAKE3 + LZ4), assemble GLPK v2 pack, upload to S3, update
+    /// CRC32 + BLAKE3 + LZ4), assemble GLPK v3 pack, upload to S3, update
     /// PackIndexCache. Manifest appends are staged and applied atomically
     /// after all chunk uploads succeed. No .meta upload.
     async fn flush_dirty_body(
@@ -599,7 +597,7 @@ impl WriteCache<Active> {
         Ok(total_stats)
     }
 
-    /// Flush dirty blocks to S3 as chunk-scoped GLPK v2 packs (no manifest upload).
+    /// Flush dirty blocks to S3 as chunk-scoped GLPK v3 packs (no manifest upload).
     ///
     /// Returns (stats, seq_cutpoint). Compaction is the caller's responsibility
     /// and should run outside the flush lock to avoid blocking concurrent flushes.

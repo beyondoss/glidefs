@@ -200,6 +200,8 @@ pub struct RouterConfig {
     /// Enables kernel-side I/O queueing during restarts. 0 = disabled.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub nbd_dead_conn_timeout: u32,
+    /// Max concurrent flush operations across all exports (0 = unlimited).
+    pub max_concurrent_flushes: usize,
 }
 
 /// Multi-tenant export router.
@@ -244,6 +246,9 @@ pub struct ExportRouter {
 
     /// Global S3 download concurrency limit (None = unlimited).
     download_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+
+    /// Global flush concurrency limit (None = unlimited).
+    flush_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 
     /// SSD utilization ratio (0.0–1.0), updated by capacity monitor.
     /// Shared with BlockHandler instances for write rejection at high utilization.
@@ -305,6 +310,13 @@ impl ExportRouter {
         } else {
             None
         };
+        let flush_semaphore = if config.max_concurrent_flushes > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(
+                config.max_concurrent_flushes,
+            )))
+        } else {
+            None
+        };
 
         let pack_index_cache = Arc::new(
             PackIndexCache::open(&config.cache_dir)
@@ -339,6 +351,7 @@ impl ExportRouter {
             s3_circuit_breaker,
             upload_semaphore,
             download_semaphore,
+            flush_semaphore,
             ssd_utilization: Arc::new(AtomicU64::new(0f64.to_bits())),
             #[cfg(target_os = "linux")]
             nbd_devices,
@@ -832,6 +845,7 @@ impl ExportRouter {
         let flush_vm = Arc::clone(&volume_manifest);
         let export_name = name.clone();
         let flush_metrics = Arc::clone(&metrics);
+        let flush_sem = self.flush_semaphore.clone();
         let flush_handle = spawn_named(&format!("flush-{}", name), async move {
             flush_scheduler(
                 flush_cache,
@@ -841,6 +855,7 @@ impl ExportRouter {
                 flush_notify,
                 flush_shutdown_rx,
                 flush_metrics,
+                flush_sem,
             )
             .await;
             info!("Flush scheduler for export '{}' stopped", export_name);
@@ -1633,6 +1648,7 @@ impl ExportRouter {
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
         })
         .await
         .expect("failed to create test router")
@@ -1676,6 +1692,7 @@ mod tests {
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_concurrent_flushes: 0,
         })
         .await
         .expect("failed to create test router")

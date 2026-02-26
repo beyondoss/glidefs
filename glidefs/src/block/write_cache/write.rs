@@ -126,7 +126,20 @@ impl WriteCache<Active> {
             ));
         }
 
-        // Zero the file range
+        // CRITICAL: Mark blocks as present BEFORE writing zeros to file.
+        // Same invariant as write() — prevents prefetch race where prefetch
+        // could overwrite our zeros with stale S3 data.
+        let block_size = self.inner.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + len - 1) / block_size;
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                self.inner.set_present(idx);
+            }
+        }
+
+        // Zero the file range (after claiming blocks via set_present)
         #[cfg(target_os = "linux")]
         {
             let fd = self.inner.data_file.as_raw_fd();
@@ -150,9 +163,10 @@ impl WriteCache<Active> {
                 if err.raw_os_error() == Some(libc::EOPNOTSUPP)
                     || err.raw_os_error() == Some(libc::ENOTSUP)
                 {
-                    return self.zero_range_fallback(offset, len);
+                    self.zero_range_fallback(offset, len)?;
+                } else {
+                    return Err(CacheError::Io(err));
                 }
-                return Err(CacheError::Io(err));
             }
         }
 
@@ -161,8 +175,8 @@ impl WriteCache<Active> {
             self.zero_range_fallback(offset, len)?;
         }
 
-        // Mark affected blocks as dirty, present, and invalidate CRCs
-        self.mark_range_dirty_and_present(offset, len);
+        // Mark affected blocks as dirty and invalidate stale CRCs (after data write)
+        self.mark_range_dirty(offset, len);
 
         // Record dirty blocks in WAL.
         // Batch all WAL entries under a single lock acquisition.
@@ -329,8 +343,11 @@ impl WriteCache<Active> {
         Ok(())
     }
 
-    /// Mark a range of blocks as dirty, present, and invalidate stale CRCs.
-    fn mark_range_dirty_and_present(&self, offset: u64, len: u64) {
+    /// Mark a range of blocks as dirty and invalidate stale CRCs.
+    ///
+    /// Called AFTER the data write. Blocks must already be marked present
+    /// (by the caller) before the data write to prevent prefetch races.
+    fn mark_range_dirty(&self, offset: u64, len: u64) {
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (offset + len - 1) / block_size;
@@ -340,7 +357,6 @@ impl WriteCache<Active> {
             if idx >= self.inner.num_blocks {
                 continue;
             }
-            self.inner.set_present(idx);
             self.inner.transition_to_dirty(idx);
             self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
         }
