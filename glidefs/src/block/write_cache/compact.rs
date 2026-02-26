@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::block::content_store::ContentStore;
 use crate::block::pack::{
-    PackId, PackIndexEntry, assemble_pack, new_pack_id,
+    PackId, PackIndexEntry, new_pack_id,
 };
 use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::volume_manifest::VolumeManifest;
@@ -99,11 +99,8 @@ pub async fn compact_chunk(
     if merged.is_empty() {
         // Edge case: all packs were empty. Just replace with empty state.
         let base_pack_id = new_pack_id();
-        let (pack_bytes, index_entries) = assemble_pack(Vec::new(), blocks_per_chunk)?;
-        let pack_size = pack_bytes.len() as u64;
-
-        content_store
-            .put_chunk_pack(chunk_idx, base_pack_id, pack_bytes)
+        let index_entries = content_store
+            .stream_chunk_pack(chunk_idx, base_pack_id, Vec::new(), blocks_per_chunk)
             .await?;
 
         pack_index_cache.insert_entries(base_pack_id, &index_entries);
@@ -115,8 +112,7 @@ pub async fn compact_chunk(
                     chunk_idx,
                     "compaction aborted: pack list changed during compaction (empty merge)"
                 );
-                return Err(CacheError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(CacheError::Io(std::io::Error::other(
                     "compaction aborted: concurrent manifest modification",
                 )));
             }
@@ -127,7 +123,7 @@ pub async fn compact_chunk(
             new_pack_id: base_pack_id,
             old_pack_ids: pack_ids.to_vec(),
             live_blocks: 0,
-            new_pack_size: pack_size,
+            new_pack_size: 0,
         });
     }
 
@@ -165,17 +161,20 @@ pub async fn compact_chunk(
         blocks_for_pack.push(result?);
     }
 
-    // 4. Assemble new GLPK v2 base pack (blocks already compressed, just repack)
-    let (pack_bytes, index_entries) = assemble_pack(blocks_for_pack, blocks_per_chunk)?;
-    let pack_size = pack_bytes.len() as u64;
+    // 4. Stream new GLPK v3 base pack to S3
     let base_pack_id = new_pack_id();
-
-    // 5. Upload base pack
-    content_store
-        .put_chunk_pack(chunk_idx, base_pack_id, pack_bytes)
+    let index_entries = content_store
+        .stream_chunk_pack(chunk_idx, base_pack_id, blocks_for_pack, blocks_per_chunk)
         .await?;
 
-    // 6. Update manifest: replace N packs with 1, preserving concurrent appends
+    // Derive pack size from index entries (for logging/stats only).
+    let pack_size: u64 = index_entries
+        .iter()
+        .map(|e| (e.offset as u64) + (e.comp_length as u64))
+        .max()
+        .unwrap_or(0);
+
+    // 5. Update manifest: replace N packs with 1, preserving concurrent appends
     {
         let mut vm = volume_manifest.write();
         if !vm.replace_packs_cas(chunk_idx, pack_ids, vec![base_pack_id]) {
@@ -183,14 +182,13 @@ pub async fn compact_chunk(
                 chunk_idx,
                 "compaction aborted: pack list changed during compaction"
             );
-            return Err(CacheError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(CacheError::Io(std::io::Error::other(
                 "compaction aborted: concurrent manifest modification",
             )));
         }
     }
 
-    // 7. Update PackIndexCache
+    // 6. Update PackIndexCache
     pack_index_cache.insert_entries(base_pack_id, &index_entries);
 
     info!(

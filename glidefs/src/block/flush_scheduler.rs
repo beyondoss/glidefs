@@ -208,10 +208,10 @@ pub async fn flush_scheduler(
                             warn!(error = %e, "deferred manifest sync retry failed");
                         }
                     }
-                } else if cache.dirty_block_count() > 0 {
-                    if let Err(e) = cache.local_checkpoint().await {
-                        warn!(error = %e, "local checkpoint failed");
-                    }
+                } else if cache.dirty_block_count() > 0
+                    && let Err(e) = cache.local_checkpoint().await
+                {
+                    warn!(error = %e, "local checkpoint failed");
                 }
             }
         }
@@ -290,6 +290,15 @@ mod tests {
             location: &object_store::path::Path,
             opts: PutMultipartOptions,
         ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            if self.fail_puts.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "FailingObjectStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Simulated S3 multipart failure",
+                    )),
+                });
+            }
             self.inner.put_multipart_opts(location, opts).await
         }
 

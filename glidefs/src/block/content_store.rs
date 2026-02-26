@@ -6,7 +6,7 @@
 use crate::circuit_breaker::CircuitBreaker;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{GetOptions, GetRange, ObjectStore, PutMultipartOptions, PutPayload, WriteMultipart};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -273,45 +273,6 @@ impl ContentStore {
         Ok(())
     }
 
-    /// List all snapshot objects with their S3 last_modified timestamps.
-    /// Returns (path, last_modified) for each snapshot in this prefix.
-    pub async fn list_all_snapshots_with_dates(
-        &self,
-    ) -> Result<Vec<(ObjectPath, chrono::DateTime<chrono::Utc>)>, ContentStoreError> {
-        let prefix_str = format!("{}/snapshots/", self.base_path);
-        let prefix = ObjectPath::from(prefix_str);
-        let mut results = Vec::new();
-        let mut stream = self.object_store.list(Some(&prefix));
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(meta) => results.push((meta.location, meta.last_modified)),
-                Err(e) => {
-                    self.record_s3_list_error(&e);
-                    return Err(e.into());
-                }
-            }
-        }
-        if let Some(cb) = &self.circuit_breaker {
-            cb.record_success();
-        }
-        Ok(results)
-    }
-
-    /// Delete a snapshot by its S3 path (idempotent).
-    pub async fn delete_snapshot_by_path(
-        &self,
-        path: &ObjectPath,
-    ) -> Result<(), ContentStoreError> {
-        self.check_circuit()?;
-        let result = self.object_store.delete(path).await;
-        self.record_s3_result(&result);
-        match result {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// Fetch a byte range from an S3 key.
     ///
     /// Core implementation for all range-read operations. Checks the circuit
@@ -343,6 +304,49 @@ impl ContentStore {
                 None => None,
             };
             store.get_range(&path, start..end).await
+        })
+        .await
+        .map_err(|e| {
+            ContentStoreError::ObjectStore(object_store::Error::Generic {
+                store: "tokio-spawn",
+                source: Box::new(e),
+            })
+        })?;
+        self.record_s3_result(&s3_result);
+        Ok(s3_result?)
+    }
+
+    /// Fetch the last `suffix_len` bytes from an S3 key.
+    ///
+    /// Used for reading footer-indexed pack data (GLPK v3). Same semaphore +
+    /// circuit breaker pattern as `get_range_from_key`.
+    async fn get_suffix_from_key(
+        &self,
+        key: &str,
+        suffix_len: u64,
+    ) -> Result<bytes::Bytes, ContentStoreError> {
+        self.check_circuit()?;
+        let sem = self.download_semaphore.clone();
+        let store = Arc::clone(&self.object_store);
+        let path = ObjectPath::from(key.to_string());
+        let s3_result = tokio::spawn(async move {
+            let _permit = match &sem {
+                Some(s) => Some(
+                    s.acquire()
+                        .await
+                        .map_err(|_| object_store::Error::Generic {
+                            store: "semaphore",
+                            source: "download semaphore closed".into(),
+                        })?,
+                ),
+                None => None,
+            };
+            let opts = GetOptions {
+                range: Some(GetRange::Suffix(suffix_len)),
+                ..Default::default()
+            };
+            let response = store.get_opts(&path, opts).await?;
+            response.bytes().await
         })
         .await
         .map_err(|e| {
@@ -449,10 +453,11 @@ impl ContentStore {
         Ok(names)
     }
 
-    /// Upload a chunk pack to S3.
+    /// Upload a chunk pack to S3 (non-streaming, used by tests and GC).
     ///
     /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
     #[instrument(skip(self, data), fields(chunk_idx, pack_id, size = data.len()))]
+    #[allow(dead_code)]
     pub async fn put_chunk_pack(
         &self,
         chunk_idx: u32,
@@ -473,8 +478,57 @@ impl ContentStore {
         let result = self.object_store.put(&path, payload).await;
         self.record_s3_result(&result);
         result?;
-        debug!("uploaded v4 chunk pack");
+        debug!("uploaded chunk pack");
         Ok(())
+    }
+
+    /// Stream a chunk pack to S3 via multipart upload.
+    ///
+    /// Blocks are written to the `WriteMultipart` as they're produced — each
+    /// compressed block `Vec<u8>` is freed immediately after `writer.put()`.
+    /// Only ~5MB (one multipart part) is buffered at a time.
+    ///
+    /// Returns the index entries for inserting into `PackIndexCache`.
+    #[instrument(skip(self, blocks), fields(chunk_idx, pack_id, block_count = blocks.len()))]
+    pub async fn stream_chunk_pack(
+        &self,
+        chunk_idx: u32,
+        pack_id: super::pack::PackId,
+        blocks: Vec<(super::block_map::Blake3Hash, u32, Vec<u8>)>,
+        chunk_size: u32,
+    ) -> Result<Vec<super::pack::PackIndexEntry>, ContentStoreError> {
+        use super::pack::stream_pack_to_writer;
+
+        self.check_circuit()?;
+        let _permit = match &self.upload_semaphore {
+            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
+            None => None,
+        };
+        let key = format!(
+            "{}/chunks/{:04}/{:016x}.pack",
+            self.base_path, chunk_idx, pack_id
+        );
+        let path = ObjectPath::from(key);
+        let upload = self
+            .object_store
+            .put_multipart_opts(&path, PutMultipartOptions::default())
+            .await;
+        self.record_s3_result(&upload);
+        let upload = upload?;
+
+        let mut writer = WriteMultipart::new(upload);
+        let entries = stream_pack_to_writer(blocks, chunk_size, &mut writer).map_err(|e| {
+            ContentStoreError::ObjectStore(object_store::Error::Generic {
+                store: "pack-stream",
+                source: Box::new(e),
+            })
+        })?;
+
+        let finish_result = writer.finish().await;
+        self.record_s3_result(&finish_result);
+        finish_result?;
+        debug!("streamed chunk pack");
+        Ok(entries)
     }
 
     /// Fetch a single compressed block from a chunk pack via S3 range request.
@@ -495,11 +549,11 @@ impl ContentStore {
         self.get_range_from_key(&key, offset, comp_length).await
     }
 
-    /// Fetch the GLPK v2 pack index from S3 in a single range-read.
+    /// Fetch the GLPK v3 pack index from S3 via suffix read.
     ///
-    /// Requests the max possible index size (header + 1024 entries = 28,688 bytes)
-    /// in one S3 GET. `parse_pack_index` reads `block_count` from the header and
-    /// ignores trailing bytes, so overshooting is safe.
+    /// Reads the last `MAX_INDEX_SIZE + TRAILER_SIZE` bytes from the pack,
+    /// then `parse_pack_index` locates the GLIX trailer and parses the
+    /// preceding index entries.
     ///
     /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
     #[instrument(skip(self), fields(chunk_idx, pack_id))]
@@ -508,11 +562,11 @@ impl ContentStore {
         chunk_idx: u32,
         pack_id: super::pack::PackId,
     ) -> Result<Vec<super::pack::PackIndexEntry>, ContentStoreError> {
-        use super::pack::{PACK_HEADER_SIZE, PACK_INDEX_ENTRY_SIZE, parse_pack_index};
+        use super::pack::{PACK_INDEX_ENTRY_SIZE, TRAILER_SIZE, parse_pack_index};
 
         // 128 MiB chunk / 128 KB block = 1024 max blocks per pack.
         const MAX_BLOCKS: usize = 1024;
-        const MAX_INDEX_SIZE: usize = PACK_HEADER_SIZE + MAX_BLOCKS * PACK_INDEX_ENTRY_SIZE;
+        const MAX_SUFFIX: u64 = (MAX_BLOCKS * PACK_INDEX_ENTRY_SIZE + TRAILER_SIZE) as u64;
 
         // Compile-time: if chunk_size or block_size defaults change, this range-read
         // must be updated to cover the new max blocks per chunk.
@@ -527,7 +581,7 @@ impl ContentStore {
             self.base_path, chunk_idx, pack_id
         );
 
-        let data = self.get_range_from_key(&key, 0, MAX_INDEX_SIZE as u32).await?;
+        let data = self.get_suffix_from_key(&key, MAX_SUFFIX).await?;
 
         let index = parse_pack_index(&data).map_err(|e| {
             ContentStoreError::ObjectStore(object_store::Error::Generic {

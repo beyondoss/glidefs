@@ -1,7 +1,7 @@
 use crate::block::block_map::{blake3_128, lz4_compress, zero_block_hash, Blake3Hash};
 use crate::block::content_store::ContentStore;
 use crate::block::manifest::serialize_hot_set;
-use crate::block::pack::{assemble_pack, new_pack_id, PackId};
+use crate::block::pack::{new_pack_id, PackId};
 use crate::block::volume_manifest::VolumeManifest;
 use crate::config::Settings;
 use crate::parse_object_store::parse_url_opts;
@@ -238,18 +238,18 @@ async fn start_chunk_upload(
     }
 
     let pack_id = new_pack_id();
-    let (pack_bytes, _entries) = assemble_pack(pack_blocks, BLOCK_SIZE)?;
 
     // Join previous upload before spawning next (keeps at most 1 in flight).
     join_upload(volume_manifest, stats, prev_in_flight).await?;
 
-    // Spawn S3 upload — runs concurrently with next chunk's disk reads.
+    // Spawn streaming S3 upload — runs concurrently with next chunk's disk reads.
     let cs = Arc::clone(content_store);
-    let pack_size = pack_bytes.len() as u64;
     let handle = tokio::spawn(async move {
-        cs.put_chunk_pack(chunk_idx, pack_id, pack_bytes)
+        let entries = cs
+            .stream_chunk_pack(chunk_idx, pack_id, pack_blocks, BLOCK_SIZE)
             .await
-            .context("Failed to upload chunk pack")?;
+            .context("Failed to stream chunk pack")?;
+        let pack_size = entries.iter().map(|e| e.comp_length as u64).sum::<u64>();
         Ok(ChunkUploadResult {
             chunk_idx,
             pack_id,

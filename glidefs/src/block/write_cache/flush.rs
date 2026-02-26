@@ -90,33 +90,33 @@ fn compute_flush_batch(
             // - Block still SYNCING → no concurrent write → real corruption
             // - Block now DIRTY → write re-dirtied it → stale CRC, not corruption
             // - CRC_SENTINEL → write invalidated the CRC, skip verification
-            if let Some(stored_crc) = inner.crc_take(chunk_index) {
-                if stored_crc != CRC_SENTINEL {
-                    let computed_crc = crc32fast::hash(&chunk_buf);
-                    if computed_crc != stored_crc {
-                        let current_state = inner.state_map.get(chunk_index);
-                        if current_state != SparseBlockState::SYNCING {
-                            // Block was re-dirtied by a concurrent write between
-                            // checkpoint and flush. CRC is stale, not corruption.
-                            return Ok(BlockResult::Skipped {
-                                chunk_index,
-                                cas_failed: true,
-                                corrupted: false,
-                            });
-                        }
-                        // Still SYNCING + CRC mismatch → real SSD corruption.
-                        warn!(
-                            chunk_index,
-                            stored_crc,
-                            computed_crc,
-                            "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
-                        );
+            if let Some(stored_crc) = inner.crc_take(chunk_index)
+                && stored_crc != CRC_SENTINEL
+            {
+                let computed_crc = crc32fast::hash(&chunk_buf);
+                if computed_crc != stored_crc {
+                    let current_state = inner.state_map.get(chunk_index);
+                    if current_state != SparseBlockState::SYNCING {
+                        // Block was re-dirtied by a concurrent write between
+                        // checkpoint and flush. CRC is stale, not corruption.
                         return Ok(BlockResult::Skipped {
                             chunk_index,
-                            cas_failed: false,
-                            corrupted: true,
+                            cas_failed: true,
+                            corrupted: false,
                         });
                     }
+                    // Still SYNCING + CRC mismatch → real SSD corruption.
+                    warn!(
+                        chunk_index,
+                        stored_crc,
+                        computed_crc,
+                        "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
+                    );
+                    return Ok(BlockResult::Skipped {
+                        chunk_index,
+                        cas_failed: false,
+                        corrupted: true,
+                    });
                 }
             }
 
@@ -445,7 +445,7 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<FlushStats, CacheError> {
-        use crate::block::pack::{new_pack_id, assemble_pack};
+        use crate::block::pack::new_pack_id;
 
         // Partition dirty blocks by chunk
         let mut per_chunk: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
@@ -542,23 +542,22 @@ impl WriteCache<Active> {
                     .collect()
             };
 
-            // Assemble GLPK v2 pack (sorted by chunk_offset for read locality)
+            // Stream GLPK v3 pack to S3 (blocks freed as they upload)
             let blocks_per_chunk = {
                 let vm = volume_manifest.read();
                 vm.blocks_per_chunk()
             };
-            let (pack_bytes, index_entries) =
-                assemble_pack(blocks_for_pack, blocks_per_chunk)?;
-            let pack_size = pack_bytes.len() as u64;
             let pack_id = new_pack_id();
 
-            // Upload pack to S3
-            content_store
-                .put_chunk_pack(chunk_idx, pack_id, pack_bytes)
+            let index_entries = content_store
+                .stream_chunk_pack(chunk_idx, pack_id, blocks_for_pack, blocks_per_chunk)
                 .await?;
 
             total_stats.packs_uploaded += 1;
-            total_stats.bytes_uploaded += pack_size;
+            total_stats.bytes_uploaded += index_entries
+                .iter()
+                .map(|e| e.comp_length as u64)
+                .sum::<u64>();
 
             // Update PackIndexCache with new entries
             pack_index_cache.insert_entries(pack_id, &index_entries);

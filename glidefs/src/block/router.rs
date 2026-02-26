@@ -262,10 +262,10 @@ pub struct ExportRouter {
 /// must start with an alphanumeric character. Rejects path traversal attempts.
 /// Remove a file, logging non-NotFound errors instead of silently swallowing them.
 fn remove_file_if_exists(path: &std::path::Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!(path = %path.display(), error = %e, "failed to remove file");
-        }
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(path = %path.display(), error = %e, "failed to remove file");
     }
 }
 

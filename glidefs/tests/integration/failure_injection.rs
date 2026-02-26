@@ -112,6 +112,15 @@ impl ObjectStore for FailingObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        if self.should_fail_put() {
+            return Err(object_store::Error::Generic {
+                store: "FailingObjectStore",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Simulated S3 multipart failure",
+                )),
+            });
+        }
         self.inner.put_multipart_opts(location, opts).await
     }
 

@@ -83,9 +83,14 @@ For each chunk (one pack per chunk per flush cycle):
     │   ├── CRC32 verify from crc_map (if available)
     │   ├── Skip zero blocks (well-known hash sentinel)
     │   ├── BLAKE3-128 hash → LZ4 compress
-    │   └── Accumulate into pack buffer
-    ├── assemble_pack() → GLPK bytes (sorted by chunk_offset for read locality)
-    ├── ContentStore::put_chunk_pack()  ──► S3 PUT at chunks/{idx:04}/{pack_id:016x}.pack
+    │   └── Collect into Vec<(hash, chunk_offset, compressed)>
+    ├── ContentStore::stream_chunk_pack():
+    │   ├── WriteMultipart::new(put_multipart_opts(...))   ← streaming S3 upload
+    │   ├── Write 16-byte header
+    │   ├── For each block: writer.put(Bytes::from(compressed))  ← freed immediately
+    │   ├── Write block index footer (N × 28 bytes, sorted by chunk_offset)
+    │   ├── Write 8-byte GLIX trailer
+    │   └── writer.finish()  ──► S3 at chunks/{idx:04}/{pack_id:016x}.pack
     ├── PackIndexCache::insert_entries(pack_id, entries)
     └── VolumeManifest::append_pack(chunk_idx, pack_id)
     │   (manifest now has [old_packs..., new_pack_id])
@@ -99,8 +104,8 @@ Inline compaction: if chunk.packs.len() > threshold (default 16):
         ├── Load all pack indices from PackIndexCache (or S3 on miss)
         ├── Build merged block map: newest entry wins per chunk_offset
         ├── Parallel S3 range-reads for live blocks (bounded concurrency)
-        ├── assemble_pack() → new base pack bytes
-        ├── S3 PUT new base pack
+        ├── ContentStore::stream_chunk_pack() → stream new base pack to S3
+        └── (old pack_ids removed from manifest → GC collects them)
         ├── VolumeManifest::replace_packs(chunk_idx, [new_pack_id])
         └── Old pack_ids removed from manifest → GC collects them eventually
     │
@@ -108,7 +113,7 @@ Inline compaction: if chunk.packs.len() > threshold (default 16):
 Atomic commit: PUT VolumeManifest (binary GLVM) to S3
 ```
 
-Each pack is self-describing — its header contains the full block index (hash + chunk_offset + offset + comp_length).
+Each pack is self-describing — the block index is a footer (trailer → index entries), enabling suffix-only reads without a full object fetch.
 
 ## Concepts & Terminology
 
@@ -119,7 +124,7 @@ Each pack is self-describing — its header contains the full block index (hash 
 | Export | A virtual block device served over a transport, with its own cache and S3 prefix | Not a filesystem — raw blocks only |
 | Block | Fixed-size unit of data (default 128 KB to match ZFS recordsize) | Not variable-sized |
 | Volume Chunk | 128 MiB range of blocks (1,024 blocks of 128 KB = 1 ext4 block group). The unit of pack scoping, compaction, and metadata management. | Not a 128 KB block — "chunk" means 128 MiB range. Aligns with ext4 block groups, bounding database scatter to 2–3 chunks per flush |
-| Pack | GLPK S3 object containing LZ4-compressed blocks scoped to one volume chunk. Self-describing: header + block index + data. | Not cross-chunk |
+| Pack | GLPK S3 object containing LZ4-compressed blocks scoped to one volume chunk. Footer-indexed: header + block data + index footer + GLIX trailer. | Not cross-chunk |
 | PackId | 8-byte random `u64` identifying one pack within its chunk. Hex string in S3 key. | Not a UUID. Collision-safe: birthday bound ~4.3 billion per chunk, and chunks see hundreds of IDs over their lifetime |
 | VolumeManifest (GLVM) | Binary file mapping `chunk_idx → [pack_id, ...]`. Sparse: only written chunks appear. The root of an export's metadata. CRC32-protected. | Not the full block index — pack IDs point to self-describing packs that contain the block-level index |
 | ChunkEntry | `Vec<PackId>` for one chunk, ordered oldest-to-newest. After compaction: single entry. | Not block-level index — that lives in each pack's embedded index |
@@ -195,8 +200,8 @@ Each flush cycle produces one delta pack per dirty chunk and appends its ID to t
 **Compaction**: When a chunk's pack list exceeds `DEFAULT_COMPACTION_THRESHOLD` (16), `compact_chunk()` runs inline after flush:
 1. Merge all pack indices — newest entry wins per `chunk_offset`
 2. S3 range-reads for each live block (bounded concurrency)
-3. Re-assemble into a single GLPK base pack
-4. Upload base pack
+3. Stream to a single GLPK base pack via `stream_chunk_pack()`
+4. Upload completes — index and trailer appended by the streaming writer
 5. `replace_packs(chunk_idx, [new_pack_id])` — removes old pack_ids from manifest
 
 Old packs are NOT deleted inline. After `replace_packs`, the old pack_ids are absent from the live manifest. GC identifies them as dead and deletes them after the grace period. This design keeps the flush path simple (no snapshot scanning inline) and leverages GC's existing safety mechanisms (grace period, max-delete cap, snapshot pinning). (`write_cache/compact.rs`)
@@ -390,32 +395,37 @@ WriteCache<Draining>
 
 ### Pack Format (GLPK)
 
-Self-describing S3 object. Each pack is scoped to one volume chunk. The block index is embedded in the header. Blocks are sorted by `chunk_offset` within each pack for sequential read locality.
+Self-describing S3 object. Each pack is scoped to one volume chunk. The block index is a **footer** — enabling streaming writes (blocks stream to S3 as they're produced; index is appended at the end) and suffix-only reads when fetching the index.
 
 ```
 ┌─────────────────────────── Pack ───────────────────────────┐
 │ Header (16 bytes)                                          │
 │   magic: "GLPK"  version: u16  block_count: u16            │
-│   blocks_per_chunk: u32  _reserved: [u8; 4]                │
+│   chunk_size: u32 LE  _reserved: [u8; 4]                   │
 ├────────────────────────────────────────────────────────────┤
-│ Block Index (28 bytes × block_count)                       │
-│   [hash:16][chunk_offset:u32 LE][offset:u32 LE][comp_length:u32 LE] 
+│ Block Data (immediately after header)                      │
+│   [LZ4-compressed blocks, concatenated]                    │
+│   Offsets in index are absolute from pack start            │
+├────────────────────────────────────────────────────────────┤
+│ Block Index footer (28 bytes × block_count)                │
+│   [hash:16][chunk_offset:u32 LE][offset:u32 LE][comp_length:u32 LE]
 │   Sorted by chunk_offset for binary search                 │
 ├────────────────────────────────────────────────────────────┤
-│ Block Data                                                 │
-│   [LZ4-compressed blocks, concatenated]                    │
-│   Offsets in index point into this region                  │
+│ Trailer (8 bytes)                                          │
+│   block_count: u16 LE  _reserved: [u8; 2]  magic: "GLIX"   │
 └────────────────────────────────────────────────────────────┘
 ```
 
 - `hash`: BLAKE3-128 of the uncompressed block (16 bytes)
 - `chunk_offset`: block's position within its chunk (0–1023 for 128 MiB / 128 KB)
-- `offset`: byte offset from start of pack to the compressed block data
+- `offset`: absolute byte offset from start of pack to the compressed block data
 - `comp_length`: compressed size in bytes
 
-S3 key: `chunks/{chunk_idx:04}/{pack_id:016x}.pack` (`content_store.rs:put_chunk_pack`)
+S3 key: `chunks/{chunk_idx:04}/{pack_id:016x}.pack` (`content_store.rs:stream_chunk_pack`)
 
-**Fetching the pack index**: `ContentStore::get_pack_index()` does a single range-read of up to 28,688 bytes (16-byte header + 1,024 × 28-byte entries). `parse_pack_index` reads `block_count` from the header and uses only the relevant entries — trailing bytes are ignored. One S3 round trip regardless of pack size. (`content_store.rs:get_pack_index`)
+**Streaming upload**: `ContentStore::stream_chunk_pack()` uses `object_store::WriteMultipart` — blocks are written to the multipart upload as they're produced. Only ~5 MB (one multipart part) is buffered at a time; each block `Vec<u8>` is freed immediately after `writer.put()`. Index (~28 KB) and trailer (8 bytes) are written last. (`pack.rs:stream_pack_to_writer`)
+
+**Fetching the pack index**: `ContentStore::get_pack_index()` suffix-reads the last `1,024 × 28 + 8 = 28,680` bytes. `parse_pack_index` validates the `GLIX` trailer magic, reads `block_count`, then parses the preceding `block_count × 28` bytes as index entries. One S3 round trip, independent of pack size. (`content_store.rs:get_pack_index`, `pack.rs:parse_pack_index`)
 
 ### VolumeManifest (GLVM)
 
@@ -555,7 +565,7 @@ CRC32 is stored in `crc_map: DashMap<usize, u32>` on `CacheInner`. At checkpoint
 
 ### Bless Pipeline
 
-`glidefs bless` reads a raw disk image sequentially, partitions 128 KB blocks by 128 MiB volume chunk, compresses unique blocks into chunk-scoped GLPK packs (one pack per volume chunk), uploads them, and builds a GLVM VolumeManifest. Output: a VolumeManifest at `exports/{s3_prefix}/manifests/bases/{name}` and a hot set at `exports/{s3_prefix}/manifests/bases/{name}.hot-set`. (`cli/bless.rs`)
+`glidefs bless` reads a raw disk image sequentially, processes one 128 MiB volume chunk at a time (streaming — never accumulates the full image). For each chunk: deduplicates 128 KB blocks by hash, then `stream_chunk_pack()` uploads the chunk as a GLPK pack via `WriteMultipart` — the previous chunk's upload runs concurrently with the next chunk's disk reads (one upload in flight at a time). Builds a GLVM VolumeManifest from the uploaded pack IDs. Output: VolumeManifest at `exports/{s3_prefix}/manifests/bases/{name}` and a hot set at `exports/{s3_prefix}/manifests/bases/{name}.hot-set`. (`cli/bless.rs`)
 
 ## Management API
 
@@ -618,12 +628,12 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 
 | File | Purpose |
 |------|---------|
-| `block/pack.rs` | GLPK format: `assemble_pack`, `parse_pack_index`, `PackId = u64`, `PackIndexEntry` with `chunk_offset` |
+| `block/pack.rs` | GLPK format: `stream_pack_to_writer`, `assemble_pack` (tests/bench), `parse_pack_index` (suffix), `PackId = u64`, `PackIndexEntry` |
 | `block/volume_manifest.rs` | Binary GLVM: `VolumeManifest`, `ChunkEntry`, `append_pack`, `replace_packs`, `all_pack_ids`, CRC32 |
 | `block/pack_index_cache.rs` | `PackIndexCache`: Foyer HybridCache keyed by `PackId`; `lookup_block`, `insert_entries`, `known_hashes` |
-| `block/content_store.rs` | S3 typed I/O: `put_chunk_pack`, `get_chunk_block`, `get_pack_index` (range-read), manifests, snapshots |
-| `block/write_cache/flush.rs` | Flush orchestration: CAS claim, rayon compute, per-chunk GLPK upload, manifest append, inline compaction trigger |
-| `block/write_cache/compact.rs` | Inline compaction: merge N delta packs → 1 base pack; `compact_chunk`, `compact_if_needed` |
+| `block/content_store.rs` | S3 typed I/O: `stream_chunk_pack` (WriteMultipart), `get_chunk_block`, `get_pack_index` (suffix-read), manifests, snapshots |
+| `block/write_cache/flush.rs` | Flush orchestration: CAS claim, rayon compute, per-chunk GLPK streaming upload, manifest append, inline compaction trigger |
+| `block/write_cache/compact.rs` | Inline compaction: merge N delta packs → 1 base pack via `stream_chunk_pack`; `compact_chunk`, `compact_if_needed` |
 | `block/write_cache/read.rs` | Read path: `resolve_block` (SSD → PackIndexCache → parallel prefetch → S3); `prefetch_chunk` |
 | `block/write_cache/mod.rs` | `WriteCache<S>` typestate; `FlushStats`, `SnapshotResult` |
 | `block/write_cache/write.rs` | Write path: `set_present` + `pwrite` + `transition_to_dirty` + WAL append |
@@ -646,6 +656,12 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `wal.rs` | Append-only WAL with CRC32 per entry |
 
 ## Design Decisions
+
+### Why footer index?
+
+With a header index, all compressed block sizes must be known before writing the first byte — so the entire pack (~30–60 MB) must be buffered in memory before upload. With N concurrent flushes, this scales linearly.
+
+With a footer index, blocks stream to S3 as they're produced via `WriteMultipart`. Only ~5 MB (one multipart part) is buffered at a time; each block `Vec<u8>` is freed immediately after `writer.put()`. The index (≤28 KB) and trailer (8 bytes) are written last.
 
 ### Why NBD + ublk instead of just one transport?
 
