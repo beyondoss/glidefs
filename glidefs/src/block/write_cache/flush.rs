@@ -457,17 +457,30 @@ impl WriteCache<Active> {
 
         // Warm PackIndexCache for all affected chunks (cold start path).
         // This ensures the read path can resolve blocks after flush without an
-        // extra S3 round-trip per pack. Not used for write-path dedup (packs use
-        // offset-based dedup, not hash-based — see comment below).
-        for &chunk_idx in per_chunk.keys() {
-            let pack_ids = {
+        // extra S3 round-trip per pack. Fetches are parallelized to avoid
+        // sequential S3 latency on cold start (O(chunks × packs) calls).
+        {
+            use futures::stream::{self, StreamExt};
+
+            let packs_to_warm: Vec<(u32, crate::block::pack::PackId)> = {
                 let vm = volume_manifest.read();
-                vm.chunk_pack_ids(chunk_idx)
-                    .map(|ids| ids.to_vec())
-                    .unwrap_or_default()
+                per_chunk
+                    .keys()
+                    .flat_map(|&chunk_idx| {
+                        vm.chunk_pack_ids(chunk_idx)
+                            .map(|ids| ids.to_vec())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(move |pid| (chunk_idx, pid))
+                    })
+                    .collect()
             };
-            for &pid in &pack_ids {
-                if pack_index_cache.get_entries(pid).await.is_none() {
+
+            stream::iter(packs_to_warm)
+                .for_each_concurrent(16, |(chunk_idx, pid)| async move {
+                    if pack_index_cache.get_entries(pid).await.is_some() {
+                        return;
+                    }
                     match content_store.get_pack_index(chunk_idx, pid).await {
                         Ok(entries) => {
                             pack_index_cache.insert_entries(pid, &entries);
@@ -480,8 +493,8 @@ impl WriteCache<Active> {
                             );
                         }
                     }
-                }
-            }
+                })
+                .await;
         }
 
         let blocks_per_chunk = {
@@ -520,30 +533,39 @@ impl WriteCache<Active> {
             let hash_to_compressed: HashMap<Blake3Hash, Vec<u8>> =
                 std::mem::take(&mut batch.to_upload).into_iter().collect();
 
-            if hash_to_compressed.is_empty() {
-                // All blocks are zero — nothing to upload, still record for CAS.
-                flushed_blocks.extend(batch.computed.iter().map(|&(idx, _)| idx));
-                continue;
-            }
-
-            // Build one pack entry per non-zero dirty block, each at its actual
+            // Build one pack entry per dirty block, each at its actual
             // chunk_offset. Two blocks with the same hash but different chunk_offsets
             // both get entries (clone of compressed bytes), ensuring both are
             // resolvable by the read path.
+            //
+            // Zero blocks get a tombstone entry with empty compressed data
+            // (comp_length = 0 in the pack index). This ensures the "newest wins"
+            // semantic is preserved across forks/migrations: without a tombstone,
+            // a block overwritten with zeros would resolve to its previous non-zero
+            // pack entry on a fork (where the local SSD is empty).
+            let zero_hash = self.inner.zero_block_hash;
             let blocks_for_pack: Vec<(Blake3Hash, u32, Vec<u8>)> = {
                 let vm = volume_manifest.read();
                 batch
                     .computed
                     .iter()
                     .filter_map(|&(block_index, hash)| {
-                        // hash_to_compressed excludes zero_hash (zero blocks → None in
-                        // compute_flush_batch → not in to_upload).
-                        let compressed = hash_to_compressed.get(&hash)?.clone();
+                        let compressed = if hash == zero_hash {
+                            Vec::new() // zero block tombstone: comp_length = 0
+                        } else {
+                            hash_to_compressed.get(&hash)?.clone()
+                        };
                         let chunk_offset = vm.block_offset_in_chunk(block_index as u64);
                         Some((hash, chunk_offset, compressed))
                     })
                     .collect()
             };
+
+            if blocks_for_pack.is_empty() {
+                // All blocks deduped (shouldn't happen — zero blocks are included).
+                flushed_blocks.extend(batch.computed.iter().map(|&(idx, _)| idx));
+                continue;
+            }
 
             // Stream GLPK v3 pack to S3 (blocks freed as they upload)
             let pack_id = new_pack_id();
@@ -693,18 +715,32 @@ impl WriteCache<Active> {
             .put_manifest(&self.inner.export_name, manifest_bytes.clone())
             .await?;
 
-        let snapshot_persisted = match content_store
-            .put_snapshot(&self.inner.export_name, seq_cutpoint, manifest_bytes)
-            .await
-        {
-            Ok(_) => true,
-            Err(e) => {
-                warn!(
-                    error = %e, sequence = seq_cutpoint,
-                    "failed to persist versioned snapshot (continuing)"
-                );
-                false
+        let snapshot_persisted = {
+            let mut persisted = false;
+            for attempt in 0..3u32 {
+                match content_store
+                    .put_snapshot(&self.inner.export_name, seq_cutpoint, manifest_bytes.clone())
+                    .await
+                {
+                    Ok(_) => {
+                        persisted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e, sequence = seq_cutpoint, attempt = attempt + 1,
+                            "failed to persist versioned snapshot, retrying"
+                        );
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                100 * (1 << attempt),
+                            ))
+                            .await;
+                        }
+                    }
+                }
             }
+            persisted
         };
 
         self.checkpoint()?;

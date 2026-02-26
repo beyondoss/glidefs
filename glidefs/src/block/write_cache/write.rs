@@ -62,19 +62,10 @@ impl WriteCache<Active> {
         // Now write to local file (after claiming blocks via set_present)
         self.inner.data_file.write_all_at(data, offset)?;
 
-        // Mark affected blocks as dirty and invalidate stale CRC32 checksums.
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx >= self.inner.num_blocks {
-                continue;
-            }
-            self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
-        }
-
-        // Record dirty blocks in WAL.
-        // Batch all WAL entries under a single lock acquisition to reduce
-        // lock/unlock overhead on multi-block writes.
+        // Mark affected blocks as dirty, invalidate stale CRC32 checksums,
+        // and record in WAL. Combined into a single pass under the WAL lock
+        // to minimize loop overhead on multi-block writes. The CAS and
+        // DashMap insert are fast (~ns), so holding the WAL lock is fine.
         {
             let mut wal = self.inner.wal.lock();
             for block in start_block..=end_block {
@@ -82,8 +73,10 @@ impl WriteCache<Active> {
                 if idx >= self.inner.num_blocks {
                     continue;
                 }
-                let seq = self.inner.sequence.next();
+                self.inner.transition_to_dirty(idx);
+                self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
 
+                let seq = self.inner.sequence.next();
                 let wal_entry = WalEntryRef {
                     block_index: block,
                     sequence: seq,
@@ -91,7 +84,6 @@ impl WriteCache<Active> {
                 wal.append(&wal_entry)?;
             }
 
-            // Flush WAL buffer (or fsync if wal_sync is enabled)
             if self.inner.config.wal_sync {
                 wal.sync()?;
             } else {
@@ -175,11 +167,8 @@ impl WriteCache<Active> {
             self.zero_range_fallback(offset, len)?;
         }
 
-        // Mark affected blocks as dirty and invalidate stale CRCs (after data write)
-        self.mark_range_dirty(offset, len);
-
-        // Record dirty blocks in WAL.
-        // Batch all WAL entries under a single lock acquisition.
+        // Mark affected blocks as dirty, invalidate stale CRCs, and record
+        // in WAL. Combined into a single pass under the WAL lock.
         {
             let block_size = self.inner.config.block_size as u64;
             let start_block = offset / block_size;
@@ -191,9 +180,10 @@ impl WriteCache<Active> {
                 if idx >= self.inner.num_blocks {
                     continue;
                 }
+                self.inner.transition_to_dirty(idx);
+                self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
 
                 let seq = self.inner.sequence.next();
-
                 let wal_entry = WalEntryRef {
                     block_index: block,
                     sequence: seq,
@@ -343,22 +333,4 @@ impl WriteCache<Active> {
         Ok(())
     }
 
-    /// Mark a range of blocks as dirty and invalidate stale CRCs.
-    ///
-    /// Called AFTER the data write. Blocks must already be marked present
-    /// (by the caller) before the data write to prevent prefetch races.
-    fn mark_range_dirty(&self, offset: u64, len: u64) {
-        let block_size = self.inner.config.block_size as u64;
-        let start_block = offset / block_size;
-        let end_block = (offset + len - 1) / block_size;
-
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx >= self.inner.num_blocks {
-                continue;
-            }
-            self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
-        }
-    }
 }

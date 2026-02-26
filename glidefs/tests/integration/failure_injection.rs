@@ -518,12 +518,14 @@ async fn test_concurrent_writes_no_torn_reads() {
     );
 }
 
-/// Test: Zero blocks are not uploaded to S3 (optimization).
+/// Test: Zero blocks produce tombstone entries in packs.
 ///
-/// Writing all-zero blocks should not result in pack uploads,
-/// as zero blocks are synthesized on read.
+/// Writing all-zero blocks produces pack entries with comp_length = 0
+/// (tombstones). This ensures "newest wins" semantics are preserved
+/// across forks/migrations: a block overwritten with zeros must be
+/// distinguishable from "never written" by the read path.
 #[tokio::test]
-async fn test_zero_blocks_not_synced_to_s3() {
+async fn test_zero_blocks_produce_tombstones() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
     let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
@@ -543,10 +545,15 @@ async fn test_zero_blocks_not_synced_to_s3() {
         .await
         .unwrap();
 
-    // With zero-block optimization, no packs should be uploaded
+    // Zero blocks produce tombstone pack entries (comp_length = 0) so
+    // that forks see zeros instead of stale non-zero data from older packs.
     assert_eq!(
-        stats.packs_uploaded, 0,
-        "Zero blocks should not result in S3 uploads (optimization)"
+        stats.packs_uploaded, 1,
+        "Zero blocks should produce one tombstone pack"
+    );
+    assert_eq!(
+        stats.bytes_uploaded, 0,
+        "Zero block tombstones have no compressed data"
     );
 }
 

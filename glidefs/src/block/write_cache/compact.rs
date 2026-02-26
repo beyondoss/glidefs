@@ -97,17 +97,11 @@ pub async fn compact_chunk(
     }
 
     if merged.is_empty() {
-        // Edge case: all packs were empty. Just replace with empty state.
-        let base_pack_id = new_pack_id();
-        let index_entries = content_store
-            .stream_chunk_pack(chunk_idx, base_pack_id, Vec::new(), blocks_per_chunk)
-            .await?;
-
-        pack_index_cache.insert_entries(base_pack_id, &index_entries);
-
+        // Edge case: all packs were empty. Remove them from the manifest
+        // without uploading an empty pack to S3.
         {
             let mut vm = volume_manifest.write();
-            if !vm.replace_packs_cas(chunk_idx, pack_ids, vec![base_pack_id]) {
+            if !vm.replace_packs_cas(chunk_idx, pack_ids, vec![]) {
                 warn!(
                     chunk_idx,
                     "compaction aborted: pack list changed during compaction (empty merge)"
@@ -120,7 +114,7 @@ pub async fn compact_chunk(
 
         return Ok(CompactionResult {
             chunk_idx,
-            new_pack_id: base_pack_id,
+            new_pack_id: 0,
             old_pack_ids: pack_ids.to_vec(),
             live_blocks: 0,
             new_pack_size: 0,
@@ -128,17 +122,21 @@ pub async fn compact_chunk(
     }
 
     // 3. Fetch compressed block data from source packs.
-    // Use concurrent range-reads bounded by a semaphore.
+    // Partition: zero tombstones (comp_length == 0) go directly into the output
+    // without an S3 fetch. Non-zero blocks use concurrent range-reads.
     use futures::stream::{self, StreamExt};
 
-    let blocks_to_fetch: Vec<(u32, PackId, Blake3Hash, u32, u32)> = merged
-        .into_iter()
-        .map(|(chunk_offset, (pid, hash, pack_offset, comp_length))| {
-            (chunk_offset, pid, hash, pack_offset, comp_length)
-        })
-        .collect();
+    let mut zero_tombstones: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
+    let mut blocks_to_fetch: Vec<(u32, PackId, Blake3Hash, u32, u32)> = Vec::new();
+    for (chunk_offset, (pid, hash, pack_offset, comp_length)) in merged {
+        if comp_length == 0 {
+            zero_tombstones.push((hash, chunk_offset, Vec::new()));
+        } else {
+            blocks_to_fetch.push((chunk_offset, pid, hash, pack_offset, comp_length));
+        }
+    }
 
-    let live_block_count = blocks_to_fetch.len();
+    let live_block_count = blocks_to_fetch.len() + zero_tombstones.len();
 
     let fetched_blocks: Vec<FetchResult> =
         stream::iter(blocks_to_fetch)
@@ -156,7 +154,9 @@ pub async fn compact_chunk(
             .await;
 
     // Collect results, propagating errors
-    let mut blocks_for_pack: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::with_capacity(live_block_count);
+    let mut blocks_for_pack: Vec<(Blake3Hash, u32, Vec<u8>)> =
+        Vec::with_capacity(live_block_count);
+    blocks_for_pack.extend(zero_tombstones);
     for result in fetched_blocks {
         blocks_for_pack.push(result?);
     }

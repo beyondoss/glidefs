@@ -405,7 +405,7 @@ impl CacheInner {
         file.write_all(&(self.config.block_size as u64).to_le_bytes())?;
         file.write_all(&(self.num_blocks as u64).to_le_bytes())?;
 
-        // v4 sparse format: stream (index, state) pairs directly to disk.
+        // v4/v5 sparse format: stream (index, state) pairs directly to disk.
         // Write a placeholder count, stream entries, then seek back to fix the count.
         // Uses iter_present() which only visits allocated pages — O(allocated_pages)
         // not O(num_blocks).

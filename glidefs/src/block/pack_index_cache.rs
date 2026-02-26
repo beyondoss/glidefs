@@ -73,7 +73,11 @@ impl PackIndexCache {
     pub async fn get_entries(&self, pack_id: PackId) -> Option<Vec<PackIndexEntry>> {
         match self.inner.get(&pack_id).await {
             Ok(Some(entry)) => deserialize_entries(entry.value()),
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(pack_id, error = %e, "pack index cache error, treating as miss");
+                None
+            }
         }
     }
 

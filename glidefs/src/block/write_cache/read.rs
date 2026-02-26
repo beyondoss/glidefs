@@ -544,6 +544,13 @@ impl WriteCache<Active> {
             return Ok(BlockLocation::Zero);
         };
 
+        // Zero block tombstone: comp_length == 0 means this block was explicitly
+        // zeroed. The pack index entry exists to override older non-zero entries
+        // via "newest wins", but there is no compressed data to fetch.
+        if comp_length == 0 {
+            return Ok(BlockLocation::Zero);
+        }
+
         // Check clean_cache (block may have been fetched earlier)
         if let Some(data) = clean_cache.get(&expected_hash).await {
             if let Some(m) = metrics {
