@@ -106,7 +106,6 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             default_blocks_per_pack: nbd_config.blocks_per_pack(),
             ublk_nr_queues: nbd_config.ublk_nr_queues(),
             nbd_dead_conn_timeout: nbd_config.nbd_dead_conn_timeout(),
-            max_concurrent_flushes: nbd_config.max_concurrent_flushes(),
         })
         .await
         .context("Failed to initialize export router")?,

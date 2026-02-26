@@ -36,7 +36,6 @@ fn create_router_config(s3: Arc<dyn ObjectStore>, dir: &TempDir) -> RouterConfig
         default_blocks_per_pack: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
-            max_concurrent_flushes: 0,
     }
 }
 

@@ -811,7 +811,6 @@ mod tests {
                 default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
-                max_concurrent_flushes: 0,
             })
             .await
             .expect("failed to create test router"),

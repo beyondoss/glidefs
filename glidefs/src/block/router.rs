@@ -200,8 +200,6 @@ pub struct RouterConfig {
     /// Enables kernel-side I/O queueing during restarts. 0 = disabled.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub nbd_dead_conn_timeout: u32,
-    /// Max concurrent flush operations across all exports (0 = unlimited).
-    pub max_concurrent_flushes: usize,
 }
 
 /// Multi-tenant export router.
@@ -310,13 +308,12 @@ impl ExportRouter {
         } else {
             None
         };
-        let flush_semaphore = if config.max_concurrent_flushes > 0 {
-            Some(Arc::new(tokio::sync::Semaphore::new(
-                config.max_concurrent_flushes,
-            )))
-        } else {
-            None
-        };
+        // Flush semaphore mirrors upload semaphore: prevents flushes from
+        // compressing data faster than S3 can drain it (compressed blocks
+        // sit in memory between rayon completion and upload permit acquisition).
+        let flush_semaphore = upload_semaphore
+            .as_ref()
+            .map(|s| Arc::new(tokio::sync::Semaphore::new(s.available_permits())));
 
         let pack_index_cache = Arc::new(
             PackIndexCache::open(&config.cache_dir)
@@ -1648,7 +1645,6 @@ impl ExportRouter {
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
-            max_concurrent_flushes: 0,
         })
         .await
         .expect("failed to create test router")
@@ -1692,7 +1688,6 @@ mod tests {
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
-            max_concurrent_flushes: 0,
         })
         .await
         .expect("failed to create test router")
