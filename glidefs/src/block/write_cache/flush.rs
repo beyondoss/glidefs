@@ -605,15 +605,8 @@ impl WriteCache<Active> {
                             live_blocks = r.live_blocks,
                             new_pack_bytes = r.new_pack_size,
                             old_packs = r.old_pack_ids.len(),
-                            "compacted chunk"
+                            "compacted chunk — old packs left for GC"
                         );
-                    }
-                    if !compaction_results.is_empty() {
-                        super::compact::delete_old_packs(
-                            &compaction_results,
-                            content_store,
-                            &self.inner.export_name,
-                        ).await;
                     }
                 }
                 Err(e) => {

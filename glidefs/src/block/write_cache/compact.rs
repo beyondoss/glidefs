@@ -76,8 +76,7 @@ pub async fn compact_chunk(
                 // Cache miss: fetch from S3
                 let fetched = content_store
                     .get_pack_index(chunk_idx, pid)
-                    .await
-                    .map_err(|e| CacheError::Io(std::io::Error::other(e.to_string())))?;
+                    .await?;
                 pack_index_cache.insert_entries(pid, &fetched);
                 fetched
             }
@@ -105,8 +104,7 @@ pub async fn compact_chunk(
 
         content_store
             .put_chunk_pack(chunk_idx, base_pack_id, pack_bytes)
-            .await
-            .map_err(|e| CacheError::Io(std::io::Error::other(e.to_string())))?;
+            .await?;
 
         pack_index_cache.insert_entries(base_pack_id, &index_entries);
 
@@ -144,8 +142,7 @@ pub async fn compact_chunk(
                 async move {
                     let data = cs
                         .get_chunk_block(chunk_idx, pid, pack_offset, comp_length)
-                        .await
-                        .map_err(|e| CacheError::Io(std::io::Error::other(e.to_string())))?;
+                        .await?;
                     Ok((hash, chunk_offset, data.to_vec()))
                 }
             })
@@ -167,8 +164,7 @@ pub async fn compact_chunk(
     // 5. Upload base pack
     content_store
         .put_chunk_pack(chunk_idx, base_pack_id, pack_bytes)
-        .await
-        .map_err(|e| CacheError::Io(std::io::Error::other(e.to_string())))?;
+        .await?;
 
     // 6. Update manifest: replace N packs with 1
     {
@@ -258,100 +254,3 @@ pub async fn compact_if_needed(
     Ok(results)
 }
 
-/// Delete old packs from S3 after compaction, skipping any still referenced by snapshots.
-///
-/// Loads all snapshot manifests for this export and builds a set of pinned
-/// (chunk_idx, pack_id) pairs. Old packs in the pinned set are preserved;
-/// the rest are deleted best-effort.
-pub async fn delete_old_packs(
-    results: &[CompactionResult],
-    content_store: &ContentStore,
-    export_name: &str,
-) {
-    // Build the set of pack IDs pinned by snapshots.
-    let pinned = match load_snapshot_pack_ids(content_store, export_name).await {
-        Ok(set) => set,
-        Err(e) => {
-            // If we can't read snapshots, don't delete anything — safe default.
-            warn!(
-                error = %e,
-                "failed to load snapshot manifests; skipping pack deletion to avoid data loss"
-            );
-            return;
-        }
-    };
-
-    for result in results {
-        for &old_pid in &result.old_pack_ids {
-            if pinned.contains(&(result.chunk_idx, old_pid)) {
-                debug!(
-                    chunk_idx = result.chunk_idx,
-                    pack_id = old_pid,
-                    "skipping pack deletion — referenced by snapshot"
-                );
-                continue;
-            }
-            if let Err(e) = content_store
-                .delete_chunk_pack(result.chunk_idx, old_pid)
-                .await
-            {
-                warn!(
-                    chunk_idx = result.chunk_idx,
-                    pack_id = old_pid,
-                    error = %e,
-                    "failed to delete old pack after compaction"
-                );
-            }
-        }
-    }
-}
-
-/// Load all snapshot manifests for an export and return the union of their pack IDs.
-async fn load_snapshot_pack_ids(
-    content_store: &ContentStore,
-    export_name: &str,
-) -> Result<std::collections::HashSet<(u32, PackId)>, super::CacheError> {
-    use std::collections::HashSet;
-    use crate::block::volume_manifest::VolumeManifest;
-
-    let sequences = content_store
-        .list_snapshots(export_name)
-        .await
-        .map_err(|e| CacheError::Io(std::io::Error::other(e.to_string())))?;
-
-    let mut pinned: HashSet<(u32, PackId)> = HashSet::new();
-
-    for seq in sequences {
-        let data = match content_store.get_snapshot(export_name, seq).await {
-            Ok(Some(d)) => d,
-            Ok(None) => continue,
-            Err(e) => {
-                warn!(
-                    export = %export_name, sequence = seq, error = %e,
-                    "failed to fetch snapshot manifest, treating its packs as pinned"
-                );
-                // Can't determine what this snapshot references — abort to be safe.
-                return Err(CacheError::Io(std::io::Error::other(
-                    format!("failed to load snapshot {seq}: {e}")
-                )));
-            }
-        };
-        match VolumeManifest::deserialize(&data) {
-            Ok(vm) => {
-                pinned.extend(vm.all_pack_ids());
-            }
-            Err(e) => {
-                warn!(
-                    export = %export_name, sequence = seq, error = %e,
-                    "corrupt snapshot manifest, treating its packs as pinned"
-                );
-                // Can't parse — could reference anything. Abort to be safe.
-                return Err(CacheError::Io(std::io::Error::other(
-                    format!("corrupt snapshot {seq}: {e}")
-                )));
-            }
-        }
-    }
-
-    Ok(pinned)
-}

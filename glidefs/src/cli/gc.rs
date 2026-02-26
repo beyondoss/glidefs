@@ -378,6 +378,7 @@ async fn enforce_snapshot_retention(
 ///
 /// Scans `{base_path}/chunks/` and parses filenames matching
 /// `{idx:04}/{pack_id:016x}.pack`. Returns `(chunk_idx, pack_id)` pairs.
+#[cfg(test)]
 async fn list_all_packs(
     content_store: &ContentStore,
 ) -> Result<HashSet<(u32, PackId)>> {
@@ -417,16 +418,19 @@ async fn list_all_packs(
 // Snapshot manifest loading
 // ---------------------------------------------------------------------------
 
-/// Load all snapshot manifests for a prefix, parsed as binary VolumeManifest.
-/// Corrupt or missing snapshots are warned and skipped.
-async fn load_snapshot_manifests(
+/// Stream snapshot manifests for a prefix, inserting live pack IDs directly
+/// into the provided set. Each manifest is deserialized and dropped before
+/// fetching the next, avoiding O(snapshots) memory for manifests.
+///
+/// Returns the number of snapshot manifests successfully scanned.
+async fn collect_snapshot_pack_ids(
     content_store: &ContentStore,
-) -> Result<Vec<VolumeManifest>> {
+    live_packs: &mut HashSet<(u32, PackId)>,
+) -> Result<usize> {
     let base = content_store.base_path();
     let prefix_str = format!("{}/snapshots/", base);
     let prefix = ObjectPath::from(prefix_str);
 
-    // List all snapshot paths.
     let mut paths = Vec::new();
     let mut stream = content_store.object_store().list(Some(&prefix));
     while let Some(result) = stream.next().await {
@@ -436,8 +440,7 @@ async fn load_snapshot_manifests(
         }
     }
 
-    // Fetch and parse each.
-    let mut manifests = Vec::new();
+    let mut scanned = 0usize;
     for path in paths {
         let data = match content_store.object_store().get(&path).await {
             Ok(response) => match response.bytes().await {
@@ -454,14 +457,17 @@ async fn load_snapshot_manifests(
             }
         };
         match VolumeManifest::deserialize(&data) {
-            Ok(vm) => manifests.push(vm),
+            Ok(vm) => {
+                live_packs.extend(vm.all_pack_ids());
+                scanned += 1;
+            }
             Err(e) => {
                 warn!(key = %path, error = %e, "corrupt snapshot manifest, skipping");
             }
         }
     }
 
-    Ok(manifests)
+    Ok(scanned)
 }
 
 // ---------------------------------------------------------------------------
@@ -518,13 +524,12 @@ async fn reconcile_prefix(
         return Ok((delta, stats));
     }
 
-    // Snapshot manifests — collect live packs from them too.
-    match load_snapshot_manifests(content_store).await {
-        Ok(snapshot_vms) => {
-            for vm in &snapshot_vms {
-                live_packs.extend(vm.all_pack_ids());
-            }
-            stats.manifests_scanned += snapshot_vms.len();
+    // Snapshot manifests — stream pack IDs directly into live_packs.
+    // Each manifest is deserialized and dropped before the next, avoiding
+    // O(snapshots) memory for manifest bodies.
+    match collect_snapshot_pack_ids(content_store, &mut live_packs).await {
+        Ok(count) => {
+            stats.manifests_scanned += count;
         }
         Err(e) => {
             warn!(error = %e, "failed to scan snapshot manifests — treating all packs as live");
@@ -532,36 +537,63 @@ async fn reconcile_prefix(
         }
     }
 
-    // Phase 2: List all pack files from S3.
-    let known_packs = list_all_packs(content_store).await?;
-
     stats.live_packs += live_packs.len();
-    stats.known_packs += known_packs.len();
 
-    // Phase 3: Compute dead packs = known - live
-    let dead_packs: HashSet<(u32, PackId)> =
-        known_packs.difference(&live_packs).copied().collect();
-    stats.dead_found += dead_packs.len();
-
-    // Phase 4: Record state changes as delta
+    // Phase 2+3: Stream S3 pack list, classify each pack inline.
+    // No `known_packs` HashSet — each pack is checked against `live_packs`
+    // as it arrives from the LIST stream, keeping memory at O(live + dead).
     let now_ts = Utc::now().to_rfc3339();
-    for &(chunk_idx, pack_id) in &dead_packs {
-        let key = pack_key(chunk_idx, pack_id);
-        if !state.dead_packs.contains_key(&key) {
-            delta.newly_dead_packs.push((key, now_ts.clone()));
+    let mut dead_packs: Vec<(u32, PackId)> = Vec::new();
+
+    let base = content_store.base_path();
+    let chunks_prefix_str = format!("{}/chunks/", base);
+    let chunks_prefix = ObjectPath::from(chunks_prefix_str.clone());
+    let mut stream = content_store.object_store().list(Some(&chunks_prefix));
+
+    while let Some(result) = stream.next().await {
+        let meta = result?;
+        let path_str = meta.location.to_string();
+        let Some(rel) = path_str.strip_prefix(&chunks_prefix_str) else {
+            continue;
+        };
+        let Some(slash_pos) = rel.find('/') else {
+            continue;
+        };
+        let Ok(chunk_idx) = rel[..slash_pos].parse::<u32>() else {
+            continue;
+        };
+        let filename = &rel[slash_pos + 1..];
+        let Some(hex_str) = filename.strip_suffix(".pack") else {
+            continue;
+        };
+        if hex_str.len() != 16 {
+            continue;
+        }
+        let Ok(pack_id) = u64::from_str_radix(hex_str, 16) else {
+            continue;
+        };
+
+        stats.known_packs += 1;
+
+        if live_packs.contains(&(chunk_idx, pack_id)) {
+            // Live pack — check if it was previously marked dead (revive it)
+            let key = pack_key(chunk_idx, pack_id);
+            if state.dead_packs.contains_key(&key) {
+                delta.revived_packs.push(key);
+            }
+        } else {
+            // Dead pack — record in delta
+            let key = pack_key(chunk_idx, pack_id);
+            if !state.dead_packs.contains_key(&key) {
+                delta.newly_dead_packs.push((key, now_ts.clone()));
+            }
+            dead_packs.push((chunk_idx, pack_id));
         }
     }
-    // Revive packs that became live again.
-    let revived: Vec<(u32, PackId)> = known_packs
-        .intersection(&live_packs)
-        .copied()
-        .filter(|(ci, pi)| state.dead_packs.contains_key(&pack_key(*ci, *pi)))
-        .collect();
-    for (ci, pi) in revived {
-        delta.revived_packs.push(pack_key(ci, pi));
-    }
 
-    // Phase 5: Filter by grace period.
+    stats.dead_found += dead_packs.len();
+
+    // Phase 4: Filter by grace period.
     let eligible: Vec<(u32, PackId)> = dead_packs
         .iter()
         .filter(|(ci, pi)| {

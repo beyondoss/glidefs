@@ -65,6 +65,7 @@ impl WriteCache<Recovering> {
         let block_size = self.inner.config.block_size;
         let device_size = self.inner.config.device_size;
         let mut warnings = 0;
+        let mut buf = vec![0u8; block_size];
 
         for idx in self
             .inner
@@ -79,8 +80,7 @@ impl WriteCache<Recovering> {
                 continue;
             }
 
-            let mut buf = vec![0u8; valid_bytes];
-            if let Err(e) = self.inner.data_file.read_exact_at(&mut buf, offset) {
+            if let Err(e) = self.inner.data_file.read_exact_at(&mut buf[..valid_bytes], offset) {
                 warn!(
                     chunk_index = idx,
                     error = %e,

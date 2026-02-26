@@ -658,20 +658,22 @@ async fn test_standalone_tag() {
     assert_eq!(data[0], 0xDD, "fork from standalone tag should see data");
 }
 
-/// Compaction must not delete packs that are still referenced by a snapshot manifest.
+/// After compaction, GC deletes old packs not referenced by snapshots
+/// but preserves old packs that a snapshot still references.
 ///
 /// Scenario:
 /// 1. Write blocks, flush → pack A
 /// 2. Overwrite blocks, flush → pack B  (chunk now has [A, B])
 /// 3. Take snapshot (snapshot manifest references [A, B])
 /// 4. Compact chunk → new base pack C replaces [A, B] in live manifest
-/// 5. delete_old_packs should skip A and B (snapshot still references them)
-/// 6. Verify A and B still exist on S3
-/// 7. Delete the snapshot, run delete_old_packs again → A and B deleted
+/// 5. Upload new manifest (so GC sees [C], snapshot sees [A, B])
+/// 6. GC should NOT delete A or B (snapshot references them)
+/// 7. Delete the snapshot → GC should find A and B as dead
 #[tokio::test]
-async fn test_compaction_respects_snapshots() {
+async fn test_compaction_old_packs_gc_respects_snapshots() {
     use glidefs::block::pack::PackId;
     use glidefs::block::write_cache::compact;
+    use glidefs::cli::gc::{new_gc_state_for_test, reconcile_prefix_for_test};
 
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
@@ -690,7 +692,7 @@ async fn test_compaction_respects_snapshots() {
         .chunk_pack_ids(0)
         .unwrap()
         .to_vec();
-    assert_eq!(packs_after_flush1.len(), 1, "should have 1 pack after first flush");
+    assert_eq!(packs_after_flush1.len(), 1);
 
     // Flush 2: overwrite same blocks → pack B
     write_blocks(&cache, 0, 3, 2, cc.as_ref());
@@ -704,7 +706,7 @@ async fn test_compaction_respects_snapshots() {
         .chunk_pack_ids(0)
         .unwrap()
         .to_vec();
-    assert_eq!(packs_after_flush2.len(), 2, "should have 2 packs after second flush");
+    assert_eq!(packs_after_flush2.len(), 2);
 
     // Take snapshot — snapshot manifest references both pack A and pack B
     let snap = cache
@@ -715,7 +717,7 @@ async fn test_compaction_respects_snapshots() {
     // Compact: merge [A, B] → C, live manifest now has [C]
     let old_packs = packs_after_flush2.clone();
     let blocks_per_chunk = volume_manifest.read().blocks_per_chunk();
-    let result = compact::compact_chunk(
+    compact::compact_chunk(
         0,
         &old_packs,
         blocks_per_chunk,
@@ -726,51 +728,32 @@ async fn test_compaction_respects_snapshots() {
     .await
     .unwrap();
 
-    let live_packs: Vec<PackId> = volume_manifest
-        .read()
-        .chunk_pack_ids(0)
-        .unwrap()
-        .to_vec();
-    assert_eq!(live_packs.len(), 1, "compaction should replace N packs with 1");
-    assert_eq!(live_packs[0], result.new_pack_id);
+    // Upload the compacted manifest so GC sees [C] not [A, B]
+    cache.sync_manifest(&cs, &volume_manifest).await.unwrap();
 
-    // delete_old_packs should NOT delete A or B (snapshot references them)
-    compact::delete_old_packs(&[result], &cs, "vm1").await;
-
-    // Verify old packs still exist on S3
-    for &pid in &old_packs {
-        let block = cs.get_chunk_block(0, pid, 0, 1).await;
-        assert!(
-            block.is_ok(),
-            "pack {:016x} should still exist on S3 (snapshot pins it), got {:?}",
-            pid,
-            block.err()
-        );
-    }
+    // GC: packs A and B are on S3 but NOT in the live manifest.
+    // However, the snapshot manifest references them → they should be live.
+    let mut gc_state = new_gc_state_for_test();
+    let report = reconcile_prefix_for_test(&cs, &mut gc_state, Duration::ZERO, 1000, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.dead_found(), 0,
+        "old packs should be live via snapshot manifest"
+    );
 
     // Delete the snapshot
     cs.delete_snapshot("vm1", snap.sequence).await.unwrap();
 
-    // Now delete_old_packs should delete A and B (nothing references them)
-    // Re-create the CompactionResult since we consumed it
-    let result2 = compact::CompactionResult {
-        chunk_idx: 0,
-        new_pack_id: live_packs[0],
-        old_pack_ids: old_packs.clone(),
-        live_blocks: 3,
-        new_pack_size: 0,
-    };
-    compact::delete_old_packs(&[result2], &cs, "vm1").await;
-
-    // Verify old packs are gone
-    for &pid in &old_packs {
-        let block = cs.get_chunk_block(0, pid, 0, 1).await;
-        assert!(
-            block.is_err(),
-            "pack {:016x} should be deleted after snapshot removal",
-            pid
-        );
-    }
+    // GC again: now A and B are truly dead (no manifest references them)
+    let report2 = reconcile_prefix_for_test(&cs, &mut gc_state, Duration::ZERO, 1000, false)
+        .await
+        .unwrap();
+    assert!(
+        report2.dead_found() >= 2,
+        "old packs should be dead after snapshot deletion, got {} dead",
+        report2.dead_found()
+    );
 }
 
 /// head_manifest returns false for nonexistent manifest in nonexistent prefix.

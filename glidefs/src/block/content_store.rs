@@ -495,10 +495,11 @@ impl ContentStore {
         self.get_range_from_key(&key, offset, comp_length).await
     }
 
-    /// Fetch the GLPK v2 pack index from S3.
+    /// Fetch the GLPK v2 pack index from S3 in a single range-read.
     ///
-    /// Range-reads the header (16 bytes) to get block_count, then reads the
-    /// full index (block_count × 28 bytes). Returns parsed entries.
+    /// Requests the max possible index size (header + 1024 entries = 28,688 bytes)
+    /// in one S3 GET. `parse_pack_index` reads `block_count` from the header and
+    /// ignores trailing bytes, so overshooting is safe.
     ///
     /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
     #[instrument(skip(self), fields(chunk_idx, pack_id))]
@@ -507,34 +508,18 @@ impl ContentStore {
         chunk_idx: u32,
         pack_id: super::pack::PackId,
     ) -> Result<Vec<super::pack::PackIndexEntry>, ContentStoreError> {
-        use super::pack::{PACK_INDEX_ENTRY_SIZE, parse_pack_index};
+        use super::pack::{PACK_HEADER_SIZE, PACK_INDEX_ENTRY_SIZE, parse_pack_index};
+
+        // 128 MiB chunk / 128 KB block = 1024 max blocks per pack.
+        const MAX_BLOCKS: usize = 1024;
+        const MAX_INDEX_SIZE: usize = PACK_HEADER_SIZE + MAX_BLOCKS * PACK_INDEX_ENTRY_SIZE;
 
         let key = format!(
             "{}/chunks/{:04}/{:016x}.pack",
             self.base_path, chunk_idx, pack_id
         );
 
-        // Read header (16 bytes: magic + version + block_count + flags + reserved)
-        let header = self.get_range_from_key(&key, 0, 16).await?;
-        if header.len() < 16 {
-            return Err(ContentStoreError::ObjectStore(
-                object_store::Error::Generic {
-                    store: "pack-index",
-                    source: "pack header too short".into(),
-                },
-            ));
-        }
-
-        // Parse block_count from header (offset 8, u32 LE).
-        // header.len() >= 16 is guaranteed by the check above, so this slice is always 4 bytes.
-        let block_count = u32::from_le_bytes(header[8..12].try_into().expect("slice is 4 bytes")) as usize;
-        if block_count == 0 {
-            return Ok(Vec::new());
-        }
-
-        // Read full header+index in one shot
-        let total_size = 16 + block_count * PACK_INDEX_ENTRY_SIZE;
-        let data = self.get_range_from_key(&key, 0, total_size as u32).await?;
+        let data = self.get_range_from_key(&key, 0, MAX_INDEX_SIZE as u32).await?;
 
         let index = parse_pack_index(&data).map_err(|e| {
             ContentStoreError::ObjectStore(object_store::Error::Generic {
