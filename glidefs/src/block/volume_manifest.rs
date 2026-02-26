@@ -119,12 +119,56 @@ impl VolumeManifest {
     }
 
     /// Replace a chunk's entire pack list (after compaction).
+    ///
+    /// **WARNING**: This is a blind overwrite. Prefer `replace_packs_cas` for
+    /// compaction to avoid losing packs appended by concurrent drain/flush.
+    #[cfg(test)]
     pub fn replace_packs(&mut self, chunk_idx: u32, packs: Vec<PackId>) {
         if packs.is_empty() {
             self.chunks.remove(&chunk_idx);
         } else {
             self.chunks.insert(chunk_idx, ChunkEntry { packs });
         }
+    }
+
+    /// Compare-and-swap replacement: replaces `old_packs` with `new_packs`,
+    /// preserving any packs appended after `old_packs` was snapshotted.
+    ///
+    /// Returns `true` if the replacement was applied, `false` if the pack list
+    /// diverged (e.g., a concurrent drain appended packs during compaction).
+    /// On `false`, the caller should abort — the orphaned new base pack in S3
+    /// will be cleaned up by GC.
+    pub fn replace_packs_cas(
+        &mut self,
+        chunk_idx: u32,
+        old_packs: &[PackId],
+        new_packs: Vec<PackId>,
+    ) -> bool {
+        let Some(entry) = self.chunks.get_mut(&chunk_idx) else {
+            // Chunk vanished (concurrent remove). Abort.
+            return false;
+        };
+
+        // old_packs must be an exact prefix of the current pack list.
+        // If not, a concurrent operation modified the chunk.
+        if entry.packs.len() < old_packs.len()
+            || entry.packs[..old_packs.len()] != *old_packs
+        {
+            return false;
+        }
+
+        // Preserve any packs appended after the snapshot.
+        let tail: Vec<PackId> = entry.packs[old_packs.len()..].to_vec();
+        let mut merged = new_packs;
+        merged.extend(tail);
+
+        if merged.is_empty() {
+            self.chunks.remove(&chunk_idx);
+        } else {
+            entry.packs = merged;
+        }
+
+        true
     }
 
     /// Serialize to binary GLVM format.
@@ -373,6 +417,58 @@ mod tests {
         m.replace_packs(0, vec![]);
         assert_eq!(m.chunk_pack_ids(0), None);
         assert!(m.chunks.is_empty());
+    }
+
+    #[test]
+    fn test_v4_replace_packs_cas_basic() {
+        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        m.append_pack(0, 100);
+        m.append_pack(0, 200);
+        m.append_pack(0, 300);
+
+        // CAS with correct old_packs succeeds.
+        assert!(m.replace_packs_cas(0, &[100, 200, 300], vec![400]));
+        assert_eq!(m.chunk_pack_ids(0), Some([400].as_slice()));
+    }
+
+    #[test]
+    fn test_v4_replace_packs_cas_preserves_concurrent_appends() {
+        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        m.append_pack(0, 100);
+        m.append_pack(0, 200);
+
+        // Simulate compaction snapshot: old_packs = [100, 200]
+        let old_packs = vec![100u64, 200];
+
+        // Simulate concurrent drain appending pack 300.
+        m.append_pack(0, 300);
+        // Now chunk 0 = [100, 200, 300]
+
+        // CAS with old snapshot preserves the concurrent append.
+        assert!(m.replace_packs_cas(0, &old_packs, vec![400]));
+        assert_eq!(m.chunk_pack_ids(0), Some([400, 300].as_slice()));
+    }
+
+    #[test]
+    fn test_v4_replace_packs_cas_fails_on_diverged_prefix() {
+        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        m.append_pack(0, 100);
+        m.append_pack(0, 200);
+
+        // Another compaction already replaced the pack list.
+        m.replace_packs(0, vec![999]);
+
+        // CAS with stale snapshot fails.
+        assert!(!m.replace_packs_cas(0, &[100, 200], vec![400]));
+        // Manifest is unchanged.
+        assert_eq!(m.chunk_pack_ids(0), Some([999].as_slice()));
+    }
+
+    #[test]
+    fn test_v4_replace_packs_cas_fails_on_missing_chunk() {
+        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        // Chunk doesn't exist.
+        assert!(!m.replace_packs_cas(0, &[100], vec![200]));
     }
 
     #[test]

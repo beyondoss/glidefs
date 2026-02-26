@@ -8,7 +8,7 @@ use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_comp
 use crate::block::content_store::ContentStore;
 use crate::block::state::{Active, Draining};
 
-use super::inner::CacheInner;
+use super::inner::{CRC_SENTINEL, CacheInner, is_zero_block};
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
 
 /// Result of CPU-heavy flush computation (pread + crc32 + blake3 + lz4).
@@ -89,42 +89,50 @@ fn compute_flush_batch(
             // distinguish corruption from concurrent writes:
             // - Block still SYNCING → no concurrent write → real corruption
             // - Block now DIRTY → write re-dirtied it → stale CRC, not corruption
+            // - CRC_SENTINEL → write invalidated the CRC, skip verification
             if let Some(stored_crc) = inner.crc_take(chunk_index) {
-                let computed_crc = crc32fast::hash(&chunk_buf);
-                if computed_crc != stored_crc {
-                    let current_state = inner.state_map.get(chunk_index);
-                    if current_state != SparseBlockState::SYNCING {
-                        // Block was re-dirtied by a concurrent write between
-                        // checkpoint and flush. CRC is stale, not corruption.
+                if stored_crc != CRC_SENTINEL {
+                    let computed_crc = crc32fast::hash(&chunk_buf);
+                    if computed_crc != stored_crc {
+                        let current_state = inner.state_map.get(chunk_index);
+                        if current_state != SparseBlockState::SYNCING {
+                            // Block was re-dirtied by a concurrent write between
+                            // checkpoint and flush. CRC is stale, not corruption.
+                            return Ok(BlockResult::Skipped {
+                                chunk_index,
+                                cas_failed: true,
+                                corrupted: false,
+                            });
+                        }
+                        // Still SYNCING + CRC mismatch → real SSD corruption.
+                        warn!(
+                            chunk_index,
+                            stored_crc,
+                            computed_crc,
+                            "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
+                        );
                         return Ok(BlockResult::Skipped {
                             chunk_index,
-                            cas_failed: true,
-                            corrupted: false,
+                            cas_failed: false,
+                            corrupted: true,
                         });
                     }
-                    // Still SYNCING + CRC mismatch → real SSD corruption.
-                    warn!(
-                        chunk_index,
-                        stored_crc,
-                        computed_crc,
-                        "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
-                    );
-                    return Ok(BlockResult::Skipped {
-                        chunk_index,
-                        cas_failed: false,
-                        corrupted: true,
-                    });
                 }
+            }
+
+            // Fast zero-block detection (AVX2 on x86_64) before BLAKE3.
+            // Avoids the full hash + compress for trimmed/unwritten blocks.
+            if is_zero_block(&chunk_buf) {
+                return Ok(BlockResult::Computed {
+                    chunk_index,
+                    hash: zero_hash,
+                    compressed: None,
+                });
             }
 
             let hash = blake3_128(&chunk_buf);
 
-            // Zero block → deduped, no upload needed.
-            let compressed = if hash == zero_hash {
-                None
-            } else {
-                Some(lz4_compress(&chunk_buf[..]))
-            };
+            let compressed = Some(lz4_compress(&chunk_buf[..]));
 
             Ok(BlockResult::Computed {
                 chunk_index,
@@ -190,6 +198,89 @@ fn compute_flush_batch(
         skipped,
         stats,
     })
+}
+
+/// Compute CRC32 checksums for dirty blocks that don't have one yet.
+///
+/// Stores CRCs in the crc_map (DashMap) for later verification by the
+/// flush path. Writes invalidate stale CRCs by storing CRC_SENTINEL.
+///
+/// Sentinel handling: when we encounter a sentinel entry, we remove it
+/// before reading the block. If a concurrent write arrives between our
+/// remove and the subsequent `or_insert`, the write inserts a fresh
+/// sentinel that prevents our (possibly stale) CRC from being stored.
+///
+/// Capped at MAX_CRC_ENTRIES to bound memory. Blocks beyond the cap skip
+/// CRC verification at flush time — the SYNCING state machine still
+/// guarantees correctness; we just lose SSD corruption detection for those
+/// blocks.
+fn compute_dirty_crc32s(inner: &CacheInner) {
+    /// Maximum crc_map entries per export. 10M entries × ~20 bytes
+    /// (DashMap overhead: bucket metadata + alignment + load factor) ≈ 200MB.
+    /// Covers a fully-dirty 1TB device (8M blocks of 128KB) with headroom.
+    /// Prevents unbounded growth if device_size is ever misconfigured.
+    const MAX_CRC_ENTRIES: usize = 10_000_000;
+
+    let block_size = inner.config.block_size;
+    let device_size = inner.config.device_size;
+    let mut buf = vec![0u8; block_size];
+    let mut computed = 0u64;
+
+    for idx in inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
+        // Bound memory: stop computing CRCs once we hit the cap.
+        if inner.crc_map.len() >= MAX_CRC_ENTRIES {
+            break;
+        }
+
+        // Skip blocks that already have a valid CRC.
+        // Sentinel entries are cleared and recomputed below.
+        let is_sentinel = inner
+            .crc_map
+            .get(&idx)
+            .map(|v| *v == CRC_SENTINEL)
+            .unwrap_or(false);
+        if inner.crc_map.contains_key(&idx) && !is_sentinel {
+            continue;
+        }
+
+        // Clear sentinel before reading. If a concurrent write arrives
+        // between this remove and our or_insert below, the write will
+        // insert a fresh sentinel that prevents our (potentially stale)
+        // CRC from being stored.
+        if is_sentinel {
+            inner.crc_map.remove(&idx);
+        }
+
+        let offset = idx as u64 * block_size as u64;
+        let valid_bytes =
+            std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
+        if valid_bytes == 0 {
+            continue;
+        }
+
+        if let Err(e) = inner
+            .data_file
+            .read_exact_at(&mut buf[..valid_bytes], offset)
+        {
+            warn!(
+                chunk_index = idx,
+                error = %e,
+                "failed to read block for CRC32 computation"
+            );
+            continue;
+        }
+        if valid_bytes < block_size {
+            buf[valid_bytes..].fill(0);
+        }
+
+        let crc = crc32fast::hash(&buf);
+        inner.crc_store(idx, crc);
+        computed += 1;
+    }
+
+    if computed > 0 {
+        debug!(computed, "computed CRC32 checksums for dirty blocks");
+    }
 }
 
 impl WriteCache<Active> {
@@ -265,84 +356,24 @@ impl WriteCache<Active> {
 
     /// Local checkpoint: compute CRC32s for dirty blocks, persist state, truncate WAL.
     ///
+    /// Runs on a blocking thread via `spawn_blocking` to avoid starving the
+    /// async runtime with synchronous pread + CRC32 computation across
+    /// potentially thousands of dirty blocks.
+    ///
     /// Independent of S3 — keeps the WAL bounded in demand-driven mode
     /// where S3 flushes may be infrequent. Should run every ~5s when
     /// there are dirty blocks.
-    pub fn local_checkpoint(&self) -> Result<(), CacheError> {
-        self.compute_dirty_crc32s();
-        self.checkpoint()?;
-        debug!("local checkpoint complete");
-        Ok(())
-    }
-
-    /// Compute CRC32 checksums for dirty blocks that don't have one yet.
-    ///
-    /// Stores CRCs in the crc_map (DashMap) for later verification by the
-    /// flush path. Only runs on the flush scheduler thread. Writes invalidate
-    /// stale CRCs via crc_map.remove in their hot path.
-    ///
-    /// Capped at MAX_CRC_ENTRIES to bound memory. Blocks beyond the cap skip
-    /// CRC verification at flush time — the SYNCING state machine still
-    /// guarantees correctness; we just lose SSD corruption detection for those
-    /// blocks.
-    fn compute_dirty_crc32s(&self) {
-        /// Maximum crc_map entries per export. 10M entries × ~20 bytes
-        /// (DashMap overhead: bucket metadata + alignment + load factor) ≈ 200MB.
-        /// Covers a fully-dirty 1TB device (8M blocks of 128KB) with headroom.
-        /// Prevents unbounded growth if device_size is ever misconfigured.
-        const MAX_CRC_ENTRIES: usize = 10_000_000;
-
-        let block_size = self.inner.config.block_size;
-        let device_size = self.inner.config.device_size;
-        let mut buf = vec![0u8; block_size];
-        let mut computed = 0u64;
-
-        for idx in self
-            .inner
-            .state_map
-            .iter_with_state(SparseBlockState::DIRTY)
-        {
-            // Bound memory: stop computing CRCs once we hit the cap.
-            if self.inner.crc_map.len() >= MAX_CRC_ENTRIES {
-                break;
-            }
-
-            // Skip blocks that already have a CRC
-            if self.inner.crc_map.contains_key(&idx) {
-                continue;
-            }
-
-            let offset = idx as u64 * block_size as u64;
-            let valid_bytes =
-                std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
-            if valid_bytes == 0 {
-                continue;
-            }
-
-            if let Err(e) = self
-                .inner
-                .data_file
-                .read_exact_at(&mut buf[..valid_bytes], offset)
-            {
-                warn!(
-                    chunk_index = idx,
-                    error = %e,
-                    "failed to read block for CRC32 computation"
-                );
-                continue;
-            }
-            if valid_bytes < block_size {
-                buf[valid_bytes..].fill(0);
-            }
-
-            let crc = crc32fast::hash(&buf);
-            self.inner.crc_store(idx, crc);
-            computed += 1;
-        }
-
-        if computed > 0 {
-            debug!(computed, "computed CRC32 checksums for dirty blocks");
-        }
+    pub async fn local_checkpoint(&self) -> Result<(), CacheError> {
+        let inner = Arc::clone(&self.inner);
+        crate::task::spawn_blocking_named("local-checkpoint", move || {
+            compute_dirty_crc32s(&inner);
+            inner.save_block_states()?;
+            inner.wal.lock().truncate()?;
+            debug!("local checkpoint complete");
+            Ok(())
+        })
+        .await
+        .map_err(|e| CacheError::Io(std::io::Error::other(e)))?
     }
 
     /// Reference to the per-export flush serialization lock.
@@ -630,6 +661,12 @@ impl WriteCache<Active> {
                         "manifest upload failed in flush_to_s3, retrying"
                     );
                     last_err = Some(e);
+                    if attempt < 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            100 * (1 << attempt),
+                        ))
+                        .await;
+                    }
                 }
             }
         }

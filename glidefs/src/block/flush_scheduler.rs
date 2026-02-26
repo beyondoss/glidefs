@@ -110,12 +110,15 @@ pub async fn flush_scheduler(
                                 // sync_manifest includes checkpoint (persist + WAL truncate).
                                 // Retry up to 3 times; if all fail, defer to checkpoint tick.
                                 let mut synced = false;
-                                for attempt in 0..3 {
+                                for attempt in 0..3u32 {
                                     match cache.sync_manifest(&content_store, &volume_manifest).await {
                                         Ok(()) => { synced = true; break; }
                                         Err(e) => {
                                             metrics.record_manifest_sync_error();
                                             warn!(error = %e, attempt = attempt + 1, "manifest sync after flush failed");
+                                            if attempt < 2 {
+                                                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
+                                            }
                                         }
                                     }
                                 }
@@ -124,7 +127,7 @@ pub async fn flush_scheduler(
                                 } else {
                                     // Checkpoint locally to bound WAL growth even
                                     // when manifest sync is failing.
-                                    if let Err(e) = cache.local_checkpoint() {
+                                    if let Err(e) = cache.local_checkpoint().await {
                                         warn!(error = %e, "checkpoint after failed manifest sync");
                                     }
                                     manifest_pending = true;
@@ -132,7 +135,7 @@ pub async fn flush_scheduler(
                             } else {
                                 // No packs uploaded — still checkpoint to persist
                                 // clean block states and compute CRC32s.
-                                if let Err(e) = cache.local_checkpoint() {
+                                if let Err(e) = cache.local_checkpoint().await {
                                     warn!(error = %e, "checkpoint after flush failed");
                                 }
                             }
@@ -148,7 +151,7 @@ pub async fn flush_scheduler(
                             warn!(error = %e, backoff_secs = flush_backoff.as_secs(), "pack flush failed, backing off");
                             // Still checkpoint on flush error to prevent WAL growth
                             // when S3 is down and flush_notify fires continuously.
-                            if let Err(e) = cache.local_checkpoint() {
+                            if let Err(e) = cache.local_checkpoint().await {
                                 warn!(error = %e, "checkpoint after flush error failed");
                             }
                         }
@@ -205,10 +208,10 @@ pub async fn flush_scheduler(
                             warn!(error = %e, "deferred manifest sync retry failed");
                         }
                     }
-                } else if cache.dirty_block_count() > 0
-                    && let Err(e) = cache.local_checkpoint()
-                {
-                    warn!(error = %e, "local checkpoint failed");
+                } else if cache.dirty_block_count() > 0 {
+                    if let Err(e) = cache.local_checkpoint().await {
+                        warn!(error = %e, "local checkpoint failed");
+                    }
                 }
             }
         }

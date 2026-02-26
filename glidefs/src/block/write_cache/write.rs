@@ -69,7 +69,7 @@ impl WriteCache<Active> {
                 continue;
             }
             self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.remove(&idx);
+            self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
         }
 
         // Record dirty blocks in WAL.
@@ -297,7 +297,7 @@ impl WriteCache<Active> {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.transition_to_dirty(idx);
-                self.inner.crc_map.remove(&idx);
+                self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
             }
         }
 
@@ -342,7 +342,7 @@ impl WriteCache<Active> {
             }
             self.inner.set_present(idx);
             self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.remove(&idx);
+            self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
         }
     }
 }

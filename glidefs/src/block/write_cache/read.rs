@@ -431,12 +431,10 @@ impl WriteCache<Active> {
             }
 
             let results = futures::future::join_all(fetch_futures).await;
-            let mut any_fetch_succeeded = false;
             let mut last_fetch_error = None;
             for (pid, result) in results {
                 match result {
                     Ok(entries) => {
-                        any_fetch_succeeded = true;
                         pack_index_cache.insert_entries(pid, &entries);
                     }
                     Err(e) => {
@@ -460,9 +458,11 @@ impl WriteCache<Active> {
                 }
             }
 
-            // If the block is still unresolved AND all fetches failed, propagate
-            // the S3 error rather than silently returning zeros.
-            if resolved.is_none() && !any_fetch_succeeded && let Some(e) = last_fetch_error {
+            // If the block is still unresolved and any fetch failed, propagate
+            // the S3 error rather than silently returning zeros. A transient
+            // failure for the pack containing this block should surface as EIO,
+            // not as a zero-read that silently corrupts the guest's data.
+            if resolved.is_none() && let Some(e) = last_fetch_error {
                 return Err(e.into());
             }
         }

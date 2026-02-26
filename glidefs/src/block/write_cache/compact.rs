@@ -110,7 +110,16 @@ pub async fn compact_chunk(
 
         {
             let mut vm = volume_manifest.write();
-            vm.replace_packs(chunk_idx, vec![base_pack_id]);
+            if !vm.replace_packs_cas(chunk_idx, pack_ids, vec![base_pack_id]) {
+                warn!(
+                    chunk_idx,
+                    "compaction aborted: pack list changed during compaction (empty merge)"
+                );
+                return Err(CacheError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "compaction aborted: concurrent manifest modification",
+                )));
+            }
         }
 
         return Ok(CompactionResult {
@@ -166,10 +175,19 @@ pub async fn compact_chunk(
         .put_chunk_pack(chunk_idx, base_pack_id, pack_bytes)
         .await?;
 
-    // 6. Update manifest: replace N packs with 1
+    // 6. Update manifest: replace N packs with 1, preserving concurrent appends
     {
         let mut vm = volume_manifest.write();
-        vm.replace_packs(chunk_idx, vec![base_pack_id]);
+        if !vm.replace_packs_cas(chunk_idx, pack_ids, vec![base_pack_id]) {
+            warn!(
+                chunk_idx,
+                "compaction aborted: pack list changed during compaction"
+            );
+            return Err(CacheError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "compaction aborted: concurrent manifest modification",
+            )));
+        }
     }
 
     // 7. Update PackIndexCache

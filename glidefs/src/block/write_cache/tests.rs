@@ -1040,7 +1040,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     assert_eq!(h.cache.dirty_block_count(), 1);
 
     // Run local checkpoint — computes CRC32 for the dirty block.
-    h.cache.local_checkpoint().unwrap();
+    h.cache.local_checkpoint().await.unwrap();
 
     // Verify CRC32 was computed (present in crc_map).
     let inner = h.cache.inner();
@@ -1068,7 +1068,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     assert!(inner.crc_map.get(&0).is_none(), "CRC32 consumed after flush");
 
     // Next checkpoint recomputes CRC32 from the (still corrupted) SSD data.
-    h.cache.local_checkpoint().unwrap();
+    h.cache.local_checkpoint().await.unwrap();
     let crc_recomputed = *inner.crc_map.get(&0).expect("checkpoint should recompute CRC32");
     assert_ne!(
         crc_recomputed, crc_after_checkpoint,
@@ -1096,16 +1096,20 @@ async fn test_crc32_cleared_on_write() {
     h.cache
         .write(0, &vec![0xAAu8; 4096], &h.clean_cache)
         .unwrap();
-    h.cache.local_checkpoint().unwrap();
+    h.cache.local_checkpoint().await.unwrap();
 
     let inner = h.cache.inner();
     assert!(inner.crc_map.get(&0).is_some(), "checkpoint should set CRC32");
 
-    // Write new data to the same block — CRC32 should be invalidated.
+    // Write new data to the same block — CRC32 should be invalidated (sentinel).
     h.cache
         .write(0, &vec![0xBBu8; 4096], &h.clean_cache)
         .unwrap();
-    assert!(inner.crc_map.get(&0).is_none(), "write should clear CRC32");
+    assert_eq!(
+        *inner.crc_map.get(&0).expect("sentinel should exist"),
+        super::inner::CRC_SENTINEL,
+        "write should set CRC sentinel"
+    );
 
     // Flush without a checkpoint in between — no CRC32, verification skipped.
     let (stats, _) = h
@@ -1132,7 +1136,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     assert_eq!(h.cache.dirty_block_count(), 5);
 
     // Checkpoint — computes CRC32 for all 5 dirty blocks.
-    h.cache.local_checkpoint().unwrap();
+    h.cache.local_checkpoint().await.unwrap();
 
     let inner = h.cache.inner();
     for i in 0usize..5 {
@@ -1174,7 +1178,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     assert!(inner.crc_map.get(&3).is_none(), "CRC consumed by flush");
 
     // Heal: checkpoint recomputes CRC32 from (still corrupted) SSD data.
-    h.cache.local_checkpoint().unwrap();
+    h.cache.local_checkpoint().await.unwrap();
     assert!(inner.crc_map.get(&1).is_some(), "checkpoint recomputed CRC for block 1");
     assert!(inner.crc_map.get(&3).is_some(), "checkpoint recomputed CRC for block 3");
 
@@ -1209,7 +1213,7 @@ async fn test_crc32_happy_path_multi_cycle() {
             .write(i as u64 * 4096, &vec![i + 10; 4096], &h.clean_cache)
             .unwrap();
     }
-    h.cache.local_checkpoint().unwrap();
+    h.cache.local_checkpoint().await.unwrap();
 
     let inner = h.cache.inner();
     for i in 0usize..3 {
@@ -1240,13 +1244,14 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     assert_eq!(h.cache.dirty_block_count(), 3);
 
-    // Block 0's CRC32 should be invalidated by the overwrite.
-    assert!(
-        inner.crc_map.get(&0).is_none(),
-        "overwrite should clear CRC32"
+    // Block 0's CRC32 should be invalidated by the overwrite (sentinel).
+    assert_eq!(
+        *inner.crc_map.get(&0).expect("sentinel should exist"),
+        super::inner::CRC_SENTINEL,
+        "overwrite should set CRC sentinel"
     );
 
-    h.cache.local_checkpoint().unwrap();
+    h.cache.local_checkpoint().await.unwrap();
 
     for idx in [0usize, 3, 4] {
         assert!(
@@ -1310,7 +1315,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
             .write(i as u64 * 4096, &vec![i + 1; 4096], clean_cache.as_ref())
             .unwrap();
     }
-    cache.local_checkpoint().unwrap();
+    cache.local_checkpoint().await.unwrap();
 
     let mut tasks = JoinSet::new();
 
@@ -1324,7 +1329,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         let corrupted = Arc::clone(&total_corrupted);
         tasks.spawn(async move {
             for _ in 0..10 {
-                cache.local_checkpoint().unwrap();
+                cache.local_checkpoint().await.unwrap();
                 let (stats, _) = cache.flush_packs(&cs, &cmc, &vm).await.unwrap();
                 corrupted.fetch_add(
                     stats.blocks_corrupted as u64,
@@ -1362,7 +1367,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     );
 
     // Final quiesced flush to verify convergence.
-    cache.local_checkpoint().unwrap();
+    cache.local_checkpoint().await.unwrap();
     let stats = cache
         .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await

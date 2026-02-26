@@ -95,6 +95,17 @@ mod sync_file {
 
 pub use sync_file::SyncFile;
 
+/// Sentinel value for CRC32 checksums invalidated by a concurrent write.
+///
+/// The write path stores this instead of removing the CRC entry, preventing
+/// `compute_dirty_crc32s` from re-inserting a stale CRC via `or_insert`.
+/// The flush path skips CRC verification when it encounters this sentinel.
+///
+/// CRC32 can legitimately produce u32::MAX (1-in-4-billion chance), in which
+/// case we simply skip corruption detection for that one block — no correctness
+/// impact, only a negligible loss of SSD corruption detection.
+pub(super) const CRC_SENTINEL: u32 = u32::MAX;
+
 /// Check if a block is all zeros.
 ///
 /// Uses SIMD when available (AVX2 on x86_64), falling back to 64-bit word
@@ -103,7 +114,6 @@ pub use sync_file::SyncFile;
 /// - u64 fallback: 16,384 comparisons
 /// - AVX2 (256-bit): 4,096 comparisons
 #[inline]
-#[allow(dead_code)] // Used by tests
 pub(super) fn is_zero_block(data: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
