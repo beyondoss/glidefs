@@ -86,7 +86,8 @@
       "WebFetch(domain:ravendb.net)",
       "WebFetch(domain:lists.gnu.org)",
       "Skill(write-docs)",
-      "WebFetch(domain:madebyevan.com)"
+      "WebFetch(domain:madebyevan.com)",
+      "Skill(audit)"
     ]
   }
 }

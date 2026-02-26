@@ -43,6 +43,12 @@ impl WriteCache<Recovering> {
                     .fetch_add(warnings as u64, Ordering::Relaxed);
             }
 
+            // Compute CRC32 baselines for dirty blocks before transitioning
+            // to Active. Without this, a notify-triggered flush could process
+            // recovered dirty blocks before the first checkpoint computes CRCs,
+            // bypassing SSD corruption detection.
+            super::flush::compute_dirty_crc32s(&self.inner);
+
             // Save metadata after recovery
             self.inner.save_metadata()?;
             info!("recovery complete, dirty blocks will be flushed by scheduler");

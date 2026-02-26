@@ -371,10 +371,12 @@ where
                     {
                         Ok(()) => {
                             if let Err(e) = router.save_export(&config).await {
-                                warn!(
-                                    "Failed to persist export to S3: {} (export is functional)",
-                                    e
-                                );
+                                // Export is functional locally but won't survive a restart.
+                                // Return 503 so the orchestrator can retry (create_export is idempotent).
+                                return Ok(error_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    &format!("Export created but definition not persisted to S3: {e}"),
+                                ));
                             }
 
                             // Register kernel block device on Linux.

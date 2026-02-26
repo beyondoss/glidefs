@@ -514,6 +514,14 @@ impl ContentStore {
         const MAX_BLOCKS: usize = 1024;
         const MAX_INDEX_SIZE: usize = PACK_HEADER_SIZE + MAX_BLOCKS * PACK_INDEX_ENTRY_SIZE;
 
+        // Compile-time: if chunk_size or block_size defaults change, this range-read
+        // must be updated to cover the new max blocks per chunk.
+        const _: () = assert!(
+            super::volume_manifest::DEFAULT_CHUNK_SIZE as usize
+                / crate::config::NbdConfig::DEFAULT_BLOCK_SIZE
+                == MAX_BLOCKS
+        );
+
         let key = format!(
             "{}/chunks/{:04}/{:016x}.pack",
             self.base_path, chunk_idx, pack_id

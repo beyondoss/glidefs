@@ -214,7 +214,7 @@ fn compute_flush_batch(
 /// CRC verification at flush time — the SYNCING state machine still
 /// guarantees correctness; we just lose SSD corruption detection for those
 /// blocks.
-fn compute_dirty_crc32s(inner: &CacheInner) {
+pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
     /// Maximum crc_map entries per export. 10M entries × ~20 bytes
     /// (DashMap overhead: bucket metadata + alignment + load factor) ≈ 200MB.
     /// Covers a fully-dirty 1TB device (8M blocks of 128KB) with headroom.
