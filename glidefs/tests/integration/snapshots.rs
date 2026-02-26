@@ -248,8 +248,6 @@ async fn test_gc_respects_snapshot_packs() {
 /// creates orphan packs that are only kept alive by a snapshot manifest.
 #[tokio::test]
 async fn test_delete_snapshot_frees_packs_for_gc() {
-    use glidefs::block::volume_manifest::VolumeManifest;
-
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
     let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
@@ -658,6 +656,121 @@ async fn test_standalone_tag() {
     let fork_handler = router.get_handler("fork2").await.unwrap();
     let data = fork_handler.read(0, BLOCK_SIZE as u32).await.unwrap();
     assert_eq!(data[0], 0xDD, "fork from standalone tag should see data");
+}
+
+/// Compaction must not delete packs that are still referenced by a snapshot manifest.
+///
+/// Scenario:
+/// 1. Write blocks, flush → pack A
+/// 2. Overwrite blocks, flush → pack B  (chunk now has [A, B])
+/// 3. Take snapshot (snapshot manifest references [A, B])
+/// 4. Compact chunk → new base pack C replaces [A, B] in live manifest
+/// 5. delete_old_packs should skip A and B (snapshot still references them)
+/// 6. Verify A and B still exist on S3
+/// 7. Delete the snapshot, run delete_old_packs again → A and B deleted
+#[tokio::test]
+async fn test_compaction_respects_snapshots() {
+    use glidefs::block::pack::PackId;
+    use glidefs::block::write_cache::compact;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
+
+    // Flush 1: write blocks → pack A
+    write_blocks(&cache, 0, 3, 1, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    let packs_after_flush1: Vec<PackId> = volume_manifest
+        .read()
+        .chunk_pack_ids(0)
+        .unwrap()
+        .to_vec();
+    assert_eq!(packs_after_flush1.len(), 1, "should have 1 pack after first flush");
+
+    // Flush 2: overwrite same blocks → pack B
+    write_blocks(&cache, 0, 3, 2, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    let packs_after_flush2: Vec<PackId> = volume_manifest
+        .read()
+        .chunk_pack_ids(0)
+        .unwrap()
+        .to_vec();
+    assert_eq!(packs_after_flush2.len(), 2, "should have 2 packs after second flush");
+
+    // Take snapshot — snapshot manifest references both pack A and pack B
+    let snap = cache
+        .snapshot(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Compact: merge [A, B] → C, live manifest now has [C]
+    let old_packs = packs_after_flush2.clone();
+    let blocks_per_chunk = volume_manifest.read().blocks_per_chunk();
+    let result = compact::compact_chunk(
+        0,
+        &old_packs,
+        blocks_per_chunk,
+        &cs,
+        &pack_index_cache,
+        &volume_manifest,
+    )
+    .await
+    .unwrap();
+
+    let live_packs: Vec<PackId> = volume_manifest
+        .read()
+        .chunk_pack_ids(0)
+        .unwrap()
+        .to_vec();
+    assert_eq!(live_packs.len(), 1, "compaction should replace N packs with 1");
+    assert_eq!(live_packs[0], result.new_pack_id);
+
+    // delete_old_packs should NOT delete A or B (snapshot references them)
+    compact::delete_old_packs(&[result], &cs, "vm1").await;
+
+    // Verify old packs still exist on S3
+    for &pid in &old_packs {
+        let block = cs.get_chunk_block(0, pid, 0, 1).await;
+        assert!(
+            block.is_ok(),
+            "pack {:016x} should still exist on S3 (snapshot pins it), got {:?}",
+            pid,
+            block.err()
+        );
+    }
+
+    // Delete the snapshot
+    cs.delete_snapshot("vm1", snap.sequence).await.unwrap();
+
+    // Now delete_old_packs should delete A and B (nothing references them)
+    // Re-create the CompactionResult since we consumed it
+    let result2 = compact::CompactionResult {
+        chunk_idx: 0,
+        new_pack_id: live_packs[0],
+        old_pack_ids: old_packs.clone(),
+        live_blocks: 3,
+        new_pack_size: 0,
+    };
+    compact::delete_old_packs(&[result2], &cs, "vm1").await;
+
+    // Verify old packs are gone
+    for &pid in &old_packs {
+        let block = cs.get_chunk_block(0, pid, 0, 1).await;
+        assert!(
+            block.is_err(),
+            "pack {:016x} should be deleted after snapshot removal",
+            pid
+        );
+    }
 }
 
 /// head_manifest returns false for nonexistent manifest in nonexistent prefix.

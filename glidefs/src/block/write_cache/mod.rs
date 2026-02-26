@@ -13,6 +13,9 @@
 //! The data file uses positional I/O (pread/pwrite) which is thread-safe per
 //! POSIX semantics, eliminating the need for any locking on the hot path.
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod compact;
+#[cfg(not(any(test, feature = "test-utils")))]
 pub(crate) mod compact;
 mod config;
 mod error;

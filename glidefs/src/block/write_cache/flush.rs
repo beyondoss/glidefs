@@ -609,7 +609,11 @@ impl WriteCache<Active> {
                         );
                     }
                     if !compaction_results.is_empty() {
-                        super::compact::delete_old_packs(&compaction_results, content_store).await;
+                        super::compact::delete_old_packs(
+                            &compaction_results,
+                            content_store,
+                            &self.inner.export_name,
+                        ).await;
                     }
                 }
                 Err(e) => {

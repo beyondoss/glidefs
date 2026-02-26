@@ -103,6 +103,10 @@ complexity = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 pedantic = { level = "allow", priority = -1 }
 
+[[example]]
+name = "measure_footprint"
+required-features = ["test-utils"]
+
 [[bench]]
 name = "flush_latency"
 harness = false
