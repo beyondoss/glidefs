@@ -456,7 +456,7 @@ impl WriteCache<Active> {
         }
 
         let mut total_stats = FlushStats::default();
-        let mut all_computed: Vec<(usize, Blake3Hash)> = Vec::new();
+        let mut flushed_blocks: Vec<usize> = Vec::new();
         let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
 
         // Per-chunk flush
@@ -488,7 +488,7 @@ impl WriteCache<Active> {
 
             if hash_to_compressed.is_empty() {
                 // All blocks are zero — nothing to upload, still record for CAS.
-                all_computed.extend(batch.computed);
+                flushed_blocks.extend(batch.computed.iter().map(|&(idx, _)| idx));
                 continue;
             }
 
@@ -536,7 +536,7 @@ impl WriteCache<Active> {
             // This avoids orphaned manifest entries if a later chunk's S3 upload fails.
             staged_appends.push((chunk_idx, pack_id));
 
-            all_computed.extend(batch.computed);
+            flushed_blocks.extend(batch.computed.iter().map(|&(idx, _)| idx));
         }
 
         // Apply all staged manifest appends atomically.
@@ -549,7 +549,7 @@ impl WriteCache<Active> {
         }
 
         // CAS SYNCING→CLEAN for successfully flushed blocks
-        for &(chunk_index, _) in &all_computed {
+        for &chunk_index in &flushed_blocks {
             if !self.inner.transition_syncing_to_clean(chunk_index) {
                 total_stats.blocks_cas_failed += 1;
             }

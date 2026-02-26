@@ -459,20 +459,16 @@ async fn reconcile_prefix(
     let snap_prefix_str = format!("{}/snapshots/", base);
     let snap_prefix = ObjectPath::from(snap_prefix_str);
 
-    let mut snap_paths = Vec::new();
-    let mut snap_stream = content_store.object_store().list(Some(&snap_prefix));
-    while let Some(result) = snap_stream.next().await {
-        match result {
-            Ok(meta) => snap_paths.push(meta.location),
-            Err(e) => return Err(e.into()),
-        }
-    }
-
     let store = std::sync::Arc::clone(content_store.object_store());
-    let mut snap_results = futures::stream::iter(snap_paths)
-        .map(move |path| {
+    let mut snap_results = content_store
+        .object_store()
+        .list(Some(&snap_prefix))
+        .map(move |result| {
             let store = std::sync::Arc::clone(&store);
             async move {
+                let path = result
+                    .map_err(|e| anyhow::anyhow!("failed to list snapshots: {}", e))?
+                    .location;
                 let response = match store.get(&path).await {
                     Ok(r) => r,
                     Err(object_store::Error::NotFound { .. }) => return Ok(None),

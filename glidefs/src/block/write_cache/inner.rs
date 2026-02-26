@@ -392,21 +392,26 @@ impl CacheInner {
         file.write_all(&(self.config.block_size as u64).to_le_bytes())?;
         file.write_all(&(self.num_blocks as u64).to_le_bytes())?;
 
-        // v4 sparse format: collect (index, state) pairs for non-zero entries.
+        // v4 sparse format: stream (index, state) pairs directly to disk.
+        // Write a placeholder count, stream entries, then seek back to fix the count.
         // Uses iter_present() which only visits allocated pages — O(allocated_pages)
         // not O(num_blocks).
-        let sparse_entries: Vec<(u32, u8)> = self
-            .state_map
-            .iter_present()
-            .map(|(idx, state)| (idx as u32, state))
-            .collect();
+        use std::io::Seek;
+        let count_pos = file.stream_position()?;
+        file.write_all(&0u64.to_le_bytes())?; // placeholder
 
-        // Write entry count then entries: index(u32 LE) + state(u8) = 5 bytes each
-        file.write_all(&(sparse_entries.len() as u64).to_le_bytes())?;
-        for &(idx, state) in &sparse_entries {
-            file.write_all(&idx.to_le_bytes())?;
+        let mut entry_count: u64 = 0;
+        for (idx, state) in self.state_map.iter_present() {
+            file.write_all(&(idx as u32).to_le_bytes())?;
             file.write_all(&[state])?;
+            entry_count += 1;
         }
+
+        // Patch the entry count
+        let end_pos = file.stream_position()?;
+        file.seek(std::io::SeekFrom::Start(count_pos))?;
+        file.write_all(&entry_count.to_le_bytes())?;
+        file.seek(std::io::SeekFrom::Start(end_pos))?;
 
         // v5: append max_sequence as trailing u64 LE
         file.write_all(&self.sequence.current().to_le_bytes())?;
@@ -439,7 +444,7 @@ impl CacheInner {
             }
         }
 
-        let present_count = sparse_entries.len();
+        let present_count = entry_count;
         debug!(
             path = %path.display(),
             blocks = self.num_blocks,
@@ -524,106 +529,49 @@ impl CacheInner {
         // max_sequence persisted in v5+, defaults to 0 for older formats
         let mut persisted_max_seq: u64 = 0;
 
-        if version >= 4 {
-            // v4/v5: sparse format -- entry_count(u64) + entries of index(u32) + state(u8)
-            let mut count_buf = [0u8; 8];
-            file.read_exact(&mut count_buf)?;
-            let entry_count = u64::from_le_bytes(count_buf) as usize;
+        if version < 4 {
+            return Err(CacheError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported metadata version {version} (minimum 4)"),
+            )));
+        }
 
-            let mut entry_buf = [0u8; 5]; // u32 index + u8 state
-            for _ in 0..entry_count {
-                file.read_exact(&mut entry_buf)?;
-                let idx = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap()) as usize;
-                let mut state = entry_buf[4];
+        // v4/v5: sparse format -- entry_count(u64) + entries of index(u32) + state(u8)
+        let mut count_buf = [0u8; 8];
+        file.read_exact(&mut count_buf)?;
+        let entry_count = u64::from_le_bytes(count_buf) as usize;
 
-                if idx >= num_blocks {
-                    continue; // skip out-of-bounds (shrink safety)
-                }
+        let mut entry_buf = [0u8; 5]; // u32 index + u8 state
+        for _ in 0..entry_count {
+            file.read_exact(&mut entry_buf)?;
+            let idx = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap()) as usize;
+            let mut state = entry_buf[4];
 
-                // Convert Syncing -> Dirty (conservative for crash recovery)
-                if state == SparseBlockState::SYNCING {
-                    state = SparseBlockState::DIRTY;
-                }
-                if state == SparseBlockState::DIRTY {
-                    dirty_count += 1;
-                }
-
-                // Populate state_map: first set_present (0->1), then CAS to target state
-                // Ignore budget errors during load (no budget set yet).
-                state_map.set_present(idx);
-                if state != SparseBlockState::CLEAN {
-                    let _ = state_map.cas(idx, SparseBlockState::CLEAN, state);
-                }
+            if idx >= num_blocks {
+                continue; // skip out-of-bounds (shrink safety)
             }
 
-            // v5: read trailing max_sequence
-            if version >= 5 {
-                let mut seq_buf = [0u8; 8];
-                file.read_exact(&mut seq_buf)?;
-                persisted_max_seq = u64::from_le_bytes(seq_buf);
+            // Convert Syncing -> Dirty (conservative for crash recovery)
+            if state == SparseBlockState::SYNCING {
+                state = SparseBlockState::DIRTY;
             }
-        } else {
-            // Legacy v1/v2/v3: dense block_states + presence bitmap
-            // Old encoding: Clean=0, Dirty=1, Syncing=2
-            const OLD_CLEAN: u8 = 0;
-            const OLD_DIRTY: u8 = 1;
-            const OLD_SYNCING: u8 = 2;
-
-            let mut old_state_bytes = vec![0u8; stored_num_blocks];
-            file.read_exact(&mut old_state_bytes)?;
-
-            // Convert Syncing(2) -> Dirty(1) in old encoding
-            for state in &mut old_state_bytes {
-                if *state == OLD_SYNCING {
-                    *state = OLD_DIRTY;
-                }
-                if *state == OLD_DIRTY {
-                    dirty_count += 1;
-                }
+            if state == SparseBlockState::DIRTY {
+                dirty_count += 1;
             }
 
-            // Read presence bitmap (varies by version)
-            let present: Vec<bool> = if version >= 3 {
-                // Version 3: packed bits (1 bit per block)
-                let num_bytes = stored_num_blocks.div_ceil(8);
-                let mut present_bytes = vec![0u8; num_bytes];
-                file.read_exact(&mut present_bytes)?;
-
-                (0..stored_num_blocks)
-                    .map(|i| {
-                        let byte_idx = i / 8;
-                        let bit_idx = i % 8;
-                        present_bytes[byte_idx] & (1 << bit_idx) != 0
-                    })
-                    .collect()
-            } else if version >= 2 {
-                // Version 2: 1 byte per block
-                let mut present_bytes = vec![0u8; stored_num_blocks];
-                file.read_exact(&mut present_bytes)?;
-                present_bytes.iter().map(|&b| b != 0).collect()
-            } else {
-                // Version 1: dirty blocks are present, clean blocks are NOT
-                old_state_bytes.iter().map(|&s| s == OLD_DIRTY).collect()
-            };
-
-            // Convert old encoding to new sparse encoding and populate state_map
-            for (idx, &old_state) in old_state_bytes.iter().enumerate() {
-                let is_present = present.get(idx).copied().unwrap_or(false);
-                if !is_present && old_state == OLD_CLEAN {
-                    // Not present + clean in old encoding -> NOT_PRESENT (0) in new
-                    continue;
-                }
-                // Block is present (or dirty/syncing which implies present)
-                let new_state = match old_state {
-                    OLD_CLEAN => SparseBlockState::CLEAN,
-                    OLD_DIRTY => SparseBlockState::DIRTY,
-                    _ => SparseBlockState::DIRTY, // conservative
-                };
-                state_map.set_present(idx);
-                if new_state != SparseBlockState::CLEAN {
-                    let _ = state_map.cas(idx, SparseBlockState::CLEAN, new_state);
-                }
+            // Populate state_map: first set_present (0->1), then CAS to target state
+            // Ignore budget errors during load (no budget set yet).
+            state_map.set_present(idx);
+            if state != SparseBlockState::CLEAN {
+                let _ = state_map.cas(idx, SparseBlockState::CLEAN, state);
             }
+        }
+
+        // v5: read trailing max_sequence
+        if version >= 5 {
+            let mut seq_buf = [0u8; 8];
+            file.read_exact(&mut seq_buf)?;
+            persisted_max_seq = u64::from_le_bytes(seq_buf);
         }
 
         if is_growing {

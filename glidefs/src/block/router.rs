@@ -354,24 +354,22 @@ impl ExportRouter {
     pub async fn collect_block_hashes(&self) -> Vec<crate::block::block_map::Blake3Hash> {
         use std::collections::{HashMap, HashSet};
 
-        // Collect all (chunk_idx, pack_id) pairs under the sync manifest lock.
-        let all_pack_ids: Vec<(u32, crate::block::pack::PackId)> = {
+        // Group (chunk_idx → pack_ids) directly under the manifest lock,
+        // avoiding an intermediate Vec of all pairs.
+        let packs_by_chunk: HashMap<u32, Vec<crate::block::pack::PackId>> = {
             let exports = self.exports.read().await;
-            let mut pairs = Vec::new();
+            let mut map: HashMap<u32, Vec<crate::block::pack::PackId>> = HashMap::new();
             for state in exports.values() {
                 let vm = state.volume_manifest.read();
-                pairs.extend(vm.all_pack_ids());
+                for (chunk_idx, pack_id) in vm.all_pack_ids() {
+                    map.entry(chunk_idx).or_default().push(pack_id);
+                }
             }
-            pairs
+            map
         };
 
-        // Group by chunk_idx for efficient known_hashes calls.
-        let mut packs_by_chunk: HashMap<u32, Vec<crate::block::pack::PackId>> = HashMap::new();
-        for (chunk_idx, pack_id) in all_pack_ids {
-            packs_by_chunk.entry(chunk_idx).or_default().push(pack_id);
-        }
-
-        // Query PackIndexCache for all hashes (async, best-effort).
+        // Query PackIndexCache per-chunk. Global HashSet deduplicates across
+        // chunks (same block hash can appear in multiple packs).
         let mut all_hashes = HashSet::new();
         for pack_ids in packs_by_chunk.values() {
             let chunk_hashes = self.pack_index_cache.known_hashes(pack_ids).await;
