@@ -30,8 +30,7 @@ impl WriteCache<Initializing> {
         // Ensure cache directory exists
         std::fs::create_dir_all(&config.cache_dir)?;
 
-        // Open or create data file with O_DIRECT for sync worker reads
-        // This prevents sync worker from polluting/contending with the page cache
+        // Open or create data file for positional I/O (pread/pwrite)
         let data_path = config.data_path();
         let data_file = super::inner::SyncFile::open(&data_path, true, config.device_size)?;
 
@@ -72,19 +71,19 @@ impl WriteCache<Initializing> {
         let mut max_wal_seq = persisted_max_seq;
 
         for entry in &wal_entries {
-            let chunk_index = entry.chunk_index as usize;
+            let block_index = entry.block_index as usize;
             max_wal_seq = max_wal_seq.max(entry.sequence);
 
             // Mark block as dirty in state_map
-            if chunk_index < num_blocks {
-                let old = state_map.get(chunk_index);
+            if block_index < num_blocks {
+                let old = state_map.get(block_index);
                 if old != SparseBlockState::DIRTY {
                     // Ensure block is present first (allocates page if needed)
-                    state_map.set_present(chunk_index);
+                    state_map.set_present(block_index);
                     // Transition to Dirty from whatever current state is
-                    let current = state_map.get(chunk_index);
+                    let current = state_map.get(block_index);
                     if current != SparseBlockState::DIRTY {
-                        let _ = state_map.cas(chunk_index, current, SparseBlockState::DIRTY);
+                        let _ = state_map.cas(block_index, current, SparseBlockState::DIRTY);
                     }
                     dirty_count += 1;
                 }

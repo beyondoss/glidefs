@@ -65,6 +65,9 @@ pub struct SnapshotResult {
     pub manifest_etag: Option<String>,
     /// Sequence number at the snapshot cut point.
     pub sequence: u64,
+    /// Whether the versioned snapshot was persisted to S3.
+    /// `false` means the manifest was saved but the versioned snapshot key wasn't.
+    pub snapshot_persisted: bool,
     /// Flush statistics.
     pub stats: FlushStats,
 }

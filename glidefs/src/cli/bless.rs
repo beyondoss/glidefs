@@ -1,12 +1,12 @@
 use crate::block::block_map::{blake3_128, lz4_compress, zero_block_hash, Blake3Hash};
 use crate::block::content_store::ContentStore;
 use crate::block::manifest::serialize_hot_set;
-use crate::block::pack::{assemble_pack, new_pack_id};
+use crate::block::pack::{assemble_pack, new_pack_id, PackId};
 use crate::block::volume_manifest::VolumeManifest;
 use crate::config::Settings;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,7 +48,7 @@ pub async fn run_bless(
     let db_path = path_from_url.to_string();
 
     let base = format!("{}/exports/{}", db_path, s3_prefix);
-    let content_store = ContentStore::new(Arc::clone(&object_store), &base);
+    let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), &base));
 
     info!(image = %image_path.display(), name = %name, "starting bless");
 
@@ -63,14 +63,18 @@ pub async fn run_bless(
 
     info!(device_size, total_blocks, blocks_per_chunk, "reading image");
 
-    // --- Stream image through pipeline: read blocks and group by chunk ---
+    // --- Stream image: read blocks, upload each chunk as it completes ---
     let zero_hash = zero_block_hash(BLOCK_SIZE as usize);
     let mut buf = vec![0u8; BLOCK_SIZE as usize];
 
-    // Per-chunk accumulator: chunk_idx -> list of BlockInfo
-    let mut per_chunk_blocks: BTreeMap<u32, Vec<BlockInfo>> = BTreeMap::new();
+    let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
     let mut stats = BlessStats::default();
     let mut hot_set_indices: Vec<u64> = Vec::new();
+
+    // Current chunk accumulator — flushed when we move to the next chunk.
+    let mut pending_chunk: Option<(u32, Vec<BlockInfo>)> = None;
+    // In-flight S3 upload — overlaps with reading the next chunk.
+    let mut in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>> = None;
 
     for block_index in 0..total_blocks {
         let bytes_read = read_full(&mut file, &mut buf)?;
@@ -96,9 +100,23 @@ pub async fn run_bless(
 
         let compressed = lz4_compress(&buf);
 
-        per_chunk_blocks
-            .entry(chunk_idx)
-            .or_default()
+        // If we've moved to a new chunk, prepare and upload the previous one.
+        if pending_chunk.as_ref().is_some_and(|(idx, _)| *idx != chunk_idx) {
+            let (completed_idx, blocks) = pending_chunk.take().unwrap();
+            in_flight = start_chunk_upload(
+                &content_store,
+                &mut volume_manifest,
+                &mut stats,
+                in_flight,
+                completed_idx,
+                blocks,
+            )
+            .await?;
+        }
+
+        pending_chunk
+            .get_or_insert_with(|| (chunk_idx, Vec::new()))
+            .1
             .push(BlockInfo {
                 block_offset,
                 hash,
@@ -106,38 +124,21 @@ pub async fn run_bless(
             });
     }
 
-    // --- Per-chunk processing: assemble packs and upload ---
-    let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
-
-    for (chunk_idx, blocks) in &per_chunk_blocks {
-        let chunk_idx = *chunk_idx;
-
-        // Within-batch dedup: same block hash within chunk -> upload once
-        let mut seen: HashSet<Blake3Hash> = HashSet::new();
-        let mut pack_blocks: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
-
-        for block in blocks {
-            if seen.insert(block.hash) {
-                pack_blocks.push((block.hash, block.block_offset, block.compressed.clone()));
-            }
-        }
-
-        if !pack_blocks.is_empty() {
-            let pack_id = new_pack_id();
-            let (pack_bytes, _entries) = assemble_pack(pack_blocks, BLOCK_SIZE)?;
-            let pack_size = pack_bytes.len() as u64;
-
-            content_store
-                .put_chunk_pack(chunk_idx, pack_id, pack_bytes)
-                .await
-                .context("Failed to upload chunk pack")?;
-
-            volume_manifest.append_pack(chunk_idx, pack_id);
-
-            stats.packs_uploaded += 1;
-            stats.bytes_uploaded += pack_size;
-        }
+    // Flush the final chunk.
+    if let Some((chunk_idx, blocks)) = pending_chunk.take() {
+        in_flight = start_chunk_upload(
+            &content_store,
+            &mut volume_manifest,
+            &mut stats,
+            in_flight,
+            chunk_idx,
+            blocks,
+        )
+        .await?;
     }
+
+    // Wait for last upload.
+    join_upload(&mut volume_manifest, &mut stats, in_flight).await?;
 
     // --- Upload manifest ---
     let manifest_key = format!("bases/{}", name);
@@ -162,7 +163,7 @@ pub async fn run_bless(
         unique_blocks = stats.unique_blocks,
         packs_uploaded = stats.packs_uploaded,
         bytes_uploaded = stats.bytes_uploaded,
-        chunks_written = per_chunk_blocks.len(),
+        chunks_written = stats.chunks_written,
         elapsed_secs = elapsed.as_secs_f64(),
         "bless complete"
     );
@@ -177,11 +178,86 @@ pub async fn run_bless(
         "  Bytes uploaded:  {:.1} MB",
         stats.bytes_uploaded as f64 / 1e6
     );
-    println!("  Chunks written:  {}", per_chunk_blocks.len());
+    println!("  Chunks written:  {}", stats.chunks_written);
     println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
     println!("  Manifest:        manifests/{}", manifest_key);
 
     Ok(())
+}
+
+/// Result of a completed chunk upload.
+struct ChunkUploadResult {
+    chunk_idx: u32,
+    pack_id: PackId,
+    pack_size: u64,
+}
+
+/// Join the previous in-flight upload (if any) and apply its results.
+async fn join_upload(
+    volume_manifest: &mut VolumeManifest,
+    stats: &mut BlessStats,
+    in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>,
+) -> Result<()> {
+    if let Some(handle) = in_flight {
+        let result = handle.await.context("upload task panicked")??;
+        volume_manifest.append_pack(result.chunk_idx, result.pack_id);
+        stats.packs_uploaded += 1;
+        stats.bytes_uploaded += result.pack_size;
+        stats.chunks_written += 1;
+    }
+    Ok(())
+}
+
+/// Dedup + assemble pack (CPU), then spawn S3 upload overlapped with next chunk's reads.
+///
+/// Joins the previous in-flight upload before spawning a new one, so at most
+/// one upload is in flight at a time.
+async fn start_chunk_upload(
+    content_store: &Arc<ContentStore>,
+    volume_manifest: &mut VolumeManifest,
+    stats: &mut BlessStats,
+    prev_in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>,
+    chunk_idx: u32,
+    blocks: Vec<BlockInfo>,
+) -> Result<Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>> {
+    // CPU: dedup + assemble pack
+    let mut seen: HashSet<Blake3Hash> = HashSet::new();
+    let mut pack_blocks: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
+
+    for block in blocks {
+        if seen.insert(block.hash) {
+            pack_blocks.push((block.hash, block.block_offset, block.compressed));
+        }
+    }
+
+    if pack_blocks.is_empty() {
+        // All-zero chunk — just join previous and move on.
+        join_upload(volume_manifest, stats, prev_in_flight).await?;
+        stats.chunks_written += 1;
+        return Ok(None);
+    }
+
+    let pack_id = new_pack_id();
+    let (pack_bytes, _entries) = assemble_pack(pack_blocks, BLOCK_SIZE)?;
+
+    // Join previous upload before spawning next (keeps at most 1 in flight).
+    join_upload(volume_manifest, stats, prev_in_flight).await?;
+
+    // Spawn S3 upload — runs concurrently with next chunk's disk reads.
+    let cs = Arc::clone(content_store);
+    let pack_size = pack_bytes.len() as u64;
+    let handle = tokio::spawn(async move {
+        cs.put_chunk_pack(chunk_idx, pack_id, pack_bytes)
+            .await
+            .context("Failed to upload chunk pack")?;
+        Ok(ChunkUploadResult {
+            chunk_idx,
+            pack_id,
+            pack_size,
+        })
+    });
+
+    Ok(Some(handle))
 }
 
 /// Block info accumulated during the image scan.
@@ -197,6 +273,7 @@ struct BlessStats {
     unique_blocks: usize,
     packs_uploaded: usize,
     bytes_uploaded: u64,
+    chunks_written: usize,
 }
 
 /// Read exactly buf.len() bytes, or fewer at EOF.
@@ -231,10 +308,15 @@ mod tests {
         let total_blocks = device_size.div_ceil(BLOCK_SIZE as u64) as usize;
         let zero_hash = zero_block_hash(BLOCK_SIZE as usize);
 
-        // Scan blocks
-        let mut per_chunk_blocks: BTreeMap<u32, Vec<BlockInfo>> = BTreeMap::new();
+        let content_store = Arc::new(ContentStore::new(
+            content_store.object_store().clone(),
+            content_store.base_path(),
+        ));
+        let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
         let mut stats = BlessStats::default();
         let mut hot_set_indices: Vec<u64> = Vec::new();
+        let mut pending_chunk: Option<(u32, Vec<BlockInfo>)> = None;
+        let mut in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>> = None;
 
         for block_index in 0..total_blocks {
             let start = block_index * BLOCK_SIZE as usize;
@@ -258,9 +340,22 @@ mod tests {
 
             let compressed = lz4_compress(&buf);
 
-            per_chunk_blocks
-                .entry(chunk_idx)
-                .or_default()
+            if pending_chunk.as_ref().is_some_and(|(idx, _)| *idx != chunk_idx) {
+                let (completed_idx, blocks) = pending_chunk.take().unwrap();
+                in_flight = start_chunk_upload(
+                    &content_store,
+                    &mut volume_manifest,
+                    &mut stats,
+                    in_flight,
+                    completed_idx,
+                    blocks,
+                )
+                .await?;
+            }
+
+            pending_chunk
+                .get_or_insert_with(|| (chunk_idx, Vec::new()))
+                .1
                 .push(BlockInfo {
                     block_offset,
                     hash,
@@ -268,36 +363,19 @@ mod tests {
                 });
         }
 
-        // Per-chunk processing
-        let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
-
-        for (chunk_idx, blocks) in &per_chunk_blocks {
-            let chunk_idx = *chunk_idx;
-
-            let mut seen: HashSet<Blake3Hash> = HashSet::new();
-            let mut pack_blocks: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
-
-            for block in blocks {
-                if seen.insert(block.hash) {
-                    pack_blocks.push((block.hash, block.block_offset, block.compressed.clone()));
-                }
-            }
-
-            if !pack_blocks.is_empty() {
-                let pack_id = new_pack_id();
-                let (pack_bytes, _entries) = assemble_pack(pack_blocks, BLOCK_SIZE)?;
-                let pack_size = pack_bytes.len() as u64;
-
-                content_store
-                    .put_chunk_pack(chunk_idx, pack_id, pack_bytes)
-                    .await?;
-
-                volume_manifest.append_pack(chunk_idx, pack_id);
-
-                stats.packs_uploaded += 1;
-                stats.bytes_uploaded += pack_size;
-            }
+        if let Some((chunk_idx, blocks)) = pending_chunk.take() {
+            in_flight = start_chunk_upload(
+                &content_store,
+                &mut volume_manifest,
+                &mut stats,
+                in_flight,
+                chunk_idx,
+                blocks,
+            )
+            .await?;
         }
+
+        join_upload(&mut volume_manifest, &mut stats, in_flight).await?;
 
         content_store
             .put_manifest(&format!("bases/{}", name), volume_manifest.serialize())

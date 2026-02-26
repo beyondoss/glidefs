@@ -157,10 +157,10 @@ Chunk directories use 4-digit zero-padded indices (`chunks/0000/`, `chunks/0001/
 
 | Scenario | GLVM size |
 |----------|-------------|
-| 100 GiB, 10% written, compacted | ~1.1 KB |
-| 1 TB, 50% written, compacted | ~53 KB |
-| 1 TB, 50% written, 4 packs/chunk | ~151 KB |
-| 1 TB, 100% written, 4 packs/chunk | ~303 KB |
+| 100 GiB, 10% written, compacted | ~1.2 KB |
+| 1 TB, 50% written, compacted | ~57 KB |
+| 1 TB, 50% written, 4 packs/chunk | ~155 KB |
+| 1 TB, 100% written, 4 packs/chunk | ~311 KB |
 
 ## Core Mechanism: Write-Behind Cache
 
@@ -424,7 +424,7 @@ Compact binary format mapping chunk indices to ordered pack ID lists. CRC32-prot
 ```
 Header (32 bytes):
   magic:        [u8; 4]  = b"GLVM"
-  version:      u16 LE   = 4
+  version:      u16 LE   = 5
   chunk_count:  u32 LE   (number of sparse chunk entries)
   chunk_size:   u32 LE   (bytes per chunk, 134217728 = 128 MiB)
   block_size:   u32 LE   (131072 = 128 KB)
@@ -433,7 +433,7 @@ Header (32 bytes):
 
 Chunk entries (chunk_count entries, sorted by chunk_idx):
   chunk_idx:    u32 LE
-  pack_count:   u8       (1–255, typically 1–16 before compaction, 1 after)
+  pack_count:   u16 LE   (1–65535, typically 1–16 before compaction, 1 after)
   packs:        [u64 LE; pack_count]  (pack IDs, ordered oldest-to-newest)
 
 CRC32 trailer: 4 bytes
@@ -448,7 +448,7 @@ Sparse: only chunks with written data appear. Absent chunk = all-zero / unwritte
 Append-only on local SSD. Metadata only — block data lives in the cache file.
 
 ```
-[chunk_index:u64][sequence:u64][crc32:u32]   (20 bytes per entry)
+[block_index:u64][sequence:u64][crc32:u32]   (20 bytes per entry)
 ```
 
 CRC32 trailer detects torn writes. On recovery, replay stops at the first corrupt entry — the torn tail is discarded, not an error. WAL is truncated after each block map persistence. (`wal.rs`)
@@ -667,10 +667,10 @@ We considered 64 MiB (2x more chunks, smaller manifests) but 128 MiB better matc
 
 Binary GLVM maps `chunk_idx → [pack_id, ...]` directly, so:
 
-1. **GC reads zero extra objects**: `manifest.all_pack_ids()` returns all live `(chunk_idx, pack_id)` pairs from a single compact blob (~53 KB for 1 TB 50% written)
+1. **GC reads zero extra objects**: `manifest.all_pack_ids()` returns all live `(chunk_idx, pack_id)` pairs from a single compact blob (~57 KB for 1 TB 50% written)
 2. **Forks are instant**: GET parent GLVM + PUT fork GLVM = 2 S3 ops
 3. **CRC32 integrity**: Corrupt manifests are detected at deserialization
-4. **Compact at scale**: 4 packs/chunk = ~151 KB. Still fits in a single S3 GET.
+4. **Compact at scale**: 4 packs/chunk = ~155 KB. Still fits in a single S3 GET.
 
 We considered JSON but it becomes verbose and hard to parse efficiently at thousands of pack entries. Binary is ~2x smaller and an order of magnitude faster to serialize/deserialize.
 

@@ -1,8 +1,12 @@
-//! Volume manifest v4: binary GLVM format with pack ID lists per chunk.
+//! Volume manifest v5: binary GLVM format with pack ID lists per chunk.
 //!
 //! The volume manifest maps chunk indices to ordered lists of pack IDs.
 //! Stored as binary GLVM at `manifests/{export_name}` in S3.
 //! Sparse: only chunks with written data appear. Absent = all-zero / unwritten.
+//!
+//! v5 changes from v4: pack_count widened from u8 to u16 to avoid silent
+//! truncation when a chunk accumulates 256+ packs (possible if compaction
+//! keeps failing).
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -11,8 +15,8 @@ use super::pack::PackId;
 /// GLVM magic bytes.
 pub const GLVM_MAGIC: &[u8; 4] = b"GLVM";
 
-/// Volume manifest version 4.
-pub const VOLUME_MANIFEST_VERSION: u16 = 4;
+/// Volume manifest version 5 (v5: pack_count widened from u8 to u16).
+pub const VOLUME_MANIFEST_VERSION: u16 = 5;
 
 /// Default chunk size for v4: 128 MiB (= 1 ext4 block group).
 pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024 * 1024;
@@ -176,7 +180,7 @@ impl VolumeManifest {
     /// ```text
     /// Header (32 bytes):
     ///   magic:        [u8; 4]  = b"GLVM"
-    ///   version:      u16 LE   = 4
+    ///   version:      u16 LE   = 5
     ///   chunk_count:  u32 LE
     ///   chunk_size:   u32 LE
     ///   block_size:   u32 LE
@@ -185,7 +189,7 @@ impl VolumeManifest {
     ///
     /// Chunk entries (sorted by chunk_idx):
     ///   chunk_idx:    u32 LE
-    ///   pack_count:   u8
+    ///   pack_count:   u16 LE
     ///   packs:        [u64 LE; pack_count]
     ///
     /// CRC32 trailer: 4 bytes
@@ -195,7 +199,7 @@ impl VolumeManifest {
         let entries_size: usize = self
             .chunks
             .values()
-            .map(|e| 4 + 1 + e.packs.len() * 8) // chunk_idx + pack_count + packs
+            .map(|e| 4 + 2 + e.packs.len() * 8) // chunk_idx + pack_count(u16) + packs
             .sum();
         let total = GLVM_HEADER_SIZE + entries_size + 4; // +4 for CRC32
         let mut buf = Vec::with_capacity(total);
@@ -212,8 +216,13 @@ impl VolumeManifest {
 
         // Chunk entries (sorted by chunk_idx via BTreeMap iteration order).
         for (&chunk_idx, entry) in &self.chunks {
+            debug_assert!(
+                entry.packs.len() <= u16::MAX as usize,
+                "chunk {chunk_idx} has {} packs, exceeds u16::MAX",
+                entry.packs.len()
+            );
             buf.extend_from_slice(&chunk_idx.to_le_bytes());
-            buf.push(entry.packs.len() as u8);
+            buf.extend_from_slice(&(entry.packs.len() as u16).to_le_bytes());
             for &pack_id in &entry.packs {
                 buf.extend_from_slice(&pack_id.to_le_bytes());
             }
@@ -262,16 +271,17 @@ impl VolumeManifest {
             return Err(VolumeManifestError::InvalidConfig);
         }
 
-        // Parse chunk entries.
+        // Parse chunk entries (pack_count is u16 LE).
         let mut chunks = BTreeMap::new();
         let mut pos = GLVM_HEADER_SIZE;
         for _ in 0..chunk_count {
-            if pos + 5 > crc_offset {
+            if pos + 6 > crc_offset {
                 return Err(VolumeManifestError::TooShort);
             }
             let chunk_idx = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-            let pack_count = data[pos + 4] as usize;
-            pos += 5;
+            let pack_count =
+                u16::from_le_bytes(data[pos + 4..pos + 6].try_into().unwrap()) as usize;
+            pos += 6;
 
             if pos + pack_count * 8 > crc_offset {
                 return Err(VolumeManifestError::TooShort);
@@ -361,8 +371,8 @@ mod tests {
             m.append_pack(i * 2, 0x1234567890ABCDEF);
         }
         let bytes = m.serialize();
-        // 32 (header) + 4096 * (4 + 1 + 8) (entries) + 4 (crc) = 32 + 53248 + 4 = 53284
-        assert_eq!(bytes.len(), 53284);
+        // 32 (header) + 4096 * (4 + 2 + 8) (entries) + 4 (crc) = 32 + 57344 + 4 = 57380
+        assert_eq!(bytes.len(), 57380);
 
         // Verify round-trip.
         let m2 = VolumeManifest::deserialize(&bytes).unwrap();

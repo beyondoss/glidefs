@@ -695,20 +695,25 @@ impl WriteCache<Active> {
             .put_manifest(&self.inner.export_name, manifest_bytes.clone())
             .await?;
 
-        if let Err(e) = content_store
+        let snapshot_persisted = match content_store
             .put_snapshot(&self.inner.export_name, seq_cutpoint, manifest_bytes)
             .await
         {
-            warn!(
-                error = %e, sequence = seq_cutpoint,
-                "failed to persist versioned snapshot (continuing)"
-            );
-        }
+            Ok(_) => true,
+            Err(e) => {
+                warn!(
+                    error = %e, sequence = seq_cutpoint,
+                    "failed to persist versioned snapshot (continuing)"
+                );
+                false
+            }
+        };
 
         self.checkpoint()?;
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,
+            snapshot_persisted,
             stats,
         })
     }

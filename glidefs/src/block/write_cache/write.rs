@@ -85,7 +85,7 @@ impl WriteCache<Active> {
                 let seq = self.inner.sequence.next();
 
                 let wal_entry = WalEntryRef {
-                    chunk_index: block,
+                    block_index: block,
                     sequence: seq,
                 };
                 wal.append(&wal_entry)?;
@@ -181,7 +181,7 @@ impl WriteCache<Active> {
                 let seq = self.inner.sequence.next();
 
                 let wal_entry = WalEntryRef {
-                    chunk_index: block,
+                    block_index: block,
                     sequence: seq,
                 };
                 wal.append(&wal_entry)?;
@@ -312,7 +312,7 @@ impl WriteCache<Active> {
                 let seq = self.inner.sequence.next();
 
                 let wal_entry = WalEntryRef {
-                    chunk_index: block,
+                    block_index: block,
                     sequence: seq,
                 };
                 wal.append(&wal_entry)?;

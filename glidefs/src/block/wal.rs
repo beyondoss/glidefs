@@ -19,13 +19,13 @@ use std::path::{Path, PathBuf};
 /// Used for replay (deserialized from WAL file).
 #[derive(Debug, Clone)]
 pub struct WalEntry {
-    pub chunk_index: u64,
+    pub block_index: u64,
     pub sequence: u64,
 }
 
 /// Borrowed WAL entry for zero-alloc appends on the write hot path.
 pub struct WalEntryRef {
-    pub chunk_index: u64,
+    pub block_index: u64,
     pub sequence: u64,
 }
 
@@ -61,15 +61,15 @@ impl Wal {
 
     /// Serialize and append an entry in wire format.
     ///
-    /// Wire format: [chunk_index:u64][sequence:u64][crc32:u32] (20 bytes)
+    /// Wire format: [block_index:u64][sequence:u64][crc32:u32] (20 bytes)
     ///
     /// Does NOT fsync -- the local SSD file provides durability guarantees.
     pub fn append(&mut self, entry: &WalEntryRef) -> io::Result<()> {
         let mut hasher = crc32fast::Hasher::new();
 
-        let chunk_index_le = entry.chunk_index.to_le_bytes();
-        hasher.update(&chunk_index_le);
-        self.writer.write_all(&chunk_index_le)?;
+        let block_index_le = entry.block_index.to_le_bytes();
+        hasher.update(&block_index_le);
+        self.writer.write_all(&block_index_le)?;
 
         let sequence_le = entry.sequence.to_le_bytes();
         hasher.update(&sequence_le);
@@ -155,7 +155,7 @@ impl Wal {
     fn read_entry(reader: &mut impl Read) -> io::Result<Option<WalEntry>> {
         let mut hasher = crc32fast::Hasher::new();
 
-        // chunk_index
+        // block_index
         let mut buf8 = [0u8; 8];
         match reader.read_exact(&mut buf8) {
             Ok(()) => {}
@@ -163,7 +163,7 @@ impl Wal {
             Err(e) => return Err(e),
         }
         hasher.update(&buf8);
-        let chunk_index = u64::from_le_bytes(buf8);
+        let block_index = u64::from_le_bytes(buf8);
 
         // sequence
         reader.read_exact(&mut buf8)?;
@@ -184,7 +184,7 @@ impl Wal {
         }
 
         Ok(Some(WalEntry {
-            chunk_index,
+            block_index,
             sequence,
         }))
     }
@@ -198,7 +198,7 @@ mod tests {
 
     fn append_test_entry(wal: &mut Wal, seq: u64) {
         let entry = WalEntryRef {
-            chunk_index: seq * 10,
+            block_index: seq * 10,
             sequence: seq,
         };
         wal.append(&entry).unwrap();
@@ -222,7 +222,7 @@ mod tests {
 
         for (i, entry) in entries.iter().enumerate() {
             let seq = (i + 1) as u64;
-            assert_eq!(entry.chunk_index, seq * 10);
+            assert_eq!(entry.block_index, seq * 10);
             assert_eq!(entry.sequence, seq);
         }
     }
@@ -344,7 +344,7 @@ mod tests {
         {
             let mut wal = Wal::open(&wal_path).unwrap();
             let entry = WalEntryRef {
-                chunk_index: 42,
+                block_index: 42,
                 sequence: 1,
             };
             wal.append(&entry).unwrap();
@@ -353,7 +353,7 @@ mod tests {
 
         let entries = Wal::replay(&wal_path, 0).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].chunk_index, 42);
+        assert_eq!(entries[0].block_index, 42);
         assert_eq!(entries[0].sequence, 1);
     }
 
@@ -373,7 +373,7 @@ mod tests {
 
         // Corrupt the CRC of entry 1 (the very first entry)
         {
-            // Entry 1: chunk_index(8) + seq(8) + crc(4) = 20 bytes
+            // Entry 1: block_index(8) + seq(8) + crc(4) = 20 bytes
             let entry_1_end: u64 = 20;
             let crc_offset = entry_1_end - 4;
             let mut file = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();

@@ -113,6 +113,9 @@ pub struct ReadinessStatus {
 pub struct SnapshotResponse {
     pub manifest_etag: Option<String>,
     pub sequence: u64,
+    /// Whether the versioned snapshot was persisted to S3.
+    /// `false` means the manifest was saved but the versioned snapshot key wasn't.
+    pub snapshot_persisted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
 }
@@ -257,6 +260,15 @@ pub struct ExportRouter {
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
 /// must start with an alphanumeric character. Rejects path traversal attempts.
+/// Remove a file, logging non-NotFound errors instead of silently swallowing them.
+fn remove_file_if_exists(path: &std::path::Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %path.display(), error = %e, "failed to remove file");
+        }
+    }
+}
+
 fn validate_export_name(name: &str) -> Result<(), RouterError> {
     if name.is_empty() || name.len() > 128 {
         return Err(RouterError::InvalidExportName(name.to_string()));
@@ -928,6 +940,7 @@ impl ExportRouter {
         Ok(SnapshotResponse {
             manifest_etag: result.manifest_etag,
             sequence: result.sequence,
+            snapshot_persisted: result.snapshot_persisted,
             tag: tag.map(|t| t.to_string()),
         })
     }
@@ -1414,8 +1427,8 @@ impl ExportRouter {
                     if purge {
                         let cache_file = self.cache_dir.join(format!("{}.cache", name));
                         let meta_file = self.cache_dir.join(format!("{}.meta", name));
-                        let _ = std::fs::remove_file(&cache_file);
-                        let _ = std::fs::remove_file(&meta_file);
+                        remove_file_if_exists(&cache_file);
+                        remove_file_if_exists(&meta_file);
                     }
                     return Ok(());
                 }
@@ -1444,8 +1457,8 @@ impl ExportRouter {
         if purge {
             let cache_file = self.cache_dir.join(format!("{}.cache", name));
             let meta_file = self.cache_dir.join(format!("{}.meta", name));
-            let _ = std::fs::remove_file(&cache_file);
-            let _ = std::fs::remove_file(&meta_file);
+            remove_file_if_exists(&cache_file);
+            remove_file_if_exists(&meta_file);
             info!("Purged cache files for export '{}'", name);
 
             // Also delete export definition from S3
