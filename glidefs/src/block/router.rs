@@ -1427,8 +1427,10 @@ impl ExportRouter {
                     if purge {
                         let cache_file = self.cache_dir.join(format!("{}.cache", name));
                         let meta_file = self.cache_dir.join(format!("{}.meta", name));
+                        let wal_file = self.cache_dir.join(format!("{}.wal", name));
                         remove_file_if_exists(&cache_file);
                         remove_file_if_exists(&meta_file);
+                        remove_file_if_exists(&wal_file);
                     }
                     return Ok(());
                 }
@@ -1457,8 +1459,10 @@ impl ExportRouter {
         if purge {
             let cache_file = self.cache_dir.join(format!("{}.cache", name));
             let meta_file = self.cache_dir.join(format!("{}.meta", name));
+            let wal_file = self.cache_dir.join(format!("{}.wal", name));
             remove_file_if_exists(&cache_file);
             remove_file_if_exists(&meta_file);
+            remove_file_if_exists(&wal_file);
             info!("Purged cache files for export '{}'", name);
 
             // Also delete export definition from S3

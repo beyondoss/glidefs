@@ -202,7 +202,7 @@ Each flush cycle produces one delta pack per dirty chunk and appends its ID to t
 2. S3 range-reads for each live block (bounded concurrency)
 3. Stream to a single GLPK base pack via `stream_chunk_pack()`
 4. Upload completes — index and trailer appended by the streaming writer
-5. `replace_packs(chunk_idx, [new_pack_id])` — removes old pack_ids from manifest
+5. `replace_packs_cas(chunk_idx, old_pack_ids, [new_pack_id])` — CAS-replaces old pack_ids in manifest, detecting concurrent appends
 
 Old packs are NOT deleted inline. After `replace_packs`, the old pack_ids are absent from the live manifest. GC identifies them as dead and deletes them after the grace period. This design keeps the flush path simple (no snapshot scanning inline) and leverages GC's existing safety mechanisms (grace period, max-delete cap, snapshot pinning). (`write_cache/compact.rs`)
 
@@ -268,8 +268,12 @@ router.create_export(config, fork_from="parent-vm")
     │
     ├── ContentStore::get_manifest("parent-vm")    ← GET manifests/parent-vm (~53KB for 1TB)
     ├── VolumeManifest::deserialize()              ← parse binary GLVM
-    ├── ContentStore::put_manifest("fork-vm", ...) ← PUT manifests/fork-vm
+    ├── VolumeManifest held in memory              ← NOT uploaded to S3 at create time
     └── WriteCache::open_fresh_active(config)      ← empty SparseStateMap (all NotPresent)
+    │
+    ▼
+Fork manifest uploaded to S3 on first flush cycle (sync_manifest)
+or explicit drain/snapshot. Crash before first flush → re-fork from parent.
     │
     ▼
 Fork is live:
@@ -375,7 +379,7 @@ WriteCache<Initializing>
          ▼
 WriteCache<Recovering>
          │
-         │  verify dirty block hashes against SSD
+         │  verify dirty blocks readable from SSD, compute CRC32 baselines
          ▼
 WriteCache<Active>
          │
