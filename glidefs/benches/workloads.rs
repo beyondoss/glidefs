@@ -26,7 +26,7 @@ use rand::{Rng, thread_rng};
 use tempfile::TempDir;
 
 use glidefs::block::cache::{BlockCache, SimpleBlockCache};
-use glidefs::block::chunk_cache::ChunkMetaCache;
+use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::metrics::ExportMetrics;
 use glidefs::block::state::Active;
@@ -40,7 +40,7 @@ const DEVICE_SIZE_MB: u64 = 256; // 256MB test device
 struct TestHarness {
     cache: WriteCache<Active>,
     content_store: ContentStore,
-    chunk_meta_cache: Arc<ChunkMetaCache>,
+    pack_index_cache: Arc<PackIndexCache>,
     volume_manifest: Arc<RwLock<VolumeManifest>>,
     clean_cache: Arc<dyn BlockCache>,
     metrics: Arc<ExportMetrics>,
@@ -64,8 +64,8 @@ impl TestHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3), "bench");
-        let chunk_meta_cache =
-            Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache =
+            Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
         let volume_manifest = Arc::new(RwLock::new(
             VolumeManifest::new(device_size, BLOCK_SIZE as u32),
         ));
@@ -77,7 +77,7 @@ impl TestHarness {
         Self {
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             clean_cache,
             metrics,
@@ -179,7 +179,7 @@ fn bench_sequential_reads(c: &mut Criterion) {
                     .cache
                     .flush_to_s3(
                         &harness.content_store,
-                        &harness.chunk_meta_cache,
+                        &harness.pack_index_cache,
                         &harness.volume_manifest,
                     )
                     .await
@@ -193,11 +193,11 @@ fn bench_sequential_reads(c: &mut Criterion) {
                 for i in 0..10 {
                     let _ = harness
                         .cache
-                        .read_v2(
+                        .read(
                             i as u64 * BLOCK_SIZE as u64,
                             BLOCK_SIZE,
                             cold_cache.as_ref(),
-                            &harness.chunk_meta_cache,
+                            &harness.pack_index_cache,
                             &harness.volume_manifest,
                             &harness.content_store,
                             &harness.metrics,
@@ -359,7 +359,7 @@ fn bench_mixed_iops_during_flush(c: &mut Criterion) {
                                 .cache
                                 .flush_to_s3(
                                     &flush_harness.content_store,
-                                    &flush_harness.chunk_meta_cache,
+                                    &flush_harness.pack_index_cache,
                                     &flush_harness.volume_manifest,
                                 )
                                 .await;
@@ -431,7 +431,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
                 .cache
                 .flush_to_s3(
                     &harness.content_store,
-                    &harness.chunk_meta_cache,
+                    &harness.pack_index_cache,
                     &harness.volume_manifest,
                 )
                 .await
@@ -467,7 +467,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
                 .cache
                 .flush_to_s3(
                     &harness.content_store,
-                    &harness.chunk_meta_cache,
+                    &harness.pack_index_cache,
                     &harness.volume_manifest,
                 )
                 .await
@@ -514,7 +514,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                     .cache
                     .flush_to_s3(
                         &harness.content_store,
-                        &harness.chunk_meta_cache,
+                        &harness.pack_index_cache,
                         &harness.volume_manifest,
                     )
                     .await
@@ -552,7 +552,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                     .cache
                     .flush_to_s3(
                         &harness.content_store,
-                        &harness.chunk_meta_cache,
+                        &harness.pack_index_cache,
                         &harness.volume_manifest,
                     )
                     .await
@@ -601,7 +601,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                     .cache
                     .flush_to_s3(
                         &harness.content_store,
-                        &harness.chunk_meta_cache,
+                        &harness.pack_index_cache,
                         &harness.volume_manifest,
                     )
                     .await
@@ -658,7 +658,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                     .cache
                     .flush_to_s3(
                         &harness.content_store,
-                        &harness.chunk_meta_cache,
+                        &harness.pack_index_cache,
                         &harness.volume_manifest,
                     )
                     .await
@@ -711,7 +711,7 @@ fn bench_flush_to_s3_latency(c: &mut Criterion) {
                             .cache
                             .flush_to_s3(
                                 &harness.content_store,
-                                &harness.chunk_meta_cache,
+                                &harness.pack_index_cache,
                                 &harness.volume_manifest,
                             )
                             .await

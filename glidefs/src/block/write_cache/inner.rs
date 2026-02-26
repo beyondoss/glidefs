@@ -2,7 +2,6 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
@@ -20,82 +19,81 @@ pub(super) const METADATA_MAGIC: &[u8; 8] = b"ZFSCACHE";
 /// Version 5: sparse state map + trailing max_sequence u64
 pub(super) const METADATA_VERSION: u32 = 5;
 
-/// A file handle safe for concurrent positional I/O.
-///
-/// This wrapper allows sharing a `File` across threads when using only
-/// positional I/O methods (`read_at`, `write_at`, `read_exact_at`, `write_all_at`).
-/// These methods use `pread`/`pwrite` system calls which are atomic and don't
-/// use the internal file position, making them thread-safe per POSIX semantics.
-///
-/// # Safety
-///
-/// This type implements `Sync` because:
-/// 1. We only expose positional I/O methods (pread/pwrite)
-/// 2. POSIX guarantees pread/pwrite are atomic with respect to each other
-/// 3. We never use seek-based read/write which would race on file position
-/// 4. `sync_all()` is safe to call concurrently (just triggers fsync)
-#[derive(Debug)]
-pub struct SyncFile {
-    file: File,
-}
+/// Sealed module for `SyncFile`. The `File` field is private to this module,
+/// preventing any code outside from accessing seek-based methods. This makes
+/// the `unsafe impl Sync` locally verifiable: only the methods below touch the
+/// inner file, and all of them use positional I/O (pread/pwrite).
+mod sync_file {
+    use std::fs::{File, OpenOptions};
+    use std::path::Path;
+    use tracing::info;
 
-impl SyncFile {
-    /// Open a file for concurrent positional I/O.
-    pub fn open(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(create)
-            .truncate(false)
-            .open(path)?;
+    /// A file handle safe for concurrent positional I/O.
+    ///
+    /// Only exposes positional I/O methods (`read_exact_at`, `write_all_at`)
+    /// which use `pread`/`pwrite` system calls — atomic per POSIX, no shared
+    /// file position. The inner `File` is module-private so no code outside
+    /// this module can call seek-based methods.
+    #[derive(Debug)]
+    pub struct SyncFile {
+        file: File,
+    }
 
-        let file_size = file.metadata()?.len();
-        if file_size < device_size {
-            file.set_len(device_size)?;
+    // SAFETY: SyncFile only exposes positional I/O methods (pread/pwrite via
+    // FileExt::{read_exact_at, write_all_at}) which are atomic per POSIX.
+    // The `file` field is private to this module — no external code can access
+    // seek-based methods (read, write, seek) that would introduce data races.
+    unsafe impl Sync for SyncFile {}
+
+    impl SyncFile {
+        /// Open a file for concurrent positional I/O.
+        pub fn open(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(create)
+                .truncate(false)
+                .open(path)?;
+
+            let file_size = file.metadata()?.len();
+            if file_size < device_size {
+                file.set_len(device_size)?;
+            }
+
+            info!(path = %path.display(), "opened cache file");
+            Ok(SyncFile { file })
         }
 
-        info!(path = %path.display(), "opened cache file");
-        Ok(SyncFile { file })
-    }
+        /// Read exact bytes at a specific offset (pread).
+        #[inline]
+        pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(buf, offset)
+        }
 
-    /// Read exact bytes at a specific offset (pread).
-    #[inline]
-    pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.read_exact_at(buf, offset)
-    }
+        /// Write all bytes at a specific offset (pwrite).
+        #[inline]
+        pub fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+            use std::os::unix::fs::FileExt;
+            self.file.write_all_at(buf, offset)
+        }
 
-    /// Write all bytes at a specific offset (pwrite).
-    #[inline]
-    pub fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.write_all_at(buf, offset)
-    }
+        /// Sync all data and metadata to disk.
+        #[inline]
+        pub fn sync_all(&self) -> std::io::Result<()> {
+            self.file.sync_all()
+        }
 
-    /// Sync all data and metadata to disk.
-    #[inline]
-    pub fn sync_all(&self) -> std::io::Result<()> {
-        self.file.sync_all()
-    }
-
-    /// Get the raw file descriptor (for fallocate, etc).
-    #[cfg(target_os = "linux")]
-    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::unix::io::AsRawFd;
-        self.file.as_raw_fd()
+        /// Get the raw file descriptor (for fallocate, etc).
+        #[cfg(target_os = "linux")]
+        pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+            use std::os::unix::io::AsRawFd;
+            self.file.as_raw_fd()
+        }
     }
 }
 
-// SAFETY: SyncFile only exposes positional I/O methods (pread/pwrite via
-// FileExt::{read_exact_at, write_all_at}) which are atomic per POSIX and don't
-// use the shared file position. Do NOT add seek-based read/write methods —
-// they would make this impl unsound.
-unsafe impl Sync for SyncFile {}
-// File is already Send; this static assert guards against future regressions.
-const _: () = {
-    const fn _assert_send<T: Send>() {}
-    let _ = _assert_send::<std::fs::File>;
-};
+pub use sync_file::SyncFile;
 
 /// Check if a block is all zeros.
 ///
@@ -422,10 +420,23 @@ impl CacheInner {
 
         // Fsync the parent directory so the rename is durable across power loss.
         // Without this, the directory entry update can be lost on crash.
-        if let Some(parent) = path.parent()
-            && let Ok(dir) = File::open(parent)
-        {
-            let _ = dir.sync_all();
+        if let Some(parent) = path.parent() {
+            match File::open(parent) {
+                Ok(dir) => {
+                    if let Err(e) = dir.sync_all() {
+                        warn!(
+                            error = %e,
+                            "dir fsync after metadata rename failed — durability weakened"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "failed to open parent dir for fsync — durability weakened"
+                    );
+                }
+            }
         }
 
         let present_count = sparse_entries.len();

@@ -85,71 +85,109 @@ pub async fn flush_scheduler(
                 }
 
                 let start = Instant::now();
+                let mut packs_uploaded = 0usize;
+
                 // Acquire per-export flush lock to serialize with concurrent
                 // drain/snapshot operations. Prevents stale manifest uploads.
-                let _flush_guard = cache.flush_lock().lock().await;
-                match cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest).await {
-                    Ok((stats, _seq_cutpoint)) => {
-                        flush_backoff = Duration::ZERO;
-                        metrics.record_s3_put_latency(start.elapsed());
-                        metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
-                        metrics.record_flush_blocks_corrupted(stats.blocks_corrupted);
-                        if stats.packs_uploaded > 0 {
-                            info!(
-                                packs = stats.packs_uploaded,
-                                blocks = stats.blocks_flushed,
-                                bytes = stats.bytes_uploaded,
-                                "pack-size flush"
-                            );
-                            // Sync manifest so flushed packs are discoverable
-                            // on cross-host recovery (host death without drain).
-                            // sync_manifest includes checkpoint (persist + WAL truncate).
-                            // Retry up to 3 times; if all fail, defer to checkpoint tick.
-                            let mut synced = false;
-                            for attempt in 0..3 {
-                                match cache.sync_manifest(&content_store, &volume_manifest).await {
-                                    Ok(()) => { synced = true; break; }
-                                    Err(e) => {
-                                        metrics.record_manifest_sync_error();
-                                        warn!(error = %e, attempt = attempt + 1, "manifest sync after flush failed");
+                {
+                    let _flush_guard = cache.flush_lock().lock().await;
+                    match cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest).await {
+                        Ok((stats, _seq_cutpoint)) => {
+                            flush_backoff = Duration::ZERO;
+                            metrics.record_s3_put_latency(start.elapsed());
+                            metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
+                            metrics.record_flush_blocks_corrupted(stats.blocks_corrupted);
+                            packs_uploaded = stats.packs_uploaded;
+                            if stats.packs_uploaded > 0 {
+                                info!(
+                                    packs = stats.packs_uploaded,
+                                    blocks = stats.blocks_flushed,
+                                    bytes = stats.bytes_uploaded,
+                                    "pack-size flush"
+                                );
+                                // Sync manifest so flushed packs are discoverable
+                                // on cross-host recovery (host death without drain).
+                                // sync_manifest includes checkpoint (persist + WAL truncate).
+                                // Retry up to 3 times; if all fail, defer to checkpoint tick.
+                                let mut synced = false;
+                                for attempt in 0..3 {
+                                    match cache.sync_manifest(&content_store, &volume_manifest).await {
+                                        Ok(()) => { synced = true; break; }
+                                        Err(e) => {
+                                            metrics.record_manifest_sync_error();
+                                            warn!(error = %e, attempt = attempt + 1, "manifest sync after flush failed");
+                                        }
                                     }
                                 }
-                            }
-                            if synced {
-                                manifest_pending = false;
-                            } else {
-                                // Checkpoint locally to bound WAL growth even
-                                // when manifest sync is failing.
-                                if let Err(e) = cache.local_checkpoint() {
-                                    warn!(error = %e, "checkpoint after failed manifest sync");
+                                if synced {
+                                    manifest_pending = false;
+                                } else {
+                                    // Checkpoint locally to bound WAL growth even
+                                    // when manifest sync is failing.
+                                    if let Err(e) = cache.local_checkpoint() {
+                                        warn!(error = %e, "checkpoint after failed manifest sync");
+                                    }
+                                    manifest_pending = true;
                                 }
-                                manifest_pending = true;
+                            } else {
+                                // No packs uploaded — still checkpoint to persist
+                                // clean block states and compute CRC32s.
+                                if let Err(e) = cache.local_checkpoint() {
+                                    warn!(error = %e, "checkpoint after flush failed");
+                                }
                             }
-                        } else {
-                            // No packs uploaded — still checkpoint to persist
-                            // clean block states and compute CRC32s.
+                        }
+                        Err(e) => {
+                            // Exponential backoff: 1s → 2s → 4s → ... → 30s cap.
+                            flush_backoff = if flush_backoff.is_zero() {
+                                Duration::from_secs(1)
+                            } else {
+                                flush_backoff.saturating_mul(2).min(MAX_BACKOFF)
+                            };
+                            metrics.record_flush_error();
+                            warn!(error = %e, backoff_secs = flush_backoff.as_secs(), "pack flush failed, backing off");
+                            // Still checkpoint on flush error to prevent WAL growth
+                            // when S3 is down and flush_notify fires continuously.
                             if let Err(e) = cache.local_checkpoint() {
-                                warn!(error = %e, "checkpoint after flush failed");
+                                warn!(error = %e, "checkpoint after flush error failed");
                             }
                         }
                     }
-                    Err(e) => {
-                        // Exponential backoff: 1s → 2s → 4s → ... → 30s cap.
-                        flush_backoff = if flush_backoff.is_zero() {
-                            Duration::from_secs(1)
-                        } else {
-                            flush_backoff.saturating_mul(2).min(MAX_BACKOFF)
-                        };
-                        metrics.record_flush_error();
-                        warn!(error = %e, backoff_secs = flush_backoff.as_secs(), "pack flush failed, backing off");
-                        // Still checkpoint on flush error to prevent WAL growth
-                        // when S3 is down and flush_notify fires continuously.
-                        if let Err(e) = cache.local_checkpoint() {
-                            warn!(error = %e, "checkpoint after flush error failed");
+                } // _flush_guard dropped — compaction runs without holding the flush lock.
+
+                // Compaction runs outside the flush lock so it doesn't block
+                // concurrent drain/snapshot/flush operations.
+                if packs_uploaded > 0 {
+                    match crate::block::write_cache::compact::compact_if_needed(
+                        crate::block::write_cache::compact::DEFAULT_COMPACTION_THRESHOLD,
+                        &content_store,
+                        &pack_index_cache,
+                        &volume_manifest,
+                    )
+                    .await
+                    {
+                        Ok(compaction_results) => {
+                            for r in &compaction_results {
+                                info!(
+                                    chunk_idx = r.chunk_idx,
+                                    new_pack_id = r.new_pack_id,
+                                    live_blocks = r.live_blocks,
+                                    new_pack_bytes = r.new_pack_size,
+                                    old_packs = r.old_pack_ids.len(),
+                                    "compacted chunk — old packs left for GC"
+                                );
+                            }
+                            // Compaction modified the manifest — schedule a sync
+                            // so the compacted state is persisted to S3.
+                            if !compaction_results.is_empty() {
+                                manifest_pending = true;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "compaction failed, will retry next cycle");
                         }
                     }
                 }
-                drop(_flush_guard);
             }
 
             // Periodic: checkpoint every 5s + retry pending manifest sync.

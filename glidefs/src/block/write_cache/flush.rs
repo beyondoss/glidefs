@@ -33,8 +33,8 @@ enum BlockResult {
     Computed {
         chunk_index: usize,
         hash: Blake3Hash,
-        /// `Some(compressed)` if block is new (not zero, not already known).
-        /// `None` if deduped (zero block or already in chunk meta).
+        /// `Some(compressed)` if block is new (not zero).
+        /// `None` if deduped (zero block).
         compressed: Option<Vec<u8>>,
     },
     /// Block skipped due to CRC mismatch or concurrent write.
@@ -48,7 +48,7 @@ enum BlockResult {
 /// CPU-heavy flush computation: read blocks from SSD, verify CRC32, hash, compress, dedup.
 ///
 /// Runs on a blocking thread via `spawn_blocking` to avoid starving the async runtime.
-/// Phase 1 (rayon parallel): pread + crc32 + blake3 + known-hash check + lz4 per block.
+/// Phase 1 (rayon parallel): pread + crc32 + blake3 + lz4 per block.
 /// Phase 2 (sequential): within-batch dedup via seen_hashes (cheap hash-set insertions).
 ///
 /// All blocks in `snapshot` have already been claimed (CAS DIRTY→SYNCING).
@@ -58,7 +58,6 @@ enum BlockResult {
 fn compute_flush_batch(
     inner: &CacheInner,
     snapshot: &[usize],
-    known_hashes: &HashSet<Blake3Hash>,
     zero_hash: Blake3Hash,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
@@ -120,8 +119,8 @@ fn compute_flush_batch(
 
             let hash = blake3_128(&chunk_buf);
 
-            // Zero block or already known in chunk meta → deduped, no upload needed.
-            let compressed = if hash == zero_hash || known_hashes.contains(&hash) {
+            // Zero block → deduped, no upload needed.
+            let compressed = if hash == zero_hash {
                 None
             } else {
                 Some(lz4_compress(&chunk_buf[..]))
@@ -169,7 +168,7 @@ fn compute_flush_batch(
 
                 match compressed {
                     None => {
-                        // Zero block or already in chunk meta.
+                        // Zero block.
                         stats.blocks_deduped += 1;
                     }
                     Some(data) => {
@@ -404,10 +403,10 @@ impl WriteCache<Active> {
 
     /// Inner body of flush_dirty_inner, factored out for error recovery.
     ///
-    /// Per-chunk: load pack indices from PackIndexCache → known_hashes,
-    /// compute_flush_batch (rayon: pread + CRC32 + BLAKE3 + LZ4),
-    /// assemble GLPK v2 pack, upload to S3, update PackIndexCache,
-    /// append pack_id to manifest. No .meta upload.
+    /// Per-chunk: warm PackIndexCache, compute_flush_batch (rayon: pread +
+    /// CRC32 + BLAKE3 + LZ4), assemble GLPK v2 pack, upload to S3, update
+    /// PackIndexCache. Manifest appends are staged and applied atomically
+    /// after all chunk uploads succeed. No .meta upload.
     async fn flush_dirty_body(
         &self,
         snapshot: &[usize],
@@ -458,26 +457,15 @@ impl WriteCache<Active> {
 
         let mut total_stats = FlushStats::default();
         let mut all_computed: Vec<(usize, Blake3Hash)> = Vec::new();
+        let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
 
         // Per-chunk flush
         for (chunk_idx, chunk_blocks) in per_chunk {
-            // Do NOT use hash-based dedup against existing packs.
-            //
-            // Packs are indexed by chunk_offset (not by hash). Hash-based
-            // dedup is incorrect because two blocks at DIFFERENT chunk_offsets may
-            // share the same hash — both need their own index entries in the pack.
-            // Without correct index entries, reads return zeros for blocks that
-            // hash-match an entry at a different chunk_offset.
-            //
-            // Compaction handles storage efficiency (delta packs get merged).
-            // The pre-fetch below only warms the read-path cache.
-            let known_hashes: HashSet<Blake3Hash> = HashSet::new();
-
             // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
             let zero_hash = self.inner.zero_block_hash;
             let inner = Arc::clone(&self.inner);
             let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
-                compute_flush_batch(&inner, &chunk_blocks, &known_hashes, zero_hash)
+                compute_flush_batch(&inner, &chunk_blocks, zero_hash)
             })
             .await
             .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
@@ -544,13 +532,20 @@ impl WriteCache<Active> {
             // Update PackIndexCache with new entries
             pack_index_cache.insert_entries(pack_id, &index_entries);
 
-            // Append pack_id to manifest chunk entry
-            {
-                let mut vm = volume_manifest.write();
-                vm.append_pack(chunk_idx, pack_id);
-            }
+            // Stage manifest append (applied after all chunk uploads succeed).
+            // This avoids orphaned manifest entries if a later chunk's S3 upload fails.
+            staged_appends.push((chunk_idx, pack_id));
 
             all_computed.extend(batch.computed);
+        }
+
+        // Apply all staged manifest appends atomically.
+        // Only reached if every chunk upload succeeded.
+        if !staged_appends.is_empty() {
+            let mut vm = volume_manifest.write();
+            for (chunk_idx, pack_id) in staged_appends {
+                vm.append_pack(chunk_idx, pack_id);
+            }
         }
 
         // CAS SYNCING→CLEAN for successfully flushed blocks
@@ -575,47 +570,16 @@ impl WriteCache<Active> {
 
     /// Flush dirty blocks to S3 as chunk-scoped GLPK v2 packs (no manifest upload).
     ///
-    /// After a successful flush, runs inline compaction for any chunks that
-    /// exceed the compaction threshold. Old packs are deleted best-effort.
+    /// Returns (stats, seq_cutpoint). Compaction is the caller's responsibility
+    /// and should run outside the flush lock to avoid blocking concurrent flushes.
     pub async fn flush_packs(
         &self,
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<(FlushStats, u64), CacheError> {
-        let result = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
-            .await?;
-
-        // Inline compaction: merge delta packs for chunks over threshold
-        if result.0.packs_uploaded > 0 {
-            match super::compact::compact_if_needed(
-                super::compact::DEFAULT_COMPACTION_THRESHOLD,
-                content_store,
-                pack_index_cache,
-                volume_manifest,
-            )
+        self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
             .await
-            {
-                Ok(compaction_results) => {
-                    for r in &compaction_results {
-                        info!(
-                            chunk_idx = r.chunk_idx,
-                            new_pack_id = r.new_pack_id,
-                            live_blocks = r.live_blocks,
-                            new_pack_bytes = r.new_pack_size,
-                            old_packs = r.old_pack_ids.len(),
-                            "compacted chunk — old packs left for GC"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "inline compaction failed, will retry next cycle");
-                }
-            }
-        }
-
-        Ok(result)
     }
 
     /// Upload the VolumeManifest (binary GLVM) to S3.
@@ -633,6 +597,11 @@ impl WriteCache<Active> {
     }
 
     /// Flush dirty blocks to S3 + upload manifest (drain/snapshot path).
+    ///
+    /// Retries manifest upload up to 3 times before propagating the error,
+    /// mirroring flush_scheduler's pattern. This prevents spurious drain
+    /// failures when blocks are already clean but a transient S3 error
+    /// prevents the manifest upload.
     #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn flush_to_s3(
         &self,
@@ -645,9 +614,28 @@ impl WriteCache<Active> {
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
             .await?;
         let manifest_bytes = volume_manifest.read().serialize();
-        content_store
-            .put_manifest(&self.inner.export_name, manifest_bytes)
-            .await?;
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            match content_store
+                .put_manifest(&self.inner.export_name, manifest_bytes.clone())
+                .await
+            {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e, attempt = attempt + 1,
+                        "manifest upload failed in flush_to_s3, retrying"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e.into());
+        }
         self.checkpoint()?;
         Ok(stats)
     }

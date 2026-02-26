@@ -17,7 +17,7 @@ use rand::Rng;
 use tempfile::TempDir;
 
 use glidefs::block::cache::{BlockCache, SimpleBlockCache};
-use glidefs::block::chunk_cache::ChunkMetaCache;
+use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::metrics::ExportMetrics;
 use glidefs::block::state::Active;
@@ -29,7 +29,7 @@ const BLOCK_SIZE: usize = 128 * 1024; // 128 KB (production block size)
 struct ReadBenchHarness {
     cache: WriteCache<Active>,
     content_store: ContentStore,
-    chunk_meta_cache: Arc<ChunkMetaCache>,
+    pack_index_cache: Arc<PackIndexCache>,
     volume_manifest: Arc<RwLock<VolumeManifest>>,
     metrics: ExportMetrics,
     num_blocks: u64,
@@ -53,8 +53,8 @@ impl ReadBenchHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3_backend), "bench");
-        let chunk_meta_cache =
-            Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache =
+            Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
         let volume_manifest = Arc::new(RwLock::new(
             VolumeManifest::new(device_size_bytes, BLOCK_SIZE as u32),
         ));
@@ -78,14 +78,14 @@ impl ReadBenchHarness {
 
         // Flush to S3 so the chunk meta cache and content store are populated.
         cache
-            .snapshot(&content_store, &chunk_meta_cache, &volume_manifest)
+            .snapshot(&content_store, &pack_index_cache, &volume_manifest)
             .await
             .unwrap();
 
         Self {
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             metrics,
             num_blocks,
@@ -100,11 +100,11 @@ impl ReadBenchHarness {
             let offset = i * BLOCK_SIZE as u64;
             let buf = self
                 .cache
-                .read_v2(
+                .read(
                     offset,
                     BLOCK_SIZE,
                     clean_cache,
-                    &self.chunk_meta_cache,
+                    &self.pack_index_cache,
                     &self.volume_manifest,
                     &self.content_store,
                     &self.metrics,

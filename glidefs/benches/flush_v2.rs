@@ -14,7 +14,7 @@ use parking_lot::RwLock;
 use tempfile::TempDir;
 
 use glidefs::block::cache::{BlockCache, SimpleBlockCache};
-use glidefs::block::chunk_cache::ChunkMetaCache;
+use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::state::Active;
 use glidefs::block::volume_manifest::VolumeManifest;
@@ -25,7 +25,7 @@ const BLOCK_SIZE: usize = 128 * 1024; // 128KB (production block size)
 struct V2BenchHarness {
     cache: WriteCache<Active>,
     content_store: ContentStore,
-    chunk_meta_cache: Arc<ChunkMetaCache>,
+    pack_index_cache: Arc<PackIndexCache>,
     volume_manifest: Arc<RwLock<VolumeManifest>>,
     clean_cache: Arc<dyn BlockCache>,
     #[allow(dead_code)]
@@ -47,8 +47,8 @@ impl V2BenchHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3_backend), "bench");
-        let chunk_meta_cache =
-            Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache =
+            Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
         let volume_manifest = Arc::new(RwLock::new(
             VolumeManifest::new(device_size, BLOCK_SIZE as u32),
         ));
@@ -60,7 +60,7 @@ impl V2BenchHarness {
         Self {
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             clean_cache,
             temp_dir,
@@ -106,7 +106,7 @@ fn bench_v2_flush_latency(c: &mut Criterion) {
                             .cache
                             .flush_to_s3(
                                 &h.content_store,
-                                &h.chunk_meta_cache,
+                                &h.pack_index_cache,
                                 &h.volume_manifest,
                             )
                             .await
@@ -153,7 +153,7 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                 h.cache
                     .flush_to_s3(
                         &h.content_store,
-                        &h.chunk_meta_cache,
+                        &h.pack_index_cache,
                         &h.volume_manifest,
                     )
                     .await
@@ -183,7 +183,7 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                 h.cache
                     .flush_to_s3(
                         &h.content_store,
-                        &h.chunk_meta_cache,
+                        &h.pack_index_cache,
                         &h.volume_manifest,
                     )
                     .await
@@ -205,7 +205,7 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                 h.cache
                     .flush_to_s3(
                         &h.content_store,
-                        &h.chunk_meta_cache,
+                        &h.pack_index_cache,
                         &h.volume_manifest,
                     )
                     .await

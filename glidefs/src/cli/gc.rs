@@ -452,9 +452,10 @@ async fn reconcile_prefix(
         "pass 1 complete, checking snapshot manifests"
     );
 
-    // Pass 2: Stream snapshot manifests one at a time.
-    // For each, remove referenced packs from maybe_dead. The manifest is
-    // deserialized and dropped before loading the next → O(1) per manifest.
+    // Pass 2: Check snapshot manifests 16-wide parallel.
+    // Each task: fetch → deserialize → return pack_ids.
+    // Consumer removes from maybe_dead, early-exits when empty.
+    // Any unrecoverable error aborts the prefix (delete nothing).
     let snap_prefix_str = format!("{}/snapshots/", base);
     let snap_prefix = ObjectPath::from(snap_prefix_str);
 
@@ -467,43 +468,58 @@ async fn reconcile_prefix(
         }
     }
 
-    for path in snap_paths {
-        if maybe_dead.is_empty() {
-            break; // All candidates accounted for, no need to check more snapshots
-        }
-
-        let data = match content_store.object_store().get(&path).await {
-            Ok(response) => match response.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(key = %path, error = %e, "failed to read snapshot manifest bytes");
-                    continue;
-                }
-            },
-            Err(object_store::Error::NotFound { .. }) => continue,
-            Err(e) => {
-                warn!(key = %path, error = %e, "failed to fetch snapshot manifest — treating remaining maybe_dead as live");
-                // Safety: if we can't read a snapshot, we can't be sure its packs are dead.
-                stats.prefixes_scanned += 1;
-                return Ok((delta, stats));
+    let store = std::sync::Arc::clone(content_store.object_store());
+    let mut snap_results = futures::stream::iter(snap_paths)
+        .map(move |path| {
+            let store = std::sync::Arc::clone(&store);
+            async move {
+                let response = match store.get(&path).await {
+                    Ok(r) => r,
+                    Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to fetch snapshot manifest {}: {}",
+                            path,
+                            e
+                        ));
+                    }
+                };
+                let data = response.bytes().await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to read snapshot manifest {} bytes: {}",
+                        path,
+                        e
+                    )
+                })?;
+                let vm = VolumeManifest::deserialize(&data).map_err(|e| {
+                    anyhow::anyhow!("corrupt snapshot manifest {}: {}", path, e)
+                })?;
+                Ok(Some(vm.all_pack_ids()))
             }
-        };
+        })
+        .buffer_unordered(16);
 
-        match VolumeManifest::deserialize(&data) {
-            Ok(vm) => {
-                for (chunk_idx, pack_id) in vm.all_pack_ids() {
-                    maybe_dead.remove(&(chunk_idx, pack_id));
+    while let Some(result) = snap_results.next().await {
+        match result {
+            Ok(Some(pack_ids)) => {
+                for id in pack_ids {
+                    maybe_dead.remove(&id);
                 }
                 stats.snapshots_checked += 1;
+                if maybe_dead.is_empty() {
+                    break; // All candidates accounted for, remaining futures dropped
+                }
             }
+            Ok(None) => {} // NotFound — snapshot deleted between list and get, skip
             Err(e) => {
-                warn!(key = %path, error = %e, "corrupt snapshot manifest — treating remaining maybe_dead as live");
+                warn!("{} — treating remaining maybe_dead as live", e);
                 stats.prefixes_scanned += 1;
                 return Ok((delta, stats));
             }
         }
-        // vm is dropped here — O(1) snapshot memory
     }
+    // Snapshot manifests are never held simultaneously — each task's
+    // HashSet is consumed and dropped on the consumer side.
 
     // Whatever survives pass 2 is truly dead.
     let now_ts = Utc::now().to_rfc3339();
@@ -1232,5 +1248,193 @@ mod tests {
         assert!(packs.contains(&(0, 0xDEADBEEF01234567)));
         assert!(packs.contains(&(42, 0x0000000000000001)));
         assert!(packs.contains(&(0, 0xCAFEBABE89ABCDEF)));
+    }
+
+    // -----------------------------------------------------------------------
+    // FaultyGetStore: ObjectStore wrapper that injects GET errors for specific
+    // S3 keys. Used to verify GC aborts when snapshot reads fail.
+    // -----------------------------------------------------------------------
+
+    use async_trait::async_trait;
+    use futures::stream::BoxStream;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct FaultyGetStore {
+        inner: InMemory,
+        /// S3 keys where get() should return a non-NotFound error.
+        fault_keys: Mutex<HashSet<String>>,
+    }
+
+    impl FaultyGetStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                fault_keys: Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn fail_on_get(&self, key: &str) {
+            self.fault_keys.lock().unwrap().insert(key.to_string());
+        }
+    }
+
+    impl std::fmt::Display for FaultyGetStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FaultyGetStore")
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for FaultyGetStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            if self
+                .fault_keys
+                .lock()
+                .unwrap()
+                .contains(&location.to_string())
+            {
+                return Err(object_store::Error::Generic {
+                    store: "FaultyGetStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "simulated snapshot read failure",
+                    )),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> ObjectStoreResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> ObjectStoreResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// Regression test: if a snapshot manifest can't be read, GC must NOT
+    /// delete packs that the unreadable snapshot might reference.
+    ///
+    /// Before the fix, a bytes() read error on a snapshot caused `continue`
+    /// (skip that snapshot), leaving its packs in maybe_dead → incorrect
+    /// deletion. The fix aborts the entire prefix when any snapshot is
+    /// unreadable.
+    #[tokio::test]
+    async fn test_gc_aborts_when_snapshot_read_fails() {
+        let faulty = Arc::new(FaultyGetStore::new());
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::clone(&faulty) as _;
+        let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
+
+        let pack_main: PackId = 0x1111111111111111;
+        let pack_snap_only: PackId = 0x2222222222222222;
+        let chunk_idx = 0u32;
+
+        // Upload both packs to S3.
+        content_store
+            .put_chunk_pack(chunk_idx, pack_main, vec![0u8; 100])
+            .await
+            .unwrap();
+        content_store
+            .put_chunk_pack(chunk_idx, pack_snap_only, vec![0u8; 100])
+            .await
+            .unwrap();
+
+        // Live manifest references only pack_main.
+        let mut vm_main = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        vm_main.append_pack(chunk_idx, pack_main);
+        content_store
+            .put_manifest("vm1", vm_main.serialize())
+            .await
+            .unwrap();
+
+        // Snapshot references pack_snap_only (the only thing keeping it alive).
+        let mut vm_snap = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        vm_snap.append_pack(chunk_idx, pack_snap_only);
+        content_store
+            .put_snapshot("vm1", 1, vm_snap.serialize())
+            .await
+            .unwrap();
+
+        // Make the snapshot GET fail (simulates network error mid-read).
+        faulty.fail_on_get("test/exports/vm1/snapshots/vm1/00000000000000000001");
+
+        // Run GC with zero grace period — would delete immediately if it
+        // incorrectly skips the failed snapshot.
+        let mut state = new_gc_state_for_test();
+        let old_ts = Utc::now() - chrono::Duration::hours(25);
+        inject_dead_pack_for_test(&mut state, chunk_idx, pack_snap_only, old_ts);
+
+        let report = reconcile_prefix_for_test(
+            &content_store,
+            &mut state,
+            Duration::from_secs(0),
+            100,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // GC must abort the prefix — zero deletions.
+        assert_eq!(
+            report.packs_deleted(),
+            0,
+            "must not delete packs when a snapshot is unreadable"
+        );
+
+        // pack_snap_only must still exist in S3.
+        let packs = list_all_packs(&content_store).await.unwrap();
+        assert!(
+            packs.contains(&(chunk_idx, pack_snap_only)),
+            "snapshot-pinned pack must survive when snapshot read fails"
+        );
     }
 }
