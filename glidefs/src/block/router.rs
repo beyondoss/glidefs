@@ -7,7 +7,7 @@ use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
 use crate::block::flush_scheduler::flush_scheduler;
 use crate::block::handler::BlockHandler;
-use crate::block::chunk_cache::ChunkMetaCache;
+use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::manifest::deserialize_hot_set;
 use crate::block::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::block::state::Active;
@@ -122,7 +122,7 @@ pub struct ExportState {
     pub handler: Arc<BlockHandler>,
     pub cache: Arc<WriteCache<Active>>,
     pub content_store: Arc<ContentStore>,
-    pub chunk_meta_cache: Arc<ChunkMetaCache>,
+    pub pack_index_cache: Arc<PackIndexCache>,
     pub volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
     pub readonly: bool,
     pub metrics: Arc<ExportMetrics>,
@@ -150,7 +150,7 @@ impl ExportState {
         for _ in 0..MAX_DRAIN_ITERATIONS {
             let stats = self
                 .cache
-                .flush_to_s3(&self.content_store, &self.chunk_meta_cache, &self.volume_manifest)
+                .flush_to_s3(&self.content_store, &self.pack_index_cache, &self.volume_manifest)
                 .await
                 .map_err(RouterError::Cache)?;
             if stats.blocks_flushed == 0 {
@@ -218,8 +218,8 @@ pub struct ExportRouter {
     /// Block size for all exports (default, can be overridden per-export)
     block_size: usize,
 
-    /// Host-level chunk meta cache shared across all exports
-    chunk_meta_cache: Arc<ChunkMetaCache>,
+    /// Shared pack index cache across all exports (v4 block resolution)
+    pack_index_cache: Arc<PackIndexCache>,
 
     /// Shared clean cache across all exports (content-addressed dedup)
     clean_cache: Arc<dyn BlockCache>,
@@ -294,10 +294,10 @@ impl ExportRouter {
             None
         };
 
-        let chunk_meta_cache = Arc::new(
-            ChunkMetaCache::open(&config.cache_dir)
+        let pack_index_cache = Arc::new(
+            PackIndexCache::open(&config.cache_dir)
                 .await
-                .map_err(|e| RouterError::Manifest(format!("chunk meta cache: {e}")))?,
+                .map_err(|e| RouterError::Manifest(format!("pack index cache: {e}")))?,
         );
 
         // Build device managers before moving config.cache_dir.
@@ -319,7 +319,7 @@ impl ExportRouter {
             db_path: config.db_path,
             cache_dir: config.cache_dir,
             block_size: config.block_size,
-            chunk_meta_cache,
+            pack_index_cache,
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
             default_blocks_per_pack: config.default_blocks_per_pack,
@@ -347,128 +347,91 @@ impl ExportRouter {
 
     /// Collect all known block hashes from active exports.
     ///
-    /// Walks VolumeManifest → ChunkMetaCache for each export, collecting the
-    /// unique block hashes that should be present in the clean cache. Used by
-    /// the background scrubber to know which cached blocks to verify.
+    /// Walks all VolumeManifest pack_ids and queries PackIndexCache for block
+    /// hashes. Used by the background scrubber to know which cached blocks to
+    /// verify. Results are best-effort — cold (uncached) pack indices return no
+    /// hashes for those packs.
     pub async fn collect_block_hashes(&self) -> Vec<crate::block::block_map::Blake3Hash> {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
 
-        // Snapshot the Arc references under the async lock, then drop it.
-        let snapshots: Vec<_> = {
+        // Collect all (chunk_idx, pack_id) pairs under the sync manifest lock.
+        let all_pack_ids: Vec<(u32, crate::block::pack::PackId)> = {
             let exports = self.exports.read().await;
-            exports
-                .values()
-                .map(|state| {
-                    (
-                        Arc::clone(&state.volume_manifest),
-                        Arc::clone(&state.chunk_meta_cache),
-                    )
-                })
-                .collect()
+            let mut pairs = Vec::new();
+            for state in exports.values() {
+                let vm = state.volume_manifest.read();
+                pairs.extend(vm.all_pack_ids());
+            }
+            pairs
         };
 
-        // Collect chunk hashes under sync lock (no await while guard held).
-        let mut chunk_hashes = Vec::new();
-        for (vm_lock, _cmc) in &snapshots {
-            let vm = vm_lock.read();
-            for chunk_idx in vm.chunks.keys() {
-                if let Some(chunk_hash) = vm.get_chunk_hash(*chunk_idx) {
-                    chunk_hashes.push(chunk_hash);
-                }
-            }
+        // Group by chunk_idx for efficient known_hashes calls.
+        let mut packs_by_chunk: HashMap<u32, Vec<crate::block::pack::PackId>> = HashMap::new();
+        for (chunk_idx, pack_id) in all_pack_ids {
+            packs_by_chunk.entry(chunk_idx).or_default().push(pack_id);
         }
 
-        // Async cache lookups (chunk_meta_cache is global, shared across exports).
+        // Query PackIndexCache for all hashes (async, best-effort).
         let mut all_hashes = HashSet::new();
-        for chunk_hash in &chunk_hashes {
-            if let Some(meta) = self.chunk_meta_cache.get(chunk_hash).await {
-                for entry in &meta.entries {
-                    all_hashes.insert(entry.hash);
-                }
-            }
+        for pack_ids in packs_by_chunk.values() {
+            let chunk_hashes = self.pack_index_cache.known_hashes(pack_ids).await;
+            all_hashes.extend(chunk_hashes);
         }
         all_hashes.into_iter().collect()
     }
 
-    /// Prefetch chunk metadata from S3 into ChunkMetaCache.
+    /// Warm the PackIndexCache for all active exports (v4 cold-start prefetch).
     ///
-    /// Walks all active exports' VolumeManifests, collects unique chunk hashes
-    /// not already in cache, and fetches them from S3 in parallel. This warms
-    /// the cache on cold start (new host or SSD wipe) so the first VM reads
-    /// hit local cache instead of blocking on S3 .meta fetches.
-    ///
-    /// Content-addressed: forks sharing chunks with their parent deduplicate
-    /// naturally — each unique chunk_hash is fetched at most once.
+    /// In v4, pack indices are fetched on-demand (on first cold read, all pack
+    /// indices for a chunk are prefetched in parallel). This function provides
+    /// an explicit warm-up on server start, reducing first-read latency for
+    /// all known packs across all exports.
     pub async fn prefetch_chunk_metas(&self) -> usize {
-        use std::collections::HashMap;
+        use futures::stream::StreamExt;
 
-        // Snapshot VolumeManifest + ContentStore refs under the async lock, then drop it.
-        let export_data: Vec<_> = {
+        // Collect all (chunk_idx, pack_id, content_store) triples under lock.
+        let to_fetch: Vec<(u32, crate::block::pack::PackId, Arc<ContentStore>)> = {
             let exports = self.exports.read().await;
-            exports
-                .values()
-                .map(|state| {
-                    (
-                        Arc::clone(&state.volume_manifest),
-                        Arc::clone(&state.content_store),
-                    )
-                })
-                .collect()
-        };
-
-        // Collect all (chunk_hash, chunk_idx, content_store) under the synchronous
-        // RwLock, then filter against the async cache after releasing the lock.
-        let mut candidates: HashMap<crate::block::block_map::Blake3Hash, (u32, Arc<ContentStore>)> =
-            HashMap::new();
-        for (vm_lock, cs) in &export_data {
-            let vm = vm_lock.read();
-            for &chunk_idx in vm.chunks.keys() {
-                if let Some(chunk_hash) = vm.get_chunk_hash(chunk_idx) {
-                    candidates
-                        .entry(chunk_hash)
-                        .or_insert_with(|| (chunk_idx, Arc::clone(cs)));
+            let mut triples = Vec::new();
+            for state in exports.values() {
+                let cs = Arc::clone(&state.content_store);
+                let vm = state.volume_manifest.read();
+                for (chunk_idx, pack_id) in vm.all_pack_ids() {
+                    triples.push((chunk_idx, pack_id, Arc::clone(&cs)));
                 }
             }
-        }
-
-        // Filter out chunks already in cache (async cache lookup, no lock held).
-        let mut to_fetch = HashMap::with_capacity(candidates.len());
-        for (chunk_hash, val) in candidates {
-            if self.chunk_meta_cache.get(&chunk_hash).await.is_none() {
-                to_fetch.insert(chunk_hash, val);
-            }
-        }
+            triples
+        };
 
         if to_fetch.is_empty() {
             return 0;
         }
 
-        info!(count = to_fetch.len(), "prefetching chunk metas from S3");
+        // Filter out packs already in cache.
+        let mut uncached = Vec::new();
+        for (chunk_idx, pack_id, cs) in to_fetch {
+            if self.pack_index_cache.get_entries(pack_id).await.is_none() {
+                uncached.push((chunk_idx, pack_id, cs));
+            }
+        }
 
-        use futures::stream::StreamExt;
-        let cmc = Arc::clone(&self.chunk_meta_cache);
-        let fetched: usize = futures::stream::iter(to_fetch)
-            .map(|(chunk_hash, (chunk_idx, cs))| {
-                let cmc = Arc::clone(&cmc);
+        if uncached.is_empty() {
+            return 0;
+        }
+
+        info!(count = uncached.len(), "prefetching pack indices from S3");
+        let pic = Arc::clone(&self.pack_index_cache);
+        let fetched: usize = futures::stream::iter(uncached)
+            .map(|(chunk_idx, pack_id, cs)| {
+                let pic = Arc::clone(&pic);
                 async move {
-                    let hash_hex: String =
-                        chunk_hash.0.iter().map(|b| format!("{b:02x}")).collect();
-                    match cs.get_chunk_meta(chunk_idx, &hash_hex).await {
-                        Ok(Some(data)) => {
-                            match crate::block::chunk_meta::ChunkMeta::deserialize(&data) {
-                                Ok(meta) => {
-                                    cmc.insert(chunk_hash, Arc::new(meta));
-                                    1usize
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "chunk meta prefetch: deserialize failed");
-                                    0
-                                }
-                            }
+                    match cs.get_pack_index(chunk_idx, pack_id).await {
+                        Ok(entries) => {
+                            pic.insert_entries(pack_id, &entries);
+                            1usize
                         }
-                        Ok(None) => 0,
                         Err(e) => {
-                            warn!(error = %e, "chunk meta prefetch: S3 fetch failed");
+                            warn!(chunk_idx, pack_id, error = %e, "pack index prefetch failed");
                             0
                         }
                     }
@@ -478,7 +441,7 @@ impl ExportRouter {
             .fold(0usize, |acc, n| async move { acc + n })
             .await;
 
-        info!(fetched, "chunk meta prefetch complete");
+        info!(fetched, "pack index prefetch complete");
         fetched
     }
 
@@ -526,7 +489,7 @@ impl ExportRouter {
                         s.cache.dirty_block_count(),
                         Arc::clone(&s.cache),
                         Arc::clone(&s.content_store),
-                        Arc::clone(&s.chunk_meta_cache),
+                        Arc::clone(&s.pack_index_cache),
                         Arc::clone(&s.volume_manifest),
                     )
                 })
@@ -708,7 +671,7 @@ impl ExportRouter {
         }
         let content_store = Arc::new(cs);
         let clean_cache = Arc::clone(&self.clean_cache);
-        let chunk_meta_cache = Arc::clone(&self.chunk_meta_cache);
+        let pack_index_cache = Arc::clone(&self.pack_index_cache);
 
         // Create write cache — either from manifest (fork) or fresh (normal)
         let cache_config = WriteCacheConfig {
@@ -741,7 +704,7 @@ impl ExportRouter {
                 }
             } else {
                 // Fork from current manifest
-                match content_store.get_volume_manifest(manifest_name).await {
+                match content_store.get_manifest(manifest_name).await {
                     Ok(Some(data)) => VolumeManifest::deserialize(&data)
                         .map_err(|e| RouterError::Manifest(format!("failed to deserialize volume manifest: {}", e)))?,
                     Ok(None) => {
@@ -784,7 +747,7 @@ impl ExportRouter {
             ));
 
             // Try to load existing volume manifest from S3
-            if let Ok(Some(data)) = content_store.get_volume_manifest(&name).await && let Ok(vm) = VolumeManifest::deserialize(&data) {
+            if let Ok(Some(data)) = content_store.get_manifest(&name).await && let Ok(vm) = VolumeManifest::deserialize(&data) {
                 *volume_manifest.write() = vm;
                 info!("Loaded existing volume manifest for '{}'", name);
             }
@@ -811,13 +774,12 @@ impl ExportRouter {
                     Ok(chunks) => {
                         info!(chunks = chunks.len(), "prefetching boot hot set");
                         let cache_clone = Arc::clone(&cache);
-                        let cc = Arc::clone(&clean_cache);
-                        let cmc = Arc::clone(&chunk_meta_cache);
+                        let cmc = Arc::clone(&pack_index_cache);
                         let vm = Arc::clone(&volume_manifest);
                         let cs = Arc::clone(&content_store);
                         spawn_named("hot-set-prefetch", async move {
                             cache_clone
-                                .prefetch_chunks(&chunks, cc.as_ref(), &cmc, &vm, &cs)
+                                .prefetch_chunks(&chunks, &cmc, &vm, &cs)
                                 .await;
                             info!("boot hot set prefetch complete");
                         });
@@ -841,7 +803,7 @@ impl ExportRouter {
             Arc::clone(&cache),
             Arc::clone(&content_store),
             Arc::clone(&clean_cache),
-            Arc::clone(&chunk_meta_cache),
+            Arc::clone(&pack_index_cache),
             Arc::clone(&volume_manifest),
             config.size_bytes(),
             readonly,
@@ -856,7 +818,7 @@ impl ExportRouter {
         let (flush_shutdown_tx, flush_shutdown_rx) = watch::channel(false);
         let flush_cache = Arc::clone(&cache);
         let flush_cs = Arc::clone(&content_store);
-        let flush_cmc = Arc::clone(&chunk_meta_cache);
+        let flush_cmc = Arc::clone(&pack_index_cache);
         let flush_vm = Arc::clone(&volume_manifest);
         let export_name = name.clone();
         let flush_metrics = Arc::clone(&metrics);
@@ -880,7 +842,7 @@ impl ExportRouter {
             handler,
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             readonly,
             metrics,
@@ -931,7 +893,7 @@ impl ExportRouter {
 
         // Clone Arc'd components under read lock, then release it so we don't
         // block export lifecycle operations (create/remove/shutdown) during flush.
-        let (cache, content_store, chunk_meta_cache, volume_manifest) = {
+        let (cache, content_store, pack_index_cache, volume_manifest) = {
             let exports = self.exports.read().await;
             let state = exports
                 .get(name)
@@ -939,14 +901,14 @@ impl ExportRouter {
             (
                 Arc::clone(&state.cache),
                 Arc::clone(&state.content_store),
-                Arc::clone(&state.chunk_meta_cache),
+                Arc::clone(&state.pack_index_cache),
                 Arc::clone(&state.volume_manifest),
             )
         };
 
         info!("Taking snapshot of export '{}'...", name);
         let result: SnapshotResult = cache
-            .snapshot(&content_store, &chunk_meta_cache, &volume_manifest)
+            .snapshot(&content_store, &pack_index_cache, &volume_manifest)
             .await
             .map_err(RouterError::Cache)?;
 
@@ -1564,7 +1526,7 @@ impl ExportRouter {
             handler,
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             metrics,
             flush_shutdown_tx,
@@ -1585,7 +1547,7 @@ impl ExportRouter {
         //    breaking — matches the public ExportState::drain() behavior.
         let mut drain_done = false;
         for _ in 0..MAX_DRAIN_ITERATIONS {
-            match cache.flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest).await {
+            match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
                 Ok(stats) if stats.blocks_flushed == 0 => {
                     drain_done = true;
                     break;
@@ -1641,7 +1603,7 @@ impl ExportRouter {
     pub(crate) async fn new_for_test() -> Self {
         use crate::block::cache::SimpleBlockCache;
         let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let temp_dir = std::env::temp_dir().join(format!("glidefs-test-{}", uuid::Uuid::new_v4()));
+        let temp_dir = std::env::temp_dir().join(format!("glidefs-test-{:016x}", rand::random::<u64>()));
         std::fs::create_dir_all(&temp_dir).expect("Failed to create test cache dir");
 
         Self::new(RouterConfig {

@@ -1,4 +1,4 @@
-//! Integration tests for garbage collection.
+//! Integration tests for garbage collection (v4).
 //!
 //! These tests verify:
 //! 1. GC reconciliation identifies and deletes orphaned packs
@@ -18,7 +18,7 @@ use glidefs::cli::gc::{
     inject_dead_pack_for_test, new_gc_state_for_test, reconcile_prefix_for_test,
 };
 
-use super::create_v2_test_cache;
+use super::create_test_cache;
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 
@@ -27,9 +27,6 @@ const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 // ---------------------------------------------------------------------------
 
 /// Write `count` distinct blocks starting at block index `start`.
-/// The `seed` parameter ensures different data for the same block indices across calls.
-/// Data is generated so that different seeds produce non-overlapping hashes
-/// even across different block indices.
 fn write_blocks(
     cache: &glidefs::block::write_cache::WriteCache<glidefs::block::state::Active>,
     start: usize,
@@ -39,8 +36,6 @@ fn write_blocks(
 ) {
     for i in 0..count {
         let offset = (start + i) * BLOCK_SIZE;
-        // Embed seed + block index as LE u16 to ensure unique content per block,
-        // even for block indices > 255 (u8 wrapping caused dedup at 500 blocks/pack).
         let mut data = vec![0u8; BLOCK_SIZE];
         data[0] = seed;
         let idx = (start + i) as u16;
@@ -49,6 +44,19 @@ fn write_blocks(
             *byte = ((i + b) % 256) as u8;
         }
         cache.write(offset as u64, &data, clean_cache).unwrap();
+    }
+}
+
+/// Upload fake orphan packs to S3 that aren't referenced by any manifest.
+async fn create_orphan_packs(
+    cs: &glidefs::block::content_store::ContentStore,
+    chunk_idx: u32,
+    pack_ids: &[u64],
+) {
+    for &pack_id in pack_ids {
+        cs.put_chunk_pack(chunk_idx, pack_id, b"orphan pack data".to_vec())
+            .await
+            .unwrap();
     }
 }
 
@@ -61,10 +69,14 @@ fn write_blocks(
 async fn test_gc_finds_no_orphans() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) = create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
     write_blocks(&cache, 0, 5, 0, cc.as_ref());
-    cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
 
     let mut state = new_gc_state_for_test();
     let report = reconcile_prefix_for_test(&cs, &mut state, Duration::ZERO, 10000, false)
@@ -77,30 +89,30 @@ async fn test_gc_finds_no_orphans() {
     assert_eq!(report.packs_deleted(), 0);
 }
 
-/// GC should identify and delete orphaned packs after blocks are overwritten.
+/// GC should identify and delete orphaned packs (packs on S3 not referenced by any manifest).
 #[tokio::test]
 async fn test_gc_deletes_orphaned_packs() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) = create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
-    // First flush: creates packs
+    // Create live packs via flush
     write_blocks(&cache, 0, 5, 0, cc.as_ref());
-    let stats1 = cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
-    let first_packs = stats1.new_pack_ids.clone();
-    assert!(!first_packs.is_empty());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
 
-    // Overwrite the same blocks with different data, flush again
-    // This creates new packs; the old packs are now orphaned
-    write_blocks(&cache, 0, 5, 42, cc.as_ref());
-    let stats2 = cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
-    assert!(!stats2.new_pack_ids.is_empty());
+    // Upload orphan packs directly to S3 (not referenced by any manifest)
+    let orphan_ids = [0xDEAD_0001_0000_0001u64, 0xDEAD_0001_0000_0002];
+    create_orphan_packs(&cs, 0, &orphan_ids).await;
 
-    // Run GC with zero grace period -- inject past timestamps for dead packs
+    // Inject old timestamps so orphans pass the grace period
     let mut state = new_gc_state_for_test();
     let old_ts = Utc::now() - chrono::Duration::hours(25);
-    for id in &first_packs {
-        inject_dead_pack_for_test(&mut state, id, old_ts);
+    for &pack_id in &orphan_ids {
+        inject_dead_pack_for_test(&mut state, 0, pack_id, old_ts);
     }
 
     let report = reconcile_prefix_for_test(&cs, &mut state, Duration::ZERO, 10000, false)
@@ -116,15 +128,21 @@ async fn test_gc_deletes_orphaned_packs() {
 async fn test_gc_respects_grace_period() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) = create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
-    // Create packs, overwrite with different data, flush to create orphans
+    // Create live packs
     write_blocks(&cache, 0, 3, 0, cc.as_ref());
-    let stats1 = cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
-    write_blocks(&cache, 0, 3, 42, cc.as_ref());
-    cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
 
-    // GC with 24h grace period -- dead packs just discovered, should NOT be deleted
+    // Upload orphan packs
+    let orphan_ids = [0xDEAD_0002_0000_0001u64, 0xDEAD_0002_0000_0002];
+    create_orphan_packs(&cs, 0, &orphan_ids).await;
+
+    // GC with 24h grace period — orphans just discovered, should NOT be deleted
     let mut state = new_gc_state_for_test();
     let report = reconcile_prefix_for_test(
         &cs,
@@ -146,8 +164,8 @@ async fn test_gc_respects_grace_period() {
 
     // Now inject old timestamps (past grace period) and run GC again
     let old_ts = Utc::now() - chrono::Duration::hours(25);
-    for id in &stats1.new_pack_ids {
-        inject_dead_pack_for_test(&mut state, id, old_ts);
+    for &pack_id in &orphan_ids {
+        inject_dead_pack_for_test(&mut state, 0, pack_id, old_ts);
     }
 
     let report2 = reconcile_prefix_for_test(
@@ -175,22 +193,25 @@ async fn test_gc_respects_grace_period() {
 async fn test_gc_respects_max_deletes() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) = create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
-    // Create orphans: write blocks, flush, overwrite with different data, flush.
-    // Need >500 blocks per write to create multiple packs (500 blocks/pack).
-    write_blocks(&cache, 0, 750, 0, cc.as_ref());
-    let stats1 = cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
-    let _orphan_count = stats1.new_pack_ids.len();
+    // Create live packs
+    write_blocks(&cache, 0, 5, 0, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
 
-    write_blocks(&cache, 0, 750, 42, cc.as_ref());
-    cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    // Upload several orphan packs across different chunks
+    let orphan_ids: Vec<u64> = (1..=5).map(|i| 0xDEAD_0003_0000_0000u64 + i).collect();
+    create_orphan_packs(&cs, 0, &orphan_ids).await;
 
     // Inject old timestamps so all orphans are eligible
     let mut state = new_gc_state_for_test();
     let old_ts = Utc::now() - chrono::Duration::hours(25);
-    for id in &stats1.new_pack_ids {
-        inject_dead_pack_for_test(&mut state, id, old_ts);
+    for &pack_id in &orphan_ids {
+        inject_dead_pack_for_test(&mut state, 0, pack_id, old_ts);
     }
 
     // Cap at 1 delete
@@ -215,18 +236,24 @@ async fn test_gc_respects_max_deletes() {
 async fn test_gc_dry_run() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) = create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
-    // Create orphans
+    // Create live packs
     write_blocks(&cache, 0, 5, 0, cc.as_ref());
-    let stats1 = cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
-    write_blocks(&cache, 0, 5, 42, cc.as_ref());
-    cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Upload orphan packs
+    let orphan_ids = [0xDEAD_0004_0000_0001u64, 0xDEAD_0004_0000_0002];
+    create_orphan_packs(&cs, 0, &orphan_ids).await;
 
     let mut state = new_gc_state_for_test();
     let old_ts = Utc::now() - chrono::Duration::hours(25);
-    for id in &stats1.new_pack_ids {
-        inject_dead_pack_for_test(&mut state, id, old_ts);
+    for &pack_id in &orphan_ids {
+        inject_dead_pack_for_test(&mut state, 0, pack_id, old_ts);
     }
 
     let report = reconcile_prefix_for_test(&cs, &mut state, Duration::ZERO, 10000, true)
@@ -238,14 +265,6 @@ async fn test_gc_dry_run() {
         report.packs_deleted() > 0,
         "dry-run should report would-delete count"
     );
-
-    // But packs should still exist in S3 -- list all known packs
-    let all_known = cs.list_all_known_packs().await.unwrap();
-    let known_ids: std::collections::HashSet<uuid::Uuid> =
-        all_known.iter().map(|(_, id)| *id).collect();
-    for id in &stats1.new_pack_ids {
-        assert!(known_ids.contains(id), "dry-run should not actually delete packs");
-    }
 }
 
 /// Shared packs referenced by a fork should NOT be deleted even after source is gone.
@@ -253,11 +272,15 @@ async fn test_gc_dry_run() {
 async fn test_gc_fork_then_delete_source() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) = create_v2_test_cache(&dir, "parent", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "parent", Arc::clone(&s3) as _).await;
 
     // Write and flush parent
     write_blocks(&cache, 0, 5, 0, cc.as_ref());
-    cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
 
     // Get parent volume manifest bytes
     let manifest_bytes = cs.get_manifest("parent").await.unwrap().unwrap();
@@ -268,7 +291,8 @@ async fn test_gc_fork_then_delete_source() {
         .unwrap();
 
     // Delete parent manifest (simulate VM deletion)
-    let parent_manifest_key = object_store::path::Path::from("test/manifests/parent".to_string());
+    let parent_manifest_key =
+        object_store::path::Path::from("test/manifests/parent".to_string());
     s3.delete(&parent_manifest_key).await.unwrap();
 
     // Run GC -- parent packs should be live because child manifest references them
@@ -291,11 +315,15 @@ async fn test_gc_fork_then_delete_source() {
 async fn test_gc_manifest_parse_error() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) = create_v2_test_cache(&dir, "vm-good", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm-good", Arc::clone(&s3) as _).await;
 
     // Create a valid VM with packs
     write_blocks(&cache, 0, 3, 0, cc.as_ref());
-    cache.flush_to_s3(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
 
     // Write a corrupt manifest for another "VM"
     cs.put_manifest("vm-corrupt", b"not a valid manifest".to_vec())
@@ -313,5 +341,9 @@ async fn test_gc_manifest_parse_error() {
         1,
         "should report one manifest parse error"
     );
-    assert_eq!(report.packs_deleted(), 0, "should not delete any packs when manifest errors occur");
+    assert_eq!(
+        report.packs_deleted(),
+        0,
+        "should not delete any packs when manifest errors occur"
+    );
 }

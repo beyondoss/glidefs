@@ -13,6 +13,7 @@
 //! The data file uses positional I/O (pread/pwrite) which is thread-safe per
 //! POSIX semantics, eliminating the need for any locking on the hot path.
 
+pub(crate) mod compact;
 mod config;
 mod error;
 mod flush;
@@ -52,8 +53,6 @@ pub struct FlushStats {
     pub packs_uploaded: usize,
     /// Total bytes uploaded to S3.
     pub bytes_uploaded: u64,
-    /// Pack IDs created during this flush (for registry updates).
-    pub new_pack_ids: Vec<uuid::Uuid>,
 }
 
 /// Result of a snapshot operation.

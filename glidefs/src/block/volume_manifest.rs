@@ -1,60 +1,70 @@
-//! Volume manifest: lightweight JSON mapping of chunk indices to chunk content hashes.
+//! Volume manifest v4: binary GLVM format with pack ID lists per chunk.
 //!
-//! The volume manifest is the top-level metadata for a chunked block index volume.
-//! It's ~1KB of JSON that maps chunk_idx → chunk_hash (BLAKE3-128 hex). Unwritten
-//! chunk indices are absent from the map. This replaces the flat GLDE binary manifest
-//! for the v3 chunked architecture.
+//! The volume manifest maps chunk indices to ordered lists of pack IDs.
+//! Stored as binary GLVM at `manifests/{export_name}` in S3.
+//! Sparse: only chunks with written data appear. Absent = all-zero / unwritten.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use super::pack::PackId;
 
-use super::block_map::Blake3Hash;
+/// GLVM magic bytes.
+pub const GLVM_MAGIC: &[u8; 4] = b"GLVM";
 
-/// Current volume manifest version.
-pub const VOLUME_MANIFEST_VERSION: u32 = 3;
+/// Volume manifest version 4.
+pub const VOLUME_MANIFEST_VERSION: u16 = 4;
 
-/// Default chunk size: 10GB.
-pub const DEFAULT_CHUNK_SIZE: u64 = 10 * 1024 * 1024 * 1024;
+/// Default chunk size for v4: 128 MiB (= 1 ext4 block group).
+pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024 * 1024;
 
-/// Volume manifest: maps chunk indices to content-addressed chunk hashes.
+/// GLVM header size in bytes.
+const GLVM_HEADER_SIZE: usize = 32;
+
+/// One chunk's pack list in the v4 manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkEntry {
+    /// Ordered pack list: oldest first, newest last (last = highest priority).
+    /// After compaction: single entry covering all written blocks.
+    pub packs: Vec<PackId>,
+}
+
+/// Volume manifest v4: binary format mapping chunk indices to pack ID lists.
 ///
-/// Stored as JSON at the same `manifests/{export_name}` S3 key.
-/// Typically ~1KB even for large volumes (sparse map of written chunks only).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Stored as binary GLVM at the same `manifests/{export_name}` S3 key.
+/// Sparse: only chunks with written data appear. Absent = all-zero / unwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeManifest {
     /// Device size in bytes.
     pub size: u64,
-    /// Format version (= 3).
-    pub version: u32,
-    /// Bytes per chunk (default 10GB).
+    /// Bytes per chunk (default 128 MiB).
     pub chunk_size: u64,
-    /// Bytes per block (default 131072 = 128KB).
+    /// Bytes per block (default 131072 = 128 KB).
     pub block_size: u32,
-    /// Sparse map: chunk_idx → BLAKE3-128 content hash (hex string).
+    /// Sparse map: chunk_idx → ordered pack list.
     /// Only written chunks appear. Absent = all-zero / unwritten.
-    pub chunks: BTreeMap<u32, String>,
+    pub chunks: BTreeMap<u32, ChunkEntry>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum VolumeManifestError {
+    #[error("unsupported volume manifest version: {0}")]
+    UnsupportedVersion(u32),
+    #[error("invalid config: block_size and chunk_size must be non-zero")]
+    InvalidConfig,
+    #[error("binary manifest data too short")]
+    TooShort,
+    #[error("bad GLVM magic bytes")]
+    BadMagic,
+    #[error("CRC32 mismatch: stored={stored:#010x}, computed={computed:#010x}")]
+    CrcMismatch { stored: u32, computed: u32 },
 }
 
 impl VolumeManifest {
-    /// Create an empty volume manifest for a new device.
+    /// Create an empty v4 manifest for a new device.
     pub fn new(size: u64, block_size: u32) -> Self {
         Self {
             size,
-            version: VOLUME_MANIFEST_VERSION,
             chunk_size: DEFAULT_CHUNK_SIZE,
-            block_size,
-            chunks: BTreeMap::new(),
-        }
-    }
-
-    /// Create with a custom chunk size (for testing).
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn with_chunk_size(size: u64, block_size: u32, chunk_size: u64) -> Self {
-        Self {
-            size,
-            version: VOLUME_MANIFEST_VERSION,
-            chunk_size,
             block_size,
             chunks: BTreeMap::new(),
         }
@@ -83,88 +93,162 @@ impl VolumeManifest {
         (block_index % blocks_per_chunk) as u32
     }
 
-    /// Get the chunk hash for a given chunk index. Returns None if unwritten.
-    pub fn get_chunk_hash(&self, chunk_idx: u32) -> Option<Blake3Hash> {
-        self.chunks
-            .get(&chunk_idx)
-            .map(|hex| hex_to_blake3(hex))
+    /// Get pack IDs for a chunk. Returns None if unwritten.
+    pub fn chunk_pack_ids(&self, chunk_idx: u32) -> Option<&[PackId]> {
+        self.chunks.get(&chunk_idx).map(|e| e.packs.as_slice())
     }
 
-    /// Set the chunk hash for a given chunk index.
-    pub fn set_chunk_hash(&mut self, chunk_idx: u32, hash: Blake3Hash) {
-        self.chunks.insert(chunk_idx, blake3_to_hex(&hash));
-    }
-
-    /// Remove a chunk (mark as unwritten). Returns whether it was present.
-    #[allow(dead_code)]
-    pub fn remove_chunk(&mut self, chunk_idx: u32) -> bool {
-        self.chunks.remove(&chunk_idx).is_some()
-    }
-
-    /// Serialize to JSON bytes.
-    pub fn serialize(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("VolumeManifest serialization cannot fail")
-    }
-
-    /// Deserialize from JSON bytes.
-    pub fn deserialize(data: &[u8]) -> Result<Self, VolumeManifestError> {
-        let manifest: Self =
-            serde_json::from_slice(data).map_err(VolumeManifestError::Json)?;
-        if manifest.version != VOLUME_MANIFEST_VERSION {
-            return Err(VolumeManifestError::UnsupportedVersion(manifest.version));
-        }
-        if manifest.block_size == 0 || manifest.chunk_size == 0 {
-            return Err(VolumeManifestError::InvalidConfig);
-        }
-        // Validate all chunk hashes: exactly 32 lowercase hex characters.
-        // Catches corrupted/truncated hashes at load time instead of silently
-        // zero-filling at read time (which would cause wrong cache lookups).
-        for (&chunk_idx, hex) in &manifest.chunks {
-            if !validate_hex_hash(hex) {
-                return Err(VolumeManifestError::InvalidChunkHash {
-                    chunk_idx,
-                    len: hex.len(),
-                });
+    /// Collect all (chunk_idx, pack_id) pairs across the manifest (for GC).
+    pub fn all_pack_ids(&self) -> HashSet<(u32, PackId)> {
+        let mut result = HashSet::new();
+        for (&chunk_idx, entry) in &self.chunks {
+            for &pack_id in &entry.packs {
+                result.insert((chunk_idx, pack_id));
             }
         }
-        Ok(manifest)
+        result
     }
-}
 
-/// Convert Blake3Hash to lowercase hex string.
-fn blake3_to_hex(hash: &Blake3Hash) -> String {
-    hash.0.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Convert hex string to Blake3Hash.
-///
-/// Panics on invalid input — callers must validate via `validate_hex_hash`
-/// (enforced by `VolumeManifest::deserialize`).
-fn hex_to_blake3(hex: &str) -> Blake3Hash {
-    let mut bytes = [0u8; 16];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        let start = i * 2;
-        *byte = u8::from_str_radix(&hex[start..start + 2], 16)
-            .expect("hex_to_blake3 called with unvalidated input");
+    /// Append a new pack to a chunk's pack list (after flush).
+    pub fn append_pack(&mut self, chunk_idx: u32, pack_id: PackId) {
+        self.chunks
+            .entry(chunk_idx)
+            .or_insert_with(|| ChunkEntry { packs: Vec::new() })
+            .packs
+            .push(pack_id);
     }
-    Blake3Hash(bytes)
-}
 
-/// Validate that a hex string is exactly 32 lowercase hex characters.
-fn validate_hex_hash(hex: &str) -> bool {
-    hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit())
-}
+    /// Replace a chunk's entire pack list (after compaction).
+    pub fn replace_packs(&mut self, chunk_idx: u32, packs: Vec<PackId>) {
+        if packs.is_empty() {
+            self.chunks.remove(&chunk_idx);
+        } else {
+            self.chunks.insert(chunk_idx, ChunkEntry { packs });
+        }
+    }
 
-#[derive(Debug, thiserror::Error)]
-pub enum VolumeManifestError {
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("unsupported volume manifest version: {0}")]
-    UnsupportedVersion(u32),
-    #[error("invalid config: block_size and chunk_size must be non-zero")]
-    InvalidConfig,
-    #[error("invalid chunk hash for chunk {chunk_idx}: expected 32 hex chars, got {len} chars")]
-    InvalidChunkHash { chunk_idx: u32, len: usize },
+    /// Serialize to binary GLVM format.
+    ///
+    /// ```text
+    /// Header (32 bytes):
+    ///   magic:        [u8; 4]  = b"GLVM"
+    ///   version:      u16 LE   = 4
+    ///   chunk_count:  u32 LE
+    ///   chunk_size:   u32 LE
+    ///   block_size:   u32 LE
+    ///   device_size:  u64 LE
+    ///   reserved:     [u8; 6]
+    ///
+    /// Chunk entries (sorted by chunk_idx):
+    ///   chunk_idx:    u32 LE
+    ///   pack_count:   u8
+    ///   packs:        [u64 LE; pack_count]
+    ///
+    /// CRC32 trailer: 4 bytes
+    /// ```
+    pub fn serialize(&self) -> Vec<u8> {
+        // Pre-compute size.
+        let entries_size: usize = self
+            .chunks
+            .values()
+            .map(|e| 4 + 1 + e.packs.len() * 8) // chunk_idx + pack_count + packs
+            .sum();
+        let total = GLVM_HEADER_SIZE + entries_size + 4; // +4 for CRC32
+        let mut buf = Vec::with_capacity(total);
+
+        // Header (32 bytes).
+        buf.extend_from_slice(GLVM_MAGIC); // 4
+        buf.extend_from_slice(&VOLUME_MANIFEST_VERSION.to_le_bytes()); // 2
+        buf.extend_from_slice(&(self.chunks.len() as u32).to_le_bytes()); // 4
+        // chunk_size: truncate to u32 (128 MiB fits)
+        buf.extend_from_slice(&(self.chunk_size as u32).to_le_bytes()); // 4
+        buf.extend_from_slice(&self.block_size.to_le_bytes()); // 4
+        buf.extend_from_slice(&self.size.to_le_bytes()); // 8
+        buf.extend_from_slice(&[0u8; 6]); // 6 reserved
+
+        // Chunk entries (sorted by chunk_idx via BTreeMap iteration order).
+        for (&chunk_idx, entry) in &self.chunks {
+            buf.extend_from_slice(&chunk_idx.to_le_bytes());
+            buf.push(entry.packs.len() as u8);
+            for &pack_id in &entry.packs {
+                buf.extend_from_slice(&pack_id.to_le_bytes());
+            }
+        }
+
+        // CRC32 trailer.
+        let crc = crc32fast::hash(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        debug_assert_eq!(buf.len(), total);
+        buf
+    }
+
+    /// Deserialize from binary GLVM format.
+    pub fn deserialize(data: &[u8]) -> Result<Self, VolumeManifestError> {
+        if data.len() < GLVM_HEADER_SIZE + 4 {
+            return Err(VolumeManifestError::TooShort);
+        }
+
+        // Verify CRC32.
+        let crc_offset = data.len() - 4;
+        let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
+        let computed_crc = crc32fast::hash(&data[..crc_offset]);
+        if stored_crc != computed_crc {
+            return Err(VolumeManifestError::CrcMismatch {
+                stored: stored_crc,
+                computed: computed_crc,
+            });
+        }
+
+        // Parse header.
+        if &data[0..4] != GLVM_MAGIC {
+            return Err(VolumeManifestError::BadMagic);
+        }
+        let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
+        if version != VOLUME_MANIFEST_VERSION {
+            return Err(VolumeManifestError::UnsupportedVersion(version as u32));
+        }
+        let chunk_count = u32::from_le_bytes(data[6..10].try_into().unwrap()) as usize;
+        let chunk_size = u32::from_le_bytes(data[10..14].try_into().unwrap()) as u64;
+        let block_size = u32::from_le_bytes(data[14..18].try_into().unwrap());
+        let device_size = u64::from_le_bytes(data[18..26].try_into().unwrap());
+        // reserved: data[26..32]
+
+        if block_size == 0 || chunk_size == 0 {
+            return Err(VolumeManifestError::InvalidConfig);
+        }
+
+        // Parse chunk entries.
+        let mut chunks = BTreeMap::new();
+        let mut pos = GLVM_HEADER_SIZE;
+        for _ in 0..chunk_count {
+            if pos + 5 > crc_offset {
+                return Err(VolumeManifestError::TooShort);
+            }
+            let chunk_idx = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            let pack_count = data[pos + 4] as usize;
+            pos += 5;
+
+            if pos + pack_count * 8 > crc_offset {
+                return Err(VolumeManifestError::TooShort);
+            }
+            let mut packs = Vec::with_capacity(pack_count);
+            for _ in 0..pack_count {
+                let pack_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                packs.push(pack_id);
+                pos += 8;
+            }
+
+            chunks.insert(chunk_idx, ChunkEntry { packs });
+        }
+
+        Ok(VolumeManifest {
+            size: device_size,
+            chunk_size,
+            block_size,
+            chunks,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -172,161 +256,157 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_manifest() {
-        let m = VolumeManifest::new(256 * 1024 * 1024 * 1024, 131072);
-        assert_eq!(m.size, 256 * 1024 * 1024 * 1024);
-        assert_eq!(m.version, 3);
+    fn test_v4_new_manifest() {
+        let m = VolumeManifest::new(1024 * 1024 * 1024 * 1024, 131072); // 1 TB
+        assert_eq!(m.size, 1024 * 1024 * 1024 * 1024);
         assert_eq!(m.chunk_size, DEFAULT_CHUNK_SIZE);
         assert_eq!(m.block_size, 131072);
         assert!(m.chunks.is_empty());
+        // 128 MiB / 128 KB = 1024 blocks per chunk
+        assert_eq!(m.blocks_per_chunk(), 1024);
+        // 1 TB / 128 MiB = 8192 chunks
+        assert_eq!(m.num_chunks(), 8192);
     }
 
     #[test]
-    fn test_blocks_per_chunk() {
-        let m = VolumeManifest::new(256 * 1024 * 1024 * 1024, 131072);
-        // 10GB / 128KB = 81920
-        assert_eq!(m.blocks_per_chunk(), 81920);
-    }
-
-    #[test]
-    fn test_num_chunks() {
-        // 256GB / 10GB = 25.6 → 26 chunks
-        let m = VolumeManifest::new(256 * 1024 * 1024 * 1024, 131072);
-        assert_eq!(m.num_chunks(), 26);
-
-        // Exact multiple: 10GB / 10GB = 1
-        let m2 = VolumeManifest::new(DEFAULT_CHUNK_SIZE, 131072);
-        assert_eq!(m2.num_chunks(), 1);
-    }
-
-    #[test]
-    fn test_chunk_idx_for_block() {
-        let m = VolumeManifest::new(256 * 1024 * 1024 * 1024, 131072);
-        // Block 0 → chunk 0
-        assert_eq!(m.chunk_idx_for_block(0), 0);
-        // Last block in chunk 0 (81919) → chunk 0
-        assert_eq!(m.chunk_idx_for_block(81919), 0);
-        // First block in chunk 1 (81920) → chunk 1
-        assert_eq!(m.chunk_idx_for_block(81920), 1);
-        // Block 200000 → chunk 2
-        assert_eq!(m.chunk_idx_for_block(200000), 2);
-    }
-
-    #[test]
-    fn test_block_offset_in_chunk() {
-        let m = VolumeManifest::new(256 * 1024 * 1024 * 1024, 131072);
-        assert_eq!(m.block_offset_in_chunk(0), 0);
-        assert_eq!(m.block_offset_in_chunk(81919), 81919);
-        assert_eq!(m.block_offset_in_chunk(81920), 0);
-        assert_eq!(m.block_offset_in_chunk(81921), 1);
-    }
-
-    #[test]
-    fn test_round_trip() {
-        let mut m = VolumeManifest::new(256 * 1024 * 1024 * 1024, 131072);
-        let hash = Blake3Hash([0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x01, 0x23,
-                               0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x00, 0x11]);
-        m.set_chunk_hash(0, hash);
-        m.set_chunk_hash(5, Blake3Hash([0xff; 16]));
+    fn test_v4_binary_round_trip() {
+        let mut m = VolumeManifest::new(100 * 1024 * 1024 * 1024, 131072); // 100 GiB
+        m.append_pack(0, 0xDEADBEEF01234567);
+        m.append_pack(0, 0xCAFEBABE89ABCDEF);
+        m.append_pack(5, 0x1111111111111111);
+        m.append_pack(800, 0x2222222222222222);
 
         let bytes = m.serialize();
         let m2 = VolumeManifest::deserialize(&bytes).unwrap();
         assert_eq!(m, m2);
-        assert_eq!(m2.get_chunk_hash(0), Some(hash));
-        assert_eq!(m2.get_chunk_hash(5), Some(Blake3Hash([0xff; 16])));
-        assert_eq!(m2.get_chunk_hash(1), None);
-    }
 
-    #[test]
-    fn test_remove_chunk() {
-        let mut m = VolumeManifest::new(10 * 1024 * 1024 * 1024, 131072);
-        let hash = Blake3Hash([0x42; 16]);
-        m.set_chunk_hash(0, hash);
-        assert!(m.get_chunk_hash(0).is_some());
-        assert!(m.remove_chunk(0));
-        assert!(m.get_chunk_hash(0).is_none());
-        assert!(!m.remove_chunk(0)); // already removed
-    }
-
-    #[test]
-    fn test_rejects_bad_version() {
-        let mut m = VolumeManifest::new(10 * 1024 * 1024 * 1024, 131072);
-        m.version = 99;
-        let bytes = serde_json::to_vec(&m).unwrap();
-        let err = VolumeManifest::deserialize(&bytes).unwrap_err();
-        assert!(matches!(err, VolumeManifestError::UnsupportedVersion(99)));
-    }
-
-    #[test]
-    fn test_rejects_invalid_config() {
-        let m = VolumeManifest {
-            size: 1024,
-            version: VOLUME_MANIFEST_VERSION,
-            chunk_size: 0,
-            block_size: 131072,
-            chunks: BTreeMap::new(),
-        };
-        let bytes = serde_json::to_vec(&m).unwrap();
-        let err = VolumeManifest::deserialize(&bytes).unwrap_err();
-        assert!(matches!(err, VolumeManifestError::InvalidConfig));
-    }
-
-    #[test]
-    fn test_rejects_truncated_chunk_hash() {
-        let mut m = VolumeManifest::new(10 * 1024 * 1024 * 1024, 131072);
-        m.chunks.insert(0, "abcdef".to_string()); // too short
-        let bytes = serde_json::to_vec(&m).unwrap();
-        let err = VolumeManifest::deserialize(&bytes).unwrap_err();
-        assert!(matches!(
-            err,
-            VolumeManifestError::InvalidChunkHash { chunk_idx: 0, len: 6 }
-        ));
-    }
-
-    #[test]
-    fn test_rejects_invalid_hex_in_chunk_hash() {
-        let mut m = VolumeManifest::new(10 * 1024 * 1024 * 1024, 131072);
-        m.chunks.insert(5, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string()); // 32 chars but not hex
-        let bytes = serde_json::to_vec(&m).unwrap();
-        let err = VolumeManifest::deserialize(&bytes).unwrap_err();
-        assert!(matches!(
-            err,
-            VolumeManifestError::InvalidChunkHash { chunk_idx: 5, len: 32 }
-        ));
-    }
-
-    #[test]
-    fn test_hex_round_trip() {
-        let hash = Blake3Hash([0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x01, 0x23,
-                               0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x00, 0x11]);
-        let hex = blake3_to_hex(&hash);
-        assert_eq!(hex, "a1b2c3d4e5f60123456789abcdef0011");
-        let back = hex_to_blake3(&hex);
-        assert_eq!(back, hash);
-    }
-
-    #[test]
-    fn test_small_device_single_chunk() {
-        // 1GB device → 1 chunk (10GB chunk size > device)
-        let m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        assert_eq!(m.num_chunks(), 1);
-        assert_eq!(m.blocks_per_chunk(), 81920);
-        assert_eq!(m.chunk_idx_for_block(0), 0);
-        assert_eq!(m.chunk_idx_for_block(8191), 0); // last block in 1GB
-    }
-
-    #[test]
-    fn test_custom_chunk_size() {
-        // 1GB chunks for testing
-        let m = VolumeManifest::with_chunk_size(
-            10 * 1024 * 1024 * 1024, // 10GB device
-            131072,                    // 128KB blocks
-            1024 * 1024 * 1024,       // 1GB chunks
+        // Verify chunk lookups.
+        assert_eq!(
+            m2.chunk_pack_ids(0),
+            Some([0xDEADBEEF01234567, 0xCAFEBABE89ABCDEF].as_slice())
         );
-        assert_eq!(m.num_chunks(), 10);
-        assert_eq!(m.blocks_per_chunk(), 8192); // 1GB / 128KB
+        assert_eq!(
+            m2.chunk_pack_ids(5),
+            Some([0x1111111111111111].as_slice())
+        );
+        assert_eq!(
+            m2.chunk_pack_ids(800),
+            Some([0x2222222222222222].as_slice())
+        );
+        assert_eq!(m2.chunk_pack_ids(1), None);
+    }
+
+    #[test]
+    fn test_v4_sparse_only_written_chunks() {
+        let m = VolumeManifest::new(1024 * 1024 * 1024 * 1024, 131072); // 1 TB, empty
+        let bytes = m.serialize();
+        // Header (32) + CRC32 (4) = 36 bytes for empty manifest.
+        assert_eq!(bytes.len(), 36);
+
+        let m2 = VolumeManifest::deserialize(&bytes).unwrap();
+        assert!(m2.chunks.is_empty());
+        assert_eq!(m2.size, 1024 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_v4_manifest_size_matches_predictions() {
+        // 1 TB, 50% written, compacted (1 pack/chunk) = ~53 KB per plan.
+        let mut m = VolumeManifest::new(1024 * 1024 * 1024 * 1024, 131072);
+        for i in 0..4096 {
+            // 50% of 8192 chunks
+            m.append_pack(i * 2, 0x1234567890ABCDEF);
+        }
+        let bytes = m.serialize();
+        // 32 (header) + 4096 * (4 + 1 + 8) (entries) + 4 (crc) = 32 + 53248 + 4 = 53284
+        assert_eq!(bytes.len(), 53284);
+
+        // Verify round-trip.
+        let m2 = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(m, m2);
+    }
+
+    #[test]
+    fn test_v4_crc_corruption_detected() {
+        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        m.append_pack(0, 42);
+
+        let mut bytes = m.serialize();
+        // Corrupt a data byte.
+        bytes[GLVM_HEADER_SIZE + 2] ^= 0xFF;
+        let err = VolumeManifest::deserialize(&bytes).unwrap_err();
+        assert!(matches!(err, VolumeManifestError::CrcMismatch { .. }));
+    }
+
+    #[test]
+    fn test_v4_bad_magic() {
+        let m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        let mut bytes = m.serialize();
+        bytes[0] = b'X';
+        // Fix CRC so we test magic detection, not CRC.
+        let crc_offset = bytes.len() - 4;
+        let crc = crc32fast::hash(&bytes[..crc_offset]);
+        bytes[crc_offset..].copy_from_slice(&crc.to_le_bytes());
+
+        let err = VolumeManifest::deserialize(&bytes).unwrap_err();
+        assert!(matches!(err, VolumeManifestError::BadMagic));
+    }
+
+    #[test]
+    fn test_v4_truncated_data() {
+        let err = VolumeManifest::deserialize(&[0u8; 10]).unwrap_err();
+        assert!(matches!(err, VolumeManifestError::TooShort));
+    }
+
+    #[test]
+    fn test_v4_append_and_replace_packs() {
+        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        m.append_pack(0, 100);
+        m.append_pack(0, 200);
+        m.append_pack(0, 300);
+        assert_eq!(m.chunk_pack_ids(0), Some([100, 200, 300].as_slice()));
+
+        // Compaction: replace 3 packs with 1.
+        m.replace_packs(0, vec![400]);
+        assert_eq!(m.chunk_pack_ids(0), Some([400].as_slice()));
+
+        // Replace with empty removes the chunk.
+        m.replace_packs(0, vec![]);
+        assert_eq!(m.chunk_pack_ids(0), None);
+        assert!(m.chunks.is_empty());
+    }
+
+    #[test]
+    fn test_v4_all_pack_ids() {
+        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        m.append_pack(0, 100);
+        m.append_pack(0, 200);
+        m.append_pack(5, 300);
+        m.append_pack(5, 100); // same pack_id in different chunk is distinct
+
+        let ids = m.all_pack_ids();
+        assert_eq!(ids.len(), 4);
+        assert!(ids.contains(&(0, 100)));
+        assert!(ids.contains(&(0, 200)));
+        assert!(ids.contains(&(5, 300)));
+        assert!(ids.contains(&(5, 100)));
+    }
+
+    #[test]
+    fn test_v4_chunk_idx_for_block() {
+        let m = VolumeManifest::new(1024 * 1024 * 1024 * 1024, 131072); // 1 TB
+        // 128 MiB / 128 KB = 1024 blocks per chunk
         assert_eq!(m.chunk_idx_for_block(0), 0);
-        assert_eq!(m.chunk_idx_for_block(8191), 0);
-        assert_eq!(m.chunk_idx_for_block(8192), 1);
+        assert_eq!(m.chunk_idx_for_block(1023), 0);
+        assert_eq!(m.chunk_idx_for_block(1024), 1);
+        assert_eq!(m.chunk_idx_for_block(2048), 2);
+    }
+
+    #[test]
+    fn test_v4_block_offset_in_chunk() {
+        let m = VolumeManifest::new(1024 * 1024 * 1024 * 1024, 131072);
+        assert_eq!(m.block_offset_in_chunk(0), 0);
+        assert_eq!(m.block_offset_in_chunk(1023), 1023);
+        assert_eq!(m.block_offset_in_chunk(1024), 0);
+        assert_eq!(m.block_offset_in_chunk(1025), 1);
     }
 }

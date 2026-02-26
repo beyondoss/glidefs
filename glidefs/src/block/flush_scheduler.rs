@@ -17,9 +17,9 @@ use rand::Rng;
 use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
-use crate::block::chunk_cache::ChunkMetaCache;
 use crate::block::content_store::ContentStore;
 use crate::block::metrics::ExportMetrics;
+use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::state::Active;
 use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::WriteCache;
@@ -32,7 +32,7 @@ use crate::block::write_cache::WriteCache;
 pub async fn flush_scheduler(
     cache: Arc<WriteCache<Active>>,
     content_store: Arc<ContentStore>,
-    chunk_meta_cache: Arc<ChunkMetaCache>,
+    pack_index_cache: Arc<PackIndexCache>,
     volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
     flush_notify: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
@@ -88,7 +88,7 @@ pub async fn flush_scheduler(
                 // Acquire per-export flush lock to serialize with concurrent
                 // drain/snapshot operations. Prevents stale manifest uploads.
                 let _flush_guard = cache.flush_lock().lock().await;
-                match cache.flush_packs(&content_store, &chunk_meta_cache, &volume_manifest).await {
+                match cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest).await {
                     Ok((stats, _seq_cutpoint)) => {
                         flush_backoff = Duration::ZERO;
                         metrics.record_s3_put_latency(start.elapsed());
@@ -184,7 +184,9 @@ mod tests {
     use crate::block::cache::{BlockCache, SimpleBlockCache};
     use crate::block::content_store::ContentStore;
     use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use crate::block::pack_index_cache::PackIndexCache;
     use crate::block::state::Initializing;
+    use crate::block::volume_manifest::VolumeManifest;
     use crate::block::write_cache::WriteCacheConfig;
     use async_trait::async_trait;
     use futures::stream::BoxStream;
@@ -301,7 +303,7 @@ mod tests {
     async fn test_scheduler_components() -> (
         Arc<WriteCache<Active>>,
         Arc<ContentStore>,
-        Arc<ChunkMetaCache>,
+        Arc<PackIndexCache>,
         Arc<parking_lot::RwLock<VolumeManifest>>,
         Arc<Notify>,
         watch::Receiver<bool>,
@@ -321,7 +323,7 @@ mod tests {
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = Arc::new(ContentStore::new(s3, "test"));
-        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
         let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
             device_size(),
             128 * 1024,
@@ -338,7 +340,7 @@ mod tests {
         (
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             flush_notify,
             shutdown_rx,
@@ -356,7 +358,7 @@ mod tests {
     ) -> (
         Arc<WriteCache<Active>>,
         Arc<ContentStore>,
-        Arc<ChunkMetaCache>,
+        Arc<PackIndexCache>,
         Arc<parking_lot::RwLock<VolumeManifest>>,
         Arc<Notify>,
         watch::Receiver<bool>,
@@ -375,7 +377,7 @@ mod tests {
         };
 
         let content_store = Arc::new(ContentStore::new(s3, "test"));
-        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
         let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
             device_size(),
             128 * 1024,
@@ -392,7 +394,7 @@ mod tests {
         (
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             flush_notify,
             shutdown_rx,
@@ -405,14 +407,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_shutdown() {
-        let (cache, content_store, chunk_meta_cache, volume_manifest, flush_notify, shutdown_rx, shutdown_tx, metrics, ..) =
+        let (cache, content_store, pack_index_cache, volume_manifest, flush_notify, shutdown_rx, shutdown_tx, metrics, ..) =
             test_scheduler_components().await;
 
         let handle = tokio::spawn(async move {
             flush_scheduler(
                 cache,
                 content_store,
-                chunk_meta_cache,
+                pack_index_cache,
                 volume_manifest,
                 flush_notify,
                 shutdown_rx,
@@ -436,7 +438,7 @@ mod tests {
         let (
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             flush_notify,
             shutdown_rx,
@@ -465,7 +467,7 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                chunk_meta_cache,
+                pack_index_cache,
                 volume_manifest,
                 flush_notify,
                 shutdown_rx,
@@ -504,7 +506,7 @@ mod tests {
         let (
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             flush_notify,
             shutdown_rx,
@@ -529,7 +531,7 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                chunk_meta_cache,
+                pack_index_cache,
                 volume_manifest,
                 flush_notify,
                 shutdown_rx,
@@ -588,7 +590,7 @@ mod tests {
         let (
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             flush_notify,
             shutdown_rx,
@@ -614,7 +616,7 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                chunk_meta_cache,
+                pack_index_cache,
                 volume_manifest,
                 flush_notify,
                 shutdown_rx,
@@ -672,7 +674,7 @@ mod tests {
         let (
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             flush_notify,
             shutdown_rx,
@@ -696,7 +698,7 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                chunk_meta_cache,
+                pack_index_cache,
                 volume_manifest,
                 flush_notify,
                 shutdown_rx,

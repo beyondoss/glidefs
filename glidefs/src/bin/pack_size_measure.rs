@@ -174,16 +174,17 @@ fn measure_pack_size(
         .map(|i| &all_blocks[i * blocks_per_pack..(i + 1) * blocks_per_pack])
         .collect();
 
-    // Pre-compute hashes + compressed data for each pack
-    let prepared_packs: Vec<Vec<(Blake3Hash, Vec<u8>)>> = packs
+    // Pre-compute hashes + compressed data for each pack (with synthetic chunk_offsets)
+    let prepared_packs: Vec<Vec<(Blake3Hash, u32, Vec<u8>)>> = packs
         .iter()
         .map(|pack_blocks| {
             pack_blocks
                 .iter()
-                .map(|data| {
+                .enumerate()
+                .map(|(i, data)| {
                     let hash = blake3_128(data);
                     let compressed = lz4_compress(data);
-                    (hash, compressed)
+                    (hash, i as u32, compressed)
                 })
                 .collect()
         })
@@ -194,7 +195,7 @@ fn measure_pack_size(
         .iter()
         .map(|prepared| {
             let (pack_bytes, _entries) =
-                assemble_pack(prepared.clone(), BLOCK_SIZE as u32).unwrap();
+                assemble_pack(prepared.clone(), blocks_per_pack as u32).unwrap();
             pack_bytes
         })
         .collect();
@@ -216,11 +217,12 @@ fn measure_pack_size(
     // Warmup
     for &pi in &bench_packs {
         for _ in 0..WARMUP_ITERS {
-            let prepped: Vec<(Blake3Hash, Vec<u8>)> = packs[pi]
+            let prepped: Vec<(Blake3Hash, u32, Vec<u8>)> = packs[pi]
                 .iter()
-                .map(|data| (blake3_128(data), lz4_compress(data)))
+                .enumerate()
+                .map(|(i, data)| (blake3_128(data), i as u32, lz4_compress(data)))
                 .collect();
-            let (pack, _) = assemble_pack(prepped, BLOCK_SIZE as u32).unwrap();
+            let (pack, _) = assemble_pack(prepped, blocks_per_pack as u32).unwrap();
             std::hint::black_box(&pack);
         }
     }
@@ -229,11 +231,12 @@ fn measure_pack_size(
     for _ in 0..iters {
         for &pi in &bench_packs {
             let start = Instant::now();
-            let prepped: Vec<(Blake3Hash, Vec<u8>)> = packs[pi]
+            let prepped: Vec<(Blake3Hash, u32, Vec<u8>)> = packs[pi]
                 .iter()
-                .map(|data| (blake3_128(data), lz4_compress(data)))
+                .enumerate()
+                .map(|(i, data)| (blake3_128(data), i as u32, lz4_compress(data)))
                 .collect();
-            let (_pack, _entries) = assemble_pack(prepped, BLOCK_SIZE as u32).unwrap();
+            let (_pack, _entries) = assemble_pack(prepped, blocks_per_pack as u32).unwrap();
             assembly_times.push(start.elapsed().as_micros() as f64);
         }
     }

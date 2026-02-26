@@ -5,10 +5,10 @@
 //! - `BlockDevice`: Device descriptor used during transmission phase
 
 use super::cache::BlockCache;
-use super::chunk_cache::ChunkMetaCache;
 use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
 use super::metrics::ExportMetrics;
+use super::pack_index_cache::PackIndexCache;
 use super::readahead::SequentialDetector;
 use super::state::Active;
 use super::volume_manifest::VolumeManifest;
@@ -52,10 +52,10 @@ pub struct BlockHandler {
     /// v2 clean block cache (decompressed blocks from S3 packs)
     clean_cache: Arc<dyn BlockCache>,
 
-    /// Host-level chunk meta cache for hash→pack location lookup
-    chunk_meta_cache: Arc<ChunkMetaCache>,
+    /// Pack index cache for v4 block resolution
+    pack_index_cache: Arc<PackIndexCache>,
 
-    /// Volume manifest mapping chunk indices to content hashes
+    /// Volume manifest mapping chunk indices to pack lists (v4)
     volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
 
     /// Device size in bytes (atomic for live resize)
@@ -99,7 +99,7 @@ impl BlockHandler {
         cache: Arc<WriteCache<Active>>,
         content_store: Arc<ContentStore>,
         clean_cache: Arc<dyn BlockCache>,
-        chunk_meta_cache: Arc<ChunkMetaCache>,
+        pack_index_cache: Arc<PackIndexCache>,
         volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
         device_size: u64,
         readonly: bool,
@@ -113,7 +113,7 @@ impl BlockHandler {
             cache,
             content_store,
             clean_cache,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             device_size: AtomicU64::new(device_size),
             readonly: AtomicBool::new(readonly),
@@ -182,11 +182,11 @@ impl BlockHandler {
 
         let data = self
             .cache
-            .read_v2(
+            .read(
                 offset,
                 length as usize,
                 self.clean_cache.as_ref(),
-                &self.chunk_meta_cache,
+                &self.pack_index_cache,
                 &self.volume_manifest,
                 &self.content_store,
                 &self.metrics,
@@ -223,19 +223,20 @@ impl BlockHandler {
 
         self.metrics.record_guest_read(length as u64);
 
-        let n = self
+        let data = self
             .cache
-            .read_into_v2(
+            .read(
                 offset,
                 length as usize,
-                buf,
                 self.clean_cache.as_ref(),
-                &self.chunk_meta_cache,
+                &self.pack_index_cache,
                 &self.volume_manifest,
                 &self.content_store,
                 &self.metrics,
             )
             .await?;
+        let n = data.len().min(buf.len());
+        buf[..n].copy_from_slice(&data[..n]);
 
         self.trigger_readahead(offset);
 
@@ -468,7 +469,7 @@ impl BlockHandler {
                 offset,
                 length as usize,
                 self.clean_cache.as_ref(),
-                &self.chunk_meta_cache,
+                &self.pack_index_cache,
                 &self.volume_manifest,
                 &self.content_store,
                 &self.metrics,
@@ -483,20 +484,23 @@ impl BlockHandler {
     /// Detects sequential access patterns and spawns a background prefetch
     /// for the next chunk. Used by the NBD read path and ublk zero-copy path.
     pub fn trigger_readahead(&self, offset: u64) {
-        let chunk_size = self.cache.block_size() as u64;
-        let chunk_idx = offset / chunk_size;
-        if let Some(readahead_chunk) = self.readahead.lock().record(chunk_idx) {
+        let block_size = self.cache.block_size() as u64;
+        let block_idx = offset / block_size;
+        if let Some(readahead_block) = self.readahead.lock().record(block_idx) {
+            // Compute the v4 chunk_idx for the readahead block
+            let chunk_idx = self
+                .volume_manifest
+                .read()
+                .chunk_idx_for_block(readahead_block);
             let cache = Arc::clone(&self.cache);
-            let clean_cache = Arc::clone(&self.clean_cache);
-            let chunk_meta_cache = Arc::clone(&self.chunk_meta_cache);
+            let pack_index_cache = Arc::clone(&self.pack_index_cache);
             let volume_manifest = Arc::clone(&self.volume_manifest);
             let content_store = Arc::clone(&self.content_store);
             tokio::spawn(async move {
                 let _ = cache
                     .prefetch_chunk(
-                        readahead_chunk as usize,
-                        clean_cache.as_ref(),
-                        &chunk_meta_cache,
+                        chunk_idx,
+                        &pack_index_cache,
                         &volume_manifest,
                         &content_store,
                     )
@@ -511,6 +515,8 @@ mod tests {
     use super::*;
     use crate::block::cache::SimpleBlockCache;
     use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use crate::block::pack_index_cache::PackIndexCache;
+    use crate::block::volume_manifest::VolumeManifest;
     use crate::block::write_cache::WriteCacheConfig;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
@@ -532,10 +538,9 @@ mod tests {
         // Create in-memory S3 store for tests
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
 
-        // v2 read path components
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
         let volume_manifest = Arc::new(parking_lot::RwLock::new(
             VolumeManifest::new(1024 * 1024, 4096),
         ));
@@ -551,7 +556,7 @@ mod tests {
             Arc::new(cache),
             content_store,
             clean_cache,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             1024 * 1024,
             readonly,
@@ -734,7 +739,7 @@ mod tests {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
         let volume_manifest = Arc::new(parking_lot::RwLock::new(
             VolumeManifest::new(1024 * 1024, 4096),
         ));
@@ -747,7 +752,7 @@ mod tests {
             Arc::new(cache),
             content_store,
             clean_cache,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             1024 * 1024,
             false,

@@ -4,13 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{debug, info, instrument, warn};
 
-use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, format_hash, lz4_compress};
-use crate::block::chunk_cache::ChunkMetaCache;
-use crate::block::chunk_meta::{ChunkMeta, ChunkMetaEntry};
+use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
 use crate::block::content_store::ContentStore;
-use crate::block::pack::{self, DEFAULT_BLOCKS_PER_PACK};
 use crate::block::state::{Active, Draining};
-use crate::block::volume_manifest::VolumeManifest;
 
 use super::inner::CacheInner;
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
@@ -260,327 +256,6 @@ impl WriteCache<Active> {
         })
     }
 
-    /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by
-    /// volume chunk, per-chunk dedup/compress/upload, CAS SYNCING→CLEAN.
-    ///
-    /// Returns (stats, seq_cutpoint) on success. seq_cutpoint is used for
-    /// snapshot versioning only (not for per-block CAS).
-    async fn flush_dirty_inner(
-        &self,
-        content_store: &ContentStore,
-        chunk_meta_cache: &Arc<ChunkMetaCache>,
-        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
-    ) -> Result<(FlushStats, u64), CacheError> {
-        let block_size = self.inner.config.block_size as u32;
-
-        // Capture sequence for snapshot versioning (not per-block CAS).
-        let seq_cutpoint = self.inner.sequence.current();
-
-        // Claim dirty blocks: CAS DIRTY→SYNCING.
-        // Only blocks that successfully transition are included in the flush.
-        let snapshot: Vec<usize> = self
-            .inner
-            .state_map
-            .iter_with_state(SparseBlockState::DIRTY)
-            .filter(|&idx| self.inner.transition_dirty_to_syncing(idx))
-            .collect();
-
-        if snapshot.is_empty() {
-            debug!("flush: no dirty blocks to flush");
-            return Ok((FlushStats::default(), seq_cutpoint));
-        }
-
-        info!(
-            dirty_blocks = snapshot.len(),
-            seq_cutpoint, "starting flush"
-        );
-
-        // Run the flush body. If any error occurs after claiming blocks,
-        // revert all SYNCING blocks back to DIRTY so they're retried.
-        let result = self
-            .flush_dirty_body(&snapshot, block_size, content_store, chunk_meta_cache, volume_manifest)
-            .await;
-
-        if result.is_err() {
-            for &idx in &snapshot {
-                // transition_to_dirty handles SYNCING→DIRTY correctly
-                // (decrements syncing_count, increments dirty_count).
-                // No-op if already transitioned by a concurrent write.
-                self.inner.transition_to_dirty(idx);
-            }
-        }
-
-        result.map(|stats| (stats, seq_cutpoint))
-    }
-
-    /// Inner body of flush_dirty_inner, factored out for error recovery.
-    async fn flush_dirty_body(
-        &self,
-        snapshot: &[usize],
-        block_size: u32,
-        content_store: &ContentStore,
-        chunk_meta_cache: &Arc<ChunkMetaCache>,
-        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
-    ) -> Result<FlushStats, CacheError> {
-        // 3. Partition dirty blocks by volume chunk
-        let mut per_chunk: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-        {
-            let vm = volume_manifest.read();
-            for &block_index in snapshot {
-                let chunk_idx = vm.chunk_idx_for_block(block_index as u64);
-                per_chunk.entry(chunk_idx).or_default().push(block_index);
-            }
-        }
-
-        // 4. Pre-fetch existing ChunkMeta for all affected chunks
-        for &chunk_idx in per_chunk.keys() {
-            let chunk_hash = volume_manifest.read().get_chunk_hash(chunk_idx);
-            if let Some(chunk_hash) = chunk_hash && chunk_meta_cache.get(&chunk_hash).await.is_none() {
-                let hash_hex = format_hash(&chunk_hash);
-                match content_store.get_chunk_meta(chunk_idx, &hash_hex).await {
-                    Ok(Some(data)) => match ChunkMeta::deserialize(&data) {
-                        Ok(meta) => {
-                            chunk_meta_cache.insert(chunk_hash, Arc::new(meta));
-                        }
-                        Err(e) => {
-                            warn!(chunk_idx, error = %e, "failed to deserialize chunk meta from S3");
-                        }
-                    },
-                    Ok(None) => {
-                        warn!(chunk_idx, "chunk meta not found in S3");
-                    }
-                    Err(e) => {
-                        warn!(chunk_idx, error = %e, "failed to fetch chunk meta from S3");
-                    }
-                }
-            }
-        }
-
-        let mut total_stats = FlushStats::default();
-        let mut all_computed: Vec<(usize, Blake3Hash)> = Vec::new();
-        let mut chunk_updates: Vec<(u32, Blake3Hash)> = Vec::new();
-
-        // 5. Per-chunk flush
-        for (chunk_idx, chunk_blocks) in per_chunk {
-            let existing_chunk_hash = volume_manifest.read().get_chunk_hash(chunk_idx);
-            let existing_meta = match existing_chunk_hash {
-                Some(h) => chunk_meta_cache.get(&h).await,
-                None => None,
-            };
-
-            // Build dedup HashSet from existing entries
-            let known_hashes: HashSet<Blake3Hash> = existing_meta
-                .as_ref()
-                .map(|m| m.block_hashes())
-                .unwrap_or_default();
-
-            // Build existing hash→pack_location map (for reusing pack locations of deduped blocks)
-            let existing_hash_locs: HashMap<Blake3Hash, (uuid::Uuid, u32, u32)> = existing_meta
-                .as_ref()
-                .map(|m| {
-                    m.entries
-                        .iter()
-                        .map(|e| (e.hash, (e.pack_id, e.pack_offset, e.comp_length)))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // Compute batch for this chunk's blocks
-            let zero_hash = self.inner.zero_block_hash;
-            let inner = Arc::clone(&self.inner);
-            let known = known_hashes;
-            let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
-                compute_flush_batch(&inner, &chunk_blocks, &known, zero_hash)
-            })
-            .await
-            .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
-
-            total_stats.blocks_flushed += batch.stats.blocks_flushed;
-            total_stats.blocks_deduped += batch.stats.blocks_deduped;
-            total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
-            total_stats.blocks_corrupted += batch.stats.blocks_corrupted;
-
-            // Transition skipped blocks back SYNCING→DIRTY so they're
-            // picked up by the next flush cycle.
-            for &idx in &batch.skipped {
-                self.inner.transition_to_dirty(idx);
-            }
-
-            // Assemble and upload packs (chunk-scoped)
-            use futures::stream::{self, StreamExt};
-
-            let to_upload = std::mem::take(&mut batch.to_upload);
-            let mut owned_chunks: Vec<Vec<(Blake3Hash, Vec<u8>)>> = Vec::new();
-            {
-                let mut iter = to_upload.into_iter().peekable();
-                while iter.peek().is_some() {
-                    owned_chunks
-                        .push(iter.by_ref().take(DEFAULT_BLOCKS_PER_PACK).collect());
-                }
-            }
-
-            // Build hash→pack_location map from upload results
-            let mut hash_to_pack_loc: HashMap<Blake3Hash, (uuid::Uuid, u32, u32)> = HashMap::new();
-
-            if !owned_chunks.is_empty() {
-                #[allow(clippy::type_complexity)]
-                let pack_results: Vec<
-                    Result<(uuid::Uuid, u64, Vec<pack::PackIndexEntry>), CacheError>,
-                > = stream::iter(owned_chunks)
-                    .map(|chunk| {
-                        let cs = content_store;
-                        let cidx = chunk_idx;
-                        async move {
-                            let pack_id = uuid::Uuid::new_v4();
-                            let (pack_bytes, index_entries) =
-                                pack::assemble_pack(chunk, block_size)?;
-                            let pack_size = pack_bytes.len() as u64;
-                            cs.put_chunk_pack(cidx, pack_id, pack_bytes).await?;
-                            Ok((pack_id, pack_size, index_entries))
-                        }
-                    })
-                    .buffer_unordered(4)
-                    .collect()
-                    .await;
-
-                for result in pack_results {
-                    let (pack_id, pack_size, index_entries) = result?;
-                    total_stats.packs_uploaded += 1;
-                    total_stats.bytes_uploaded += pack_size;
-                    total_stats.new_pack_ids.push(pack_id);
-                    for entry in &index_entries {
-                        hash_to_pack_loc
-                            .insert(entry.hash, (pack_id, entry.offset, entry.comp_length));
-                    }
-                }
-            }
-
-            // Build new ChunkMetaEntry list from computed results
-            let mut new_entries: Vec<ChunkMetaEntry> = Vec::new();
-            {
-                let vm = volume_manifest.read();
-                for &(block_index, hash) in &batch.computed {
-                    if hash == zero_hash || hash == self.inner.zero_block_hash {
-                        continue; // zero blocks don't need entries
-                    }
-                    let block_offset = vm.block_offset_in_chunk(block_index as u64);
-
-                    // Try newly uploaded packs first, then existing entries
-                    let pack_loc = hash_to_pack_loc
-                        .get(&hash)
-                        .or_else(|| existing_hash_locs.get(&hash));
-
-                    if let Some(&(pack_id, pack_offset, comp_length)) = pack_loc {
-                        new_entries.push(ChunkMetaEntry {
-                            offset: block_offset,
-                            hash,
-                            pack_id,
-                            pack_offset,
-                            comp_length,
-                        });
-                    }
-                }
-            }
-
-            // Read chunk geometry from VolumeManifest
-            let (chunk_size_bytes, device_block_size) = {
-                let vm = volume_manifest.read();
-                (vm.chunk_size, vm.block_size)
-            };
-
-            // Merge with existing ChunkMeta to produce new version
-            let new_meta = if let Some(ref old_meta) = existing_meta {
-                ChunkMeta::merge(old_meta, &new_entries)
-            } else {
-                let mut entries = new_entries;
-                entries.sort_by_key(|e| e.offset);
-                ChunkMeta {
-                    chunk_idx,
-                    chunk_size: chunk_size_bytes,
-                    block_size: device_block_size,
-                    entries,
-                }
-            };
-
-            // Compute new content hash and upload
-            let new_chunk_hash = new_meta.content_hash();
-            let meta_bytes = new_meta.serialize();
-            let hash_hex = format_hash(&new_chunk_hash);
-            content_store
-                .put_chunk_meta(chunk_idx, &hash_hex, meta_bytes)
-                .await?;
-
-            // Update cache
-            chunk_meta_cache.insert(new_chunk_hash, Arc::new(new_meta));
-            chunk_updates.push((chunk_idx, new_chunk_hash));
-
-            // Collect all computed entries for post-upload CAS
-            all_computed.extend(batch.computed);
-        }
-
-        // 6. CAS SYNCING→CLEAN for successfully flushed blocks.
-        // If a concurrent write transitioned SYNCING→DIRTY, the CAS fails
-        // and the block stays DIRTY for the next flush cycle.
-        for &(chunk_index, _actual_hash) in &all_computed {
-            if !self.inner.transition_syncing_to_clean(chunk_index) {
-                total_stats.blocks_cas_failed += 1;
-            }
-        }
-
-        // 7. Update VolumeManifest with new chunk hashes
-        {
-            let mut vm = volume_manifest.write();
-            for &(chunk_idx, ref chunk_hash) in &chunk_updates {
-                vm.set_chunk_hash(chunk_idx, *chunk_hash);
-            }
-        }
-
-        info!(
-            blocks_flushed = total_stats.blocks_flushed,
-            blocks_deduped = total_stats.blocks_deduped,
-            blocks_cas_failed = total_stats.blocks_cas_failed,
-            blocks_corrupted = total_stats.blocks_corrupted,
-            packs_uploaded = total_stats.packs_uploaded,
-            bytes_uploaded = total_stats.bytes_uploaded,
-            chunks_updated = chunk_updates.len(),
-            "flush dirty inner complete"
-        );
-
-        Ok(total_stats)
-    }
-
-    /// Flush dirty blocks to S3 as chunk-scoped packs (no manifest upload).
-    ///
-    /// Returns flush statistics and the sequence cutpoint for a subsequent
-    /// `sync_manifest()` call. Used by the flush scheduler to separate
-    /// pack flushes (~5s) from manifest syncs (~60s).
-    pub async fn flush_packs(
-        &self,
-        content_store: &ContentStore,
-        chunk_meta_cache: &Arc<ChunkMetaCache>,
-        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
-    ) -> Result<(FlushStats, u64), CacheError> {
-        self.flush_dirty_inner(content_store, chunk_meta_cache, volume_manifest)
-            .await
-    }
-
-    /// Upload the VolumeManifest to S3.
-    ///
-    /// Call after `flush_packs()` with the returned `seq_cutpoint` to persist
-    /// a recovery manifest.
-    pub async fn sync_manifest(
-        &self,
-        content_store: &ContentStore,
-        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
-    ) -> Result<(), CacheError> {
-        let manifest_bytes = volume_manifest.read().serialize();
-        content_store
-            .put_volume_manifest(&self.inner.export_name, manifest_bytes)
-            .await?;
-        self.checkpoint()?;
-        Ok(())
-    }
-
     /// Persist block states and truncate WAL.
     fn checkpoint(&self) -> Result<(), CacheError> {
         let mut wal = self.inner.wal.lock();
@@ -671,62 +346,333 @@ impl WriteCache<Active> {
         }
     }
 
-    /// Flush dirty blocks to S3 as chunk-scoped packs + volume manifest.
+    /// Reference to the per-export flush serialization lock.
     ///
-    /// This is the v3 chunked flush path:
-    /// 1. Claim dirty blocks via CAS DIRTY→SYNCING
-    /// 2. Partition by volume chunk, dedup against chunk meta
-    /// 3. LZ4-compress new blocks and assemble into packs per chunk
-    /// 4. Upload packs to S3 concurrently as chunks/{idx}/{uuid}.pack
-    /// 5. Build new ChunkMeta, upload as chunks/{idx}/{hash}.meta
-    /// 6. CAS SYNCING→CLEAN (fails if concurrent write re-dirtied)
-    /// 7. Upload VolumeManifest
-    /// 8. Checkpoint: persist block states + truncate WAL
-    #[instrument(skip(self, content_store, chunk_meta_cache, volume_manifest))]
+    /// The flush_scheduler must acquire this lock around the
+    /// `flush_packs` + `sync_manifest` sequence to prevent concurrent
+    /// manifest uploads from racing with `flush_to_s3` (drain path).
+    pub(crate) fn flush_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.flush_lock
+    }
+
+    /// Get a clone of the inner Arc for sharing with the sync worker.
+    #[allow(dead_code)]
+    pub(crate) fn inner(&self) -> Arc<CacheInner> {
+        Arc::clone(&self.inner)
+    }
+
+    /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by
+    /// chunk (128 MiB), per-chunk dedup/compress/upload as GLPK v2 packs,
+    /// append pack_id to VolumeManifest, CAS SYNCING→CLEAN.
+    ///
+    /// Returns (stats, seq_cutpoint) on success.
+    async fn flush_dirty_inner(
+        &self,
+        content_store: &ContentStore,
+        pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+    ) -> Result<(FlushStats, u64), CacheError> {
+        let seq_cutpoint = self.inner.sequence.current();
+
+        // Claim dirty blocks: CAS DIRTY→SYNCING.
+        let snapshot: Vec<usize> = self
+            .inner
+            .state_map
+            .iter_with_state(SparseBlockState::DIRTY)
+            .filter(|&idx| self.inner.transition_dirty_to_syncing(idx))
+            .collect();
+
+        if snapshot.is_empty() {
+            debug!("flush: no dirty blocks to flush");
+            return Ok((FlushStats::default(), seq_cutpoint));
+        }
+
+        info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
+
+        let result = self
+            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest)
+            .await;
+
+        if result.is_err() {
+            for &idx in &snapshot {
+                self.inner.transition_to_dirty(idx);
+            }
+        }
+
+        result.map(|stats| (stats, seq_cutpoint))
+    }
+
+    /// Inner body of flush_dirty_inner, factored out for error recovery.
+    ///
+    /// Per-chunk: load pack indices from PackIndexCache → known_hashes,
+    /// compute_flush_batch (rayon: pread + CRC32 + BLAKE3 + LZ4),
+    /// assemble GLPK v2 pack, upload to S3, update PackIndexCache,
+    /// append pack_id to manifest. No .meta upload.
+    async fn flush_dirty_body(
+        &self,
+        snapshot: &[usize],
+        content_store: &ContentStore,
+        pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+    ) -> Result<FlushStats, CacheError> {
+        use crate::block::pack::{new_pack_id, assemble_pack};
+
+        // Partition dirty blocks by chunk
+        let mut per_chunk: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        {
+            let vm = volume_manifest.read();
+            for &block_index in snapshot {
+                let chunk_idx = vm.chunk_idx_for_block(block_index as u64);
+                per_chunk.entry(chunk_idx).or_default().push(block_index);
+            }
+        }
+
+        // Warm PackIndexCache for all affected chunks (cold start path).
+        // This ensures the read path can resolve blocks after flush without an
+        // extra S3 round-trip per pack. Not used for write-path dedup (packs use
+        // offset-based dedup, not hash-based — see comment below).
+        for &chunk_idx in per_chunk.keys() {
+            let pack_ids = {
+                let vm = volume_manifest.read();
+                vm.chunk_pack_ids(chunk_idx)
+                    .map(|ids| ids.to_vec())
+                    .unwrap_or_default()
+            };
+            for &pid in &pack_ids {
+                if pack_index_cache.get_entries(pid).await.is_none() {
+                    match content_store.get_pack_index(chunk_idx, pid).await {
+                        Ok(entries) => {
+                            pack_index_cache.insert_entries(pid, &entries);
+                        }
+                        Err(e) => {
+                            warn!(
+                                chunk_idx, pack_id = pid,
+                                error = %e,
+                                "failed to warm pack index cache from S3"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut total_stats = FlushStats::default();
+        let mut all_computed: Vec<(usize, Blake3Hash)> = Vec::new();
+
+        // Per-chunk flush
+        for (chunk_idx, chunk_blocks) in per_chunk {
+            // Do NOT use hash-based dedup against existing packs.
+            //
+            // Packs are indexed by chunk_offset (not by hash). Hash-based
+            // dedup is incorrect because two blocks at DIFFERENT chunk_offsets may
+            // share the same hash — both need their own index entries in the pack.
+            // Without correct index entries, reads return zeros for blocks that
+            // hash-match an entry at a different chunk_offset.
+            //
+            // Compaction handles storage efficiency (delta packs get merged).
+            // The pre-fetch below only warms the read-path cache.
+            let known_hashes: HashSet<Blake3Hash> = HashSet::new();
+
+            // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
+            let zero_hash = self.inner.zero_block_hash;
+            let inner = Arc::clone(&self.inner);
+            let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
+                compute_flush_batch(&inner, &chunk_blocks, &known_hashes, zero_hash)
+            })
+            .await
+            .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
+
+            total_stats.blocks_flushed += batch.stats.blocks_flushed;
+            total_stats.blocks_deduped += batch.stats.blocks_deduped;
+            total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
+            total_stats.blocks_corrupted += batch.stats.blocks_corrupted;
+
+            // Transition skipped blocks back SYNCING→DIRTY
+            for &idx in &batch.skipped {
+                self.inner.transition_to_dirty(idx);
+            }
+
+            // Build hash → compressed data map from the unique-hash upload set.
+            // Within-batch dedup (seen_hashes in compute_flush_batch) ensures one
+            // copy of compressed data per unique hash.
+            let hash_to_compressed: HashMap<Blake3Hash, Vec<u8>> =
+                std::mem::take(&mut batch.to_upload).into_iter().collect();
+
+            if hash_to_compressed.is_empty() {
+                // All blocks are zero — nothing to upload, still record for CAS.
+                all_computed.extend(batch.computed);
+                continue;
+            }
+
+            // Build one pack entry per non-zero dirty block, each at its actual
+            // chunk_offset. Two blocks with the same hash but different chunk_offsets
+            // both get entries (clone of compressed bytes), ensuring both are
+            // resolvable by the read path.
+            let blocks_for_pack: Vec<(Blake3Hash, u32, Vec<u8>)> = {
+                let vm = volume_manifest.read();
+                batch
+                    .computed
+                    .iter()
+                    .filter_map(|&(block_index, hash)| {
+                        // hash_to_compressed excludes zero_hash (zero blocks → None in
+                        // compute_flush_batch → not in to_upload).
+                        let compressed = hash_to_compressed.get(&hash)?.clone();
+                        let chunk_offset = vm.block_offset_in_chunk(block_index as u64);
+                        Some((hash, chunk_offset, compressed))
+                    })
+                    .collect()
+            };
+
+            // Assemble GLPK v2 pack (sorted by chunk_offset for read locality)
+            let blocks_per_chunk = {
+                let vm = volume_manifest.read();
+                vm.blocks_per_chunk()
+            };
+            let (pack_bytes, index_entries) =
+                assemble_pack(blocks_for_pack, blocks_per_chunk)?;
+            let pack_size = pack_bytes.len() as u64;
+            let pack_id = new_pack_id();
+
+            // Upload pack to S3
+            content_store
+                .put_chunk_pack(chunk_idx, pack_id, pack_bytes)
+                .await?;
+
+            total_stats.packs_uploaded += 1;
+            total_stats.bytes_uploaded += pack_size;
+
+            // Update PackIndexCache with new entries
+            pack_index_cache.insert_entries(pack_id, &index_entries);
+
+            // Append pack_id to manifest chunk entry
+            {
+                let mut vm = volume_manifest.write();
+                vm.append_pack(chunk_idx, pack_id);
+            }
+
+            all_computed.extend(batch.computed);
+        }
+
+        // CAS SYNCING→CLEAN for successfully flushed blocks
+        for &(chunk_index, _) in &all_computed {
+            if !self.inner.transition_syncing_to_clean(chunk_index) {
+                total_stats.blocks_cas_failed += 1;
+            }
+        }
+
+        info!(
+            blocks_flushed = total_stats.blocks_flushed,
+            blocks_deduped = total_stats.blocks_deduped,
+            blocks_cas_failed = total_stats.blocks_cas_failed,
+            blocks_corrupted = total_stats.blocks_corrupted,
+            packs_uploaded = total_stats.packs_uploaded,
+            bytes_uploaded = total_stats.bytes_uploaded,
+            "flush complete"
+        );
+
+        Ok(total_stats)
+    }
+
+    /// Flush dirty blocks to S3 as chunk-scoped GLPK v2 packs (no manifest upload).
+    ///
+    /// After a successful flush, runs inline compaction for any chunks that
+    /// exceed the compaction threshold. Old packs are deleted best-effort.
+    pub async fn flush_packs(
+        &self,
+        content_store: &ContentStore,
+        pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+    ) -> Result<(FlushStats, u64), CacheError> {
+        let result = self
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+            .await?;
+
+        // Inline compaction: merge delta packs for chunks over threshold
+        if result.0.packs_uploaded > 0 {
+            match super::compact::compact_if_needed(
+                super::compact::DEFAULT_COMPACTION_THRESHOLD,
+                content_store,
+                pack_index_cache,
+                volume_manifest,
+            )
+            .await
+            {
+                Ok(compaction_results) => {
+                    for r in &compaction_results {
+                        info!(
+                            chunk_idx = r.chunk_idx,
+                            new_pack_id = r.new_pack_id,
+                            live_blocks = r.live_blocks,
+                            new_pack_bytes = r.new_pack_size,
+                            old_packs = r.old_pack_ids.len(),
+                            "compacted chunk"
+                        );
+                    }
+                    if !compaction_results.is_empty() {
+                        super::compact::delete_old_packs(&compaction_results, content_store).await;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "inline compaction failed, will retry next cycle");
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Upload the VolumeManifest (binary GLVM) to S3.
+    pub async fn sync_manifest(
+        &self,
+        content_store: &ContentStore,
+        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+    ) -> Result<(), CacheError> {
+        let manifest_bytes = volume_manifest.read().serialize();
+        content_store
+            .put_manifest(&self.inner.export_name, manifest_bytes)
+            .await?;
+        self.checkpoint()?;
+        Ok(())
+    }
+
+    /// Flush dirty blocks to S3 + upload manifest (drain/snapshot path).
+    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn flush_to_s3(
         &self,
         content_store: &ContentStore,
-        chunk_meta_cache: &Arc<ChunkMetaCache>,
-        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+        pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, _seq_cutpoint) = self
-            .flush_dirty_inner(content_store, chunk_meta_cache, volume_manifest)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
             .await?;
-        // Upload VolumeManifest
         let manifest_bytes = volume_manifest.read().serialize();
         content_store
-            .put_volume_manifest(&self.inner.export_name, manifest_bytes)
+            .put_manifest(&self.inner.export_name, manifest_bytes)
             .await?;
         self.checkpoint()?;
         Ok(stats)
     }
 
-    /// Take a point-in-time snapshot: flush dirty blocks + upload volume manifest.
-    ///
-    /// In addition to uploading the current volume manifest (overwriting
-    /// `manifests/{name}`), this persists a versioned copy at
-    /// `snapshots/{name}/{sequence:020}` that is never overwritten by
-    /// background flushes.
-    #[instrument(skip(self, content_store, chunk_meta_cache, volume_manifest))]
+    /// Take a point-in-time snapshot.
+    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn snapshot(
         &self,
         content_store: &ContentStore,
-        chunk_meta_cache: &Arc<ChunkMetaCache>,
-        volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+        pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, seq_cutpoint) = self
-            .flush_dirty_inner(content_store, chunk_meta_cache, volume_manifest)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
             .await?;
 
-        // Upload current volume manifest
         let manifest_bytes = volume_manifest.read().serialize();
         let manifest_etag = content_store
-            .put_volume_manifest(&self.inner.export_name, manifest_bytes.clone())
+            .put_manifest(&self.inner.export_name, manifest_bytes.clone())
             .await?;
 
-        // Persist versioned snapshot (best-effort)
         if let Err(e) = content_store
             .put_snapshot(&self.inner.export_name, seq_cutpoint, manifest_bytes)
             .await
@@ -743,20 +689,5 @@ impl WriteCache<Active> {
             sequence: seq_cutpoint,
             stats,
         })
-    }
-
-    /// Reference to the per-export flush serialization lock.
-    ///
-    /// The flush_scheduler must acquire this lock around the
-    /// `flush_packs` + `sync_manifest` sequence to prevent concurrent
-    /// manifest uploads from racing with `flush_to_s3` (drain path).
-    pub(crate) fn flush_lock(&self) -> &tokio::sync::Mutex<()> {
-        &self.inner.flush_lock
-    }
-
-    /// Get a clone of the inner Arc for sharing with the sync worker.
-    #[allow(dead_code)]
-    pub(crate) fn inner(&self) -> Arc<CacheInner> {
-        Arc::clone(&self.inner)
     }
 }

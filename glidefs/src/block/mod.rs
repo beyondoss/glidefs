@@ -2,14 +2,13 @@ pub mod api;
 pub mod block_map;
 pub mod cache;
 pub mod capacity_monitor;
-pub mod chunk_cache;
-pub mod chunk_meta;
 pub mod error;
 pub mod flush_scheduler;
 pub mod handler;
 pub mod content_store;
 pub mod manifest;
 pub mod pack;
+pub mod pack_index_cache;
 pub mod readahead;
 pub mod scrubber;
 

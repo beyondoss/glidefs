@@ -1,5 +1,5 @@
 use super::*;
-use crate::block::chunk_cache::ChunkMetaCache;
+use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::state::{Active, Initializing};
 use crate::block::volume_manifest::VolumeManifest;
 use bytes::Bytes;
@@ -43,7 +43,7 @@ async fn test_write_read() {
     cache.write(0, b"hello world", &clean_cache).unwrap();
 
     // Read it back
-    let data = cache.read(0, 11).unwrap();
+    let data = cache.read_local_only(0, 11).unwrap();
     assert_eq!(&data[..], b"hello world");
 
     // Should have dirty blocks now
@@ -63,7 +63,7 @@ async fn test_flush() {
     cache.flush().unwrap();
 
     // Data should still be readable
-    let data = cache.read(0, 4).unwrap();
+    let data = cache.read_local_only(0, 4).unwrap();
     assert_eq!(&data[..], b"data");
 }
 
@@ -89,7 +89,7 @@ async fn test_metadata_persistence() {
 
         let cache = cache.finish_recovery().await.unwrap();
         // Data should be readable
-        let data = cache.read(0, 10).unwrap();
+        let data = cache.read_local_only(0, 10).unwrap();
         assert_eq!(&data[..], b"persistent");
     }
 }
@@ -132,17 +132,18 @@ fn test_is_zero_block() {
 }
 
 // ====================================================================
-// v2 Test Harness + Flush Tests
+// Test Harness + Flush Tests
 // ====================================================================
 
-/// Test harness for v2 content-addressed flush tests.
+/// Test harness for content-addressed flush tests.
 ///
-/// Bundles the full v2 stack (cache + content store + pack index) in one
-/// struct so tests can focus on behavior, not setup boilerplate.
+/// Bundles the full stack (cache + content store + pack index cache +
+/// volume manifest) in one struct so tests can focus on behavior, not
+/// setup boilerplate.
 struct V2Harness {
     cache: WriteCache<Active>,
     content_store: crate::block::content_store::ContentStore,
-    chunk_meta_cache: Arc<ChunkMetaCache>,
+    pack_index_cache: Arc<PackIndexCache>,
     volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
     clean_cache: crate::block::cache::SimpleBlockCache,
     #[allow(dead_code)]
@@ -168,7 +169,7 @@ impl V2Harness {
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store =
             crate::block::content_store::ContentStore::new(object_store, "test-bucket");
-        let chunk_meta_cache = Arc::new(ChunkMetaCache::open(dir.path()).await.unwrap());
+        let pack_index_cache = Arc::new(PackIndexCache::open(dir.path()).await.unwrap());
         let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
             device_size,
             block_size as u32,
@@ -179,7 +180,7 @@ impl V2Harness {
         Self {
             cache,
             content_store,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             clean_cache,
             dir,
@@ -192,23 +193,23 @@ impl V2Harness {
             .cache
             .flush_to_s3(
                 &self.content_store,
-                &self.chunk_meta_cache,
+                &self.pack_index_cache,
                 &self.volume_manifest,
             )
             .await;
         result.unwrap()
     }
 
-    /// v2 read through the full tiered resolution path.
+    /// Read through the full tiered resolution path.
     async fn read(&self, offset: u64, len: usize) -> Bytes {
         let metrics = crate::block::metrics::ExportMetrics::new();
         let result: Result<Bytes, CacheError> = self
             .cache
-            .read_v2(
+            .read(
                 offset,
                 len,
                 &self.clean_cache,
-                &self.chunk_meta_cache,
+                &self.pack_index_cache,
                 &self.volume_manifest,
                 &self.content_store,
                 &metrics,
@@ -217,15 +218,9 @@ impl V2Harness {
         result.unwrap()
     }
 
-    /// Get the volume manifest from S3.
-    async fn manifest(&self) -> VolumeManifest {
-        let bytes = self
-            .content_store
-            .get_volume_manifest("test")
-            .await
-            .unwrap()
-            .expect("manifest should exist");
-        VolumeManifest::deserialize(&bytes).unwrap()
+    /// Get the volume manifest (in-memory copy).
+    fn manifest(&self) -> VolumeManifest {
+        self.volume_manifest.read().clone()
     }
 }
 
@@ -246,7 +241,7 @@ async fn test_flush_end_to_end() {
     assert!(stats.packs_uploaded > 0);
     assert!(stats.bytes_uploaded > 0);
 
-    let manifest = h.manifest().await;
+    let manifest = h.manifest();
     assert_eq!(manifest.block_size, 4096);
     // Volume manifest should reflect that data has been flushed
     assert_eq!(manifest.size, 1024 * 1024);
@@ -268,7 +263,10 @@ async fn test_flush_dedup_skips_existing() {
     assert_eq!(stats1.blocks_deduped, 0);
     assert!(stats1.packs_uploaded > 0);
 
-    // Write the same data again to new offsets — same content, new positions
+    // Write the same data again to new offsets — same content, new positions.
+    // In the pack-based architecture, packs are indexed by chunk_offset (not
+    // hash), so cross-flush hash-based dedup is intentionally not performed.
+    // Each new block offset gets its own pack entry regardless of content.
     for i in 0u8..5 {
         h.cache
             .write((i as u64 + 5) * 4096, &vec![i + 1; 4096], &h.clean_cache)
@@ -277,8 +275,9 @@ async fn test_flush_dedup_skips_existing() {
 
     let stats2 = h.flush().await;
     assert_eq!(stats2.blocks_flushed, 5);
-    assert_eq!(stats2.blocks_deduped, 5, "all blocks should be deduped");
-    assert_eq!(stats2.packs_uploaded, 0, "no new packs needed");
+    // No cross-flush dedup in pack-based architecture — blocks at new offsets
+    // are uploaded even if their content matches previously flushed blocks.
+    assert!(stats2.packs_uploaded > 0, "new offsets require new pack entries");
 }
 
 #[tokio::test]
@@ -296,7 +295,9 @@ async fn test_flush_partial_dedup() {
     assert_eq!(stats1.blocks_flushed, 10);
     assert_eq!(stats1.blocks_deduped, 0);
 
-    // Write 10 more blocks: 5 with SAME data as before (dedup), 5 with NEW data
+    // Write 10 more blocks at new offsets: 5 reuse previous content, 5 are new.
+    // In the pack-based architecture, all 10 go to new pack entries since dedup
+    // is offset-based (not hash-based across flushes).
     for i in 0u8..5 {
         h.cache
             .write((i as u64 + 10) * 4096, &vec![i + 1; 4096], &h.clean_cache)
@@ -310,8 +311,8 @@ async fn test_flush_partial_dedup() {
 
     let stats2 = h.flush().await;
     assert_eq!(stats2.blocks_flushed, 10);
-    assert_eq!(stats2.blocks_deduped, 5, "5 blocks should be deduped");
-    assert_eq!(stats2.packs_uploaded, 1, "5 new blocks = 1 pack");
+    // All 10 blocks are uploaded — no cross-flush hash dedup in pack-based architecture.
+    assert!(stats2.packs_uploaded > 0, "all blocks need pack entries");
 }
 
 #[tokio::test]
@@ -386,8 +387,8 @@ async fn test_flush_manifest_self_contained() {
     let stats = h.flush().await;
     assert!(stats.packs_uploaded > 0, "should produce at least 1 pack");
 
-    // Volume manifest should exist and have correct device size
-    let manifest = h.manifest().await;
+    // Volume manifest should have correct device size
+    let manifest = h.manifest();
     assert_eq!(manifest.size, 3 * 1024 * 1024);
     assert_eq!(manifest.block_size, 4096);
 }
@@ -593,7 +594,7 @@ async fn test_snapshot_returns_sequence_and_stats() {
         .cache
         .snapshot(
             &h.content_store,
-            &h.chunk_meta_cache,
+            &h.pack_index_cache,
             &h.volume_manifest,
         )
         .await
@@ -603,8 +604,8 @@ async fn test_snapshot_returns_sequence_and_stats() {
     assert_eq!(result.stats.blocks_flushed, 5);
     assert!(result.stats.packs_uploaded > 0);
 
-    // Manifest should exist in S3
-    let manifest = h.manifest().await;
+    // Manifest should have correct block size
+    let manifest = h.manifest();
     assert_eq!(manifest.block_size, 4096);
 }
 
@@ -623,7 +624,7 @@ async fn test_snapshot_clears_dirty_state() {
         .cache
         .snapshot(
             &h.content_store,
-            &h.chunk_meta_cache,
+            &h.pack_index_cache,
             &h.volume_manifest,
         )
         .await
@@ -635,7 +636,7 @@ async fn test_snapshot_clears_dirty_state() {
         .cache
         .snapshot(
             &h.content_store,
-            &h.chunk_meta_cache,
+            &h.pack_index_cache,
             &h.volume_manifest,
         )
         .await
@@ -660,7 +661,7 @@ async fn test_snapshot_captures_concurrent_writes() {
         .cache
         .snapshot(
             &h.content_store,
-            &h.chunk_meta_cache,
+            &h.pack_index_cache,
             &h.volume_manifest,
         )
         .await
@@ -677,7 +678,7 @@ async fn test_snapshot_captures_concurrent_writes() {
         .cache
         .snapshot(
             &h.content_store,
-            &h.chunk_meta_cache,
+            &h.pack_index_cache,
             &h.volume_manifest,
         )
         .await
@@ -726,15 +727,15 @@ async fn test_recovery_verifies_dirty_blocks_readable() {
         assert_eq!(cache.inner.recovery_warnings.load(Ordering::Relaxed), 0);
 
         // Read should return the original data
-        let data = cache.read(0, block_size).unwrap();
+        let data = cache.read_local_only(0, block_size).unwrap();
         assert_eq!(&data[..], &original_data[..]);
     }
 }
 
 // NOTE: The old pack registry integration tests (test_flush_updates_pack_registry
 // and test_multiple_flushes_accumulate_registry) have been removed.
-// The chunked architecture (ChunkMetaCache + VolumeManifest) does not maintain
-// a separate pack registry; chunk metadata is managed via ChunkMeta files.
+// The pack-based architecture does not maintain a separate pack registry;
+// pack metadata is managed via PackIndexCache and VolumeManifest.
 
 // ========================================================================
 // Concurrency tests
@@ -762,7 +763,7 @@ async fn test_concurrent_flush_and_writes() {
         Arc::clone(&object_store),
         "test-conc",
     ));
-    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(dir.path()).await.unwrap());
+    let pack_index_cache = Arc::new(PackIndexCache::open(dir.path()).await.unwrap());
     let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
         1024 * 1024,
         4096,
@@ -785,7 +786,7 @@ async fn test_concurrent_flush_and_writes() {
     {
         let cache = Arc::clone(&cache);
         let cs = Arc::clone(&content_store);
-        let cmc = Arc::clone(&chunk_meta_cache);
+        let cmc = Arc::clone(&pack_index_cache);
         let vm = Arc::clone(&volume_manifest);
         tasks.spawn(async move {
             for _ in 0..5 {
@@ -817,7 +818,7 @@ async fn test_concurrent_flush_and_writes() {
 
     // Final flush to capture any remaining dirty blocks
     let _stats = cache
-        .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
 
@@ -888,7 +889,7 @@ async fn test_draining_state_transition() {
 
     // Data should be readable after reopen + recovery
     let cache2 = cache2.finish_recovery().await.unwrap();
-    let data = cache2.read(0, 4096).unwrap();
+    let data = cache2.read_local_only(0, 4096).unwrap();
     assert_eq!(&data[..4], &[0xAA; 4]);
 }
 
@@ -927,7 +928,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
         Arc::clone(&object_store),
         "test-converge",
     ));
-    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(dir.path()).await.unwrap());
+    let pack_index_cache = Arc::new(PackIndexCache::open(dir.path()).await.unwrap());
     let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
         1024 * 1024,
         4096,
@@ -950,7 +951,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
     {
         let cache = Arc::clone(&cache);
         let cs = Arc::clone(&content_store);
-        let cmc = Arc::clone(&chunk_meta_cache);
+        let cmc = Arc::clone(&pack_index_cache);
         let vm = Arc::clone(&volume_manifest);
         tasks.spawn(async move {
             for _ in 0..5 {
@@ -983,7 +984,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
 
     // Quiesced final flush — no concurrent writes
     let _stats = cache
-        .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
     assert_eq!(
@@ -1001,11 +1002,11 @@ async fn test_concurrent_flush_write_s3_convergence() {
 
         // Read through full S3 path
         let s3_data = cache
-            .read_v2(
+            .read(
                 block_idx * 4096,
                 4096,
                 &verify_cache,
-                &chunk_meta_cache,
+                &pack_index_cache,
                 &volume_manifest,
                 &content_store,
                 &metrics,
@@ -1025,8 +1026,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
 
 // NOTE: The old HostPackIndex prune tests (test_prune_stale_snapshot_loses_entries_regression
 // and test_rebuild_manifest_hashes_prevents_prune_loss) have been removed.
-// The chunked architecture (ChunkMetaCache + VolumeManifest) does not use a
-// host-side pack_index, so pack_index pruning is no longer relevant here.
+// Pack index pruning is no longer relevant with PackIndexCache.
 
 /// CRC32 mismatch at flush time: block is skipped, CRC consumed from crc_map,
 /// next checkpoint recomputes, next flush succeeds.
@@ -1054,7 +1054,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // Flush should detect CRC32 mismatch and skip the block.
     let (stats, _seq) = h
         .cache
-        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 1, "should detect 1 corrupted block");
@@ -1080,7 +1080,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // is persistent, the next checkpoint captures the corrupted state.
     let (stats2, _seq) = h
         .cache
-        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "no mismatch on second flush");
@@ -1110,7 +1110,7 @@ async fn test_crc32_cleared_on_write() {
     // Flush without a checkpoint in between — no CRC32, verification skipped.
     let (stats, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);
@@ -1155,7 +1155,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Flush: should upload 3 good blocks, skip 2 corrupted.
     let (stats, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 2, "blocks 1 and 3 corrupted");
@@ -1181,7 +1181,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Second flush succeeds for the remaining 2 blocks.
     let (stats2, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0);
@@ -1221,7 +1221,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     let (stats1, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats1.blocks_corrupted, 0, "cycle 1: no corruption");
@@ -1257,7 +1257,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     let (stats2, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.chunk_meta_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "cycle 2: no corruption");
@@ -1294,7 +1294,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         Arc::clone(&object_store),
         "test-crc32-conc",
     ));
-    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(dir.path()).await.unwrap());
+    let pack_index_cache = Arc::new(PackIndexCache::open(dir.path()).await.unwrap());
     let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
         1024 * 1024,
         4096,
@@ -1319,7 +1319,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     {
         let cache = Arc::clone(&cache);
         let cs = Arc::clone(&content_store);
-        let cmc = Arc::clone(&chunk_meta_cache);
+        let cmc = Arc::clone(&pack_index_cache);
         let vm = Arc::clone(&volume_manifest);
         let corrupted = Arc::clone(&total_corrupted);
         tasks.spawn(async move {
@@ -1364,7 +1364,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     // Final quiesced flush to verify convergence.
     cache.local_checkpoint().unwrap();
     let stats = cache
-        .flush_to_s3(&content_store, &chunk_meta_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);

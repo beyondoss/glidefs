@@ -1215,10 +1215,10 @@ async fn dispatch_io(
 mod tests {
     use super::*;
     use crate::block::cache::SimpleBlockCache;
-    use crate::block::chunk_cache::ChunkMetaCache;
     use crate::block::content_store::ContentStore;
     use crate::block::metrics::ExportMetrics;
     use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use crate::block::pack_index_cache::PackIndexCache;
     use crate::block::volume_manifest::VolumeManifest;
     use crate::block::write_cache::{WriteCache, WriteCacheConfig};
     use object_store::memory::InMemory;
@@ -1229,7 +1229,7 @@ mod tests {
     const DEVICE_SIZE: u64 = 1024 * 1024; // 1MB
     const BLOCK_SIZE: usize = 4096;
 
-    fn make_handler(readonly: bool) -> (BlockHandler, TempDir) {
+    async fn make_handler(readonly: bool) -> (BlockHandler, TempDir) {
         let temp = TempDir::new().unwrap();
         let config = WriteCacheConfig {
             cache_dir: temp.path().to_path_buf(),
@@ -1242,15 +1242,17 @@ mod tests {
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
         let clean_cache: Arc<dyn crate::block::cache::BlockCache> =
             Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let chunk_meta_cache = Arc::new(ChunkMetaCache::new(32, temp.path().join("chunk_meta")));
-        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(DEVICE_SIZE)));
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
+        ));
         let metrics = Arc::new(ExportMetrics::new());
         let cache = WriteCache::open(config).unwrap().skip_recovery_for_test();
         let handler = BlockHandler::new(
             Arc::new(cache),
             content_store,
             clean_cache,
-            chunk_meta_cache,
+            pack_index_cache,
             volume_manifest,
             DEVICE_SIZE,
             readonly,

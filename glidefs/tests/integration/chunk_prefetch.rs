@@ -1,6 +1,6 @@
 //! Integration test for chunk metadata prefetch on cold start.
 //!
-//! Verifies that `ExportRouter::prefetch_chunk_metas()` warms the ChunkMetaCache
+//! Verifies that `ExportRouter::prefetch_chunk_metas()` warms the PackIndexCache
 //! from S3 so that the first VM reads don't block on S3 .meta fetches.
 
 use std::sync::Arc;

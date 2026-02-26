@@ -78,11 +78,6 @@ pub fn zero_block_hash(block_size: usize) -> Blake3Hash {
     blake3_128(&vec![0u8; block_size])
 }
 
-/// Format a Blake3Hash as lowercase hex string (for S3 keys).
-pub fn format_hash(hash: &Blake3Hash) -> String {
-    hash.0.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 // ============================================================================
 // SparseStateMap -- lock-free sparse block state tracking
 // ============================================================================

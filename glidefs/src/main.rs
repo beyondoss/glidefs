@@ -41,7 +41,6 @@ async fn main() -> Result<()> {
             grace_period,
             max_deletes,
             state_file,
-            meta_cache_dir,
             snapshot_retention,
         } => {
             cli::gc::run_gc(
@@ -50,7 +49,6 @@ async fn main() -> Result<()> {
                 grace_period,
                 max_deletes,
                 state_file,
-                meta_cache_dir,
                 snapshot_retention,
             )
             .await?;

@@ -21,7 +21,7 @@ use glidefs::block::content_store::ContentStore;
 use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::cli::gc::{new_gc_state_for_test, reconcile_prefix_for_test};
 
-use super::create_v2_test_cache;
+use super::create_test_cache;
 
 const BLOCK_SIZE: usize = 128 * 1024;
 
@@ -58,11 +58,11 @@ fn write_blocks(
 async fn test_snapshot_persists_versioned_key() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) =
-        create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
-    let result = cache.snapshot(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    let result = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
 
     // Snapshot sequence should be listed
     let snapshots = cs.list_snapshots("vm1").await.unwrap();
@@ -84,17 +84,17 @@ async fn test_snapshot_persists_versioned_key() {
 async fn test_multiple_snapshots_accumulate() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) =
-        create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
     write_blocks(&cache, 0, 2, 1, cc.as_ref());
-    let r1 = cache.snapshot(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    let r1 = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
 
     write_blocks(&cache, 2, 2, 2, cc.as_ref());
-    let r2 = cache.snapshot(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    let r2 = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
 
     write_blocks(&cache, 4, 2, 3, cc.as_ref());
-    let r3 = cache.snapshot(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    let r3 = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
 
     let snapshots = cs.list_snapshots("vm1").await.unwrap();
     assert_eq!(snapshots, vec![r1.sequence, r2.sequence, r3.sequence]);
@@ -105,13 +105,13 @@ async fn test_multiple_snapshots_accumulate() {
 async fn test_sync_manifest_does_not_create_snapshots() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) =
-        create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
 
     // flush_packs + sync_manifest (the background flush path)
-    let (_stats, _seq) = cache.flush_packs(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    let (_stats, _seq) = cache.flush_packs(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
     cache.sync_manifest(&cs, &volume_manifest).await.unwrap();
 
     // No snapshot should be created by sync_manifest
@@ -195,16 +195,16 @@ async fn test_fork_from_snapshot() {
 async fn test_gc_respects_snapshot_packs() {
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) =
-        create_v2_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
 
     // Write blocks and snapshot (creates snapshot manifest referencing pack_A)
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
-    let snap = cache.snapshot(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    let snap = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
 
     // Overwrite same blocks with different data and flush (creates pack_B)
     write_blocks(&cache, 0, 3, 2, cc.as_ref());
-    cache.snapshot(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
 
     // pack_A is no longer referenced by manifests/{name} but IS referenced by the first snapshot.
     // GC should NOT delete pack_A.
@@ -226,18 +226,12 @@ async fn test_gc_respects_snapshot_packs() {
         .unwrap()
         .expect("snapshot should still exist");
     let vm = VolumeManifest::deserialize(&snapshot_data).unwrap();
-    // Resolve chunk metas and verify referenced packs still exist in S3
-    for (&chunk_idx, chunk_hash_hex) in &vm.chunks {
-        let meta_bytes = cs
-            .get_chunk_meta(chunk_idx, chunk_hash_hex)
-            .await
-            .unwrap()
-            .expect("chunk meta should exist");
-        let meta = glidefs::block::chunk_meta::ChunkMeta::deserialize(&meta_bytes).unwrap();
-        for pack_id in meta.pack_ids() {
-            let packs = cs.list_chunk_packs(chunk_idx).await.unwrap();
+    // Verify referenced packs still exist in S3 (v4: pack IDs are in the manifest directly)
+    for (&chunk_idx, entry) in &vm.chunks {
+        let packs = cs.list_chunk_packs(chunk_idx).await.unwrap();
+        for &pack_id in &entry.packs {
             assert!(
-                packs.iter().any(|p| p.contains(&pack_id.to_string())),
+                packs.iter().any(|p| p.contains(&format!("{pack_id:016x}"))),
                 "pack referenced by snapshot should not be deleted"
             );
         }
@@ -247,52 +241,63 @@ async fn test_gc_respects_snapshot_packs() {
     assert_eq!(report.packs_deleted(), 0, "GC should not delete packs referenced by snapshots");
 }
 
-/// Deleting a snapshot allows GC to free the previously pinned packs.
+/// Deleting a snapshot allows GC to free packs only referenced by that snapshot.
+///
+/// In v4, manifests accumulate pack_ids (append_pack), so overwriting blocks
+/// doesn't immediately orphan old packs — compaction handles that. This test
+/// creates orphan packs that are only kept alive by a snapshot manifest.
 #[tokio::test]
 async fn test_delete_snapshot_frees_packs_for_gc() {
+    use glidefs::block::volume_manifest::VolumeManifest;
+
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, cc, _m) =
-        create_v2_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
 
-    // Write blocks and snapshot
+    // Write blocks and flush to create live packs
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
-    let snap1 = cache.snapshot(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
 
-    // Overwrite with different data, snapshot again
-    write_blocks(&cache, 0, 3, 2, cc.as_ref());
-    let _snap2 = cache.snapshot(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    // Upload orphan packs to S3 (not in current manifest)
+    let orphan_pack_id: u64 = 0xDEAD_5AAB_0000_0001;
+    cs.put_chunk_pack(0, orphan_pack_id, b"snapshot-only pack data".to_vec())
+        .await
+        .unwrap();
 
-    // Delete the first snapshot
-    cs.delete_snapshot("vm1", snap1.sequence).await.unwrap();
+    // Build a snapshot manifest that includes the orphan pack along with live packs
+    let mut snap_vm = volume_manifest.read().clone();
+    snap_vm.append_pack(0, orphan_pack_id);
+    let snap_seq = 1u64;
+    cs.put_snapshot("vm1", snap_seq, snap_vm.serialize())
+        .await
+        .unwrap();
 
-    // Delete again — must be idempotent (no error on already-deleted snapshot)
-    cs.delete_snapshot("vm1", snap1.sequence).await.unwrap();
-
-    // GC should now be able to delete the orphaned packs from snap1
+    // GC should NOT delete the orphan pack (snapshot references it)
     let mut gc_state = new_gc_state_for_test();
-    let report = reconcile_prefix_for_test(
-        &cs,
-        &mut gc_state,
-        Duration::from_secs(0),
-        1000,
-        false,
-    )
-    .await
-    .unwrap();
+    let report = reconcile_prefix_for_test(&cs, &mut gc_state, Duration::ZERO, 1000, false)
+        .await
+        .unwrap();
+    assert_eq!(report.dead_found(), 0, "orphan pack should be live via snapshot");
 
-    assert_eq!(
-        cs.list_snapshots("vm1").await.unwrap().len(),
-        1,
-        "only snap2 should remain"
-    );
+    // Delete the snapshot
+    cs.delete_snapshot("vm1", snap_seq).await.unwrap();
 
-    // snap1's packs used seed=1, snap2's used seed=2 — different content, different packs.
-    // With snap1 deleted, its exclusive packs are orphaned and should be collected.
+    // Delete again — must be idempotent
+    cs.delete_snapshot("vm1", snap_seq).await.unwrap();
+
+    // GC should now find the orphan pack as dead (no manifest references it)
+    let report2 = reconcile_prefix_for_test(&cs, &mut gc_state, Duration::ZERO, 1000, false)
+        .await
+        .unwrap();
+
     assert!(
-        report.packs_deleted() >= 1,
-        "GC should delete orphaned packs from deleted snapshot, got {} deleted",
-        report.packs_deleted()
+        report2.dead_found() >= 1,
+        "GC should find orphaned pack after snapshot deletion, got {} dead",
+        report2.dead_found()
     );
 }
 
@@ -448,11 +453,11 @@ async fn test_api_list_and_delete_snapshots() {
 async fn test_snapshot_empty_export() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, chunk_meta_cache, volume_manifest, _cc, _m) =
-        create_v2_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+    let (cache, cs, pack_index_cache, volume_manifest, _cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
     // Snapshot immediately — no writes. Sequence may be 0 (no flushes yet).
-    let result = cache.snapshot(&cs, &chunk_meta_cache, &volume_manifest).await.unwrap();
+    let result = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
 
     let snapshots = cs.list_snapshots("vm1").await.unwrap();
     assert_eq!(snapshots, vec![result.sequence]);

@@ -21,9 +21,9 @@ use object_store::ObjectStore;
 use tempfile::TempDir;
 
 use glidefs::block::cache::SimpleBlockCache;
-use glidefs::block::chunk_cache::ChunkMetaCache;
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::metrics::ExportMetrics;
+use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::state::Active;
 use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -31,18 +31,18 @@ use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 const DEVICE_SIZE: u64 = 256 * 1024 * 1024; // 256MB (enough for multi-pack tests at 500 blocks/pack)
 
-/// Shared v2 test harness: creates a WriteCache with ContentStore + ChunkMetaCache + VolumeManifest + SimpleBlockCache.
+/// Shared test harness: creates a WriteCache with ContentStore + PackIndexCache + VolumeManifest + SimpleBlockCache.
 ///
-/// Returns all components needed for the v2 flush/read API.
+/// Returns all components needed for the flush/read API.
 #[allow(clippy::type_complexity)]
-pub async fn create_v2_test_cache(
+pub async fn create_test_cache(
     temp_dir: &TempDir,
     name: &str,
     s3: Arc<dyn ObjectStore>,
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    Arc<ChunkMetaCache>,
+    Arc<PackIndexCache>,
     Arc<parking_lot::RwLock<VolumeManifest>>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
@@ -57,7 +57,7 @@ pub async fn create_v2_test_cache(
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(s3, "test");
-    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+    let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
     let volume_manifest = Arc::new(parking_lot::RwLock::new(
         VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
     ));
@@ -69,26 +69,26 @@ pub async fn create_v2_test_cache(
     (
         Arc::new(cache),
         content_store,
-        chunk_meta_cache,
+        pack_index_cache,
         volume_manifest,
         clean_cache,
         metrics,
     )
 }
 
-/// Cold reader: creates a WriteCache whose reads go through VolumeManifest + ChunkMetaCache + S3.
+/// Cold reader: creates a WriteCache whose reads go through VolumeManifest + PackIndexCache + S3.
 ///
-/// After a writer calls `flush_to_s3`, the VolumeManifest in S3 contains chunk hashes.
+/// After a writer calls `flush_to_s3`, the VolumeManifest in S3 contains pack IDs.
 /// This helper downloads the VolumeManifest, opens a fresh WriteCache (local SSD starts
-/// empty), and `read_v2` resolves blocks through VolumeManifest -> ChunkMetaCache -> S3.
-pub async fn create_v2_cold_reader(
+/// empty), and `read` resolves blocks through VolumeManifest -> PackIndexCache -> S3.
+pub async fn create_cold_reader(
     temp_dir: &TempDir,
     name: &str,
     s3: Arc<dyn ObjectStore>,
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    Arc<ChunkMetaCache>,
+    Arc<PackIndexCache>,
     Arc<parking_lot::RwLock<VolumeManifest>>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
@@ -96,7 +96,7 @@ pub async fn create_v2_cold_reader(
     let content_store = ContentStore::new(Arc::clone(&s3), "test");
 
     // Fetch VolumeManifest from S3
-    let volume_manifest = match content_store.get_volume_manifest(name).await {
+    let volume_manifest = match content_store.get_manifest(name).await {
         Ok(Some(data)) => Arc::new(parking_lot::RwLock::new(
             VolumeManifest::deserialize(&data).expect("failed to deserialize volume manifest"),
         )),
@@ -104,7 +104,7 @@ pub async fn create_v2_cold_reader(
         Err(e) => panic!("failed to fetch volume manifest: {}", e),
     };
 
-    let chunk_meta_cache = Arc::new(ChunkMetaCache::open(temp_dir.path()).await.unwrap());
+    let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
 
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
@@ -123,7 +123,7 @@ pub async fn create_v2_cold_reader(
     (
         Arc::new(cache),
         content_store,
-        chunk_meta_cache,
+        pack_index_cache,
         volume_manifest,
         clean_cache,
         metrics,

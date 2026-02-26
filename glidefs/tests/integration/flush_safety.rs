@@ -94,7 +94,7 @@ async fn test_pressure_flush_syncs_manifest() {
     // Router's ContentStore base path is "{db_path}/exports/{export_name}".
     let cs = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
     let manifest_data = cs
-        .get_volume_manifest("vm1")
+        .get_manifest("vm1")
         .await
         .expect("should succeed")
         .expect("manifest should exist after pressure_flush");
@@ -153,7 +153,7 @@ async fn test_pressure_flush_concurrent_with_drain() {
     let reader_dir = TempDir::new().unwrap();
     let cs = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
     let manifest_data = cs
-        .get_volume_manifest("vm1")
+        .get_manifest("vm1")
         .await
         .expect("should succeed")
         .expect("manifest should exist");
@@ -173,8 +173,8 @@ async fn test_pressure_flush_concurrent_with_drain() {
     };
     let reader_cache = glidefs::block::write_cache::WriteCache::open_fresh_active(reader_config)
         .unwrap();
-    let reader_chunk_meta_cache = Arc::new(
-        glidefs::block::chunk_cache::ChunkMetaCache::open(reader_dir.path())
+    let reader_pack_index_cache = Arc::new(
+        glidefs::block::pack_index_cache::PackIndexCache::open(reader_dir.path())
             .await
             .unwrap(),
     );
@@ -184,11 +184,11 @@ async fn test_pressure_flush_concurrent_with_drain() {
 
     for i in 0..20 {
         let data = reader_cache
-            .read_v2(
+            .read(
                 i as u64 * BLOCK_SIZE as u64,
                 BLOCK_SIZE,
                 reader_clean_cache.as_ref(),
-                &reader_chunk_meta_cache,
+                &reader_pack_index_cache,
                 &reader_vm,
                 &cs,
                 &reader_metrics,
