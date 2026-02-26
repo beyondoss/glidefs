@@ -53,6 +53,12 @@ pub async fn flush_scheduler(
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
     let mut flush_backoff = Duration::ZERO;
 
+    // Track when the last flush failure occurred so the checkpoint ticker
+    // can retry S3 flushes after the backoff has elapsed. Without this,
+    // dirty blocks can sit unsynced indefinitely if S3 recovers but no
+    // new writes trigger flush_notify.
+    let mut last_flush_failure: Option<Instant> = None;
+
     // Pending manifest sync: if sync_manifest fails after a successful pack
     // flush, we retry on the next checkpoint tick to close the window where
     // packs are on S3 but not referenced by any manifest.
@@ -103,6 +109,7 @@ pub async fn flush_scheduler(
                     match cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest).await {
                         Ok((stats, _seq_cutpoint)) => {
                             flush_backoff = Duration::ZERO;
+                            last_flush_failure = None;
                             metrics.record_s3_put_latency(start.elapsed());
                             metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
                             metrics.record_flush_blocks_corrupted(stats.blocks_corrupted);
@@ -156,6 +163,7 @@ pub async fn flush_scheduler(
                             } else {
                                 flush_backoff.saturating_mul(2).min(MAX_BACKOFF)
                             };
+                            last_flush_failure = Some(Instant::now());
                             metrics.record_flush_error();
                             warn!(error = %e, backoff_secs = flush_backoff.as_secs(), "pack flush failed, backing off");
                             // Still checkpoint on flush error to prevent WAL growth
@@ -202,7 +210,8 @@ pub async fn flush_scheduler(
                 }
             }
 
-            // Periodic: checkpoint every 5s + retry pending manifest sync.
+            // Periodic: checkpoint every 5s + retry pending manifest sync +
+            // retry S3 flush after backoff has elapsed.
             _ = checkpoint_ticker.tick() => {
                 // Retry manifest sync that failed after a previous pack flush.
                 if manifest_pending {
@@ -217,10 +226,54 @@ pub async fn flush_scheduler(
                             warn!(error = %e, "deferred manifest sync retry failed");
                         }
                     }
-                } else if cache.dirty_block_count() > 0
-                    && let Err(e) = cache.local_checkpoint().await
-                {
-                    warn!(error = %e, "local checkpoint failed");
+                } else if cache.dirty_block_count() > 0 {
+                    // If a previous flush failed and enough backoff time has
+                    // elapsed, retry the S3 flush. This ensures dirty blocks
+                    // eventually reach S3 even if no new writes trigger
+                    // flush_notify (liveness after S3 recovery).
+                    let should_retry = flush_backoff > Duration::ZERO
+                        && last_flush_failure
+                            .map_or(false, |t| t.elapsed() >= flush_backoff);
+
+                    if should_retry {
+                        let _flush_guard = cache.flush_lock().lock().await;
+                        match cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest).await {
+                            Ok((stats, _)) => {
+                                flush_backoff = Duration::ZERO;
+                                last_flush_failure = None;
+                                if stats.packs_uploaded > 0 {
+                                    info!(
+                                        packs = stats.packs_uploaded,
+                                        blocks = stats.blocks_flushed,
+                                        "periodic retry flush succeeded"
+                                    );
+                                    match cache.sync_manifest(&content_store, &volume_manifest).await {
+                                        Ok(()) => { manifest_pending = false; }
+                                        Err(e) => {
+                                            metrics.record_manifest_sync_error();
+                                            warn!(error = %e, "manifest sync after periodic retry failed");
+                                            manifest_pending = true;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                flush_backoff = flush_backoff.saturating_mul(2).min(MAX_BACKOFF);
+                                last_flush_failure = Some(Instant::now());
+                                metrics.record_flush_error();
+                                warn!(
+                                    error = %e,
+                                    backoff_secs = flush_backoff.as_secs(),
+                                    "periodic retry flush failed, extending backoff"
+                                );
+                            }
+                        }
+                    }
+
+                    // Always checkpoint locally when dirty.
+                    if let Err(e) = cache.local_checkpoint().await {
+                        warn!(error = %e, "local checkpoint failed");
+                    }
                 }
             }
         }

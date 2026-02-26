@@ -296,16 +296,11 @@ impl WriteCache<Active> {
         let start_block = offset / block_size;
         let end_block = (offset + len - 1) / block_size;
 
-        // Mark affected blocks as dirty and invalidate stale CRCs
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx < self.inner.num_blocks {
-                self.inner.transition_to_dirty(idx);
-                self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
-            }
-        }
-
-        // Record dirty blocks in WAL.
+        // Mark affected blocks as dirty, invalidate stale CRCs, and record
+        // in WAL. Combined into a single pass under the WAL lock to prevent
+        // a crash-safety gap: without the lock, a crash between
+        // transition_to_dirty and WAL append would leave a block appearing
+        // CLEAN after recovery despite having new data on SSD.
         {
             let mut wal = self.inner.wal.lock();
             for block in start_block..=end_block {
@@ -313,8 +308,10 @@ impl WriteCache<Active> {
                 if idx >= self.inner.num_blocks {
                     continue;
                 }
-                let seq = self.inner.sequence.next();
+                self.inner.transition_to_dirty(idx);
+                self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
 
+                let seq = self.inner.sequence.next();
                 let wal_entry = WalEntryRef {
                     block_index: block,
                     sequence: seq,

@@ -345,11 +345,20 @@ impl WriteCache<Active> {
     }
 
     /// Persist block states and truncate WAL.
-    fn checkpoint(&self) -> Result<(), CacheError> {
-        let mut wal = self.inner.wal.lock();
-        self.inner.save_block_states()?;
-        wal.truncate()?;
-        Ok(())
+    ///
+    /// Runs on a blocking thread via `spawn_blocking` to avoid blocking
+    /// the Tokio runtime with `sync_all()` + `rename()` syscalls in
+    /// `save_block_states`.
+    async fn checkpoint(&self) -> Result<(), CacheError> {
+        let inner = Arc::clone(&self.inner);
+        crate::task::spawn_blocking_named("checkpoint", move || {
+            let mut wal = inner.wal.lock();
+            inner.save_block_states()?;
+            wal.truncate()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| CacheError::Io(std::io::Error::other(e)))?
     }
 
     /// Local checkpoint: compute CRC32s for dirty blocks, persist state, truncate WAL.
@@ -562,7 +571,9 @@ impl WriteCache<Active> {
             };
 
             if blocks_for_pack.is_empty() {
-                // All blocks deduped (shouldn't happen — zero blocks are included).
+                // All blocks in this chunk were skipped (CRC mismatch or concurrent
+                // re-dirty). Nothing to upload — skipped blocks were already
+                // transitioned back to DIRTY above.
                 flushed_blocks.extend(batch.computed.iter().map(|&(idx, _)| idx));
                 continue;
             }
@@ -643,7 +654,7 @@ impl WriteCache<Active> {
         content_store
             .put_manifest(&self.inner.export_name, manifest_bytes)
             .await?;
-        self.checkpoint()?;
+        self.checkpoint().await?;
         Ok(())
     }
 
@@ -693,7 +704,7 @@ impl WriteCache<Active> {
         if let Some(e) = last_err {
             return Err(e.into());
         }
-        self.checkpoint()?;
+        self.checkpoint().await?;
         Ok(stats)
     }
 
@@ -743,7 +754,7 @@ impl WriteCache<Active> {
             persisted
         };
 
-        self.checkpoint()?;
+        self.checkpoint().await?;
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,
