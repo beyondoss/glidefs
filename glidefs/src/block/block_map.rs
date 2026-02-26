@@ -367,11 +367,12 @@ impl SparseStateMap {
                 let val = page
                     .map(|p| p.data[byte_idx].load(Ordering::Relaxed))
                     .unwrap_or(0);
+                if val == 0 {
+                    // All 4 entries NOT_PRESENT — skip entire byte.
+                    return None;
+                }
                 let base = page_start + byte_idx * ENTRIES_PER_BYTE;
-                (0..ENTRIES_PER_BYTE as u32).filter_map(move |slot| {
-                    if val == 0 {
-                        return None; // all 4 entries NOT_PRESENT
-                    }
+                Some((0..ENTRIES_PER_BYTE as u32).filter_map(move |slot| {
                     let idx = base + slot as usize;
                     if idx >= num_entries {
                         return None;
@@ -382,8 +383,8 @@ impl SparseStateMap {
                     } else {
                         None
                     }
-                })
-            })
+                }))
+            }).flatten()
         })
     }
 
@@ -402,11 +403,11 @@ impl SparseStateMap {
                 let val = page
                     .map(|p| p.data[byte_idx].load(Ordering::Relaxed))
                     .unwrap_or(0);
+                if val == 0 {
+                    return None;
+                }
                 let base = page_start + byte_idx * ENTRIES_PER_BYTE;
-                (0..ENTRIES_PER_BYTE as u32).filter_map(move |slot| {
-                    if val == 0 {
-                        return None;
-                    }
+                Some((0..ENTRIES_PER_BYTE as u32).filter_map(move |slot| {
                     let idx = base + slot as usize;
                     if idx >= num_entries {
                         return None;
@@ -417,8 +418,8 @@ impl SparseStateMap {
                     } else {
                         None
                     }
-                })
-            })
+                }))
+            }).flatten()
         })
     }
 

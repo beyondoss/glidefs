@@ -486,6 +486,11 @@ impl WriteCache<Active> {
             }
         }
 
+        let blocks_per_chunk = {
+            let vm = volume_manifest.read();
+            vm.blocks_per_chunk()
+        };
+
         let mut total_stats = FlushStats::default();
         let mut flushed_blocks: Vec<usize> = Vec::new();
         let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
@@ -543,10 +548,6 @@ impl WriteCache<Active> {
             };
 
             // Stream GLPK v3 pack to S3 (blocks freed as they upload)
-            let blocks_per_chunk = {
-                let vm = volume_manifest.read();
-                vm.blocks_per_chunk()
-            };
             let pack_id = new_pack_id();
 
             let index_entries = content_store

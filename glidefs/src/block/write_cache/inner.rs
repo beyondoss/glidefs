@@ -211,7 +211,9 @@ pub(crate) struct CacheInner {
     pub(super) sequence: SequenceNumber,
 
     /// Write-ahead log for crash recovery.
-    /// Mutex is effectively uncontended: single writer per export.
+    /// Mutex is contended under concurrent writes (multiple NBD I/O tasks
+    /// per export), but each write batches all its WAL entries under a
+    /// single lock acquisition to minimize hold time.
     pub(super) wal: Mutex<Wal>,
 
     /// Export name (used in WAL entries).
@@ -231,9 +233,10 @@ pub(crate) struct CacheInner {
 
     /// CRC32 checksums for dirty blocks, used to detect SSD corruption between
     /// checkpoint and flush. Sized proportional to currently dirty blocks, not
-    /// device size. Only accessed by the flush scheduler thread (checkpoint +
-    /// flush are sequential in the same select loop). DashMap for safety since
-    /// pressure-flush from capacity_monitor may run on a different task.
+    /// device size. Concurrently accessed by: the write path (inserts
+    /// CRC_SENTINEL on every write), the checkpoint path (computes and stores
+    /// CRCs), and the flush path (takes CRCs for verification). DashMap
+    /// provides the necessary concurrent access safety.
     pub(super) crc_map: DashMap<usize, u32>,
 
     /// Per-export flush serialization lock.
