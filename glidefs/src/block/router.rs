@@ -2389,6 +2389,76 @@ mod tests {
         assert!(result.is_err(), "Fork from missing manifest should fail");
     }
 
+    /// Fork B from A's snapshot, then fork C from B's snapshot.
+    /// C should read A's data through two levels of manifest inheritance.
+    ///
+    /// All forks share the same S3 prefix ("a") because packs are content-
+    /// addressed and shared. Each fork has its own manifest key under that
+    /// prefix: manifests/a, manifests/b, manifests/c.
+    #[tokio::test]
+    async fn test_fork_of_fork_reads_grandparent_blocks() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // A: write 0xAA and snapshot
+        router
+            .create_export(test_export_config("a"), false, None, None)
+            .await
+            .unwrap();
+        let a_handler = router.get_handler("a").await.unwrap();
+        a_handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
+        router.snapshot_export("a", None).await.unwrap();
+
+        // B: fork from A's manifest, same S3 prefix so packs are shared.
+        // Write 0xBB to block 1 (leave block 0 from A untouched) and snapshot.
+        let b_config = ExportConfig {
+            name: "b".to_string(),
+            size_gb: 0.01,
+            s3_prefix: Some("a".to_string()),
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router
+            .create_export(b_config, false, Some("a"), None)
+            .await
+            .unwrap();
+        let b_handler = router.get_handler("b").await.unwrap();
+        b_handler
+            .write(128 * 1024, &[0xBB; 128 * 1024], false)
+            .unwrap();
+        router.snapshot_export("b", None).await.unwrap();
+
+        // C: fork from B's manifest (same S3 prefix).
+        let c_config = ExportConfig {
+            name: "c".to_string(),
+            size_gb: 0.01,
+            s3_prefix: Some("a".to_string()),
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router
+            .create_export(c_config, false, Some("b"), None)
+            .await
+            .unwrap();
+
+        // C should read A's block 0 (0xAA) and B's block 1 (0xBB)
+        let c_handler = router.get_handler("c").await.unwrap();
+        let block0 = c_handler.read(0, 128 * 1024).await.unwrap();
+        assert!(
+            block0.iter().all(|&b| b == 0xAA),
+            "fork-of-fork block 0 should read grandparent A's data (0xAA)"
+        );
+        let block1 = c_handler.read(128 * 1024, 128 * 1024).await.unwrap();
+        assert!(
+            block1.iter().all(|&b| b == 0xBB),
+            "fork-of-fork block 1 should read parent B's data (0xBB)"
+        );
+    }
+
     // =========================================================================
     // Resize tests
     // =========================================================================

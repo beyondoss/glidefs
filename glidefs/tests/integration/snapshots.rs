@@ -756,6 +756,52 @@ async fn test_compaction_old_packs_gc_respects_snapshots() {
     );
 }
 
+/// Calling snapshot() twice with no writes in between is idempotent.
+///
+/// The sequence number only advances on writes, so a second snapshot with no
+/// intervening writes returns the same sequence and overwrites the same S3 key
+/// with identical content. The list shows a single entry, not a duplicate.
+#[tokio::test]
+async fn test_snapshot_idempotent_when_no_writes() {
+    let s3 = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
+
+    // Write some data and take the first snapshot.
+    write_blocks(&cache, 0, 3, 1, cc.as_ref());
+    let r1 = cache
+        .snapshot(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Take a second snapshot with no writes in between.
+    let r2 = cache
+        .snapshot(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Same sequence — sequence only advances on writes.
+    assert_eq!(
+        r1.sequence, r2.sequence,
+        "snapshot with no writes should return same sequence"
+    );
+
+    // Only one entry in the list (same S3 key, overwritten idempotently).
+    let snapshots = cs.list_snapshots("vm1").await.unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0], r1.sequence);
+
+    // Manifest is still valid and has the same chunk content.
+    let data = cs
+        .get_snapshot("vm1", r1.sequence)
+        .await
+        .unwrap()
+        .expect("snapshot should exist");
+    let vm = VolumeManifest::deserialize(&data).unwrap();
+    assert!(!vm.chunks.is_empty(), "snapshot should have chunk entries");
+}
+
 /// head_manifest returns false for nonexistent manifest in nonexistent prefix.
 #[tokio::test]
 async fn test_head_manifest_not_found() {

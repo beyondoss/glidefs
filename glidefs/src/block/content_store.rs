@@ -744,6 +744,68 @@ mod tests {
         assert!(matches!(cb.state(), CircuitState::Closed { .. }));
     }
 
+    /// Round-trip through the production streaming upload path.
+    ///
+    /// `stream_chunk_pack` writes header + compressed blocks + footer index +
+    /// trailer via `WriteMultipart`. This test verifies that `get_pack_index`
+    /// can parse the footer and that `get_chunk_block` returns data that
+    /// decompresses to the original block content.
+    #[tokio::test]
+    async fn test_stream_chunk_pack_round_trip() {
+        use crate::block::block_map::{blake3_128, lz4_compress, lz4_decompress};
+        use crate::block::pack::PackIndexEntry;
+
+        let store = test_store("test-bucket");
+        let pack_id: u64 = 0x0123_4567_89AB_CDEF;
+        let chunk_size: u32 = 128 * 1024;
+
+        // Build 3 blocks with distinct data, out-of-order chunk offsets.
+        let mut originals = Vec::new();
+        let mut blocks = Vec::new();
+        for (i, chunk_offset) in [5u32, 0, 3].into_iter().enumerate() {
+            let data: Vec<u8> = (0..chunk_size as usize)
+                .map(|j| ((i * 31 + j * 7) % 256) as u8)
+                .collect();
+            let hash = blake3_128(&data);
+            let compressed = lz4_compress(&data);
+            originals.push((chunk_offset, data));
+            blocks.push((hash, chunk_offset, compressed));
+        }
+
+        // Upload via the streaming production path.
+        let entries: Vec<PackIndexEntry> = store
+            .stream_chunk_pack(0, pack_id, blocks, chunk_size)
+            .await
+            .expect("stream_chunk_pack should succeed");
+
+        assert_eq!(entries.len(), 3);
+        // Entries must be sorted by chunk_offset (stream_pack_to_writer sorts).
+        assert!(entries.windows(2).all(|w| w[0].chunk_offset < w[1].chunk_offset));
+
+        // Read back via suffix-based index parse (the S3 cold-read path).
+        let index_entries = store.get_pack_index(0, pack_id).await.unwrap();
+        assert_eq!(index_entries.len(), 3);
+
+        // Verify each block decompresses to original data.
+        for entry in &index_entries {
+            let compressed = store
+                .get_chunk_block(0, pack_id, entry.offset, entry.comp_length)
+                .await
+                .unwrap();
+            let decompressed = lz4_decompress(&compressed)
+                .expect("LZ4 decompression should succeed");
+            let original = originals
+                .iter()
+                .find(|(co, _)| *co == entry.chunk_offset)
+                .unwrap_or_else(|| panic!("no original for chunk_offset {}", entry.chunk_offset));
+            assert_eq!(
+                decompressed, original.1,
+                "data mismatch at chunk_offset {}",
+                entry.chunk_offset
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_v4_chunk_pack_round_trip() {
         let store = test_store("test-bucket");
