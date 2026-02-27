@@ -66,6 +66,26 @@ pub struct ReadPlan {
 }
 
 impl WriteCache<Active> {
+    /// Try to pread directly into a caller-provided buffer (zero-alloc fast path).
+    ///
+    /// Returns `Some(Ok(len))` if all blocks in range are present on local SSD
+    /// and the pread succeeded. Returns `None` if any block is not present,
+    /// signaling the caller to fall back to the full `read()` path.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
+    #[inline]
+    pub fn try_pread_local(&self, offset: u64, len: usize, buf: &mut [u8]) -> Option<Result<usize, CacheError>> {
+        let block_size = self.inner.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + len as u64 - 1) / block_size;
+        if !(start_block..=end_block).all(|i| self.inner.is_present(i as usize)) {
+            return None;
+        }
+        Some(match self.inner.data_file.read_exact_at(&mut buf[..len], offset) {
+            Ok(()) => Ok(len),
+            Err(e) => Err(CacheError::from(e)),
+        })
+    }
+
     /// Read data from local cache only (no S3 fetch).
     ///
     /// Used internally and by sync worker. Caller must ensure blocks are present.

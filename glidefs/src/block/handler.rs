@@ -223,6 +223,15 @@ impl BlockHandler {
 
         self.metrics.record_guest_read(length as u64);
 
+        // Fast path: all blocks present on local SSD → pread directly into
+        // caller buffer. Zero allocation, zero memcpy.
+        if let Some(result) = self.cache.try_pread_local(offset, length as usize, buf) {
+            let n = result?;
+            self.trigger_readahead(offset);
+            self.metrics.record_read_latency(start.elapsed());
+            return Ok(n);
+        }
+
         let data = self
             .cache
             .read(
