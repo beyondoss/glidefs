@@ -858,12 +858,12 @@ async fn test_concurrent_compaction_and_flush() {
 // TEST 6: METADATA CORRUPT BLOCK STATE
 // =============================================================================
 
-/// Test: Corrupt block state entry in .meta file is handled gracefully.
+/// Test: CRC32 trailer on .meta file detects corruption.
 ///
-/// Write data → save metadata → corrupt a block state byte to an invalid value →
-/// reopen cache. Recovery should either skip the invalid entry or return a clean error.
+/// Write data → save metadata (now includes CRC32 trailer) → flip a byte →
+/// reopen cache. The CRC32 mismatch should be caught and return InvalidMetadata.
 #[tokio::test]
-async fn test_metadata_corrupt_block_state_recovery() {
+async fn test_metadata_crc32_detects_corruption() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path(), "meta-corrupt");
     let clean = SimpleBlockCache::new(1024);
@@ -879,11 +879,9 @@ async fn test_metadata_corrupt_block_state_recovery() {
         cache.save_metadata().unwrap();
     }
 
-    // Corrupt the .meta file: find a block state byte and set it to 0xFF (invalid).
-    // The v5 sparse format has entries of (u32 index, u8 state) after the header.
-    // Header = 8 (magic) + 4 (version) + 8 (device_size) + 8 (block_size) + 8 (num_blocks) = 36 bytes
-    // Then 8 bytes for entry_count, then entries of 5 bytes each (u32 + u8).
-    // So first entry's state byte is at offset 36 + 8 + 4 = 48.
+    // Corrupt a byte in the .meta file (the state byte of the first entry).
+    // Header = 36 bytes, entry_count = 8 bytes, first entry index = 4 bytes,
+    // first entry state byte is at offset 48.
     let meta_path = config.metadata_path();
     {
         use std::io::{Read, Seek, Write};
@@ -893,58 +891,28 @@ async fn test_metadata_corrupt_block_state_recovery() {
             .open(&meta_path)
             .unwrap();
 
-        // Read current contents to verify structure
         let mut contents = Vec::new();
         file.read_to_end(&mut contents).unwrap();
-        assert!(
-            contents.len() > 48,
-            "metadata file should be large enough to contain entries"
-        );
+        assert!(contents.len() > 48);
 
-        // Corrupt the state byte of the first entry (offset 48)
-        // Valid states are: 1 (Clean), 2 (Dirty), 3 (Syncing)
-        // 0xFF is invalid
+        // Flip a byte — CRC32 will no longer match.
         file.seek(std::io::SeekFrom::Start(48)).unwrap();
-        file.write_all(&[0xFF]).unwrap();
+        file.write_all(&[contents[48] ^ 0xFF]).unwrap();
         file.sync_all().unwrap();
     }
 
-    // Session 2: reopen with full recovery. The invalid state should be handled gracefully.
+    // Session 2: open should fail with InvalidMetadata due to CRC mismatch.
     let result = WriteCache::<Initializing>::open(config.clone());
-
-    // The code does `state_map.cas(idx, current, state)` where state=0xFF.
-    // SparseBlockState CAS just stores the raw u8. On recovery, blocks with
-    // invalid state aren't treated as Dirty/Clean/Syncing — they're just orphaned
-    // in the state map with an unknown value. The cache should still open.
     match result {
-        Ok(recovering) => {
-            // If it opened, recovery should handle the invalid state gracefully
-            let cache = recovering.finish_recovery().await;
-            match cache {
-                Ok(cache) => {
-                    // The invalid-state block might be treated as present-but-not-dirty,
-                    // or might be skipped. Either way, no panic.
-                    // The valid block should still be recoverable.
-                    let _ = cache.read_local(0, BLOCK_SIZE);
-                }
-                Err(e) => {
-                    // A clean error is acceptable
-                    assert!(
-                        !e.to_string().is_empty(),
-                        "should return a meaningful error"
-                    );
-                }
-            }
-        }
+        Ok(_) => panic!("should reject .meta file with CRC32 mismatch"),
         Err(e) => {
-            // A clean error during open is also acceptable (e.g., InvalidMetadata)
+            let err = e.to_string();
             assert!(
-                !e.to_string().is_empty(),
-                "should return a meaningful error"
+                err.contains("invalid") || err.contains("Invalid") || err.contains("metadata"),
+                "error should indicate metadata corruption, got: {err}"
             );
         }
     }
-    // The key assertion: we didn't panic. Any non-panic outcome is acceptable.
 }
 
 // =============================================================================
