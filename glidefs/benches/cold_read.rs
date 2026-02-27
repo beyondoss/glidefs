@@ -17,9 +17,9 @@ use rand::Rng;
 use tempfile::TempDir;
 
 use glidefs::block::cache::{BlockCache, SimpleBlockCache};
-use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::metrics::ExportMetrics;
+use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::state::Active;
 use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -39,7 +39,7 @@ struct ReadBenchHarness {
 
 impl ReadBenchHarness {
     /// Create a harness with `num_blocks` of random data already flushed to InMemory S3.
-    async fn new(num_blocks: u64) -> Self {
+    async fn new(num_blocks: u64, pic: &Arc<PackIndexCache>) -> Self {
         let temp_dir = TempDir::new().unwrap();
         let s3_backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
 
@@ -53,8 +53,6 @@ impl ReadBenchHarness {
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3_backend), "bench");
-        let pack_index_cache =
-            Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
         let volume_manifest = Arc::new(RwLock::new(
             VolumeManifest::new(device_size_bytes, BLOCK_SIZE as u32),
         ));
@@ -78,14 +76,14 @@ impl ReadBenchHarness {
 
         // Flush to S3 so the chunk meta cache and content store are populated.
         cache
-            .snapshot(&content_store, &pack_index_cache, &volume_manifest)
+            .snapshot(&content_store, pic, &volume_manifest)
             .await
             .unwrap();
 
         Self {
             cache,
             content_store,
-            pack_index_cache,
+            pack_index_cache: Arc::clone(pic),
             volume_manifest,
             metrics,
             num_blocks,
@@ -126,12 +124,15 @@ fn bench_cold_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("cold_read");
     group.sample_size(10);
 
+    let pic_dir = TempDir::new().unwrap();
+    let pic = Arc::new(rt.block_on(PackIndexCache::open(pic_dir.path())).unwrap());
+
     for num_blocks in [8u64, 64, 256] {
         let total_bytes = num_blocks * BLOCK_SIZE as u64;
         group.throughput(Throughput::Bytes(total_bytes));
 
         // Build the harness once (data is already in S3).
-        let harness = rt.block_on(ReadBenchHarness::new(num_blocks));
+        let harness = rt.block_on(ReadBenchHarness::new(num_blocks, &pic));
 
         group.bench_with_input(
             BenchmarkId::new("sequential", format!("{num_blocks}_blocks")),
@@ -170,12 +171,15 @@ fn bench_warm_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("warm_read");
     group.sample_size(10);
 
+    let pic_dir = TempDir::new().unwrap();
+    let pic = Arc::new(rt.block_on(PackIndexCache::open(pic_dir.path())).unwrap());
+
     for num_blocks in [8u64, 64, 256] {
         let total_bytes = num_blocks * BLOCK_SIZE as u64;
         group.throughput(Throughput::Bytes(total_bytes));
 
         // Build the harness and pre-warm the cache.
-        let harness = rt.block_on(ReadBenchHarness::new(num_blocks));
+        let harness = rt.block_on(ReadBenchHarness::new(num_blocks, &pic));
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Prime the cache with one full read pass.

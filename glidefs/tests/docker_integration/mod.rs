@@ -269,21 +269,35 @@ impl TestContext {
         let endpoint = format!("http://{}:{}", host, port);
 
         // Create bucket using curl with AWS SigV4 auth inside the container
-        // (reqwest basic_auth doesn't work for S3 API — MinIO requires SigV4)
-        minio
-            .exec(ExecCommand::new(vec![
-                "curl",
-                "-sf",
-                "-X",
-                "PUT",
-                "--aws-sigv4",
-                "aws:amz:us-east-1:s3",
-                "-u",
-                "minioadmin:minioadmin",
-                "http://localhost:9000/test-bucket",
-            ]))
-            .await
-            .unwrap();
+        // (reqwest basic_auth doesn't work for S3 API — MinIO requires SigV4).
+        // Retry: exec() confirms the command started but not that it completed,
+        // and MinIO may not be ready to accept requests immediately.
+        for attempt in 0..10 {
+            let result = minio
+                .exec(ExecCommand::new(vec![
+                    "curl",
+                    "-sf",
+                    "-X",
+                    "PUT",
+                    "--aws-sigv4",
+                    "aws:amz:us-east-1:s3",
+                    "-u",
+                    "minioadmin:minioadmin",
+                    "http://localhost:9000/test-bucket",
+                ]))
+                .await;
+            match result {
+                Ok(r) if r.exit_code().await.unwrap_or(1) == 0 => break,
+                _ if attempt < 9 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Ok(r) => panic!(
+                    "bucket creation failed after retries (exit code {:?})",
+                    r.exit_code().await,
+                ),
+                Err(e) => panic!("bucket creation exec failed after retries: {e}"),
+            }
+        }
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(
             AmazonS3Builder::new()
