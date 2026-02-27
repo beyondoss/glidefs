@@ -157,7 +157,7 @@ fn compute_flush_batch(
                 cas_failed,
                 corrupted,
             } => {
-                stats.blocks_flushed += 1;
+                stats.blocks_claimed += 1;
                 skipped.push(chunk_index);
                 if cas_failed {
                     stats.blocks_cas_failed += 1;
@@ -171,7 +171,7 @@ fn compute_flush_batch(
                 hash,
                 compressed,
             } => {
-                stats.blocks_flushed += 1;
+                stats.blocks_claimed += 1;
                 computed.push((chunk_index, hash));
 
                 match compressed {
@@ -215,30 +215,51 @@ fn compute_flush_batch(
 /// guarantees correctness; we just lose SSD corruption detection for those
 /// blocks.
 pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
+    use rayon::prelude::*;
+    use std::sync::atomic::AtomicU64;
+
     /// Maximum crc_map entries per export. 10M entries × ~20 bytes
     /// (DashMap overhead: bucket metadata + alignment + load factor) ≈ 200MB.
     /// Covers a fully-dirty 1TB device (8M blocks of 128KB) with headroom.
     /// Prevents unbounded growth if device_size is ever misconfigured.
     const MAX_CRC_ENTRIES: usize = 10_000_000;
 
+    // Already at cap — skip entirely.
+    if inner.crc_map.len() >= MAX_CRC_ENTRIES {
+        return;
+    }
+
+    // Collect dirty block indices up front so rayon can partition the work.
+    // Capped to leave headroom in the crc_map.
+    let dirty_indices: Vec<usize> = inner
+        .state_map
+        .iter_with_state(SparseBlockState::DIRTY)
+        .take(MAX_CRC_ENTRIES.saturating_sub(inner.crc_map.len()))
+        .collect();
+
+    if dirty_indices.is_empty() {
+        return;
+    }
+
     let block_size = inner.config.block_size;
     let device_size = inner.config.device_size;
-    let mut buf = vec![0u8; block_size];
-    let mut computed = 0u64;
+    let computed = AtomicU64::new(0);
 
-    for idx in inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
-        // Bound memory: stop computing CRCs once we hit the cap.
+    // Parallel CRC32 computation: each rayon task allocates its own read
+    // buffer (peak memory = num_threads × block_size, same as compute_flush_batch).
+    dirty_indices.par_iter().for_each(|&idx| {
+        // Soft cap: stop computing CRCs once the map is full. Racy but harmless —
+        // exceeding the cap slightly is fine, the bound prevents runaway growth.
         if inner.crc_map.len() >= MAX_CRC_ENTRIES {
-            break;
+            return;
         }
 
         // Skip blocks that already have a valid CRC.
         // If a sentinel is present (invalidated by a concurrent write),
-        // clear it and recompute. A single DashMap lookup replaces the
-        // prior two-step get + contains_key pattern.
+        // clear it and recompute.
         if let Some(existing) = inner.crc_map.get(&idx) {
             if *existing != CRC_SENTINEL {
-                continue; // valid CRC exists, skip
+                return; // valid CRC exists, skip
             }
             // Drop the read guard before removing (different shard lock).
             drop(existing);
@@ -253,9 +274,10 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
         let valid_bytes =
             std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
         if valid_bytes == 0 {
-            continue;
+            return;
         }
 
+        let mut buf = vec![0u8; block_size];
         if let Err(e) = inner
             .data_file
             .read_exact_at(&mut buf[..valid_bytes], offset)
@@ -265,7 +287,7 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
                 error = %e,
                 "failed to read block for CRC32 computation"
             );
-            continue;
+            return;
         }
         if valid_bytes < block_size {
             buf[valid_bytes..].fill(0);
@@ -273,9 +295,10 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
 
         let crc = crc32fast::hash(&buf);
         inner.crc_store(idx, crc);
-        computed += 1;
-    }
+        computed.fetch_add(1, Ordering::Relaxed);
+    });
 
+    let computed = computed.load(Ordering::Relaxed);
     if computed > 0 {
         debug!(computed, "computed CRC32 checksums for dirty blocks");
     }
@@ -526,7 +549,7 @@ impl WriteCache<Active> {
             .await
             .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
 
-            total_stats.blocks_flushed += batch.stats.blocks_flushed;
+            total_stats.blocks_claimed += batch.stats.blocks_claimed;
             total_stats.blocks_deduped += batch.stats.blocks_deduped;
             total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
             total_stats.blocks_corrupted += batch.stats.blocks_corrupted;
@@ -618,7 +641,7 @@ impl WriteCache<Active> {
         }
 
         info!(
-            blocks_flushed = total_stats.blocks_flushed,
+            blocks_claimed = total_stats.blocks_claimed,
             blocks_deduped = total_stats.blocks_deduped,
             blocks_cas_failed = total_stats.blocks_cas_failed,
             blocks_corrupted = total_stats.blocks_corrupted,
@@ -634,6 +657,7 @@ impl WriteCache<Active> {
     ///
     /// Returns (stats, seq_cutpoint). Compaction is the caller's responsibility
     /// and should run outside the flush lock to avoid blocking concurrent flushes.
+    #[must_use = "flush errors must be handled to avoid silent data loss"]
     pub async fn flush_packs(
         &self,
         content_store: &ContentStore,
@@ -645,6 +669,7 @@ impl WriteCache<Active> {
     }
 
     /// Upload the VolumeManifest (binary GLVM) to S3.
+    #[must_use = "manifest sync errors must be handled to avoid orphaned packs"]
     pub async fn sync_manifest(
         &self,
         content_store: &ContentStore,
@@ -664,6 +689,7 @@ impl WriteCache<Active> {
     /// mirroring flush_scheduler's pattern. This prevents spurious drain
     /// failures when blocks are already clean but a transient S3 error
     /// prevents the manifest upload.
+    #[must_use = "flush errors must be handled to avoid silent data loss"]
     #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn flush_to_s3(
         &self,
@@ -709,6 +735,7 @@ impl WriteCache<Active> {
     }
 
     /// Take a point-in-time snapshot.
+    #[must_use = "snapshot errors must be handled"]
     #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn snapshot(
         &self,

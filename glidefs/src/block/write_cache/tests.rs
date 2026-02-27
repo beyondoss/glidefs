@@ -236,7 +236,7 @@ async fn test_flush_end_to_end() {
     }
 
     let stats = h.flush().await;
-    assert_eq!(stats.blocks_flushed, 10);
+    assert_eq!(stats.blocks_claimed, 10);
     assert_eq!(stats.blocks_deduped, 0);
     assert!(stats.packs_uploaded > 0);
     assert!(stats.bytes_uploaded > 0);
@@ -259,7 +259,7 @@ async fn test_flush_dedup_skips_existing() {
     }
 
     let stats1 = h.flush().await;
-    assert_eq!(stats1.blocks_flushed, 5);
+    assert_eq!(stats1.blocks_claimed, 5);
     assert_eq!(stats1.blocks_deduped, 0);
     assert!(stats1.packs_uploaded > 0);
 
@@ -274,7 +274,7 @@ async fn test_flush_dedup_skips_existing() {
     }
 
     let stats2 = h.flush().await;
-    assert_eq!(stats2.blocks_flushed, 5);
+    assert_eq!(stats2.blocks_claimed, 5);
     // No cross-flush dedup in pack-based architecture — blocks at new offsets
     // are uploaded even if their content matches previously flushed blocks.
     assert!(stats2.packs_uploaded > 0, "new offsets require new pack entries");
@@ -292,7 +292,7 @@ async fn test_flush_partial_dedup() {
     }
 
     let stats1 = h.flush().await;
-    assert_eq!(stats1.blocks_flushed, 10);
+    assert_eq!(stats1.blocks_claimed, 10);
     assert_eq!(stats1.blocks_deduped, 0);
 
     // Write 10 more blocks at new offsets: 5 reuse previous content, 5 are new.
@@ -310,7 +310,7 @@ async fn test_flush_partial_dedup() {
     }
 
     let stats2 = h.flush().await;
-    assert_eq!(stats2.blocks_flushed, 10);
+    assert_eq!(stats2.blocks_claimed, 10);
     // All 10 blocks are uploaded — no cross-flush hash dedup in pack-based architecture.
     assert!(stats2.packs_uploaded > 0, "all blocks need pack entries");
 }
@@ -330,7 +330,7 @@ async fn test_flush_zero_blocks_skipped() {
         .unwrap();
 
     let stats = h.flush().await;
-    assert_eq!(stats.blocks_flushed, 2);
+    assert_eq!(stats.blocks_claimed, 2);
     assert_eq!(stats.blocks_deduped, 1, "zero block should be deduped");
     assert_eq!(stats.packs_uploaded, 1, "only one pack for the real block");
 }
@@ -349,7 +349,7 @@ async fn test_flush_clears_dirty_state() {
 
     // A second flush should be a no-op
     let stats = h.flush().await;
-    assert_eq!(stats.blocks_flushed, 0, "no dirty blocks after flush");
+    assert_eq!(stats.blocks_claimed, 0, "no dirty blocks after flush");
 }
 
 #[tokio::test]
@@ -364,7 +364,7 @@ async fn test_flush_concurrent_write_stays_dirty() {
 
     let stats = h.flush().await;
     assert_eq!(
-        stats.blocks_flushed, 1,
+        stats.blocks_claimed, 1,
         "overwritten block should be flushed"
     );
 }
@@ -601,7 +601,7 @@ async fn test_snapshot_returns_sequence_and_stats() {
         .unwrap();
 
     assert!(result.sequence > 0, "sequence should be > 0 after writes");
-    assert_eq!(result.stats.blocks_flushed, 5);
+    assert_eq!(result.stats.blocks_claimed, 5);
     assert!(result.stats.packs_uploaded > 0);
 
     // Manifest should have correct block size
@@ -629,7 +629,7 @@ async fn test_snapshot_clears_dirty_state() {
         )
         .await
         .unwrap();
-    assert_eq!(result1.stats.blocks_flushed, 3);
+    assert_eq!(result1.stats.blocks_claimed, 3);
 
     // Second snapshot with no new writes should be a no-op
     let result2: SnapshotResult = h
@@ -642,7 +642,7 @@ async fn test_snapshot_clears_dirty_state() {
         .await
         .unwrap();
     assert_eq!(
-        result2.stats.blocks_flushed, 0,
+        result2.stats.blocks_claimed, 0,
         "no dirty blocks after snapshot"
     );
 }
@@ -666,7 +666,7 @@ async fn test_snapshot_captures_concurrent_writes() {
         )
         .await
         .unwrap();
-    assert_eq!(result.stats.blocks_flushed, 2);
+    assert_eq!(result.stats.blocks_claimed, 2);
 
     // Write more after snapshot
     h.cache
@@ -683,7 +683,7 @@ async fn test_snapshot_captures_concurrent_writes() {
         )
         .await
         .unwrap();
-    assert_eq!(result2.stats.blocks_flushed, 1);
+    assert_eq!(result2.stats.blocks_claimed, 1);
 }
 
 // ========================================================================
@@ -1084,7 +1084,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "no mismatch on second flush");
-    assert_eq!(stats2.blocks_flushed, 1);
+    assert_eq!(stats2.blocks_claimed, 1);
 }
 
 /// CRC32 is invalidated on new writes, so stale checksums don't cause false positives.
@@ -1118,7 +1118,7 @@ async fn test_crc32_cleared_on_write() {
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);
-    assert_eq!(stats.blocks_flushed, 1);
+    assert_eq!(stats.blocks_claimed, 1);
 }
 
 /// Partial corruption: multiple dirty blocks, only some corrupted.
@@ -1163,7 +1163,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 2, "blocks 1 and 3 corrupted");
-    assert_eq!(stats.blocks_flushed, 5, "all 5 scanned");
+    assert_eq!(stats.blocks_claimed, 5, "all 5 scanned");
     assert_eq!(stats.packs_uploaded, 1, "3 good blocks → 1 pack");
 
     // Good blocks (0, 2, 4) should be clean now; corrupted (1, 3) still dirty.
@@ -1189,7 +1189,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0);
-    assert_eq!(stats2.blocks_flushed, 2);
+    assert_eq!(stats2.blocks_claimed, 2);
     assert_eq!(
         h.cache.dirty_block_count(),
         0,
@@ -1229,7 +1229,7 @@ async fn test_crc32_happy_path_multi_cycle() {
         .await
         .unwrap();
     assert_eq!(stats1.blocks_corrupted, 0, "cycle 1: no corruption");
-    assert_eq!(stats1.blocks_flushed, 3);
+    assert_eq!(stats1.blocks_claimed, 3);
     assert_eq!(stats1.packs_uploaded, 1);
     assert_eq!(h.cache.dirty_block_count(), 0, "cycle 1: all clean");
 
@@ -1266,7 +1266,7 @@ async fn test_crc32_happy_path_multi_cycle() {
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "cycle 2: no corruption");
-    assert_eq!(stats2.blocks_flushed, 3);
+    assert_eq!(stats2.blocks_claimed, 3);
     assert_eq!(h.cache.dirty_block_count(), 0, "cycle 2: all clean");
 }
 

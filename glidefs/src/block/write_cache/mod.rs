@@ -43,8 +43,10 @@ use inner::CacheInner;
 /// Statistics from a flush operation.
 #[derive(Debug, Default)]
 pub struct FlushStats {
-    /// Total blocks included in the flush snapshot.
-    pub blocks_flushed: usize,
+    /// Total blocks claimed from the dirty set (CAS DIRTY→SYNCING) for this
+    /// flush cycle. Includes blocks that were later skipped (CRC mismatch,
+    /// concurrent re-dirty). Zero means no dirty blocks existed.
+    pub blocks_claimed: usize,
     /// Blocks skipped (already in S3 or zero blocks).
     pub blocks_deduped: usize,
     /// Blocks left dirty because a concurrent write changed their sequence

@@ -156,7 +156,7 @@ impl ExportState {
                 .flush_to_s3(&self.content_store, &self.pack_index_cache, &self.volume_manifest)
                 .await
                 .map_err(RouterError::Cache)?;
-            if stats.blocks_flushed == 0 {
+            if stats.blocks_claimed == 0 {
                 return Ok(());
             }
         }
@@ -427,24 +427,19 @@ impl ExportRouter {
             return 0;
         }
 
-        // Filter out packs already in cache.
-        let mut uncached = Vec::new();
-        for (chunk_idx, pack_id, cs) in to_fetch {
-            if self.pack_index_cache.get_entries(pack_id).await.is_none() {
-                uncached.push((chunk_idx, pack_id, cs));
-            }
-        }
-
-        if uncached.is_empty() {
-            return 0;
-        }
-
-        info!(count = uncached.len(), "prefetching pack indices from S3");
+        // Filter out packs already in cache and fetch uncached ones in parallel.
+        // The cache check and S3 fetch are combined into a single stream to avoid
+        // a sequential O(N) await loop for the filter step.
+        info!(total = to_fetch.len(), "prefetching pack indices from S3");
         let pic = Arc::clone(&self.pack_index_cache);
-        let fetched: usize = futures::stream::iter(uncached)
+        let fetched: usize = futures::stream::iter(to_fetch)
             .map(|(chunk_idx, pack_id, cs)| {
                 let pic = Arc::clone(&pic);
                 async move {
+                    // Fast path: already cached — no S3 fetch needed.
+                    if pic.get_entries(pack_id).await.is_some() {
+                        return 0;
+                    }
                     match cs.get_pack_index(chunk_idx, pack_id).await {
                         Ok(entries) => {
                             pic.insert_entries(pack_id, &entries);
@@ -935,8 +930,8 @@ impl ExportRouter {
             .map_err(RouterError::Cache)?;
 
         info!(
-            "Snapshot of '{}' complete: seq={}, blocks_flushed={}, packs_uploaded={}",
-            name, result.sequence, result.stats.blocks_flushed, result.stats.packs_uploaded,
+            "Snapshot of '{}' complete: seq={}, blocks_claimed={}, packs_uploaded={}",
+            name, result.sequence, result.stats.blocks_claimed, result.stats.packs_uploaded,
         );
 
         // If a tag was provided, publish the manifest under that name too.
@@ -1575,7 +1570,7 @@ impl ExportRouter {
         let mut drain_done = false;
         for _ in 0..MAX_DRAIN_ITERATIONS {
             match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
-                Ok(stats) if stats.blocks_flushed == 0 => {
+                Ok(stats) if stats.blocks_claimed == 0 => {
                     drain_done = true;
                     break;
                 }

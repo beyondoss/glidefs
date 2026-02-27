@@ -117,7 +117,7 @@ pub async fn flush_scheduler(
                             if stats.packs_uploaded > 0 {
                                 info!(
                                     packs = stats.packs_uploaded,
-                                    blocks = stats.blocks_flushed,
+                                    blocks = stats.blocks_claimed,
                                     bytes = stats.bytes_uploaded,
                                     "pack-size flush"
                                 );
@@ -244,7 +244,7 @@ pub async fn flush_scheduler(
                                 if stats.packs_uploaded > 0 {
                                     info!(
                                         packs = stats.packs_uploaded,
-                                        blocks = stats.blocks_flushed,
+                                        blocks = stats.blocks_claimed,
                                         "periodic retry flush succeeded"
                                     );
                                     match cache.sync_manifest(&content_store, &volume_manifest).await {

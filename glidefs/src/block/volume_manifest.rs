@@ -8,7 +8,7 @@
 //! truncation when a chunk accumulates 256+ packs (possible if compaction
 //! keeps failing).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use super::pack::PackId;
 
@@ -102,12 +102,16 @@ impl VolumeManifest {
         self.chunks.get(&chunk_idx).map(|e| e.packs.as_slice())
     }
 
-    /// Collect all (chunk_idx, pack_id) pairs across the manifest (for GC).
-    pub fn all_pack_ids(&self) -> HashSet<(u32, PackId)> {
-        let mut result = HashSet::new();
+    /// Collect all (chunk_idx, pack_id) pairs across the manifest.
+    ///
+    /// Pairs are structurally unique: each pack_id appears exactly once per chunk.
+    /// Returns a Vec (no hashing overhead) — callers that need set semantics
+    /// can collect into a HashSet.
+    pub fn all_pack_ids(&self) -> Vec<(u32, PackId)> {
+        let mut result = Vec::new();
         for (&chunk_idx, entry) in &self.chunks {
             for &pack_id in &entry.packs {
-                result.insert((chunk_idx, pack_id));
+                result.push((chunk_idx, pack_id));
             }
         }
         result

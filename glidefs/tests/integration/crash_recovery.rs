@@ -507,7 +507,7 @@ async fn test_wal_recovery_without_metadata_save() {
             .unwrap();
         assert!(stats.packs_uploaded > 0, "should upload recovered blocks");
         assert_eq!(
-            stats.blocks_flushed, 2,
+            stats.blocks_claimed, 2,
             "should flush both WAL-recovered blocks"
         );
     }
@@ -636,7 +636,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
             .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
             .await
             .unwrap();
-        assert_eq!(stats.blocks_flushed, 2, "both blocks should flush to S3");
+        assert_eq!(stats.blocks_claimed, 2, "both blocks should flush to S3");
 
         // Verify from cold reader
         let cold_dir = TempDir::new().unwrap();
