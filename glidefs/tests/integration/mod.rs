@@ -15,7 +15,7 @@ mod property_tests;
 mod snapshots;
 mod wake_any_node;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use object_store::ObjectStore;
 use tempfile::TempDir;
@@ -30,6 +30,31 @@ use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128KB
 const DEVICE_SIZE: u64 = 256 * 1024 * 1024; // 256MB (enough for multi-pack tests at 500 blocks/pack)
+
+/// Process-global shared PackIndexCache.
+///
+/// Foyer's SSD tier doesn't release file descriptors on drop. Creating one per
+/// test exhausts the FD limit and causes SIGSEGV on CI. A single shared cache
+/// avoids this — entries are keyed by PackId so tests don't interfere.
+static SHARED_PACK_INDEX_CACHE: LazyLock<Arc<PackIndexCache>> = LazyLock::new(|| {
+    // LazyLock is initialized inside a #[tokio::test] runtime, so we can't call
+    // Runtime::new() (panics with "cannot start a runtime from within a runtime").
+    // Spawn a std thread to create and leak a dedicated runtime for foyer's background tasks.
+    let cache = std::thread::spawn(|| {
+        let rt = tokio::runtime::Runtime::new()
+            .expect("failed to create runtime for pack index cache");
+        let dir = TempDir::new().expect("failed to create temp dir for shared pack index cache");
+        let dir = Box::leak(Box::new(dir));
+        let cache = rt.block_on(PackIndexCache::open(dir.path()))
+            .expect("failed to open pack index cache");
+        // Leak the runtime so foyer's background tasks keep running.
+        std::mem::forget(rt);
+        cache
+    })
+    .join()
+    .expect("failed to initialize shared pack index cache");
+    Arc::new(cache)
+});
 
 /// Shared test harness: creates a WriteCache with ContentStore + PackIndexCache + VolumeManifest + SimpleBlockCache.
 ///
@@ -57,7 +82,7 @@ pub async fn create_test_cache(
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(s3, "test");
-    let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+    let pack_index_cache = Arc::clone(&*SHARED_PACK_INDEX_CACHE);
     let volume_manifest = Arc::new(parking_lot::RwLock::new(
         VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
     ));
@@ -104,7 +129,7 @@ pub async fn create_cold_reader(
         Err(e) => panic!("failed to fetch volume manifest: {}", e),
     };
 
-    let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+    let pack_index_cache = Arc::clone(&*SHARED_PACK_INDEX_CACHE);
 
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),

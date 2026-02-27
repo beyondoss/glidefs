@@ -184,7 +184,7 @@ async fn create_test_cache(
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
-    let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+    let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
         DEVICE_SIZE,
         BLOCK_SIZE as u32,
@@ -242,7 +242,7 @@ async fn create_reader_from_manifest(
     };
 
     let metrics = Arc::new(ExportMetrics::new());
-    let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+    let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let volume_manifest = Arc::new(parking_lot::RwLock::new(volume_manifest));
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 

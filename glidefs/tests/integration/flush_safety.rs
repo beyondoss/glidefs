@@ -173,11 +173,7 @@ async fn test_pressure_flush_concurrent_with_drain() {
     };
     let reader_cache = glidefs::block::write_cache::WriteCache::open_fresh_active(reader_config)
         .unwrap();
-    let reader_pack_index_cache = Arc::new(
-        glidefs::block::pack_index_cache::PackIndexCache::open(reader_dir.path())
-            .await
-            .unwrap(),
-    );
+    let reader_pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let reader_vm = Arc::new(parking_lot::RwLock::new(vm));
     let reader_clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
     let reader_metrics = Arc::new(glidefs::block::metrics::ExportMetrics::new());
