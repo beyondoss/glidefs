@@ -1514,14 +1514,20 @@ impl ExportRouter {
         let export_list: Vec<_> = exports.drain().collect();
         drop(exports); // Release the lock
 
-        let mut incomplete: Vec<(String, u64)> = Vec::new();
-        for (name, state) in export_list {
-            info!("Shutting down export '{}'...", name);
-            let remaining = Self::teardown_export(&name, state).await;
-            if remaining > 0 {
-                incomplete.push((name, remaining));
-            }
-        }
+        use futures::stream::{self, StreamExt};
+
+        let incomplete: Vec<(String, u64)> = stream::iter(export_list)
+            .map(|(name, state)| async move {
+                info!("Shutting down export '{}'...", name);
+                let remaining = Self::teardown_export(&name, state).await;
+                (name, remaining)
+            })
+            .buffer_unordered(16)
+            .filter_map(|(name, remaining)| async move {
+                if remaining > 0 { Some((name, remaining)) } else { None }
+            })
+            .collect()
+            .await;
 
         if !incomplete.is_empty() {
             let details = incomplete

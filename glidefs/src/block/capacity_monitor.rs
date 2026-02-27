@@ -85,7 +85,11 @@ pub async fn capacity_monitor(
                 break;
             }
             _ = interval.tick() => {
-                let utilization = statvfs_utilization(router.cache_dir());
+                let Some(utilization) = statvfs_utilization(router.cache_dir()) else {
+                    // statvfs failed — preserve previous pressure level
+                    // and skip this tick rather than falsely reporting Normal.
+                    continue;
+                };
                 router.set_ssd_utilization(utilization);
 
                 let new_level = PressureLevel::classify(utilization, &config);
@@ -142,32 +146,30 @@ pub async fn capacity_monitor(
     }
 }
 
-/// Query SSD utilization via `statvfs`. Returns a ratio in [0.0, 1.0].
+/// Query SSD utilization via `statvfs`. Returns `Some(ratio)` in [0.0, 1.0],
+/// or `None` on error so the caller can preserve the previous reading.
 ///
 /// Uses `f_bavail` (blocks available to unprivileged users) rather than
 /// `f_bfree` to match what userspace processes actually see.
-fn statvfs_utilization(path: &Path) -> f64 {
+fn statvfs_utilization(path: &Path) -> Option<f64> {
     use std::ffi::CString;
     use std::mem::MaybeUninit;
 
-    let c_path = match CString::new(path.as_os_str().as_encoded_bytes()) {
-        Ok(p) => p,
-        Err(_) => return 0.0,
-    };
+    let c_path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
 
     let mut stat = MaybeUninit::<libc::statvfs>::uninit();
     let ret = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
     if ret != 0 {
         warn!("statvfs failed: {}", std::io::Error::last_os_error());
-        return 0.0;
+        return None;
     }
 
     let stat = unsafe { stat.assume_init() };
     if stat.f_blocks == 0 {
-        return 0.0;
+        return Some(0.0);
     }
 
-    1.0 - (stat.f_bavail as f64 / stat.f_blocks as f64)
+    Some(1.0 - (stat.f_bavail as f64 / stat.f_blocks as f64))
 }
 
 #[cfg(test)]
@@ -198,14 +200,14 @@ mod tests {
     #[test]
     fn test_statvfs_on_real_filesystem() {
         // Should return a valid ratio on any real filesystem
-        let util = statvfs_utilization(Path::new("/tmp"));
+        let util = statvfs_utilization(Path::new("/tmp")).expect("statvfs should succeed on /tmp");
         assert!((0.0..=1.0).contains(&util), "utilization out of range: {util}");
     }
 
     #[test]
     fn test_statvfs_nonexistent_path() {
-        // Should return 0.0 on error, not panic
+        // Should return None on error, not panic
         let util = statvfs_utilization(Path::new("/nonexistent/path/that/does/not/exist"));
-        assert_eq!(util, 0.0);
+        assert_eq!(util, None);
     }
 }

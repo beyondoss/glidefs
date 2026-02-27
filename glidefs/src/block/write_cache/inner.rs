@@ -108,11 +108,10 @@ pub(super) const CRC_SENTINEL: u32 = u32::MAX;
 
 /// Check if a block is all zeros.
 ///
-/// Uses SIMD when available (AVX2 on x86_64), falling back to 64-bit word
-/// comparison. For a 128KB block:
-/// - Byte-by-byte: 131,072 comparisons
-/// - u64 fallback: 16,384 comparisons
-/// - AVX2 (256-bit): 4,096 comparisons
+/// Uses SIMD when available:
+/// - AVX2 on x86_64 (32 bytes/iter → 4,096 iterations for 128KB)
+/// - NEON on aarch64 (2×16 bytes/iter → 4,096 iterations for 128KB)
+/// - u64 fallback on other arches (8 bytes/iter → 16,384 iterations for 128KB)
 #[inline]
 pub(super) fn is_zero_block(data: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -122,6 +121,12 @@ pub(super) fn is_zero_block(data: &[u8]) -> bool {
             return unsafe { is_zero_block_avx2(data) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is always available on aarch64 (baseline ISA).
+        return is_zero_block_neon(data);
+    }
+    #[allow(unreachable_code)]
     is_zero_block_u64(data)
 }
 
@@ -149,6 +154,52 @@ unsafe fn is_zero_block_avx2(data: &[u8]) -> bool {
         }
 
         // Handle remainder (0-31 bytes) with scalar code
+        while ptr < end {
+            if *ptr != 0 {
+                return false;
+            }
+            ptr = ptr.add(1);
+        }
+
+        true
+    }
+}
+
+/// NEON implementation for aarch64 — checks 32 bytes at a time (2×128-bit loads + OR).
+/// NEON is baseline on aarch64, so no runtime detection needed.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn is_zero_block_neon(data: &[u8]) -> bool {
+    use std::arch::aarch64::*;
+
+    // SAFETY: NEON is always available on aarch64. All pointer operations
+    // stay within the bounds of `data`.
+    unsafe {
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+
+        // Process 32 bytes at a time: load 2×16B, OR together, check.
+        // Same throughput as AVX2 (32 bytes/branch) using 128-bit registers.
+        while ptr.add(32) <= end {
+            let a = vld1q_u8(ptr);
+            let b = vld1q_u8(ptr.add(16));
+            let combined = vorrq_u8(a, b);
+            if vmaxvq_u8(combined) != 0 {
+                return false;
+            }
+            ptr = ptr.add(32);
+        }
+
+        // Handle 16-byte remainder
+        if ptr.add(16) <= end {
+            let chunk = vld1q_u8(ptr);
+            if vmaxvq_u8(chunk) != 0 {
+                return false;
+            }
+            ptr = ptr.add(16);
+        }
+
+        // Handle trailing bytes (0-15)
         while ptr < end {
             if *ptr != 0 {
                 return false;

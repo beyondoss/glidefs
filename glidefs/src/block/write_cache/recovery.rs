@@ -3,10 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tracing::{info, instrument, warn};
 
-use crate::block::block_map::SparseBlockState;
 use crate::block::state::{Active, Recovering};
 
-use super::inner::CacheInner;
 use super::{CacheError, WriteCache};
 
 impl WriteCache<Recovering> {
@@ -24,9 +22,9 @@ impl WriteCache<Recovering> {
 
     /// Recover from a previous session and transition to Active.
     ///
-    /// Verifies dirty blocks are readable from SSD (confirms SSD integrity
-    /// before entering Active state). The flush path always computes fresh
-    /// blake3 hashes from SSD, so no stored hash needs to be verified.
+    /// Computes CRC32 baselines for all dirty blocks (parallel via rayon),
+    /// which also serves as an SSD readability check. Blocks that fail
+    /// pread are logged as warnings but do not prevent recovery.
     ///
     /// Runs the blocking SSD I/O (pread + CRC32) on a blocking thread to
     /// avoid starving the async runtime during recovery.
@@ -41,14 +39,10 @@ impl WriteCache<Recovering> {
 
             let inner = Arc::clone(&self.inner);
             let warnings = crate::task::spawn_blocking_named("recovery", move || {
-                // Verify dirty blocks are readable from SSD
-                let warnings = verify_dirty_blocks_readable(&inner)?;
-
                 // Compute CRC32 baselines for dirty blocks before transitioning
-                // to Active. Without this, a notify-triggered flush could process
-                // recovered dirty blocks before the first checkpoint computes CRCs,
-                // bypassing SSD corruption detection.
-                super::flush::compute_dirty_crc32s(&inner);
+                // to Active. This also verifies SSD readability — blocks that
+                // fail pread are counted as warnings (no separate pass needed).
+                let warnings = super::flush::compute_dirty_crc32s(&inner);
 
                 // Save metadata after recovery
                 inner.save_metadata()?;
@@ -73,39 +67,4 @@ impl WriteCache<Recovering> {
             _state: PhantomData,
         })
     }
-}
-
-/// Verify dirty blocks are readable from SSD.
-///
-/// For each DIRTY block, pread from SSD to confirm the data is intact.
-/// The flush path computes fresh blake3 hashes from SSD, so no stored
-/// hash comparison is needed. This only checks SSD readability.
-///
-/// Returns the number of blocks with read errors.
-fn verify_dirty_blocks_readable(inner: &CacheInner) -> Result<usize, CacheError> {
-    let block_size = inner.config.block_size;
-    let device_size = inner.config.device_size;
-    let mut warnings = 0;
-    let mut buf = vec![0u8; block_size];
-
-    for idx in inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
-        let offset = idx as u64 * block_size as u64;
-        let valid_bytes =
-            std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
-
-        if valid_bytes == 0 {
-            continue;
-        }
-
-        if let Err(e) = inner.data_file.read_exact_at(&mut buf[..valid_bytes], offset) {
-            warn!(
-                chunk_index = idx,
-                error = %e,
-                "recovery: failed to read dirty block from SSD"
-            );
-            warnings += 1;
-        }
-    }
-
-    Ok(warnings)
 }

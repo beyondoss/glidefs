@@ -67,22 +67,42 @@ pub async fn compact_chunk(
         "starting compaction"
     );
 
-    // 1. Load all pack indices (from cache, or fetch from S3 on miss)
-    let mut all_entries: Vec<(PackId, Vec<PackIndexEntry>)> = Vec::new();
-    for &pid in pack_ids {
-        let entries = match pack_index_cache.get_entries(pid).await {
-            Some(e) => e,
-            None => {
-                // Cache miss: fetch from S3
-                let fetched = content_store
-                    .get_pack_index(chunk_idx, pid)
-                    .await?;
-                pack_index_cache.insert_entries(pid, &fetched);
-                fetched
-            }
-        };
-        all_entries.push((pid, entries));
-    }
+    // 1. Load all pack indices in parallel (from cache, or fetch from S3 on miss)
+    use futures::stream::{self, StreamExt};
+
+    let all_entries: Vec<(PackId, Vec<PackIndexEntry>)> = {
+        let results: Vec<Result<(PackId, Vec<PackIndexEntry>), CacheError>> =
+            stream::iter(pack_ids.iter().copied())
+                .map(|pid| async move {
+                    let entries = match pack_index_cache.get_entries(pid).await {
+                        Some(e) => e,
+                        None => {
+                            let fetched = content_store
+                                .get_pack_index(chunk_idx, pid)
+                                .await?;
+                            pack_index_cache.insert_entries(pid, &fetched);
+                            fetched
+                        }
+                    };
+                    Ok((pid, entries))
+                })
+                .buffer_unordered(16)
+                .collect()
+                .await;
+        let mut entries = Vec::with_capacity(results.len());
+        for r in results {
+            entries.push(r?);
+        }
+        // Restore original oldest-to-newest ordering (buffer_unordered
+        // completes out of order). Needed for "newest wins" merge below.
+        let id_order: HashMap<PackId, usize> = pack_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &pid)| (pid, i))
+            .collect();
+        entries.sort_by_key(|(pid, _)| id_order[pid]);
+        entries
+    };
 
     // 2. Build merged block map: newest entry wins per chunk_offset.
     // pack_ids are ordered oldest-to-newest, so we iterate forward and overwrite.
@@ -124,8 +144,6 @@ pub async fn compact_chunk(
     // 3. Fetch compressed block data from source packs.
     // Partition: zero tombstones (comp_length == 0) go directly into the output
     // without an S3 fetch. Non-zero blocks use concurrent range-reads.
-    use futures::stream::{self, StreamExt};
-
     let mut zero_tombstones: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
     let mut blocks_to_fetch: Vec<(u32, PackId, Blake3Hash, u32, u32)> = Vec::new();
     for (chunk_offset, (pid, hash, pack_offset, comp_length)) in merged {

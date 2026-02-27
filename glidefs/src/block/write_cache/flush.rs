@@ -214,7 +214,7 @@ fn compute_flush_batch(
 /// CRC verification at flush time — the SYNCING state machine still
 /// guarantees correctness; we just lose SSD corruption detection for those
 /// blocks.
-pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
+pub(super) fn compute_dirty_crc32s(inner: &CacheInner) -> usize {
     use rayon::prelude::*;
     use std::sync::atomic::AtomicU64;
 
@@ -226,7 +226,7 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
 
     // Already at cap — skip entirely.
     if inner.crc_map.len() >= MAX_CRC_ENTRIES {
-        return;
+        return 0;
     }
 
     // Collect dirty block indices up front so rayon can partition the work.
@@ -238,12 +238,13 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
         .collect();
 
     if dirty_indices.is_empty() {
-        return;
+        return 0;
     }
 
     let block_size = inner.config.block_size;
     let device_size = inner.config.device_size;
     let computed = AtomicU64::new(0);
+    let read_errors = AtomicU64::new(0);
 
     // Parallel CRC32 computation: each rayon task allocates its own read
     // buffer (peak memory = num_threads × block_size, same as compute_flush_batch).
@@ -287,6 +288,7 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
                 error = %e,
                 "failed to read block for CRC32 computation"
             );
+            read_errors.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if valid_bytes < block_size {
@@ -302,6 +304,8 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) {
     if computed > 0 {
         debug!(computed, "computed CRC32 checksums for dirty blocks");
     }
+
+    read_errors.load(Ordering::Relaxed) as usize
 }
 
 impl WriteCache<Active> {
