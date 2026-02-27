@@ -110,12 +110,6 @@ impl PackIndexCache {
             })
     }
 
-    /// Close the cache, flushing the SSD tier and releasing file descriptors.
-    pub async fn close(self) -> anyhow::Result<()> {
-        self.inner.close().await?;
-        Ok(())
-    }
-
     /// Collect all block hashes across multiple packs (for flush dedup).
     ///
     /// Used by the v4 flush path to build the known_hashes set from
