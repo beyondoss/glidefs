@@ -287,7 +287,7 @@ impl TestContext {
                 ]))
                 .await;
             match result {
-                Ok(r) if r.exit_code().await.unwrap_or(1) == 0 => break,
+                Ok(r) if r.exit_code().await.unwrap_or(Some(1)) == Some(0) => break,
                 _ if attempt < 9 => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
