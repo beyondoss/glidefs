@@ -79,6 +79,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "glidefs -> target"
+          shared-key: "cross-${{ matrix.target }}"
 
       - name: Install cross (Linux only)
         if: matrix.platform == 'linux'
