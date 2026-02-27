@@ -1070,8 +1070,7 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
 
     // Upload manifest so GC can read it
     {
-        let vm_guard = vm.read();
-        let manifest_bytes = vm_guard.serialize();
+        let manifest_bytes = vm.read().serialize();
         cs.put_manifest("orphan-gc", manifest_bytes).await.unwrap();
     }
 
