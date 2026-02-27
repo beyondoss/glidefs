@@ -332,6 +332,14 @@ impl WriteCache<Active> {
         let end_block = (offset + len as u64 - 1) / block_size;
         let num_blocks = (end_block - start_block + 1) as usize;
 
+        // Fast path: all blocks present on local SSD → single pread of exact bytes.
+        // Bypasses per-block resolution, full-block allocation, and Bytes wrapping.
+        if (start_block..=end_block).all(|i| self.inner.is_present(i as usize)) {
+            let mut buf = vec![0u8; len];
+            self.inner.data_file.read_exact_at(&mut buf, offset)?;
+            return Ok(Bytes::from(buf));
+        }
+
         // Single block fast path
         if num_blocks == 1 {
             let block_data = self

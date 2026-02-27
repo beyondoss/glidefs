@@ -33,6 +33,14 @@ struct V2BenchHarness {
 }
 
 impl V2BenchHarness {
+    /// Close the pack index cache to release foyer's SSD-tier file descriptors.
+    async fn teardown(self) {
+        // foyer doesn't release FDs on drop; requires explicit async close.
+        let cache = Arc::try_unwrap(self.pack_index_cache)
+            .unwrap_or_else(|_| panic!("pack_index_cache has other owners"));
+        let _ = cache.close().await;
+    }
+
     async fn new(device_size_mb: u64) -> Self {
         let temp_dir = TempDir::new().unwrap();
         let s3_backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -112,6 +120,8 @@ fn bench_v2_flush_latency(c: &mut Criterion) {
                             .await
                             .unwrap();
                         total += start.elapsed();
+
+                        h.teardown().await;
                     }
 
                     total
@@ -159,6 +169,8 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                     .await
                     .unwrap();
                 total += start.elapsed();
+
+                h.teardown().await;
             }
 
             total
@@ -211,6 +223,8 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                     .await
                     .unwrap();
                 total += start.elapsed();
+
+                h.teardown().await;
             }
 
             total
