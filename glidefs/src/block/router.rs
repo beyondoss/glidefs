@@ -1573,17 +1573,24 @@ impl ExportRouter {
         // 3. V2 drain: flush remaining dirty data.
         //    Continue on errors (may be transient S3 failures) instead of
         //    breaking — matches the public ExportState::drain() behavior.
+        //    Exponential backoff on consecutive errors prevents tight-looping
+        //    when S3 is down (100 rapid retries → log spam + wasted network).
         let mut drain_done = false;
+        let mut backoff = Duration::from_millis(100);
         for _ in 0..MAX_DRAIN_ITERATIONS {
             match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
                 Ok(stats) if stats.blocks_claimed == 0 => {
                     drain_done = true;
                     break;
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    backoff = Duration::from_millis(100);
+                }
                 Err(e) => {
                     metrics.record_flush_error();
-                    warn!("Drain error for '{}' (retrying): {}", name, e);
+                    warn!("Drain error for '{}' (retrying in {:?}): {}", name, backoff, e);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
                 }
             }
         }
