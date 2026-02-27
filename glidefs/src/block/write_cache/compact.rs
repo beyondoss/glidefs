@@ -190,7 +190,9 @@ pub async fn compact_chunk(
         .iter()
         .map(|e| (e.offset as u64) + (e.comp_length as u64))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        + (index_entries.len() as u64) * (crate::block::pack::PACK_INDEX_ENTRY_SIZE as u64)
+        + (crate::block::pack::TRAILER_SIZE as u64);
 
     // 5. Update manifest: replace N packs with 1, preserving concurrent appends
     {
