@@ -233,7 +233,7 @@ pub async fn flush_scheduler(
                     // flush_notify (liveness after S3 recovery).
                     let should_retry = flush_backoff > Duration::ZERO
                         && last_flush_failure
-                            .map_or(false, |t| t.elapsed() >= flush_backoff);
+                            .is_some_and(|t| t.elapsed() >= flush_backoff);
 
                     if should_retry {
                         let _flush_guard = cache.flush_lock().lock().await;
