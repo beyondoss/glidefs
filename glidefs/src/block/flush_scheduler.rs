@@ -19,22 +19,120 @@ use tracing::{info, warn};
 
 use crate::block::content_store::ContentStore;
 use crate::block::metrics::ExportMetrics;
-use crate::block::pack_index::HostPackIndex;
+use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::state::Active;
+use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::WriteCache;
+
+/// Maximum backoff between flush retries.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Result of a flush-and-sync cycle.
+struct FlushResult {
+    /// Number of packs uploaded to S3 (0 = no dirty blocks or all deduped).
+    packs_uploaded: usize,
+    /// Whether the manifest was successfully synced to S3.
+    manifest_synced: bool,
+}
+
+/// Execute flush_packs + sync_manifest (with retries).
+///
+/// Must be called while holding the per-export flush lock. On success: resets
+/// backoff, records metrics, syncs manifest with 3 retries. On failure: extends
+/// exponential backoff, records error metric.
+///
+/// Returns `Some(result)` on flush success, `None` on flush failure.
+async fn flush_and_sync(
+    cache: &WriteCache<Active>,
+    content_store: &ContentStore,
+    pack_index_cache: &Arc<PackIndexCache>,
+    volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+    metrics: &ExportMetrics,
+    flush_backoff: &mut Duration,
+    last_flush_failure: &mut Option<Instant>,
+) -> Option<FlushResult> {
+    match cache
+        .flush_packs(content_store, pack_index_cache, volume_manifest)
+        .await
+    {
+        Ok((stats, _seq_cutpoint)) => {
+            *flush_backoff = Duration::ZERO;
+            *last_flush_failure = None;
+            metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
+            metrics.record_flush_blocks_corrupted(stats.blocks_corrupted);
+
+            let mut manifest_synced = false;
+            if stats.packs_uploaded > 0 {
+                info!(
+                    packs = stats.packs_uploaded,
+                    blocks = stats.blocks_claimed,
+                    bytes = stats.bytes_uploaded,
+                    "flushed packs"
+                );
+                for attempt in 0..3u32 {
+                    match cache
+                        .sync_manifest(content_store, volume_manifest)
+                        .await
+                    {
+                        Ok(()) => {
+                            manifest_synced = true;
+                            break;
+                        }
+                        Err(e) => {
+                            metrics.record_manifest_sync_error();
+                            warn!(
+                                error = %e, attempt = attempt + 1,
+                                "manifest sync failed"
+                            );
+                            if attempt < 2 {
+                                tokio::time::sleep(Duration::from_millis(
+                                    100 * (1 << attempt),
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some(FlushResult {
+                packs_uploaded: stats.packs_uploaded,
+                manifest_synced,
+            })
+        }
+        Err(e) => {
+            *flush_backoff = if flush_backoff.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                flush_backoff.saturating_mul(2).min(MAX_BACKOFF)
+            };
+            *last_flush_failure = Some(Instant::now());
+            metrics.record_flush_error();
+            warn!(
+                error = %e,
+                backoff_secs = flush_backoff.as_secs(),
+                "pack flush failed, backing off"
+            );
+            None
+        }
+    }
+}
 
 /// Run the flush scheduler for a single export.
 ///
 /// Loops until `shutdown` signals true. Two select branches:
 /// 1. `flush_notify` — event-driven pack flush when dirty count crosses threshold
 /// 2. Checkpoint ticker — periodic WAL truncation every 5s
+#[allow(clippy::too_many_arguments)]
 pub async fn flush_scheduler(
     cache: Arc<WriteCache<Active>>,
     content_store: Arc<ContentStore>,
-    pack_index: Arc<HostPackIndex>,
+    pack_index_cache: Arc<PackIndexCache>,
+    volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
     flush_notify: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<ExportMetrics>,
+    flush_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 ) {
     info!("flush scheduler started");
 
@@ -46,13 +144,18 @@ pub async fn flush_scheduler(
 
     // Backoff state: when flush fails (e.g., S3 down), wait before retrying
     // to avoid a tight spin of failed flush_packs calls.
-    const MAX_BACKOFF: Duration = Duration::from_secs(30);
     let mut flush_backoff = Duration::ZERO;
+
+    // Track when the last flush failure occurred so the checkpoint ticker
+    // can retry S3 flushes after the backoff has elapsed. Without this,
+    // dirty blocks can sit unsynced indefinitely if S3 recovers but no
+    // new writes trigger flush_notify.
+    let mut last_flush_failure: Option<Instant> = None;
 
     // Pending manifest sync: if sync_manifest fails after a successful pack
     // flush, we retry on the next checkpoint tick to close the window where
     // packs are on S3 but not referenced by any manifest.
-    let mut manifest_pending: Option<u64> = None;
+    let mut manifest_pending = false;
 
     loop {
         tokio::select! {
@@ -83,81 +186,127 @@ pub async fn flush_scheduler(
                 }
 
                 let start = Instant::now();
-                match cache.flush_packs(&content_store, &pack_index).await {
-                    Ok((stats, seq_cutpoint)) => {
-                        flush_backoff = Duration::ZERO;
+                let mut packs_uploaded = 0usize;
+
+                // Acquire global flush semaphore to limit how many exports
+                // prepare + upload pack data simultaneously (memory bound).
+                let _flush_permit = match &flush_semaphore {
+                    Some(sem) => Some(sem.acquire().await),
+                    None => None,
+                };
+
+                // Acquire per-export flush lock to serialize with concurrent
+                // drain/snapshot operations. Prevents stale manifest uploads.
+                {
+                    let _flush_guard = cache.flush_lock().lock().await;
+                    if let Some(result) = flush_and_sync(
+                        &cache, &content_store, &pack_index_cache, &volume_manifest,
+                        &metrics, &mut flush_backoff, &mut last_flush_failure,
+                    ).await {
                         metrics.record_s3_put_latency(start.elapsed());
-                        metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
-                        if stats.packs_uploaded > 0 {
-                            info!(
-                                packs = stats.packs_uploaded,
-                                blocks = stats.blocks_flushed,
-                                bytes = stats.bytes_uploaded,
-                                "pack-size flush"
-                            );
-                            // Sync manifest so flushed packs are discoverable
-                            // on cross-host recovery (host death without drain).
-                            // sync_manifest includes checkpoint (persist + WAL truncate).
-                            // Retry up to 3 times; if all fail, defer to checkpoint tick.
-                            let mut synced = false;
-                            for attempt in 0..3 {
-                                match cache.sync_manifest(&content_store, &pack_index, seq_cutpoint).await {
-                                    Ok(()) => { synced = true; break; }
-                                    Err(e) => {
-                                        metrics.record_manifest_sync_error();
-                                        warn!(error = %e, attempt = attempt + 1, "manifest sync after flush failed");
-                                    }
-                                }
-                            }
-                            if synced {
-                                manifest_pending = None;
+                        packs_uploaded = result.packs_uploaded;
+                        if result.packs_uploaded > 0 {
+                            if result.manifest_synced {
+                                manifest_pending = false;
                             } else {
-                                manifest_pending = Some(seq_cutpoint);
+                                // Checkpoint locally to bound WAL growth even
+                                // when manifest sync is failing.
+                                if let Err(e) = cache.local_checkpoint().await {
+                                    warn!(error = %e, "checkpoint after failed manifest sync");
+                                }
+                                manifest_pending = true;
                             }
                         } else {
                             // No packs uploaded — still checkpoint to persist
                             // clean block states and compute CRC32s.
-                            if let Err(e) = cache.local_checkpoint() {
-                                warn!(error = %e, "checkpoint after flush failed");
+                            if let Err(e) = cache.local_checkpoint().await {
+                                warn!(error = %e, "checkpoint after flush");
                             }
                         }
-                    }
-                    Err(e) => {
-                        // Exponential backoff: 1s → 2s → 4s → ... → 30s cap.
-                        flush_backoff = if flush_backoff.is_zero() {
-                            Duration::from_secs(1)
-                        } else {
-                            flush_backoff.saturating_mul(2).min(MAX_BACKOFF)
-                        };
-                        metrics.record_flush_error();
-                        warn!(error = %e, backoff_secs = flush_backoff.as_secs(), "pack flush failed, backing off");
-                        // Still checkpoint on flush error to prevent WAL growth
+                    } else {
+                        // Flush failed — still checkpoint to prevent WAL growth
                         // when S3 is down and flush_notify fires continuously.
-                        if let Err(e) = cache.local_checkpoint() {
-                            warn!(error = %e, "checkpoint after flush error failed");
+                        if let Err(e) = cache.local_checkpoint().await {
+                            warn!(error = %e, "checkpoint after flush error");
+                        }
+                    }
+                } // _flush_guard dropped — compaction runs without holding the flush lock.
+
+                // Compaction runs outside the flush lock so it doesn't block
+                // concurrent drain/snapshot/flush operations.
+                if packs_uploaded > 0 {
+                    match crate::block::write_cache::compact::compact_if_needed(
+                        crate::block::write_cache::compact::DEFAULT_COMPACTION_THRESHOLD,
+                        &content_store,
+                        &pack_index_cache,
+                        &volume_manifest,
+                    )
+                    .await
+                    {
+                        Ok(compaction_results) => {
+                            for r in &compaction_results {
+                                info!(
+                                    chunk_idx = r.chunk_idx,
+                                    new_pack_id = r.new_pack_id,
+                                    live_blocks = r.live_blocks,
+                                    new_pack_bytes = r.new_pack_size,
+                                    old_packs = r.old_pack_ids.len(),
+                                    "compacted chunk — old packs left for GC"
+                                );
+                            }
+                            // Compaction modified the manifest — schedule a sync
+                            // so the compacted state is persisted to S3.
+                            if !compaction_results.is_empty() {
+                                manifest_pending = true;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "compaction failed, will retry next cycle");
                         }
                     }
                 }
             }
 
-            // Periodic: checkpoint every 5s + retry pending manifest sync.
+            // Periodic: checkpoint every 5s + retry pending manifest sync +
+            // retry S3 flush after backoff has elapsed.
             _ = checkpoint_ticker.tick() => {
                 // Retry manifest sync that failed after a previous pack flush.
-                if let Some(seq) = manifest_pending {
-                    match cache.sync_manifest(&content_store, &pack_index, seq).await {
+                if manifest_pending {
+                    let _flush_guard = cache.flush_lock().lock().await;
+                    match cache.sync_manifest(&content_store, &volume_manifest).await {
                         Ok(()) => {
                             info!("deferred manifest sync succeeded");
-                            manifest_pending = None;
+                            manifest_pending = false;
                         }
                         Err(e) => {
                             metrics.record_manifest_sync_error();
                             warn!(error = %e, "deferred manifest sync retry failed");
                         }
                     }
-                } else if cache.dirty_block_count() > 0
-                    && let Err(e) = cache.local_checkpoint()
-                {
-                    warn!(error = %e, "local checkpoint failed");
+                } else if cache.dirty_block_count() > 0 {
+                    // If a previous flush failed and enough backoff time has
+                    // elapsed, retry the S3 flush. This ensures dirty blocks
+                    // eventually reach S3 even if no new writes trigger
+                    // flush_notify (liveness after S3 recovery).
+                    let should_retry = flush_backoff > Duration::ZERO
+                        && last_flush_failure
+                            .is_some_and(|t| t.elapsed() >= flush_backoff);
+
+                    if should_retry {
+                        let _flush_guard = cache.flush_lock().lock().await;
+                        if let Some(result) = flush_and_sync(
+                            &cache, &content_store, &pack_index_cache, &volume_manifest,
+                            &metrics, &mut flush_backoff, &mut last_flush_failure,
+                        ).await
+                            && result.packs_uploaded > 0 {
+                            manifest_pending = !result.manifest_synced;
+                        }
+                    }
+
+                    // Always checkpoint locally when dirty.
+                    if let Err(e) = cache.local_checkpoint().await {
+                        warn!(error = %e, "local checkpoint failed");
+                    }
                 }
             }
         }
@@ -171,8 +320,9 @@ mod tests {
     use crate::block::cache::{BlockCache, SimpleBlockCache};
     use crate::block::content_store::ContentStore;
     use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
-    use crate::block::pack_index::HostPackIndex;
+    use crate::block::pack_index_cache::PackIndexCache;
     use crate::block::state::Initializing;
+    use crate::block::volume_manifest::VolumeManifest;
     use crate::block::write_cache::WriteCacheConfig;
     use async_trait::async_trait;
     use futures::stream::BoxStream;
@@ -235,6 +385,15 @@ mod tests {
             location: &object_store::path::Path,
             opts: PutMultipartOptions,
         ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            if self.fail_puts.load(Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "FailingObjectStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Simulated S3 multipart failure",
+                    )),
+                });
+            }
             self.inner.put_multipart_opts(location, opts).await
         }
 
@@ -281,11 +440,16 @@ mod tests {
         }
     }
 
+    fn device_size() -> u64 {
+        128 * 1024 * (DEFAULT_BLOCKS_PER_PACK as u64 + 10)
+    }
+
     #[allow(clippy::type_complexity)]
-    fn test_scheduler_components() -> (
+    async fn test_scheduler_components() -> (
         Arc<WriteCache<Active>>,
         Arc<ContentStore>,
-        Arc<HostPackIndex>,
+        Arc<PackIndexCache>,
+        Arc<parking_lot::RwLock<VolumeManifest>>,
         Arc<Notify>,
         watch::Receiver<bool>,
         watch::Sender<bool>,
@@ -297,15 +461,18 @@ mod tests {
         let config = WriteCacheConfig {
             cache_dir: temp_dir.path().to_path_buf(),
             device_name: "sched-test".to_string(),
-            device_size: 128 * 1024 * (DEFAULT_BLOCKS_PER_PACK as u64 + 10), // enough for DEFAULT_BLOCKS_PER_PACK + headroom
+            device_size: device_size(),
             block_size: 128 * 1024,
             wal_sync: false,
         };
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = Arc::new(ContentStore::new(s3, "test"));
-        let pack_index =
-            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            device_size(),
+            128 * 1024,
+        )));
         let metrics = Arc::new(ExportMetrics::new());
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
@@ -318,7 +485,8 @@ mod tests {
         (
             cache,
             content_store,
-            pack_index,
+            pack_index_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
@@ -330,12 +498,13 @@ mod tests {
 
     /// Like test_scheduler_components but with a custom object store.
     #[allow(clippy::type_complexity)]
-    fn test_scheduler_components_with_store(
+    async fn test_scheduler_components_with_store(
         s3: Arc<dyn object_store::ObjectStore>,
     ) -> (
         Arc<WriteCache<Active>>,
         Arc<ContentStore>,
-        Arc<HostPackIndex>,
+        Arc<PackIndexCache>,
+        Arc<parking_lot::RwLock<VolumeManifest>>,
         Arc<Notify>,
         watch::Receiver<bool>,
         watch::Sender<bool>,
@@ -347,14 +516,17 @@ mod tests {
         let config = WriteCacheConfig {
             cache_dir: temp_dir.path().to_path_buf(),
             device_name: "sched-backoff".to_string(),
-            device_size: 128 * 1024 * (DEFAULT_BLOCKS_PER_PACK as u64 + 10),
+            device_size: device_size(),
             block_size: 128 * 1024,
             wal_sync: false,
         };
 
         let content_store = Arc::new(ContentStore::new(s3, "test"));
-        let pack_index =
-            Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            device_size(),
+            128 * 1024,
+        )));
         let metrics = Arc::new(ExportMetrics::new());
         let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
@@ -367,7 +539,8 @@ mod tests {
         (
             cache,
             content_store,
-            pack_index,
+            pack_index_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
@@ -379,17 +552,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_shutdown() {
-        let (cache, content_store, pack_index, flush_notify, shutdown_rx, shutdown_tx, metrics, ..) =
-            test_scheduler_components();
+        let (cache, content_store, pack_index_cache, volume_manifest, flush_notify, shutdown_rx, shutdown_tx, metrics, ..) =
+            test_scheduler_components().await;
 
         let handle = tokio::spawn(async move {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                pack_index_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });
@@ -409,14 +584,15 @@ mod tests {
         let (
             cache,
             content_store,
-            pack_index,
+            pack_index_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
             metrics,
             clean_cache,
             _temp,
-        ) = test_scheduler_components();
+        ) = test_scheduler_components().await;
 
         let cache_check = Arc::clone(&cache);
         let flush_notify_clone = Arc::clone(&flush_notify);
@@ -437,10 +613,12 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                pack_index_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });
@@ -475,14 +653,15 @@ mod tests {
         let (
             cache,
             content_store,
-            pack_index,
+            pack_index_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
             metrics,
             clean_cache,
             _temp,
-        ) = test_scheduler_components_with_store(failing_s3.clone() as _);
+        ) = test_scheduler_components_with_store(failing_s3.clone() as _).await;
 
         let metrics_check = Arc::clone(&metrics);
         let flush_notify_clone = Arc::clone(&flush_notify);
@@ -499,10 +678,12 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                pack_index_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });
@@ -557,14 +738,15 @@ mod tests {
         let (
             cache,
             content_store,
-            pack_index,
+            pack_index_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
             metrics,
             clean_cache,
             _temp,
-        ) = test_scheduler_components_with_store(failing_s3.clone() as _);
+        ) = test_scheduler_components_with_store(failing_s3.clone() as _).await;
 
         let metrics_check = Arc::clone(&metrics);
         let cache_check = Arc::clone(&cache);
@@ -582,10 +764,12 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                pack_index_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });
@@ -639,14 +823,15 @@ mod tests {
         let (
             cache,
             content_store,
-            pack_index,
+            pack_index_cache,
+            volume_manifest,
             flush_notify,
             shutdown_rx,
             shutdown_tx,
             metrics,
             clean_cache,
             _temp,
-        ) = test_scheduler_components_with_store(failing_s3 as _);
+        ) = test_scheduler_components_with_store(failing_s3 as _).await;
 
         let flush_notify_clone = Arc::clone(&flush_notify);
 
@@ -662,10 +847,12 @@ mod tests {
             flush_scheduler(
                 cache,
                 content_store,
-                pack_index,
+                pack_index_cache,
+                volume_manifest,
                 flush_notify,
                 shutdown_rx,
                 metrics,
+                None,
             )
             .await;
         });

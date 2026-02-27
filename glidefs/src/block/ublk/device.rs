@@ -1218,7 +1218,8 @@ mod tests {
     use crate::block::content_store::ContentStore;
     use crate::block::metrics::ExportMetrics;
     use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
-    use crate::block::pack_index::HostPackIndex;
+    use crate::block::pack_index_cache::PackIndexCache;
+    use crate::block::volume_manifest::VolumeManifest;
     use crate::block::write_cache::{WriteCache, WriteCacheConfig};
     use object_store::memory::InMemory;
     use std::sync::atomic::AtomicU64;
@@ -1228,7 +1229,7 @@ mod tests {
     const DEVICE_SIZE: u64 = 1024 * 1024; // 1MB
     const BLOCK_SIZE: usize = 4096;
 
-    fn make_handler(readonly: bool) -> (BlockHandler, TempDir) {
+    async fn make_handler(readonly: bool) -> (BlockHandler, TempDir) {
         let temp = TempDir::new().unwrap();
         let config = WriteCacheConfig {
             cache_dir: temp.path().to_path_buf(),
@@ -1241,15 +1242,18 @@ mod tests {
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
         let clean_cache: Arc<dyn crate::block::cache::BlockCache> =
             Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index =
-            Arc::new(HostPackIndex::open(temp.path().join("pack_index.redb")).unwrap());
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
+        ));
         let metrics = Arc::new(ExportMetrics::new());
         let cache = WriteCache::open(config).unwrap().skip_recovery_for_test();
         let handler = BlockHandler::new(
             Arc::new(cache),
             content_store,
             clean_cache,
-            pack_index,
+            pack_index_cache,
+            volume_manifest,
             DEVICE_SIZE,
             readonly,
             metrics,
@@ -1266,7 +1270,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_read_roundtrip() {
-        let (handler, _dir) = make_handler(false);
+        let (handler, _dir) = make_handler(false).await;
 
         let mut buf = vec![0x42u8; BLOCK_SIZE];
         let result =
@@ -1282,7 +1286,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_returns_ok() {
-        let (handler, _dir) = make_handler(false);
+        let (handler, _dir) = make_handler(false).await;
         let result =
             handle_io(ublk_core::sys::UBLK_IO_OP_FLUSH, 0, 0, false, &mut [], &handler).await;
         assert_eq!(result, 0);
@@ -1290,7 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn discard_returns_ok() {
-        let (handler, _dir) = make_handler(false);
+        let (handler, _dir) = make_handler(false).await;
         let result =
             handle_io(ublk_core::sys::UBLK_IO_OP_DISCARD, 0, BLOCK_SIZE as u32, false, &mut [], &handler).await;
         assert_eq!(result, 0);
@@ -1298,7 +1302,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_zeroes_clears_data() {
-        let (handler, _dir) = make_handler(false);
+        let (handler, _dir) = make_handler(false).await;
 
         // Write non-zero data.
         let mut buf = vec![0xFFu8; BLOCK_SIZE];
@@ -1317,14 +1321,14 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_op_returns_einval() {
-        let (handler, _dir) = make_handler(false);
+        let (handler, _dir) = make_handler(false).await;
         let result = handle_io(0xFF, 0, 0, false, &mut [], &handler).await;
         assert_eq!(result, -libc::EINVAL);
     }
 
     #[tokio::test]
     async fn read_beyond_device_returns_error() {
-        let (handler, _dir) = make_handler(false);
+        let (handler, _dir) = make_handler(false).await;
         let mut buf = vec![0u8; BLOCK_SIZE];
         let result =
             handle_io(ublk_core::sys::UBLK_IO_OP_READ, DEVICE_SIZE, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
@@ -1333,7 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_with_fua_succeeds() {
-        let (handler, _dir) = make_handler(false);
+        let (handler, _dir) = make_handler(false).await;
         let mut buf = vec![0xABu8; BLOCK_SIZE];
         let result =
             handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, true, &mut buf, &handler).await;
@@ -1342,7 +1346,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_readonly_returns_erofs() {
-        let (handler, _dir) = make_handler(true);
+        let (handler, _dir) = make_handler(true).await;
         let mut buf = vec![0x42u8; BLOCK_SIZE];
         let result =
             handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
@@ -1351,7 +1355,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_length_read_returns_zero() {
-        let (handler, _dir) = make_handler(false);
+        let (handler, _dir) = make_handler(false).await;
         let result =
             handle_io(ublk_core::sys::UBLK_IO_OP_READ, 0, 0, false, &mut [], &handler).await;
         assert_eq!(result, 0);

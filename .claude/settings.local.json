@@ -84,7 +84,11 @@
       "WebFetch(domain:patchwork.kernel.org)",
       "WebFetch(domain:gist.github.com)",
       "WebFetch(domain:ravendb.net)",
-      "WebFetch(domain:lists.gnu.org)"
+      "WebFetch(domain:lists.gnu.org)",
+      "Skill(write-docs)",
+      "WebFetch(domain:madebyevan.com)",
+      "Skill(audit)",
+      "WebFetch(domain:)"
     ]
   }
 }

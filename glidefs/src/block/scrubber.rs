@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::block_map::blake3_128;
+use super::block_map::{Blake3Hash, blake3_128};
 use super::cache::BlockCache;
-use super::pack_index::HostPackIndex;
+use super::router::ExportRouter;
 
 /// Configuration for the background scrubber.
 pub struct ScrubberConfig {
@@ -44,14 +45,45 @@ impl ScrubberMetrics {
     }
 }
 
+/// Trait for providing block hashes to the scrubber.
+///
+/// Implementations collect known block hashes from whatever metadata source
+/// is active (e.g. VolumeManifest + ChunkMeta in the chunked architecture).
+#[async_trait]
+pub trait HashSource: Send + Sync {
+    async fn all_hashes(&self) -> Vec<Blake3Hash>;
+}
+
+/// Hash source backed by the export router.
+///
+/// Walks each active export's VolumeManifest and ChunkMetaCache to collect
+/// all known block hashes. The scrubber then verifies any of these hashes
+/// that happen to be present in the clean cache.
+pub struct RouterHashSource {
+    router: Arc<ExportRouter>,
+}
+
+impl RouterHashSource {
+    pub fn new(router: Arc<ExportRouter>) -> Self {
+        Self { router }
+    }
+}
+
+#[async_trait]
+impl HashSource for RouterHashSource {
+    async fn all_hashes(&self) -> Vec<Blake3Hash> {
+        self.router.collect_block_hashes().await
+    }
+}
+
 /// Run the background scrubber until cancelled.
 ///
-/// Iterates all known hashes from the pack index, checks if each is in the
+/// Iterates all known hashes from the hash source, checks if each is in the
 /// clean cache, and verifies its integrity by re-hashing. Corrupted blocks
 /// are evicted (S3 will re-supply on next read).
 pub async fn scrubber(
     clean_cache: Arc<dyn BlockCache>,
-    pack_index: Arc<HostPackIndex>,
+    hash_source: Arc<dyn HashSource>,
     config: ScrubberConfig,
     metrics: Arc<ScrubberMetrics>,
     shutdown: CancellationToken,
@@ -63,14 +95,7 @@ pub async fn scrubber(
     let interval = Duration::from_micros(1_000_000 / config.blocks_per_second);
 
     loop {
-        let hashes = match pack_index.all_hashes() {
-            Ok(h) => h,
-            Err(e) => {
-                warn!("scrubber: failed to read pack index: {e}");
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                continue;
-            }
-        };
+        let hashes = hash_source.all_hashes().await;
         let mut ticker = tokio::time::interval(interval);
         let mut checked = 0u64;
         let mut evicted = 0u64;
@@ -113,32 +138,27 @@ mod tests {
     use super::*;
     use crate::block::block_map::blake3_128;
     use crate::block::cache::SimpleBlockCache;
-    use crate::block::pack::PackLocation;
     use bytes::Bytes;
-    use tempfile::TempDir;
-    use uuid::Uuid;
+
+    /// Test hash source that returns a fixed set of hashes.
+    struct StaticHashes(Vec<Blake3Hash>);
+    #[async_trait]
+    impl HashSource for StaticHashes {
+        async fn all_hashes(&self) -> Vec<Blake3Hash> {
+            self.0.clone()
+        }
+    }
 
     #[tokio::test]
     async fn test_scrubber_detects_corruption() {
-        let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index =
-            Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
 
         // Insert a valid block
         let data = Bytes::from(vec![0xAA; 4096]);
         let correct_hash = blake3_128(&data);
         cache.insert(correct_hash, data);
 
-        // Register the hash in the pack index
-        pack_index.insert(
-            correct_hash,
-            PackLocation {
-                pack_id: Uuid::new_v4(),
-                offset: 0,
-                comp_length: 100,
-            },
-        );
+        let hash_source: Arc<dyn HashSource> = Arc::new(StaticHashes(vec![correct_hash]));
 
         // Now corrupt it: remove the correct entry and insert wrong data under the same key
         cache.remove(&correct_hash);
@@ -149,14 +169,14 @@ mod tests {
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
         let cache_clone = Arc::clone(&cache);
-        let pi_clone = Arc::clone(&pack_index);
+        let hs_clone = Arc::clone(&hash_source);
 
         let metrics = Arc::new(ScrubberMetrics::new());
         let metrics_clone = Arc::clone(&metrics);
         let handle = tokio::spawn(async move {
             scrubber(
                 cache_clone,
-                pi_clone,
+                hs_clone,
                 ScrubberConfig {
                     blocks_per_second: 10_000,
                 },
@@ -190,48 +210,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_scrubber_leaves_valid_blocks() {
-        let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index =
-            Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
 
         // Insert valid blocks
         let data1 = Bytes::from(vec![0xAA; 4096]);
         let hash1 = blake3_128(&data1);
         cache.insert(hash1, data1.clone());
-        pack_index.insert(
-            hash1,
-            PackLocation {
-                pack_id: Uuid::new_v4(),
-                offset: 0,
-                comp_length: 100,
-            },
-        );
 
         let data2 = Bytes::from(vec![0xBB; 4096]);
         let hash2 = blake3_128(&data2);
         cache.insert(hash2, data2.clone());
-        pack_index.insert(
-            hash2,
-            PackLocation {
-                pack_id: Uuid::new_v4(),
-                offset: 100,
-                comp_length: 200,
-            },
-        );
+
+        let hash_source: Arc<dyn HashSource> = Arc::new(StaticHashes(vec![hash1, hash2]));
 
         // Run scrubber briefly
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
         let cache_clone = Arc::clone(&cache);
-        let pi_clone = Arc::clone(&pack_index);
+        let hs_clone = Arc::clone(&hash_source);
 
         let metrics = Arc::new(ScrubberMetrics::new());
         let metrics_clone = Arc::clone(&metrics);
         let handle = tokio::spawn(async move {
             scrubber(
                 cache_clone,
-                pi_clone,
+                hs_clone,
                 ScrubberConfig {
                     blocks_per_second: 10_000,
                 },
@@ -269,23 +272,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_scrubber_shutdown_during_inter_pass_sleep() {
-        let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index =
-            Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
 
         // Insert a single valid block so the scrubber completes one pass quickly
         let data = Bytes::from(vec![0xCC; 4096]);
         let hash = blake3_128(&data);
         cache.insert(hash, data);
-        pack_index.insert(
-            hash,
-            PackLocation {
-                pack_id: Uuid::new_v4(),
-                offset: 0,
-                comp_length: 100,
-            },
-        );
+
+        let hash_source: Arc<dyn HashSource> = Arc::new(StaticHashes(vec![hash]));
 
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
@@ -295,7 +289,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             scrubber(
                 cache,
-                pack_index,
+                hash_source,
                 ScrubberConfig {
                     blocks_per_second: 100_000, // Very fast — completes pass quickly
                 },
@@ -329,17 +323,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_scrubber_disabled_when_zero() {
-        let _dir = TempDir::new().unwrap();
         let cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-        let pack_index =
-            Arc::new(HostPackIndex::open(_dir.path().join("pack_index.redb")).unwrap());
+        let hash_source: Arc<dyn HashSource> = Arc::new(StaticHashes(vec![]));
         let shutdown = CancellationToken::new();
 
         // Should return immediately when blocks_per_second = 0
         let metrics = Arc::new(ScrubberMetrics::new());
         scrubber(
             cache,
-            pack_index,
+            hash_source,
             ScrubberConfig {
                 blocks_per_second: 0,
             },

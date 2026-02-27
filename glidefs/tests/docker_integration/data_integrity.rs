@@ -36,13 +36,16 @@ transport_test! {
         server.shutdown().await;
 
         // Phase 2: List packs in S3 and corrupt the first one.
-        // Packs are stored at {db_path}/exports/{export_name}/packs/{prefix}/{uuid}
-        let prefix = ObjPath::from(format!("{}/exports/vol1/packs/", db_path));
+        // Packs are stored at {db_path}/exports/{export_name}/chunks/{chunk_idx:04}/{uuid}.pack
+        let prefix = ObjPath::from(format!("{}/exports/vol1/chunks/", db_path));
         let mut stream = ctx.object_store.list(Some(&prefix));
         let mut pack_paths = Vec::new();
         while let Some(meta) = stream.next().await {
             let meta = meta.unwrap();
-            pack_paths.push(meta.location);
+            // Only include .pack files (skip .meta files)
+            if let Some(filename) = meta.location.filename() && filename.ends_with(".pack") {
+                pack_paths.push(meta.location);
+            }
         }
         assert!(!pack_paths.is_empty(), "expected at least one pack in S3");
 
@@ -128,7 +131,7 @@ transport_test! {
         };
         let result = server2
             .router
-            .create_export(config, false, Some("vol1"))
+            .create_export(config, false, Some("vol1"), None)
             .await;
 
         assert!(result.is_err(), "corrupt manifest should be rejected");

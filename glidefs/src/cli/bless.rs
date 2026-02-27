@@ -1,23 +1,26 @@
-use crate::block::block_map::{BlockMap, BlockMapEntry, blake3_128, lz4_compress, zero_block_hash};
+use crate::block::block_map::{blake3_128, lz4_compress, zero_block_hash, Blake3Hash};
 use crate::block::content_store::ContentStore;
-use crate::block::manifest::{Manifest, ManifestBlockEntry, serialize_hot_set};
-use crate::block::pack::{DEFAULT_BLOCKS_PER_PACK, PackLocation, assemble_pack};
-use crate::block::pack_index::HostPackIndex;
+use crate::block::manifest::serialize_hot_set;
+use crate::block::pack::{new_pack_id, PackId};
+use crate::block::volume_manifest::VolumeManifest;
 use crate::config::Settings;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::info;
-use uuid::Uuid;
+
+/// Fixed block size for the chunked architecture: 128KB.
+const BLOCK_SIZE: u32 = 131_072;
 
 pub async fn run_bless(
     image_path: PathBuf,
     name: String,
+    s3_prefix: String,
     config_path: PathBuf,
-    chunk_size: u32,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -26,10 +29,6 @@ pub async fn run_bless(
         )
         .with_writer(std::io::stderr)
         .init();
-
-    if !chunk_size.is_power_of_two() {
-        anyhow::bail!("chunk_size must be a power of two, got {chunk_size}");
-    }
 
     let start = Instant::now();
 
@@ -48,151 +47,108 @@ pub async fn run_bless(
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
     let db_path = path_from_url.to_string();
 
-    let content_store = ContentStore::new(Arc::clone(&object_store), &db_path);
+    let base = format!("{}/exports/{}", db_path, s3_prefix);
+    let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), &base));
 
-    info!(image = %image_path.display(), name = %name, chunk_size, "starting bless");
+    info!(image = %image_path.display(), name = %name, "starting bless");
 
-    // --- Load existing base manifests for cross-image dedup ---
-    let pack_index_dir =
-        tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
-    let pack_index = HostPackIndex::open(pack_index_dir.path().join("pack_index.redb"))
-        .context("Failed to open pack index")?;
-    let base_names = content_store.list_base_manifests().await?;
-    if !base_names.is_empty() {
-        info!(
-            count = base_names.len(),
-            "loading existing base manifests for dedup"
-        );
-        let mut manifests = Vec::new();
-        for base_name in &base_names {
-            let key = format!("bases/{}", base_name);
-            if let Some(data) = content_store.get_manifest(&key).await? {
-                match Manifest::deserialize(&data) {
-                    Ok(m) => manifests.push(m),
-                    Err(e) => {
-                        tracing::warn!(name = %base_name, error = %e, "skipping corrupt manifest")
-                    }
-                }
-            }
-        }
-        pack_index.rebuild(&manifests)?;
-        info!(
-            entries = pack_index.len()?,
-            "dedup index loaded from {} manifest(s)",
-            manifests.len()
-        );
-    }
-
-    // --- Stream image through pipeline ---
+    // --- Read image ---
     let mut file = std::fs::File::open(&image_path)
         .with_context(|| format!("Failed to open image {}", image_path.display()))?;
     let device_size = file.metadata()?.len();
-    let num_chunks = device_size.div_ceil(chunk_size as u64) as usize;
 
-    info!(device_size, num_chunks, "reading image");
+    let volume_manifest_template = VolumeManifest::new(device_size, BLOCK_SIZE);
+    let blocks_per_chunk = volume_manifest_template.blocks_per_chunk();
+    let total_blocks = device_size.div_ceil(BLOCK_SIZE as u64) as usize;
 
-    let mut block_entries: Vec<ManifestBlockEntry> = Vec::with_capacity(num_chunks);
-    let mut batch: Vec<(crate::block::block_map::Blake3Hash, Vec<u8>)> =
-        Vec::with_capacity(DEFAULT_BLOCKS_PER_PACK);
-    let mut buf = vec![0u8; chunk_size as usize];
+    info!(device_size, total_blocks, blocks_per_chunk, "reading image");
 
+    // --- Stream image: read blocks, upload each chunk as it completes ---
+    let zero_hash = zero_block_hash(BLOCK_SIZE as usize);
+    let mut buf = vec![0u8; BLOCK_SIZE as usize];
+
+    let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
     let mut stats = BlessStats::default();
-    let zero_hash = zero_block_hash(chunk_size as usize);
+    let mut hot_set_indices: Vec<u64> = Vec::new();
 
-    for chunk_index in 0..num_chunks {
-        // Read chunk (last chunk may be short, pad with zeros)
+    // Current chunk accumulator — flushed when we move to the next chunk.
+    let mut pending_chunk: Option<(u32, Vec<BlockInfo>)> = None;
+    // In-flight S3 upload — overlaps with reading the next chunk.
+    let mut in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>> = None;
+
+    for block_index in 0..total_blocks {
         let bytes_read = read_full(&mut file, &mut buf)?;
-        if bytes_read < chunk_size as usize {
+        if bytes_read < BLOCK_SIZE as usize {
             buf[bytes_read..].fill(0);
         }
 
         let hash = blake3_128(&buf);
 
-        // Skip zero blocks entirely — read path returns zeros by convention
+        // Skip zero blocks entirely
         if hash == zero_hash {
-            stats.zero_chunks += 1;
+            stats.zero_blocks += 1;
             continue;
         }
 
-        // Record in manifest block map
-        block_entries.push(ManifestBlockEntry {
-            chunk_index: chunk_index as u64,
-            hash,
-            flags: 0,
-        });
+        // Record non-zero block index for hot set (prefetch at boot)
+        hot_set_indices.push(block_index as u64);
 
-        // Dedup: skip if already in pack index (from prior base images)
-        if pack_index.contains(&hash)? {
-            stats.deduped_chunks += 1;
-            continue;
-        }
+        let chunk_idx = volume_manifest_template.chunk_idx_for_block(block_index as u64);
+        let block_offset = volume_manifest_template.block_offset_in_chunk(block_index as u64);
 
-        // Compress and accumulate
+        stats.unique_blocks += 1;
+
         let compressed = lz4_compress(&buf);
-        stats.unique_chunks += 1;
-        batch.push((hash, compressed));
 
-        // Flush pack when full
-        if batch.len() >= DEFAULT_BLOCKS_PER_PACK {
-            upload_pack(
+        // If we've moved to a new chunk, prepare and upload the previous one.
+        if pending_chunk.as_ref().is_some_and(|(idx, _)| *idx != chunk_idx) {
+            let (completed_idx, blocks) = pending_chunk.take().unwrap();
+            in_flight = start_chunk_upload(
                 &content_store,
-                &pack_index,
-                &mut batch,
-                chunk_size,
+                &mut volume_manifest,
                 &mut stats,
+                in_flight,
+                completed_idx,
+                blocks,
             )
             .await?;
         }
+
+        pending_chunk
+            .get_or_insert_with(|| (chunk_idx, Vec::new()))
+            .1
+            .push(BlockInfo {
+                block_offset,
+                hash,
+                compressed,
+            });
     }
 
-    // Flush remaining partial pack
-    if !batch.is_empty() {
-        upload_pack(
+    // Flush the final chunk.
+    if let Some((chunk_idx, blocks)) = pending_chunk.take() {
+        in_flight = start_chunk_upload(
             &content_store,
-            &pack_index,
-            &mut batch,
-            chunk_size,
+            &mut volume_manifest,
             &mut stats,
+            in_flight,
+            chunk_idx,
+            blocks,
         )
         .await?;
     }
 
-    // --- Build and upload manifest ---
-    let mut block_map = BlockMap::new(device_size, chunk_size);
-    for entry in &block_entries {
-        block_map.set(
-            entry.chunk_index as usize,
-            BlockMapEntry {
-                hash: entry.hash,
-                flags: 0,
-                sequence: 1,
-            },
-        );
-    }
+    // Wait for last upload.
+    join_upload(&mut volume_manifest, &mut stats, in_flight).await?;
 
-    let pack_entries = pack_index.derive_for_block_map(&block_map)?;
-
-    // Collect hot set chunk indices before block_entries is moved into the manifest
-    let hot_set_chunks: Vec<u64> = block_entries.iter().map(|e| e.chunk_index).collect();
-
-    let manifest = Manifest {
-        name: name.clone(),
-        sequence: 1,
-        chunk_size,
-        device_size,
-        block_map: block_entries,
-        pack_index: pack_entries,
-    };
-
-    let manifest_data = manifest.serialize();
+    // --- Upload manifest ---
     let manifest_key = format!("bases/{}", name);
     content_store
-        .put_manifest(&manifest_key, manifest_data)
+        .put_manifest(&manifest_key, volume_manifest.serialize())
         .await
         .context("Failed to upload manifest")?;
 
-    // Upload boot hot set (all non-zero chunk indices)
-    let hot_set_data = serialize_hot_set(&hot_set_chunks);
+    // --- Upload hot set (block indices needed at boot for prefetching) ---
+    let hot_set_data = serialize_hot_set(&hot_set_indices);
     content_store
         .put_hot_set(&name, hot_set_data)
         .await
@@ -202,80 +158,122 @@ pub async fn run_bless(
 
     info!(
         name = %name,
-        total_chunks = num_chunks,
-        zero_chunks = stats.zero_chunks,
-        deduped_chunks = stats.deduped_chunks,
-        unique_chunks = stats.unique_chunks,
+        total_blocks,
+        zero_blocks = stats.zero_blocks,
+        unique_blocks = stats.unique_blocks,
         packs_uploaded = stats.packs_uploaded,
         bytes_uploaded = stats.bytes_uploaded,
+        chunks_written = stats.chunks_written,
         elapsed_secs = elapsed.as_secs_f64(),
         "bless complete"
     );
 
     println!("Blessed '{}' successfully:", name);
     println!("  Image size:      {:.1} GB", device_size as f64 / 1e9);
-    println!("  Total chunks:    {}", num_chunks);
-    println!("  Zero chunks:     {} (skipped)", stats.zero_chunks);
-    println!(
-        "  Deduped chunks:  {} (already in S3)",
-        stats.deduped_chunks
-    );
-    println!("  Unique chunks:   {} (uploaded)", stats.unique_chunks);
+    println!("  Total blocks:    {}", total_blocks);
+    println!("  Zero blocks:     {} (skipped)", stats.zero_blocks);
+    println!("  Unique blocks:   {} (uploaded)", stats.unique_blocks);
     println!("  Packs uploaded:  {}", stats.packs_uploaded);
     println!(
         "  Bytes uploaded:  {:.1} MB",
         stats.bytes_uploaded as f64 / 1e6
     );
-    println!("  Hot set:         {} chunks", hot_set_chunks.len());
+    println!("  Chunks written:  {}", stats.chunks_written);
     println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
     println!("  Manifest:        manifests/{}", manifest_key);
 
     Ok(())
 }
 
-#[derive(Default)]
-struct BlessStats {
-    zero_chunks: usize,
-    deduped_chunks: usize,
-    unique_chunks: usize,
-    packs_uploaded: usize,
-    bytes_uploaded: u64,
+/// Result of a completed chunk upload.
+struct ChunkUploadResult {
+    chunk_idx: u32,
+    pack_id: PackId,
+    pack_size: u64,
 }
 
-async fn upload_pack(
-    content_store: &ContentStore,
-    pack_index: &HostPackIndex,
-    batch: &mut Vec<(crate::block::block_map::Blake3Hash, Vec<u8>)>,
-    chunk_size: u32,
+/// Join the previous in-flight upload (if any) and apply its results.
+async fn join_upload(
+    volume_manifest: &mut VolumeManifest,
     stats: &mut BlessStats,
+    in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>,
 ) -> Result<()> {
-    let pack_id = Uuid::new_v4();
-    let (pack_bytes, index_entries) = assemble_pack(std::mem::take(batch), chunk_size)?;
-    let pack_size = pack_bytes.len() as u64;
-
-    content_store
-        .put_pack(pack_id, pack_bytes)
-        .await
-        .context("Failed to upload pack")?;
-
-    let pi_entries: Vec<_> = index_entries
-        .iter()
-        .map(|entry| {
-            (
-                entry.hash,
-                PackLocation {
-                    pack_id,
-                    offset: entry.offset,
-                    comp_length: entry.comp_length,
-                },
-            )
-        })
-        .collect();
-    pack_index.insert_batch(&pi_entries)?;
-
-    stats.packs_uploaded += 1;
-    stats.bytes_uploaded += pack_size;
+    if let Some(handle) = in_flight {
+        let result = handle.await.context("upload task panicked")??;
+        volume_manifest.append_pack(result.chunk_idx, result.pack_id);
+        stats.packs_uploaded += 1;
+        stats.bytes_uploaded += result.pack_size;
+        stats.chunks_written += 1;
+    }
     Ok(())
+}
+
+/// Dedup + assemble pack (CPU), then spawn S3 upload overlapped with next chunk's reads.
+///
+/// Joins the previous in-flight upload before spawning a new one, so at most
+/// one upload is in flight at a time.
+async fn start_chunk_upload(
+    content_store: &Arc<ContentStore>,
+    volume_manifest: &mut VolumeManifest,
+    stats: &mut BlessStats,
+    prev_in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>,
+    chunk_idx: u32,
+    blocks: Vec<BlockInfo>,
+) -> Result<Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>> {
+    // CPU: dedup + assemble pack
+    let mut seen: HashSet<Blake3Hash> = HashSet::new();
+    let mut pack_blocks: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
+
+    for block in blocks {
+        if seen.insert(block.hash) {
+            pack_blocks.push((block.hash, block.block_offset, block.compressed));
+        }
+    }
+
+    if pack_blocks.is_empty() {
+        // All-zero chunk — just join previous and move on.
+        join_upload(volume_manifest, stats, prev_in_flight).await?;
+        stats.chunks_written += 1;
+        return Ok(None);
+    }
+
+    let pack_id = new_pack_id();
+
+    // Join previous upload before spawning next (keeps at most 1 in flight).
+    join_upload(volume_manifest, stats, prev_in_flight).await?;
+
+    // Spawn streaming S3 upload — runs concurrently with next chunk's disk reads.
+    let cs = Arc::clone(content_store);
+    let handle = tokio::spawn(async move {
+        let entries = cs
+            .stream_chunk_pack(chunk_idx, pack_id, pack_blocks, BLOCK_SIZE)
+            .await
+            .context("Failed to stream chunk pack")?;
+        let pack_size = entries.iter().map(|e| e.comp_length as u64).sum::<u64>();
+        Ok(ChunkUploadResult {
+            chunk_idx,
+            pack_id,
+            pack_size,
+        })
+    });
+
+    Ok(Some(handle))
+}
+
+/// Block info accumulated during the image scan.
+struct BlockInfo {
+    block_offset: u32,
+    hash: Blake3Hash,
+    compressed: Vec<u8>,
+}
+
+#[derive(Default)]
+struct BlessStats {
+    zero_blocks: usize,
+    unique_blocks: usize,
+    packs_uploaded: usize,
+    bytes_uploaded: u64,
+    chunks_written: usize,
 }
 
 /// Read exactly buf.len() bytes, or fewer at EOF.
@@ -293,133 +291,101 @@ fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::block_map::{Blake3Hash, lz4_decompress};
-    use crate::block::manifest::deserialize_hot_set;
-    use crate::block::pack::extract_block;
+    use crate::block::block_map::lz4_decompress;
+    use crate::block::pack::{extract_block, lookup_block_in_index, parse_pack_index, PackId};
     use object_store::memory::InMemory;
-
-    const TEST_CHUNK_SIZE: u32 = 131072; // 128KB
+    use object_store::path::Path as ObjectPath;
+    use object_store::ObjectStore;
 
     /// Helper: run the bless pipeline directly against an InMemory object store.
     async fn bless_bytes(
         content_store: &ContentStore,
         name: &str,
         image_data: &[u8],
-        chunk_size: u32,
     ) -> Result<BlessStats> {
-        let pack_index_dir =
-            tempfile::TempDir::new().context("Failed to create temp dir for pack index")?;
-        let pack_index = HostPackIndex::open(pack_index_dir.path().join("pack_index.redb"))
-            .context("Failed to open pack index")?;
-
-        // Load existing base manifests for dedup
-        let base_names = content_store.list_base_manifests().await?;
-        if !base_names.is_empty() {
-            let mut manifests = Vec::new();
-            for base_name in &base_names {
-                let key = format!("bases/{}", base_name);
-                if let Some(data) = content_store.get_manifest(&key).await?
-                    && let Ok(m) = Manifest::deserialize(&data)
-                {
-                    manifests.push(m);
-                }
-            }
-            pack_index.rebuild(&manifests)?;
-        }
-
         let device_size = image_data.len() as u64;
-        let num_chunks = device_size.div_ceil(chunk_size as u64) as usize;
+        let vm_template = VolumeManifest::new(device_size, BLOCK_SIZE);
+        let total_blocks = device_size.div_ceil(BLOCK_SIZE as u64) as usize;
+        let zero_hash = zero_block_hash(BLOCK_SIZE as usize);
 
-        let mut block_entries: Vec<ManifestBlockEntry> = Vec::new();
-        let mut batch: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
+        let content_store = Arc::new(ContentStore::new(
+            content_store.object_store().clone(),
+            content_store.base_path(),
+        ));
+        let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
         let mut stats = BlessStats::default();
-        let zero_hash = zero_block_hash(chunk_size as usize);
+        let mut hot_set_indices: Vec<u64> = Vec::new();
+        let mut pending_chunk: Option<(u32, Vec<BlockInfo>)> = None;
+        let mut in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>> = None;
 
-        for chunk_index in 0..num_chunks {
-            let start = chunk_index * chunk_size as usize;
-            let end = (start + chunk_size as usize).min(image_data.len());
-            let mut buf = vec![0u8; chunk_size as usize];
+        for block_index in 0..total_blocks {
+            let start = block_index * BLOCK_SIZE as usize;
+            let end = (start + BLOCK_SIZE as usize).min(image_data.len());
+            let mut buf = vec![0u8; BLOCK_SIZE as usize];
             buf[..end - start].copy_from_slice(&image_data[start..end]);
 
             let hash = blake3_128(&buf);
 
             if hash == zero_hash {
-                stats.zero_chunks += 1;
+                stats.zero_blocks += 1;
                 continue;
             }
 
-            block_entries.push(ManifestBlockEntry {
-                chunk_index: chunk_index as u64,
-                hash,
-                flags: 0,
-            });
+            hot_set_indices.push(block_index as u64);
 
-            if pack_index.contains(&hash)? {
-                stats.deduped_chunks += 1;
-                continue;
-            }
+            let chunk_idx = vm_template.chunk_idx_for_block(block_index as u64);
+            let block_offset = vm_template.block_offset_in_chunk(block_index as u64);
+
+            stats.unique_blocks += 1;
 
             let compressed = lz4_compress(&buf);
-            stats.unique_chunks += 1;
-            batch.push((hash, compressed));
 
-            if batch.len() >= DEFAULT_BLOCKS_PER_PACK {
-                upload_pack(
-                    content_store,
-                    &pack_index,
-                    &mut batch,
-                    chunk_size,
+            if pending_chunk.as_ref().is_some_and(|(idx, _)| *idx != chunk_idx) {
+                let (completed_idx, blocks) = pending_chunk.take().unwrap();
+                in_flight = start_chunk_upload(
+                    &content_store,
+                    &mut volume_manifest,
                     &mut stats,
+                    in_flight,
+                    completed_idx,
+                    blocks,
                 )
                 .await?;
             }
+
+            pending_chunk
+                .get_or_insert_with(|| (chunk_idx, Vec::new()))
+                .1
+                .push(BlockInfo {
+                    block_offset,
+                    hash,
+                    compressed,
+                });
         }
 
-        if !batch.is_empty() {
-            upload_pack(
-                content_store,
-                &pack_index,
-                &mut batch,
-                chunk_size,
+        if let Some((chunk_idx, blocks)) = pending_chunk.take() {
+            in_flight = start_chunk_upload(
+                &content_store,
+                &mut volume_manifest,
                 &mut stats,
+                in_flight,
+                chunk_idx,
+                blocks,
             )
             .await?;
         }
 
-        // Build manifest
-        let mut block_map = BlockMap::new(device_size, chunk_size);
-        for entry in &block_entries {
-            block_map.set(
-                entry.chunk_index as usize,
-                BlockMapEntry {
-                    hash: entry.hash,
-                    flags: 0,
-                    sequence: 1,
-                },
-            );
-        }
-
-        let pack_entries = pack_index.derive_for_block_map(&block_map)?;
-
-        // Collect hot set chunk indices before block_entries is moved into the manifest
-        let hot_set_chunks: Vec<u64> = block_entries.iter().map(|e| e.chunk_index).collect();
-
-        let manifest = Manifest {
-            name: name.to_string(),
-            sequence: 1,
-            chunk_size,
-            device_size,
-            block_map: block_entries,
-            pack_index: pack_entries,
-        };
+        join_upload(&mut volume_manifest, &mut stats, in_flight).await?;
 
         content_store
-            .put_manifest(&format!("bases/{}", name), manifest.serialize())
+            .put_manifest(&format!("bases/{}", name), volume_manifest.serialize())
             .await?;
 
-        // Upload boot hot set (all non-zero chunk indices)
-        let hot_set_data = serialize_hot_set(&hot_set_chunks);
-        content_store.put_hot_set(name, hot_set_data).await?;
+        let hot_set_data = serialize_hot_set(&hot_set_indices);
+        content_store
+            .put_hot_set(name, hot_set_data)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         Ok(stats)
     }
@@ -430,59 +396,88 @@ mod tests {
         (store, cs)
     }
 
+    /// Fetch a full pack from the InMemory store and parse its index.
+    async fn fetch_pack_index(
+        store: &Arc<InMemory>,
+        base_path: &str,
+        chunk_idx: u32,
+        pack_id: PackId,
+    ) -> Vec<crate::block::pack::PackIndexEntry> {
+        let key = format!("{}/chunks/{:04}/{:016x}.pack", base_path, chunk_idx, pack_id);
+        let path = ObjectPath::from(key);
+        let response = store.get(&path).await.unwrap();
+        let bytes = response.bytes().await.unwrap();
+        let index = parse_pack_index(&bytes).unwrap();
+        index.entries
+    }
+
+    /// Fetch full pack bytes from the InMemory store.
+    async fn fetch_pack_bytes(
+        store: &Arc<InMemory>,
+        base_path: &str,
+        chunk_idx: u32,
+        pack_id: PackId,
+    ) -> Vec<u8> {
+        let key = format!("{}/chunks/{:04}/{:016x}.pack", base_path, chunk_idx, pack_id);
+        let path = ObjectPath::from(key);
+        let response = store.get(&path).await.unwrap();
+        response.bytes().await.unwrap().to_vec()
+    }
+
     #[tokio::test]
     async fn test_bless_and_read_back() {
-        let (_, cs) = test_store();
+        let (store, cs) = test_store();
 
-        // Create a 1MB image with known pattern (8 x 128KB chunks)
-        let mut image = vec![0u8; 8 * TEST_CHUNK_SIZE as usize];
+        // Create a 1MB image with known pattern (8 x 128KB blocks)
+        let mut image = vec![0u8; 8 * BLOCK_SIZE as usize];
         for i in 0..8 {
-            let start = i * TEST_CHUNK_SIZE as usize;
-            // Fill each chunk with a distinct byte pattern
-            image[start..start + TEST_CHUNK_SIZE as usize].fill((i + 1) as u8);
+            let start = i * BLOCK_SIZE as usize;
+            image[start..start + BLOCK_SIZE as usize].fill((i + 1) as u8);
         }
 
-        let stats = bless_bytes(&cs, "test-image", &image, TEST_CHUNK_SIZE)
-            .await
-            .unwrap();
+        let stats = bless_bytes(&cs, "test-image", &image).await.unwrap();
 
-        assert_eq!(stats.zero_chunks, 0);
-        assert_eq!(stats.unique_chunks, 8);
-        assert_eq!(stats.deduped_chunks, 0);
+        assert_eq!(stats.zero_blocks, 0);
+        assert_eq!(stats.unique_blocks, 8);
 
-        // Load manifest and verify
+        // Load VolumeManifest and verify
         let manifest_data = cs
             .get_manifest("bases/test-image")
             .await
             .unwrap()
             .expect("manifest should exist");
-        let manifest = Manifest::deserialize(&manifest_data).unwrap();
+        let vm = VolumeManifest::deserialize(&manifest_data).unwrap();
 
-        assert_eq!(manifest.name, "test-image");
-        assert_eq!(manifest.block_map.len(), 8);
-        assert_eq!(manifest.device_size, image.len() as u64);
+        assert_eq!(vm.size, image.len() as u64);
+        assert_eq!(vm.block_size, BLOCK_SIZE);
+        // All 8 blocks fit in chunk 0 (128 MiB chunks, 1MB image)
+        assert_eq!(vm.chunks.len(), 1);
+        assert!(vm.chunks.contains_key(&0));
+
+        // Get the pack_id for chunk 0
+        let pack_ids = vm.chunk_pack_ids(0).unwrap();
+        assert_eq!(pack_ids.len(), 1);
+        let pack_id = pack_ids[0];
+
+        // Fetch full pack and parse index
+        let pack_bytes = fetch_pack_bytes(&store, "test", 0, pack_id).await;
+        let entries = parse_pack_index(&pack_bytes).unwrap().entries;
+
+        assert_eq!(entries.len(), 8);
 
         // Verify every block can be fetched and matches original data
-        for entry in &manifest.block_map {
-            let chunk_index = entry.chunk_index as usize;
-            let original_start = chunk_index * TEST_CHUNK_SIZE as usize;
-            let original_chunk = &image[original_start..original_start + TEST_CHUNK_SIZE as usize];
+        for entry in &entries {
+            let block_index = entry.chunk_offset as usize;
+            let original_start = block_index * BLOCK_SIZE as usize;
+            let original_block = &image[original_start..original_start + BLOCK_SIZE as usize];
 
-            // Find the pack entry for this hash
-            let pack_entry = manifest
-                .pack_index
-                .iter()
-                .find(|pe| pe.hash == entry.hash)
-                .expect("block should have a pack entry");
-
-            // Fetch the pack, extract and decompress the block
-            let pack_data = cs.get_pack(pack_entry.pack_id).await.unwrap();
-            let compressed = extract_block(&pack_data, pack_entry.offset, pack_entry.comp_length)
-                .expect("block should be extractable from pack");
+            // Extract and decompress the block from pack
+            let compressed =
+                extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
             let decompressed = lz4_decompress(compressed).unwrap();
 
             assert_eq!(blake3_128(&decompressed), entry.hash);
-            assert_eq!(&decompressed[..], original_chunk);
+            assert_eq!(&decompressed[..], original_block);
         }
     }
 
@@ -490,135 +485,228 @@ mod tests {
     async fn test_bless_idempotent() {
         let (_, cs) = test_store();
 
-        let mut image = vec![0u8; 4 * TEST_CHUNK_SIZE as usize];
+        let mut image = vec![0u8; 4 * BLOCK_SIZE as usize];
         for i in 0..4 {
-            image[i * TEST_CHUNK_SIZE as usize..(i + 1) * TEST_CHUNK_SIZE as usize]
-                .fill((i + 1) as u8);
+            image[i * BLOCK_SIZE as usize..(i + 1) * BLOCK_SIZE as usize].fill((i + 1) as u8);
         }
 
         // First bless
-        let stats1 = bless_bytes(&cs, "idempotent", &image, TEST_CHUNK_SIZE)
-            .await
-            .unwrap();
-        assert_eq!(stats1.unique_chunks, 4);
+        let stats1 = bless_bytes(&cs, "idempotent", &image).await.unwrap();
+        assert_eq!(stats1.unique_blocks, 4);
         assert!(stats1.packs_uploaded > 0);
 
-        // Second bless — should dedup everything
-        let stats2 = bless_bytes(&cs, "idempotent", &image, TEST_CHUNK_SIZE)
-            .await
-            .unwrap();
+        // Second bless of the same image under a different name -- no cross-base
+        // dedup in v4, so all blocks are uploaded again as a self-contained base.
+        let stats2 = bless_bytes(&cs, "idempotent-2", &image).await.unwrap();
         assert_eq!(
-            stats2.unique_chunks, 0,
-            "re-bless should upload zero new blocks"
+            stats2.unique_blocks, 4,
+            "v4 bless uploads all blocks (no cross-base dedup)"
         );
-        assert_eq!(
-            stats2.packs_uploaded, 0,
-            "re-bless should upload zero new packs"
+        assert!(
+            stats2.packs_uploaded > 0,
+            "v4 bless creates packs for every base"
         );
-        assert_eq!(stats2.deduped_chunks, 4, "all blocks should be deduped");
     }
 
     #[tokio::test]
     async fn test_bless_sparse_image() {
-        let (_, cs) = test_store();
+        let (store, cs) = test_store();
 
-        // 4-chunk image: first chunk has data, rest are zeros
-        let mut image = vec![0u8; 4 * TEST_CHUNK_SIZE as usize];
-        image[..TEST_CHUNK_SIZE as usize].fill(0xAB);
+        // 4-block image: first block has data, rest are zeros
+        let mut image = vec![0u8; 4 * BLOCK_SIZE as usize];
+        image[..BLOCK_SIZE as usize].fill(0xAB);
 
-        let stats = bless_bytes(&cs, "sparse", &image, TEST_CHUNK_SIZE)
-            .await
-            .unwrap();
+        let stats = bless_bytes(&cs, "sparse", &image).await.unwrap();
 
-        assert_eq!(stats.zero_chunks, 3, "3 zero chunks should be skipped");
-        assert_eq!(stats.unique_chunks, 1, "1 data chunk should be uploaded");
+        assert_eq!(stats.zero_blocks, 3, "3 zero blocks should be skipped");
+        assert_eq!(stats.unique_blocks, 1, "1 data block should be uploaded");
         assert_eq!(stats.packs_uploaded, 1);
 
-        // Verify manifest only has 1 block entry (zero chunks excluded)
+        // Verify VolumeManifest only has 1 chunk entry (chunk 0 with 1 pack)
         let manifest_data = cs
             .get_manifest("bases/sparse")
             .await
             .unwrap()
             .expect("manifest should exist");
-        let manifest = Manifest::deserialize(&manifest_data).unwrap();
-        assert_eq!(manifest.block_map.len(), 1);
-        assert_eq!(manifest.block_map[0].chunk_index, 0);
+        let vm = VolumeManifest::deserialize(&manifest_data).unwrap();
+        assert_eq!(vm.chunks.len(), 1);
+
+        // Verify pack has 1 entry at chunk_offset 0
+        let pack_ids = vm.chunk_pack_ids(0).unwrap();
+        assert_eq!(pack_ids.len(), 1);
+
+        let entries = fetch_pack_index(&store, "test", 0, pack_ids[0]).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].chunk_offset, 0);
     }
 
     #[tokio::test]
-    async fn test_bless_cross_image_dedup() {
+    async fn test_bless_generates_hot_set() {
+        use crate::block::manifest::deserialize_hot_set;
+
         let (_, cs) = test_store();
 
-        // Image A: 10 chunks of unique data
-        let mut image_a = vec![0u8; 10 * TEST_CHUNK_SIZE as usize];
-        for i in 0..10 {
-            image_a[i * TEST_CHUNK_SIZE as usize..(i + 1) * TEST_CHUNK_SIZE as usize]
-                .fill((i + 1) as u8);
-        }
+        // 4-block image: block 0 has data, blocks 1-2 are zero, block 3 has data
+        let mut image = vec![0u8; 4 * BLOCK_SIZE as usize];
+        image[..BLOCK_SIZE as usize].fill(0xAA);
+        image[3 * BLOCK_SIZE as usize..4 * BLOCK_SIZE as usize].fill(0xBB);
 
-        // Image B: first 8 chunks same as A, last 2 different
-        let mut image_b = image_a.clone();
-        image_b[8 * TEST_CHUNK_SIZE as usize..9 * TEST_CHUNK_SIZE as usize].fill(0xFE);
-        image_b[9 * TEST_CHUNK_SIZE as usize..10 * TEST_CHUNK_SIZE as usize].fill(0xFF);
+        bless_bytes(&cs, "hot-test", &image).await.unwrap();
 
-        // Bless A
-        let stats_a = bless_bytes(&cs, "image-a", &image_a, TEST_CHUNK_SIZE)
-            .await
-            .unwrap();
-        assert_eq!(stats_a.unique_chunks, 10);
-
-        // Bless B — should dedup the 8 shared chunks
-        let stats_b = bless_bytes(&cs, "image-b", &image_b, TEST_CHUNK_SIZE)
-            .await
-            .unwrap();
-        assert_eq!(
-            stats_b.deduped_chunks, 8,
-            "8 shared chunks should be deduped"
-        );
-        assert_eq!(
-            stats_b.unique_chunks, 2,
-            "only 2 new chunks should be uploaded"
-        );
-    }
-
-    #[test]
-    fn test_hot_set_round_trip() {
-        let chunks = vec![0, 5, 10, 100, 50000];
-        let data = serialize_hot_set(&chunks);
-        let restored = deserialize_hot_set(&data).unwrap();
-        assert_eq!(restored, chunks);
-    }
-
-    #[test]
-    fn test_hot_set_empty() {
-        let chunks: Vec<u64> = vec![];
-        let data = serialize_hot_set(&chunks);
-        let restored = deserialize_hot_set(&data).unwrap();
-        assert!(restored.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_bless_uploads_hot_set() {
-        let (_, cs) = test_store();
-
-        let mut image = vec![0u8; 4 * TEST_CHUNK_SIZE as usize];
-        for i in 0..4 {
-            image[i * TEST_CHUNK_SIZE as usize..(i + 1) * TEST_CHUNK_SIZE as usize]
-                .fill((i + 1) as u8);
-        }
-
-        bless_bytes(&cs, "hot-set-test", &image, TEST_CHUNK_SIZE)
-            .await
-            .unwrap();
-
-        // Verify hot set was uploaded
+        // Fetch and verify hot set
         let hot_set_data = cs
-            .get_hot_set("hot-set-test")
+            .get_hot_set("hot-test")
             .await
             .unwrap()
             .expect("hot set should exist");
-        let chunks = deserialize_hot_set(&hot_set_data).unwrap();
-        assert_eq!(chunks.len(), 4);
-        assert_eq!(chunks, vec![0, 1, 2, 3]);
+        let hot_set = deserialize_hot_set(&hot_set_data).unwrap();
+
+        // Only block indices 0 and 3 are non-zero
+        assert_eq!(hot_set, vec![0, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_bless_within_batch_dedup() {
+        let (store, cs) = test_store();
+
+        // 4-block image where block 0 and block 2 have identical content.
+        // Within-batch dedup should store only 3 unique blocks in the pack.
+        let mut image = vec![0u8; 4 * BLOCK_SIZE as usize];
+        image[0..BLOCK_SIZE as usize].fill(0xAA); // block 0
+        image[BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize].fill(0xBB); // block 1
+        image[2 * BLOCK_SIZE as usize..3 * BLOCK_SIZE as usize].fill(0xAA); // block 2 = same as block 0
+        image[3 * BLOCK_SIZE as usize..4 * BLOCK_SIZE as usize].fill(0xCC); // block 3
+
+        let stats = bless_bytes(&cs, "dedup-test", &image).await.unwrap();
+
+        // All 4 blocks are non-zero and counted as unique (within-batch dedup
+        // only affects pack assembly, not the stats counter)
+        assert_eq!(stats.unique_blocks, 4);
+        assert_eq!(stats.packs_uploaded, 1);
+
+        // The pack should contain only 3 entries (blocks 0 and 2 share a hash,
+        // so only the first occurrence is stored)
+        let manifest_data = cs
+            .get_manifest("bases/dedup-test")
+            .await
+            .unwrap()
+            .expect("manifest should exist");
+        let vm = VolumeManifest::deserialize(&manifest_data).unwrap();
+        let pack_ids = vm.chunk_pack_ids(0).unwrap();
+        assert_eq!(pack_ids.len(), 1);
+
+        let entries = fetch_pack_index(&store, "test", 0, pack_ids[0]).await;
+        assert_eq!(
+            entries.len(),
+            3,
+            "within-batch dedup should store 3 unique blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bless_self_contained_bases() {
+        let (store, cs) = test_store();
+
+        // Image A: 10 blocks of unique data
+        let mut image_a = vec![0u8; 10 * BLOCK_SIZE as usize];
+        for i in 0..10 {
+            image_a[i * BLOCK_SIZE as usize..(i + 1) * BLOCK_SIZE as usize].fill((i + 1) as u8);
+        }
+
+        // Image B: first 8 blocks same as A, last 2 different
+        let mut image_b = image_a.clone();
+        image_b[8 * BLOCK_SIZE as usize..9 * BLOCK_SIZE as usize].fill(0xFE);
+        image_b[9 * BLOCK_SIZE as usize..10 * BLOCK_SIZE as usize].fill(0xFF);
+
+        // Bless A
+        let stats_a = bless_bytes(&cs, "image-a", &image_a).await.unwrap();
+        assert_eq!(stats_a.unique_blocks, 10);
+
+        // Bless B -- v4 has no cross-base dedup, so all 10 blocks are uploaded
+        let stats_b = bless_bytes(&cs, "image-b", &image_b).await.unwrap();
+        assert_eq!(
+            stats_b.unique_blocks, 10,
+            "v4 bless uploads all blocks (self-contained)"
+        );
+
+        // Verify each base is independently readable
+        for (name, image) in [("image-a", &image_a), ("image-b", &image_b)] {
+            let manifest_data = cs
+                .get_manifest(&format!("bases/{}", name))
+                .await
+                .unwrap()
+                .expect("manifest should exist");
+            let vm = VolumeManifest::deserialize(&manifest_data).unwrap();
+
+            for (&chunk_idx, entry) in &vm.chunks {
+                for &pack_id in &entry.packs {
+                    let pack_bytes =
+                        fetch_pack_bytes(&store, "test", chunk_idx, pack_id).await;
+                    let index = parse_pack_index(&pack_bytes).unwrap();
+
+                    for pie in &index.entries {
+                        let block_index = chunk_idx as usize
+                            * vm.blocks_per_chunk() as usize
+                            + pie.chunk_offset as usize;
+                        let original_start = block_index * BLOCK_SIZE as usize;
+                        let original_block =
+                            &image[original_start..original_start + BLOCK_SIZE as usize];
+
+                        let compressed = extract_block(
+                            &pack_bytes,
+                            pie.offset,
+                            pie.comp_length,
+                        )
+                        .unwrap();
+                        let decompressed = lz4_decompress(compressed).unwrap();
+                        assert_eq!(
+                            &decompressed[..],
+                            original_block,
+                            "data mismatch at block {} in base {}",
+                            block_index,
+                            name,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bless_block_lookup_by_chunk_offset() {
+        let (store, cs) = test_store();
+
+        // Create a 4-block image with distinct patterns
+        let mut image = vec![0u8; 4 * BLOCK_SIZE as usize];
+        for i in 0..4 {
+            image[i * BLOCK_SIZE as usize..(i + 1) * BLOCK_SIZE as usize].fill((i + 1) as u8);
+        }
+
+        bless_bytes(&cs, "lookup-test", &image).await.unwrap();
+
+        let manifest_data = cs
+            .get_manifest("bases/lookup-test")
+            .await
+            .unwrap()
+            .expect("manifest should exist");
+        let vm = VolumeManifest::deserialize(&manifest_data).unwrap();
+        let pack_ids = vm.chunk_pack_ids(0).unwrap();
+        let pack_bytes = fetch_pack_bytes(&store, "test", 0, pack_ids[0]).await;
+        let index = parse_pack_index(&pack_bytes).unwrap();
+
+        // Look up each block by chunk_offset and verify data
+        for offset in 0..4u32 {
+            let (hash, pack_offset, comp_length) =
+                lookup_block_in_index(&index.entries, offset)
+                    .unwrap_or_else(|| panic!("block at chunk_offset {} not found", offset));
+
+            let compressed =
+                extract_block(&pack_bytes, pack_offset, comp_length).unwrap();
+            let decompressed = lz4_decompress(compressed).unwrap();
+
+            assert_eq!(blake3_128(&decompressed), hash);
+            let expected = vec![(offset + 1) as u8; BLOCK_SIZE as usize];
+            assert_eq!(decompressed, expected);
+        }
     }
 }

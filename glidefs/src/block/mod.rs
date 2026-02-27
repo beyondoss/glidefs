@@ -8,8 +8,7 @@ pub mod handler;
 pub mod content_store;
 pub mod manifest;
 pub mod pack;
-pub mod pack_index;
-pub mod pack_registry;
+pub mod pack_index_cache;
 pub mod readahead;
 pub mod scrubber;
 
@@ -20,6 +19,7 @@ pub mod server;
 pub mod state;
 pub mod sync;
 pub mod wal;
+pub mod volume_manifest;
 pub mod write_cache;
 pub mod write_trace;
 

@@ -13,6 +13,10 @@
 //! The data file uses positional I/O (pread/pwrite) which is thread-safe per
 //! POSIX semantics, eliminating the need for any locking on the hot path.
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod compact;
+#[cfg(not(any(test, feature = "test-utils")))]
+pub(crate) mod compact;
 mod config;
 mod error;
 mod flush;
@@ -39,8 +43,10 @@ use inner::CacheInner;
 /// Statistics from a flush operation.
 #[derive(Debug, Default)]
 pub struct FlushStats {
-    /// Total blocks included in the flush snapshot.
-    pub blocks_flushed: usize,
+    /// Total blocks claimed from the dirty set (CAS DIRTY→SYNCING) for this
+    /// flush cycle. Includes blocks that were later skipped (CRC mismatch,
+    /// concurrent re-dirty). Zero means no dirty blocks existed.
+    pub blocks_claimed: usize,
     /// Blocks skipped (already in S3 or zero blocks).
     pub blocks_deduped: usize,
     /// Blocks left dirty because a concurrent write changed their sequence
@@ -52,8 +58,6 @@ pub struct FlushStats {
     pub packs_uploaded: usize,
     /// Total bytes uploaded to S3.
     pub bytes_uploaded: u64,
-    /// Pack IDs created during this flush (for registry updates).
-    pub new_pack_ids: Vec<uuid::Uuid>,
 }
 
 /// Result of a snapshot operation.
@@ -63,6 +67,9 @@ pub struct SnapshotResult {
     pub manifest_etag: Option<String>,
     /// Sequence number at the snapshot cut point.
     pub sequence: u64,
+    /// Whether the versioned snapshot was persisted to S3.
+    /// `false` means the manifest was saved but the versioned snapshot key wasn't.
+    pub snapshot_persisted: bool,
     /// Flush statistics.
     pub stats: FlushStats,
 }

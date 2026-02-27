@@ -249,25 +249,64 @@ impl TestContext {
     pub async fn new() -> Self {
         let minio = MinIO::default().start().await.unwrap();
         let host = minio.get_host().await.unwrap();
-        let port = minio.get_host_port_ipv4(9000).await.unwrap();
+
+        // Retry port lookup — Docker can race between container start and
+        // port mapping visibility, causing PortNotExposed on loaded machines.
+        let port = {
+            let mut last_err = None;
+            let mut port = None;
+            for _ in 0..10 {
+                match minio.get_host_port_ipv4(9000).await {
+                    Ok(p) => { port = Some(p); break; }
+                    Err(e) => {
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+            }
+            port.unwrap_or_else(|| panic!("MinIO port 9000 not available after retries: {:?}", last_err))
+        };
         let endpoint = format!("http://{}:{}", host, port);
 
         // Create bucket using curl with AWS SigV4 auth inside the container
-        // (reqwest basic_auth doesn't work for S3 API — MinIO requires SigV4)
-        minio
-            .exec(ExecCommand::new(vec![
-                "curl",
-                "-sf",
-                "-X",
-                "PUT",
-                "--aws-sigv4",
-                "aws:amz:us-east-1:s3",
-                "-u",
-                "minioadmin:minioadmin",
-                "http://localhost:9000/test-bucket",
-            ]))
-            .await
-            .unwrap();
+        // (reqwest basic_auth doesn't work for S3 API — MinIO requires SigV4).
+        // Retry: exec() confirms the command started but not that it completed,
+        // and MinIO may not be ready to accept requests immediately.
+        for attempt in 0..10 {
+            let result = minio
+                .exec(ExecCommand::new(vec![
+                    "curl",
+                    "-sf",
+                    "-X",
+                    "PUT",
+                    "--aws-sigv4",
+                    "aws:amz:us-east-1:s3",
+                    "-u",
+                    "minioadmin:minioadmin",
+                    "http://localhost:9000/test-bucket",
+                ]))
+                .await;
+            match result {
+                Ok(mut r) => {
+                    // stdout_to_vec blocks until the exec command exits.
+                    let _ = r.stdout_to_vec().await;
+                    if r.exit_code().await.unwrap_or(Some(1)) == Some(0) {
+                        break;
+                    }
+                    if attempt >= 9 {
+                        panic!(
+                            "bucket creation failed after retries (exit code {:?})",
+                            r.exit_code().await,
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(_) if attempt < 9 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("bucket creation exec failed after retries: {e}"),
+            }
+        }
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(
             AmazonS3Builder::new()
@@ -349,6 +388,7 @@ impl TestServer {
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
             })
+            .await
             .expect("failed to create test router"),
         );
 
@@ -504,7 +544,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, false, None)
+            .create_export(config, false, None, None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;
@@ -537,7 +577,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, false, Some(name))
+            .create_export(config, false, Some(name), None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;
@@ -556,7 +596,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, false, Some(name))
+            .create_export(config, false, Some(name), None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;
@@ -565,7 +605,7 @@ impl TestServer {
 
     /// Snapshot an export (flush dirty blocks + upload manifest).
     pub async fn snapshot_export(&self, name: &str) -> SnapshotResponse {
-        self.router.snapshot_export(name).await.unwrap()
+        self.router.snapshot_export(name, None).await.unwrap()
     }
 
     /// Fork an export from a source manifest (read-write).
@@ -580,7 +620,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, false, Some(source_manifest))
+            .create_export(config, false, Some(source_manifest), None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;
@@ -599,7 +639,7 @@ impl TestServer {
             transport: None,
         };
         self.router
-            .create_export(config, true, Some(source_manifest))
+            .create_export(config, true, Some(source_manifest), None)
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;

@@ -44,6 +44,24 @@ pub struct PutExportRequest {
     /// Block device transport: "nbd" (default) or "ublk" (Linux 6.0+).
     #[serde(default)]
     pub transport: Option<String>,
+    /// If set (with manifest_name), fork from this specific snapshot sequence.
+    #[serde(default)]
+    pub snapshot_sequence: Option<u64>,
+}
+
+/// Optional request body for POST /api/exports/{name}/snapshot.
+#[derive(Debug, Deserialize)]
+pub struct SnapshotRequest {
+    /// If set, also publish the manifest under this tag name.
+    #[serde(default)]
+    pub tag: Option<String>,
+}
+
+/// Request body for POST /api/exports/{name}/tag.
+#[derive(Debug, Deserialize)]
+pub struct TagRequest {
+    /// Tag name to publish the manifest under.
+    pub tag: String,
 }
 
 /// Response for export info.
@@ -116,6 +134,21 @@ fn is_valid_export_name(name: &str) -> bool {
     let first = chars.next().unwrap();
     first.is_ascii_alphanumeric()
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Public test wrapper for `handle_request`.
+#[cfg(feature = "test-utils")]
+#[allow(dead_code)]
+pub async fn handle_request_for_test<B>(
+    router: Arc<ExportRouter>,
+    req: Request<B>,
+) -> Result<Response<BoxBody>, Infallible>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: std::fmt::Display,
+{
+    handle_request(router, req).await
 }
 
 /// Handle API requests.
@@ -255,6 +288,13 @@ where
                 ));
             }
 
+            if put_req.snapshot_sequence.is_some() && put_req.manifest_name.is_none() {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "snapshot_sequence requires manifest_name to be set",
+                ));
+            }
+
             // Check if export already exists
             let existing = router
                 .list_exports()
@@ -325,15 +365,18 @@ where
                             config.clone(),
                             put_req.readonly,
                             put_req.manifest_name.as_deref(),
+                            put_req.snapshot_sequence,
                         )
                         .await
                     {
                         Ok(()) => {
                             if let Err(e) = router.save_export(&config).await {
-                                warn!(
-                                    "Failed to persist export to S3: {} (export is functional)",
-                                    e
-                                );
+                                // Export is functional locally but won't survive a restart.
+                                // Return 503 so the orchestrator can retry (create_export is idempotent).
+                                return Ok(error_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    &format!("Export created but definition not persisted to S3: {e}"),
+                                ));
                             }
 
                             // Register kernel block device on Linux.
@@ -403,7 +446,27 @@ where
 
         // POST /api/exports/{name}/snapshot - Snapshot export to S3 manifest
         (Method::POST, ["api", "exports", name, "snapshot"]) => {
-            match router.snapshot_export(name).await {
+            // Parse optional body for tag
+            let tag = match req.into_body().collect().await {
+                Ok(b) => {
+                    let bytes = b.to_bytes();
+                    if bytes.is_empty() {
+                        None
+                    } else {
+                        match serde_json::from_slice::<SnapshotRequest>(&bytes) {
+                            Ok(r) => r.tag,
+                            Err(e) => {
+                                return Ok(error_response(
+                                    StatusCode::BAD_REQUEST,
+                                    &format!("Invalid JSON: {}", e),
+                                ));
+                            }
+                        }
+                    }
+                }
+                Err(_) => None,
+            };
+            match router.snapshot_export(name, tag.as_deref()).await {
                 Ok(result) => json_response(StatusCode::OK, &result),
                 Err(RouterError::ExportNotFound(name)) => error_response(
                     StatusCode::NOT_FOUND,
@@ -414,6 +477,87 @@ where
                     &format!("Invalid export name '{}'", name),
                 ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // POST /api/exports/{name}/tag - Tag export manifest under a name
+        (Method::POST, ["api", "exports", name, "tag"]) => {
+            let body = match req.into_body().collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            let tag_req: TagRequest = match serde_json::from_slice(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid JSON: {}", e),
+                    ));
+                }
+            };
+            match router.tag_export(name, &tag_req.tag).await {
+                Ok(()) => json_response(
+                    StatusCode::OK,
+                    &ApiResponse::success(format!(
+                        "Tagged '{}' as '{}'",
+                        name, tag_req.tag
+                    )),
+                ),
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid export or tag name",
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/exports/{name}/snapshots - List snapshot sequences
+        (Method::GET, ["api", "exports", name, "snapshots"]) => {
+            match router.list_export_snapshots(name).await {
+                Ok(sequences) => json_response(StatusCode::OK, &sequences),
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid export name '{}'", name),
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // DELETE /api/exports/{name}/snapshots/{sequence} - Delete a snapshot
+        (Method::DELETE, ["api", "exports", name, "snapshots", seq_str]) => {
+            match seq_str.parse::<u64>() {
+                Err(_) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    "snapshot sequence must be a valid u64",
+                ),
+                Ok(sequence) => match router.delete_export_snapshot(name, sequence).await {
+                    Ok(()) => json_response(
+                        StatusCode::OK,
+                        &ApiResponse::success(format!(
+                            "Snapshot seq={} deleted for '{}'",
+                            sequence, name
+                        )),
+                    ),
+                    Err(RouterError::ExportNotFound(name)) => error_response(
+                        StatusCode::NOT_FOUND,
+                        &format!("Export '{}' not found", name),
+                    ),
+                    Err(RouterError::InvalidExportName(_)) => error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid export name '{}'", name),
+                    ),
+                    Err(e) => {
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                    }
+                },
             }
         }
 
@@ -471,6 +615,25 @@ where
                     StatusCode::BAD_REQUEST,
                     &format!("Invalid export name '{}'", name),
                 ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // HEAD /api/manifests/{s3_prefix}/{name} - Check manifest existence
+        (Method::HEAD, ["api", "manifests", s3_prefix, manifest_name]) => {
+            // Reject path traversal
+            if s3_prefix.contains("..") || manifest_name.contains("..") {
+                return Ok(error_response(StatusCode::BAD_REQUEST, "Invalid path"));
+            }
+            match router.head_manifest(s3_prefix, manifest_name).await {
+                Ok(true) => Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+                Ok(false) => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
@@ -535,14 +698,7 @@ where
                 writeln!(output, "# TYPE glidefs_s3_circuit_breaker_state gauge").unwrap();
                 writeln!(output, "glidefs_s3_circuit_breaker_state {cb_value}").unwrap();
             }
-            // Host-level pack index size (content-addressed dedup entries)
-            {
-                use std::fmt::Write;
-                let entries = router.pack_index().len().unwrap_or(0);
-                writeln!(output, "# HELP glidefs_pack_index_entries Number of entries in the host-level pack index").unwrap();
-                writeln!(output, "# TYPE glidefs_pack_index_entries gauge").unwrap();
-                writeln!(output, "glidefs_pack_index_entries {entries}").unwrap();
-            }
+            // (pack index metric removed — replaced by ChunkMetaCache)
             // SSD capacity
             {
                 use std::fmt::Write;
@@ -639,7 +795,7 @@ mod tests {
     use crate::block::router::RouterConfig;
     use tempfile::TempDir;
 
-    fn create_test_router(temp_dir: &TempDir) -> Arc<ExportRouter> {
+    async fn create_test_router(temp_dir: &TempDir) -> Arc<ExportRouter> {
         let s3: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         Arc::new(
@@ -656,6 +812,7 @@ mod tests {
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
             })
+            .await
             .expect("failed to create test router"),
         )
     }
@@ -725,7 +882,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_endpoint() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/health", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -733,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn test_readiness_endpoint() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/health/ready", None).await;
         // May be OK or SERVICE_UNAVAILABLE depending on state
         assert!(
@@ -744,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn test_unknown_route_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/nonexistent", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -752,7 +909,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_creates_export() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -774,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_existing_export_is_noop() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         // Create
         request(
             &router,
@@ -797,7 +954,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_existing_export() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -813,7 +970,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_missing_export_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/api/exports/nope", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -821,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_exports() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -837,7 +994,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_export() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -853,7 +1010,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_with_purge() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -875,7 +1032,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_missing_export_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::POST, "/api/exports/nope/drain", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -883,7 +1040,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_export_name_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -897,7 +1054,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_size_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -915,7 +1072,7 @@ mod tests {
             return; // Skip on Linux+ublk builds where it would succeed.
         }
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -929,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_transport_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -943,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn test_nbd_transport_accepted() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(
             &router,
             Method::PUT,
@@ -957,7 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_json_returns_400() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::PUT, "/api/exports/vol1", Some("not json")).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
@@ -965,7 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn test_metrics_endpoint() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::GET, "/metrics", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -977,7 +1134,7 @@ mod tests {
     #[tokio::test]
     async fn test_drain_export_success() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -993,7 +1150,7 @@ mod tests {
     #[tokio::test]
     async fn test_promote_export_success() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         // Create a readonly export
         request(
             &router,
@@ -1010,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn test_promote_nonexistent_export_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::POST, "/api/exports/nope/promote", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -1018,7 +1175,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_export_success() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -1034,9 +1191,76 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_nonexistent_export_returns_404() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         let resp = request(&router, Method::POST, "/api/exports/nope/snapshot", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_delete_snapshot_invalid_sequence_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        let resp = request(
+            &router,
+            Method::DELETE,
+            "/api/exports/vol1/snapshots/not-a-number",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_api_fork_from_snapshot_sequence() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+
+        // Create source export
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/source",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+
+        // Snapshot source
+        let resp = request(&router, Method::POST, "/api/exports/source/snapshot", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let snap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let seq = snap["sequence"].as_u64().unwrap();
+
+        // Fork from snapshot_sequence via API
+        let body = format!(
+            r#"{{"size_gb": 0.01, "s3_prefix": "source", "manifest_name": "source", "snapshot_sequence": {}}}"#,
+            seq
+        );
+        let resp = request(&router, Method::PUT, "/api/exports/fork1", Some(&body)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_api_snapshot_sequence_without_manifest_name_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "snapshot_sequence": 1}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // =========================================================================
@@ -1046,7 +1270,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_export_includes_transport_and_device() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -1069,7 +1293,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_exports_includes_transport() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
         request(
             &router,
             Method::PUT,
@@ -1088,7 +1312,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_idempotent_returns_export_info() {
         let temp = TempDir::new().unwrap();
-        let router = create_test_router(&temp);
+        let router = create_test_router(&temp).await;
 
         // First PUT — creates
         let resp = request(

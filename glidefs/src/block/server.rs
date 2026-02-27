@@ -938,7 +938,7 @@ mod tests {
     #[tokio::test]
     async fn test_handshake_client_fixed_newstyle() {
         // Create mock router
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         // Client sends FIXED_NEWSTYLE flag
@@ -954,7 +954,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_client_no_zeroes() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         // Client sends both flags
@@ -970,7 +970,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_incompatible_client() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         // Client without FIXED_NEWSTYLE (incompatible)
@@ -985,7 +985,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handshake_writes_correct_magic() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         let client_input = client_flags_bytes(NBD_FLAG_C_FIXED_NEWSTYLE);
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_option_list_empty() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         // Client sends LIST option with 0 length
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_option_go_export_not_found() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         let payload = go_option_payload("nonexistent");
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_option_structured_reply_unsupported() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         let mut client_input = client_flags_bytes(NBD_FLAG_C_FIXED_NEWSTYLE);
@@ -1071,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_option_unknown_returns_unsupported() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         let mut client_input = client_flags_bytes(NBD_FLAG_C_FIXED_NEWSTYLE);
@@ -1103,7 +1103,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_write_data_beyond_device() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         // Simulate a duplex stream
@@ -1134,7 +1134,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_option_info_invalid_data() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         // INFO option with too-short data
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_go_option_invalid_name_length() {
-        let router = Arc::new(ExportRouter::new_for_test());
+        let router = Arc::new(ExportRouter::new_for_test().await);
         let shutdown = CancellationToken::new();
 
         // GO option where name_len exceeds actual data

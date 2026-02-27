@@ -20,11 +20,11 @@ use object_store::{
 use tempfile::TempDir;
 
 use glidefs::block::cache::SimpleBlockCache;
+use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::content_store::ContentStore;
-use glidefs::block::manifest::Manifest;
 use glidefs::block::metrics::ExportMetrics;
-use glidefs::block::pack_index::HostPackIndex;
 use glidefs::block::state::Active;
+use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
 const BLOCK_SIZE: usize = 128 * 1024;
@@ -112,6 +112,15 @@ impl ObjectStore for FailingObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        if self.should_fail_put() {
+            return Err(object_store::Error::Generic {
+                store: "FailingObjectStore",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Simulated S3 multipart failure",
+                )),
+            });
+        }
         self.inner.put_multipart_opts(location, opts).await
     }
 
@@ -149,31 +158,37 @@ impl ObjectStore for FailingObjectStore {
     }
 }
 
+const DEVICE_SIZE: u64 = 256 * 1024 * 1024; // 256MB (enough for multi-pack tests at 500 blocks/pack)
+
 /// Helper to create a writer cache with the failing object store.
 #[allow(clippy::type_complexity)]
-fn create_test_cache(
+async fn create_test_cache(
     temp_dir: &TempDir,
     name: &str,
     s3: Arc<FailingObjectStore>,
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    Arc<HostPackIndex>,
+    Arc<PackIndexCache>,
+    Arc<parking_lot::RwLock<VolumeManifest>>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
 ) {
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: name.to_string(),
-        device_size: 256 * 1024 * 1024, // 256MB (enough for multi-pack tests at 500 blocks/pack)
+        device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
         wal_sync: false,
     };
 
     let metrics = Arc::new(ExportMetrics::new());
     let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
-    let pack_index =
-        Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
+    let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        DEVICE_SIZE,
+        BLOCK_SIZE as u32,
+    )));
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
@@ -182,18 +197,19 @@ fn create_test_cache(
     (
         Arc::new(cache),
         content_store,
-        pack_index,
+        pack_index_cache,
+        volume_manifest,
         clean_cache,
         metrics,
     )
 }
 
-/// Helper to create a cold reader cache from the manifest in S3.
+/// Helper to create a cold reader cache from the volume manifest in S3.
 ///
-/// After a writer flushes, the manifest in S3 contains the block_map and
-/// pack_index entries. This helper downloads the manifest, opens a WriteCache
-/// via `open_from_manifest` (which populates the block_map), and rebuilds
-/// the HostPackIndex so read_v2 can resolve blocks through S3.
+/// After a writer flushes, the VolumeManifest in S3 maps chunk indices to
+/// content-addressed chunk hashes. This helper downloads the VolumeManifest,
+/// opens a fresh WriteCache via `open_fresh_active` (empty local block map),
+/// and creates a PackIndexCache so read can resolve blocks through S3.
 async fn create_reader_from_manifest(
     temp_dir: &TempDir,
     name: &str,
@@ -201,45 +217,45 @@ async fn create_reader_from_manifest(
 ) -> (
     Arc<WriteCache<Active>>,
     ContentStore,
-    Arc<HostPackIndex>,
+    Arc<PackIndexCache>,
+    Arc<parking_lot::RwLock<VolumeManifest>>,
     Arc<SimpleBlockCache>,
     Arc<ExportMetrics>,
 ) {
     let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
 
-    // Fetch manifest from S3
+    // Fetch VolumeManifest from S3
     let manifest_bytes = content_store
         .get_manifest(name)
         .await
-        .expect("manifest fetch failed")
-        .expect("manifest should exist in S3");
-    let manifest = Manifest::deserialize(&manifest_bytes).expect("manifest deserialization failed");
-
-    // Rebuild pack_index from manifest
-    let pack_index =
-        Arc::new(HostPackIndex::open(temp_dir.path().join("pack_index.redb")).unwrap());
-    pack_index.rebuild(std::slice::from_ref(&manifest)).unwrap();
+        .expect("volume manifest fetch failed")
+        .expect("volume manifest should exist in S3");
+    let volume_manifest = VolumeManifest::deserialize(&manifest_bytes)
+        .expect("volume manifest deserialization failed");
 
     let config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: name.to_string(),
-        device_size: manifest.device_size,
+        device_size: volume_manifest.size,
         block_size: BLOCK_SIZE,
         wal_sync: false,
     };
 
     let metrics = Arc::new(ExportMetrics::new());
+    let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(volume_manifest));
     let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
-    // open_from_manifest populates the block_map from the manifest so
-    // read_v2 knows which hashes exist at each chunk index.
-    let cache = WriteCache::open_from_manifest(config, &manifest, None)
-        .expect("Failed to open cache from manifest");
+    // open_fresh_active creates a WriteCache with an empty local block map.
+    // read resolves remote data via VolumeManifest + PackIndexCache.
+    let cache = WriteCache::open_fresh_active(config)
+        .expect("Failed to open fresh active cache");
 
     (
         Arc::new(cache),
         content_store,
-        pack_index,
+        pack_index_cache,
+        volume_manifest,
         clean_cache,
         metrics,
     )
@@ -258,8 +274,8 @@ async fn create_reader_from_manifest(
 async fn test_s3_failure_during_sync_marks_blocks_dirty() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write some blocks
     for i in 0..5 {
@@ -276,7 +292,9 @@ async fn test_s3_failure_during_sync_marks_blocks_dirty() {
 
     // Attempt to flush - will fail because pack upload fails.
     // flush_dirty_inner returns Err before CAS-clearing dirty flags.
-    let result = cache.flush_to_s3(&content_store, &pack_index).await;
+    let result = cache
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .await;
     assert!(result.is_err(), "Flush should fail when S3 is unavailable");
 
     // Blocks should still be dirty (error returned before CAS-clear step)
@@ -291,7 +309,7 @@ async fn test_s3_failure_during_sync_marks_blocks_dirty() {
 
     // Now flush should succeed
     let stats = cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
     assert_eq!(
@@ -315,23 +333,23 @@ async fn test_s3_failure_during_read_returns_error() {
 
     // First, write data to S3 successfully
     let writer_dir = TempDir::new().unwrap();
-    let (writer_cache, writer_content_store, writer_pack_index, writer_clean_cache, _) =
-        create_test_cache(&writer_dir, "vol1", Arc::clone(&s3));
+    let (writer_cache, writer_content_store, writer_pack_index_cache, writer_volume_manifest, writer_clean_cache, _) =
+        create_test_cache(&writer_dir, "vol1", Arc::clone(&s3)).await;
 
     let data = vec![0xAB; BLOCK_SIZE];
     writer_cache
         .write(0, &data, writer_clean_cache.as_ref())
         .unwrap();
     writer_cache
-        .flush_to_s3(&writer_content_store, &writer_pack_index)
+        .flush_to_s3(&writer_content_store, &writer_pack_index_cache, &writer_volume_manifest)
         .await
         .unwrap();
     drop(writer_cache);
 
-    // Create a fresh reader from the manifest. This populates the block_map
-    // so read_v2 knows that block 0 has a non-zero hash and will attempt S3.
+    // Create a fresh reader from the volume manifest. read resolves
+    // remote data via VolumeManifest + PackIndexCache.
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+    let (reader_cache, reader_content_store, reader_pack_index_cache, reader_volume_manifest, reader_clean_cache, reader_metrics) =
         create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     // Enable S3 failures
@@ -339,11 +357,12 @@ async fn test_s3_failure_during_read_returns_error() {
 
     // Read should fail (not cached locally, S3 unavailable)
     let result = reader_cache
-        .read_v2(
+        .read(
             0,
             BLOCK_SIZE,
             reader_clean_cache.as_ref(),
-            &reader_pack_index,
+            &reader_pack_index_cache,
+            &reader_volume_manifest,
             &reader_content_store,
             &reader_metrics,
         )
@@ -356,11 +375,12 @@ async fn test_s3_failure_during_read_returns_error() {
 
     // Now read should succeed
     let result = reader_cache
-        .read_v2(
+        .read(
             0,
             BLOCK_SIZE,
             reader_clean_cache.as_ref(),
-            &reader_pack_index,
+            &reader_pack_index_cache,
+            &reader_volume_manifest,
             &reader_content_store,
             &reader_metrics,
         )
@@ -378,14 +398,14 @@ async fn test_s3_failure_during_read_returns_error() {
 async fn test_write_during_sync_preserves_new_data() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write initial data and flush to S3
     let data_v1 = vec![0x11; BLOCK_SIZE];
     cache.write(0, &data_v1, clean_cache.as_ref()).unwrap();
     cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
 
@@ -402,22 +422,23 @@ async fn test_write_during_sync_preserves_new_data() {
 
     // Flush the new data
     cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
 
     // Verify S3 has the new data by reading from a cold reader
     drop(cache);
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+    let (reader_cache, reader_content_store, reader_pack_index_cache, reader_volume_manifest, reader_clean_cache, reader_metrics) =
         create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     let s3_data = reader_cache
-        .read_v2(
+        .read(
             0,
             BLOCK_SIZE,
             reader_clean_cache.as_ref(),
-            &reader_pack_index,
+            &reader_pack_index_cache,
+            &reader_volume_manifest,
             &reader_content_store,
             &reader_metrics,
         )
@@ -442,8 +463,8 @@ async fn test_concurrent_writes_no_torn_reads() {
 
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, _content_store, _pack_index, clean_cache, _metrics) =
-        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, _content_store, _pack_index_cache, _volume_manifest, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     let cache = Arc::new(cache);
     let write_count = Arc::new(AtomicUsize::new(0));
@@ -497,16 +518,18 @@ async fn test_concurrent_writes_no_torn_reads() {
     );
 }
 
-/// Test: Zero blocks are not uploaded to S3 (optimization).
+/// Test: Zero blocks produce tombstone entries in packs.
 ///
-/// Writing all-zero blocks should not result in pack uploads,
-/// as zero blocks are synthesized on read.
+/// Writing all-zero blocks produces pack entries with comp_length = 0
+/// (tombstones). This ensures "newest wins" semantics are preserved
+/// across forks/migrations: a block overwritten with zeros must be
+/// distinguishable from "never written" by the read path.
 #[tokio::test]
-async fn test_zero_blocks_not_synced_to_s3() {
+async fn test_zero_blocks_produce_tombstones() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write zero blocks
     let zeros = vec![0u8; BLOCK_SIZE];
@@ -518,14 +541,19 @@ async fn test_zero_blocks_not_synced_to_s3() {
 
     // Flush to S3
     let stats = cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
 
-    // With zero-block optimization, no packs should be uploaded
+    // Zero blocks produce tombstone pack entries (comp_length = 0) so
+    // that forks see zeros instead of stale non-zero data from older packs.
     assert_eq!(
-        stats.packs_uploaded, 0,
-        "Zero blocks should not result in S3 uploads (optimization)"
+        stats.packs_uploaded, 1,
+        "Zero blocks should produce one tombstone pack"
+    );
+    assert_eq!(
+        stats.bytes_uploaded, 0,
+        "Zero block tombstones have no compressed data"
     );
 }
 
@@ -537,8 +565,8 @@ async fn test_zero_blocks_not_synced_to_s3() {
 async fn test_mixed_zero_nonzero_batch() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write alternating zero and non-zero blocks
     for i in 0..10 {
@@ -554,23 +582,24 @@ async fn test_mixed_zero_nonzero_batch() {
 
     // Flush
     cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
 
     // Verify by reading from a cold reader
     drop(cache);
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+    let (reader_cache, reader_content_store, reader_pack_index_cache, reader_volume_manifest, reader_clean_cache, reader_metrics) =
         create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     for i in 0..10 {
         let data = reader_cache
-            .read_v2(
+            .read(
                 i as u64 * BLOCK_SIZE as u64,
                 BLOCK_SIZE,
                 reader_clean_cache.as_ref(),
-                &reader_pack_index,
+                &reader_pack_index_cache,
+                &reader_volume_manifest,
                 &reader_content_store,
                 &reader_metrics,
             )
@@ -595,8 +624,8 @@ async fn test_mixed_zero_nonzero_batch() {
 async fn test_data_integrity_after_failure_recovery() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write known pattern
     let mut expected_data = Vec::new();
@@ -610,7 +639,9 @@ async fn test_data_integrity_after_failure_recovery() {
 
     // Enable S3 failures and attempt flush
     s3.set_fail_puts(true);
-    let result = cache.flush_to_s3(&content_store, &pack_index).await;
+    let result = cache
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .await;
     assert!(result.is_err(), "First flush should fail");
 
     // Blocks should still be dirty
@@ -622,23 +653,24 @@ async fn test_data_integrity_after_failure_recovery() {
     // Disable failures and flush successfully
     s3.set_fail_puts(false);
     cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
 
     // Verify from a cold reader
     drop(cache);
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+    let (reader_cache, reader_content_store, reader_pack_index_cache, reader_volume_manifest, reader_clean_cache, reader_metrics) =
         create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     for (i, expected) in expected_data.iter().enumerate() {
         let data = reader_cache
-            .read_v2(
+            .read(
                 i as u64 * BLOCK_SIZE as u64,
                 BLOCK_SIZE,
                 reader_clean_cache.as_ref(),
-                &reader_pack_index,
+                &reader_pack_index_cache,
+                &reader_volume_manifest,
                 &reader_content_store,
                 &reader_metrics,
             )
@@ -662,8 +694,8 @@ async fn test_data_integrity_after_failure_recovery() {
 async fn test_concurrent_drain_safety() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write data
     for i in 0..10 {
@@ -682,9 +714,12 @@ async fn test_concurrent_drain_safety() {
     for _ in 0..3 {
         let cache = Arc::clone(&cache);
         let content_store = Arc::clone(&content_store);
-        let pack_index = Arc::clone(&pack_index);
+        let pack_index_cache = Arc::clone(&pack_index_cache);
+        let volume_manifest = Arc::clone(&volume_manifest);
         handles.push(tokio::spawn(async move {
-            let _ = cache.flush_to_s3(&content_store, &pack_index).await;
+            let _ = cache
+                .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+                .await;
         }));
     }
 
@@ -698,16 +733,17 @@ async fn test_concurrent_drain_safety() {
     // Verify data integrity from a cold reader
     drop(cache);
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+    let (reader_cache, reader_content_store, reader_pack_index_cache, reader_volume_manifest, reader_clean_cache, reader_metrics) =
         create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     for i in 0..10 {
         let data = reader_cache
-            .read_v2(
+            .read(
                 i as u64 * BLOCK_SIZE as u64,
                 BLOCK_SIZE,
                 reader_clean_cache.as_ref(),
-                &reader_pack_index,
+                &reader_pack_index_cache,
+                &reader_volume_manifest,
                 &reader_content_store,
                 &reader_metrics,
             )
@@ -733,8 +769,8 @@ async fn test_concurrent_drain_safety() {
 async fn test_partial_pack_upload_preserves_dirty() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index, clean_cache, _metrics) =
-        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3));
+    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write enough blocks for 3 packs (500 blocks per pack, so 1250 = 3 packs).
     // fail_after_puts(2) lets 2 pack uploads succeed, fails the 3rd.
@@ -762,7 +798,9 @@ async fn test_partial_pack_upload_preserves_dirty() {
     s3.set_fail_after_puts(2);
 
     // Flush should fail — some packs uploaded, but not all
-    let result = cache.flush_to_s3(&content_store, &pack_index).await;
+    let result = cache
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .await;
     assert!(result.is_err(), "flush should fail on partial pack upload");
 
     // All blocks should still be dirty (flush_dirty_inner returns Err before
@@ -778,7 +816,7 @@ async fn test_partial_pack_upload_preserves_dirty() {
     s3.set_fail_puts(false);
 
     let stats = cache
-        .flush_to_s3(&content_store, &pack_index)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
 
@@ -792,16 +830,17 @@ async fn test_partial_pack_upload_preserves_dirty() {
     // Verify data integrity from a cold reader
     drop(cache);
     let reader_dir = TempDir::new().unwrap();
-    let (reader_cache, reader_content_store, reader_pack_index, reader_clean_cache, reader_metrics) =
+    let (reader_cache, reader_content_store, reader_pack_index_cache, reader_volume_manifest, reader_clean_cache, reader_metrics) =
         create_reader_from_manifest(&reader_dir, "vol1", Arc::clone(&s3)).await;
 
     for i in 0..num_blocks {
         let data = reader_cache
-            .read_v2(
+            .read(
                 i as u64 * BLOCK_SIZE as u64,
                 BLOCK_SIZE,
                 reader_clean_cache.as_ref(),
-                &reader_pack_index,
+                &reader_pack_index_cache,
+                &reader_volume_manifest,
                 &reader_content_store,
                 &reader_metrics,
             )

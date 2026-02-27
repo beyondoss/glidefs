@@ -1,25 +1,12 @@
-use parking_lot::{Mutex, RwLock};
+use dashmap::DashMap;
+use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
-use std::collections::{HashMap, HashSet};
+use crate::block::block_map::{Blake3Hash, SequenceNumber, SparseBlockState, SparseStateMap};
 
-use crate::block::block_map::{
-    Blake3Hash, BlockMap, BlockMapKind, SequenceNumber, SparseBlockState, SparseStateMap,
-};
-
-/// Cached state from the most recent full (base) manifest upload.
-///
-/// Used to compute delta manifests: diff current block_map against
-/// this cached snapshot to produce upserts and deletes.
-pub(super) struct BaseManifestState {
-    pub sequence: u64,
-    pub block_map: HashMap<u64, Blake3Hash>,
-    pub syncs_since_base: u32,
-}
 use crate::block::wal::Wal;
 
 use super::config::WriteCacheConfig;
@@ -29,95 +16,103 @@ use bytes::Bytes;
 
 /// Magic bytes for cache metadata file
 pub(super) const METADATA_MAGIC: &[u8; 8] = b"ZFSCACHE";
-/// Version 4: sparse state map (only non-zero entries persisted)
-pub(super) const METADATA_VERSION: u32 = 4;
+/// Version 5: sparse state map + trailing max_sequence u64
+pub(super) const METADATA_VERSION: u32 = 5;
 
-/// A file handle safe for concurrent positional I/O.
-///
-/// This wrapper allows sharing a `File` across threads when using only
-/// positional I/O methods (`read_at`, `write_at`, `read_exact_at`, `write_all_at`).
-/// These methods use `pread`/`pwrite` system calls which are atomic and don't
-/// use the internal file position, making them thread-safe per POSIX semantics.
-///
-/// # Safety
-///
-/// This type implements `Sync` because:
-/// 1. We only expose positional I/O methods (pread/pwrite)
-/// 2. POSIX guarantees pread/pwrite are atomic with respect to each other
-/// 3. We never use seek-based read/write which would race on file position
-/// 4. `sync_all()` is safe to call concurrently (just triggers fsync)
-#[derive(Debug)]
-pub struct SyncFile {
-    file: File,
-}
+/// Sealed module for `SyncFile`. The `File` field is private to this module,
+/// preventing any code outside from accessing seek-based methods. This makes
+/// the `unsafe impl Sync` locally verifiable: only the methods below touch the
+/// inner file, and all of them use positional I/O (pread/pwrite).
+mod sync_file {
+    use std::fs::{File, OpenOptions};
+    use std::path::Path;
+    use tracing::info;
 
-impl SyncFile {
-    /// Open a file for concurrent positional I/O.
-    pub fn open(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(create)
-            .truncate(false)
-            .open(path)?;
+    /// A file handle safe for concurrent positional I/O.
+    ///
+    /// Only exposes positional I/O methods (`read_exact_at`, `write_all_at`)
+    /// which use `pread`/`pwrite` system calls — atomic per POSIX, no shared
+    /// file position. The inner `File` is module-private so no code outside
+    /// this module can call seek-based methods.
+    #[derive(Debug)]
+    pub struct SyncFile {
+        file: File,
+    }
 
-        let file_size = file.metadata()?.len();
-        if file_size < device_size {
-            file.set_len(device_size)?;
+    // SAFETY: SyncFile only exposes positional I/O methods (pread/pwrite via
+    // FileExt::{read_exact_at, write_all_at}) which are atomic per POSIX.
+    // The `file` field is private to this module — no external code can access
+    // seek-based methods (read, write, seek) that would introduce data races.
+    unsafe impl Sync for SyncFile {}
+
+    impl SyncFile {
+        /// Open a file for concurrent positional I/O.
+        pub fn open(path: &Path, create: bool, device_size: u64) -> std::io::Result<Self> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(create)
+                .truncate(false)
+                .open(path)?;
+
+            let file_size = file.metadata()?.len();
+            if file_size < device_size {
+                file.set_len(device_size)?;
+            }
+
+            info!(path = %path.display(), "opened cache file");
+            Ok(SyncFile { file })
         }
 
-        info!(path = %path.display(), "opened cache file");
-        Ok(SyncFile { file })
-    }
+        /// Read exact bytes at a specific offset (pread).
+        #[inline]
+        pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(buf, offset)
+        }
 
-    /// Read exact bytes at a specific offset (pread).
-    #[inline]
-    pub fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.read_exact_at(buf, offset)
-    }
+        /// Write all bytes at a specific offset (pwrite).
+        #[inline]
+        pub fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
+            use std::os::unix::fs::FileExt;
+            self.file.write_all_at(buf, offset)
+        }
 
-    /// Write all bytes at a specific offset (pwrite).
-    #[inline]
-    pub fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.write_all_at(buf, offset)
-    }
+        /// Sync all data and metadata to disk.
+        #[inline]
+        pub fn sync_all(&self) -> std::io::Result<()> {
+            self.file.sync_all()
+        }
 
-    /// Sync all data and metadata to disk.
-    #[inline]
-    pub fn sync_all(&self) -> std::io::Result<()> {
-        self.file.sync_all()
-    }
-
-    /// Get the raw file descriptor (for fallocate, etc).
-    #[cfg(target_os = "linux")]
-    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        use std::os::unix::io::AsRawFd;
-        self.file.as_raw_fd()
+        /// Get the raw file descriptor (for fallocate, etc).
+        #[cfg(target_os = "linux")]
+        pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+            use std::os::unix::io::AsRawFd;
+            self.file.as_raw_fd()
+        }
     }
 }
 
-// SAFETY: SyncFile only exposes positional I/O methods (pread/pwrite via
-// FileExt::{read_exact_at, write_all_at}) which are atomic per POSIX and don't
-// use the shared file position. Do NOT add seek-based read/write methods —
-// they would make this impl unsound.
-unsafe impl Sync for SyncFile {}
-// File is already Send; this static assert guards against future regressions.
-const _: () = {
-    const fn _assert_send<T: Send>() {}
-    let _ = _assert_send::<std::fs::File>;
-};
+pub use sync_file::SyncFile;
+
+/// Sentinel value for CRC32 checksums invalidated by a concurrent write.
+///
+/// The write path stores this instead of removing the CRC entry, preventing
+/// `compute_dirty_crc32s` from re-inserting a stale CRC via `or_insert`.
+/// The flush path skips CRC verification when it encounters this sentinel.
+///
+/// CRC32 can legitimately produce u32::MAX (1-in-4-billion chance), in which
+/// case we simply skip corruption detection for that one block — no correctness
+/// impact, only a negligible loss of SSD corruption detection.
+pub(super) const CRC_SENTINEL: u32 = u32::MAX;
 
 /// Check if a block is all zeros.
 ///
-/// Uses SIMD when available (AVX2 on x86_64), falling back to 64-bit word
-/// comparison. For a 128KB block:
-/// - Byte-by-byte: 131,072 comparisons
-/// - u64 fallback: 16,384 comparisons
-/// - AVX2 (256-bit): 4,096 comparisons
+/// Uses SIMD when available:
+/// - AVX2 on x86_64 (32 bytes/iter → 4,096 iterations for 128KB)
+/// - NEON on aarch64 (2×16 bytes/iter → 4,096 iterations for 128KB)
+/// - u64 fallback on other arches (8 bytes/iter → 16,384 iterations for 128KB)
 #[inline]
-#[allow(dead_code)] // Used by tests
 pub(super) fn is_zero_block(data: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
@@ -126,6 +121,12 @@ pub(super) fn is_zero_block(data: &[u8]) -> bool {
             return unsafe { is_zero_block_avx2(data) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is always available on aarch64 (baseline ISA).
+        return is_zero_block_neon(data);
+    }
+    #[allow(unreachable_code)]
     is_zero_block_u64(data)
 }
 
@@ -153,6 +154,52 @@ unsafe fn is_zero_block_avx2(data: &[u8]) -> bool {
         }
 
         // Handle remainder (0-31 bytes) with scalar code
+        while ptr < end {
+            if *ptr != 0 {
+                return false;
+            }
+            ptr = ptr.add(1);
+        }
+
+        true
+    }
+}
+
+/// NEON implementation for aarch64 — checks 32 bytes at a time (2×128-bit loads + OR).
+/// NEON is baseline on aarch64, so no runtime detection needed.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn is_zero_block_neon(data: &[u8]) -> bool {
+    use std::arch::aarch64::*;
+
+    // SAFETY: NEON is always available on aarch64. All pointer operations
+    // stay within the bounds of `data`.
+    unsafe {
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+
+        // Process 32 bytes at a time: load 2×16B, OR together, check.
+        // Same throughput as AVX2 (32 bytes/branch) using 128-bit registers.
+        while ptr.add(32) <= end {
+            let a = vld1q_u8(ptr);
+            let b = vld1q_u8(ptr.add(16));
+            let combined = vorrq_u8(a, b);
+            if vmaxvq_u8(combined) != 0 {
+                return false;
+            }
+            ptr = ptr.add(32);
+        }
+
+        // Handle 16-byte remainder
+        if ptr.add(16) <= end {
+            let chunk = vld1q_u8(ptr);
+            if vmaxvq_u8(chunk) != 0 {
+                return false;
+            }
+            ptr = ptr.add(16);
+        }
+
+        // Handle trailing bytes (0-15)
         while ptr < end {
             if *ptr != 0 {
                 return false;
@@ -210,21 +257,14 @@ pub(crate) struct CacheInner {
     pub(super) dirty_block_count: AtomicU64,
     pub(super) syncing_block_count: AtomicU64,
 
-    // === v2 content-addressed structures ===
-    /// Content-addressed block map: chunk_index -> (Blake3Hash, sequence).
-    ///
-    /// Wrapped in RwLock<BlockMapKind> to support both full (AtomicBlockMap)
-    /// and forked (ForkedBlockMap with DashMap overlay) variants.
-    /// All normal reads/writes take a read lock (interior mutability handles
-    /// the actual mutation). Write lock is only taken during rare flatten ops.
-    pub(super) block_map: RwLock<BlockMapKind>,
-
-    /// Monotonic sequence counter for snapshot consistency.
+    /// Monotonic sequence counter for WAL replay ordering and snapshot versioning.
     /// Lock-free AtomicU64.
     pub(super) sequence: SequenceNumber,
 
     /// Write-ahead log for crash recovery.
-    /// Mutex is effectively uncontended: single writer per export.
+    /// Mutex is contended under concurrent writes (multiple NBD I/O tasks
+    /// per export), but each write batches all its WAL entries under a
+    /// single lock acquisition to minimize hold time.
     pub(super) wal: Mutex<Wal>,
 
     /// Export name (used in WAL entries).
@@ -238,24 +278,26 @@ pub(crate) struct CacheInner {
     /// Avoids a heap allocation on every sparse read.
     pub(super) zero_block_bytes: Bytes,
 
-    /// Cached set of hashes from the most recent manifest build.
-    ///
-    /// Updated on every `upload_full_manifest()` and on-demand via
-    /// `rebuild_manifest_hashes()`. Used by pack index pruning to
-    /// determine which entries are still needed — the manifest is the
-    /// durable reference, not the live block_map (which has ZERO
-    /// placeholders for in-flight flushes).
-    pub(super) manifest_pack_hashes: Mutex<HashSet<Blake3Hash>>,
-
-    /// Cached state from the last full (base) manifest upload.
-    ///
-    /// Used to compute delta manifests by diffing the current block_map
-    /// against this snapshot. None until the first full manifest upload.
-    pub(super) base_manifest_state: Mutex<Option<BaseManifestState>>,
-
     /// Number of recovery issues encountered during cache open (WAL replay
     /// failure, block map load failure). Exposed via metrics for monitoring.
     pub(super) recovery_warnings: AtomicU64,
+
+    /// CRC32 checksums for dirty blocks, used to detect SSD corruption between
+    /// checkpoint and flush. Sized proportional to currently dirty blocks, not
+    /// device size. Concurrently accessed by: the write path (inserts
+    /// CRC_SENTINEL on every write), the checkpoint path (computes and stores
+    /// CRCs), and the flush path (takes CRCs for verification). DashMap
+    /// provides the necessary concurrent access safety.
+    pub(super) crc_map: DashMap<usize, u32>,
+
+    /// Per-export flush serialization lock.
+    ///
+    /// Serializes flush + manifest upload operations to prevent concurrent
+    /// callers (drain, flush_scheduler, snapshot) from uploading stale
+    /// manifests. Without this, two concurrent `flush_to_s3` calls can each
+    /// serialize the in-memory VolumeManifest at different points, and
+    /// last-writer-wins on S3 can overwrite a correct manifest with a stale one.
+    pub(crate) flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl CacheInner {
@@ -296,6 +338,12 @@ impl CacheInner {
         loop {
             let current = self.state_map.get(idx);
 
+            debug_assert_ne!(
+                current,
+                SparseBlockState::NOT_PRESENT,
+                "transition_to_dirty called on NOT_PRESENT block {idx}"
+            );
+
             if current == SparseBlockState::DIRTY {
                 break;
             }
@@ -325,46 +373,42 @@ impl CacheInner {
         }
     }
 
-    /// Get a block map entry (takes read lock, effectively zero overhead).
+    /// Atomically claim a dirty block for flushing: CAS DIRTY→SYNCING.
+    ///
+    /// Returns true if the CAS succeeded (block claimed for this flush cycle).
+    /// Returns false if the block is no longer DIRTY (already claimed or cleaned).
     #[inline]
-    pub(super) fn block_map_get(&self, chunk_index: usize) -> (Blake3Hash, u64) {
-        self.block_map.read().get(chunk_index)
+    pub(super) fn transition_dirty_to_syncing(&self, idx: usize) -> bool {
+        if self
+            .state_map
+            .cas(idx, SparseBlockState::DIRTY, SparseBlockState::SYNCING)
+            .is_ok()
+        {
+            self.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
+            self.syncing_block_count.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Set a block map entry (takes read lock — interior mutability handles the write).
+    /// Atomically finalize a flushed block: CAS SYNCING→CLEAN.
+    ///
+    /// Returns true if the CAS succeeded (block is now clean).
+    /// Returns false if a concurrent write transitioned SYNCING→DIRTY,
+    /// meaning the block must be re-flushed in the next cycle.
     #[inline]
-    pub(super) fn block_map_set(&self, chunk_index: usize, hash: Blake3Hash, seq: u64) {
-        self.block_map.read().set(chunk_index, hash, seq);
-    }
-
-    /// Snapshot the block map (takes read lock).
-    pub(super) fn block_map_snapshot(&self) -> BlockMap {
-        self.block_map.read().snapshot(&self.state_map)
-    }
-
-    // -- CRC32 dirty-block integrity ------------------------------------------
-
-    /// Load the CRC32 checksum for a chunk (takes read lock).
-    #[inline]
-    pub(super) fn block_map_get_crc32(&self, chunk_index: usize) -> u32 {
-        self.block_map.read().get_crc32(chunk_index)
-    }
-
-    /// Clear the CRC32 checksum for a chunk (takes read lock).
-    #[inline]
-    pub(super) fn block_map_clear_crc32(&self, chunk_index: usize) {
-        self.block_map.read().clear_crc32(chunk_index)
-    }
-
-    /// CAS the CRC32 checksum (takes read lock).
-    #[inline]
-    pub(super) fn block_map_cas_crc32(
-        &self,
-        chunk_index: usize,
-        expected: u32,
-        new: u32,
-    ) -> Result<u32, u32> {
-        self.block_map.read().cas_crc32(chunk_index, expected, new)
+    pub(super) fn transition_syncing_to_clean(&self, idx: usize) -> bool {
+        if self
+            .state_map
+            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::CLEAN)
+            .is_ok()
+        {
+            self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Count present blocks (for metrics/logging).
@@ -373,11 +417,26 @@ impl CacheInner {
         self.state_map.count_present()
     }
 
-    /// Persist block states to metadata file (fast path).
+    // -- CRC32 DashMap methods (for dirty-block corruption detection) ----------
+
+    /// Store a CRC32 checksum for a dirty block (checkpoint path).
+    /// Only inserts if no entry exists — a concurrent write that re-dirtied
+    /// the block should not overwrite a fresh CRC.
+    #[inline]
+    pub(super) fn crc_store(&self, idx: usize, crc: u32) {
+        self.crc_map.entry(idx).or_insert(crc);
+    }
+
+    /// Remove and return the CRC32 checksum for a block (flush path).
+    #[inline]
+    pub(super) fn crc_take(&self, idx: usize) -> Option<u32> {
+        self.crc_map.remove(&idx).map(|(_, v)| v)
+    }
+
+    /// Persist block states to metadata file.
     ///
-    /// v4 sparse format: only writes entries with non-zero state (present blocks).
-    /// Does NOT persist the block map -- call `persist_block_map()` separately
-    /// (outside the WAL lock) for that. Uses atomic write pattern: temp file ->
+    /// v5 sparse format: only writes entries with non-zero state (present blocks),
+    /// plus a trailing max_sequence u64. Uses atomic write pattern: temp file ->
     /// fsync -> rename.
     pub(super) fn save_block_states(&self) -> Result<(), CacheError> {
         let path = self.config.metadata_path();
@@ -397,21 +456,29 @@ impl CacheInner {
         file.write_all(&(self.config.block_size as u64).to_le_bytes())?;
         file.write_all(&(self.num_blocks as u64).to_le_bytes())?;
 
-        // v4 sparse format: collect (index, state) pairs for non-zero entries.
+        // v4/v5 sparse format: stream (index, state) pairs directly to disk.
+        // Write a placeholder count, stream entries, then seek back to fix the count.
         // Uses iter_present() which only visits allocated pages — O(allocated_pages)
         // not O(num_blocks).
-        let sparse_entries: Vec<(u32, u8)> = self
-            .state_map
-            .iter_present()
-            .map(|(idx, state)| (idx as u32, state))
-            .collect();
+        use std::io::Seek;
+        let count_pos = file.stream_position()?;
+        file.write_all(&0u64.to_le_bytes())?; // placeholder
 
-        // Write entry count then entries: index(u32 LE) + state(u8) = 5 bytes each
-        file.write_all(&(sparse_entries.len() as u64).to_le_bytes())?;
-        for &(idx, state) in &sparse_entries {
-            file.write_all(&idx.to_le_bytes())?;
+        let mut entry_count: u64 = 0;
+        for (idx, state) in self.state_map.iter_present() {
+            file.write_all(&(idx as u32).to_le_bytes())?;
             file.write_all(&[state])?;
+            entry_count += 1;
         }
+
+        // Patch the entry count
+        let end_pos = file.stream_position()?;
+        file.seek(std::io::SeekFrom::Start(count_pos))?;
+        file.write_all(&entry_count.to_le_bytes())?;
+        file.seek(std::io::SeekFrom::Start(end_pos))?;
+
+        // v5: append max_sequence as trailing u64 LE
+        file.write_all(&self.sequence.current().to_le_bytes())?;
 
         // Fsync temp file to ensure data is on disk
         file.sync_all()?;
@@ -420,7 +487,28 @@ impl CacheInner {
         // Atomic rename (POSIX guarantees this is atomic)
         std::fs::rename(&tmp_path, &path)?;
 
-        let present_count = sparse_entries.len();
+        // Fsync the parent directory so the rename is durable across power loss.
+        // Without this, the directory entry update can be lost on crash.
+        if let Some(parent) = path.parent() {
+            match File::open(parent) {
+                Ok(dir) => {
+                    if let Err(e) = dir.sync_all() {
+                        warn!(
+                            error = %e,
+                            "dir fsync after metadata rename failed — durability weakened"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "failed to open parent dir for fsync — durability weakened"
+                    );
+                }
+            }
+        }
+
+        let present_count = entry_count;
         debug!(
             path = %path.display(),
             blocks = self.num_blocks,
@@ -430,47 +518,28 @@ impl CacheInner {
         Ok(())
     }
 
-    /// Persist the v2 block map (content hashes) to disk.
-    ///
-    /// Safe to call outside the WAL lock: the block map file only needs to be
-    /// accurate for clean blocks (which don't change), and dirty blocks are
-    /// re-hashed from SSD during crash recovery regardless.
-    pub(super) fn persist_block_map(&self) -> Result<(), CacheError> {
-        let block_map_path = self.config.block_map_path();
-        let bm_snapshot = self.block_map_snapshot();
-        if let Err(e) = bm_snapshot.persist_to_file(&block_map_path) {
-            warn!(error = %e, "failed to persist block map");
-            return Err(CacheError::Io(e));
-        }
-        Ok(())
-    }
-
-    /// Persist block states, presence, and block map.
-    ///
-    /// Convenience method that calls both `save_block_states` and
-    /// `persist_block_map`. Used by callers that don't need to split
-    /// these operations around a WAL lock.
+    /// Persist block states and presence.
     pub(super) fn save_metadata(&self) -> Result<(), CacheError> {
-        self.save_block_states()?;
-        self.persist_block_map()
+        self.save_block_states()
     }
 
     /// Load block states and presence from metadata file.
     ///
-    /// Returns `(SparseStateMap, dirty_count)`. Handles legacy v1/v2/v3 formats
-    /// by converting the old encoding (Clean=0, Dirty=1, Syncing=2) plus
-    /// separate presence bitmap into the new sparse encoding (NotPresent=0,
-    /// Clean=1, Dirty=2, Syncing=3).
+    /// Returns `(SparseStateMap, dirty_count, max_sequence)`. Handles legacy
+    /// v1/v2/v3/v4 formats by converting the old encoding (Clean=0, Dirty=1,
+    /// Syncing=2) plus separate presence bitmap into the new sparse encoding
+    /// (NotPresent=0, Clean=1, Dirty=2, Syncing=3). max_sequence is 0 for
+    /// formats prior to v5.
     pub(super) fn load_metadata(
         config: &WriteCacheConfig,
-    ) -> Result<(SparseStateMap, usize), CacheError> {
+    ) -> Result<(SparseStateMap, usize, u64), CacheError> {
         let path = config.metadata_path();
         let num_blocks = config.num_blocks();
 
         if !path.exists() {
             // No metadata file -- all blocks are NOT_PRESENT
             debug!(path = %path.display(), "no metadata file, starting fresh");
-            return Ok((SparseStateMap::new(num_blocks), 0));
+            return Ok((SparseStateMap::new(num_blocks), 0, 0));
         }
 
         let mut file = File::open(&path)?;
@@ -521,99 +590,52 @@ impl CacheInner {
         let state_map = SparseStateMap::new(num_blocks);
         let mut dirty_count = 0;
 
-        if version >= 4 {
-            // v4: sparse format -- entry_count(u64) + entries of index(u32) + state(u8)
-            let mut count_buf = [0u8; 8];
-            file.read_exact(&mut count_buf)?;
-            let entry_count = u64::from_le_bytes(count_buf) as usize;
+        // max_sequence persisted in v5+, defaults to 0 for older formats
+        let mut persisted_max_seq: u64 = 0;
 
-            let mut entry_buf = [0u8; 5]; // u32 index + u8 state
-            for _ in 0..entry_count {
-                file.read_exact(&mut entry_buf)?;
-                let idx = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap()) as usize;
-                let mut state = entry_buf[4];
+        if version < 4 {
+            return Err(CacheError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported metadata version {version} (minimum 4)"),
+            )));
+        }
 
-                if idx >= num_blocks {
-                    continue; // skip out-of-bounds (shrink safety)
-                }
+        // v4/v5: sparse format -- entry_count(u64) + entries of index(u32) + state(u8)
+        let mut count_buf = [0u8; 8];
+        file.read_exact(&mut count_buf)?;
+        let entry_count = u64::from_le_bytes(count_buf) as usize;
 
-                // Convert Syncing -> Dirty (conservative for crash recovery)
-                if state == SparseBlockState::SYNCING {
-                    state = SparseBlockState::DIRTY;
-                }
-                if state == SparseBlockState::DIRTY {
-                    dirty_count += 1;
-                }
+        let mut entry_buf = [0u8; 5]; // u32 index + u8 state
+        for _ in 0..entry_count {
+            file.read_exact(&mut entry_buf)?;
+            let idx = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap()) as usize;
+            let mut state = entry_buf[4];
 
-                // Populate state_map: first set_present (0->1), then CAS to target state
-                // Ignore budget errors during load (no budget set yet).
-                state_map.set_present(idx);
-                if state != SparseBlockState::CLEAN {
-                    let _ = state_map.cas(idx, SparseBlockState::CLEAN, state);
-                }
-            }
-        } else {
-            // Legacy v1/v2/v3: dense block_states + presence bitmap
-            // Old encoding: Clean=0, Dirty=1, Syncing=2
-            const OLD_CLEAN: u8 = 0;
-            const OLD_DIRTY: u8 = 1;
-            const OLD_SYNCING: u8 = 2;
-
-            let mut old_state_bytes = vec![0u8; stored_num_blocks];
-            file.read_exact(&mut old_state_bytes)?;
-
-            // Convert Syncing(2) -> Dirty(1) in old encoding
-            for state in &mut old_state_bytes {
-                if *state == OLD_SYNCING {
-                    *state = OLD_DIRTY;
-                }
-                if *state == OLD_DIRTY {
-                    dirty_count += 1;
-                }
+            if idx >= num_blocks {
+                continue; // skip out-of-bounds (shrink safety)
             }
 
-            // Read presence bitmap (varies by version)
-            let present: Vec<bool> = if version >= 3 {
-                // Version 3: packed bits (1 bit per block)
-                let num_bytes = stored_num_blocks.div_ceil(8);
-                let mut present_bytes = vec![0u8; num_bytes];
-                file.read_exact(&mut present_bytes)?;
-
-                (0..stored_num_blocks)
-                    .map(|i| {
-                        let byte_idx = i / 8;
-                        let bit_idx = i % 8;
-                        present_bytes[byte_idx] & (1 << bit_idx) != 0
-                    })
-                    .collect()
-            } else if version >= 2 {
-                // Version 2: 1 byte per block
-                let mut present_bytes = vec![0u8; stored_num_blocks];
-                file.read_exact(&mut present_bytes)?;
-                present_bytes.iter().map(|&b| b != 0).collect()
-            } else {
-                // Version 1: dirty blocks are present, clean blocks are NOT
-                old_state_bytes.iter().map(|&s| s == OLD_DIRTY).collect()
-            };
-
-            // Convert old encoding to new sparse encoding and populate state_map
-            for (idx, &old_state) in old_state_bytes.iter().enumerate() {
-                let is_present = present.get(idx).copied().unwrap_or(false);
-                if !is_present && old_state == OLD_CLEAN {
-                    // Not present + clean in old encoding -> NOT_PRESENT (0) in new
-                    continue;
-                }
-                // Block is present (or dirty/syncing which implies present)
-                let new_state = match old_state {
-                    OLD_CLEAN => SparseBlockState::CLEAN,
-                    OLD_DIRTY => SparseBlockState::DIRTY,
-                    _ => SparseBlockState::DIRTY, // conservative
-                };
-                state_map.set_present(idx);
-                if new_state != SparseBlockState::CLEAN {
-                    let _ = state_map.cas(idx, SparseBlockState::CLEAN, new_state);
-                }
+            // Convert Syncing -> Dirty (conservative for crash recovery)
+            if state == SparseBlockState::SYNCING {
+                state = SparseBlockState::DIRTY;
             }
+            if state == SparseBlockState::DIRTY {
+                dirty_count += 1;
+            }
+
+            // Populate state_map: first set_present (0->1), then CAS to target state
+            // Ignore budget errors during load (no budget set yet).
+            state_map.set_present(idx);
+            if state != SparseBlockState::CLEAN {
+                let _ = state_map.cas(idx, SparseBlockState::CLEAN, state);
+            }
+        }
+
+        // v5: read trailing max_sequence
+        if version >= 5 {
+            let mut seq_buf = [0u8; 8];
+            file.read_exact(&mut seq_buf)?;
+            persisted_max_seq = u64::from_le_bytes(seq_buf);
         }
 
         if is_growing {
@@ -633,6 +655,6 @@ impl CacheInner {
             "loaded cache metadata"
         );
 
-        Ok((state_map, dirty_count))
+        Ok((state_map, dirty_count, persisted_max_seq))
     }
 }

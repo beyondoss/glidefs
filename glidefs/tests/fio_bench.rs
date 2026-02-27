@@ -57,6 +57,7 @@ mod fio_bench {
                     ublk_nr_queues: 1,
                     nbd_dead_conn_timeout: 0,
                 })
+                .await
                 .expect("failed to create router"),
             );
 
@@ -69,7 +70,7 @@ mod fio_bench {
                 flush_mode: None,
                 transport: None,
             };
-            router.create_export(config, false, None).await.unwrap();
+            router.create_export(config, false, None, None).await.unwrap();
 
             let handler = router
                 .get_handler("bench")

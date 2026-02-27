@@ -65,17 +65,28 @@ curl -X PUT localhost:8080/api/exports/my-vm \
   -d '{"size_gb": 500}'
 # → {"name":"my-vm","size_bytes":500000000000,"readonly":false,"transport":"nbd","device":"/dev/nbd0"}
 
-# Fork from an existing manifest
+# Fork from the current state of an existing export
 curl -X PUT localhost:8080/api/exports/my-vm-fork \
   -d '{"size_gb": 500, "manifest_name": "my-vm"}'
+
+# Fork from a specific snapshot (returns sequence from POST /snapshot)
+curl -X PUT localhost:8080/api/exports/my-vm-fork \
+  -d '{"size_gb": 500, "manifest_name": "my-vm", "snapshot_sequence": 42}'
 
 # Use ublk transport (Linux 6.0+, requires --features ublk)
 curl -X PUT localhost:8080/api/exports/my-vm \
   -d '{"size_gb": 500, "transport": "ublk"}'
 # → {"name":"my-vm","size_bytes":500000000000,"readonly":false,"transport":"ublk","device":"/dev/ublkb0"}
 
-# Snapshot to S3
+# Snapshot to S3 — returns {"sequence": 42, "manifest_etag": "..."}
 curl -X POST localhost:8080/api/exports/my-vm/snapshot
+
+# List snapshots
+curl localhost:8080/api/exports/my-vm/snapshots
+# → [1, 5, 42]
+
+# Delete a snapshot
+curl -X DELETE localhost:8080/api/exports/my-vm/snapshots/5
 
 # Drain (flush all dirty blocks, prepare for migration)
 curl -X POST localhost:8080/api/exports/my-vm/drain
@@ -89,12 +100,16 @@ PUT is idempotent. Same size → returns current state. Larger size → grows th
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/exports` | GET | List exports (includes transport + device path) |
-| `/api/exports/{name}` | PUT | Create or resize export (returns device path) |
+| `/api/exports/{name}` | PUT | Create or resize export. `manifest_name` + optional `snapshot_sequence` to fork. |
 | `/api/exports/{name}` | GET | Get export info |
-| `/api/exports/{name}` | DELETE | Remove export (removes kernel device) |
-| `/api/exports/{name}/drain` | POST | Flush to S3 for shutdown/migration |
-| `/api/exports/{name}/snapshot` | POST | Point-in-time snapshot to S3 |
+| `/api/exports/{name}` | DELETE | Remove export. `?purge=true` deletes local cache and all S3 snapshots. |
+| `/api/exports/{name}/drain` | POST | Flush all dirty blocks to S3 (no snapshot created) |
+| `/api/exports/{name}/snapshot` | POST | Flush dirty blocks + create versioned snapshot. Optional body `{"tag": "..."}`. Returns `{sequence, manifest_etag, tag}`. |
+| `/api/exports/{name}/snapshots` | GET | List snapshot sequences in ascending order |
+| `/api/exports/{name}/snapshots/{seq}` | DELETE | Delete a specific snapshot (idempotent) |
+| `/api/exports/{name}/tag` | POST | Tag the current manifest without flushing. Body: `{"tag": "..."}`. |
 | `/api/exports/{name}/promote` | POST | Promote readonly to read-write |
+| `/api/manifests/{s3_prefix}/{name}` | HEAD | 200 if manifest exists, 404 if not. No running export required. |
 | `/health/ready` | GET | Readiness check |
 | `/api/exports/{name}/metrics` | GET | I/O metrics |
 | `/health` | GET | Health check |
@@ -105,10 +120,102 @@ PUT is idempotent. Same size → returns current state. Larger size → grows th
 Create content-addressed base images from raw disk files:
 
 ```sh
-glidefs bless --image ubuntu-22.04.raw --name ubuntu-22.04-v1 --config glidefs.toml
+glidefs bless --image ubuntu-22.04.raw --name ubuntu-22.04-v1 --s3-prefix bases --config glidefs.toml
 ```
 
 Exports forked from base images share blocks via content addressing. Identical data is stored once.
+
+Fork from a blessed image using `manifest_name: "bases/{name}"`:
+
+```sh
+curl -X PUT localhost:8080/api/exports/vm-1 \
+  -d '{"size_gb": 50, "manifest_name": "bases/ubuntu-22.04-v1"}'
+```
+
+## Deployments
+
+Fork is instant — parent blocks are copy-on-write, not copied. Two flows.
+
+### Code deploy (setup unchanged)
+
+Parent VM already has OS + runtime. Deploy is just new app code.
+
+```sh
+# 1. Snapshot production (safety net + rollback point)
+curl -sX POST localhost:8080/api/exports/prod/snapshot \
+  -d '{"tag": "pre-deploy-7"}'
+# → {"sequence": 42, "manifest_etag": "...", "tag": "pre-deploy-7"}
+
+# 2. Fork — instant CoW, no data copied
+curl -X PUT localhost:8080/api/exports/vm-deploy-7 \
+  -d '{"size_gb": 50, "manifest_name": "prod"}'
+# → {"device": "/dev/nbd1", ...}
+
+# 3. Mount + sync code + start
+mount /dev/nbd1 /mnt
+rsync -a ./dist/ /mnt/app/code/
+systemctl start my-app
+
+# 4. Health check → swap traffic → delete old export
+curl localhost:8080/api/exports/vm-deploy-7/metrics  # verify
+curl -X DELETE localhost:8080/api/exports/prod-old
+```
+
+Setup is untouched. Deploy is seconds.
+
+### Setup change (new dependency or runtime bump)
+
+Compute a content-derived hash from image + deps. Tag IS the cache key — no external state needed.
+
+```
+hash = blake3(image_id + lockfile_hash)
+
+HEAD /api/manifests/bases/setup-{hash}
+              │
+         ┌────┴────┐
+        200        404
+         │          │
+   fork from    fork from base
+   cached       → run setup
+   setup        → snapshot+tag("setup-{hash}")
+         │          │
+         └────┬─────┘
+              │
+    sync code → deploy → swap traffic
+```
+
+```sh
+SETUP_HASH=$(echo "${IMAGE_ID}:${LOCKFILE_HASH}" | blake3)
+
+# Check if this setup was already built
+STATUS=$(curl -so /dev/null -w "%{http_code}" \
+  -X HEAD localhost:8080/api/manifests/bases/setup-${SETUP_HASH})
+
+if [ "$STATUS" -eq 200 ]; then
+  # Hit: fork from cached setup, skip straight to code sync
+  SOURCE="setup-${SETUP_HASH}"
+else
+  # Miss: fork from base, run setup, tag result
+  curl -X PUT localhost:8080/api/exports/setup-work \
+    -d '{"size_gb": 50, "manifest_name": "bases/ubuntu-24.04-v1"}'
+
+  mount /dev/nbd1 /mnt
+  mise install node@22 && npm ci --prefix /mnt/app
+  umount /mnt
+
+  curl -X POST localhost:8080/api/exports/setup-work/snapshot \
+    -d "{\"tag\": \"setup-${SETUP_HASH}\"}"
+  curl -X DELETE localhost:8080/api/exports/setup-work
+
+  SOURCE="setup-${SETUP_HASH}"
+fi
+
+# Fork from setup state, sync code, deploy
+curl -X PUT localhost:8080/api/exports/vm-deploy-8 \
+  -d "{\"size_gb\": 50, \"manifest_name\": \"${SOURCE}\"}"
+```
+
+Same `IMAGE_ID + LOCKFILE_HASH` next deploy → HEAD returns 200 → setup is skipped entirely.
 
 ## Operations
 
@@ -168,7 +275,7 @@ Both transports: the orchestrator doesn't know or care which one is in use. It g
 
 ### Restart Behavior
 
-On startup, GlideFS discovers exports from S3, recovers WAL + redb from local SSD, and re-registers kernel devices. Recovery is local — no S3 writes. 2000 exports recover in ~6 seconds.
+On startup, GlideFS discovers exports from S3, recovers from the WAL on local SSD, and re-registers kernel devices. Recovery is local — no S3 writes. 2000 exports recover in ~6 seconds.
 
 **NBD (zero-downtime):** The kernel queues I/O during the restart window via `dead_conn_timeout`. VMs never see a disconnect. Device paths (`/dev/nbdN`) stay the same.
 
@@ -176,7 +283,7 @@ On startup, GlideFS discovers exports from S3, recovers WAL + redb from local SS
 1. SIGUSR1 → drain all exports to S3
 2. SIGTERM → graceful shutdown (NBD devices stay alive in kernel)
 3. Start new binary (same config, same cache dir)
-4. New process discovers exports, recovers from WAL + redb
+4. New process discovers exports, recovers from WAL
 5. NBD_CMD_RECONFIGURE swaps socket fds on existing /dev/nbdN devices
 6. Kernel resumes queued I/O on new sockets
 7. /health/ready returns 200
@@ -192,7 +299,7 @@ The orchestrator does nothing. Same device paths, same VMs, no reconnection need
 1. SIGUSR1 → drain all exports to S3
 2. SIGTERM → graceful shutdown (ublk devices enter QUIESCED state)
 3. Start new binary (same config, same cache dir)
-4. New process discovers exports, recovers from WAL + redb
+4. New process discovers exports, recovers from WAL
 5. Scans for QUIESCED glidefs devices, resumes them via START_USER_RECOVERY
 6. Kernel reissues queued I/O to new process
 7. /health/ready returns 200
@@ -227,13 +334,81 @@ innodb_log_group_home_dir = /mnt/wal
 
 **Forks:** Fork gets the CoW snapshot of data files but no WAL. The forked DB starts from the last checkpoint — clean state, no in-flight transactions.
 
+### Snapshots
+
+`POST /snapshot` flushes dirty blocks to S3 and writes a versioned manifest at a stable S3 key. Background syncs never touch snapshot keys — they accumulate until you delete them.
+
+```sh
+# Take a snapshot — record the sequence number
+SEQ=$(curl -sX POST localhost:8080/api/exports/my-vm/snapshot | jq .sequence)
+# → 42
+
+# List all snapshots for an export
+curl localhost:8080/api/exports/my-vm/snapshots
+# → [1, 5, 42]
+
+# Fork a new export from snapshot 42 (read-only parent blocks, CoW overlay for writes)
+curl -X PUT localhost:8080/api/exports/my-vm-test \
+  -d "{\"size_gb\": 500, \"manifest_name\": \"my-vm\", \"snapshot_sequence\": $SEQ}"
+
+# Delete a snapshot when done
+curl -X DELETE localhost:8080/api/exports/my-vm/snapshots/5
+```
+
+`snapshot_sequence` is optional. Omit it to fork from the current state.
+
+**GC and snapshots**: GC scans all snapshot manifests before deleting any pack. Packs referenced by a snapshot are kept alive even if they're no longer in the current manifest. Deleting a snapshot unpins its exclusive packs — they become eligible for GC after the grace period (default 24h).
+
+**Rollback**: There is no in-place rollback. To restore an export to a prior snapshot:
+
+```sh
+# 1. Remove the export without purge (snapshots stay in S3)
+curl -X DELETE localhost:8080/api/exports/my-vm
+
+# 2. Fork from the target snapshot into the same name
+curl -X PUT localhost:8080/api/exports/my-vm \
+  -d '{"size_gb": 500, "manifest_name": "my-vm", "snapshot_sequence": 5}'
+```
+
+No data is copied — the new export reads parent blocks from the existing S3 packs via the CoW overlay.
+
+**Blue/green rollback**: Fork to a new name first, verify, then cut over:
+
+```sh
+curl -X PUT localhost:8080/api/exports/my-vm-rollback \
+  -d '{"size_gb": 500, "manifest_name": "my-vm", "snapshot_sequence": 5}'
+# verify my-vm-rollback, then swap at the load balancer
+```
+
+### Garbage Collection
+
+Writes accumulate new packs in S3. Run GC periodically to delete packs no longer referenced by any manifest or snapshot.
+
+```sh
+glidefs gc --config glidefs.toml
+```
+
+GC reads pack IDs from all current and snapshot manifests, lists packs in S3, and deletes anything unreferenced. State is persisted between runs (default `gc-state.json`) to enforce the grace period.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dry-run` | false | Report what would be deleted without deleting |
+| `--grace-period` | `24h` | Protect recently-dead packs from deletion |
+| `--max-deletes` | `100000` | Cap deletes per run |
+| `--state-file` | `gc-state.json` | Path to grace period state file |
+| `--snapshot-retention` | disabled | Auto-delete snapshots older than this (e.g. `30d`) |
+
+**When to run:** Daily cron is sufficient. Run immediately after bulk snapshot deletion to reclaim space faster.
+
+**Grace period:** Packs marked dead for less than `--grace-period` are never deleted. Protects against races between concurrent writes and GC. The grace period must be longer than your longest flush cycle.
+
 ### Flush and Durability
 
 Writes are durable on local SSD immediately. They are **not** in S3 until flushed. Local disk loss before flush = data loss for unflushed blocks.
 
 - Automatic flush runs on a background schedule (configurable)
-- `POST /api/exports/{name}/drain` forces a full flush before shutdown or migration
-- `POST /api/exports/{name}/snapshot` creates a point-in-time manifest in S3
+- `POST /api/exports/{name}/drain` forces a full flush before shutdown or migration (no snapshot created)
+- `POST /api/exports/{name}/snapshot` flushes + creates a versioned snapshot in S3 (returns `sequence` for forking)
 
 ### Scrubber
 
@@ -248,7 +423,7 @@ At 1,000 blocks/sec with 128KB blocks: ~2% of one core for BLAKE3 hashing, ~128M
 
 ## Key Design Choices
 
-- **128KB blocks** match ZFS recordsize. One S3 object holds 25 compressed blocks (~3.2MB).
+- **128KB blocks** match ZFS recordsize. Each flush creates one LZ4-compressed pack per modified 128MiB chunk.
 - **BLAKE3-128 hashing** for content addressing and integrity verification. Truncated from 256-bit; 128-bit collision resistance is sufficient for dedup.
 - **Lock-free write path** using `pread`/`pwrite`, atomic block map with CAS, and monotonic sequence numbers.
 - **Typestate pattern** enforces valid lifecycle transitions at compile time. Can't write to a recovering cache.

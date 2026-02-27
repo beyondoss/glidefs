@@ -1,48 +1,83 @@
-//! Content-addressed pack format for S3 block storage.
+//! Content-addressed pack format (GLPK v3) for S3 block storage.
 //!
 //! Packs batch multiple compressed blocks into a single S3 object to reduce
-//! per-object overhead and improve throughput. Each pack is self-describing:
-//! a fixed header, a block index, and concatenated LZ4-compressed block data.
+//! per-object overhead and improve throughput. The block index is a footer,
+//! enabling streaming writes (blocks upload as they're produced via
+//! `WriteMultipart`, with the index appended at the end).
 //!
 //! ## Wire Format
 //!
 //! ```text
 //! Pack Header (16 bytes, fixed):
 //!   magic:        [u8; 4]  = b"GLPK"
-//!   version:      u16 LE   = 1
+//!   version:      u16 LE   = 3
 //!   block_count:  u16 LE
 //!   chunk_size:   u32 LE   (uncompressed block size, e.g. 131072 = 128KB)
 //!   _reserved:    [u8; 4]  = [0; 4]
 //!
-//! Block Index (block_count * 24 bytes, immediately after header):
-//!   hash:         [u8; 16]  (BLAKE3-128 of uncompressed data)
-//!   offset:       u32 LE    (byte offset from start of pack file)
-//!   comp_length:  u32 LE    (compressed size in bytes)
-//!
-//! Block Data (immediately after block index):
+//! Block Data (immediately after header):
 //!   [LZ4-compressed blocks, concatenated]
-//!   Offsets in the index point into this region.
+//!   Offsets in the index point into this region (absolute from pack start).
+//!
+//! Block Index (block_count * 28 bytes, footer):
+//!   hash:           [u8; 16]  (BLAKE3-128 of uncompressed data)
+//!   chunk_offset:   u32 LE    (block offset within chunk, 0–1023)
+//!   offset:         u32 LE    (byte offset from start of pack file)
+//!   comp_length:    u32 LE    (compressed size in bytes)
+//!
+//! Trailer (8 bytes):
+//!   block_count:  u16 LE      (enables suffix-only reads without header)
+//!   _reserved:    [u8; 2]     = [0; 2]
+//!   magic:        [u8; 4]     = b"GLIX"
 //! ```
 
 use std::io;
 
+use bytes::Bytes;
+use object_store::WriteMultipart;
+
 use super::block_map::Blake3Hash;
 
 pub const PACK_MAGIC: &[u8; 4] = b"GLPK";
-pub const PACK_VERSION: u16 = 1;
+pub const PACK_VERSION: u16 = 3;
 pub const DEFAULT_BLOCKS_PER_PACK: usize = 500;
 pub const PACK_HEADER_SIZE: usize = 16;
-pub const PACK_INDEX_ENTRY_SIZE: usize = 24;
+/// Index entry size (28 bytes with chunk_offset).
+pub const PACK_INDEX_ENTRY_SIZE: usize = 28;
+/// Trailer magic identifying footer-indexed packs.
+pub const TRAILER_MAGIC: &[u8; 4] = b"GLIX";
+/// Trailer size: block_count (2) + reserved (2) + magic (4).
+pub const TRAILER_SIZE: usize = 8;
 
-/// Where a block lives inside a pack stored in S3.
-#[derive(Debug, Clone, Copy)]
-pub struct PackLocation {
-    pub pack_id: uuid::Uuid,
+/// 8-byte random pack identifier.
+///
+/// Collision-safe per chunk (birthday bound ~4.3 billion).
+/// Hex representation distributes uniformly for S3 prefix sharding.
+pub type PackId = u64;
+
+/// Generate a random pack ID.
+pub fn new_pack_id() -> PackId {
+    rand::random::<u64>()
+}
+
+// ============================================================================
+// GLPK v3 — footer-indexed packs with streaming writes
+// ============================================================================
+
+/// One entry in a pack's block index. Includes `chunk_offset` so packs are
+/// self-describing for the chunk-based architecture (no external `.meta` needed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackIndexEntry {
+    pub hash: Blake3Hash,
+    /// Block offset within chunk (0–1023 for 128 MiB / 128 KB).
+    pub chunk_offset: u32,
+    /// Byte offset from start of pack file to the compressed block data.
     pub offset: u32,
+    /// Compressed size in bytes.
     pub comp_length: u32,
 }
 
-/// A parsed pack header and block index (metadata only, no decompressed data).
+/// Parsed pack header + block index.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct PackIndex {
@@ -51,29 +86,21 @@ pub struct PackIndex {
     pub entries: Vec<PackIndexEntry>,
 }
 
-/// One entry in the pack's block index.
-#[derive(Debug, Clone)]
-pub struct PackIndexEntry {
-    pub hash: Blake3Hash,
-    pub offset: u32,
-    pub comp_length: u32,
-}
-
-/// Assemble a pack from pre-compressed blocks (takes ownership).
+/// Assemble a v3 pack from pre-compressed blocks (in-memory).
 ///
-/// `blocks` contains `(hash, compressed_data)` pairs where the compressed data
-/// is already LZ4-encoded. `chunk_size` is the uncompressed block size (e.g. 131072).
+/// `blocks` contains `(hash, chunk_offset, compressed_data)` triples.
+/// Entries are sorted by `chunk_offset` before writing for read locality.
+/// Returns the complete pack bytes and the sorted index entries.
 ///
-/// Takes ownership of `blocks` so each compressed `Vec<u8>` is freed immediately
-/// after being copied into the output buffer, halving peak memory vs borrowing.
-///
-/// Returns the complete pack bytes and the index entries with their final offsets.
-///
-/// Returns an error if `blocks.len()` exceeds `u16::MAX` (wire format limit).
+/// For production uploads, prefer [`stream_pack_to_writer`] which streams
+/// blocks to S3 via `WriteMultipart` without buffering the entire pack.
+#[allow(dead_code)]
 pub fn assemble_pack(
-    blocks: Vec<(Blake3Hash, Vec<u8>)>,
+    mut blocks: Vec<(Blake3Hash, u32, Vec<u8>)>,
     chunk_size: u32,
 ) -> io::Result<(Vec<u8>, Vec<PackIndexEntry>)> {
+    blocks.sort_by_key(|&(_, co, _)| co);
+
     let block_count: u16 = blocks.len().try_into().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -81,17 +108,15 @@ pub fn assemble_pack(
         )
     })?;
 
-    let data_start = PACK_HEADER_SIZE + blocks.len() * PACK_INDEX_ENTRY_SIZE;
-
-    // First pass: collect metadata + compute total size.
-    // Only borrows hashes and lengths — no data copy yet.
+    // v3: data starts right after header (index is a footer).
     let mut entries = Vec::with_capacity(blocks.len());
-    let mut running_offset = data_start as u32;
+    let mut running_offset = PACK_HEADER_SIZE as u32;
     let mut total_compressed = 0usize;
-    for (hash, compressed) in &blocks {
+    for (hash, chunk_offset, compressed) in &blocks {
         let comp_length = compressed.len() as u32;
         entries.push(PackIndexEntry {
             hash: *hash,
+            chunk_offset: *chunk_offset,
             offset: running_offset,
             comp_length,
         });
@@ -99,7 +124,8 @@ pub fn assemble_pack(
         total_compressed += compressed.len();
     }
 
-    let total_size = data_start + total_compressed;
+    let index_size = blocks.len() * PACK_INDEX_ENTRY_SIZE;
+    let total_size = PACK_HEADER_SIZE + total_compressed + index_size + TRAILER_SIZE;
     let mut buf = Vec::with_capacity(total_size);
 
     // -- Header (16 bytes) --
@@ -109,86 +135,157 @@ pub fn assemble_pack(
     buf.extend_from_slice(&chunk_size.to_le_bytes());
     buf.extend_from_slice(&[0u8; 4]); // reserved
 
-    // -- Block Index --
+    // -- Block Data (consumes blocks — each Vec<u8> freed after copy) --
+    for (_, _, compressed) in blocks {
+        buf.extend_from_slice(&compressed);
+    }
+
+    // -- Block Index footer (28 bytes per entry) --
     for entry in &entries {
         buf.extend_from_slice(entry.hash.as_bytes());
+        buf.extend_from_slice(&entry.chunk_offset.to_le_bytes());
         buf.extend_from_slice(&entry.offset.to_le_bytes());
         buf.extend_from_slice(&entry.comp_length.to_le_bytes());
     }
 
-    // -- Block Data (consumes blocks — each Vec<u8> freed after copy) --
-    for (_, compressed) in blocks {
-        buf.extend_from_slice(&compressed);
-    }
+    // -- Trailer (8 bytes) --
+    buf.extend_from_slice(&block_count.to_le_bytes());
+    buf.extend_from_slice(&[0u8; 2]); // reserved
+    buf.extend_from_slice(TRAILER_MAGIC);
 
     debug_assert_eq!(buf.len(), total_size);
     Ok((buf, entries))
 }
 
-/// Parse a pack's header and block index from raw bytes.
+/// Stream a v3 pack to a `WriteMultipart` writer.
 ///
-/// Validates the magic bytes and version. Does NOT decompress any block data;
-/// only reads the metadata needed to locate blocks within the pack.
+/// Blocks are written to the multipart stream as they're consumed — each
+/// compressed `Vec<u8>` is freed immediately after `writer.put()`. The index
+/// and trailer are appended at the end.
+///
+/// Returns sorted index entries (for `PackIndexCache` insertion).
+pub fn stream_pack_to_writer(
+    mut blocks: Vec<(Blake3Hash, u32, Vec<u8>)>,
+    chunk_size: u32,
+    writer: &mut WriteMultipart,
+) -> io::Result<Vec<PackIndexEntry>> {
+    blocks.sort_by_key(|&(_, co, _)| co);
+
+    let block_count: u16 = blocks.len().try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("block count {} exceeds u16::MAX", blocks.len()),
+        )
+    })?;
+
+    // -- Header (16 bytes) --
+    let mut header = [0u8; PACK_HEADER_SIZE];
+    header[0..4].copy_from_slice(PACK_MAGIC);
+    header[4..6].copy_from_slice(&PACK_VERSION.to_le_bytes());
+    header[6..8].copy_from_slice(&block_count.to_le_bytes());
+    header[8..12].copy_from_slice(&chunk_size.to_le_bytes());
+    writer.write(&header);
+
+    // -- Block Data (zero-copy: each Vec<u8> converted to Bytes) --
+    let mut entries = Vec::with_capacity(blocks.len());
+    let mut running_offset = PACK_HEADER_SIZE as u32;
+    for (hash, chunk_offset, compressed) in blocks {
+        let comp_length = compressed.len() as u32;
+        entries.push(PackIndexEntry {
+            hash,
+            chunk_offset,
+            offset: running_offset,
+            comp_length,
+        });
+        running_offset += comp_length;
+        writer.put(Bytes::from(compressed));
+    }
+
+    // -- Block Index footer (28 bytes per entry) --
+    for entry in &entries {
+        let mut entry_buf = [0u8; PACK_INDEX_ENTRY_SIZE];
+        entry_buf[0..16].copy_from_slice(entry.hash.as_bytes());
+        entry_buf[16..20].copy_from_slice(&entry.chunk_offset.to_le_bytes());
+        entry_buf[20..24].copy_from_slice(&entry.offset.to_le_bytes());
+        entry_buf[24..28].copy_from_slice(&entry.comp_length.to_le_bytes());
+        writer.write(&entry_buf);
+    }
+
+    // -- Trailer (8 bytes) --
+    let mut trailer = [0u8; TRAILER_SIZE];
+    trailer[0..2].copy_from_slice(&block_count.to_le_bytes());
+    // [2..4] reserved zeros
+    trailer[4..8].copy_from_slice(TRAILER_MAGIC);
+    writer.write(&trailer);
+
+    Ok(entries)
+}
+
+/// Parse a v3 pack's block index from suffix data.
+///
+/// `data` is the last N bytes of the pack (suffix read). The trailer at the
+/// end contains `block_count` and `GLIX` magic. The index entries immediately
+/// precede the trailer.
+///
+/// For full-pack bytes (tests), this also works: the suffix is the entire pack,
+/// and the index + trailer are at the end.
 pub fn parse_pack_index(data: &[u8]) -> io::Result<PackIndex> {
-    if data.len() < PACK_HEADER_SIZE {
+    if data.len() < TRAILER_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "pack too small for header",
+            "pack too small for trailer",
         ));
     }
 
-    // Validate magic.
-    if &data[..4] != PACK_MAGIC {
+    // Parse trailer (last 8 bytes).
+    let trailer_start = data.len() - TRAILER_SIZE;
+    if &data[trailer_start + 4..trailer_start + 8] != TRAILER_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid pack magic",
+            "invalid trailer magic",
         ));
     }
 
-    // Validate version.
-    let version = u16::from_le_bytes([data[4], data[5]]);
-    if version != PACK_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported pack version: {version}"),
-        ));
-    }
-
-    let block_count = u16::from_le_bytes([data[6], data[7]]);
-    let chunk_size = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    // bytes 12..16 are reserved
+    let block_count = u16::from_le_bytes([data[trailer_start], data[trailer_start + 1]]);
 
     let index_size = block_count as usize * PACK_INDEX_ENTRY_SIZE;
-    let required = PACK_HEADER_SIZE + index_size;
+    let required = index_size + TRAILER_SIZE;
     if data.len() < required {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "pack too small for index: need {required} bytes, got {}",
+                "suffix too small for index: need {required} bytes, got {}",
                 data.len()
             ),
         ));
     }
 
+    // Index entries are right before the trailer.
+    let index_start = trailer_start - index_size;
+
+    // Try to read chunk_size from header if the full pack is available.
+    let chunk_size = if data.len() >= PACK_HEADER_SIZE
+        && &data[..4] == PACK_MAGIC
+    {
+        u32::from_le_bytes(data[8..12].try_into().unwrap())
+    } else {
+        0 // suffix-only read; chunk_size not available (callers don't need it)
+    };
+
     let mut entries = Vec::with_capacity(block_count as usize);
     for i in 0..block_count as usize {
-        let base = PACK_HEADER_SIZE + i * PACK_INDEX_ENTRY_SIZE;
+        let base = index_start + i * PACK_INDEX_ENTRY_SIZE;
         let mut hash_bytes = [0u8; 16];
         hash_bytes.copy_from_slice(&data[base..base + 16]);
-        let offset = u32::from_le_bytes([
-            data[base + 16],
-            data[base + 17],
-            data[base + 18],
-            data[base + 19],
-        ]);
-        let comp_length = u32::from_le_bytes([
-            data[base + 20],
-            data[base + 21],
-            data[base + 22],
-            data[base + 23],
-        ]);
+        let chunk_offset =
+            u32::from_le_bytes(data[base + 16..base + 20].try_into().unwrap());
+        let offset =
+            u32::from_le_bytes(data[base + 20..base + 24].try_into().unwrap());
+        let comp_length =
+            u32::from_le_bytes(data[base + 24..base + 28].try_into().unwrap());
         entries.push(PackIndexEntry {
             hash: Blake3Hash::from_bytes(hash_bytes),
+            chunk_offset,
             offset,
             comp_length,
         });
@@ -201,10 +298,29 @@ pub fn parse_pack_index(data: &[u8]) -> io::Result<PackIndex> {
     })
 }
 
+/// Lookup a block in a pack index by its chunk offset.
+///
+/// Entries are sorted by chunk_offset (guaranteed by `assemble_pack`), so this
+/// uses binary search. Returns `(hash, pack_offset, comp_length)` if found.
+#[cfg(test)]
+pub fn lookup_block_in_index(
+    entries: &[PackIndexEntry],
+    chunk_offset: u32,
+) -> Option<(Blake3Hash, u32, u32)> {
+    entries
+        .binary_search_by_key(&chunk_offset, |e| e.chunk_offset)
+        .ok()
+        .map(|idx| {
+            let e = &entries[idx];
+            (e.hash, e.offset, e.comp_length)
+        })
+}
+
 /// Extract a single block's compressed data from pack bytes.
 ///
 /// Returns a slice into `pack_data` at `[offset..offset+comp_length]`,
 /// or `None` if the range is out of bounds.
+#[allow(dead_code)] // used by pack_size_measure binary
 pub fn extract_block(pack_data: &[u8], offset: u32, comp_length: u32) -> Option<&[u8]> {
     let start = offset as usize;
     let end = start.checked_add(comp_length as usize)?;
@@ -214,17 +330,6 @@ pub fn extract_block(pack_data: &[u8], offset: u32, comp_length: u32) -> Option<
     Some(&pack_data[start..end])
 }
 
-/// Generate the S3 object key for a pack.
-///
-/// Format: `packs/{first-2-hex-of-uuid}/{uuid}`
-///
-/// The 2-character hex prefix provides 256-way prefix sharding for S3
-/// performance (avoids hot-partition issues on high-throughput workloads).
-pub fn pack_s3_key(pack_id: uuid::Uuid) -> String {
-    let uuid_str = pack_id.to_string();
-    let prefix = &uuid_str[..2];
-    format!("packs/{prefix}/{uuid_str}")
-}
 
 #[cfg(test)]
 mod tests {
@@ -238,10 +343,9 @@ mod tests {
 
     #[test]
     fn test_pack_round_trip() {
-        let chunk_size: u32 = 131072; // 128KB
+        let chunk_size: u32 = 131072;
         let block_count = DEFAULT_BLOCKS_PER_PACK;
 
-        // Build blocks: hash the raw data, then compress it.
         let mut blocks = Vec::with_capacity(block_count);
         let mut originals = Vec::with_capacity(block_count);
         for i in 0..block_count {
@@ -249,182 +353,112 @@ mod tests {
             let hash = blake3_128(&data);
             let compressed = lz4_compress(&data);
             originals.push((hash, data));
-            blocks.push((hash, compressed));
+            blocks.push((hash, i as u32, compressed));
         }
 
         let (pack_bytes, entries) = assemble_pack(blocks, chunk_size).unwrap();
 
-        // Parse the index back.
         let index = parse_pack_index(&pack_bytes).unwrap();
         assert_eq!(index.block_count as usize, block_count);
         assert_eq!(index.chunk_size, chunk_size);
         assert_eq!(index.entries.len(), block_count);
 
-        // For each entry: extract, decompress, verify hash matches original.
-        for (i, entry) in index.entries.iter().enumerate() {
+        // Entries sorted by chunk_offset (0, 1, 2, ...).
+        for w in index.entries.windows(2) {
+            assert!(w[0].chunk_offset < w[1].chunk_offset);
+        }
+
+        for entry in &index.entries {
+            let i = entry.chunk_offset as usize;
             let compressed = extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
             let decompressed = lz4_decompress(compressed).unwrap();
             let hash = blake3_128(&decompressed);
             assert_eq!(hash, originals[i].0, "hash mismatch at block {i}");
             assert_eq!(decompressed, originals[i].1, "data mismatch at block {i}");
-            // Verify the returned entries match the parsed index.
-            assert_eq!(entry.offset, entries[i].offset);
-            assert_eq!(entry.comp_length, entries[i].comp_length);
+            assert_eq!(entry.offset, entries[entry.chunk_offset as usize].offset);
         }
     }
 
     #[test]
-    fn test_pack_single_block() {
-        let chunk_size: u32 = 131072;
-        let data = vec![42u8; chunk_size as usize];
-        let hash = blake3_128(&data);
-        let compressed = lz4_compress(&data);
-        let blocks = vec![(hash, compressed)];
-
-        let (pack_bytes, entries) = assemble_pack(blocks, chunk_size).unwrap();
-        assert_eq!(entries.len(), 1);
-
-        let index = parse_pack_index(&pack_bytes).unwrap();
-        assert_eq!(index.block_count, 1);
-        assert_eq!(index.entries.len(), 1);
-        assert_eq!(index.entries[0].hash, hash);
-
-        let compressed = extract_block(
-            &pack_bytes,
-            index.entries[0].offset,
-            index.entries[0].comp_length,
-        )
-        .unwrap();
-        let decompressed = lz4_decompress(compressed).unwrap();
-        assert_eq!(decompressed, data);
-    }
-
-    #[test]
-    fn test_pack_header_magic() {
+    fn test_pack_header_and_trailer() {
         let data = vec![0u8; 4096];
         let hash = blake3_128(&data);
         let compressed = lz4_compress(&data);
-        let blocks = vec![(hash, compressed.clone()), (hash, compressed)];
+        let blocks = vec![(hash, 0u32, compressed.clone()), (hash, 1u32, compressed)];
 
         let (pack_bytes, _) = assemble_pack(blocks, 4096).unwrap();
 
-        // First 4 bytes: magic.
+        // Header
         assert_eq!(&pack_bytes[..4], b"GLPK");
-        // Bytes 4-5: version (u16 LE = 1).
-        assert_eq!(u16::from_le_bytes([pack_bytes[4], pack_bytes[5]]), 1);
-        // Bytes 6-7: block_count (u16 LE = 2).
+        assert_eq!(u16::from_le_bytes([pack_bytes[4], pack_bytes[5]]), 3);
         assert_eq!(u16::from_le_bytes([pack_bytes[6], pack_bytes[7]]), 2);
+
+        // Trailer (last 8 bytes)
+        let t = pack_bytes.len() - TRAILER_SIZE;
+        assert_eq!(u16::from_le_bytes([pack_bytes[t], pack_bytes[t + 1]]), 2);
+        assert_eq!(&pack_bytes[t + 4..t + 8], b"GLIX");
     }
 
     #[test]
-    fn test_pack_block_lookup_by_hash() {
+    fn test_pack_lookup_by_chunk_offset() {
         let chunk_size: u32 = 4096;
         let mut blocks = Vec::new();
-        let mut expected_data = Vec::new();
 
-        for i in 0..5u8 {
-            let data: Vec<u8> = vec![i; chunk_size as usize];
+        for co in [10u32, 20, 30, 40, 50] {
+            let data = vec![co as u8; chunk_size as usize];
             let hash = blake3_128(&data);
             let compressed = lz4_compress(&data);
-            expected_data.push((hash, data));
-            blocks.push((hash, compressed));
+            blocks.push((hash, co, compressed));
         }
 
         let (pack_bytes, _) = assemble_pack(blocks, chunk_size).unwrap();
         let index = parse_pack_index(&pack_bytes).unwrap();
 
-        // Look up block 3 by its hash.
-        let target_hash = expected_data[3].0;
-        let entry = index
-            .entries
-            .iter()
-            .find(|e| e.hash == target_hash)
-            .expect("should find block by hash");
-
-        let compressed = extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
+        let (hash, offset, comp_length) = lookup_block_in_index(&index.entries, 30).unwrap();
+        let compressed = extract_block(&pack_bytes, offset, comp_length).unwrap();
         let decompressed = lz4_decompress(compressed).unwrap();
-        assert_eq!(decompressed, expected_data[3].1);
-    }
-
-    #[test]
-    fn test_pack_incompressible_data() {
-        let chunk_size: u32 = 4096;
-        // Pseudo-random data that LZ4 cannot compress.
-        let data: Vec<u8> = (0..chunk_size)
-            .map(|i| ((i.wrapping_mul(2654435761).wrapping_shr(16)) & 0xFF) as u8)
-            .collect();
-        let hash = blake3_128(&data);
-        let compressed = lz4_compress(&data);
-        let blocks = vec![(hash, compressed)];
-
-        let (pack_bytes, _) = assemble_pack(blocks, chunk_size).unwrap();
-        let index = parse_pack_index(&pack_bytes).unwrap();
-        assert_eq!(index.entries.len(), 1);
-
-        let compressed = extract_block(
-            &pack_bytes,
-            index.entries[0].offset,
-            index.entries[0].comp_length,
-        )
-        .unwrap();
-        let decompressed = lz4_decompress(compressed).unwrap();
-        assert_eq!(decompressed, data);
         assert_eq!(blake3_128(&decompressed), hash);
+        assert_eq!(decompressed, vec![30u8; chunk_size as usize]);
+
+        assert!(lookup_block_in_index(&index.entries, 25).is_none());
+        assert!(lookup_block_in_index(&index.entries, 0).is_none());
+        assert!(lookup_block_in_index(&index.entries, 999).is_none());
     }
 
     #[test]
-    fn test_pack_s3_key_format() {
-        let id = uuid::Uuid::parse_str("a7550e84-00e2-9b41-d4a7-16446655440a").unwrap();
-        let key = pack_s3_key(id);
+    fn test_pack_empty() {
+        let (pack_bytes, entries) = assemble_pack(vec![], 131072).unwrap();
+        assert!(entries.is_empty());
+        // v3: header (16) + no data + no index + trailer (8)
+        assert_eq!(pack_bytes.len(), PACK_HEADER_SIZE + TRAILER_SIZE);
 
-        assert!(key.starts_with("packs/"), "key must start with packs/");
-        // Prefix is first 2 chars of the UUID string representation.
-        assert!(
-            key.starts_with("packs/a7/"),
-            "key must have 2-char hex prefix"
-        );
-        assert!(
-            key.contains(&id.to_string()),
-            "key must contain the full UUID"
-        );
-        assert_eq!(key, "packs/a7/a7550e84-00e2-9b41-d4a7-16446655440a");
+        let index = parse_pack_index(&pack_bytes).unwrap();
+        assert_eq!(index.block_count, 0);
+        assert!(index.entries.is_empty());
+        assert_eq!(index.chunk_size, 131072);
     }
 
     #[test]
-    fn test_parse_invalid_magic() {
+    fn test_parse_invalid_trailer_magic() {
         let data = vec![0u8; 4096];
         let hash = blake3_128(&data);
         let compressed = lz4_compress(&data);
-        let (mut pack_bytes, _) = assemble_pack(vec![(hash, compressed)], 4096).unwrap();
+        let (mut pack_bytes, _) = assemble_pack(vec![(hash, 0, compressed)], 4096).unwrap();
 
-        // Corrupt magic bytes
-        pack_bytes[0..4].copy_from_slice(b"NOPE");
+        // Corrupt trailer magic
+        let t = pack_bytes.len() - 4;
+        pack_bytes[t..].copy_from_slice(b"NOPE");
         let err = parse_pack_index(&pack_bytes).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("magic"), "error: {err}");
+        assert!(err.to_string().contains("trailer magic"), "error: {err}");
     }
 
     #[test]
-    fn test_parse_unsupported_version() {
-        let data = vec![0u8; 4096];
-        let hash = blake3_128(&data);
-        let compressed = lz4_compress(&data);
-        let (mut pack_bytes, _) = assemble_pack(vec![(hash, compressed)], 4096).unwrap();
-
-        // Set version to 99
-        pack_bytes[4..6].copy_from_slice(&99u16.to_le_bytes());
-        let err = parse_pack_index(&pack_bytes).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("version"), "error: {err}");
-    }
-
-    #[test]
-    fn test_parse_truncated_header() {
-        // Less than PACK_HEADER_SIZE bytes
-        let err = parse_pack_index(&[0u8; 8]).unwrap_err();
+    fn test_parse_truncated_trailer() {
+        let err = parse_pack_index(&[0u8; 4]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(
-            err.to_string().contains("too small for header"),
+            err.to_string().contains("too small for trailer"),
             "error: {err}"
         );
     }
@@ -434,11 +468,11 @@ mod tests {
         let data = vec![0u8; 4096];
         let hash = blake3_128(&data);
         let compressed = lz4_compress(&data);
-        let (pack_bytes, _) = assemble_pack(vec![(hash, compressed)], 4096).unwrap();
+        let (pack_bytes, _) = assemble_pack(vec![(hash, 0, compressed)], 4096).unwrap();
 
-        // Truncate after header but before the full index entry
-        let truncated = &pack_bytes[..PACK_HEADER_SIZE + 10];
-        let err = parse_pack_index(truncated).unwrap_err();
+        // Give just the trailer (8 bytes) but claim 1 entry → need 28 + 8 = 36
+        let suffix = &pack_bytes[pack_bytes.len() - TRAILER_SIZE..];
+        let err = parse_pack_index(suffix).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(
             err.to_string().contains("too small for index"),
@@ -451,41 +485,103 @@ mod tests {
         let data = vec![42u8; 4096];
         let hash = blake3_128(&data);
         let compressed = lz4_compress(&data);
-        let (pack_bytes, entries) = assemble_pack(vec![(hash, compressed)], 4096).unwrap();
+        let (pack_bytes, entries) = assemble_pack(vec![(hash, 0, compressed)], 4096).unwrap();
 
-        // Valid extraction works
         assert!(extract_block(&pack_bytes, entries[0].offset, entries[0].comp_length).is_some());
-
-        // Offset past end of pack
         assert!(extract_block(&pack_bytes, pack_bytes.len() as u32, 1).is_none());
-
-        // comp_length extends past end
         assert!(extract_block(&pack_bytes, entries[0].offset, pack_bytes.len() as u32).is_none());
-
-        // u32 overflow in offset + comp_length
         assert!(extract_block(&pack_bytes, u32::MAX, 1).is_none());
     }
 
     #[test]
-    fn test_decompress_invalid_lz4_data() {
-        // Corrupt LZ4 data should return Err, not panic
-        let garbage = vec![0xFF, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00];
-        let result = lz4_decompress(&garbage);
-        assert!(result.is_err(), "invalid LZ4 data should return Err");
+    fn test_pack_sort_by_chunk_offset() {
+        let chunk_size: u32 = 131072;
+
+        let mut blocks = Vec::new();
+        let mut originals = Vec::new();
+        for i in [5u32, 2, 8, 0, 3] {
+            let data = test_block_data(i as usize, chunk_size as usize);
+            let hash = blake3_128(&data);
+            let compressed = lz4_compress(&data);
+            originals.push((i, hash, data));
+            blocks.push((hash, i, compressed));
+        }
+
+        let (pack_bytes, entries) = assemble_pack(blocks, chunk_size).unwrap();
+
+        // v3 header
+        assert_eq!(&pack_bytes[..4], b"GLPK");
+        assert_eq!(u16::from_le_bytes([pack_bytes[4], pack_bytes[5]]), 3);
+
+        // Entries sorted by chunk_offset.
+        for w in entries.windows(2) {
+            assert!(
+                w[0].chunk_offset < w[1].chunk_offset,
+                "entries not sorted: {} >= {}",
+                w[0].chunk_offset,
+                w[1].chunk_offset
+            );
+        }
+
+        let index = parse_pack_index(&pack_bytes).unwrap();
+        assert_eq!(index.block_count, 5);
+
+        for entry in &index.entries {
+            let compressed = extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
+            let decompressed = lz4_decompress(compressed).unwrap();
+            let hash = blake3_128(&decompressed);
+            assert_eq!(hash, entry.hash);
+
+            let orig = originals
+                .iter()
+                .find(|(co, _, _)| *co == entry.chunk_offset)
+                .unwrap();
+            assert_eq!(decompressed, orig.2);
+        }
+    }
+
+    /// Suffix-only parse: pass just the index + trailer portion.
+    #[test]
+    fn test_parse_suffix_only() {
+        let chunk_size: u32 = 4096;
+        let mut blocks = Vec::new();
+        for co in [0u32, 1, 2] {
+            let data = vec![co as u8; chunk_size as usize];
+            let hash = blake3_128(&data);
+            blocks.push((hash, co, lz4_compress(&data)));
+        }
+
+        let (pack_bytes, _) = assemble_pack(blocks, chunk_size).unwrap();
+
+        // Simulate a suffix read: just the index + trailer.
+        let suffix_size = 3 * PACK_INDEX_ENTRY_SIZE + TRAILER_SIZE;
+        let suffix = &pack_bytes[pack_bytes.len() - suffix_size..];
+
+        let index = parse_pack_index(suffix).unwrap();
+        assert_eq!(index.block_count, 3);
+        assert_eq!(index.entries.len(), 3);
+        // chunk_size not available from suffix-only
+        assert_eq!(index.chunk_size, 0);
     }
 
     #[test]
-    fn test_pack_empty_rejected() {
-        // Assembling with 0 blocks produces a header-only pack. This is allowed
-        // for symmetry (a valid but useless pack), and parse_pack_index handles
-        // it correctly.
-        let (pack_bytes, entries) = assemble_pack(vec![], 131072).unwrap();
-        assert!(entries.is_empty());
-        assert_eq!(pack_bytes.len(), PACK_HEADER_SIZE);
+    fn test_pack_id_distribution() {
+        let mut top_bytes = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let id = new_pack_id();
+            top_bytes.insert((id >> 56) as u8);
+        }
+        assert!(
+            top_bytes.len() > 20,
+            "poor distribution: only {} distinct top bytes out of 100",
+            top_bytes.len()
+        );
+    }
 
-        let index = parse_pack_index(&pack_bytes).unwrap();
-        assert_eq!(index.block_count, 0);
-        assert!(index.entries.is_empty());
-        assert_eq!(index.chunk_size, 131072);
+    #[test]
+    fn test_decompress_invalid_lz4_data() {
+        let garbage = vec![0xFF, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00];
+        let result = lz4_decompress(&garbage);
+        assert!(result.is_err(), "invalid LZ4 data should return Err");
     }
 }

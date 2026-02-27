@@ -60,13 +60,11 @@ url = "2.5"
 deku = "0.20"
 thiserror = "2.0"
 libc = "0.2"
-uuid = { version = "1.17", features = ["v4"] }
 toml = "0.9"
 shellexpand = "3.1"
 clap = { version = "4.5", features = ["derive"] }
 crossbeam = "0.8"
 dashmap = "6.1"
-redb = "2"
 blake3 = "1.8"
 lz4_flex = "0.12"
 crc32fast = "1.5"
@@ -105,6 +103,10 @@ complexity = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 pedantic = { level = "allow", priority = -1 }
 
+[[example]]
+name = "measure_footprint"
+required-features = ["test-utils"]
+
 [[bench]]
 name = "flush_latency"
 harness = false
@@ -124,10 +126,6 @@ required-features = ["test-utils"]
 name = "cold_read"
 harness = false
 required-features = ["test-utils"]
-
-[[bench]]
-name = "manifest_serde"
-harness = false
 
 [[bin]]
 name = "dedup_measure"

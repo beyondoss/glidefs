@@ -1,8 +1,6 @@
 use futures::StreamExt;
 use object_store::{Error, ObjectStore, PutMode, PutOptions, path::Path};
 use std::sync::Arc;
-use uuid::Uuid;
-
 const TEST_FILE_PREFIX: &str = ".glidefs_compatibility_test_";
 
 pub async fn check_if_match_support(
@@ -16,8 +14,8 @@ pub async fn check_if_match_support(
         let _ = object_store.delete(&meta.location).await;
     }
 
-    let test_id = Uuid::new_v4();
-    let test_path = Path::from(db_path).child(format!("{}{}", TEST_FILE_PREFIX, test_id));
+    let test_id: u64 = rand::random();
+    let test_path = Path::from(db_path).child(format!("{}{:016x}", TEST_FILE_PREFIX, test_id));
 
     tracing::info!("Checking storage provider compatibility (conditional writes for fencing)...");
 

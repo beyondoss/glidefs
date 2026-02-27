@@ -27,8 +27,8 @@ use super::block_map::Blake3Hash;
 pub trait BlockCache: Send + Sync {
     async fn get(&self, hash: &Blake3Hash) -> Option<Bytes>;
     fn insert(&self, hash: Blake3Hash, data: Bytes);
-    /// Remove a block from the cache. Returns true if it was present.
-    fn remove(&self, hash: &Blake3Hash) -> bool;
+    /// Remove a block from the cache.
+    fn remove(&self, hash: &Blake3Hash);
 }
 
 // ============================================================================
@@ -88,7 +88,11 @@ impl BlockCache for FoyerBlockCache {
     async fn get(&self, hash: &Blake3Hash) -> Option<Bytes> {
         match self.inner.get(hash).await {
             Ok(Some(entry)) => Some(entry.value().clone()),
-            _ => None,
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "foyer cache error, treating as miss");
+                None
+            }
         }
     }
 
@@ -96,10 +100,8 @@ impl BlockCache for FoyerBlockCache {
         self.inner.insert(hash, data);
     }
 
-    fn remove(&self, hash: &Blake3Hash) -> bool {
+    fn remove(&self, hash: &Blake3Hash) {
         self.inner.remove(hash);
-        // foyer's remove is fire-and-forget; assume it was present
-        true
     }
 }
 
@@ -174,14 +176,11 @@ impl BlockCache for SimpleBlockCache {
         inner.map.insert(hash, data);
     }
 
-    fn remove(&self, hash: &Blake3Hash) -> bool {
+    fn remove(&self, hash: &Blake3Hash) {
         let mut inner = self.inner.lock();
         if let Some(evicted) = inner.map.remove(hash) {
             inner.current_bytes -= evicted.len();
             inner.order.retain(|h| h != hash);
-            true
-        } else {
-            false
         }
     }
 }
