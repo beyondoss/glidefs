@@ -187,6 +187,46 @@ mod tests {
         assert_eq!(target, expected_next_pack);
     }
 
+    /// After a sequential boot pattern triggers readahead, switching to random
+    /// I/O should stop all readahead. The ring buffer fills with non-sequential
+    /// entries, preventing false prefetches that waste S3 bandwidth.
+    ///
+    /// The detector requires 3 consecutive entries in its ring buffer to trigger.
+    /// A single random access breaks the chain and requires a fresh run of 3
+    /// consecutive accesses before readahead resumes.
+    #[test]
+    fn test_workload_transition_stops_readahead() {
+        let mut det = SequentialDetector::new();
+
+        // Phase 1: Sequential boot pattern — triggers readahead
+        assert_eq!(det.record(0), None);
+        assert_eq!(det.record(1), None);
+        let boot_trigger = det.record(2);
+        assert!(boot_trigger.is_some(), "sequential boot should trigger readahead");
+
+        // Phase 2: Workload switches to random database I/O.
+        // Each random access should NOT trigger readahead.
+        assert_eq!(det.record(500), None, "random access should not trigger");
+        assert_eq!(det.record(100), None, "random access should not trigger");
+        assert_eq!(det.record(900), None, "random access should not trigger");
+
+        // Phase 3: A partial sequential run from the last random access.
+        // Ring buffer is [500, 100, 900, _]. After record(901):
+        // Last 3 = [100, 900, 901] — NOT all consecutive (100→900 jumps).
+        assert_eq!(
+            det.record(901),
+            None,
+            "one sequential step after random should not trigger (ring has [500, 100, 900, 901])"
+        );
+
+        // Phase 4: Break the partial sequence with another random access.
+        // This proves the detector doesn't "remember" the earlier sequential run.
+        assert_eq!(det.record(5000), None, "random access resets again");
+        assert_eq!(det.record(5001), None, "only 1 sequential step");
+        assert_eq!(det.record(8000), None, "another random access breaks it");
+        assert_eq!(det.record(8001), None, "only 1 sequential step again");
+    }
+
     #[test]
     fn test_reset_on_non_sequential() {
         let mut det = SequentialDetector::new();

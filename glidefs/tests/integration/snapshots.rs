@@ -802,6 +802,210 @@ async fn test_snapshot_idempotent_when_no_writes() {
     assert!(!vm.chunks.is_empty(), "snapshot should have chunk entries");
 }
 
+/// Concurrent compaction and fork from the same manifest.
+///
+/// Compaction replaces [A, B] → [C] via replace_packs_cas. A concurrent fork
+/// loads the manifest from S3 and gets either [A, B] (pre-compaction) or [C]
+/// (post-compaction). Either way, reads through the fork manifest must return
+/// correct data.
+#[tokio::test]
+async fn test_fork_during_compaction_sees_consistent_data() {
+    use glidefs::block::pack::PackId;
+    use glidefs::block::write_cache::compact;
+    use glidefs::block::metrics::ExportMetrics;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
+
+    // Flush 1: write blocks → pack A
+    write_blocks(&cache, 0, 3, 1, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Flush 2: overwrite same blocks with seed=2 → pack B (manifest: [A, B])
+    write_blocks(&cache, 0, 3, 2, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    let packs_before: Vec<PackId> = volume_manifest
+        .read()
+        .chunk_pack_ids(0)
+        .unwrap()
+        .to_vec();
+    assert_eq!(packs_before.len(), 2, "should have 2 packs before compaction");
+
+    // Sync manifest to S3 so fork can load it
+    cache.sync_manifest(&cs, &volume_manifest).await.unwrap();
+
+    // Run compaction and "fork" (manifest load from S3) concurrently
+    let blocks_per_chunk = volume_manifest.read().blocks_per_chunk();
+    let cs2 = ContentStore::new(Arc::clone(&s3), "test");
+
+    let compact_handle = {
+        let packs = packs_before.clone();
+        let pic = Arc::clone(&pack_index_cache);
+        let vm = Arc::clone(&volume_manifest);
+        let cs_clone = ContentStore::new(Arc::clone(&s3), "test");
+        tokio::spawn(async move {
+            compact::compact_chunk(0, &packs, blocks_per_chunk, &cs_clone, &pic, &vm)
+                .await
+                .unwrap();
+            // Sync the compacted manifest to S3
+            cache.sync_manifest(&cs_clone, &vm).await.unwrap();
+        })
+    };
+
+    let fork_handle = tokio::spawn(async move {
+        // Simulate fork: load manifest from S3 (may be pre- or post-compaction)
+        let data = cs2
+            .get_manifest("vm1")
+            .await
+            .unwrap()
+            .expect("manifest should exist");
+        VolumeManifest::deserialize(&data).unwrap()
+    });
+
+    let (compact_result, fork_result) = tokio::join!(compact_handle, fork_handle);
+    compact_result.unwrap();
+    let fork_manifest = fork_result.unwrap();
+
+    // Regardless of timing, the fork manifest should produce correct reads.
+    // Create a cold reader using the fork manifest.
+    let fork_dir = TempDir::new().unwrap();
+    let fork_cs = ContentStore::new(Arc::clone(&s3), "test");
+    let fork_vm = Arc::new(parking_lot::RwLock::new(fork_manifest));
+    let fork_cc = Arc::new(glidefs::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+    let fork_config = glidefs::block::write_cache::WriteCacheConfig {
+        cache_dir: fork_dir.path().to_path_buf(),
+        device_name: "fork-reader".to_string(),
+        device_size: super::DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: false,
+    };
+    let fork_cache = glidefs::block::write_cache::WriteCache::open_fresh_active(fork_config)
+        .unwrap();
+    let fork_metrics = Arc::new(ExportMetrics::new());
+
+    // Read blocks through the fork manifest — all should contain seed=2 data
+    // (seed=2 was the last write, so it wins regardless of pack layout)
+    for i in 0..3usize {
+        let offset = (i * BLOCK_SIZE) as u64;
+        let data = fork_cache
+            .read(
+                offset,
+                BLOCK_SIZE,
+                fork_cc.as_ref(),
+                &pack_index_cache,
+                &fork_vm,
+                &fork_cs,
+                &fork_metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            data[0], 2,
+            "block {} should have seed=2 (last write wins), got seed={}",
+            i, data[0]
+        );
+    }
+}
+
+/// Snapshot and flush_to_s3 (which triggers compaction) running concurrently.
+///
+/// Both acquire the flush lock — they serialize, not race. The test verifies
+/// that after both complete, the manifest is valid and all data is readable.
+#[tokio::test]
+async fn test_snapshot_concurrent_with_flush_and_compaction() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
+
+    // Build up pack count: 17 flushes to chunk 0 (exceeds DEFAULT_COMPACTION_THRESHOLD of 16)
+    for round in 0u8..17 {
+        write_blocks(&cache, 0, 3, round + 1, cc.as_ref());
+        cache
+            .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+            .await
+            .unwrap();
+    }
+
+    let pack_count = volume_manifest
+        .read()
+        .chunk_pack_ids(0)
+        .unwrap()
+        .len();
+    assert!(
+        pack_count >= 17,
+        "should have 17+ packs to trigger compaction, got {}",
+        pack_count
+    );
+
+    // Write fresh data so both tasks have something to flush
+    write_blocks(&cache, 0, 3, 0xAA, cc.as_ref());
+
+    // Spawn concurrent flush_to_s3 (triggers compact_if_needed) + snapshot
+    let cache2 = Arc::clone(&cache);
+    let cs2 = ContentStore::new(Arc::clone(&s3), "test");
+    let pic2 = Arc::clone(&pack_index_cache);
+    let vm2 = Arc::clone(&volume_manifest);
+
+    let flush_handle = tokio::spawn(async move {
+        cache2
+            .flush_to_s3(&cs2, &pic2, &vm2)
+            .await
+    });
+
+    let snapshot_handle = {
+        let cache3 = Arc::clone(&cache);
+        let cs3 = ContentStore::new(Arc::clone(&s3), "test");
+        let pic3 = Arc::clone(&pack_index_cache);
+        let vm3 = Arc::clone(&volume_manifest);
+        tokio::spawn(async move {
+            cache3.snapshot(&cs3, &pic3, &vm3).await
+        })
+    };
+
+    let (flush_result, snap_result) = tokio::join!(flush_handle, snapshot_handle);
+    flush_result.unwrap().unwrap();
+    snap_result.unwrap().unwrap();
+
+    // Verify: live manifest is valid — cold read all blocks
+    cache.sync_manifest(&cs, &volume_manifest).await.unwrap();
+
+    let reader_dir = TempDir::new().unwrap();
+    let (reader_cache, reader_cs, reader_pic, reader_vm, reader_cc, reader_m) =
+        super::create_cold_reader(&reader_dir, "vm1", Arc::clone(&s3)).await;
+
+    for i in 0..3usize {
+        let offset = (i * BLOCK_SIZE) as u64;
+        let data = reader_cache
+            .read(
+                offset,
+                BLOCK_SIZE,
+                reader_cc.as_ref(),
+                &reader_pic,
+                &reader_vm,
+                &reader_cs,
+                &reader_m,
+            )
+            .await
+            .unwrap();
+        // Last write was seed=0xAA
+        assert_eq!(
+            data[0], 0xAA,
+            "block {} should have seed=0xAA after concurrent flush+snapshot, got 0x{:02x}",
+            i, data[0]
+        );
+    }
+}
+
 /// head_manifest returns false for nonexistent manifest in nonexistent prefix.
 #[tokio::test]
 async fn test_head_manifest_not_found() {

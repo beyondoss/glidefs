@@ -549,6 +549,55 @@ async fn test_v2_mixed_dirty_and_clean_reads() {
     }
 }
 
+/// Multi-block read where some blocks are in the clean cache and others
+/// require S3 fetch. Verifies the `try_join_all` fan-out assembles blocks
+/// correctly even when resolution takes different paths (cached vs S3).
+///
+/// Layout: blocks 0-7 flushed to S3. Clean cache has 0-2 and 5-7.
+/// Blocks 3-4 evicted from clean cache → must be fetched from S3 packs.
+/// A single `read(0, 8*4096)` must return all 8 blocks in order.
+#[tokio::test]
+async fn test_v2_read_mixed_cache_hit_and_s3_miss() {
+    use crate::block::block_map::blake3_128;
+    use crate::block::cache::BlockCache;
+
+    let h = V2Harness::new().await;
+
+    // Write 8 blocks with distinct data per block
+    for i in 0u8..8 {
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
+    }
+    h.flush().await;
+
+    // Evict only blocks 3 and 4 from clean cache — they'll require S3 fetch
+    for i in 3u8..5 {
+        let hash = blake3_128(&vec![i + 1; 4096]);
+        h.clean_cache.remove(&hash);
+    }
+
+    // Single multi-block read spanning all 8 blocks.
+    // Blocks 0-2: clean cache hit
+    // Blocks 3-4: cache miss → S3 pack fetch
+    // Blocks 5-7: clean cache hit
+    let got = h.read(0, 8 * 4096).await;
+    assert_eq!(got.len(), 8 * 4096);
+
+    for i in 0u8..8 {
+        let start = i as usize * 4096;
+        let block_data = &got[start..start + 4096];
+        assert!(
+            block_data.iter().all(|&b| b == i + 1),
+            "block {} should contain 0x{:02x}, got 0x{:02x} (source: {})",
+            i,
+            i + 1,
+            block_data[0],
+            if (3..5).contains(&i) { "S3" } else { "cache" }
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_v2_clean_cache_eviction() {
     use crate::block::block_map::blake3_128;

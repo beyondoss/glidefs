@@ -14,7 +14,6 @@ use object_store::ObjectStore;
 use tempfile::TempDir;
 
 use glidefs::block::cache::SimpleBlockCache;
-use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::state::Initializing;
 use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -399,7 +398,7 @@ async fn test_write_after_recovery_overwrites() {
         // Flush to S3 via pack path
         let content_store =
             glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
-        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
         let volume_manifest = Arc::new(parking_lot::RwLock::new(
             VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
         ));
@@ -497,7 +496,7 @@ async fn test_wal_recovery_without_metadata_save() {
         // so flush_dirty_inner picks them up even though v1 block_states says Clean.
         let content_store =
             glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
-        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
         let volume_manifest = Arc::new(parking_lot::RwLock::new(
             VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
         ));
@@ -628,7 +627,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
         // block 1 from WAL only (both have FLAG_DIRTY in block map).
         let content_store =
             glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
-        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
         let volume_manifest = Arc::new(parking_lot::RwLock::new(
             VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
         ));
