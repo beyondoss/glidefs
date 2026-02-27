@@ -57,6 +57,7 @@ mod fio_bench {
                     ublk_nr_queues: 1,
                     nbd_dead_conn_timeout: 0,
                 })
+                .await
                 .expect("failed to create router"),
             );
 
