@@ -580,28 +580,41 @@ impl WriteCache<Active> {
             // a block overwritten with zeros would resolve to its previous non-zero
             // pack entry on a fork (where the local SSD is empty).
             let zero_hash = self.inner.zero_block_hash;
-            let blocks_for_pack: Vec<(Blake3Hash, u32, Vec<u8>)> = {
+            let mut blocks_for_pack: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
+            let mut packed_indices: Vec<usize> = Vec::new();
+            {
                 let vm = volume_manifest.read();
-                batch
-                    .computed
-                    .iter()
-                    .filter_map(|&(block_index, hash)| {
-                        let compressed = if hash == zero_hash {
-                            Vec::new() // zero block tombstone: comp_length = 0
-                        } else {
-                            hash_to_compressed.get(&hash)?.clone()
-                        };
-                        let chunk_offset = vm.block_offset_in_chunk(block_index as u64);
-                        Some((hash, chunk_offset, compressed))
-                    })
-                    .collect()
-            };
+                for &(block_index, hash) in &batch.computed {
+                    let compressed = if hash == zero_hash {
+                        Vec::new() // zero block tombstone: comp_length = 0
+                    } else {
+                        match hash_to_compressed.get(&hash) {
+                            Some(data) => data.clone(),
+                            None => {
+                                // Invariant violation: every non-zero hash in
+                                // computed must have its first occurrence in
+                                // to_upload (and thus hash_to_compressed).
+                                // Treat as skipped to prevent silent data loss.
+                                warn!(
+                                    block_index,
+                                    "BUG: non-zero hash missing from hash_to_compressed, \
+                                     treating as skipped to prevent data loss"
+                                );
+                                self.inner.transition_to_dirty(block_index);
+                                continue;
+                            }
+                        }
+                    };
+                    let chunk_offset = vm.block_offset_in_chunk(block_index as u64);
+                    blocks_for_pack.push((hash, chunk_offset, compressed));
+                    packed_indices.push(block_index);
+                }
+            }
 
             if blocks_for_pack.is_empty() {
-                // All blocks in this chunk were skipped (CRC mismatch or concurrent
-                // re-dirty). Nothing to upload — skipped blocks were already
-                // transitioned back to DIRTY above.
-                flushed_blocks.extend(batch.computed.iter().map(|&(idx, _)| idx));
+                // All blocks in this chunk were skipped (CRC mismatch, concurrent
+                // re-dirty, or invariant violation). Nothing to upload — skipped
+                // blocks were already transitioned back to DIRTY above.
                 continue;
             }
 
@@ -625,7 +638,7 @@ impl WriteCache<Active> {
             // This avoids orphaned manifest entries if a later chunk's S3 upload fails.
             staged_appends.push((chunk_idx, pack_id));
 
-            flushed_blocks.extend(batch.computed.iter().map(|&(idx, _)| idx));
+            flushed_blocks.extend(packed_indices);
         }
 
         // Apply all staged manifest appends atomically.

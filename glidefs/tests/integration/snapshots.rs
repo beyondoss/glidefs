@@ -1006,6 +1006,316 @@ async fn test_snapshot_concurrent_with_flush_and_compaction() {
     }
 }
 
+/// Cold reader resolves zero-block tombstones correctly.
+///
+/// Write non-zero data, flush → pack A. Overwrite with zeros, flush → pack B
+/// (zero tombstones with comp_length = 0). Cold reader with manifest [A, B]
+/// must return zeros — the tombstone in B overrides the non-zero entry in A
+/// via "newest wins" in the read path (read.rs:575-580).
+#[tokio::test]
+async fn test_zero_overwrite_cold_reader_sees_zeros() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
+
+    // Write non-zero data to blocks 0-2
+    write_blocks(&cache, 0, 3, 0xAA, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Overwrite blocks 0-2 with all zeros
+    for i in 0..3 {
+        let offset = i * BLOCK_SIZE;
+        cache
+            .write(offset as u64, &vec![0u8; BLOCK_SIZE], cc.as_ref())
+            .unwrap();
+    }
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Manifest should have 2 packs: [A (non-zero), B (zero tombstones)]
+    let pack_count = volume_manifest.read().chunk_pack_ids(0).unwrap().len();
+    assert_eq!(pack_count, 2, "should have 2 packs before cold read");
+
+    // Cold reader: loads manifest from S3, empty local SSD
+    let reader_dir = TempDir::new().unwrap();
+    let (reader_cache, reader_cs, reader_pic, reader_vm, reader_cc, reader_m) =
+        super::create_cold_reader(&reader_dir, "vm1", Arc::clone(&s3)).await;
+
+    // Read blocks 0-2 through cold reader — must be all zeros
+    for i in 0..3 {
+        let offset = i * BLOCK_SIZE;
+        let data = reader_cache
+            .read(
+                offset as u64,
+                BLOCK_SIZE,
+                reader_cc.as_ref(),
+                &reader_pic,
+                &reader_vm,
+                &reader_cs,
+                &reader_m,
+            )
+            .await
+            .unwrap();
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "block {} should be all zeros (tombstone overrides non-zero pack), got first byte 0x{:02x}",
+            i,
+            data[0]
+        );
+    }
+}
+
+/// Fork from snapshot sees original non-zero data; current manifest sees zeros.
+///
+/// Write non-zero → snapshot → overwrite with zeros → flush.
+/// Fork from snapshot gets [A] only → reads non-zero data.
+/// Cold reader from current manifest gets [A, B] → tombstone wins → zeros.
+#[tokio::test]
+async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    let config = ExportConfig {
+        name: "vm1".to_string(),
+        size_gb: 0.01,
+        s3_prefix: None,
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(config, false, None, None)
+        .await
+        .unwrap();
+
+    // Write non-zero data and snapshot
+    let handler = router.get_handler("vm1").await.unwrap();
+    for i in 0..3 {
+        handler
+            .write(i as u64 * BLOCK_SIZE as u64, &[0xAA; BLOCK_SIZE], false)
+            .unwrap();
+    }
+    let snap1 = router.snapshot_export("vm1", None).await.unwrap();
+
+    // Overwrite with zeros and snapshot again (creates tombstones)
+    for i in 0..3 {
+        handler
+            .write(
+                i as u64 * BLOCK_SIZE as u64,
+                &vec![0u8; BLOCK_SIZE],
+                false,
+            )
+            .unwrap();
+    }
+    let _snap2 = router.snapshot_export("vm1", None).await.unwrap();
+
+    // Fork from snap1 — should see 0xAA (pre-zero snapshot)
+    let fork_config = ExportConfig {
+        name: "fork1".to_string(),
+        size_gb: 0.01,
+        s3_prefix: Some("vm1".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(fork_config, false, Some("vm1"), Some(snap1.sequence))
+        .await
+        .unwrap();
+
+    let fork_handler = router.get_handler("fork1").await.unwrap();
+    for i in 0..3 {
+        let data = fork_handler
+            .read(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        assert!(
+            data.iter().all(|&b| b == 0xAA),
+            "fork from snap1 block {} should be 0xAA, got 0x{:02x}",
+            i,
+            data[0]
+        );
+    }
+
+    // Fork from snap2 (current, with tombstones) — should see zeros
+    let fork2_config = ExportConfig {
+        name: "fork2".to_string(),
+        size_gb: 0.01,
+        s3_prefix: Some("vm1".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(fork2_config, false, Some("vm1"), Some(_snap2.sequence))
+        .await
+        .unwrap();
+
+    let fork2_handler = router.get_handler("fork2").await.unwrap();
+    for i in 0..3 {
+        let data = fork2_handler
+            .read(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "fork from snap2 block {} should be all zeros (tombstone), got 0x{:02x}",
+            i,
+            data[0]
+        );
+    }
+}
+
+/// Compaction CAS failure leaves an orphaned pack; GC cleans it up.
+///
+/// Run compaction #1 with [A, B] → succeeds, manifest becomes [C].
+/// Run compaction #2 with stale [A, B] → CAS fails (manifest has [C]),
+/// but the new base pack D is already on S3 (orphaned).
+/// GC finds A, B, D as dead and deletes them. Data stays intact via pack C.
+#[tokio::test]
+async fn test_compaction_cas_failure_orphan_cleaned_by_gc() {
+    use glidefs::block::pack::PackId;
+    use glidefs::block::write_cache::compact;
+    use glidefs::cli::gc::{new_gc_state_for_test, reconcile_prefix_for_test};
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
+
+    // Flush 1: write blocks → pack A
+    write_blocks(&cache, 0, 3, 1, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Flush 2: overwrite same blocks → pack B (manifest: [A, B])
+    write_blocks(&cache, 0, 3, 2, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    let stale_packs: Vec<PackId> = volume_manifest
+        .read()
+        .chunk_pack_ids(0)
+        .unwrap()
+        .to_vec();
+    assert_eq!(stale_packs.len(), 2);
+
+    // Compaction #1: [A, B] → [C] (succeeds)
+    let blocks_per_chunk = volume_manifest.read().blocks_per_chunk();
+    compact::compact_chunk(
+        0,
+        &stale_packs,
+        blocks_per_chunk,
+        &cs,
+        &pack_index_cache,
+        &volume_manifest,
+    )
+    .await
+    .unwrap();
+
+    // Manifest now has [C]
+    let packs_after_compact: Vec<PackId> = volume_manifest
+        .read()
+        .chunk_pack_ids(0)
+        .unwrap()
+        .to_vec();
+    assert_eq!(packs_after_compact.len(), 1, "compaction should produce 1 pack");
+
+    // Sync manifest to S3 so GC sees [C]
+    cache.sync_manifest(&cs, &volume_manifest).await.unwrap();
+
+    // Compaction #2: same stale [A, B] — CAS must fail because manifest has [C]
+    let result = compact::compact_chunk(
+        0,
+        &stale_packs,
+        blocks_per_chunk,
+        &cs,
+        &pack_index_cache,
+        &volume_manifest,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "compaction with stale pack list should fail (CAS mismatch)"
+    );
+
+    // Orphaned base pack from failed compaction #2 is now on S3.
+    // GC should find it along with A and B (no longer in live manifest).
+    let mut gc_state = new_gc_state_for_test();
+    let report = reconcile_prefix_for_test(&cs, &mut gc_state, Duration::ZERO, 1000, false)
+        .await
+        .unwrap();
+
+    // Dead packs: A, B (pre-compaction), D (orphan from failed compaction #2)
+    assert!(
+        report.dead_found() >= 3,
+        "should find at least 3 dead packs (A, B, and orphan D), got {}",
+        report.dead_found()
+    );
+    assert!(
+        report.packs_deleted() >= 3,
+        "should delete at least 3 dead packs with grace_period=0, got {}",
+        report.packs_deleted()
+    );
+
+    // Data integrity: cold reader reads through pack C
+    let reader_dir = TempDir::new().unwrap();
+    let (reader_cache, reader_cs, reader_pic, reader_vm, reader_cc, reader_m) =
+        super::create_cold_reader(&reader_dir, "vm1", Arc::clone(&s3)).await;
+    for i in 0..3 {
+        let offset = i * BLOCK_SIZE;
+        let data = reader_cache
+            .read(
+                offset as u64,
+                BLOCK_SIZE,
+                reader_cc.as_ref(),
+                &reader_pic,
+                &reader_vm,
+                &reader_cs,
+                &reader_m,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            data[0], 2,
+            "block {} should have seed=2 (last write) via compacted pack, got {}",
+            i, data[0]
+        );
+    }
+}
+
 /// head_manifest returns false for nonexistent manifest in nonexistent prefix.
 #[tokio::test]
 async fn test_head_manifest_not_found() {

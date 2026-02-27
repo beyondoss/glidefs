@@ -539,6 +539,7 @@ Every layer has a verification mechanism. The goal: corruption is detected befor
 | VolumeManifest | Chunk pack list root | CRC32 trailer | On deserialization | Reject manifest |
 | GLPK pack | Block index + data | BLAKE3-128 per block | On block read from S3 | `HashMismatch` error |
 | WAL entries | Per-entry metadata | CRC32 trailer | On replay (crash recovery) | Stop replay, discard torn tail |
+| Block state metadata (.meta) | Per-block state + sequence | CRC32 trailer | On load (open/recovery) | Reject file (`InvalidMetadata`) |
 | Dirty blocks (SSD) | Block data between write and flush | CRC32 in `crc_map` | Flush time: before BLAKE3 computation | Skip block (stays dirty), do NOT launder to S3 |
 
 ### Dirty Block CRC32

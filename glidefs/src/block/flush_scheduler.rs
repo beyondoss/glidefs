@@ -209,11 +209,13 @@ pub async fn flush_scheduler(
                             if result.manifest_synced {
                                 manifest_pending = false;
                             } else {
-                                // Checkpoint locally to bound WAL growth even
-                                // when manifest sync is failing.
-                                if let Err(e) = cache.local_checkpoint().await {
-                                    warn!(error = %e, "checkpoint after failed manifest sync");
-                                }
+                                // Do NOT checkpoint here. local_checkpoint persists
+                                // block states as CLEAN and truncates the WAL. If the
+                                // host crashes before manifest sync succeeds, those
+                                // blocks become irrecoverable (CLEAN on disk, but S3
+                                // manifest doesn't reference the packs). The 5s
+                                // checkpoint ticker retries manifest sync and will
+                                // checkpoint after it succeeds.
                                 manifest_pending = true;
                             }
                         } else {
@@ -339,6 +341,10 @@ mod tests {
     struct FailingObjectStore {
         inner: InMemory,
         fail_puts: AtomicBool,
+        /// When true, only single-object `put_opts` fails (manifest uploads).
+        /// Multipart uploads (pack data) still succeed. This simulates
+        /// "packs upload fine, manifest PUT fails."
+        fail_single_puts: AtomicBool,
     }
 
     impl FailingObjectStore {
@@ -346,11 +352,16 @@ mod tests {
             Self {
                 inner: InMemory::new(),
                 fail_puts: AtomicBool::new(false),
+                fail_single_puts: AtomicBool::new(false),
             }
         }
 
         fn set_fail_puts(&self, fail: bool) {
             self.fail_puts.store(fail, Ordering::SeqCst);
+        }
+
+        fn set_fail_single_puts(&self, fail: bool) {
+            self.fail_single_puts.store(fail, Ordering::SeqCst);
         }
     }
 
@@ -368,7 +379,9 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> ObjectStoreResult<PutResult> {
-            if self.fail_puts.load(Ordering::SeqCst) {
+            if self.fail_puts.load(Ordering::SeqCst)
+                || self.fail_single_puts.load(Ordering::SeqCst)
+            {
                 return Err(object_store::Error::Generic {
                     store: "FailingObjectStore",
                     source: Box::new(std::io::Error::new(
@@ -873,5 +886,102 @@ mod tests {
             .await
             .expect("scheduler should exit within 2s during backoff")
             .unwrap();
+    }
+
+    /// Verify that when pack uploads succeed but manifest sync fails, a
+    /// simulated crash + recovery still sees the blocks as dirty. This
+    /// prevents data loss: blocks are on S3 as unreferenced packs, and the
+    /// manifest doesn't know about them. Recovery must re-flush them.
+    #[tokio::test(start_paused = true)]
+    async fn test_manifest_sync_failure_preserves_dirty_after_crash() {
+        let failing_s3 = Arc::new(FailingObjectStore::new());
+        // Only fail single-object puts (manifest) — multipart (packs) succeeds.
+        failing_s3.set_fail_single_puts(true);
+
+        let (
+            cache,
+            content_store,
+            pack_index_cache,
+            volume_manifest,
+            flush_notify,
+            shutdown_rx,
+            shutdown_tx,
+            metrics,
+            clean_cache,
+            temp,
+        ) = test_scheduler_components_with_store(failing_s3 as _).await;
+
+        let cache_check = Arc::clone(&cache);
+        let flush_notify_clone = Arc::clone(&flush_notify);
+        let cache_dir = temp.path().to_path_buf();
+
+        // Write DEFAULT_BLOCKS_PER_PACK dirty blocks.
+        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+            let offset = i as u64 * 128 * 1024;
+            cache
+                .write(offset, &[0xFF; 128 * 1024], clean_cache.as_ref())
+                .unwrap();
+        }
+        assert_eq!(
+            cache_check.dirty_block_count(),
+            DEFAULT_BLOCKS_PER_PACK as u64
+        );
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache,
+                content_store,
+                pack_index_cache,
+                volume_manifest,
+                flush_notify,
+                shutdown_rx,
+                metrics,
+                None,
+            )
+            .await;
+        });
+
+        // Trigger flush — packs upload (multipart OK), manifest fails (single put).
+        flush_notify_clone.notify_one();
+
+        // Wait for in-memory dirty count to reach 0 (blocks CAS'd CLEAN).
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if cache_check.dirty_block_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            cache_check.dirty_block_count(),
+            0,
+            "packs should have uploaded (blocks CAS'd CLEAN in memory)"
+        );
+
+        // Shut down scheduler.
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        // Drop all references — simulates host crash.
+        drop(cache_check);
+
+        // Reopen cache from same directory — simulates host restart.
+        let config = WriteCacheConfig {
+            cache_dir,
+            device_name: "sched-backoff".to_string(),
+            device_size: device_size(),
+            block_size: 128 * 1024,
+            wal_sync: false,
+        };
+        let recovered = WriteCache::<Initializing>::open(config).unwrap();
+        let recovered = recovered.skip_recovery_for_test();
+
+        // After recovery, blocks MUST still be dirty. The manifest never
+        // synced, so these blocks exist as unreferenced packs on S3. If
+        // local_checkpoint() ran after the failed manifest sync, .meta
+        // would show CLEAN + WAL truncated = data loss on crash.
+        assert!(
+            recovered.dirty_block_count() > 0,
+            "blocks must be dirty after crash with unsynced manifest (got 0 — data loss bug)"
+        );
     }
 }

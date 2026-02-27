@@ -442,43 +442,46 @@ impl CacheInner {
         let path = self.config.metadata_path();
         let tmp_path = path.with_extension("meta.tmp");
 
-        // Write to temp file first
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&tmp_path)?;
 
-        // Write header
-        file.write_all(METADATA_MAGIC)?;
-        file.write_all(&METADATA_VERSION.to_le_bytes())?;
-        file.write_all(&self.config.device_size.to_le_bytes())?;
-        file.write_all(&(self.config.block_size as u64).to_le_bytes())?;
-        file.write_all(&(self.num_blocks as u64).to_le_bytes())?;
+        // Incremental CRC32 hasher — fed every byte written to the file.
+        let mut hasher = crc32fast::Hasher::new();
 
-        // v4/v5 sparse format: stream (index, state) pairs directly to disk.
-        // Write a placeholder count, stream entries, then seek back to fix the count.
-        // Uses iter_present() which only visits allocated pages — O(allocated_pages)
-        // not O(num_blocks).
-        use std::io::Seek;
-        let count_pos = file.stream_position()?;
-        file.write_all(&0u64.to_le_bytes())?; // placeholder
-
-        let mut entry_count: u64 = 0;
-        for (idx, state) in self.state_map.iter_present() {
-            file.write_all(&(idx as u32).to_le_bytes())?;
-            file.write_all(&[state])?;
-            entry_count += 1;
+        // Helper: write to file and feed the hasher.
+        macro_rules! write_hashed {
+            ($data:expr) => {{
+                let d = $data;
+                file.write_all(d)?;
+                hasher.update(d);
+            }};
         }
 
-        // Patch the entry count
-        let end_pos = file.stream_position()?;
-        file.seek(std::io::SeekFrom::Start(count_pos))?;
-        file.write_all(&entry_count.to_le_bytes())?;
-        file.seek(std::io::SeekFrom::Start(end_pos))?;
+        // Write header
+        write_hashed!(METADATA_MAGIC);
+        write_hashed!(&METADATA_VERSION.to_le_bytes());
+        write_hashed!(&self.config.device_size.to_le_bytes());
+        write_hashed!(&(self.config.block_size as u64).to_le_bytes());
+        write_hashed!(&(self.num_blocks as u64).to_le_bytes());
+
+        // v4/v5 sparse format: entry_count(u64) + entries of (index u32, state u8).
+        let entry_count = self.state_map.count_present() as u64;
+        write_hashed!(&entry_count.to_le_bytes());
+
+        for (idx, state) in self.state_map.iter_present() {
+            write_hashed!(&(idx as u32).to_le_bytes());
+            write_hashed!(&[state]);
+        }
 
         // v5: append max_sequence as trailing u64 LE
-        file.write_all(&self.sequence.current().to_le_bytes())?;
+        write_hashed!(&self.sequence.current().to_le_bytes());
+
+        // CRC32 trailer over all preceding bytes.
+        let crc = hasher.finalize();
+        file.write_all(&crc.to_le_bytes())?;
 
         // Fsync temp file to ensure data is on disk
         file.sync_all()?;
@@ -543,8 +546,18 @@ impl CacheInner {
         }
 
         let mut file = File::open(&path)?;
+        let mut hasher = crc32fast::Hasher::new();
+
+        // Helper: read from file and feed the hasher.
+        macro_rules! read_hashed {
+            ($buf:expr) => {{
+                file.read_exact($buf)?;
+                hasher.update($buf);
+            }};
+        }
+
         let mut header = [0u8; 8 + 4 + 8 + 8 + 8]; // magic + version + size + block_size + num_blocks
-        file.read_exact(&mut header)?;
+        read_hashed!(&mut header);
 
         // Validate header
         if &header[0..8] != METADATA_MAGIC {
@@ -602,12 +615,12 @@ impl CacheInner {
 
         // v4/v5: sparse format -- entry_count(u64) + entries of index(u32) + state(u8)
         let mut count_buf = [0u8; 8];
-        file.read_exact(&mut count_buf)?;
+        read_hashed!(&mut count_buf);
         let entry_count = u64::from_le_bytes(count_buf) as usize;
 
         let mut entry_buf = [0u8; 5]; // u32 index + u8 state
         for _ in 0..entry_count {
-            file.read_exact(&mut entry_buf)?;
+            read_hashed!(&mut entry_buf);
             let idx = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap()) as usize;
             let mut state = entry_buf[4];
 
@@ -634,8 +647,24 @@ impl CacheInner {
         // v5: read trailing max_sequence
         if version >= 5 {
             let mut seq_buf = [0u8; 8];
-            file.read_exact(&mut seq_buf)?;
+            read_hashed!(&mut seq_buf);
             persisted_max_seq = u64::from_le_bytes(seq_buf);
+        }
+
+        // Verify CRC32 trailer (mandatory).
+        let computed_crc = hasher.finalize();
+        let mut crc_buf = [0u8; 4];
+        file.read_exact(&mut crc_buf).map_err(|_| {
+            warn!("metadata file missing CRC32 trailer");
+            CacheError::invalid_metadata()
+        })?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+        if stored_crc != computed_crc {
+            warn!(
+                stored_crc,
+                computed_crc, "metadata CRC32 mismatch — file corrupted"
+            );
+            return Err(CacheError::invalid_metadata());
         }
 
         if is_growing {
