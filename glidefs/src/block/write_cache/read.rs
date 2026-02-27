@@ -215,7 +215,7 @@ impl WriteCache<Active> {
         let mut sources: HashMap<usize, ChunkSource> = HashMap::new();
         let mut fetch_entries = Vec::new();
 
-        for (i, (block_idx, location, local_offset)) in located.into_iter().enumerate() {
+        for (i, (_block_idx, location, local_offset)) in located.into_iter().enumerate() {
             if let Some(file_offset) = local_offset {
                 sources.insert(i, ChunkSource::LocalSsd { file_offset });
                 continue;

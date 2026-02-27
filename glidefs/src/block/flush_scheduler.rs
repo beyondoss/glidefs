@@ -297,10 +297,9 @@ pub async fn flush_scheduler(
                         if let Some(result) = flush_and_sync(
                             &cache, &content_store, &pack_index_cache, &volume_manifest,
                             &metrics, &mut flush_backoff, &mut last_flush_failure,
-                        ).await {
-                            if result.packs_uploaded > 0 {
-                                manifest_pending = !result.manifest_synced;
-                            }
+                        ).await
+                            && result.packs_uploaded > 0 {
+                            manifest_pending = !result.manifest_synced;
                         }
                     }
 
