@@ -287,14 +287,23 @@ impl TestContext {
                 ]))
                 .await;
             match result {
-                Ok(r) if r.exit_code().await.unwrap_or(Some(1)) == Some(0) => break,
-                _ if attempt < 9 => {
+                Ok(mut r) => {
+                    // stdout_to_vec blocks until the exec command exits.
+                    let _ = r.stdout_to_vec().await;
+                    if r.exit_code().await.unwrap_or(Some(1)) == Some(0) {
+                        break;
+                    }
+                    if attempt >= 9 {
+                        panic!(
+                            "bucket creation failed after retries (exit code {:?})",
+                            r.exit_code().await,
+                        );
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
-                Ok(r) => panic!(
-                    "bucket creation failed after retries (exit code {:?})",
-                    r.exit_code().await,
-                ),
+                Err(_) if attempt < 9 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
                 Err(e) => panic!("bucket creation exec failed after retries: {e}"),
             }
         }
