@@ -324,11 +324,16 @@ impl SparseStateMap {
             Some(p) => p,
             None => {
                 // Page doesn't exist → current state is NOT_PRESENT.
-                return if expected == SparseBlockState::NOT_PRESENT {
-                    Ok(SparseBlockState::NOT_PRESENT)
-                } else {
-                    Err(SparseBlockState::NOT_PRESENT)
-                };
+                if expected != SparseBlockState::NOT_PRESENT {
+                    return Err(SparseBlockState::NOT_PRESENT);
+                }
+                if new == SparseBlockState::NOT_PRESENT {
+                    // No-op: NOT_PRESENT → NOT_PRESENT needs no allocation.
+                    return Ok(SparseBlockState::NOT_PRESENT);
+                }
+                // Transitioning from NOT_PRESENT to a real state —
+                // allocate the page so the CAS loop below can write it.
+                self.ensure_page(page_idx)
             }
         };
 
@@ -738,6 +743,19 @@ mod tests {
             SparseBlockState::DIRTY,
         );
         assert_eq!(result, Err(SparseBlockState::NOT_PRESENT));
+    }
+
+    #[test]
+    fn test_sparse_state_map_cas_allocates_on_transition_from_not_present() {
+        let map = SparseStateMap::new(STATE_PAGE_ENTRIES * 2);
+        let idx = STATE_PAGE_ENTRIES + 5; // on second (unallocated) page
+        assert_eq!(map.allocated_pages(), 0);
+
+        // CAS NOT_PRESENT → DIRTY on unallocated page should allocate and succeed.
+        let result = map.cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY);
+        assert_eq!(result, Ok(SparseBlockState::NOT_PRESENT));
+        assert_eq!(map.get(idx), SparseBlockState::DIRTY);
+        assert_eq!(map.allocated_pages(), 1);
     }
 
     #[test]

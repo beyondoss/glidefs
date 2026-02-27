@@ -24,6 +24,100 @@ use crate::block::state::Active;
 use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::WriteCache;
 
+/// Maximum backoff between flush retries.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Result of a flush-and-sync cycle.
+struct FlushResult {
+    /// Number of packs uploaded to S3 (0 = no dirty blocks or all deduped).
+    packs_uploaded: usize,
+    /// Whether the manifest was successfully synced to S3.
+    manifest_synced: bool,
+}
+
+/// Execute flush_packs + sync_manifest (with retries).
+///
+/// Must be called while holding the per-export flush lock. On success: resets
+/// backoff, records metrics, syncs manifest with 3 retries. On failure: extends
+/// exponential backoff, records error metric.
+///
+/// Returns `Some(result)` on flush success, `None` on flush failure.
+async fn flush_and_sync(
+    cache: &WriteCache<Active>,
+    content_store: &ContentStore,
+    pack_index_cache: &Arc<PackIndexCache>,
+    volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+    metrics: &ExportMetrics,
+    flush_backoff: &mut Duration,
+    last_flush_failure: &mut Option<Instant>,
+) -> Option<FlushResult> {
+    match cache
+        .flush_packs(content_store, pack_index_cache, volume_manifest)
+        .await
+    {
+        Ok((stats, _seq_cutpoint)) => {
+            *flush_backoff = Duration::ZERO;
+            *last_flush_failure = None;
+            metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
+            metrics.record_flush_blocks_corrupted(stats.blocks_corrupted);
+
+            let mut manifest_synced = false;
+            if stats.packs_uploaded > 0 {
+                info!(
+                    packs = stats.packs_uploaded,
+                    blocks = stats.blocks_claimed,
+                    bytes = stats.bytes_uploaded,
+                    "flushed packs"
+                );
+                for attempt in 0..3u32 {
+                    match cache
+                        .sync_manifest(content_store, volume_manifest)
+                        .await
+                    {
+                        Ok(()) => {
+                            manifest_synced = true;
+                            break;
+                        }
+                        Err(e) => {
+                            metrics.record_manifest_sync_error();
+                            warn!(
+                                error = %e, attempt = attempt + 1,
+                                "manifest sync failed"
+                            );
+                            if attempt < 2 {
+                                tokio::time::sleep(Duration::from_millis(
+                                    100 * (1 << attempt),
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some(FlushResult {
+                packs_uploaded: stats.packs_uploaded,
+                manifest_synced,
+            })
+        }
+        Err(e) => {
+            *flush_backoff = if flush_backoff.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                flush_backoff.saturating_mul(2).min(MAX_BACKOFF)
+            };
+            *last_flush_failure = Some(Instant::now());
+            metrics.record_flush_error();
+            warn!(
+                error = %e,
+                backoff_secs = flush_backoff.as_secs(),
+                "pack flush failed, backing off"
+            );
+            None
+        }
+    }
+}
+
 /// Run the flush scheduler for a single export.
 ///
 /// Loops until `shutdown` signals true. Two select branches:
@@ -50,7 +144,6 @@ pub async fn flush_scheduler(
 
     // Backoff state: when flush fails (e.g., S3 down), wait before retrying
     // to avoid a tight spin of failed flush_packs calls.
-    const MAX_BACKOFF: Duration = Duration::from_secs(30);
     let mut flush_backoff = Duration::ZERO;
 
     // Track when the last flush failure occurred so the checkpoint ticker
@@ -106,71 +199,35 @@ pub async fn flush_scheduler(
                 // drain/snapshot operations. Prevents stale manifest uploads.
                 {
                     let _flush_guard = cache.flush_lock().lock().await;
-                    match cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest).await {
-                        Ok((stats, _seq_cutpoint)) => {
-                            flush_backoff = Duration::ZERO;
-                            last_flush_failure = None;
-                            metrics.record_s3_put_latency(start.elapsed());
-                            metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
-                            metrics.record_flush_blocks_corrupted(stats.blocks_corrupted);
-                            packs_uploaded = stats.packs_uploaded;
-                            if stats.packs_uploaded > 0 {
-                                info!(
-                                    packs = stats.packs_uploaded,
-                                    blocks = stats.blocks_claimed,
-                                    bytes = stats.bytes_uploaded,
-                                    "pack-size flush"
-                                );
-                                // Sync manifest so flushed packs are discoverable
-                                // on cross-host recovery (host death without drain).
-                                // sync_manifest includes checkpoint (persist + WAL truncate).
-                                // Retry up to 3 times; if all fail, defer to checkpoint tick.
-                                let mut synced = false;
-                                for attempt in 0..3u32 {
-                                    match cache.sync_manifest(&content_store, &volume_manifest).await {
-                                        Ok(()) => { synced = true; break; }
-                                        Err(e) => {
-                                            metrics.record_manifest_sync_error();
-                                            warn!(error = %e, attempt = attempt + 1, "manifest sync after flush failed");
-                                            if attempt < 2 {
-                                                tokio::time::sleep(std::time::Duration::from_millis(100 * (1 << attempt))).await;
-                                            }
-                                        }
-                                    }
-                                }
-                                if synced {
-                                    manifest_pending = false;
-                                } else {
-                                    // Checkpoint locally to bound WAL growth even
-                                    // when manifest sync is failing.
-                                    if let Err(e) = cache.local_checkpoint().await {
-                                        warn!(error = %e, "checkpoint after failed manifest sync");
-                                    }
-                                    manifest_pending = true;
-                                }
+                    if let Some(result) = flush_and_sync(
+                        &cache, &content_store, &pack_index_cache, &volume_manifest,
+                        &metrics, &mut flush_backoff, &mut last_flush_failure,
+                    ).await {
+                        metrics.record_s3_put_latency(start.elapsed());
+                        packs_uploaded = result.packs_uploaded;
+                        if result.packs_uploaded > 0 {
+                            if result.manifest_synced {
+                                manifest_pending = false;
                             } else {
-                                // No packs uploaded — still checkpoint to persist
-                                // clean block states and compute CRC32s.
+                                // Checkpoint locally to bound WAL growth even
+                                // when manifest sync is failing.
                                 if let Err(e) = cache.local_checkpoint().await {
-                                    warn!(error = %e, "checkpoint after flush failed");
+                                    warn!(error = %e, "checkpoint after failed manifest sync");
                                 }
+                                manifest_pending = true;
+                            }
+                        } else {
+                            // No packs uploaded — still checkpoint to persist
+                            // clean block states and compute CRC32s.
+                            if let Err(e) = cache.local_checkpoint().await {
+                                warn!(error = %e, "checkpoint after flush");
                             }
                         }
-                        Err(e) => {
-                            // Exponential backoff: 1s → 2s → 4s → ... → 30s cap.
-                            flush_backoff = if flush_backoff.is_zero() {
-                                Duration::from_secs(1)
-                            } else {
-                                flush_backoff.saturating_mul(2).min(MAX_BACKOFF)
-                            };
-                            last_flush_failure = Some(Instant::now());
-                            metrics.record_flush_error();
-                            warn!(error = %e, backoff_secs = flush_backoff.as_secs(), "pack flush failed, backing off");
-                            // Still checkpoint on flush error to prevent WAL growth
-                            // when S3 is down and flush_notify fires continuously.
-                            if let Err(e) = cache.local_checkpoint().await {
-                                warn!(error = %e, "checkpoint after flush error failed");
-                            }
+                    } else {
+                        // Flush failed — still checkpoint to prevent WAL growth
+                        // when S3 is down and flush_notify fires continuously.
+                        if let Err(e) = cache.local_checkpoint().await {
+                            warn!(error = %e, "checkpoint after flush error");
                         }
                     }
                 } // _flush_guard dropped — compaction runs without holding the flush lock.
@@ -237,35 +294,12 @@ pub async fn flush_scheduler(
 
                     if should_retry {
                         let _flush_guard = cache.flush_lock().lock().await;
-                        match cache.flush_packs(&content_store, &pack_index_cache, &volume_manifest).await {
-                            Ok((stats, _)) => {
-                                flush_backoff = Duration::ZERO;
-                                last_flush_failure = None;
-                                if stats.packs_uploaded > 0 {
-                                    info!(
-                                        packs = stats.packs_uploaded,
-                                        blocks = stats.blocks_claimed,
-                                        "periodic retry flush succeeded"
-                                    );
-                                    match cache.sync_manifest(&content_store, &volume_manifest).await {
-                                        Ok(()) => { manifest_pending = false; }
-                                        Err(e) => {
-                                            metrics.record_manifest_sync_error();
-                                            warn!(error = %e, "manifest sync after periodic retry failed");
-                                            manifest_pending = true;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                flush_backoff = flush_backoff.saturating_mul(2).min(MAX_BACKOFF);
-                                last_flush_failure = Some(Instant::now());
-                                metrics.record_flush_error();
-                                warn!(
-                                    error = %e,
-                                    backoff_secs = flush_backoff.as_secs(),
-                                    "periodic retry flush failed, extending backoff"
-                                );
+                        if let Some(result) = flush_and_sync(
+                            &cache, &content_store, &pack_index_cache, &volume_manifest,
+                            &metrics, &mut flush_backoff, &mut last_flush_failure,
+                        ).await {
+                            if result.packs_uploaded > 0 {
+                                manifest_pending = !result.manifest_synced;
                             }
                         }
                     }
