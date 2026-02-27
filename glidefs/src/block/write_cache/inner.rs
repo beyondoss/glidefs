@@ -651,20 +651,20 @@ impl CacheInner {
             persisted_max_seq = u64::from_le_bytes(seq_buf);
         }
 
-        // Verify CRC32 trailer if present. If the file has 4 more bytes,
-        // they're the CRC. Files written before the CRC addition won't
-        // have the trailer and that's fine — just skip verification.
+        // Verify CRC32 trailer (mandatory).
         let computed_crc = hasher.finalize();
         let mut crc_buf = [0u8; 4];
-        if file.read_exact(&mut crc_buf).is_ok() {
-            let stored_crc = u32::from_le_bytes(crc_buf);
-            if stored_crc != computed_crc {
-                warn!(
-                    stored_crc,
-                    computed_crc, "metadata CRC32 mismatch — file corrupted"
-                );
-                return Err(CacheError::invalid_metadata());
-            }
+        file.read_exact(&mut crc_buf).map_err(|_| {
+            warn!("metadata file missing CRC32 trailer");
+            CacheError::invalid_metadata()
+        })?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+        if stored_crc != computed_crc {
+            warn!(
+                stored_crc,
+                computed_crc, "metadata CRC32 mismatch — file corrupted"
+            );
+            return Err(CacheError::invalid_metadata());
         }
 
         if is_growing {
