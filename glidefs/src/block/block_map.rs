@@ -475,9 +475,28 @@ impl SequenceNumber {
     ///
     /// Uses Relaxed ordering because sequence numbers only need to be
     /// monotonically increasing, not synchronized with other memory.
+    /// Saturates at `u64::MAX` instead of wrapping, which would violate
+    /// the monotonicity invariant that WAL replay depends on.
     #[inline]
     pub fn next(&self) -> u64 {
-        self.0.fetch_add(1, Ordering::Relaxed) + 1
+        match self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v == u64::MAX {
+                    None
+                } else {
+                    Some(v + 1)
+                }
+            }) {
+            Ok(prev) => prev + 1,
+            Err(_) => {
+                tracing::error!(
+                    "SequenceNumber saturated at u64::MAX — \
+                     this should be impossible in normal operation"
+                );
+                u64::MAX
+            }
+        }
     }
 
     /// Read the current value without incrementing.

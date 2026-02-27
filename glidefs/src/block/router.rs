@@ -3062,4 +3062,119 @@ mod tests {
         router.shutdown_devices().await.unwrap();
         router.shutdown_devices().await.unwrap();
     }
+
+    // =========================================================================
+    // Stale export.json discovery tests
+    // =========================================================================
+
+    /// export.json exists in S3 but no manifest was ever uploaded (no flush/drain).
+    /// The export should create successfully with an empty manifest and reads
+    /// return zeros.
+    #[tokio::test]
+    async fn test_discover_exports_missing_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // Save export config to S3 without creating the export locally
+        // (simulates: export.json persisted, but node was replaced before first flush)
+        let config = test_export_config("stale-vol");
+        router.save_export(&config).await.unwrap();
+
+        // Discover should find it
+        let discovered = router.discover_exports().await.unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name, "stale-vol");
+
+        // Create from discovered config — normal path (no manifest_name)
+        // The manifest doesn't exist in S3 so it starts with an empty one
+        router
+            .create_export(discovered[0].clone(), false, None, None)
+            .await
+            .unwrap();
+
+        // Read block 0 — should return zeros (no data in manifest)
+        let handler = router.get_handler("stale-vol").await.unwrap();
+        let data = handler.read(0, 4096).await.unwrap();
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "missing manifest should yield zero-filled reads"
+        );
+    }
+
+    /// export.json references an export whose manifest was deleted from S3
+    /// (e.g., manual cleanup). The export should create successfully and start
+    /// fresh rather than failing or blocking startup.
+    #[tokio::test]
+    async fn test_discover_exports_deleted_manifest() {
+        let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let temp_dir = TempDir::new().unwrap();
+        let router = ExportRouter::new(RouterConfig {
+            object_store: Arc::clone(&s3),
+            db_path: "test".to_string(),
+            cache_dir: temp_dir.path().to_path_buf(),
+            block_size: 128 * 1024,
+            clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+        })
+        .await
+        .unwrap();
+
+        // Create export, write data, flush + sync manifest
+        let config = test_export_config("del-manifest");
+        router
+            .create_export(config.clone(), false, None, None)
+            .await
+            .unwrap();
+        let handler = router.get_handler("del-manifest").await.unwrap();
+        handler
+            .write(0, &vec![0xAA; 128 * 1024], false)
+            .unwrap();
+        router.drain_export("del-manifest").await.unwrap();
+        router.save_export(&config).await.unwrap();
+
+        // Manually delete the manifest from S3
+        let manifest_path = Path::from("test/exports/del-manifest/manifests/del-manifest");
+        s3.delete(&manifest_path).await.unwrap();
+
+        // Simulate node replacement: create a new router with the same S3
+        let temp_dir2 = TempDir::new().unwrap();
+        let router2 = ExportRouter::new(RouterConfig {
+            object_store: Arc::clone(&s3),
+            db_path: "test".to_string(),
+            cache_dir: temp_dir2.path().to_path_buf(),
+            block_size: 128 * 1024,
+            clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+        })
+        .await
+        .unwrap();
+
+        // Discover finds the config
+        let discovered = router2.discover_exports().await.unwrap();
+        assert_eq!(discovered.len(), 1);
+
+        // Create export from discovered config — manifest is gone, should start fresh
+        router2
+            .create_export(discovered[0].clone(), false, None, None)
+            .await
+            .unwrap();
+
+        // Export is usable — reads return zeros (manifest was deleted)
+        let handler2 = router2.get_handler("del-manifest").await.unwrap();
+        let data = handler2.read(0, 4096).await.unwrap();
+        assert!(
+            data.iter().all(|&b| b == 0),
+            "deleted manifest should yield zero-filled reads"
+        );
+    }
 }

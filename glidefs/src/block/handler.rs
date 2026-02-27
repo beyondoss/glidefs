@@ -841,4 +841,85 @@ mod tests {
             "default handler should use DEFAULT_BLOCKS_PER_PACK"
         );
     }
+
+    // =========================================================================
+    // SSD pressure / ENOSPC tests
+    // =========================================================================
+
+    /// Helper: create a handler and return the shared SSD utilization atomic
+    /// so tests can simulate disk pressure.
+    async fn test_handler_with_ssd_util() -> (BlockHandler, Arc<AtomicU64>, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "enospc-test".to_string(),
+            device_size: 1024 * 1024,
+            block_size: 4096,
+            wal_sync: false,
+        };
+
+        let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(1024 * 1024, 4096),
+        ));
+        let metrics = Arc::new(ExportMetrics::new());
+        let ssd_util = Arc::new(AtomicU64::new(0f64.to_bits()));
+
+        let cache = WriteCache::open(config).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let handler = BlockHandler::new(
+            Arc::new(cache),
+            content_store,
+            clean_cache,
+            pack_index_cache,
+            volume_manifest,
+            1024 * 1024,
+            false,
+            metrics,
+            Arc::clone(&ssd_util),
+            Arc::new(Notify::const_new()),
+            DEFAULT_BLOCKS_PER_PACK,
+            None,
+        );
+
+        (handler, ssd_util, temp_dir)
+    }
+
+    /// At >95% SSD utilization, writes to NEW blocks return ENOSPC while
+    /// overwrites to existing blocks are still allowed (they don't grow the
+    /// data file). Lowering utilization re-enables new-block writes.
+    #[tokio::test]
+    async fn test_enospc_rejects_new_blocks_allows_overwrites() {
+        let (handler, ssd_util, _temp) = test_handler_with_ssd_util().await;
+
+        // Write block 0 at normal pressure — establishes it as "present" on SSD
+        handler.write(0, &[0xAA; 4096], false).unwrap();
+
+        // Simulate 96% SSD utilization (above WRITE_REJECT_THRESHOLD of 0.95)
+        ssd_util.store(0.96f64.to_bits(), Ordering::Relaxed);
+
+        // Overwrite block 0 — should succeed (existing block, no new SSD allocation)
+        assert!(
+            handler.write(0, &[0xBB; 4096], false).is_ok(),
+            "overwrite of existing block should succeed even at 96% utilization"
+        );
+
+        // Write to block 1 — should fail (new block requires SSD allocation)
+        assert!(
+            matches!(handler.write(4096, &[0xCC; 4096], false), Err(CommandError::NoSpace)),
+            "write to new block should return ENOSPC at 96% utilization"
+        );
+
+        // Lower utilization back to normal
+        ssd_util.store(0.50f64.to_bits(), Ordering::Relaxed);
+
+        // Write to block 1 again — should succeed now
+        assert!(
+            handler.write(4096, &[0xDD; 4096], false).is_ok(),
+            "write to new block should succeed after pressure drops"
+        );
+    }
 }
