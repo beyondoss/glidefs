@@ -205,7 +205,7 @@ We never need to read back what we wrote — the goal is to produce an image to 
 2. No deserialization code — saves ~30% of the implementation
 3. Single-pass over input data
 
-The only seeks are to rewrite the inode table entries (`finish_inode`) and the superblock/group descriptors (`close`). These are pre-reserved at `Writer::new` time.
+The only seeks are to overwrite xattr blocks (when replacing an inode's xattrs) and to write the superblock/group descriptors at `close()`. The inode table is written in a single sequential pass at `close()` time — not per-inode via seeks.
 
 ### Why defer directory writes to close()?
 

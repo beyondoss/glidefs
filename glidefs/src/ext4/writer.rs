@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::io::{self, BufWriter, Read, Seek, Write};
 
 use crate::ext4::format::{
-    self, FileType, InodeFlags, InodeNumber, INODE_DATA_SIZE, INODE_EXTRA_SIZE, INODE_SIZE,
-    INODE_USED_SIZE, TYPE_MASK, XATTR_HEADER_MAGIC,
+    self, FileType, InodeFlags, InodeNumber, DIR_ENTRY_HEADER_SIZE, INODE_DATA_SIZE,
+    INODE_EXTRA_SIZE, INODE_SIZE, INODE_USED_SIZE, TYPE_MASK, XATTR_HEADER_MAGIC,
 };
 
 // ---- Constants ----
@@ -30,7 +30,6 @@ const INLINE_DATA_XATTR_OVERHEAD: usize = XATTR_INODE_OVERHEAD + 16 + 4; // entr
 pub(crate) const INLINE_DATA_SIZE: usize = INODE_DATA_SIZE + INODE_EXTRA_SIZE - INLINE_DATA_XATTR_OVERHEAD;
 const INODE_FIRST: u32 = 11;
 const INODE_LOST_AND_FOUND: u32 = INODE_FIRST;
-const DIR_ENTRY_HEADER_SIZE: usize = 8;
 const EXTRA_ISIZE: u16 = (INODE_USED_SIZE - 128) as u16;
 
 // ---- Public types ----
@@ -442,7 +441,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
 
         // Preserve children and link_count for directory reuse
-        let (children, mut link_count) = if !is_new {
+        let (children, link_count) = if !is_new {
             let existing = self.inodes[(ino - 1) as usize].as_ref().unwrap();
             (existing.children.clone(), existing.link_count)
         } else if typ == format::S_IFDIR {
@@ -451,19 +450,15 @@ impl<W: Read + Write + Seek> Writer<W> {
             (BTreeMap::new(), 0u32)
         };
 
-        // If reusing, keep old link_count
-        if is_new && typ != format::S_IFDIR {
-            link_count = 0;
-        }
-
         let mut xstate = XattrState::new();
 
         let mut size: i64 = 0;
         let mut data: Vec<u8> = Vec::new();
-        let mut flags = InodeFlags::HUGE_FILE;
+        let mut flags = InodeFlags::empty();
 
         match typ {
             format::S_IFREG => {
+                flags |= InodeFlags::HUGE_FILE;
                 size = f.size;
                 if f.size > MAX_FILE_SIZE {
                     return Err(io::Error::new(
@@ -490,13 +485,17 @@ impl<W: Read + Write + Seek> Writer<W> {
                 }
             }
             format::S_IFLNK => {
+                flags |= InodeFlags::HUGE_FILE;
                 mode |= 0o777; // symlinks should appear as ugw rwx
                 size = f.linkname.len() as i64;
                 if (size as usize) <= SMALL_SYMLINK_SIZE {
                     data = f.linkname.as_bytes().to_vec();
                 }
             }
-            format::S_IFDIR | format::S_IFIFO | format::S_IFSOCK | format::S_IFCHR | format::S_IFBLK => {}
+            format::S_IFDIR => {
+                flags |= InodeFlags::HUGE_FILE;
+            }
+            format::S_IFIFO | format::S_IFSOCK | format::S_IFCHR | format::S_IFBLK => {}
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1021,6 +1020,8 @@ impl<W: Read + Write + Seek> Writer<W> {
 
     // ---- directory writing ----
 
+    const DIR_ZEROS: [u8; BLOCK_SIZE as usize] = [0u8; BLOCK_SIZE as usize];
+
     fn write_directory(&mut self, dir_ino: InodeNumber, parent_ino: InodeNumber) -> io::Result<()> {
         self.finish_inode()?;
         // Start with max size; we'll fix it later
@@ -1059,7 +1060,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             self.write_data(name.as_bytes())?;
             let padding = rl - rlb;
             if padding > 0 {
-                self.write_data(&vec![0u8; padding])?;
+                self.write_data(&Self::DIR_ZEROS[..padding])?;
             }
             left -= rl;
         }
@@ -1086,7 +1087,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                     "not enough space for trailing directory entry",
                 ));
             }
-            self.write_data(&vec![0u8; padding])?;
+            self.write_data(&Self::DIR_ZEROS[..padding])?;
         }
         Ok(())
     }
@@ -1125,8 +1126,10 @@ impl<W: Read + Write + Seek> Writer<W> {
 
     fn write_inode_table(&mut self, table_size: u32) -> io::Result<()> {
         let inode_count = self.inodes.len();
+        let mut buf = Vec::with_capacity(INODE_SIZE);
+        let zero_inode = [0u8; INODE_SIZE];
         for i in 0..inode_count {
-            let mut buf = Vec::with_capacity(INODE_SIZE);
+            buf.clear();
             match &self.inodes[i] {
                 Some(inode) => {
                     let mut block_data = [0u8; INODE_DATA_SIZE];
@@ -1196,8 +1199,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                     self.write_bytes(&buf)?;
                 }
                 None => {
-                    buf.resize(INODE_SIZE, 0);
-                    self.write_bytes(&buf)?;
+                    self.write_bytes(&zero_inode)?;
                 }
             }
         }
@@ -1209,6 +1211,7 @@ impl<W: Read + Write + Seek> Writer<W> {
     // ---- finalize ----
 
     /// Finalize the filesystem. Must be called after all files are added.
+    #[must_use = "close() finalizes the filesystem; the returned writer contains the complete image"]
     pub fn close(mut self) -> io::Result<W> {
         self.finish_inode()?;
 
@@ -1364,7 +1367,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         let mut blk = vec![0u8; BLOCK_SIZE as usize];
         let mut sb_buf = Vec::with_capacity(1024);
         sb.write_to(&mut sb_buf)?;
-        debug_assert_eq!(sb_buf.len(), 1024, "superblock must serialize to exactly 1024 bytes");
+        assert_eq!(sb_buf.len(), 1024, "superblock must serialize to exactly 1024 bytes");
         blk[1024..1024 + sb_buf.len()].copy_from_slice(&sb_buf);
         self.write_bytes(&blk)?;
 
