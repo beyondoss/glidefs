@@ -72,16 +72,19 @@ impl Read for BlockAdapter<'_> {
             .rt
             .block_on(self.handler.read(self.pos, n as u32))
             .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
-        buf[..data.len()].copy_from_slice(&data);
-        self.pos += data.len() as u64;
-        Ok(data.len())
+        let actual = data.len().min(buf.len());
+        buf[..actual].copy_from_slice(&data[..actual]);
+        self.pos += actual as u64;
+        Ok(actual)
     }
 }
 
 impl Seek for BlockAdapter<'_> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new_pos = match pos {
-            SeekFrom::Start(n) => n as i64,
+            SeekFrom::Start(n) => i64::try_from(n).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "seek offset too large")
+            })?,
             SeekFrom::End(n) => self.size as i64 + n,
             SeekFrom::Current(n) => self.pos as i64 + n,
         };

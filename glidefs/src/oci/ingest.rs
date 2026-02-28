@@ -50,7 +50,7 @@ pub async fn ingest_tar<R: Read + Send + 'static>(
         Ok(())
     })
     .await
-    .unwrap()
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("blocking task panicked: {e}")))?
 }
 
 #[cfg(test)]

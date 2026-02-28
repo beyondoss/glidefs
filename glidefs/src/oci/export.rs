@@ -27,7 +27,7 @@ pub async fn export_tar<W: Write + Send + 'static>(
         reader.to_tar(tar_writer)
     })
     .await
-    .unwrap()
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("blocking task panicked: {e}")))?
 }
 
 #[cfg(test)]
