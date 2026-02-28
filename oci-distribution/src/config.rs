@@ -19,6 +19,14 @@ use glidefs::parse_object_store::parse_url_opts;
 /// Fixed block size for the chunked architecture: 128KB.
 const BLOCK_SIZE: u32 = 131_072;
 
+/// Owns a read-only [`BlockHandler`] and the temporary directory backing its caches.
+///
+/// When dropped, the temp directory is cleaned up automatically.
+pub struct ReadonlyHandler {
+    pub handler: Arc<BlockHandler>,
+    _temp_dir: tempfile::TempDir,
+}
+
 /// Parse the GlideFS config file and create an object store + base path.
 pub fn setup_object_store(
     settings: &Settings,
@@ -39,7 +47,7 @@ pub async fn load_readonly_handler(
     content_store: &Arc<ContentStore>,
     manifest_name: &str,
     label: &str,
-) -> Result<Arc<BlockHandler>> {
+) -> Result<ReadonlyHandler> {
     let manifest_data = content_store
         .get_manifest(manifest_name)
         .await
@@ -100,8 +108,8 @@ pub async fn load_readonly_handler(
         None,
     ));
 
-    // Leak temp_dir so it lives as long as the handler.
-    std::mem::forget(temp_dir);
-
-    Ok(handler)
+    Ok(ReadonlyHandler {
+        handler,
+        _temp_dir: temp_dir,
+    })
 }

@@ -37,18 +37,18 @@ pub async fn run_publish(
             "exporting delta layers"
         );
 
-        let target_handler =
+        let target_rh =
             config::load_readonly_handler(&content_store, &manifest_name, "target").await?;
-        let base_handler =
+        let base_rh =
             config::load_readonly_handler(&content_store, base_name, "base").await?;
 
         let base_handle = {
-            let h = Arc::clone(&base_handler);
+            let h = Arc::clone(&base_rh.handler);
             tokio::task::spawn_blocking(move || export_full_layer(h))
         };
         let delta_handle = {
-            let bh = Arc::clone(&base_handler);
-            let th = Arc::clone(&target_handler);
+            let bh = Arc::clone(&base_rh.handler);
+            let th = Arc::clone(&target_rh.handler);
             tokio::task::spawn_blocking(move || export_delta_layer(bh, th))
         };
 
@@ -59,17 +59,23 @@ pub async fn run_publish(
             .await
             .map_err(|e| anyhow::anyhow!("delta export panicked: {e}"))??;
 
+        // Drop after both tasks complete so temp dirs stay alive during export.
+        drop((base_rh, target_rh));
+
         vec![base_layer, delta_layer]
     } else {
         // Full publish: single layer.
         info!(manifest = %manifest_name, "exporting full layer");
 
-        let handler =
+        let rh =
             config::load_readonly_handler(&content_store, &manifest_name, "target").await?;
+        let handler = Arc::clone(&rh.handler);
 
         let layer = tokio::task::spawn_blocking(move || export_full_layer(handler))
             .await
             .map_err(|e| anyhow::anyhow!("export panicked: {e}"))??;
+
+        drop(rh);
 
         vec![layer]
     };

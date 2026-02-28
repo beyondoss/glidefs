@@ -171,7 +171,6 @@ mod tests {
             std::io::Cursor::new(input_tar),
             IngestOptions {
                 writer_options: vec![WriterOption::MaximumDiskSize(device_size as i64)],
-                ..Default::default()
             },
         )
         .await

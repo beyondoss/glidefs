@@ -14,11 +14,11 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use object_store::ObjectStore;
 use object_store::path::Path as ObjectPath;
-use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
 use glidefs::config::Settings;
+use glidefs::oci::hex_sha256;
 
 type ResponseBody = http_body_util::combinators::UnsyncBoxBody<Bytes, io::Error>;
 
@@ -43,11 +43,9 @@ fn stream_from_s3(result: object_store::GetResult) -> ResponseBody {
     BodyExt::boxed_unsync(StreamBody::new(stream))
 }
 
-/// Compute sha256 hex digest of data.
-fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("{:x}", hasher.finalize())
+/// Returns true if `s` is a valid lowercase sha256 hex digest (64 chars).
+fn is_valid_hex_sha256(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// Build an OCI error response.
@@ -196,7 +194,7 @@ async fn handle_manifest(
         }
     };
 
-    let digest = format!("sha256:{}", sha256_hex(&data));
+    let digest = format!("sha256:{}", hex_sha256(&data));
 
     let builder = Response::builder()
         .status(StatusCode::OK)
@@ -225,6 +223,14 @@ async fn handle_blob(
         );
     };
 
+    if !is_valid_hex_sha256(hex) {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "invalid sha256 digest",
+        );
+    }
+
     let s3_path = ObjectPath::from(format!("{}/blobs/sha256/{}", state.oci_base, hex));
 
     if head_only {
@@ -232,6 +238,7 @@ async fn handle_blob(
         match state.object_store.head(&s3_path).await {
             Ok(meta) => Response::builder()
                 .status(StatusCode::OK)
+                .header("Content-Type", "application/octet-stream")
                 .header("Docker-Content-Digest", digest_ref)
                 .header("Content-Length", meta.size.to_string())
                 .body(empty())
@@ -255,6 +262,7 @@ async fn handle_blob(
                 let meta = result.meta.clone();
                 Response::builder()
                     .status(StatusCode::OK)
+                    .header("Content-Type", "application/octet-stream")
                     .header("Docker-Content-Digest", digest_ref)
                     .header("Content-Length", meta.size.to_string())
                     .body(stream_from_s3(result))
@@ -297,7 +305,7 @@ async fn handle_tags_list(state: &RegistryState) -> Response<ResponseBody> {
                 error!(error = %e, "S3 error listing tags");
                 return oci_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "TAG_LIST_ERROR",
+                    "INTERNAL_ERROR",
                     "failed to list tags",
                 );
             }
@@ -336,19 +344,19 @@ mod tests {
     /// Populate the store with a minimal OCI image (config + 1 layer + manifest).
     async fn populate_store(store: &InMemory) -> (String, String, String) {
         let layer_data = b"fake-compressed-layer-data";
-        let layer_digest = sha256_hex(layer_data);
+        let layer_digest = hex_sha256(layer_data);
 
         let config = serde_json::json!({
             "architecture": "amd64",
             "os": "linux",
             "rootfs": {
                 "type": "layers",
-                "diff_ids": [format!("sha256:{}", sha256_hex(b"uncompressed"))]
+                "diff_ids": [format!("sha256:{}", hex_sha256(b"uncompressed"))]
             },
             "config": {}
         });
         let config_bytes = serde_json::to_vec(&config).unwrap();
-        let config_digest = sha256_hex(&config_bytes);
+        let config_digest = hex_sha256(&config_bytes);
 
         let manifest = serde_json::json!({
             "schemaVersion": 2,
@@ -365,7 +373,7 @@ mod tests {
             }]
         });
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let manifest_digest = sha256_hex(&manifest_bytes);
+        let manifest_digest = hex_sha256(&manifest_bytes);
 
         // Upload all artifacts.
         let base = "test/exports/myapp/oci";
