@@ -3,20 +3,19 @@
 /// Ported from: github.com/Microsoft/hcsshim/ext4/tar2ext4
 ///
 /// Iterates tar entries and maps them to ext4 writer operations.
-/// Handles OCI whiteouts, PAX xattr records, and all standard entry types.
+/// Skips OCI whiteout entries, extracts PAX xattr records, and handles
+/// all standard entry types.
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, Write};
 
-use crate::ext4::format;
-use crate::ext4::writer::{File, Writer, WriterOption};
+use crate::format;
+use crate::writer::{File, Writer, WriterOption};
 
 const WHITEOUT_PREFIX: &str = ".wh.";
-const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 
 /// Options for tar-to-ext4 conversion.
 #[derive(Default)]
 pub struct ConvertOptions {
-    pub convert_whiteout: bool,
     pub convert_backslash: bool,
     pub writer_options: Vec<WriterOption>,
 }
@@ -54,32 +53,11 @@ pub fn convert_tar_to_ext4<R: Read, W: Read + Write + Seek>(
 
         fs.make_parents(&name)?;
 
-        // Handle whiteouts
-        if options.convert_whiteout {
-            if let Some((dir, file)) = split_dir_file(&name) {
-                if let Some(stripped) = file.strip_prefix(WHITEOUT_PREFIX) {
-                    if file == OPAQUE_WHITEOUT {
-                        // Update the directory with opaque xattr
-                        let mut stat = fs.stat(dir)?;
-                        stat.xattrs.insert("trusted.overlay.opaque".to_string(), b"y".to_vec());
-                        fs.create(dir, &stat)?;
-                    } else {
-                        // Create overlay-style whiteout (char device 0,0)
-                        let whiteout_path = if dir.is_empty() {
-                            stripped.to_string()
-                        } else {
-                            format!("{dir}{stripped}")
-                        };
-                        let f = File {
-                            mode: format::S_IFCHR,
-                            devmajor: 0,
-                            devminor: 0,
-                            ..Default::default()
-                        };
-                        fs.create(&whiteout_path, &f)?;
-                    }
-                    continue;
-                }
+        // Skip OCI whiteout entries — they're layer-deletion markers that are
+        // meaningless in a single merged ext4 filesystem.
+        if let Some((_, file)) = split_dir_file(&name) {
+            if file.starts_with(WHITEOUT_PREFIX) {
+                continue;
             }
         }
 

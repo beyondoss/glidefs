@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use crate::ext4::format::{
+use crate::format::{
     self, DirEntry, ExtentHeader, ExtentIndex, ExtentLeaf, GroupDescriptor, InodeFlags,
     InodeNumber, ParsedInode, SuperBlock, BLOCK_SIZE, EXTENT_HEADER_MAGIC, EXTENT_NODE_SIZE,
     GROUP_DESCRIPTOR_SIZE, INODE_DATA_SIZE, INODE_FIRST, INODE_ROOT, INODE_SIZE,

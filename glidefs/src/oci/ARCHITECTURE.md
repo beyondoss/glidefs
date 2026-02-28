@@ -211,7 +211,6 @@ Directory opaque whiteouts (`.wh..wh..opq`) set `trusted.overlay.opaque=y` xattr
 
 | Field             | Default | Purpose                                                      |
 | ----------------- | ------- | ------------------------------------------------------------ |
-| `convert_whiteout`| `true`  | Convert OCI `.wh.*` markers to overlayfs char device 0,0    |
 | `writer_options`  | `[]`    | Pass-through to ext4 Writer (see below)                      |
 
 `WriterOption` values:

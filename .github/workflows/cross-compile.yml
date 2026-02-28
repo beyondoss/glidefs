@@ -78,7 +78,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "glidefs -> target"
+          workspaces: ". -> target"
           shared-key: "cross-${{ matrix.target }}"
 
       - name: Install cross (Linux only)
@@ -106,7 +106,7 @@ jobs:
       - name: Prepare binary
         run: |
           mkdir -p artifacts
-          cp glidefs/target/${{ matrix.target }}/ci/glidefs artifacts/glidefs-${{ matrix.platform }}-${{ matrix.variant || '' }}${{ matrix.arch }}
+          cp target/${{ matrix.target }}/ci/glidefs artifacts/glidefs-${{ matrix.platform }}-${{ matrix.variant || '' }}${{ matrix.arch }}
           chmod +x artifacts/glidefs-${{ matrix.platform }}-${{ matrix.variant || '' }}${{ matrix.arch }}
 
       - name: Upload artifacts

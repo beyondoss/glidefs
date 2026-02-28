@@ -3,8 +3,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{self, Cursor, Read, Write};
 
-    use crate::ext4::format::{self, MAX_LINKS, TYPE_MASK};
-    use crate::ext4::writer::{File, Writer, WriterOption, BLOCK_SIZE, INLINE_DATA_SIZE};
+    use crate::format::{self, MAX_LINKS, TYPE_MASK};
+    use crate::writer::{File, Writer, WriterOption, BLOCK_SIZE, INLINE_DATA_SIZE};
 
     // ---- Test data ----
 
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_tar_determinism() {
-        use crate::ext4::tar_convert::{convert_tar_to_ext4, ConvertOptions};
+        use crate::tar_convert::{convert_tar_to_ext4, ConvertOptions};
         use sha2::{Sha256, Digest};
 
         // Build a tar in memory
@@ -485,7 +485,7 @@ mod tests {
 
     // ---- Reader roundtrip tests ----
 
-    use crate::ext4::reader::Reader;
+    use crate::reader::Reader;
 
     /// Helper: write an ext4 image, then open it with Reader.
     fn write_and_read(
@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn test_reader_tar_roundtrip() {
-        use crate::ext4::tar_convert::{convert_tar_to_ext4, ConvertOptions};
+        use crate::tar_convert::{convert_tar_to_ext4, ConvertOptions};
 
         // Build a tar
         let mut builder = tar::Builder::new(Vec::new());
@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn test_reader_to_tar_with_xattrs() {
-        use crate::ext4::tar_convert::{convert_tar_to_ext4, ConvertOptions};
+        use crate::tar_convert::{convert_tar_to_ext4, ConvertOptions};
 
         // Build a tar with PAX xattrs
         let mut builder = tar::Builder::new(Vec::new());

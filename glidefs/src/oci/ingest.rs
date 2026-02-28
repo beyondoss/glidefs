@@ -7,24 +7,15 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 use crate::block::handler::BlockHandler;
-use crate::ext4::tar_convert::{ConvertOptions, convert_tar_to_ext4};
-use crate::ext4::writer::WriterOption;
+use ext4::tar_convert::{ConvertOptions, convert_tar_to_ext4};
+use ext4::writer::WriterOption;
 
 use super::BlockAdapter;
 
 /// Options for tar-to-ext4 ingest.
+#[derive(Default)]
 pub struct IngestOptions {
-    pub convert_whiteout: bool,
     pub writer_options: Vec<WriterOption>,
-}
-
-impl Default for IngestOptions {
-    fn default() -> Self {
-        Self {
-            convert_whiteout: true,
-            writer_options: Vec::new(),
-        }
-    }
 }
 
 /// Ingest a tar stream into GlideFS block storage as an ext4 filesystem.
@@ -38,7 +29,6 @@ pub async fn ingest_tar<R: Read + Send + 'static>(
     options: IngestOptions,
 ) -> io::Result<()> {
     let convert_opts = ConvertOptions {
-        convert_whiteout: options.convert_whiteout,
         convert_backslash: false,
         writer_options: options.writer_options,
     };
@@ -63,7 +53,7 @@ mod tests {
     use crate::block::pack_index_cache::PackIndexCache;
     use crate::block::volume_manifest::VolumeManifest;
     use crate::block::write_cache::{WriteCache, WriteCacheConfig};
-    use crate::ext4::reader::Reader;
+    use ext4::reader::Reader;
     use object_store::memory::InMemory;
     use std::sync::atomic::AtomicU64;
     use tempfile::TempDir;
@@ -215,8 +205,8 @@ mod tests {
             let adapter = BlockAdapter::new(&handler, rt);
             let reader = Reader::new(adapter).unwrap();
             let sb = reader.superblock();
-            assert!(sb.feature_compat.contains(crate::ext4::format::CompatFeature::HAS_JOURNAL));
-            assert_eq!(sb.journal_inum, crate::ext4::format::INODE_JOURNAL);
+            assert!(sb.feature_compat.contains(ext4::format::CompatFeature::HAS_JOURNAL));
+            assert_eq!(sb.journal_inum, ext4::format::INODE_JOURNAL);
             assert_eq!(sb.uuid, uuid);
         })
         .await

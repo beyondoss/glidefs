@@ -23,7 +23,7 @@ jobs:
           components: "clippy"
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "glidefs -> target"
+          workspaces: ". -> target"
       - name: Run clippy
         run: cargo clippy --features test-utils --tests --benches
 
@@ -38,7 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "glidefs -> target"
+          workspaces: ". -> target"
       - name: Run all tests
         run: cargo test --features test-utils --verbose
 
@@ -53,7 +53,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "glidefs -> target"
+          workspaces: ". -> target"
       - name: Run docker integration tests
         run: cargo test --features docker-tests --test docker_integration --verbose
 
@@ -83,7 +83,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "glidefs -> target"
+          workspaces: ". -> target"
       - name: Run benchmarks
         run: cargo bench --features test-utils --benches
 
@@ -100,7 +100,7 @@ jobs:
           components: "clippy"
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "glidefs -> target"
+          workspaces: ". -> target"
       - name: Install kernel modules + fio
         run: |
           sudo apt-get update

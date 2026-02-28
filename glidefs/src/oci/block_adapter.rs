@@ -293,8 +293,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ext4_roundtrip_through_blocks() {
-        use crate::ext4::reader::Reader;
-        use crate::ext4::writer::{File, Writer, WriterOption};
+        use ext4::reader::Reader;
+        use ext4::writer::{File, Writer, WriterOption};
         let (handler, _temp) = test_handler().await;
         let rt = tokio::runtime::Handle::current();
 

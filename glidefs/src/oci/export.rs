@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use crate::block::handler::BlockHandler;
-use crate::ext4::reader::Reader;
+use ext4::reader::Reader;
 
 use super::BlockAdapter;
 
@@ -40,8 +40,8 @@ mod tests {
     use crate::block::pack_index_cache::PackIndexCache;
     use crate::block::volume_manifest::VolumeManifest;
     use crate::block::write_cache::{WriteCache, WriteCacheConfig};
-    use crate::ext4::writer::{File as Ext4File, Writer, WriterOption};
-    use crate::ext4::format;
+    use ext4::writer::{File as Ext4File, Writer, WriterOption};
+    use ext4::format;
     use object_store::memory::InMemory;
     use std::io::Read;
     use std::sync::atomic::AtomicU64;

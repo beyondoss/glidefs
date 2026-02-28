@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufWriter, Read, Seek, Write};
 
-use crate::ext4::format::{
+use crate::format::{
     self, FileType, InodeFlags, InodeNumber, DIR_ENTRY_HEADER_SIZE,
     INODE_DATA_SIZE, INODE_EXTRA_SIZE, INODE_FIRST, INODE_SIZE,
     INODE_USED_SIZE, SMALL_SYMLINK_SIZE, TYPE_MASK, XATTR_BLOCK_OVERHEAD,
@@ -15,7 +15,7 @@ use crate::ext4::format::{
 };
 
 // Re-export for backward compatibility (tests import from writer)
-pub use crate::ext4::format::{BLOCK_SIZE, INLINE_DATA_SIZE};
+pub use crate::format::{BLOCK_SIZE, INLINE_DATA_SIZE};
 
 // ---- Constants ----
 
@@ -68,6 +68,7 @@ impl Default for File {
 }
 
 /// Option for configuring the Writer.
+#[derive(Clone)]
 pub enum WriterOption {
     InlineData,
     MaximumDiskSize(i64),
@@ -114,7 +115,7 @@ impl Inode {
 
 // ---- Xattr helpers ----
 
-use crate::ext4::format::{compress_xattr_name, get_xattrs};
+use crate::format::{compress_xattr_name, get_xattrs};
 
 fn hash_xattr_entry(name: &str, value: &[u8]) -> u32 {
     let mut hash: u32 = 0;
