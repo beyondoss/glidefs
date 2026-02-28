@@ -72,6 +72,8 @@ rayon = "1.11"
 tempfile = "3.21"
 parking_lot = "0.12"
 chrono = { version = "0.4.43", features = ["serde"] }
+bitflags = "2"
+tar = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ublk-core = { path = "ublk-core", optional = true }
@@ -85,6 +87,7 @@ proptest = "1.4"
 paste = "1"
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
+sha2 = "0.10"
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"

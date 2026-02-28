@@ -810,6 +810,7 @@ mod cold_wake;
 mod concurrent;
 mod data_integrity;
 mod export_discovery;
+mod ext4_verify;
 mod fork_roundtrip;
 mod live_migration;
 mod multi_export;
