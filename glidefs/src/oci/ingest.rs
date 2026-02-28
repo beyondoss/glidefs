@@ -192,7 +192,6 @@ mod tests {
                     WriterOption::Uuid(uuid),
                     WriterOption::Journal(256),
                 ],
-                ..Default::default()
             },
         )
         .await
