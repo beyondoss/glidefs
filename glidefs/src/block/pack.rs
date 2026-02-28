@@ -49,15 +49,36 @@ pub const TRAILER_MAGIC: &[u8; 4] = b"GLIX";
 /// Trailer size: block_count (2) + reserved (2) + magic (4).
 pub const TRAILER_SIZE: usize = 8;
 
-/// 8-byte random pack identifier.
+/// 16-char base36 pack identifier (~83 bits of entropy).
 ///
-/// Collision-safe per chunk (birthday bound ~4.3 billion).
-/// Hex representation distributes uniformly for S3 prefix sharding.
-pub type PackId = u64;
+/// Stored as u128 internally, constrained to [0, 36^16). Displayed as
+/// 16-char zero-padded lowercase base36 (`0-9a-z`). Birthday collision
+/// threshold ~2.8 trillion per chunk.
+pub type PackId = u128;
 
-/// Generate a random pack ID.
+/// Maximum value for a 16-char base36 ID (36^16).
+const BASE36_MAX: u128 = 36u128.pow(16);
+
+/// Generate a random pack ID (16-char base36 range).
 pub fn new_pack_id() -> PackId {
-    rand::random::<u64>()
+    rand::random::<u128>() % BASE36_MAX
+}
+
+/// Encode a pack ID as a 16-char zero-padded lowercase base36 string.
+pub fn pack_id_to_string(mut id: PackId) -> String {
+    const CHARS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = [b'0'; 16];
+    for i in (0..16).rev() {
+        buf[i] = CHARS[(id % 36) as usize];
+        id /= 36;
+    }
+    // SAFETY: buf contains only ASCII alphanumeric bytes.
+    unsafe { String::from_utf8_unchecked(buf.to_vec()) }
+}
+
+/// Parse a base36 string into a pack ID. Returns None on invalid input.
+pub fn pack_id_from_str(s: &str) -> Option<PackId> {
+    u128::from_str_radix(s, 36).ok()
 }
 
 // ============================================================================
@@ -565,16 +586,32 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_id_distribution() {
-        let mut top_bytes = std::collections::HashSet::new();
+    fn test_pack_id_base36_round_trip() {
         for _ in 0..100 {
             let id = new_pack_id();
-            top_bytes.insert((id >> 56) as u8);
+            let s = pack_id_to_string(id);
+            assert_eq!(s.len(), 16, "base36 string should be 16 chars: {s}");
+            assert!(
+                s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "invalid base36 char in: {s}"
+            );
+            let parsed = pack_id_from_str(&s).unwrap();
+            assert_eq!(parsed, id, "round-trip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn test_pack_id_distribution() {
+        let mut first_chars = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let id = new_pack_id();
+            let s = pack_id_to_string(id);
+            first_chars.insert(s.chars().next().unwrap());
         }
         assert!(
-            top_bytes.len() > 20,
-            "poor distribution: only {} distinct top bytes out of 100",
-            top_bytes.len()
+            first_chars.len() > 5,
+            "poor distribution: only {} distinct first chars out of 100",
+            first_chars.len()
         );
     }
 

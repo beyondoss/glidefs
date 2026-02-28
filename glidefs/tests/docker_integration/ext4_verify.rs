@@ -13,9 +13,9 @@ use testcontainers::core::{ExecCommand, Mount};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-use glidefs::ext4::format;
-use glidefs::ext4::tar_convert::{convert_tar_to_ext4, ConvertOptions};
-use glidefs::ext4::writer::{File, Writer, WriterOption};
+use ext4::format;
+use ext4::tar_convert::{convert_tar_to_ext4, ConvertOptions};
+use ext4::writer::{File, Writer, WriterOption};
 
 // ---------------------------------------------------------------------------
 // Helpers

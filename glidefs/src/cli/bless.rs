@@ -403,7 +403,7 @@ mod tests {
         chunk_idx: u32,
         pack_id: PackId,
     ) -> Vec<crate::block::pack::PackIndexEntry> {
-        let key = format!("{}/chunks/{:04}/{:016x}.pack", base_path, chunk_idx, pack_id);
+        let key = format!("{}/chunks/{:04}/{}.pack", base_path, chunk_idx, crate::block::pack::pack_id_to_string(pack_id));
         let path = ObjectPath::from(key);
         let response = store.get(&path).await.unwrap();
         let bytes = response.bytes().await.unwrap();
@@ -418,7 +418,7 @@ mod tests {
         chunk_idx: u32,
         pack_id: PackId,
     ) -> Vec<u8> {
-        let key = format!("{}/chunks/{:04}/{:016x}.pack", base_path, chunk_idx, pack_id);
+        let key = format!("{}/chunks/{:04}/{}.pack", base_path, chunk_idx, crate::block::pack::pack_id_to_string(pack_id));
         let path = ObjectPath::from(key);
         let response = store.get(&path).await.unwrap();
         response.bytes().await.unwrap().to_vec()

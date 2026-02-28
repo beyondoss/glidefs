@@ -70,19 +70,21 @@ impl RegistryClient {
                     platform_entry.digest.clone(),
                 );
 
-                let (nested, _) = self
+                let (nested, platform_digest) = self
                     .client
                     .pull_manifest(&platform_ref, &registry_auth)
                     .await?;
 
-                match nested {
+                let m = match nested {
                     OciManifest::Image(m) => m,
                     OciManifest::ImageIndex(_) => {
                         return Err(Error::InvalidReference(
                             "nested image index not supported".into(),
                         ));
                     }
-                }
+                };
+
+                (m, platform_digest)
             }
         };
 

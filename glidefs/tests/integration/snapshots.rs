@@ -231,7 +231,7 @@ async fn test_gc_respects_snapshot_packs() {
         let packs = cs.list_chunk_packs(chunk_idx).await.unwrap();
         for &pack_id in &entry.packs {
             assert!(
-                packs.iter().any(|p| p.contains(&format!("{pack_id:016x}"))),
+                packs.iter().any(|p| p.contains(&glidefs::block::pack::pack_id_to_string(pack_id))),
                 "pack referenced by snapshot should not be deleted"
             );
         }
@@ -261,7 +261,7 @@ async fn test_delete_snapshot_frees_packs_for_gc() {
         .unwrap();
 
     // Upload orphan packs to S3 (not in current manifest)
-    let orphan_pack_id: u64 = 0xDEAD_5AAB_0000_0001;
+    let orphan_pack_id: u128 = 0xDEAD_5AAB_0000_0001;
     cs.put_chunk_pack(0, orphan_pack_id, b"snapshot-only pack data".to_vec())
         .await
         .unwrap();

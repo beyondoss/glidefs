@@ -671,7 +671,7 @@ async fn test_pack_index_corruption_returns_error() {
     cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
     // Find the pack file in S3 and corrupt the GLIX trailer
-    let pack_ids: Vec<u64> = {
+    let pack_ids: Vec<u128> = {
         let vm_guard = vm.read();
         vm_guard
             .chunk_pack_ids(0)
@@ -682,8 +682,8 @@ async fn test_pack_index_corruption_returns_error() {
 
     // Corrupt the pack: overwrite with garbage that has bad trailer
     let pack_path = object_store::path::Path::from(format!(
-        "test/chunks/0000/{:016x}.pack",
-        pack_ids[0]
+        "test/chunks/0000/{}.pack",
+        glidefs::block::pack::pack_id_to_string(pack_ids[0])
     ));
     let garbage = PutPayload::from(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00]);
     s3.put(&pack_path, garbage).await.unwrap();
@@ -1043,7 +1043,7 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     }
 
     // Snapshot pack list — both "compactions" start from this same stale view
-    let pack_ids: Vec<u64> = {
+    let pack_ids: Vec<u128> = {
         let vm_guard = vm.read();
         vm_guard
             .chunk_pack_ids(0)

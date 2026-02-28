@@ -51,7 +51,7 @@ fn write_blocks(
 async fn create_orphan_packs(
     cs: &glidefs::block::content_store::ContentStore,
     chunk_idx: u32,
-    pack_ids: &[u64],
+    pack_ids: &[u128],
 ) {
     for &pack_id in pack_ids {
         cs.put_chunk_pack(chunk_idx, pack_id, b"orphan pack data".to_vec())
@@ -105,7 +105,7 @@ async fn test_gc_deletes_orphaned_packs() {
         .unwrap();
 
     // Upload orphan packs directly to S3 (not referenced by any manifest)
-    let orphan_ids = [0xDEAD_0001_0000_0001u64, 0xDEAD_0001_0000_0002];
+    let orphan_ids = [0xDEAD_0001_0000_0001u128, 0xDEAD_0001_0000_0002];
     create_orphan_packs(&cs, 0, &orphan_ids).await;
 
     // Inject old timestamps so orphans pass the grace period
@@ -139,7 +139,7 @@ async fn test_gc_respects_grace_period() {
         .unwrap();
 
     // Upload orphan packs
-    let orphan_ids = [0xDEAD_0002_0000_0001u64, 0xDEAD_0002_0000_0002];
+    let orphan_ids = [0xDEAD_0002_0000_0001u128, 0xDEAD_0002_0000_0002];
     create_orphan_packs(&cs, 0, &orphan_ids).await;
 
     // GC with 24h grace period — orphans just discovered, should NOT be deleted
@@ -204,7 +204,7 @@ async fn test_gc_respects_max_deletes() {
         .unwrap();
 
     // Upload several orphan packs across different chunks
-    let orphan_ids: Vec<u64> = (1..=5).map(|i| 0xDEAD_0003_0000_0000u64 + i).collect();
+    let orphan_ids: Vec<u128> = (1..=5).map(|i| 0xDEAD_0003_0000_0000u128 + i).collect();
     create_orphan_packs(&cs, 0, &orphan_ids).await;
 
     // Inject old timestamps so all orphans are eligible
@@ -247,7 +247,7 @@ async fn test_gc_dry_run() {
         .unwrap();
 
     // Upload orphan packs
-    let orphan_ids = [0xDEAD_0004_0000_0001u64, 0xDEAD_0004_0000_0002];
+    let orphan_ids = [0xDEAD_0004_0000_0001u128, 0xDEAD_0004_0000_0002];
     create_orphan_packs(&cs, 0, &orphan_ids).await;
 
     let mut state = new_gc_state_for_test();

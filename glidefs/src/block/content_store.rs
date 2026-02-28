@@ -455,7 +455,7 @@ impl ContentStore {
 
     /// Upload a chunk pack to S3 (non-streaming, used by tests and GC).
     ///
-    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
+    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id}.pack`
     #[instrument(skip(self, data), fields(chunk_idx, pack_id, size = data.len()))]
     #[allow(dead_code)]
     pub async fn put_chunk_pack(
@@ -470,8 +470,8 @@ impl ContentStore {
             None => None,
         };
         let key = format!(
-            "{}/chunks/{:04}/{:016x}.pack",
-            self.base_path, chunk_idx, pack_id
+            "{}/chunks/{:04}/{}.pack",
+            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
         );
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
@@ -505,8 +505,8 @@ impl ContentStore {
             None => None,
         };
         let key = format!(
-            "{}/chunks/{:04}/{:016x}.pack",
-            self.base_path, chunk_idx, pack_id
+            "{}/chunks/{:04}/{}.pack",
+            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
         );
         let path = ObjectPath::from(key);
         let upload = self
@@ -533,7 +533,7 @@ impl ContentStore {
 
     /// Fetch a single compressed block from a chunk pack via S3 range request.
     ///
-    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
+    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id}.pack`
     #[instrument(skip(self), fields(chunk_idx, pack_id, offset, comp_length))]
     pub async fn get_chunk_block(
         &self,
@@ -543,8 +543,8 @@ impl ContentStore {
         comp_length: u32,
     ) -> Result<bytes::Bytes, ContentStoreError> {
         let key = format!(
-            "{}/chunks/{:04}/{:016x}.pack",
-            self.base_path, chunk_idx, pack_id
+            "{}/chunks/{:04}/{}.pack",
+            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
         );
         self.get_range_from_key(&key, offset, comp_length).await
     }
@@ -555,7 +555,7 @@ impl ContentStore {
     /// then `parse_pack_index` locates the GLIX trailer and parses the
     /// preceding index entries.
     ///
-    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
+    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id}.pack`
     #[instrument(skip(self), fields(chunk_idx, pack_id))]
     pub async fn get_pack_index(
         &self,
@@ -577,8 +577,8 @@ impl ContentStore {
         );
 
         let key = format!(
-            "{}/chunks/{:04}/{:016x}.pack",
-            self.base_path, chunk_idx, pack_id
+            "{}/chunks/{:04}/{}.pack",
+            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
         );
 
         let data = self.get_suffix_from_key(&key, MAX_SUFFIX).await?;
@@ -601,8 +601,8 @@ impl ContentStore {
     ) -> Result<(), ContentStoreError> {
         self.check_circuit()?;
         let key = format!(
-            "{}/chunks/{:04}/{:016x}.pack",
-            self.base_path, chunk_idx, pack_id
+            "{}/chunks/{:04}/{}.pack",
+            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
         );
         let path = ObjectPath::from(key);
         let result = self.object_store.delete(&path).await;
@@ -696,7 +696,7 @@ mod tests {
         let err = store.put_manifest("test", vec![1]).await.unwrap_err();
         assert!(matches!(err, ContentStoreError::CircuitOpen), "put_manifest should fail: {err}");
 
-        let err = store.get_chunk_block(0, 1234u64, 0, 10).await.unwrap_err();
+        let err = store.get_chunk_block(0, 1234u128, 0, 10).await.unwrap_err();
         assert!(matches!(err, ContentStoreError::CircuitOpen), "get_chunk_block should fail: {err}");
     }
 
@@ -756,7 +756,7 @@ mod tests {
         use crate::block::pack::PackIndexEntry;
 
         let store = test_store("test-bucket");
-        let pack_id: u64 = 0x0123_4567_89AB_CDEF;
+        let pack_id: u128 = 0x0123_4567_89AB_CDEF;
         let chunk_size: u32 = 128 * 1024;
 
         // Build 3 blocks with distinct data, out-of-order chunk offsets.
@@ -809,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn test_v4_chunk_pack_round_trip() {
         let store = test_store("test-bucket");
-        let pack_id: u64 = 0xDEADBEEF_CAFEBABE;
+        let pack_id: u128 = 0xDEADBEEF_CAFEBABE;
         let data = b"fake pack data".to_vec();
 
         store
