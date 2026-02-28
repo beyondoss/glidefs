@@ -37,15 +37,31 @@ while let Some(chunk) = stream.next().await {
 
 ## Push a blob and manifest
 
-`push_blob` is idempotent — skips the upload if the blob already exists.
+`push_blob` accepts any `Stream<Item = Result<Bytes, io::Error>>`. Idempotent — skips if the digest already exists. Uses OCI chunked upload (POST → PATCH → PUT).
 
 ```rust
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
+
 let auth = Credentials::UsernamePassword {
     username: "user".into(),
     password: "token".into(),
 };
 
-let digest = client.push_blob(&image, &data, "sha256:abc...", &auth).await?;
+// Stream a large blob from disk.
+let file = File::open("layer.tar.gz").await?;
+let stream = ReaderStream::with_capacity(file, 4 * 1024 * 1024);
+let digest = client.push_blob(&image, stream, "sha256:abc...", &auth).await?;
+
+// Small blobs work too.
+let config = b"{...}";
+let digest = client.push_blob(
+    &image,
+    futures::stream::iter([Ok(Bytes::from(&config[..]))]),
+    "sha256:def...",
+    &auth,
+).await?;
+
 let manifest_digest = client.push_manifest(&image, &manifest, &auth).await?;
 ```
 
@@ -62,6 +78,6 @@ Credentials::UsernamePassword { username, password }
 |---|---|
 | `resolve(image, auth)` | Manifest + config + layer list. Handles multi-arch indexes. |
 | `pull_layer(image, layer, auth)` | Stream raw layer bytes (gzip-compressed). |
-| `push_blob(image, data, digest, auth)` | Push blob. No-op if digest already exists. |
+| `push_blob(image, stream, digest, auth)` | Streaming push. No-op if digest already exists. |
 | `push_manifest(image, manifest, auth)` | Push image manifest. Returns digest. |
 | `blob_exists(image, digest, auth)` | HEAD check for a blob. |

@@ -49,35 +49,15 @@ pub const TRAILER_MAGIC: &[u8; 4] = b"GLIX";
 /// Trailer size: block_count (2) + reserved (2) + magic (4).
 pub const TRAILER_SIZE: usize = 8;
 
-/// 13-char base36 pack identifier (64 bits of entropy).
+/// 8-byte random pack identifier.
 ///
-/// Displayed as 13-char zero-padded lowercase base36 (`0-9a-z`).
-/// Birthday collision threshold ~4.3 billion per chunk.
+/// Collision-safe per chunk (birthday bound ~4.3 billion).
+/// Hex representation distributes uniformly for S3 prefix sharding.
 pub type PackId = u64;
 
 /// Generate a random pack ID.
 pub fn new_pack_id() -> PackId {
     rand::random::<u64>()
-}
-
-/// Base36 width for a u64 (36^13 > u64::MAX).
-const BASE36_WIDTH: usize = 13;
-
-/// Encode a pack ID as a 13-char zero-padded lowercase base36 string.
-pub fn pack_id_to_string(mut id: PackId) -> String {
-    const CHARS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut buf = [b'0'; BASE36_WIDTH];
-    for i in (0..BASE36_WIDTH).rev() {
-        buf[i] = CHARS[(id % 36) as usize];
-        id /= 36;
-    }
-    // SAFETY: buf contains only ASCII alphanumeric bytes.
-    unsafe { String::from_utf8_unchecked(buf.to_vec()) }
-}
-
-/// Parse a base36 string into a pack ID. Returns None on invalid input.
-pub fn pack_id_from_str(s: &str) -> Option<PackId> {
-    u64::from_str_radix(s, 36).ok()
 }
 
 // ============================================================================
@@ -585,33 +565,16 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_id_base36_round_trip() {
+    fn test_pack_id_distribution() {
+        let mut top_bytes = std::collections::HashSet::new();
         for _ in 0..100 {
             let id = new_pack_id();
-            let s = pack_id_to_string(id);
-            assert_eq!(s.len(), 13, "base36 string should be 13 chars: {s}");
-            assert!(
-                s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
-                "invalid base36 char in: {s}"
-            );
-            let parsed = pack_id_from_str(&s).unwrap();
-            assert_eq!(parsed, id, "round-trip failed for {s}");
-        }
-    }
-
-    #[test]
-    fn test_pack_id_distribution() {
-        // Check last char (full 36-value range) for uniform distribution.
-        let mut last_chars = std::collections::HashSet::new();
-        for _ in 0..200 {
-            let id = new_pack_id();
-            let s = pack_id_to_string(id);
-            last_chars.insert(s.chars().last().unwrap());
+            top_bytes.insert((id >> 56) as u8);
         }
         assert!(
-            last_chars.len() > 20,
-            "poor distribution: only {} distinct last chars out of 200",
-            last_chars.len()
+            top_bytes.len() > 20,
+            "poor distribution: only {} distinct top bytes out of 100",
+            top_bytes.len()
         );
     }
 

@@ -432,105 +432,118 @@ impl<R: Read + Seek> Reader<R> {
     pub fn to_tar<W: Write>(&mut self, w: W) -> io::Result<W> {
         let mut builder = tar::Builder::new(w);
         let entries = self.walk()?;
-
-        // Track inodes we've seen for hard link detection
         let mut seen_inodes: BTreeMap<InodeNumber, String> = BTreeMap::new();
 
         for entry in &entries {
-            let file_type = entry.mode & TYPE_MASK;
-
-            // Hard link detection: if we've seen this inode before and it has links > 1
-            if entry.links_count > 1 && file_type == format::S_IFREG {
-                if let Some(first_path) = seen_inodes.get(&entry.inode_number) {
-                    let mut header = tar::Header::new_gnu();
-                    header.set_entry_type(tar::EntryType::Link);
-                    header.set_size(0);
-                    header.set_mode((entry.mode & !TYPE_MASK) as u32);
-                    header.set_uid(entry.uid as u64);
-                    header.set_gid(entry.gid as u64);
-                    header.set_mtime(entry.mtime & 0xFFFFFFFF);
-                    header.set_cksum();
-                    builder.append_link(&mut header, &entry.path, first_path)?;
-                    continue;
-                }
-                seen_inodes.insert(entry.inode_number, entry.path.clone());
-            }
-
-            let mut header = tar::Header::new_gnu();
-            header.set_mode((entry.mode & !TYPE_MASK) as u32);
-            header.set_uid(entry.uid as u64);
-            header.set_gid(entry.gid as u64);
-            header.set_mtime(entry.mtime & 0xFFFFFFFF);
-
-            match file_type {
-                format::S_IFREG => {
-                    header.set_entry_type(tar::EntryType::Regular);
-                    header.set_size(entry.size);
-                    header.set_cksum();
-                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
-
-                    // Stream file data without buffering the entire file.
-                    if entry.size == 0 {
-                        builder.append_data(&mut header, &entry.path, io::empty())?;
-                    } else {
-                        let inode = self.read_inode(entry.inode_number)?;
-                        if inode.flags.contains(InodeFlags::INLINE_DATA) {
-                            let data = self.read_inline_data(&inode)?;
-                            builder.append_data(&mut header, &entry.path, &data[..])?;
-                        } else {
-                            let mut reader = self.extent_reader(&inode)?;
-                            builder.append_data(&mut header, &entry.path, &mut reader)?;
-                        }
-                    }
-                }
-                format::S_IFDIR => {
-                    header.set_entry_type(tar::EntryType::Directory);
-                    header.set_size(0);
-                    header.set_cksum();
-                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
-                    let path = format!("{}/", entry.path);
-                    builder.append_data(&mut header, &path, io::empty())?;
-                }
-                format::S_IFLNK => {
-                    header.set_entry_type(tar::EntryType::Symlink);
-                    header.set_size(0);
-                    if let Some(ref target) = entry.symlink_target {
-                        header.set_link_name(target)?;
-                    }
-                    header.set_cksum();
-                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
-                    builder.append_data(&mut header, &entry.path, io::empty())?;
-                }
-                format::S_IFCHR => {
-                    header.set_entry_type(tar::EntryType::Char);
-                    header.set_size(0);
-                    header.set_device_major(entry.devmajor)?;
-                    header.set_device_minor(entry.devminor)?;
-                    header.set_cksum();
-                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
-                    builder.append_data(&mut header, &entry.path, io::empty())?;
-                }
-                format::S_IFBLK => {
-                    header.set_entry_type(tar::EntryType::Block);
-                    header.set_size(0);
-                    header.set_device_major(entry.devmajor)?;
-                    header.set_device_minor(entry.devminor)?;
-                    header.set_cksum();
-                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
-                    builder.append_data(&mut header, &entry.path, io::empty())?;
-                }
-                format::S_IFIFO => {
-                    header.set_entry_type(tar::EntryType::Fifo);
-                    header.set_size(0);
-                    header.set_cksum();
-                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
-                    builder.append_data(&mut header, &entry.path, io::empty())?;
-                }
-                _ => {} // Skip unknown types
-            }
+            self.write_entry_to_tar(entry, &mut builder, &mut seen_inodes)?;
         }
 
         builder.into_inner()
+    }
+
+    /// Write a single WalkEntry to a tar builder, streaming file data.
+    ///
+    /// Handles all file types (regular, directory, symlink, char/block device, FIFO)
+    /// and hard link detection via the `seen_inodes` map.
+    pub(crate) fn write_entry_to_tar<W: Write>(
+        &mut self,
+        entry: &WalkEntry,
+        builder: &mut tar::Builder<W>,
+        seen_inodes: &mut BTreeMap<InodeNumber, String>,
+    ) -> io::Result<()> {
+        let file_type = entry.mode & TYPE_MASK;
+
+        // Hard link detection: if we've seen this inode before and it has links > 1
+        if entry.links_count > 1 && file_type == format::S_IFREG {
+            if let Some(first_path) = seen_inodes.get(&entry.inode_number) {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Link);
+                header.set_size(0);
+                header.set_mode((entry.mode & !TYPE_MASK) as u32);
+                header.set_uid(entry.uid as u64);
+                header.set_gid(entry.gid as u64);
+                header.set_mtime(entry.mtime & 0xFFFFFFFF);
+                header.set_cksum();
+                builder.append_link(&mut header, &entry.path, first_path)?;
+                return Ok(());
+            }
+            seen_inodes.insert(entry.inode_number, entry.path.clone());
+        }
+
+        let mut header = tar::Header::new_gnu();
+        header.set_mode((entry.mode & !TYPE_MASK) as u32);
+        header.set_uid(entry.uid as u64);
+        header.set_gid(entry.gid as u64);
+        header.set_mtime(entry.mtime & 0xFFFFFFFF);
+
+        match file_type {
+            format::S_IFREG => {
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(entry.size);
+                header.set_cksum();
+                append_pax_xattrs(builder, &entry.xattrs)?;
+
+                // Stream file data without buffering the entire file.
+                if entry.size == 0 {
+                    builder.append_data(&mut header, &entry.path, io::empty())?;
+                } else {
+                    let inode = self.read_inode(entry.inode_number)?;
+                    if inode.flags.contains(InodeFlags::INLINE_DATA) {
+                        let data = self.read_inline_data(&inode)?;
+                        builder.append_data(&mut header, &entry.path, &data[..])?;
+                    } else {
+                        let mut reader = self.extent_reader(&inode)?;
+                        builder.append_data(&mut header, &entry.path, &mut reader)?;
+                    }
+                }
+            }
+            format::S_IFDIR => {
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_size(0);
+                header.set_cksum();
+                append_pax_xattrs(builder, &entry.xattrs)?;
+                let path = format!("{}/", entry.path);
+                builder.append_data(&mut header, &path, io::empty())?;
+            }
+            format::S_IFLNK => {
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                if let Some(ref target) = entry.symlink_target {
+                    header.set_link_name(target)?;
+                }
+                header.set_cksum();
+                append_pax_xattrs(builder, &entry.xattrs)?;
+                builder.append_data(&mut header, &entry.path, io::empty())?;
+            }
+            format::S_IFCHR => {
+                header.set_entry_type(tar::EntryType::Char);
+                header.set_size(0);
+                header.set_device_major(entry.devmajor)?;
+                header.set_device_minor(entry.devminor)?;
+                header.set_cksum();
+                append_pax_xattrs(builder, &entry.xattrs)?;
+                builder.append_data(&mut header, &entry.path, io::empty())?;
+            }
+            format::S_IFBLK => {
+                header.set_entry_type(tar::EntryType::Block);
+                header.set_size(0);
+                header.set_device_major(entry.devmajor)?;
+                header.set_device_minor(entry.devminor)?;
+                header.set_cksum();
+                append_pax_xattrs(builder, &entry.xattrs)?;
+                builder.append_data(&mut header, &entry.path, io::empty())?;
+            }
+            format::S_IFIFO => {
+                header.set_entry_type(tar::EntryType::Fifo);
+                header.set_size(0);
+                header.set_cksum();
+                append_pax_xattrs(builder, &entry.xattrs)?;
+                builder.append_data(&mut header, &entry.path, io::empty())?;
+            }
+            _ => {} // Skip unknown types
+        }
+
+        Ok(())
     }
 
     /// Access the parsed superblock.
@@ -564,7 +577,7 @@ pub struct WalkEntry {
 }
 
 /// Emit PAX xattr extensions into the tar stream, if any.
-fn append_pax_xattrs<W: Write>(
+pub(crate) fn append_pax_xattrs<W: Write>(
     builder: &mut tar::Builder<W>,
     xattrs: &BTreeMap<String, Vec<u8>>,
 ) -> io::Result<()> {

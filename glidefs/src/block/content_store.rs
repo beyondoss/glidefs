@@ -455,7 +455,7 @@ impl ContentStore {
 
     /// Upload a chunk pack to S3 (non-streaming, used by tests and GC).
     ///
-    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id}.pack`
+    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
     #[instrument(skip(self, data), fields(chunk_idx, pack_id, size = data.len()))]
     #[allow(dead_code)]
     pub async fn put_chunk_pack(
@@ -470,8 +470,8 @@ impl ContentStore {
             None => None,
         };
         let key = format!(
-            "{}/chunks/{:04}/{}.pack",
-            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
+            "{}/chunks/{:04}/{:016x}.pack",
+            self.base_path, chunk_idx, pack_id
         );
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
@@ -505,8 +505,8 @@ impl ContentStore {
             None => None,
         };
         let key = format!(
-            "{}/chunks/{:04}/{}.pack",
-            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
+            "{}/chunks/{:04}/{:016x}.pack",
+            self.base_path, chunk_idx, pack_id
         );
         let path = ObjectPath::from(key);
         let upload = self
@@ -533,7 +533,7 @@ impl ContentStore {
 
     /// Fetch a single compressed block from a chunk pack via S3 range request.
     ///
-    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id}.pack`
+    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
     #[instrument(skip(self), fields(chunk_idx, pack_id, offset, comp_length))]
     pub async fn get_chunk_block(
         &self,
@@ -543,8 +543,8 @@ impl ContentStore {
         comp_length: u32,
     ) -> Result<bytes::Bytes, ContentStoreError> {
         let key = format!(
-            "{}/chunks/{:04}/{}.pack",
-            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
+            "{}/chunks/{:04}/{:016x}.pack",
+            self.base_path, chunk_idx, pack_id
         );
         self.get_range_from_key(&key, offset, comp_length).await
     }
@@ -555,7 +555,7 @@ impl ContentStore {
     /// then `parse_pack_index` locates the GLIX trailer and parses the
     /// preceding index entries.
     ///
-    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id}.pack`
+    /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
     #[instrument(skip(self), fields(chunk_idx, pack_id))]
     pub async fn get_pack_index(
         &self,
@@ -577,8 +577,8 @@ impl ContentStore {
         );
 
         let key = format!(
-            "{}/chunks/{:04}/{}.pack",
-            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
+            "{}/chunks/{:04}/{:016x}.pack",
+            self.base_path, chunk_idx, pack_id
         );
 
         let data = self.get_suffix_from_key(&key, MAX_SUFFIX).await?;
@@ -601,8 +601,8 @@ impl ContentStore {
     ) -> Result<(), ContentStoreError> {
         self.check_circuit()?;
         let key = format!(
-            "{}/chunks/{:04}/{}.pack",
-            self.base_path, chunk_idx, super::pack::pack_id_to_string(pack_id)
+            "{}/chunks/{:04}/{:016x}.pack",
+            self.base_path, chunk_idx, pack_id
         );
         let path = ObjectPath::from(key);
         let result = self.object_store.delete(&path).await;

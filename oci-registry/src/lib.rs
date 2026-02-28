@@ -141,30 +141,39 @@ impl RegistryClient {
         Ok(self.client.blob_exists(image, digest).await?)
     }
 
-    /// Push a blob to the registry.
+    /// Push a blob to the registry via streaming upload.
     ///
-    /// Skips upload if the blob already exists (idempotent). Returns the digest.
-    pub async fn push_blob(
+    /// Idempotent — skips upload if the blob already exists. Returns the digest.
+    /// Uses the OCI chunked upload flow (POST → PATCH → PUT) so the full blob
+    /// never needs to be held in memory.
+    pub async fn push_blob<S>(
         &self,
         image: &Reference,
-        data: Bytes,
+        stream: S,
         digest: &str,
         auth: &Credentials,
-    ) -> Result<String, Error> {
+    ) -> Result<String, Error>
+    where
+        S: Stream<Item = Result<Bytes, io::Error>> + Send + Unpin,
+    {
         let registry_auth = auth.into();
         self.client
             .auth(image, &registry_auth, oci_client::RegistryOperation::Push)
             .await?;
 
-        // Check if blob already exists.
         if self.client.blob_exists(image, digest).await? {
             debug!(digest, "blob already exists, skipping upload");
             return Ok(digest.to_string());
         }
 
+        use futures::StreamExt;
+        let mapped = stream.map(|r| {
+            r.map_err(|e| oci_client::errors::OciDistributionError::IoError(e))
+        });
+
         let url = self
             .client
-            .push_blob(image, data, digest)
+            .push_blob_stream(image, mapped, digest)
             .await?;
         debug!(digest, url, "pushed blob");
         Ok(digest.to_string())

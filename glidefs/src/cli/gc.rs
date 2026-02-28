@@ -30,14 +30,13 @@ use crate::parse_object_store::parse_url_opts;
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct GcState {
-    /// Pack key ("{chunk_idx:04}/{pack_id_base36}") -> first-seen-dead ISO 8601 timestamp.
+    /// Pack key ("{chunk_idx:04}/{pack_id:016x}") -> first-seen-dead ISO 8601 timestamp.
     pub(crate) dead_packs: HashMap<String, String>,
 }
 
 /// Format a composite key for a (chunk_idx, pack_id) pair.
 fn pack_key(chunk_idx: u32, pack_id: PackId) -> String {
-    use crate::block::pack::pack_id_to_string;
-    format!("{chunk_idx:04}/{}", pack_id_to_string(pack_id))
+    format!("{chunk_idx:04}/{pack_id:016x}")
 }
 
 impl GcState {
@@ -293,7 +292,7 @@ async fn discover_s3_prefixes(
 /// List all v4 pack files across chunk directories.
 ///
 /// Scans `{base_path}/chunks/` and parses filenames matching
-/// `{idx:04}/{pack_id_base36}.pack`. Returns `(chunk_idx, pack_id)` pairs.
+/// `{idx:04}/{pack_id:016x}.pack`. Returns `(chunk_idx, pack_id)` pairs.
 #[cfg(test)]
 async fn list_all_packs(
     content_store: &ContentStore,
@@ -318,9 +317,9 @@ async fn list_all_packs(
             continue;
         };
         let filename = &rel[slash_pos + 1..];
-        if let Some(id_str) = filename.strip_suffix(".pack")
-            && id_str.len() == 13
-            && let Some(pack_id) = crate::block::pack::pack_id_from_str(id_str)
+        if let Some(hex_str) = filename.strip_suffix(".pack")
+            && hex_str.len() == 16
+            && let Ok(pack_id) = u64::from_str_radix(hex_str, 16)
         {
             packs.insert((chunk_idx, pack_id));
         }
@@ -339,11 +338,11 @@ fn parse_pack_path(rel: &str) -> Option<(u32, PackId)> {
     let slash_pos = rel.find('/')?;
     let chunk_idx = rel[..slash_pos].parse::<u32>().ok()?;
     let filename = &rel[slash_pos + 1..];
-    let id_str = filename.strip_suffix(".pack")?;
-    if id_str.len() != 13 {
+    let hex_str = filename.strip_suffix(".pack")?;
+    if hex_str.len() != 16 {
         return None;
     }
-    let pack_id = crate::block::pack::pack_id_from_str(id_str)?;
+    let pack_id = u64::from_str_radix(hex_str, 16).ok()?;
     Some((chunk_idx, pack_id))
 }
 
@@ -785,21 +784,8 @@ mod tests {
 
     #[test]
     fn test_pack_key_format() {
-        use crate::block::pack::{pack_id_from_str, pack_id_to_string};
-        // Verify round-trip: pack_key uses base36, parse back to PackId.
-        let id = 42u64;
-        let key = pack_key(0, id);
-        let parts: Vec<&str> = key.split('/').collect();
-        assert_eq!(parts[0], "0000");
-        assert_eq!(parts[1].len(), 13);
-        assert_eq!(pack_id_from_str(parts[1]).unwrap(), id);
-
-        // Verify chunk_idx padding.
-        let key2 = pack_key(42, id);
-        assert!(key2.starts_with("0042/"));
-
-        // Verify pack_id_to_string output matches.
-        assert_eq!(parts[1], pack_id_to_string(id));
+        assert_eq!(pack_key(0, 0xDEADBEEF01234567), "0000/deadbeef01234567");
+        assert_eq!(pack_key(42, 0x0000000000000001), "0042/0000000000000001");
     }
 
     #[tokio::test]

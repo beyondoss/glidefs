@@ -88,20 +88,18 @@ jobs:
 
       - name: Build with cross (Linux)
         if: matrix.platform == 'linux'
-        working-directory: glidefs
         env:
           # io-uring (transitive dep via foyer) only ships prebuilt bindings for
           # x86_64/aarch64. This flag tells it to use those bindings on other
           # architectures where the io_uring ABI is identical.
           RUSTFLAGS: '--cfg=io_uring_skip_arch_check --cfg tokio_unstable'
         run: |
-          cross build --profile ci --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+          cross build -p glidefs --profile ci --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
       - name: Build with cargo (macOS)
         if: matrix.platform == 'darwin'
-        working-directory: glidefs
         run: |
-          cargo build --profile ci --target ${{ matrix.target }}
+          cargo build -p glidefs --profile ci --target ${{ matrix.target }}
 
       - name: Prepare binary
         run: |

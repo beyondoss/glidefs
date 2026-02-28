@@ -682,8 +682,8 @@ async fn test_pack_index_corruption_returns_error() {
 
     // Corrupt the pack: overwrite with garbage that has bad trailer
     let pack_path = object_store::path::Path::from(format!(
-        "test/chunks/0000/{}.pack",
-        glidefs::block::pack::pack_id_to_string(pack_ids[0])
+        "test/chunks/0000/{:016x}.pack",
+        pack_ids[0]
     ));
     let garbage = PutPayload::from(vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00]);
     s3.put(&pack_path, garbage).await.unwrap();

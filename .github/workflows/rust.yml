@@ -13,9 +13,6 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: glidefs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,30 +21,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - name: Run clippy
-        run: cargo clippy --features test-utils --tests --benches
+      - name: Clippy (ext4, oci-registry)
+        run: cargo clippy -p ext4 -p oci-registry --tests
+      - name: Clippy (glidefs)
+        run: cargo clippy -p glidefs --features test-utils --tests --benches
 
   build:
     name: Build and Test
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: glidefs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - name: Run all tests
-        run: cargo test --features test-utils --verbose
+      - name: Test (ext4, oci-registry)
+        run: cargo test -p ext4 -p oci-registry --verbose
+      - name: Test (glidefs)
+        run: cargo test -p glidefs --features test-utils --verbose
 
   docker-integration:
     name: Docker Integration Tests
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: glidefs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -55,7 +50,7 @@ jobs:
         with:
           workspaces: ". -> target"
       - name: Run docker integration tests
-        run: cargo test --features docker-tests --test docker_integration --verbose
+        run: cargo test -p glidefs --features docker-tests --test docker_integration --verbose
 
   loom:
     name: Loom Concurrency Tests
@@ -75,9 +70,6 @@ jobs:
   benchmarks:
     name: Benchmarks
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: glidefs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,14 +77,11 @@ jobs:
         with:
           workspaces: ". -> target"
       - name: Run benchmarks
-        run: cargo bench --features test-utils --benches
+        run: cargo bench -p glidefs --features test-utils --benches
 
   kernel-devices:
     name: Kernel Devices (Linux)
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: glidefs
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -106,14 +95,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y linux-modules-extra-$(uname -r) fio
       - name: Clippy (ublk)
-        run: cargo clippy --features ublk,test-utils --tests --benches
+        run: cargo clippy -p glidefs --features ublk,test-utils --tests --benches
       - name: Load kernel modules
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
       - name: fio benchmark (ublk)
-        run: sudo -E env "PATH=$PATH" cargo test --features fio-bench --test fio_bench -- --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features fio-bench --test fio_bench -- --nocapture
       - name: Test (ublk)
-        run: cargo test --features ublk,test-utils --verbose
+        run: cargo test -p glidefs --features ublk,test-utils --verbose
       - name: Docker integration (ublk)
-        run: sudo -E env "PATH=$PATH" cargo test --features ublk,docker-tests --test docker_integration ublk --verbose
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose

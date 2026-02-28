@@ -1,16 +1,27 @@
 use crate::block::block_map::{blake3_128, lz4_compress, zero_block_hash, Blake3Hash};
+use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
 use crate::block::content_store::ContentStore;
+use crate::block::handler::BlockHandler;
 use crate::block::manifest::serialize_hot_set;
-use crate::block::pack::{new_pack_id, PackId};
+use crate::block::metrics::ExportMetrics;
+use crate::block::pack::{new_pack_id, PackId, DEFAULT_BLOCKS_PER_PACK};
+use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::volume_manifest::VolumeManifest;
+use crate::block::write_cache::{WriteCache, WriteCacheConfig};
 use crate::config::Settings;
+use crate::oci::ingest::IngestOptions;
+use crate::oci::pull::pull_image;
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
+use ext4::writer::WriterOption;
+use oci_registry::{Credentials, RegistryClient};
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
+use tokio::sync::Notify;
 use tracing::info;
 
 /// Fixed block size for the chunked architecture: 128KB.
@@ -179,6 +190,209 @@ pub async fn run_bless(
         stats.bytes_uploaded as f64 / 1e6
     );
     println!("  Chunks written:  {}", stats.chunks_written);
+    println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
+    println!("  Manifest:        manifests/{}", manifest_key);
+
+    Ok(())
+}
+
+/// Bless an OCI image into a content-addressed base image.
+///
+/// Pulls layers from the registry, converts to ext4, writes through
+/// BlockHandler → WriteCache, drains to S3, then generates a hot set
+/// and saves the manifest as a base.
+pub async fn run_bless_oci(
+    image_ref: String,
+    name: String,
+    s3_prefix: String,
+    config_path: PathBuf,
+) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or(tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let start = Instant::now();
+
+    // --- S3 setup (same as run_bless) ---
+    let settings = Settings::from_file(&config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+
+    let url = settings.storage.url.clone();
+    let env_vars = settings.cloud_provider_env_vars();
+    let (object_store, path_from_url) = parse_url_opts(
+        &url.parse()?,
+        env_vars.into_iter(),
+        Some(settings.storage.connect_timeout()),
+        Some(settings.storage.request_timeout()),
+    )?;
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+    let db_path = path_from_url.to_string();
+
+    let base = format!("{}/exports/{}", db_path, s3_prefix);
+    let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), &base));
+
+    // --- Resolve OCI image to get layer sizes for device size estimation ---
+    let registry_client = RegistryClient::new();
+    let image: oci_registry::Reference = image_ref
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid image reference: {e}"))?;
+
+    info!(image = %image_ref, name = %name, "resolving OCI image");
+
+    let resolved = registry_client
+        .resolve(&image, &Credentials::Anonymous)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve image: {e}"))?;
+
+    // Estimate device size: sum compressed layer sizes × 3 (decompression + ext4 overhead).
+    // Round up to next power-of-2 MiB boundary. Minimum 64 MiB.
+    let total_compressed: u64 = resolved.layers.iter().map(|l| l.size as u64).sum();
+    let estimated = (total_compressed * 3).max(64 * 1024 * 1024);
+    let device_size = estimated.next_power_of_two();
+
+    info!(
+        layers = resolved.layers.len(),
+        total_compressed,
+        device_size,
+        "estimated device size"
+    );
+
+    // --- Create temporary export infrastructure ---
+    let temp_dir = tempfile::TempDir::new().context("failed to create temp dir")?;
+    let cache_config = WriteCacheConfig {
+        cache_dir: temp_dir.path().to_path_buf(),
+        device_name: format!("bless-oci-{}", name),
+        device_size,
+        block_size: BLOCK_SIZE as usize,
+        wal_sync: false,
+    };
+
+    let cache = Arc::new(WriteCache::open_fresh_active(cache_config)?);
+
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        device_size, BLOCK_SIZE,
+    )));
+
+    let pack_index_cache = Arc::new(
+        PackIndexCache::open(temp_dir.path())
+            .await
+            .context("failed to open pack index cache")?,
+    );
+
+    // Minimal clean cache — OCI ingest is write-only, no reads from S3.
+    let foyer_dir = temp_dir.path().join("foyer");
+    std::fs::create_dir_all(&foyer_dir)?;
+    let clean_cache: Arc<dyn BlockCache> = Arc::new(
+        FoyerBlockCache::open(FoyerCacheConfig {
+            memory_bytes: 4 * 1024 * 1024,
+            ssd_bytes: 16 * 1024 * 1024,
+            ssd_dir: foyer_dir,
+        })
+        .await
+        .context("failed to open block cache")?,
+    );
+
+    let metrics = Arc::new(ExportMetrics::new());
+    let flush_notify = Arc::new(Notify::const_new());
+
+    let handler = Arc::new(BlockHandler::new(
+        Arc::clone(&cache),
+        Arc::clone(&content_store),
+        Arc::clone(&clean_cache),
+        Arc::clone(&pack_index_cache),
+        Arc::clone(&volume_manifest),
+        device_size,
+        false,
+        metrics,
+        Arc::new(AtomicU64::new(0f64.to_bits())),
+        flush_notify,
+        DEFAULT_BLOCKS_PER_PACK,
+        None,
+    ));
+
+    // --- Pull + ingest OCI image ---
+    let uuid: [u8; 16] = rand::random();
+    let ingest_opts = IngestOptions {
+        writer_options: vec![
+            WriterOption::MaximumDiskSize(device_size as i64),
+            WriterOption::Uuid(uuid),
+            WriterOption::Journal(1024), // 4 MiB journal
+        ],
+    };
+
+    info!("pulling and ingesting layers");
+
+    pull_image(
+        &registry_client,
+        &image,
+        &Credentials::Anonymous,
+        Arc::clone(&handler),
+        ingest_opts,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("pull failed: {e}"))?;
+
+    // --- Drain to S3 ---
+    info!("draining to S3");
+
+    for i in 0..100 {
+        let stats = cache
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .await
+            .map_err(|e| anyhow::anyhow!("flush failed: {e}"))?;
+        if stats.blocks_claimed == 0 {
+            info!(iterations = i + 1, "drain complete");
+            break;
+        }
+    }
+
+    // --- Generate hot set from VolumeManifest ---
+    let hot_set = {
+        let vm = volume_manifest.read();
+        let blocks_per_chunk = vm.blocks_per_chunk() as u64;
+        let mut indices: Vec<u64> = Vec::new();
+
+        for (&chunk_idx, entry) in &vm.chunks {
+            for &pack_id in &entry.packs {
+                if let Some(entries) = pack_index_cache.get_entries(pack_id).await {
+                    for e in &entries {
+                        let global_block = chunk_idx as u64 * blocks_per_chunk + e.chunk_offset as u64;
+                        indices.push(global_block);
+                    }
+                }
+            }
+        }
+
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    };
+
+    let hot_set_data = serialize_hot_set(&hot_set);
+    content_store
+        .put_hot_set(&name, hot_set_data)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to upload hot set: {e}"))?;
+
+    // --- Save manifest as base ---
+    let manifest_key = format!("bases/{}", name);
+    let manifest_data = volume_manifest.read().serialize();
+    content_store
+        .put_manifest(&manifest_key, manifest_data)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
+
+    let elapsed = start.elapsed();
+
+    println!("Blessed '{}' from OCI image successfully:", name);
+    println!("  Image:           {}", image_ref);
+    println!("  Layers:          {}", resolved.layers.len());
+    println!("  Device size:     {:.1} MB", device_size as f64 / 1e6);
+    println!("  Hot set blocks:  {}", hot_set.len());
     println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
     println!("  Manifest:        manifests/{}", manifest_key);
 
@@ -403,7 +617,7 @@ mod tests {
         chunk_idx: u32,
         pack_id: PackId,
     ) -> Vec<crate::block::pack::PackIndexEntry> {
-        let key = format!("{}/chunks/{:04}/{}.pack", base_path, chunk_idx, crate::block::pack::pack_id_to_string(pack_id));
+        let key = format!("{}/chunks/{:04}/{:016x}.pack", base_path, chunk_idx, pack_id);
         let path = ObjectPath::from(key);
         let response = store.get(&path).await.unwrap();
         let bytes = response.bytes().await.unwrap();
@@ -418,7 +632,7 @@ mod tests {
         chunk_idx: u32,
         pack_id: PackId,
     ) -> Vec<u8> {
-        let key = format!("{}/chunks/{:04}/{}.pack", base_path, chunk_idx, crate::block::pack::pack_id_to_string(pack_id));
+        let key = format!("{}/chunks/{:04}/{:016x}.pack", base_path, chunk_idx, pack_id);
         let path = ObjectPath::from(key);
         let response = store.get(&path).await.unwrap();
         response.bytes().await.unwrap().to_vec()

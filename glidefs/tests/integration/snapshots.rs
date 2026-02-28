@@ -231,7 +231,7 @@ async fn test_gc_respects_snapshot_packs() {
         let packs = cs.list_chunk_packs(chunk_idx).await.unwrap();
         for &pack_id in &entry.packs {
             assert!(
-                packs.iter().any(|p| p.contains(&glidefs::block::pack::pack_id_to_string(pack_id))),
+                packs.iter().any(|p| p.contains(&format!("{pack_id:016x}"))),
                 "pack referenced by snapshot should not be deleted"
             );
         }

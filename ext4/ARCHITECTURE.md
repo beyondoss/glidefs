@@ -90,6 +90,41 @@ ext4 image (Read + Seek)
 
 **Hard link detection**: During `to_tar()`, a `BTreeMap<InodeNumber, String>` tracks the first path seen for each inode. When the same inode appears again with `links_count > 1`, a tar `Link` entry is emitted referencing the first path. This correctly reconstructs hard links without duplicating data.
 
+### Diff Path (base ext4 + target ext4 → delta tar)
+
+```
+ext4 image A (base)      ext4 image B (target)
+      │                        │
+      ▼                        ▼
+ Reader::walk()           Reader::walk()
+      │                        │
+      ▼                        ▼
+ BTreeMap<path, entry>    iterate entries
+      │                        │
+      └────────┬───────────────┘
+               ▼
+       diff by path + metadata
+               │
+       ┌───────┼──────────┐
+       ▼       ▼          ▼
+     added   modified   deleted
+       │       │          │
+       ▼       ▼          ▼
+    tar entry  tar entry  .wh. entry
+               │
+               ▼
+       delta tar stream
+```
+
+`diff_to_tar(base, target, writer)` walks both snapshots and produces a minimal OCI-compatible delta layer:
+
+- **Added**: in target but not base → full tar entry with data
+- **Modified**: metadata differs (mode, uid, gid, size, mtime, symlink_target, devmajor, devminor, xattrs) → full tar entry with data
+- **Deleted**: in base but not target → `.wh.<name>` whiteout marker
+- **Deleted directory**: single `.wh.<dirname>` entry; child whiteouts are suppressed since the whiteout removes the entire subtree
+
+Comparison ignores atime, ctime (volatile), inode_number (internal), and links_count (hard link topology tracked by the tar writer).
+
 **Streaming reads**: `read_data_to(inode, &mut W)` streams file data block-by-block (4 KiB at a time) without buffering the whole file, suitable for large files.
 
 ## Concepts & Terminology
@@ -288,6 +323,7 @@ Container layer images are read-only once mounted by the overlay filesystem. A j
 | `writer.rs` | Core filesystem builder. Manages inode lifecycle, block allocation, extent tree construction, xattr packing, directory serialization, superblock finalization. |
 | `reader.rs` | ext4 image parser. Reads superblock, group descriptors, inode table, extent trees, directory entries, and xattrs. Exports via `walk()` and `to_tar()`. |
 | `tar_convert.rs` | tar→ext4 bridge. Maps tar entry types to writer operations, handles OCI whiteouts and PAX xattrs. |
+| `diff.rs` | Incremental export: diffs two ext4 snapshots and produces an OCI-compatible delta tar layer with whiteout markers for deletions. |
 | `tests.rs` | Integration tests: basic files, hard links, symlinks, devices, large files (>600 MiB), large dirs (50K entries), inline data, xattrs, determinism, reader roundtrips, tar roundtrips. |
 
 ## Configuration
@@ -339,6 +375,18 @@ Three test tiers in `tests.rs`:
 | `test_reader_device_nodes_roundtrip` | Char/block devices, major/minor decoding |
 | `test_reader_tar_roundtrip` | Full tar→ext4→tar roundtrip |
 | `test_reader_to_tar_with_xattrs` | xattr preservation through tar→ext4→tar |
+
+**Diff tests** — diff two in-memory ext4 images, verify delta tar contents:
+
+| Test | What it covers |
+|------|---------------|
+| `test_diff_no_changes` | Identical images → empty tar |
+| `test_diff_added_file` | New file appears in delta, unchanged file absent |
+| `test_diff_deleted_file` | `.wh.` whiteout entry in delta |
+| `test_diff_modified_file` | Changed content appears with new data |
+| `test_diff_deleted_directory` | Single `.wh.` for dir, child entries suppressed |
+| `test_diff_metadata_change` | Mode change detected without content change |
+| `test_whiteout_nested_path` | Correct `.wh.` path for deeply nested files |
 
 **Docker integration tests** (`--features docker-tests`) — validate against real `e2fsck` and `debugfs`:
 

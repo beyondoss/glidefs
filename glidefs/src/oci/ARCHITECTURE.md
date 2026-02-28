@@ -52,6 +52,79 @@ BlockHandler (loaded GlideFS export)
  tar stream (OCI layer)
 ```
 
+### Push (block storage → OCI registry)
+
+```
+BlockHandler (loaded GlideFS export)
+      │
+      ▼
+ push_image()              ← async entry point
+      │
+      │  spawn_blocking (Phase 1: export + compress + hash)
+      ▼
+ BlockAdapter              ← wraps handler as Read + Seek
+      │
+      ▼
+ ext4::Reader::to_tar()    ← walks inode tree, streams tar entries
+      │
+      ▼
+ DigestWriter(uncompressed)   ← computes diff_id (sha256 of uncompressed tar)
+      │
+      ▼
+ GzEncoder                 ← gzip compression
+      │
+      ▼
+ DigestWriter(compressed)  ← computes layer digest (sha256 of compressed blob)
+      │
+      ▼
+ BufWriter<File>           ← spools to temp file (bounded memory)
+      │
+      │  Phase 2: stream from temp file
+      ▼
+ ReaderStream → push_blob_stream()  ← chunked upload to registry (POST → PATCH → PUT)
+      │
+      │  Phase 3-4: config + manifest
+      ▼
+ OCI image in registry
+```
+
+### Incremental Push (two snapshots → two-layer OCI image)
+
+```
+BlockHandler A (base)      BlockHandler B (target)
+      │                          │
+      ▼                          ▼
+ export_compressed_layer    export_delta_layer
+      │                          │
+      │                    ┌─────┴─────┐
+      │                    ▼           ▼
+      │              ext4::Reader  ext4::Reader
+      │                    │           │
+      │                    └─────┬─────┘
+      │                          ▼
+      │                   ext4::diff_to_tar()
+      │                          │
+      ▼                          ▼
+ DigestWriter chain        DigestWriter chain
+      │                          │
+      ▼                          ▼
+ temp file (base layer)    temp file (delta layer)
+      │                          │
+      ▼                          ▼
+ push_blob_stream          push_blob_stream
+ (idempotent)              (delta changes only)
+      │                          │
+      └──────────┬───────────────┘
+                 ▼
+          OCI manifest with two layers
+          layer 0 = full base
+          layer 1 = delta (adds/mods/whiteouts)
+```
+
+`push_delta_image()` exports base and delta layers in parallel via `spawn_blocking`, then stream-uploads both. The base layer is idempotent — `push_blob_stream` skips the upload if the blob already exists. The delta layer contains only changes: added/modified files with full data, `.wh.<name>` whiteout entries for deletions.
+
+The compressed layer is spooled to a temp file so the digest can be computed before upload starts (OCI spec requires the digest in the PUT request). Memory usage is bounded to gzip buffers (~4MB), never proportional to volume size.
+
 ## Concepts & Terminology
 
 | Term           | Definition                                                                  | NOT                                           |
@@ -146,7 +219,7 @@ Determinism is maintained by:
 
 | File                          | Purpose                                                              |
 | ----------------------------- | -------------------------------------------------------------------- |
-| `oci/mod.rs`                  | Public re-exports: `BlockAdapter`, `ingest_tar`, `export_tar`, `IngestOptions` |
+| `oci/mod.rs`                  | Public re-exports: `BlockAdapter`, `ingest_tar`, `export_tar`, `push_image`, `push_delta_image` |
 | `oci/block_adapter.rs`        | `Read + Write + Seek` bridge between sync ext4 code and async `BlockHandler` |
 | `oci/ingest.rs`               | `ingest_tar()`: tar → ext4 → GlideFS blocks pipeline                |
 | `oci/export.rs`               | `export_tar()`: GlideFS blocks → ext4 → tar stream pipeline         |
@@ -155,6 +228,8 @@ Determinism is maintained by:
 | `ext4/writer.rs`              | Deterministic ext4 writer; ported from Microsoft/hcsshim compactext4 |
 | `ext4/reader.rs`              | ext4 reader: `walk()`, `to_tar()`, extent resolution, xattr parsing  |
 | `ext4/tar_convert.rs`         | Tar→ext4 conversion with OCI whiteout and PAX xattr handling         |
+| `oci/push.rs`                 | `push_image()` and `push_delta_image()`: export + compress + stream-upload to OCI registry |
+| `oci/pull.rs`                 | `pull_image()`: resolve + download OCI image layers                  |
 | `ext4/tests.rs`               | Comprehensive roundtrip tests (60+)                                  |
 
 ## Design Decisions
@@ -187,6 +262,24 @@ Enabled via `WriterOption::InlineData`. Disabled by default for compatibility wi
 The OCI image spec represents file deletions as `.wh.<name>` tar entries. The overlayfs kernel driver uses char device `0,0` as its whiteout representation on disk. By converting OCI whiteouts to char device `0,0` during ingest, the resulting ext4 filesystem is directly usable as an overlayfs lower layer without any translation layer at mount time.
 
 Directory opaque whiteouts (`.wh..wh..opq`) set `trusted.overlay.opaque=y` xattr on the directory, matching overlayfs's own convention.
+
+## OCI Images and VM Booting
+
+OCI images produced by `push_image` / `push_delta_image` contain the rootfs only — the ext4 filesystem exported as gzip-compressed tar layers. They do **not** include:
+
+- **Kernel** (`vmlinuz`) — the hypervisor or host provides this
+- **Initramfs** (`initrd.img`) — same; provided by the VM runtime
+- **Bootloader** (GRUB, systemd-boot) — not needed; the VM runtime boots the kernel directly
+- **Partition table** (GPT/MBR) — the ext4 image is a raw filesystem, not a disk image
+
+This matches how container runtimes (Docker, containerd) use OCI images: the image is a rootfs, the runtime provides the kernel. For VM-based workloads (like GlideFS), the hypervisor boots a host-provided kernel that mounts the ext4 rootfs from the NBD block device.
+
+To boot a VM from a GlideFS volume:
+
+1. **Pull** the OCI image → `ingest_tar` → blocks stored in GlideFS
+2. **Export** the NBD block device
+3. **Boot** the VM with a host kernel pointing at the NBD device as root (`root=/dev/nbd0`)
+4. The kernel mounts the ext4 filesystem directly — no bootloader involved
 
 ## Key Invariants
 
