@@ -20,8 +20,7 @@ const MAX_INODES_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32;
 const INODES_PER_GROUP_INCREMENT: u32 = (BLOCK_SIZE as u32) / (INODE_SIZE as u32);
 const DEFAULT_MAX_DISK_SIZE: i64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 const MAX_MAX_DISK_SIZE: i64 = 16 * 1024 * 1024 * 1024 * 1024; // 16 TiB
-const GROUP_DESCRIPTOR_SIZE: u32 = 32;
-const GROUPS_PER_DESCRIPTOR_BLOCK: u32 = (BLOCK_SIZE as u32) / GROUP_DESCRIPTOR_SIZE;
+const GROUPS_PER_DESCRIPTOR_BLOCK: u32 = (BLOCK_SIZE as u32) / format::GROUP_DESCRIPTOR_SIZE as u32;
 const MAX_FILE_SIZE: i64 = 128 * 1024 * 1024 * 1024; // 128 GiB
 const SMALL_SYMLINK_SIZE: usize = 59;
 const MAX_BLOCKS_PER_EXTENT: u32 = 0x8000;
@@ -418,7 +417,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.inodes.len() as u32 + 1
     }
 
-    fn make_inode(&mut self, f: &mut File, reuse_ino: Option<InodeNumber>) -> io::Result<InodeNumber> {
+    fn make_inode(&mut self, f: &File, reuse_ino: Option<InodeNumber>) -> io::Result<InodeNumber> {
         let mut mode = f.mode;
         if mode & TYPE_MASK == 0 {
             mode |= format::S_IFREG;
@@ -440,15 +439,6 @@ impl<W: Read + Write + Seek> Writer<W> {
         } else {
             ino = self.alloc_inode_number();
             is_new = true;
-        }
-
-        // Build existing xattrs map for merge
-        let mut existing_xattrs = BTreeMap::new();
-        if !is_new {
-            let existing = self.inodes[(ino - 1) as usize].as_ref().unwrap();
-            if !existing.xattr_inline.is_empty() {
-                get_xattrs(&existing.xattr_inline[4..], &mut existing_xattrs, 0);
-            }
         }
 
         // Preserve children and link_count for directory reuse
@@ -491,7 +481,10 @@ impl<W: Read + Write + Seek> Writer<W> {
                     // Add dummy entry — will be rewritten in writeInodeTable
                     let dummy = vec![0u8; extra];
                     if !xstate.add_xattr("system.data", &dummy) {
-                        panic!("not enough room for inline data");
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "not enough room for inline data",
+                        ));
                     }
                     flags |= InodeFlags::INLINE_DATA;
                 }
@@ -512,12 +505,8 @@ impl<W: Read + Write + Seek> Writer<W> {
             }
         }
 
-        // Merge xattrs: prefer currently passed over existing
-        for (name, val) in &existing_xattrs {
-            if !f.xattrs.contains_key(name) {
-                f.xattrs.insert(name.clone(), val.clone());
-            }
-        }
+        // Caller's xattrs are authoritative — no merge with existing.
+        // Callers that need to preserve existing xattrs should use stat() + merge + create().
 
         // Accumulate xattrs (BTreeMap iteration is sorted)
         for (name, value) in &f.xattrs {
@@ -611,7 +600,7 @@ impl<W: Read + Write + Seek> Writer<W> {
 
         // Handle large symlinks (data written as file content)
         if typ == format::S_IFLNK && (size as usize) > SMALL_SYMLINK_SIZE {
-            self.start_inode("", ino, size);
+            self.start_inode("", ino, size)?;
             self.write_data(f.linkname.as_bytes())?;
             self.finish_inode()?;
         }
@@ -619,12 +608,18 @@ impl<W: Read + Write + Seek> Writer<W> {
         Ok(ino)
     }
 
-    fn start_inode(&mut self, name: &str, ino: InodeNumber, size: i64) {
-        assert!(self.cur_inode.is_none(), "inode already in progress");
+    fn start_inode(&mut self, name: &str, ino: InodeNumber, size: i64) -> io::Result<()> {
+        if self.cur_inode.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "inode already in progress",
+            ));
+        }
         self.cur_name = name.to_string();
         self.cur_inode = Some((ino - 1) as usize);
         self.data_written = 0;
         self.data_max = size;
+        Ok(())
     }
 
     fn finish_inode(&mut self) -> io::Result<()> {
@@ -653,7 +648,12 @@ impl<W: Read + Write + Seek> Writer<W> {
 
     fn write_extents(&mut self, idx: usize) -> io::Result<()> {
         let start = self.pos - self.data_written;
-        assert!(start % BLOCK_SIZE as i64 == 0, "unaligned");
+        if start % BLOCK_SIZE as i64 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "data start position is not block-aligned",
+            ));
+        }
         self.next_block()?;
 
         let start_block = (start / BLOCK_SIZE as i64) as u32;
@@ -738,7 +738,10 @@ impl<W: Read + Write + Seek> Writer<W> {
                 self.write_bytes(&leaf_buf)?;
             }
         } else {
-            panic!("file too big");
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "file too large for two-level extent tree",
+            ));
         }
 
         let inode = self.inodes[idx].as_mut().unwrap();
@@ -779,11 +782,11 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.initialized = true;
 
         // lost+found is required for e2fsck
-        let mut lf_file = File {
+        let lf_file = File {
             mode: format::S_IFDIR | 0o700,
             ..Default::default()
         };
-        self.create("lost+found", &mut lf_file)?;
+        self.create("lost+found", &lf_file)?;
         Ok(())
     }
 
@@ -799,6 +802,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
 
         let root_ino = self.root_number();
+        let mut current_ino = root_ino;
         let mut current_path = String::new();
         let mut remaining = parent_dirs;
 
@@ -808,14 +812,15 @@ impl<W: Read + Write + Seek> Writer<W> {
             current_path.push('/');
             current_path.push_str(dirname);
 
-            let root = self.get_inode(root_ino).unwrap();
-            if root.children.contains_key(dirname) {
+            let parent = self.get_inode(current_ino).unwrap();
+            if let Some(&child_ino) = parent.children.get(dirname) {
+                current_ino = child_ino;
                 continue;
             }
 
             // Copy root's metadata for the new directory
             let root = self.get_inode(root_ino).unwrap();
-            let mut f = File {
+            let f = File {
                 mode: root.mode,
                 atime: root.atime,
                 mtime: root.mtime,
@@ -827,13 +832,17 @@ impl<W: Read + Write + Seek> Writer<W> {
                 devminor: root.devminor,
                 ..Default::default()
             };
-            self.create(&current_path, &mut f)?;
+            self.create(&current_path, &f)?;
+
+            // Track the newly created directory's inode
+            let (_, new_ino, _) = self.lookup(&current_path, true)?;
+            current_ino = new_ino.unwrap();
         }
         Ok(())
     }
 
     /// Add a file to the filesystem.
-    pub fn create(&mut self, name: &str, f: &mut File) -> io::Result<()> {
+    pub fn create(&mut self, name: &str, f: &File) -> io::Result<()> {
         self.finish_inode()?;
         let (dir_ino, existing_ino, childname) = self.lookup(name, false)?;
 
@@ -886,7 +895,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
 
         if self.inodes[(child_ino - 1) as usize].as_ref().unwrap().mode & TYPE_MASK == format::S_IFREG {
-            self.start_inode(name, child_ino, f.size);
+            self.start_inode(name, child_ino, f.size)?;
         }
         Ok(())
     }
@@ -930,6 +939,10 @@ impl<W: Read + Write + Seek> Writer<W> {
     }
 
     /// Read back file metadata.
+    ///
+    /// For symlinks with targets longer than 59 bytes, the link target cannot
+    /// be retrieved (it was written as file data in a forward-only pass).
+    /// In that case, `linkname` will be empty and an error is returned.
     pub fn stat(&mut self, name: &str) -> io::Result<File> {
         self.finish_inode()?;
         let (_, node_ino, _) = self.lookup(name, true)?;
@@ -1011,7 +1024,7 @@ impl<W: Read + Write + Seek> Writer<W> {
     fn write_directory(&mut self, dir_ino: InodeNumber, parent_ino: InodeNumber) -> io::Result<()> {
         self.finish_inode()?;
         // Start with max size; we'll fix it later
-        self.start_inode("", dir_ino, 0x7fffffffffffffff);
+        self.start_inode("", dir_ino, 0x7fffffffffffffff)?;
 
         let mut left = BLOCK_SIZE as usize;
 
@@ -1068,7 +1081,10 @@ impl<W: Read + Write + Seek> Writer<W> {
             self.write_dir_entry(0, left as u16, 0, FileType::Unknown)?;
             let padding = left - DIR_ENTRY_HEADER_SIZE;
             if padding < 4 {
-                panic!("not enough space for trailing entry");
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "not enough space for trailing directory entry",
+                ));
             }
             self.write_data(&vec![0u8; padding])?;
         }
@@ -1108,8 +1124,10 @@ impl<W: Read + Write + Seek> Writer<W> {
     // ---- inode table ----
 
     fn write_inode_table(&mut self, table_size: u32) -> io::Result<()> {
-        for slot in &self.inodes {
-            match slot {
+        let inode_count = self.inodes.len();
+        for i in 0..inode_count {
+            let mut buf = Vec::with_capacity(INODE_SIZE);
+            match &self.inodes[i] {
                 Some(inode) => {
                     let mut block_data = [0u8; INODE_DATA_SIZE];
                     let typ = inode.mode & TYPE_MASK;
@@ -1126,12 +1144,10 @@ impl<W: Read + Write + Seek> Writer<W> {
                                     value: overflow.to_vec(),
                                 };
                                 if !inode.xattr_inline.is_empty() {
-                                    // Clone to mutate
                                     let mut inline = inode.xattr_inline.clone();
                                     put_xattrs(&[x], &mut inline[4..], 0);
-                                    // Write the modified inline
                                     format::write_inode(
-                                        &mut self.f,
+                                        &mut buf,
                                         inode.mode,
                                         inode.uid,
                                         inode.gid,
@@ -1147,7 +1163,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                                         &block_data,
                                         &inline,
                                     )?;
-                                    self.pos += INODE_SIZE as i64;
+                                    self.write_bytes(&buf)?;
                                     continue;
                                 }
                             }
@@ -1161,7 +1177,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                         _ => {}
                     }
                     format::write_inode(
-                        &mut self.f,
+                        &mut buf,
                         inode.mode,
                         inode.uid,
                         inode.gid,
@@ -1177,15 +1193,15 @@ impl<W: Read + Write + Seek> Writer<W> {
                         &block_data,
                         &inode.xattr_inline,
                     )?;
-                    self.pos += INODE_SIZE as i64;
+                    self.write_bytes(&buf)?;
                 }
                 None => {
-                    format::write_zero_inode(&mut self.f)?;
-                    self.pos += INODE_SIZE as i64;
+                    buf.resize(INODE_SIZE, 0);
+                    self.write_bytes(&buf)?;
                 }
             }
         }
-        let rest = table_size - (self.inodes.len() as u32) * (INODE_SIZE as u32);
+        let rest = table_size - (inode_count as u32) * (INODE_SIZE as u32);
         self.write_zeros(i64::from(rest))?;
         Ok(())
     }
@@ -1348,6 +1364,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         let mut blk = vec![0u8; BLOCK_SIZE as usize];
         let mut sb_buf = Vec::with_capacity(1024);
         sb.write_to(&mut sb_buf)?;
+        debug_assert_eq!(sb_buf.len(), 1024, "superblock must serialize to exactly 1024 bytes");
         blk[1024..1024 + sb_buf.len()].copy_from_slice(&sb_buf);
         self.write_bytes(&blk)?;
 

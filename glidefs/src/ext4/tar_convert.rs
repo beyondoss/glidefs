@@ -62,7 +62,7 @@ pub fn convert_tar_to_ext4<R: Read, W: Read + Write + Seek>(
                         // Update the directory with opaque xattr
                         let mut stat = fs.stat(dir)?;
                         stat.xattrs.insert("trusted.overlay.opaque".to_string(), b"y".to_vec());
-                        fs.create(dir, &mut stat)?;
+                        fs.create(dir, &stat)?;
                     } else {
                         // Create overlay-style whiteout (char device 0,0)
                         let whiteout_path = if dir.is_empty() {
@@ -70,13 +70,13 @@ pub fn convert_tar_to_ext4<R: Read, W: Read + Write + Seek>(
                         } else {
                             format!("{dir}{stripped}")
                         };
-                        let mut f = File {
+                        let f = File {
                             mode: format::S_IFCHR,
                             devmajor: 0,
                             devminor: 0,
                             ..Default::default()
                         };
-                        fs.create(&whiteout_path, &mut f)?;
+                        fs.create(&whiteout_path, &f)?;
                     }
                     continue;
                 }
@@ -125,7 +125,7 @@ pub fn convert_tar_to_ext4<R: Read, W: Read + Write + Seek>(
             // Convert time: mtime as fs time (seconds in low 34 bits, 0 nanoseconds)
             let fs_mtime = mtime & 0x3ffffffff;
 
-            let mut f = File {
+            let f = File {
                 mode: (mode_bits & !format::TYPE_MASK) | typ,
                 size,
                 uid,
@@ -140,7 +140,7 @@ pub fn convert_tar_to_ext4<R: Read, W: Read + Write + Seek>(
                 xattrs,
             };
 
-            fs.create(&name, &mut f)?;
+            fs.create(&name, &f)?;
 
             // Copy file data
             if typ == format::S_IFREG && size > 0 {
