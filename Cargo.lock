@@ -2577,7 +2577,6 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "tokio",
  "tracing",

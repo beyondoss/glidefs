@@ -91,20 +91,41 @@ pub async fn run_serve(
     let listener = TcpListener::bind(listen).await?;
     info!(addr = %listen, "OCI distribution server listening");
 
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
+
+    let mut connections = tokio::task::JoinSet::new();
+
     loop {
-        let (stream, _) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _) = result?;
                 let state = Arc::clone(&state);
-                async move { handle_request(state, req).await }
-            });
-            if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-                error!(error = %e, "HTTP connection error");
+                connections.spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req| {
+                        let state = Arc::clone(&state);
+                        async move { handle_request(state, req).await }
+                    });
+                    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                        error!(error = %e, "HTTP connection error");
+                    }
+                });
             }
-        });
+            _ = &mut shutdown => {
+                info!("shutdown signal received, draining {} connections", connections.len());
+                break;
+            }
+            // Reap completed connection tasks.
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        }
     }
+
+    // Wait for in-flight connections to finish.
+    while connections.join_next().await.is_some() {}
+    info!("all connections drained, exiting");
+
+    Ok(())
 }
 
 async fn handle_request<B>(

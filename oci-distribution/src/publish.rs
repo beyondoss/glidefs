@@ -4,6 +4,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use object_store::path::Path as ObjectPath;
+use object_store::{ObjectStore, PutMultipartOptions, WriteMultipart};
+use tokio::io::AsyncReadExt;
 use tracing::info;
 
 use glidefs::block::content_store::ContentStore;
@@ -80,16 +82,12 @@ pub async fn run_publish(
         vec![layer]
     };
 
-    // Upload layer blobs to S3.
+    // Upload layer blobs to S3 via streaming multipart upload.
     let oci_base = format!("{}/oci", base);
     for layer in &layers {
         let blob_path = ObjectPath::from(format!("{}/blobs/sha256/{}", oci_base, layer.digest));
         info!(digest = %layer.digest, size = layer.size, "uploading layer blob");
-        let data = tokio::fs::read(layer.temp_file.path()).await?;
-        object_store
-            .put(&blob_path, data.into())
-            .await
-            .context("failed to upload layer blob")?;
+        upload_file(&*object_store, &blob_path, layer.temp_file.path()).await?;
     }
 
     // Build + upload config blob.
@@ -169,5 +167,31 @@ pub async fn run_publish(
     );
     println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
 
+    Ok(())
+}
+
+/// Stream a file to S3 via multipart upload, avoiding reading it all into memory.
+async fn upload_file(
+    store: &dyn ObjectStore,
+    path: &ObjectPath,
+    file_path: &std::path::Path,
+) -> Result<()> {
+    let upload = store
+        .put_multipart_opts(path, PutMultipartOptions::default())
+        .await
+        .context("failed to start multipart upload")?;
+    let mut writer = WriteMultipart::new(upload);
+
+    let mut file = tokio::fs::File::open(file_path).await?;
+    let mut buf = vec![0u8; 8 * 1024 * 1024]; // 8 MB chunks
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        writer.put(bytes::Bytes::copy_from_slice(&buf[..n]));
+    }
+
+    writer.finish().await.context("failed to finish multipart upload")?;
     Ok(())
 }
