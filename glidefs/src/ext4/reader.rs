@@ -194,28 +194,13 @@ impl<R: Read + Seek> Reader<R> {
             return Ok(Vec::new());
         }
 
-        // Inline data: stored in inode block area + xattr "system.data"
         if inode.flags.contains(InodeFlags::INLINE_DATA) {
             return self.read_inline_data(inode);
         }
 
-        // Extent-based data
-        if !inode.flags.contains(InodeFlags::EXTENTS) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "only extent-based inodes are supported",
-            ));
-        }
-
-        let extents = self.resolve_extents(&inode.block)?;
         let mut data = Vec::with_capacity(inode.size as usize);
-        for (phys_block, length) in &extents {
-            for b in 0..*length as u64 {
-                let block = self.read_block(phys_block + b)?;
-                data.extend_from_slice(&block);
-            }
-        }
-        data.truncate(inode.size as usize);
+        let mut reader = self.extent_reader(inode)?;
+        reader.read_to_end(&mut data)?;
         Ok(data)
     }
 
@@ -231,27 +216,20 @@ impl<R: Read + Seek> Reader<R> {
             return Ok(data.len() as u64);
         }
 
+        let mut reader = self.extent_reader(inode)?;
+        io::copy(&mut reader, w)
+    }
+
+    /// Create a streaming `ExtentReader` for an extent-based inode.
+    fn extent_reader(&mut self, inode: &ParsedInode) -> io::Result<ExtentReader<'_, R>> {
         if !inode.flags.contains(InodeFlags::EXTENTS) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "only extent-based inodes are supported",
             ));
         }
-
         let extents = self.resolve_extents(&inode.block)?;
-        let mut remaining = inode.size;
-        for (phys_block, length) in &extents {
-            for b in 0..*length as u64 {
-                let block = self.read_block(phys_block + b)?;
-                let n = (remaining as usize).min(BLOCK_SIZE as usize);
-                w.write_all(&block[..n])?;
-                remaining -= n as u64;
-                if remaining == 0 {
-                    return Ok(inode.size);
-                }
-            }
-        }
-        Ok(inode.size - remaining)
+        Ok(ExtentReader::new(&mut self.inner, extents, inode.size))
     }
 
     /// Read inline data from inode block area + xattr overflow.
@@ -322,14 +300,12 @@ impl<R: Read + Seek> Reader<R> {
         let mut xattrs = BTreeMap::new();
 
         // Inline xattrs from extra inode space
-        if inode.xattr_inline.len() >= 4 {
-            let magic = u32::from_le_bytes([
-                inode.xattr_inline[0], inode.xattr_inline[1],
-                inode.xattr_inline[2], inode.xattr_inline[3],
-            ]);
-            if magic == XATTR_HEADER_MAGIC {
-                format::get_xattrs(&inode.xattr_inline[4..], &mut xattrs, 0);
-            }
+        let magic = u32::from_le_bytes([
+            inode.xattr_inline[0], inode.xattr_inline[1],
+            inode.xattr_inline[2], inode.xattr_inline[3],
+        ]);
+        if magic == XATTR_HEADER_MAGIC {
+            format::get_xattrs(&inode.xattr_inline[4..], &mut xattrs, 0);
         }
 
         // Block xattrs
@@ -491,18 +467,7 @@ impl<R: Read + Seek> Reader<R> {
                     header.set_entry_type(tar::EntryType::Regular);
                     header.set_size(entry.size);
                     header.set_cksum();
-
-                    // Append xattrs as PAX extensions
-                    if !entry.xattrs.is_empty() {
-                        let mut pax = Vec::new();
-                        for (key, value) in &entry.xattrs {
-                            let pax_key = format!("SCHILY.xattr.{key}");
-                            write_pax_record(&mut pax, &pax_key, value);
-                        }
-                        builder.append_pax_extensions(
-                            pax.iter().map(|(k, v)| (k.as_str(), v.as_slice())),
-                        )?;
-                    }
+                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
 
                     // Stream file data without buffering the entire file.
                     if entry.size == 0 {
@@ -512,19 +477,9 @@ impl<R: Read + Seek> Reader<R> {
                         if inode.flags.contains(InodeFlags::INLINE_DATA) {
                             let data = self.read_inline_data(&inode)?;
                             builder.append_data(&mut header, &entry.path, &data[..])?;
-                        } else if inode.flags.contains(InodeFlags::EXTENTS) {
-                            let extents = self.resolve_extents(&inode.block)?;
-                            let reader = ExtentReader::new(
-                                &mut self.inner,
-                                extents,
-                                entry.size,
-                            );
-                            builder.append_data(&mut header, &entry.path, reader)?;
                         } else {
-                            return Err(io::Error::new(
-                                io::ErrorKind::Unsupported,
-                                "only extent-based inodes are supported",
-                            ));
+                            let mut reader = self.extent_reader(&inode)?;
+                            builder.append_data(&mut header, &entry.path, &mut reader)?;
                         }
                     }
                 }
@@ -532,18 +487,7 @@ impl<R: Read + Seek> Reader<R> {
                     header.set_entry_type(tar::EntryType::Directory);
                     header.set_size(0);
                     header.set_cksum();
-
-                    if !entry.xattrs.is_empty() {
-                        let mut pax = Vec::new();
-                        for (key, value) in &entry.xattrs {
-                            let pax_key = format!("SCHILY.xattr.{key}");
-                            write_pax_record(&mut pax, &pax_key, value);
-                        }
-                        builder.append_pax_extensions(
-                            pax.iter().map(|(k, v)| (k.as_str(), v.as_slice())),
-                        )?;
-                    }
-
+                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
                     let path = format!("{}/", entry.path);
                     builder.append_data(&mut header, &path, io::empty())?;
                 }
@@ -554,6 +498,7 @@ impl<R: Read + Seek> Reader<R> {
                         header.set_link_name(target)?;
                     }
                     header.set_cksum();
+                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
                     builder.append_data(&mut header, &entry.path, io::empty())?;
                 }
                 format::S_IFCHR => {
@@ -562,6 +507,7 @@ impl<R: Read + Seek> Reader<R> {
                     header.set_device_major(entry.devmajor)?;
                     header.set_device_minor(entry.devminor)?;
                     header.set_cksum();
+                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
                     builder.append_data(&mut header, &entry.path, io::empty())?;
                 }
                 format::S_IFBLK => {
@@ -570,12 +516,14 @@ impl<R: Read + Seek> Reader<R> {
                     header.set_device_major(entry.devmajor)?;
                     header.set_device_minor(entry.devminor)?;
                     header.set_cksum();
+                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
                     builder.append_data(&mut header, &entry.path, io::empty())?;
                 }
                 format::S_IFIFO => {
                     header.set_entry_type(tar::EntryType::Fifo);
                     header.set_size(0);
                     header.set_cksum();
+                    append_pax_xattrs(&mut builder, &entry.xattrs)?;
                     builder.append_data(&mut header, &entry.path, io::empty())?;
                 }
                 _ => {} // Skip unknown types
@@ -615,9 +563,21 @@ pub struct WalkEntry {
     pub xattrs: BTreeMap<String, Vec<u8>>,
 }
 
-/// Build a PAX key-value record pair for tar extensions.
-fn write_pax_record(pairs: &mut Vec<(String, Vec<u8>)>, key: &str, value: &[u8]) {
-    pairs.push((key.to_string(), value.to_vec()));
+/// Emit PAX xattr extensions into the tar stream, if any.
+fn append_pax_xattrs<W: Write>(
+    builder: &mut tar::Builder<W>,
+    xattrs: &BTreeMap<String, Vec<u8>>,
+) -> io::Result<()> {
+    if xattrs.is_empty() {
+        return Ok(());
+    }
+    let pax: Vec<(String, Vec<u8>)> = xattrs
+        .iter()
+        .map(|(k, v)| (format!("SCHILY.xattr.{k}"), v.clone()))
+        .collect();
+    builder.append_pax_extensions(
+        pax.iter().map(|(k, v)| (k.as_str(), v.as_slice())),
+    )
 }
 
 /// Streaming reader over extent-based file data. Reads blocks on demand
