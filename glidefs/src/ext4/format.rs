@@ -672,7 +672,7 @@ pub fn write_dir_entry(
 // ---- Parsing (read-side) ----
 
 /// Helper: read a little-endian u16 from a byte slice at the given offset.
-fn le_u16(buf: &[u8], off: usize) -> u16 {
+pub(super) fn le_u16(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
 }
 
@@ -762,7 +762,7 @@ pub struct ParsedInode {
     pub block: [u8; INODE_DATA_SIZE],
     pub xattr_block_low: u32,
     pub extra_isize: u16,
-    pub xattr_inline: Vec<u8>,
+    pub xattr_inline: [u8; INODE_EXTRA_SIZE],
 }
 
 impl ParsedInode {
@@ -807,7 +807,8 @@ impl ParsedInode {
         // That's INODE_USED_SIZE = 152 bytes.
 
         // Extra inode space (after used size) contains inline xattrs.
-        let xattr_inline = buf[INODE_USED_SIZE..INODE_SIZE].to_vec();
+        let mut xattr_inline = [0u8; INODE_EXTRA_SIZE];
+        xattr_inline.copy_from_slice(&buf[INODE_USED_SIZE..INODE_SIZE]);
 
         Ok(ParsedInode {
             mode,
@@ -999,16 +1000,31 @@ pub fn decompress_xattr_name(index: u8, name: &str) -> String {
 pub fn get_xattrs(buf: &[u8], xattrs: &mut BTreeMap<String, Vec<u8>>, offset_delta: u16) {
     let mut pos = 0usize;
     while pos < buf.len() {
+        // Need at least 16 bytes for the entry header.
+        if pos + 16 > buf.len() {
+            break;
+        }
         let name_len = buf[pos] as usize;
         if name_len == 0 {
             break;
         }
         let index = buf[pos + 1];
-        let offset = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]) - offset_delta;
+        let raw_offset = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]);
+        let Some(offset) = raw_offset.checked_sub(offset_delta) else {
+            break;
+        };
         let value_len = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]) as usize;
+        // Validate name and value bounds before accessing.
+        if pos + 16 + name_len > buf.len() {
+            break;
+        }
+        let offset_usize = offset as usize;
+        if offset_usize.saturating_add(value_len) > buf.len() {
+            break;
+        }
         let name = std::str::from_utf8(&buf[pos + 16..pos + 16 + name_len]).unwrap_or("");
         let full_name = decompress_xattr_name(index, name);
-        let value = buf[offset as usize..offset as usize + value_len].to_vec();
+        let value = buf[offset_usize..offset_usize + value_len].to_vec();
         xattrs.insert(full_name, value);
         let entry_len = ((name_len + 3) & !3usize) + 16;
         pos += entry_len;

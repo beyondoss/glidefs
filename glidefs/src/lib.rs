@@ -2,6 +2,7 @@ pub mod circuit_breaker;
 pub mod config;
 pub mod block;
 pub mod ext4;
+pub mod oci;
 pub mod task;
 
 #[cfg(feature = "test-utils")]

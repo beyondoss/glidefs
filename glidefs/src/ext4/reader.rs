@@ -4,7 +4,7 @@
 /// extent trees, directory entries, and xattrs from a seekable ext4 image.
 ///
 /// Used by the OCI bridge export path: GlideFS blocks → ext4 reader → tar stream.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::ext4::format::{
@@ -36,6 +36,13 @@ impl<R: Read + Seek> Reader<R> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported block size: {block_size} (expected {BLOCK_SIZE})"),
+            ));
+        }
+
+        if sb.inodes_per_group == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "inodes_per_group is zero",
             ));
         }
 
@@ -110,6 +117,16 @@ impl<R: Read + Seek> Reader<R> {
 
         if header.depth == 0 {
             // Leaf nodes directly in inode
+            let max_entries = (INODE_DATA_SIZE - EXTENT_NODE_SIZE) / EXTENT_NODE_SIZE;
+            if header.entries as usize > max_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "extent header claims {} entries but inode data fits at most {}",
+                        header.entries, max_entries,
+                    ),
+                ));
+            }
             let mut extents = Vec::with_capacity(header.entries as usize);
             for i in 0..header.entries as usize {
                 let off = EXTENT_NODE_SIZE + i * EXTENT_NODE_SIZE;
@@ -119,6 +136,16 @@ impl<R: Read + Seek> Reader<R> {
             Ok(extents)
         } else {
             // Index nodes — read each leaf block
+            let max_index_entries = (INODE_DATA_SIZE - EXTENT_NODE_SIZE) / EXTENT_NODE_SIZE;
+            if header.entries as usize > max_index_entries {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "extent index claims {} entries but inode data fits at most {}",
+                        header.entries, max_index_entries,
+                    ),
+                ));
+            }
             let mut extents = Vec::new();
             for i in 0..header.entries as usize {
                 let off = EXTENT_NODE_SIZE + i * EXTENT_NODE_SIZE;
@@ -129,6 +156,26 @@ impl<R: Read + Seek> Reader<R> {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "bad extent leaf header magic",
+                    ));
+                }
+                if leaf_header.depth != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "extent leaf block has depth {} (expected 0)",
+                            leaf_header.depth,
+                        ),
+                    ));
+                }
+                let max_leaf_entries =
+                    (BLOCK_SIZE as usize - EXTENT_NODE_SIZE) / EXTENT_NODE_SIZE;
+                if leaf_header.entries as usize > max_leaf_entries {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "extent leaf claims {} entries but block fits at most {}",
+                            leaf_header.entries, max_leaf_entries,
+                        ),
                     ));
                 }
                 for j in 0..leaf_header.entries as usize {
@@ -217,13 +264,19 @@ impl<R: Read + Seek> Reader<R> {
         data.extend_from_slice(&inode.block[..first]);
 
         // Overflow: from "system.data" xattr in extra inode space
-        if size > INODE_DATA_SIZE && inode.xattr_inline.len() >= 4 {
+        if size > INODE_DATA_SIZE {
             // The xattr inline area starts with a 4-byte magic, then xattr entries.
             // The "system.data" xattr holds the overflow bytes.
-            let mut xattrs = BTreeMap::new();
-            format::get_xattrs(&inode.xattr_inline[4..], &mut xattrs, 0);
-            if let Some(overflow) = xattrs.get("system.data") {
-                data.extend_from_slice(overflow);
+            let magic = u32::from_le_bytes([
+                inode.xattr_inline[0], inode.xattr_inline[1],
+                inode.xattr_inline[2], inode.xattr_inline[3],
+            ]);
+            if magic == XATTR_HEADER_MAGIC {
+                let mut xattrs = BTreeMap::new();
+                format::get_xattrs(&inode.xattr_inline[4..], &mut xattrs, 0);
+                if let Some(overflow) = xattrs.get("system.data") {
+                    data.extend_from_slice(overflow);
+                }
             }
         }
 
@@ -239,11 +292,10 @@ impl<R: Read + Seek> Reader<R> {
 
         while pos < data.len() {
             if let Some(entry) = DirEntry::read_from(&data[pos..]) {
+                let rec_len = entry.rec_len as usize;
                 if entry.name != "." && entry.name != ".." {
                     entries.push(entry);
                 }
-                // Advance by rec_len (which includes padding)
-                let rec_len = le_u16_inline(&data, pos + 4) as usize;
                 if rec_len == 0 {
                     break;
                 }
@@ -251,7 +303,7 @@ impl<R: Read + Seek> Reader<R> {
             } else {
                 // Padding entry — advance by rec_len
                 if pos + 6 <= data.len() {
-                    let rec_len = le_u16_inline(&data, pos + 4) as usize;
+                    let rec_len = format::le_u16(&data, pos + 4) as usize;
                     if rec_len == 0 {
                         break;
                     }
@@ -313,17 +365,19 @@ impl<R: Read + Seek> Reader<R> {
     }
 
     /// Decode a device number from the inode block area (for char/block devices).
+    /// Matches Linux `new_decode_dev`: 12-bit major, 20-bit minor.
     fn decode_device(block: &[u8; INODE_DATA_SIZE]) -> (u32, u32) {
         let dev = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
-        let major = (dev >> 8) & 0xff;
-        let minor = (dev & 0xff) | ((dev >> 12) & 0xffffff00);
+        let major = (dev & 0xfff00) >> 8;
+        let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
         (major, minor)
     }
 
     /// Walk the entire filesystem tree from root. Returns all entries with full paths.
     pub fn walk(&mut self) -> io::Result<Vec<WalkEntry>> {
         let mut entries = Vec::new();
-        self.walk_recursive(INODE_ROOT, "", &mut entries)?;
+        let mut visited = HashSet::new();
+        self.walk_recursive(INODE_ROOT, "", &mut entries, &mut visited)?;
         Ok(entries)
     }
 
@@ -332,7 +386,14 @@ impl<R: Read + Seek> Reader<R> {
         dir_ino: InodeNumber,
         prefix: &str,
         entries: &mut Vec<WalkEntry>,
+        visited: &mut HashSet<InodeNumber>,
     ) -> io::Result<()> {
+        if !visited.insert(dir_ino) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("directory cycle detected at inode {dir_ino}"),
+            ));
+        }
         let dir_inode = self.read_inode(dir_ino)?;
         let dir_entries = self.read_dir(&dir_inode)?;
 
@@ -384,7 +445,7 @@ impl<R: Read + Seek> Reader<R> {
 
             // Recurse into directories
             if file_type == format::S_IFDIR {
-                self.walk_recursive(entry.inode, &path, entries)?;
+                self.walk_recursive(entry.inode, &path, entries, visited)?;
             }
         }
 
@@ -443,10 +504,29 @@ impl<R: Read + Seek> Reader<R> {
                         )?;
                     }
 
-                    // Read file data and append
-                    let inode = self.read_inode(entry.inode_number)?;
-                    let data = self.read_data(&inode)?;
-                    builder.append_data(&mut header, &entry.path, &data[..])?;
+                    // Stream file data without buffering the entire file.
+                    if entry.size == 0 {
+                        builder.append_data(&mut header, &entry.path, io::empty())?;
+                    } else {
+                        let inode = self.read_inode(entry.inode_number)?;
+                        if inode.flags.contains(InodeFlags::INLINE_DATA) {
+                            let data = self.read_inline_data(&inode)?;
+                            builder.append_data(&mut header, &entry.path, &data[..])?;
+                        } else if inode.flags.contains(InodeFlags::EXTENTS) {
+                            let extents = self.resolve_extents(&inode.block)?;
+                            let reader = ExtentReader::new(
+                                &mut self.inner,
+                                extents,
+                                entry.size,
+                            );
+                            builder.append_data(&mut header, &entry.path, reader)?;
+                        } else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "only extent-based inodes are supported",
+                            ));
+                        }
+                    }
                 }
                 format::S_IFDIR => {
                     header.set_entry_type(tar::EntryType::Directory);
@@ -535,12 +615,74 @@ pub struct WalkEntry {
     pub xattrs: BTreeMap<String, Vec<u8>>,
 }
 
-/// Helper to read u16 at offset (avoids importing format's private helpers).
-fn le_u16_inline(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([buf[off], buf[off + 1]])
-}
-
 /// Build a PAX key-value record pair for tar extensions.
 fn write_pax_record(pairs: &mut Vec<(String, Vec<u8>)>, key: &str, value: &[u8]) {
     pairs.push((key.to_string(), value.to_vec()));
+}
+
+/// Streaming reader over extent-based file data. Reads blocks on demand
+/// without buffering the entire file, suitable for large files in `to_tar`.
+struct ExtentReader<'a, R: Read + Seek> {
+    inner: &'a mut R,
+    extents: Vec<(u64, u32)>,
+    remaining: u64,
+    extent_idx: usize,
+    block_in_extent: u32,
+    offset_in_block: usize,
+    block_buf: [u8; BLOCK_SIZE as usize],
+    block_loaded: bool,
+}
+
+impl<'a, R: Read + Seek> ExtentReader<'a, R> {
+    fn new(inner: &'a mut R, extents: Vec<(u64, u32)>, size: u64) -> Self {
+        ExtentReader {
+            inner,
+            extents,
+            remaining: size,
+            extent_idx: 0,
+            block_in_extent: 0,
+            offset_in_block: 0,
+            block_buf: [0u8; BLOCK_SIZE as usize],
+            block_loaded: false,
+        }
+    }
+}
+
+impl<R: Read + Seek> Read for ExtentReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || self.extent_idx >= self.extents.len() {
+            return Ok(0);
+        }
+
+        if !self.block_loaded {
+            let (phys_block, _) = self.extents[self.extent_idx];
+            let block_num = phys_block + self.block_in_extent as u64;
+            self.inner.seek(SeekFrom::Start(block_num * BLOCK_SIZE))?;
+            self.inner.read_exact(&mut self.block_buf)?;
+            self.block_loaded = true;
+            self.offset_in_block = 0;
+        }
+
+        let available = (BLOCK_SIZE as usize - self.offset_in_block)
+            .min(self.remaining as usize);
+        let n = buf.len().min(available);
+        buf[..n].copy_from_slice(
+            &self.block_buf[self.offset_in_block..self.offset_in_block + n],
+        );
+        self.offset_in_block += n;
+        self.remaining -= n as u64;
+
+        // Advance to next block if this one is consumed.
+        if self.offset_in_block >= BLOCK_SIZE as usize {
+            self.block_in_extent += 1;
+            let (_, length) = self.extents[self.extent_idx];
+            if self.block_in_extent >= length {
+                self.extent_idx += 1;
+                self.block_in_extent = 0;
+            }
+            self.block_loaded = false;
+        }
+
+        Ok(n)
+    }
 }
