@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::io::{self, Cursor, Read};
+    use std::io::{self, Cursor, Read, Write};
 
     use crate::ext4::format::{self, MAX_LINKS, TYPE_MASK};
     use crate::ext4::writer::{File, Writer, WriterOption, BLOCK_SIZE, INLINE_DATA_SIZE};
@@ -910,5 +910,134 @@ mod tests {
             Some(b"value123".as_slice()),
             "xattr not preserved through roundtrip"
         );
+    }
+
+    // ---- UUID + Journal tests ----
+
+    #[test]
+    fn test_uuid_roundtrip() {
+        let uuid: [u8; 16] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+            0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10,
+        ];
+
+        let buf = Cursor::new(Vec::new());
+        let mut w = Writer::new(buf, &[WriterOption::Uuid(uuid)]);
+        w.create("hello.txt", &File {
+            size: 5,
+            mode: format::S_IFREG | 0o644,
+            ..Default::default()
+        }).unwrap();
+        w.write_all(b"hello").unwrap();
+        let output = w.close().unwrap().into_inner();
+
+        let reader = Reader::new(Cursor::new(output)).unwrap();
+        let sb = reader.superblock();
+        assert_eq!(sb.uuid, uuid, "UUID not preserved");
+        assert_eq!(
+            sb.hash_seed,
+            [
+                u32::from_le_bytes(uuid[0..4].try_into().unwrap()),
+                u32::from_le_bytes(uuid[4..8].try_into().unwrap()),
+                u32::from_le_bytes(uuid[8..12].try_into().unwrap()),
+                u32::from_le_bytes(uuid[12..16].try_into().unwrap()),
+            ],
+            "hash_seed not derived from UUID"
+        );
+    }
+
+    #[test]
+    fn test_journal_roundtrip() {
+        let uuid: [u8; 16] = [0xAA; 16];
+        let journal_size: u32 = 1024; // 4 MiB
+
+        let buf = Cursor::new(Vec::new());
+        let mut w = Writer::new(buf, &[
+            WriterOption::Uuid(uuid),
+            WriterOption::Journal(journal_size),
+        ]);
+        w.create("file.txt", &File {
+            size: 4,
+            mode: format::S_IFREG | 0o644,
+            ..Default::default()
+        }).unwrap();
+        w.write_all(b"data").unwrap();
+        let output = w.close().unwrap().into_inner();
+
+        // Verify superblock journal fields
+        let mut reader = Reader::new(Cursor::new(output.clone())).unwrap();
+        {
+            let sb = reader.superblock();
+            assert!(
+                sb.feature_compat.contains(format::CompatFeature::HAS_JOURNAL),
+                "HAS_JOURNAL flag not set"
+            );
+            assert_eq!(sb.journal_inum, format::INODE_JOURNAL, "journal_inum should be 8");
+            assert_eq!(sb.journal_uuid, uuid, "journal_uuid should match filesystem uuid");
+            assert_ne!(sb.journal_blocks[0], 0, "journal_blocks backup should be populated");
+        }
+
+        // Verify journal inode (inode 8) exists and has correct size
+        let journal_inode = reader.read_inode(format::INODE_JOURNAL).unwrap();
+        assert_eq!(
+            journal_inode.size,
+            journal_size as u64 * BLOCK_SIZE as u64,
+            "journal inode size mismatch"
+        );
+        assert_eq!(journal_inode.mode & TYPE_MASK, format::S_IFREG);
+        assert!(journal_inode.flags.contains(format::InodeFlags::EXTENTS));
+
+        // Verify JBD2 superblock magic at start of journal data
+        let journal_data = reader.read_data(&journal_inode).unwrap();
+        let jbd2_magic = u32::from_be_bytes(journal_data[0..4].try_into().unwrap());
+        assert_eq!(jbd2_magic, format::JBD2_MAGIC, "JBD2 magic mismatch");
+
+        let jbd2_blocktype = u32::from_be_bytes(journal_data[4..8].try_into().unwrap());
+        assert_eq!(jbd2_blocktype, format::JBD2_SUPERBLOCK_V2, "JBD2 blocktype mismatch");
+
+        let jbd2_maxlen = u32::from_be_bytes(journal_data[16..20].try_into().unwrap());
+        assert_eq!(jbd2_maxlen, journal_size, "JBD2 maxlen mismatch");
+
+        // Verify user files still work alongside journal
+        let entries = reader.walk().unwrap();
+        let file = entries.iter().find(|e| e.path == "file.txt").unwrap();
+        assert_eq!(file.size, 4);
+    }
+
+    #[test]
+    fn test_journal_with_large_content() {
+        // Ensure journal works alongside substantial file data
+        let uuid: [u8; 16] = [0xBB; 16];
+        let journal_size: u32 = 256; // 1 MiB journal (small, to keep test fast)
+
+        let buf = Cursor::new(Vec::new());
+        let mut w = Writer::new(buf, &[
+            WriterOption::Uuid(uuid),
+            WriterOption::Journal(journal_size),
+        ]);
+
+        // Create a file larger than one extent (>128 KiB)
+        let big_data: Vec<u8> = (0..256 * 1024u32).map(|i| (i % 251) as u8).collect();
+        w.create("big.bin", &File {
+            size: big_data.len() as i64,
+            mode: format::S_IFREG | 0o644,
+            ..Default::default()
+        }).unwrap();
+        w.write_all(&big_data).unwrap();
+
+        let output = w.close().unwrap().into_inner();
+
+        // Verify both journal and file data are intact
+        let mut reader = Reader::new(Cursor::new(output)).unwrap();
+        let sb = reader.superblock();
+        assert!(sb.feature_compat.contains(format::CompatFeature::HAS_JOURNAL));
+
+        let entries = reader.walk().unwrap();
+        let file = entries.iter().find(|e| e.path == "big.bin").unwrap();
+        assert_eq!(file.size, big_data.len() as u64);
+
+        let inode = reader.read_inode(file.inode_number).unwrap();
+        let read_data = reader.read_data(&inode).unwrap();
+        assert_eq!(read_data, big_data, "file data corrupted with journal enabled");
     }
 }

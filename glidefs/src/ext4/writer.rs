@@ -71,6 +71,11 @@ impl Default for File {
 pub enum WriterOption {
     InlineData,
     MaximumDiskSize(i64),
+    /// Set the filesystem UUID (16 bytes). Also used as hash_seed and journal_uuid.
+    Uuid([u8; 16]),
+    /// Create an internal journal with the given size in 4 KiB blocks.
+    /// Typical values: 1024 (4 MiB), 4096 (16 MiB), 16384 (64 MiB).
+    Journal(u32),
 }
 
 // ---- Internal inode ----
@@ -227,6 +232,8 @@ pub struct Writer<W: Read + Write + Seek> {
     support_inline_data: bool,
     max_disk_size: i64,
     gd_blocks: u32,
+    uuid: [u8; 16],
+    journal_blocks: u32,
 }
 
 impl<W: Read + Write + Seek> Writer<W> {
@@ -243,6 +250,8 @@ impl<W: Read + Write + Seek> Writer<W> {
             support_inline_data: false,
             max_disk_size: DEFAULT_MAX_DISK_SIZE,
             gd_blocks: 0,
+            uuid: [0u8; 16],
+            journal_blocks: 0,
         };
         for opt in opts {
             match opt {
@@ -256,6 +265,8 @@ impl<W: Read + Write + Seek> Writer<W> {
                         w.max_disk_size = (*size + BLOCK_SIZE as i64 - 1) & !(BLOCK_SIZE as i64 - 1);
                     }
                 }
+                WriterOption::Uuid(u) => w.uuid = *u,
+                WriterOption::Journal(blocks) => w.journal_blocks = *blocks,
             }
         }
         w
@@ -1071,6 +1082,110 @@ impl<W: Read + Write + Seek> Writer<W> {
         Ok(())
     }
 
+    // ---- journal ----
+
+    /// Write journal blocks and create journal inode (inode 8).
+    ///
+    /// Allocates `self.journal_blocks` contiguous blocks starting at the
+    /// current position. The first block contains the JBD2 v2 superblock
+    /// (empty/clean journal). Remaining blocks are zeros.
+    ///
+    /// Creates inode 8 (EXT4_JOURNAL_INO) with an extent pointing to the
+    /// journal blocks. The superblock is updated in close() to set
+    /// HAS_JOURNAL, journal_inum, and the journal_blocks backup.
+    fn write_journal(&mut self) -> io::Result<()> {
+        let journal_start = self.block();
+
+        // Write JBD2 v2 superblock (first block of journal)
+        // All multi-byte fields are big-endian per JBD2 spec.
+        let mut jbd2_sb = [0u8; BLOCK_SIZE as usize];
+        jbd2_sb[0..4].copy_from_slice(&format::JBD2_MAGIC.to_be_bytes());
+        jbd2_sb[4..8].copy_from_slice(&format::JBD2_SUPERBLOCK_V2.to_be_bytes());
+        // s_sequence = 1 (initial sequence number)
+        jbd2_sb[8..12].copy_from_slice(&1u32.to_be_bytes());
+        // s_blocksize
+        jbd2_sb[12..16].copy_from_slice(&(BLOCK_SIZE as u32).to_be_bytes());
+        // s_maxlen (total journal blocks)
+        jbd2_sb[16..20].copy_from_slice(&self.journal_blocks.to_be_bytes());
+        // s_first = 1 (first usable block, after this superblock)
+        jbd2_sb[20..24].copy_from_slice(&1u32.to_be_bytes());
+        // s_start = 0, s_sequence = 0 at offset 24-28 → clean journal (already zeros)
+        // s_uuid (offset 48..64)
+        jbd2_sb[48..64].copy_from_slice(&self.uuid);
+        // s_nr_users = 1 (offset 64..68)
+        jbd2_sb[64..68].copy_from_slice(&1u32.to_be_bytes());
+        self.write_bytes(&jbd2_sb)?;
+
+        // Zero-fill remaining journal blocks
+        self.write_zeros((self.journal_blocks as i64 - 1) * BLOCK_SIZE as i64)?;
+
+        // Build extent data for journal inode: single extent covering all journal blocks
+        let mut extent_data = [0u8; INODE_DATA_SIZE];
+        // Extent header (12 bytes): magic, entries=1, max=4, depth=0
+        extent_data[0..2].copy_from_slice(&format::EXTENT_HEADER_MAGIC.to_le_bytes());
+        extent_data[2..4].copy_from_slice(&1u16.to_le_bytes()); // entries
+        extent_data[4..6].copy_from_slice(&4u16.to_le_bytes()); // max
+        // depth=0, generation=0 (already zeros at bytes 6..12)
+        // Extent leaf at offset 12 (12 bytes):
+        //   ee_block(u32) + ee_len(u16) + ee_start_hi(u16) + ee_start_lo(u32)
+        // ee_block = 0 (logical block 0, already zeros at 12..16)
+        extent_data[16..18].copy_from_slice(&(self.journal_blocks as u16).to_le_bytes()); // ee_len
+        // ee_start_hi = 0 (already zeros at 18..20)
+        extent_data[20..24].copy_from_slice(&journal_start.to_le_bytes()); // ee_start_lo
+
+        // Create journal inode at index 7 (inode 8)
+        let journal_size = self.journal_blocks as i64 * BLOCK_SIZE as i64;
+        self.inodes[7] = Some(Inode {
+            number: format::INODE_JOURNAL,
+            size: journal_size,
+            mode: format::S_IFREG | 0o600,
+            uid: 0,
+            gid: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            crtime: 0,
+            link_count: 1,
+            xattr_block: 0,
+            block_count: self.journal_blocks * (BLOCK_SIZE as u32 / 512),
+            devmajor: 0,
+            devminor: 0,
+            flags: InodeFlags::EXTENTS,
+            data: extent_data.to_vec(),
+            xattr_inline: Vec::new(),
+            children: BTreeMap::new(),
+        });
+
+        Ok(())
+    }
+
+    /// Build the journal_blocks backup array for the superblock.
+    ///
+    /// The superblock stores the first 15 u32s of the journal inode's block[]
+    /// field (extent data) plus the inode size and block count, for recovery.
+    fn journal_blocks_backup(&self) -> [u32; 17] {
+        let mut backup = [0u32; 17];
+        if self.journal_blocks == 0 {
+            return backup;
+        }
+        if let Some(Some(journal_inode)) = self.inodes.get(7) {
+            // First 15 entries: the 60-byte block[] field as 15 u32s (extent data)
+            for i in 0..15 {
+                let off = i * 4;
+                if off + 4 <= journal_inode.data.len() {
+                    backup[i] = u32::from_le_bytes(
+                        journal_inode.data[off..off + 4].try_into().unwrap(),
+                    );
+                }
+            }
+            // Entry 15: inode size (low 32 bits)
+            backup[15] = journal_inode.size as u32;
+            // Entry 16: inode size (high 32 bits)
+            backup[16] = (journal_inode.size >> 32) as u32;
+        }
+        backup
+    }
+
     // ---- inode table ----
 
     fn write_inode_table(&mut self, table_size: u32) -> io::Result<()> {
@@ -1167,6 +1282,11 @@ impl<W: Read + Write + Seek> Writer<W> {
         let root = self.root_number();
         self.write_directory_recursive(root, root)?;
         self.finish_inode()?;
+
+        // Write journal blocks (if enabled)
+        if self.journal_blocks > 0 {
+            self.write_journal()?;
+        }
 
         // Write the inode table
         let inode_table_offset = self.block();
@@ -1296,7 +1416,9 @@ impl<W: Read + Write + Seek> Writer<W> {
             first_inode: INODE_FIRST,
             lpf_inode: INODE_LOST_AND_FOUND,
             inode_size: INODE_SIZE as u16,
-            feature_compat: format::CompatFeature::SPARSE_SUPER2 | format::CompatFeature::EXT_ATTR,
+            feature_compat: format::CompatFeature::SPARSE_SUPER2
+                | format::CompatFeature::EXT_ATTR
+                | if self.journal_blocks > 0 { format::CompatFeature::HAS_JOURNAL } else { format::CompatFeature::empty() },
             feature_incompat: format::IncompatFeature::FILETYPE
                 | format::IncompatFeature::EXTENTS
                 | format::IncompatFeature::FLEX_BG
@@ -1305,6 +1427,16 @@ impl<W: Read + Write + Seek> Writer<W> {
                 | format::RoCompatFeature::HUGE_FILE
                 | format::RoCompatFeature::EXTRA_ISIZE
                 | format::RoCompatFeature::READONLY,
+            uuid: self.uuid,
+            journal_uuid: self.uuid,
+            journal_inum: if self.journal_blocks > 0 { format::INODE_JOURNAL } else { 0 },
+            hash_seed: [
+                u32::from_le_bytes(self.uuid[0..4].try_into().unwrap()),
+                u32::from_le_bytes(self.uuid[4..8].try_into().unwrap()),
+                u32::from_le_bytes(self.uuid[8..12].try_into().unwrap()),
+                u32::from_le_bytes(self.uuid[12..16].try_into().unwrap()),
+            ],
+            journal_blocks: self.journal_blocks_backup(),
             min_extra_isize: EXTRA_ISIZE,
             want_extra_isize: EXTRA_ISIZE,
             log_groups_per_flex: 31,

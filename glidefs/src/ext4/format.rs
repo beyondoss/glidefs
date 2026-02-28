@@ -713,8 +713,18 @@ impl SuperBlock {
         sb.feature_compat = CompatFeature::from_bits_truncate(le_u32(buf, 92));
         sb.feature_incompat = IncompatFeature::from_bits_truncate(le_u32(buf, 96));
         sb.feature_ro_compat = RoCompatFeature::from_bits_truncate(le_u32(buf, 100));
+        sb.uuid.copy_from_slice(&buf[104..120]);
         sb.reserved_gdt_blocks = le_u16(buf, 206);
+        sb.journal_uuid.copy_from_slice(&buf[208..224]);
+        sb.journal_inum = le_u32(buf, 224);
+        sb.journal_dev = le_u32(buf, 228);
+        for i in 0..4 {
+            sb.hash_seed[i] = le_u32(buf, 236 + i * 4);
+        }
         sb.desc_size = le_u16(buf, 254);
+        for i in 0..17 {
+            sb.journal_blocks[i] = le_u32(buf, 268 + i * 4);
+        }
         sb.blocks_count_high = le_u32(buf, 336);
         sb.log_groups_per_flex = buf[372];
         sb.lpf_inode = le_u32(buf, 616);
@@ -954,6 +964,12 @@ pub const XATTR_HEADER_MAGIC: u32 = 0xea020000;
 pub const BLOCK_SIZE: u64 = 4096;
 pub const SMALL_SYMLINK_SIZE: usize = 59;
 pub const INODE_FIRST: u32 = 11;
+pub const INODE_JOURNAL: u32 = 8;
+
+// ---- JBD2 (ext4 journal) constants ----
+
+pub const JBD2_MAGIC: u32 = 0xC03B3998;
+pub const JBD2_SUPERBLOCK_V2: u32 = 4;
 pub const XATTR_INODE_OVERHEAD: usize = 4 + 4; // magic + empty next entry
 pub const XATTR_BLOCK_OVERHEAD: usize = 32 + 4; // header + empty next entry
 pub const INLINE_DATA_XATTR_OVERHEAD: usize = XATTR_INODE_OVERHEAD + 16 + 4; // entry + "data"
