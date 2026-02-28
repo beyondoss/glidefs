@@ -671,7 +671,7 @@ async fn test_pack_index_corruption_returns_error() {
     cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
     // Find the pack file in S3 and corrupt the GLIX trailer
-    let pack_ids: Vec<u128> = {
+    let pack_ids: Vec<u64> = {
         let vm_guard = vm.read();
         vm_guard
             .chunk_pack_ids(0)
@@ -1043,7 +1043,7 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     }
 
     // Snapshot pack list — both "compactions" start from this same stale view
-    let pack_ids: Vec<u128> = {
+    let pack_ids: Vec<u64> = {
         let vm_guard = vm.read();
         vm_guard
             .chunk_pack_ids(0)

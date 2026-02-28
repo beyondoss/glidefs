@@ -194,7 +194,7 @@ impl VolumeManifest {
     /// Chunk entries (sorted by chunk_idx):
     ///   chunk_idx:    u32 LE
     ///   pack_count:   u16 LE
-    ///   packs:        [u128 LE; pack_count]
+    ///   packs:        [u64 LE; pack_count]
     ///
     /// CRC32 trailer: 4 bytes
     /// ```
@@ -203,7 +203,7 @@ impl VolumeManifest {
         let entries_size: usize = self
             .chunks
             .values()
-            .map(|e| 4 + 2 + e.packs.len() * 16) // chunk_idx + pack_count(u16) + packs
+            .map(|e| 4 + 2 + e.packs.len() * 8) // chunk_idx + pack_count(u16) + packs
             .sum();
         let total = GLVM_HEADER_SIZE + entries_size + 4; // +4 for CRC32
         let mut buf = Vec::with_capacity(total);
@@ -287,14 +287,14 @@ impl VolumeManifest {
                 u16::from_le_bytes(data[pos + 4..pos + 6].try_into().unwrap()) as usize;
             pos += 6;
 
-            if pos + pack_count * 16 > crc_offset {
+            if pos + pack_count * 8 > crc_offset {
                 return Err(VolumeManifestError::TooShort);
             }
             let mut packs = Vec::with_capacity(pack_count);
             for _ in 0..pack_count {
-                let pack_id = u128::from_le_bytes(data[pos..pos + 16].try_into().unwrap());
+                let pack_id = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
                 packs.push(pack_id);
-                pos += 16;
+                pos += 8;
             }
 
             chunks.insert(chunk_idx, ChunkEntry { packs });
@@ -375,8 +375,8 @@ mod tests {
             m.append_pack(i * 2, 0x1234567890ABCDEF);
         }
         let bytes = m.serialize();
-        // 32 (header) + 4096 * (4 + 2 + 16) (entries) + 4 (crc) = 32 + 90112 + 4 = 90148
-        assert_eq!(bytes.len(), 90148);
+        // 32 (header) + 4096 * (4 + 2 + 8) (entries) + 4 (crc) = 32 + 57344 + 4 = 57380
+        assert_eq!(bytes.len(), 57380);
 
         // Verify round-trip.
         let m2 = VolumeManifest::deserialize(&bytes).unwrap();
@@ -452,7 +452,7 @@ mod tests {
         m.append_pack(0, 200);
 
         // Simulate compaction snapshot: old_packs = [100, 200]
-        let old_packs = vec![100u128, 200];
+        let old_packs = vec![100u64, 200];
 
         // Simulate concurrent drain appending pack 300.
         m.append_pack(0, 300);

@@ -319,7 +319,7 @@ async fn list_all_packs(
         };
         let filename = &rel[slash_pos + 1..];
         if let Some(id_str) = filename.strip_suffix(".pack")
-            && id_str.len() == 16
+            && id_str.len() == 13
             && let Some(pack_id) = crate::block::pack::pack_id_from_str(id_str)
         {
             packs.insert((chunk_idx, pack_id));
@@ -340,7 +340,7 @@ fn parse_pack_path(rel: &str) -> Option<(u32, PackId)> {
     let chunk_idx = rel[..slash_pos].parse::<u32>().ok()?;
     let filename = &rel[slash_pos + 1..];
     let id_str = filename.strip_suffix(".pack")?;
-    if id_str.len() != 16 {
+    if id_str.len() != 13 {
         return None;
     }
     let pack_id = crate::block::pack::pack_id_from_str(id_str)?;
@@ -787,11 +787,11 @@ mod tests {
     fn test_pack_key_format() {
         use crate::block::pack::{pack_id_from_str, pack_id_to_string};
         // Verify round-trip: pack_key uses base36, parse back to PackId.
-        let id = 42u128;
+        let id = 42u64;
         let key = pack_key(0, id);
         let parts: Vec<&str> = key.split('/').collect();
         assert_eq!(parts[0], "0000");
-        assert_eq!(parts[1].len(), 16);
+        assert_eq!(parts[1].len(), 13);
         assert_eq!(pack_id_from_str(parts[1]).unwrap(), id);
 
         // Verify chunk_idx padding.
@@ -1198,7 +1198,7 @@ mod tests {
         let chunk_idx = 0u32;
 
         // Create 5 dead packs.
-        let dead_packs: Vec<PackId> = (1..=5u128).map(|i| i * 0x1000000000000000).collect();
+        let dead_packs: Vec<PackId> = (1..=5u64).map(|i| i * 0x1000000000000000).collect();
         for &pack_id in &dead_packs {
             content_store
                 .put_chunk_pack(chunk_idx, pack_id, vec![0u8; 100])

@@ -261,7 +261,7 @@ async fn test_delete_snapshot_frees_packs_for_gc() {
         .unwrap();
 
     // Upload orphan packs to S3 (not in current manifest)
-    let orphan_pack_id: u128 = 0xDEAD_5AAB_0000_0001;
+    let orphan_pack_id: u64 = 0xDEAD_5AAB_0000_0001;
     cs.put_chunk_pack(0, orphan_pack_id, b"snapshot-only pack data".to_vec())
         .await
         .unwrap();

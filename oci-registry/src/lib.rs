@@ -9,7 +9,11 @@ use futures::Stream;
 use oci_client::client::ClientConfig;
 use oci_client::manifest::OciManifest;
 use std::io;
+use std::time::Duration;
 use tracing::debug;
+
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// OCI registry client for pulling and pushing container images.
 ///
@@ -21,9 +25,11 @@ pub struct RegistryClient {
 impl RegistryClient {
     /// Create a new client with default settings.
     pub fn new() -> Self {
-        Self {
-            client: oci_client::Client::new(ClientConfig::default()),
-        }
+        Self::with_config(ClientConfig {
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+            read_timeout: Some(DEFAULT_READ_TIMEOUT),
+            ..Default::default()
+        })
     }
 
     /// Create a client with custom configuration.
@@ -47,8 +53,8 @@ impl RegistryClient {
         // Pull the manifest — could be an image manifest or an image index.
         let (manifest, digest) = self.client.pull_manifest(image, &registry_auth).await?;
 
-        let image_manifest = match manifest {
-            OciManifest::Image(m) => m,
+        let (image_manifest, digest) = match manifest {
+            OciManifest::Image(m) => (m, digest),
             OciManifest::ImageIndex(index) => {
                 // Find a manifest matching linux/amd64.
                 let platform_entry = index
@@ -75,16 +81,14 @@ impl RegistryClient {
                     .pull_manifest(&platform_ref, &registry_auth)
                     .await?;
 
-                let m = match nested {
-                    OciManifest::Image(m) => m,
+                match nested {
+                    OciManifest::Image(m) => (m, platform_digest),
                     OciManifest::ImageIndex(_) => {
                         return Err(Error::InvalidReference(
                             "nested image index not supported".into(),
                         ));
                     }
-                };
-
-                (m, platform_digest)
+                }
             }
         };
 
@@ -114,7 +118,7 @@ impl RegistryClient {
         image: &Reference,
         layer: &OciDescriptor,
         auth: &Credentials,
-    ) -> Result<impl Stream<Item = Result<Bytes, io::Error>> + 'static, Error> {
+    ) -> Result<impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static, Error> {
         let registry_auth = auth.into();
         self.client
             .auth(image, &registry_auth, oci_client::RegistryOperation::Pull)
@@ -143,7 +147,7 @@ impl RegistryClient {
     pub async fn push_blob(
         &self,
         image: &Reference,
-        data: &[u8],
+        data: Bytes,
         digest: &str,
         auth: &Credentials,
     ) -> Result<String, Error> {
@@ -160,7 +164,7 @@ impl RegistryClient {
 
         let url = self
             .client
-            .push_blob(image, Bytes::copy_from_slice(data), digest)
+            .push_blob(image, data, digest)
             .await?;
         debug!(digest, url, "pushed blob");
         Ok(digest.to_string())
