@@ -1,8 +1,10 @@
 # ext4 Architecture
 
-Deterministic, write-only ext4 filesystem image generator for producing byte-identical OCI container layer images from tar archives or programmatic file trees.
+Bidirectional OCI bridge between tar archives and ext4 filesystem images. The writer produces deterministic, byte-identical ext4 images from tar archives or programmatic file trees. The reader parses those images back into tar streams for container export.
 
 ## Data Flow
+
+### Write Path (tar → ext4 → bytes)
 
 ### Programmatic API
 
@@ -51,6 +53,44 @@ tar::Archive<R>
         ├── create(name, &File{mode,size,uid,gid,mtime,xattrs,...})
         └── io::copy(entry → &mut fs)   ── only for S_IFREG with size>0
 ```
+
+### Read Path (ext4 bytes → tar)
+
+```
+ext4 image (Read + Seek)
+  │
+  Reader::new()
+  │  ├── seek to 1024, read SuperBlock (magic, block size, inode counts)
+  │  └── read GroupDescriptors from block 1
+  │
+  Reader::walk()
+  │  └── walk_recursive(root_inode=2, prefix="")
+  │        ├── read_inode(dir_ino) ──► GroupDescriptor → inode table offset → 256-byte inode
+  │        ├── read_dir(inode)     ──► read_data → parse DirEntry records (skip ".", "..")
+  │        └── for each child entry:
+  │              ├── read_inode(child_ino)
+  │              ├── if S_IFLNK: read_symlink (inline ≤59 bytes, else extent data)
+  │              ├── if S_IFCHR|S_IFBLK: decode_device from inode.block[4..8]
+  │              ├── read_xattrs (inline extra space + optional xattr block)
+  │              └── if S_IFDIR: recurse
+  │
+  Reader::to_tar()
+  │  ├── walk() → Vec<WalkEntry>
+  │  ├── seen_inodes: BTreeMap<InodeNumber, first_path>
+  │  └── for each WalkEntry:
+  │        ├── S_IFREG: emit Regular tar entry + PAX xattrs + read_data_to(w)
+  │        ├── S_IFDIR: emit Directory entry + PAX xattrs
+  │        ├── S_IFLNK: emit Symlink entry
+  │        ├── S_IFCHR/BLK: emit Char/Block entry with major/minor
+  │        ├── S_IFIFO: emit Fifo entry
+  │        └── hard link (links_count > 1, seen inode): emit Link entry (no data)
+  │
+  └── tar stream written to W
+```
+
+**Hard link detection**: During `to_tar()`, a `BTreeMap<InodeNumber, String>` tracks the first path seen for each inode. When the same inode appears again with `links_count > 1`, a tar `Link` entry is emitted referencing the first path. This correctly reconstructs hard links without duplicating data.
+
+**Streaming reads**: `read_data_to(inode, &mut W)` streams file data block-by-block (4 KiB at a time) without buffering the whole file, suitable for large files.
 
 ## Concepts & Terminology
 
@@ -173,7 +213,7 @@ Separate xattr block (4096 bytes, one per inode)
 
 ## Inline Data
 
-When `WriterOption::InlineData` is set and a file's content fits in 216 bytes, the content is stored directly in the inode:
+When `WriterOption::InlineData` is set and a file's content fits in `INLINE_DATA_SIZE` (136 bytes), the content is stored directly in the inode:
 
 ```
 inode.data[0..60]      ── first 60 bytes of file content
@@ -243,17 +283,18 @@ Container layer images are read-only once mounted by the overlay filesystem. A j
 
 | File | Purpose |
 |------|---------|
-| `mod.rs` | Re-exports public API: `Writer`, `File`, `WriterOption`, `convert_tar_to_ext4` |
-| `format.rs` | On-disk binary structures: `SuperBlock`, `GroupDescriptor`, extent/dir/xattr writers, mode constants, feature bitflags. Write-only, no deserialization. |
+| `mod.rs` | Re-exports public API: `Writer`, `Reader`, `File`, `WriterOption`, `convert_tar_to_ext4` |
+| `format.rs` | On-disk binary structures: `SuperBlock`, `GroupDescriptor`, `ParsedInode`, `ExtentHeader/Leaf/Index`, `DirEntry`, xattr helpers. Both serialization (`write_to`) and deserialization (`read_from`, `get_xattrs`) for shared on-disk types. |
 | `writer.rs` | Core filesystem builder. Manages inode lifecycle, block allocation, extent tree construction, xattr packing, directory serialization, superblock finalization. |
-| `tar_convert.rs` | Tar-to-ext4 bridge. Maps tar entry types to writer operations, handles OCI whiteouts and PAX xattrs. |
-| `tests.rs` | Integration tests: basic files, hard links, symlinks, devices, large files (>600 MiB), large dirs (50K entries), inline data, xattrs, determinism. |
+| `reader.rs` | ext4 image parser. Reads superblock, group descriptors, inode table, extent trees, directory entries, and xattrs. Exports via `walk()` and `to_tar()`. |
+| `tar_convert.rs` | tar→ext4 bridge. Maps tar entry types to writer operations, handles OCI whiteouts and PAX xattrs. |
+| `tests.rs` | Integration tests: basic files, hard links, symlinks, devices, large files (>600 MiB), large dirs (50K entries), inline data, xattrs, determinism, reader roundtrips, tar roundtrips. |
 
 ## Configuration
 
 | Option | Default | Effect |
 |--------|---------|--------|
-| `WriterOption::InlineData` | disabled | Store files ≤216 bytes inside the inode instead of allocating data blocks. Reduces image size for layers with many small files (e.g., config files, scripts). |
+| `WriterOption::InlineData` | disabled | Store files ≤136 bytes inside the inode instead of allocating data blocks. Reduces image size for layers with many small files (e.g., config files, scripts). |
 | `WriterOption::MaximumDiskSize(n)` | 16 GiB | Maximum filesystem size. Controls the number of block groups pre-allocated in the group descriptor table. Range: 0..16 TiB. |
 
 ## Limits
@@ -261,11 +302,54 @@ Container layer images are read-only once mounted by the overlay filesystem. A j
 | Resource | Limit | Reason |
 |----------|-------|--------|
 | File size | 128 GiB | Two-level extent tree with 4 index entries × 340 leaves × 32K blocks |
-| Inline data | 216 bytes | 60 (inode.data) + 104 (extra) − 48 (xattr overhead) |
+| Inline data | 136 bytes | 60 (inode.data) + 104 (extra) − 28 (`system.data` xattr overhead: 8 magic/terminator + 16 entry header + 4 compressed name) |
 | Short symlinks | 59 bytes | Stored inline in `inode.data` without extent tree |
 | Hard links per inode | 65,000 | ext4 `MAX_LINKS` constant |
 | xattr name+value | ~4 KiB | One xattr block per inode; no multi-block xattr support |
 | Filesystem size | 16 TiB | 128 block groups × 32,768 blocks × 4096 bytes |
+
+## Testing
+
+Three test tiers in `tests.rs`:
+
+**Writer unit tests** — create an ext4 image in memory, inspect metadata:
+
+| Test | What it covers |
+|------|---------------|
+| `test_basic` | Files, symlinks, devices, hard links, directories |
+| `test_large_directory` | 50K entries in one directory (multi-block dir) |
+| `test_inline_data` | Files at the inline boundary (136 vs 137 bytes) |
+| `test_xattrs` | Small and large xattr sets, inode vs block storage |
+| `test_replace` | Overwrite files and directories, xattr updates |
+| `test_large_file` | 1–600 MiB files (tests 2-level extent trees) |
+| `test_large_disk` | 16 TiB filesystem (verifies group descriptor math) |
+| `test_determinism` | SHA-256 hash of output must be identical across runs |
+| `test_tar_determinism` | tar→ext4 output hash must be identical across runs |
+
+**Reader roundtrip tests** — write with writer, read back with reader, assert bit-for-bit correctness:
+
+| Test | What it covers |
+|------|---------------|
+| `test_reader_basic_roundtrip` | Files, dirs, symlinks, devices — metadata and content |
+| `test_reader_xattr_roundtrip` | xattr key/value preservation |
+| `test_reader_inline_data_roundtrip` | Inline data reading (INLINE_DATA flag) |
+| `test_reader_large_directory_roundtrip` | 1K-entry directory |
+| `test_reader_large_file_roundtrip` | 200 KiB file spanning multiple extents |
+| `test_reader_hard_link_roundtrip` | Hard link detection via shared inode number |
+| `test_reader_device_nodes_roundtrip` | Char/block devices, major/minor decoding |
+| `test_reader_tar_roundtrip` | Full tar→ext4→tar roundtrip |
+| `test_reader_to_tar_with_xattrs` | xattr preservation through tar→ext4→tar |
+
+**Docker integration tests** (`--features docker-tests`) — validate against real `e2fsck` and `debugfs`:
+
+| Test | What it covers |
+|------|---------------|
+| `test_ext4_fsck_with_verification` | e2fsck + debugfs content checks |
+| `test_ext4_fsck_large_directory` | 10K-file directory via e2fsck |
+| `test_ext4_fsck_tar_roundtrip` | tar→ext4 validated by e2fsck |
+| `test_ext4_fsck_inline_data` | Inline data validated by e2fsck |
+
+Run without Docker: `cargo test --features test-utils --lib` and `cargo test --features test-utils --test integration`
 
 ## Failure Modes
 
@@ -278,3 +362,8 @@ Container layer images are read-only once mounted by the overlay filesystem. A j
 | Link count overflow (>65,000) | `io::Error` returned from `link()` |
 | Overwrite dir with file (or vice versa) | `io::Error` returned from `create()` |
 | Overwrite inode that has extent data | `io::Error`: cannot replace inode with existing extent data |
+| Reader: bad superblock magic | `io::Error(InvalidData)`: `"bad magic"` |
+| Reader: unsupported block size | `io::Error(InvalidData)`: `"unsupported block size: N"` |
+| Reader: bad extent header magic | `io::Error(InvalidData)`: `"bad extent header magic: 0xN"` |
+| Reader: indirect-block inode (no EXTENTS flag) | `io::Error(Unsupported)`: `"only extent-based inodes are supported"` |
+| Reader: inode number out of range | `io::Error(InvalidInput)` with group/count details |
