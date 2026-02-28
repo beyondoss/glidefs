@@ -8,13 +8,17 @@ use std::collections::BTreeMap;
 use std::io::{self, BufWriter, Read, Seek, Write};
 
 use crate::ext4::format::{
-    self, FileType, InodeFlags, InodeNumber, DIR_ENTRY_HEADER_SIZE, INODE_DATA_SIZE,
-    INODE_EXTRA_SIZE, INODE_SIZE, INODE_USED_SIZE, TYPE_MASK, XATTR_HEADER_MAGIC,
+    self, FileType, InodeFlags, InodeNumber, DIR_ENTRY_HEADER_SIZE,
+    INODE_DATA_SIZE, INODE_EXTRA_SIZE, INODE_FIRST, INODE_SIZE,
+    INODE_USED_SIZE, SMALL_SYMLINK_SIZE, TYPE_MASK, XATTR_BLOCK_OVERHEAD,
+    XATTR_HEADER_MAGIC, XATTR_INODE_OVERHEAD,
 };
+
+// Re-export for backward compatibility (tests import from writer)
+pub use crate::ext4::format::{BLOCK_SIZE, INLINE_DATA_SIZE};
 
 // ---- Constants ----
 
-pub const BLOCK_SIZE: u64 = 4096;
 const BLOCKS_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32;
 const MAX_INODES_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32;
 const INODES_PER_GROUP_INCREMENT: u32 = (BLOCK_SIZE as u32) / (INODE_SIZE as u32);
@@ -22,13 +26,7 @@ const DEFAULT_MAX_DISK_SIZE: i64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 const MAX_MAX_DISK_SIZE: i64 = 16 * 1024 * 1024 * 1024 * 1024; // 16 TiB
 const GROUPS_PER_DESCRIPTOR_BLOCK: u32 = (BLOCK_SIZE as u32) / format::GROUP_DESCRIPTOR_SIZE as u32;
 const MAX_FILE_SIZE: i64 = 128 * 1024 * 1024 * 1024; // 128 GiB
-const SMALL_SYMLINK_SIZE: usize = 59;
 const MAX_BLOCKS_PER_EXTENT: u32 = 0x8000;
-const XATTR_INODE_OVERHEAD: usize = 4 + 4; // magic + empty next entry
-const XATTR_BLOCK_OVERHEAD: usize = 32 + 4; // header + empty next entry
-const INLINE_DATA_XATTR_OVERHEAD: usize = XATTR_INODE_OVERHEAD + 16 + 4; // entry + "data"
-pub(crate) const INLINE_DATA_SIZE: usize = INODE_DATA_SIZE + INODE_EXTRA_SIZE - INLINE_DATA_XATTR_OVERHEAD;
-const INODE_FIRST: u32 = 11;
 const INODE_LOST_AND_FOUND: u32 = INODE_FIRST;
 const EXTRA_ISIZE: u16 = (INODE_USED_SIZE - 128) as u16;
 
@@ -111,38 +109,7 @@ impl Inode {
 
 // ---- Xattr helpers ----
 
-struct XattrPrefix {
-    index: u8,
-    prefix: &'static str,
-}
-
-const XATTR_PREFIXES: &[XattrPrefix] = &[
-    XattrPrefix { index: 2, prefix: "system.posix_acl_access" },
-    XattrPrefix { index: 3, prefix: "system.posix_acl_default" },
-    XattrPrefix { index: 8, prefix: "system.richacl" },
-    XattrPrefix { index: 7, prefix: "system." },
-    XattrPrefix { index: 1, prefix: "user." },
-    XattrPrefix { index: 4, prefix: "trusted." },
-    XattrPrefix { index: 6, prefix: "security." },
-];
-
-fn compress_xattr_name(name: &str) -> (u8, &str) {
-    for p in XATTR_PREFIXES {
-        if let Some(rest) = name.strip_prefix(p.prefix) {
-            return (p.index, rest);
-        }
-    }
-    (0, name)
-}
-
-fn decompress_xattr_name(index: u8, name: &str) -> String {
-    for p in XATTR_PREFIXES {
-        if index == p.index {
-            return format!("{}{}", p.prefix, name);
-        }
-    }
-    name.to_string()
-}
+use crate::ext4::format::{compress_xattr_name, get_xattrs};
 
 fn hash_xattr_entry(name: &str, value: &[u8]) -> u32 {
     let mut hash: u32 = 0;
@@ -241,24 +208,6 @@ fn put_xattrs(xattrs: &[Xattr], buf: &mut [u8], offset_delta: u16) {
     }
 }
 
-fn get_xattrs(buf: &[u8], xattrs: &mut BTreeMap<String, Vec<u8>>, offset_delta: u16) {
-    let mut pos = 0usize;
-    while pos < buf.len() {
-        let name_len = buf[pos] as usize;
-        if name_len == 0 {
-            break;
-        }
-        let index = buf[pos + 1];
-        let offset = u16::from_le_bytes([buf[pos + 2], buf[pos + 3]]) - offset_delta;
-        let value_len = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]) as usize;
-        let name = std::str::from_utf8(&buf[pos + 16..pos + 16 + name_len]).unwrap_or("");
-        let full_name = decompress_xattr_name(index, name);
-        let value = buf[offset as usize..offset as usize + value_len].to_vec();
-        xattrs.insert(full_name, value);
-        let entry_len = ((name_len + 3) & !3usize) + 16;
-        pos += entry_len;
-    }
-}
 
 // ---- Writer ----
 

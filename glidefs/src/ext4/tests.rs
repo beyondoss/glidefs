@@ -482,4 +482,433 @@ mod tests {
         let hash2 = Sha256::digest(&out2);
         assert_eq!(hash1, hash2, "tar-to-ext4 conversion is not deterministic");
     }
+
+    // ---- Reader roundtrip tests ----
+
+    use crate::ext4::reader::Reader;
+
+    /// Helper: write an ext4 image, then open it with Reader.
+    fn write_and_read(
+        test_files: &mut [TestFile],
+        opts: &[WriterOption],
+    ) -> (Vec<u8>, Reader<Cursor<Vec<u8>>>) {
+        let buf = Cursor::new(Vec::new());
+        let mut w = Writer::new(buf, opts);
+
+        for tf in test_files.iter_mut() {
+            create_test_file(&mut w, tf).unwrap();
+        }
+
+        let output = w.close().unwrap().into_inner();
+        let reader = Reader::new(Cursor::new(output.clone())).unwrap();
+        (output, reader)
+    }
+
+    #[test]
+    fn test_reader_basic_roundtrip() {
+        let data = test_data();
+
+        let mut test_files = vec![
+            TestFile::new_file_with_data("hello.txt", File {
+                mode: format::S_IFREG | 0o644,
+                uid: 1000,
+                gid: 1000,
+                atime: 1700000000,
+                mtime: 1700003600,
+                ..Default::default()
+            }, b"hello world"),
+            TestFile::new_file("empty", File { mode: 0o644, ..Default::default() }),
+            TestFile::new_file("subdir", File { mode: format::S_IFDIR | 0o755, ..Default::default() }),
+            TestFile::new_file_with_data("subdir/nested.txt", File {
+                mode: format::S_IFREG | 0o600,
+                uid: 1000,
+                gid: 1000,
+                ..Default::default()
+            }, b"nested content"),
+            TestFile::new_file("link_to_hello", File {
+                mode: format::S_IFLNK,
+                linkname: "hello.txt".to_string(),
+                ..Default::default()
+            }),
+            TestFile::new_file("subdir/null_dev", File {
+                mode: format::S_IFCHR,
+                devmajor: 1,
+                devminor: 3,
+                ..Default::default()
+            }),
+            TestFile::new_file("subdir/fifo", File {
+                mode: format::S_IFIFO | 0o644,
+                ..Default::default()
+            }),
+            TestFile::new_file_with_data("bigger.txt", File {
+                mode: format::S_IFREG | 0o644,
+                ..Default::default()
+            }, &data[..200]),
+        ];
+
+        let (_output, mut reader) = write_and_read(&mut test_files, &[]);
+        let entries = reader.walk().unwrap();
+
+        // Check entry count (lost+found + our entries)
+        // lost+found is a directory created by the writer. Walk skips it by default since
+        // inode 11 >= INODE_FIRST, so it will be included.
+        let names: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(names.contains(&"hello.txt"), "missing hello.txt in walk: {names:?}");
+        assert!(names.contains(&"empty"), "missing empty in walk: {names:?}");
+        assert!(names.contains(&"subdir"), "missing subdir in walk: {names:?}");
+        assert!(names.contains(&"subdir/nested.txt"), "missing subdir/nested.txt: {names:?}");
+        assert!(names.contains(&"link_to_hello"), "missing link_to_hello: {names:?}");
+        assert!(names.contains(&"subdir/null_dev"), "missing subdir/null_dev: {names:?}");
+        assert!(names.contains(&"subdir/fifo"), "missing subdir/fifo: {names:?}");
+
+        // Verify file content
+        let hello = entries.iter().find(|e| e.path == "hello.txt").unwrap();
+        let inode = reader.read_inode(hello.inode_number).unwrap();
+        let content = reader.read_data(&inode).unwrap();
+        assert_eq!(content, b"hello world", "hello.txt content mismatch");
+
+        // Verify nested file content
+        let nested = entries.iter().find(|e| e.path == "subdir/nested.txt").unwrap();
+        let inode = reader.read_inode(nested.inode_number).unwrap();
+        let content = reader.read_data(&inode).unwrap();
+        assert_eq!(content, b"nested content", "nested.txt content mismatch");
+
+        // Verify symlink target
+        let link = entries.iter().find(|e| e.path == "link_to_hello").unwrap();
+        assert_eq!(link.symlink_target.as_deref(), Some("hello.txt"), "symlink target mismatch");
+
+        // Verify device node
+        let dev = entries.iter().find(|e| e.path == "subdir/null_dev").unwrap();
+        assert_eq!(dev.devmajor, 1, "devmajor mismatch");
+        assert_eq!(dev.devminor, 3, "devminor mismatch");
+
+        // Verify metadata
+        assert_eq!(hello.uid, 1000);
+        assert_eq!(hello.gid, 1000);
+        assert_eq!(hello.mode & !TYPE_MASK, 0o644);
+        assert_eq!(hello.atime, 1700000000);
+        assert_eq!(hello.mtime, 1700003600);
+
+        // Verify bigger file content
+        let bigger = entries.iter().find(|e| e.path == "bigger.txt").unwrap();
+        let inode = reader.read_inode(bigger.inode_number).unwrap();
+        let content = reader.read_data(&inode).unwrap();
+        assert_eq!(content, &data[..200], "bigger.txt content mismatch");
+    }
+
+    #[test]
+    fn test_reader_xattr_roundtrip() {
+        let data = test_data();
+
+        let mut test_files = vec![
+            TestFile::new_file("with_xattrs", File {
+                mode: format::S_IFREG | 0o644,
+                xattrs: BTreeMap::from([
+                    ("user.test".to_string(), b"value123".to_vec()),
+                    ("user.other".to_string(), b"data".to_vec()),
+                ]),
+                ..Default::default()
+            }),
+            TestFile::new_file("with_large_xattrs", File {
+                mode: format::S_IFREG | 0o644,
+                xattrs: BTreeMap::from([
+                    ("user.big".to_string(), data[..100].to_vec()),
+                ]),
+                ..Default::default()
+            }),
+        ];
+
+        let (_output, mut reader) = write_and_read(&mut test_files, &[]);
+        let entries = reader.walk().unwrap();
+
+        let entry = entries.iter().find(|e| e.path == "with_xattrs").unwrap();
+        assert_eq!(entry.xattrs.get("user.test").map(|v| v.as_slice()), Some(b"value123".as_slice()));
+        assert_eq!(entry.xattrs.get("user.other").map(|v| v.as_slice()), Some(b"data".as_slice()));
+
+        let entry = entries.iter().find(|e| e.path == "with_large_xattrs").unwrap();
+        assert_eq!(entry.xattrs.get("user.big").map(|v| v.as_slice()), Some(&data[..100] as &[u8]));
+    }
+
+    #[test]
+    fn test_reader_inline_data_roundtrip() {
+        let data = test_data();
+
+        let mut test_files = vec![
+            TestFile::new_file_with_data("tiny.txt", File {
+                mode: format::S_IFREG | 0o644,
+                ..Default::default()
+            }, b"tiny"),
+            TestFile::new_file_with_data("bigger.txt", File {
+                mode: format::S_IFREG | 0o644,
+                ..Default::default()
+            }, &data[..60]),
+        ];
+
+        let (_output, mut reader) = write_and_read(&mut test_files, &[WriterOption::InlineData]);
+        let entries = reader.walk().unwrap();
+
+        let tiny = entries.iter().find(|e| e.path == "tiny.txt").unwrap();
+        let inode = reader.read_inode(tiny.inode_number).unwrap();
+        let content = reader.read_data(&inode).unwrap();
+        assert_eq!(content, b"tiny", "tiny.txt content mismatch");
+
+        let bigger = entries.iter().find(|e| e.path == "bigger.txt").unwrap();
+        let inode = reader.read_inode(bigger.inode_number).unwrap();
+        let content = reader.read_data(&inode).unwrap();
+        assert_eq!(&content, &data[..60], "bigger.txt content mismatch");
+    }
+
+    #[test]
+    fn test_reader_large_directory_roundtrip() {
+        let mut test_files = vec![
+            TestFile::new_file("bigdir", File { mode: format::S_IFDIR | 0o755, ..Default::default() }),
+        ];
+        for i in 0..1000 {
+            test_files.push(TestFile::new_file(
+                &format!("bigdir/file_{i:04}"),
+                File { mode: 0o644, ..Default::default() },
+            ));
+        }
+
+        let (_output, mut reader) = write_and_read(&mut test_files, &[]);
+        let entries = reader.walk().unwrap();
+
+        // Filter to bigdir/* entries
+        let dir_entries: Vec<_> = entries.iter()
+            .filter(|e| e.path.starts_with("bigdir/"))
+            .collect();
+        assert_eq!(dir_entries.len(), 1000, "expected 1000 entries in bigdir, got {}", dir_entries.len());
+
+        // Verify specific entries exist
+        assert!(dir_entries.iter().any(|e| e.path == "bigdir/file_0000"));
+        assert!(dir_entries.iter().any(|e| e.path == "bigdir/file_0999"));
+    }
+
+    #[test]
+    fn test_reader_large_file_roundtrip() {
+        // Multi-extent file: 128KB+ should require extent tree
+        let data: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let file_data = &data[..200_000]; // ~200KB
+
+        let mut test_files = vec![
+            TestFile::new_file_with_data("large.bin", File {
+                mode: format::S_IFREG | 0o644,
+                ..Default::default()
+            }, file_data),
+        ];
+
+        let (_output, mut reader) = write_and_read(&mut test_files, &[]);
+        let entries = reader.walk().unwrap();
+
+        let entry = entries.iter().find(|e| e.path == "large.bin").unwrap();
+        assert_eq!(entry.size, file_data.len() as u64);
+
+        let inode = reader.read_inode(entry.inode_number).unwrap();
+        let content = reader.read_data(&inode).unwrap();
+        assert_eq!(content.len(), file_data.len());
+        assert_eq!(content, file_data, "large file content mismatch");
+    }
+
+    #[test]
+    fn test_reader_hard_link_roundtrip() {
+        let mut test_files = vec![
+            TestFile::new_file_with_data("original.txt", File {
+                mode: format::S_IFREG | 0o644,
+                ..Default::default()
+            }, b"shared content"),
+            TestFile::new_link("hardlink.txt", "original.txt"),
+        ];
+
+        let (_output, mut reader) = write_and_read(&mut test_files, &[]);
+        let entries = reader.walk().unwrap();
+
+        let orig = entries.iter().find(|e| e.path == "original.txt").unwrap();
+        let link = entries.iter().find(|e| e.path == "hardlink.txt").unwrap();
+
+        // Same inode number
+        assert_eq!(orig.inode_number, link.inode_number, "hard link should share inode");
+        // Link count should be 2
+        assert_eq!(orig.links_count, 2, "expected link count 2");
+
+        // Both should read the same content
+        let inode = reader.read_inode(orig.inode_number).unwrap();
+        let content = reader.read_data(&inode).unwrap();
+        assert_eq!(content, b"shared content");
+    }
+
+    #[test]
+    fn test_reader_device_nodes_roundtrip() {
+        let mut test_files = vec![
+            TestFile::new_file("chr_dev", File {
+                mode: format::S_IFCHR,
+                devmajor: 0x56,
+                devminor: 0x1234,
+                ..Default::default()
+            }),
+            TestFile::new_file("blk_dev", File {
+                mode: format::S_IFBLK,
+                devmajor: 0x78,
+                devminor: 0x12,
+                ..Default::default()
+            }),
+        ];
+
+        let (_output, mut reader) = write_and_read(&mut test_files, &[]);
+        let entries = reader.walk().unwrap();
+
+        let chr = entries.iter().find(|e| e.path == "chr_dev").unwrap();
+        assert_eq!(chr.devmajor, 0x56, "chr devmajor mismatch");
+        assert_eq!(chr.devminor, 0x1234, "chr devminor mismatch");
+
+        let blk = entries.iter().find(|e| e.path == "blk_dev").unwrap();
+        assert_eq!(blk.devmajor, 0x78, "blk devmajor mismatch");
+        assert_eq!(blk.devminor, 0x12, "blk devminor mismatch");
+    }
+
+    #[test]
+    fn test_reader_tar_roundtrip() {
+        use crate::ext4::tar_convert::{convert_tar_to_ext4, ConvertOptions};
+
+        // Build a tar
+        let mut builder = tar::Builder::new(Vec::new());
+
+        let mut header = tar::Header::new_gnu();
+        header.set_path("app/").unwrap();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o755);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, io::empty()).unwrap();
+
+        let file_data = b"#!/bin/sh\necho hello\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("app/run.sh").unwrap();
+        header.set_mode(0o755);
+        header.set_size(file_data.len() as u64);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        builder.append(&header, &file_data[..]).unwrap();
+
+        let mut header = tar::Header::new_gnu();
+        header.set_path("app/link").unwrap();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_link_name("run.sh").unwrap();
+        header.set_mode(0o777);
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, io::empty()).unwrap();
+
+        let config_data = b"config=value\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("app/config.txt").unwrap();
+        header.set_mode(0o644);
+        header.set_size(config_data.len() as u64);
+        header.set_cksum();
+        builder.append(&header, &config_data[..]).unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        // Convert tar -> ext4
+        let opts = ConvertOptions::default();
+        let ext4_data = convert_tar_to_ext4(
+            Cursor::new(tar_data),
+            Cursor::new(Vec::new()),
+            &opts,
+        ).unwrap().into_inner();
+
+        // Read ext4 with Reader
+        let mut reader = Reader::new(Cursor::new(ext4_data)).unwrap();
+        let entries = reader.walk().unwrap();
+
+        let names: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(names.contains(&"app"), "missing app directory: {names:?}");
+        assert!(names.contains(&"app/run.sh"), "missing app/run.sh: {names:?}");
+        assert!(names.contains(&"app/link"), "missing app/link: {names:?}");
+        assert!(names.contains(&"app/config.txt"), "missing app/config.txt: {names:?}");
+
+        // Verify file content
+        let run_sh = entries.iter().find(|e| e.path == "app/run.sh").unwrap();
+        let inode = reader.read_inode(run_sh.inode_number).unwrap();
+        let content = reader.read_data(&inode).unwrap();
+        assert_eq!(content, file_data.as_slice(), "run.sh content mismatch");
+
+        let config = entries.iter().find(|e| e.path == "app/config.txt").unwrap();
+        let inode = reader.read_inode(config.inode_number).unwrap();
+        let content = reader.read_data(&inode).unwrap();
+        assert_eq!(content, config_data.as_slice(), "config.txt content mismatch");
+
+        // Verify symlink
+        let link = entries.iter().find(|e| e.path == "app/link").unwrap();
+        assert_eq!(link.symlink_target.as_deref(), Some("run.sh"));
+
+        // Now test to_tar export
+        let mut reader = Reader::new(Cursor::new(reader.into_inner().into_inner())).unwrap();
+        let tar_output = reader.to_tar(Vec::new()).unwrap();
+        assert!(!tar_output.is_empty(), "tar output should not be empty");
+
+        // Parse the exported tar and verify entries
+        let mut archive = tar::Archive::new(Cursor::new(tar_output));
+        let mut found_run_sh = false;
+        let mut found_config = false;
+        for entry_result in archive.entries().unwrap() {
+            let mut entry: tar::Entry<_> = entry_result.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            if path == "app/run.sh" {
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content).unwrap();
+                assert_eq!(content, file_data.as_slice(), "tar run.sh content mismatch");
+                found_run_sh = true;
+            } else if path == "app/config.txt" {
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content).unwrap();
+                assert_eq!(content, config_data.as_slice(), "tar config.txt content mismatch");
+                found_config = true;
+            }
+        }
+        assert!(found_run_sh, "run.sh not found in exported tar");
+        assert!(found_config, "config.txt not found in exported tar");
+    }
+
+    #[test]
+    fn test_reader_to_tar_with_xattrs() {
+        use crate::ext4::tar_convert::{convert_tar_to_ext4, ConvertOptions};
+
+        // Build a tar with PAX xattrs
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Add PAX extensions for xattrs
+        builder.append_pax_extensions([
+            ("SCHILY.xattr.user.test", b"value123" as &[u8]),
+        ]).unwrap();
+
+        let file_data = b"xattr content";
+        let mut header = tar::Header::new_gnu();
+        header.set_path("xattr_file").unwrap();
+        header.set_mode(0o644);
+        header.set_size(file_data.len() as u64);
+        header.set_cksum();
+        builder.append(&header, &file_data[..]).unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        // Convert tar -> ext4
+        let opts = ConvertOptions::default();
+        let ext4_data = convert_tar_to_ext4(
+            Cursor::new(tar_data),
+            Cursor::new(Vec::new()),
+            &opts,
+        ).unwrap().into_inner();
+
+        // Read and verify xattrs
+        let mut reader = Reader::new(Cursor::new(ext4_data)).unwrap();
+        let entries = reader.walk().unwrap();
+
+        let entry = entries.iter().find(|e| e.path == "xattr_file").unwrap();
+        assert_eq!(
+            entry.xattrs.get("user.test").map(|v| v.as_slice()),
+            Some(b"value123".as_slice()),
+            "xattr not preserved through roundtrip"
+        );
+    }
 }
