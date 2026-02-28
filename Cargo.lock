@@ -2561,6 +2561,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "oci-distribution"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "ext4",
+ "futures",
+ "glidefs",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "object_store",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "oci-registry"
 version = "0.1.0"
 dependencies = [

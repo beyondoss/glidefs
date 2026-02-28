@@ -33,6 +33,7 @@ const EXTRA_ISIZE: u16 = (INODE_USED_SIZE - 128) as u16;
 // ---- Public types ----
 
 /// A file to be added to the ext4 filesystem.
+#[derive(Default)]
 pub struct File {
     pub linkname: String,
     pub size: i64,
@@ -48,24 +49,6 @@ pub struct File {
     pub xattrs: BTreeMap<String, Vec<u8>>,
 }
 
-impl Default for File {
-    fn default() -> Self {
-        Self {
-            linkname: String::new(),
-            size: 0,
-            mode: 0,
-            uid: 0,
-            gid: 0,
-            atime: 0,
-            ctime: 0,
-            mtime: 0,
-            crtime: 0,
-            devmajor: 0,
-            devminor: 0,
-            xattrs: BTreeMap::new(),
-        }
-    }
-}
 
 /// Option for configuring the Writer.
 #[derive(Clone)]
@@ -127,7 +110,7 @@ fn hash_xattr_entry(name: &str, value: &[u8]) -> u32 {
         hash = (hash << 16) ^ (hash >> 16) ^ u32::from_le_bytes([value[i], value[i+1], value[i+2], value[i+3]]);
         i += 4;
     }
-    if value.len() % 4 != 0 {
+    if !value.len().is_multiple_of(4) {
         let start = value.len() & !3;
         let mut last = [0u8; 4];
         last[..value.len() - start].copy_from_slice(&value[start..]);
@@ -277,8 +260,7 @@ impl<W: Read + Write + Seek> Writer<W> {
 
     fn write_bytes(&mut self, b: &[u8]) -> io::Result<usize> {
         if self.pos + b.len() as i64 > self.max_disk_size {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("disk exceeded maximum size of {} bytes", self.max_disk_size),
             ));
         }
@@ -289,8 +271,7 @@ impl<W: Read + Write + Seek> Writer<W> {
 
     fn write_zeros(&mut self, n: i64) -> io::Result<()> {
         if self.pos + n > self.max_disk_size {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("disk exceeded maximum size of {} bytes", self.max_disk_size),
             ));
         }
@@ -389,8 +370,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         if let Some(existing_ino) = reuse_ino {
             let existing = self.inodes[(existing_ino - 1) as usize].as_ref().unwrap();
             if existing.flags.contains(InodeFlags::EXTENTS) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "cannot overwrite file with non-inline data",
                 ));
             }
@@ -422,8 +402,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                 flags |= InodeFlags::HUGE_FILE;
                 size = f.size;
                 if f.size > MAX_FILE_SIZE {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         format!("file too big: {} > {MAX_FILE_SIZE}", f.size),
                     ));
                 }
@@ -437,8 +416,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                     // Add dummy entry — will be rewritten in writeInodeTable
                     let dummy = vec![0u8; extra];
                     if !xstate.add_xattr("system.data", &dummy) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
+                        return Err(io::Error::other(
                             "not enough room for inline data",
                         ));
                     }
@@ -471,8 +449,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         // Accumulate xattrs (BTreeMap iteration is sorted)
         for (name, value) in &f.xattrs {
             if !xstate.add_xattr(name, value) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!("could not fit xattr {name}"),
                 ));
             }
@@ -570,8 +547,7 @@ impl<W: Read + Write + Seek> Writer<W> {
 
     fn start_inode(&mut self, name: &str, ino: InodeNumber, size: i64) -> io::Result<()> {
         if self.cur_inode.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "inode already in progress",
             ));
         }
@@ -591,8 +567,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             None => return Ok(()),
         };
         if self.data_written != self.data_max {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("did not write the right amount: {} != {}", self.data_written, self.data_max),
             ));
         }
@@ -609,8 +584,7 @@ impl<W: Read + Write + Seek> Writer<W> {
     fn write_extents(&mut self, idx: usize) -> io::Result<()> {
         let start = self.pos - self.data_written;
         if start % BLOCK_SIZE as i64 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "data start position is not block-aligned",
             ));
         }
@@ -623,7 +597,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         const EXTENT_NODE_SIZE: u32 = 12;
         const EXTENTS_PER_BLOCK: u32 = (BLOCK_SIZE as u32) / EXTENT_NODE_SIZE - 1;
 
-        let extents = if blocks == 0 { 0 } else { (blocks + MAX_BLOCKS_PER_EXTENT - 1) / MAX_BLOCKS_PER_EXTENT };
+        let extents = if blocks == 0 { 0 } else { blocks.div_ceil(MAX_BLOCKS_PER_EXTENT) };
         let mut data = Vec::new();
 
         if extents == 0 {
@@ -643,7 +617,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             let padding = (4 - extents) * EXTENT_NODE_SIZE;
             data.extend(std::iter::repeat_n(0u8, padding as usize));
         } else if extents <= 4 * EXTENTS_PER_BLOCK {
-            let extent_blocks = (extents + EXTENTS_PER_BLOCK - 1) / EXTENTS_PER_BLOCK;
+            let extent_blocks = extents.div_ceil(EXTENTS_PER_BLOCK);
             used_blocks += extent_blocks;
 
             // Root: index nodes
@@ -698,8 +672,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                 self.write_bytes(&leaf_buf)?;
             }
         } else {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "file too large for two-level extent tree",
             ));
         }
@@ -719,11 +692,11 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.inodes.push(None);
 
         // Create root directory (inode 2)
-        let mut root_file = File {
+        let root_file = File {
             mode: format::S_IFDIR | 0o755,
             ..Default::default()
         };
-        let root_ino = self.make_inode(&mut root_file, None)?;
+        let root_ino = self.make_inode(&root_file, None)?;
         // Root is linked to itself
         self.inodes[(root_ino - 1) as usize].as_mut().unwrap().link_count += 1;
 
@@ -811,15 +784,13 @@ impl<W: Read + Write + Seek> Writer<W> {
             let existing_inode = self.get_inode(existing).unwrap();
             if existing_inode.is_dir() {
                 if f.mode & TYPE_MASK != format::S_IFDIR {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         format!("{name}: cannot replace a directory with a file"),
                     ));
                 }
                 reuse_ino = Some(existing);
             } else if f.mode & TYPE_MASK == format::S_IFDIR {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!("{name}: cannot replace a file with a directory"),
                 ));
             } else if existing_inode.link_count < 2 {
@@ -831,8 +802,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             if f.mode & TYPE_MASK == format::S_IFDIR {
                 let dir = self.get_inode(dir_ino).unwrap();
                 if dir.link_count >= format::MAX_LINKS {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         format!("{name}: exceeded parent directory maximum link count"),
                     ));
                 }
@@ -867,8 +837,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         if let Some(existing) = existing_ino {
             let ex = self.get_inode(existing).unwrap();
             if ex.is_dir() || ex.link_count < 2 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!("{newname}: cannot orphan existing file or directory"),
                 ));
             }
@@ -878,14 +847,12 @@ impl<W: Read + Write + Seek> Writer<W> {
         let old_ino = old_ino.unwrap();
         let old_file = self.get_inode(old_ino).unwrap();
         if old_file.mode & TYPE_MASK == format::S_IFDIR {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("{newname}: link target cannot be a directory: {oldname}"),
             ));
         }
         if existing_ino != Some(old_ino) && old_file.link_count >= format::MAX_LINKS {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("{newname}: link target would exceed maximum link count: {oldname}"),
             ));
         }
@@ -938,8 +905,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
         if node.file_type() == format::S_IFLNK {
             if node.size > SMALL_SYMLINK_SIZE as i64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!("{name}: cannot retrieve link information"),
                 ));
             }
@@ -954,8 +920,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             return Ok(0);
         }
         if self.data_written + b.len() as i64 > self.data_max {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!(
                     "{}: wrote too much: {} > {}",
                     self.cur_name,
@@ -1043,8 +1008,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             self.write_dir_entry(0, left as u16, 0, FileType::Unknown)?;
             let padding = left - DIR_ENTRY_HEADER_SIZE;
             if padding < 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     "not enough space for trailing directory entry",
                 ));
             }
@@ -1171,10 +1135,10 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
         if let Some(Some(journal_inode)) = self.inodes.get(7) {
             // First 15 entries: the 60-byte block[] field as 15 u32s (extent data)
-            for i in 0..15 {
+            for (i, slot) in backup.iter_mut().enumerate().take(15) {
                 let off = i * 4;
                 if off + 4 <= journal_inode.data.len() {
-                    backup[i] = u32::from_le_bytes(
+                    *slot = u32::from_le_bytes(
                         journal_inode.data[off..off + 4].try_into().unwrap(),
                     );
                 }
@@ -1306,8 +1270,7 @@ impl<W: Read + Write + Seek> Writer<W> {
 
         let used_gd_blocks = (groups - 1) / GROUPS_PER_DESCRIPTOR_BLOCK + 1;
         if used_gd_blocks > self.gd_blocks {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("disk exceeded maximum size of {} bytes", self.max_disk_size),
             ));
         }
@@ -1343,7 +1306,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                     used_block_count -= 1;
                 }
             }
-            if g == groups - 1 && disk_size % BLOCKS_PER_GROUP != 0 {
+            if g == groups - 1 && !disk_size.is_multiple_of(BLOCKS_PER_GROUP) {
                 for j in (disk_size % BLOCKS_PER_GROUP)..BLOCKS_PER_GROUP {
                     bitmap_buf[(j / 8) as usize] |= 1 << (j % 8);
                     used_block_count += 1;
@@ -1358,11 +1321,10 @@ impl<W: Read + Write + Seek> Writer<W> {
                     bitmap_buf[BLOCK_SIZE as usize + (j / 8) as usize] |= 1 << (j % 8);
                     used_inode_count += 1;
                 }
-                if let Some(inode) = inode {
-                    if inode.mode & TYPE_MASK == format::S_IFDIR {
+                if let Some(inode) = inode
+                    && inode.mode & TYPE_MASK == format::S_IFDIR {
                         dir_count += 1;
                     }
-                }
             }
             // Padding: bits beyond inodes_per_group must be set to 1
             for j in inodes_per_group..(BLOCK_SIZE as u32 * 8) {
@@ -1457,7 +1419,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.seek_block(disk_size)?;
 
         self.f.flush()?;
-        Ok(self.f.into_inner().map_err(|e| e.into_error())?)
+        self.f.into_inner().map_err(|e| e.into_error())
     }
 }
 
@@ -1515,7 +1477,7 @@ fn group_count(blocks: u32, inodes: u32, inodes_per_group: u32) -> u32 {
     if blocks < min_blocks {
         blocks = min_blocks;
     }
-    (blocks + data_blocks_per_group - 1) / data_blocks_per_group
+    blocks.div_ceil(data_blocks_per_group)
 }
 
 fn best_group_count(blocks: u32, inodes: u32) -> (u32, u32) {

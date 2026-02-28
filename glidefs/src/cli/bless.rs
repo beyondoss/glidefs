@@ -352,15 +352,24 @@ pub async fn run_bless_oci(
 
     // --- Generate hot set from VolumeManifest ---
     let hot_set = {
-        let vm = volume_manifest.read();
-        let blocks_per_chunk = vm.blocks_per_chunk() as u64;
-        let mut indices: Vec<u64> = Vec::new();
+        // Collect chunk data under the read lock, then release before awaiting.
+        let (blocks_per_chunk, chunk_packs): (u64, Vec<(u32, Vec<u64>)>) = {
+            let vm = volume_manifest.read();
+            let bpc = vm.blocks_per_chunk() as u64;
+            let cp = vm
+                .chunks
+                .iter()
+                .map(|(&idx, entry)| (idx, entry.packs.clone()))
+                .collect();
+            (bpc, cp)
+        };
 
-        for (&chunk_idx, entry) in &vm.chunks {
-            for &pack_id in &entry.packs {
+        let mut indices: Vec<u64> = Vec::new();
+        for (chunk_idx, packs) in &chunk_packs {
+            for &pack_id in packs {
                 if let Some(entries) = pack_index_cache.get_entries(pack_id).await {
                     for e in &entries {
-                        let global_block = chunk_idx as u64 * blocks_per_chunk + e.chunk_offset as u64;
+                        let global_block = *chunk_idx as u64 * blocks_per_chunk + e.chunk_offset as u64;
                         indices.push(global_block);
                     }
                 }

@@ -694,41 +694,50 @@ impl SuperBlock {
                 format!("bad superblock magic: 0x{magic:04x}"),
             ));
         }
-        let mut sb = SuperBlock::default();
-        sb.inodes_count = le_u32(buf, 0);
-        sb.blocks_count_low = le_u32(buf, 4);
-        sb.r_blocks_count_low = le_u32(buf, 8);
-        sb.free_blocks_count_low = le_u32(buf, 12);
-        sb.free_inodes_count = le_u32(buf, 16);
-        sb.first_data_block = le_u32(buf, 20);
-        sb.log_block_size = le_u32(buf, 24);
-        sb.log_cluster_size = le_u32(buf, 28);
-        sb.blocks_per_group = le_u32(buf, 32);
-        sb.clusters_per_group = le_u32(buf, 36);
-        sb.inodes_per_group = le_u32(buf, 40);
-        sb.magic = magic;
-        sb.revision_level = le_u32(buf, 76);
-        sb.first_inode = le_u32(buf, 84);
-        sb.inode_size = le_u16(buf, 88);
-        sb.feature_compat = CompatFeature::from_bits_truncate(le_u32(buf, 92));
-        sb.feature_incompat = IncompatFeature::from_bits_truncate(le_u32(buf, 96));
-        sb.feature_ro_compat = RoCompatFeature::from_bits_truncate(le_u32(buf, 100));
-        sb.uuid.copy_from_slice(&buf[104..120]);
-        sb.reserved_gdt_blocks = le_u16(buf, 206);
-        sb.journal_uuid.copy_from_slice(&buf[208..224]);
-        sb.journal_inum = le_u32(buf, 224);
-        sb.journal_dev = le_u32(buf, 228);
-        for i in 0..4 {
-            sb.hash_seed[i] = le_u32(buf, 236 + i * 4);
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(&buf[104..120]);
+        let mut journal_uuid = [0u8; 16];
+        journal_uuid.copy_from_slice(&buf[208..224]);
+        let mut hash_seed = [0u32; 4];
+        for (i, slot) in hash_seed.iter_mut().enumerate() {
+            *slot = le_u32(buf, 236 + i * 4);
         }
-        sb.desc_size = le_u16(buf, 254);
-        for i in 0..17 {
-            sb.journal_blocks[i] = le_u32(buf, 268 + i * 4);
+        let mut journal_blocks = [0u32; 17];
+        for (i, slot) in journal_blocks.iter_mut().enumerate() {
+            *slot = le_u32(buf, 268 + i * 4);
         }
-        sb.blocks_count_high = le_u32(buf, 336);
-        sb.log_groups_per_flex = buf[372];
-        sb.lpf_inode = le_u32(buf, 616);
-        Ok(sb)
+        Ok(SuperBlock {
+            inodes_count: le_u32(buf, 0),
+            blocks_count_low: le_u32(buf, 4),
+            r_blocks_count_low: le_u32(buf, 8),
+            free_blocks_count_low: le_u32(buf, 12),
+            free_inodes_count: le_u32(buf, 16),
+            first_data_block: le_u32(buf, 20),
+            log_block_size: le_u32(buf, 24),
+            log_cluster_size: le_u32(buf, 28),
+            blocks_per_group: le_u32(buf, 32),
+            clusters_per_group: le_u32(buf, 36),
+            inodes_per_group: le_u32(buf, 40),
+            magic,
+            revision_level: le_u32(buf, 76),
+            first_inode: le_u32(buf, 84),
+            inode_size: le_u16(buf, 88),
+            feature_compat: CompatFeature::from_bits_truncate(le_u32(buf, 92)),
+            feature_incompat: IncompatFeature::from_bits_truncate(le_u32(buf, 96)),
+            feature_ro_compat: RoCompatFeature::from_bits_truncate(le_u32(buf, 100)),
+            uuid,
+            reserved_gdt_blocks: le_u16(buf, 206),
+            journal_uuid,
+            journal_inum: le_u32(buf, 224),
+            journal_dev: le_u32(buf, 228),
+            hash_seed,
+            desc_size: le_u16(buf, 254),
+            journal_blocks,
+            blocks_count_high: le_u32(buf, 336),
+            log_groups_per_flex: buf[372],
+            lpf_inode: le_u32(buf, 616),
+            ..Default::default()
+        })
     }
 }
 

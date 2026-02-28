@@ -40,7 +40,7 @@ pub async fn ingest_tar<R: Read + Send + 'static>(
         Ok(())
     })
     .await
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("blocking task panicked: {e}")))?
+    .map_err(|e| io::Error::other(format!("blocking task panicked: {e}")))?
 }
 
 #[cfg(test)]
@@ -149,7 +149,6 @@ mod tests {
             std::io::Cursor::new(tar_data),
             IngestOptions {
                 writer_options: vec![WriterOption::MaximumDiskSize(device_size as i64)],
-                ..Default::default()
             },
         )
         .await

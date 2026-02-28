@@ -55,11 +55,10 @@ pub fn convert_tar_to_ext4<R: Read, W: Read + Write + Seek>(
 
         // Skip OCI whiteout entries — they're layer-deletion markers that are
         // meaningless in a single merged ext4 filesystem.
-        if let Some((_, file)) = split_dir_file(&name) {
-            if file.starts_with(WHITEOUT_PREFIX) {
+        if let Some((_, file)) = split_dir_file(&name)
+            && file.starts_with(WHITEOUT_PREFIX) {
                 continue;
             }
-        }
 
         let entry_type = header.entry_type();
         if entry_type == tar::EntryType::Link {

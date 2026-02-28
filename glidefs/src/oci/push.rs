@@ -39,14 +39,14 @@ pub enum PushError {
 }
 
 /// An exported, compressed layer ready for upload.
-struct ExportedLayer {
-    temp_file: NamedTempFile,
+pub struct ExportedLayer {
+    pub temp_file: NamedTempFile,
     /// sha256 of the uncompressed tar (OCI diff_id).
-    diff_id: String,
+    pub diff_id: String,
     /// sha256 of the compressed blob.
-    digest: String,
+    pub digest: String,
     /// Size of the compressed blob in bytes.
-    size: u64,
+    pub size: u64,
 }
 
 /// Push GlideFS blocks as a single-layer OCI image.
@@ -178,7 +178,7 @@ async fn push_layers(
 /// Export a full snapshot as a compressed tar layer.
 ///
 /// Must be called from a blocking context (`spawn_blocking`).
-fn export_full_layer(handler: Arc<BlockHandler>) -> io::Result<ExportedLayer> {
+pub fn export_full_layer(handler: Arc<BlockHandler>) -> io::Result<ExportedLayer> {
     let (temp_file, writer_chain) = new_writer_chain()?;
 
     let rt = tokio::runtime::Handle::current();
@@ -193,7 +193,7 @@ fn export_full_layer(handler: Arc<BlockHandler>) -> io::Result<ExportedLayer> {
 ///
 /// Produces only the changes (adds, modifications, deletions with whiteouts).
 /// Must be called from a blocking context (`spawn_blocking`).
-fn export_delta_layer(
+pub fn export_delta_layer(
     base_handler: Arc<BlockHandler>,
     target_handler: Arc<BlockHandler>,
 ) -> io::Result<ExportedLayer> {
@@ -247,14 +247,14 @@ fn finish_layer(
 
 // --- Utilities --------------------------------------------------------------
 
-fn hex_sha256(data: &[u8]) -> String {
+pub fn hex_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
 }
 
 fn join_err(e: tokio::task::JoinError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, format!("task panicked: {e}"))
+    io::Error::other(format!("task panicked: {e}"))
 }
 
 /// A writer that passes all bytes through to an inner writer while computing

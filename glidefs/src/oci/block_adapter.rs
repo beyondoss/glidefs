@@ -46,7 +46,7 @@ impl Write for BlockAdapter<'_> {
         let n = buf.len().min(remaining as usize);
         self.handler
             .write(self.pos, &buf[..n], false)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
         self.pos += n as u64;
         Ok(n)
     }
@@ -54,7 +54,7 @@ impl Write for BlockAdapter<'_> {
     fn flush(&mut self) -> io::Result<()> {
         self.handler
             .flush()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))
+            .map_err(|e| io::Error::other(format!("{e:?}")))
     }
 }
 
@@ -71,7 +71,7 @@ impl Read for BlockAdapter<'_> {
         let data = self
             .rt
             .block_on(self.handler.read(self.pos, n as u32))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))?;
+            .map_err(|e| io::Error::other(format!("{e:?}")))?;
         let actual = data.len().min(buf.len());
         buf[..actual].copy_from_slice(&data[..actual]);
         self.pos += actual as u64;

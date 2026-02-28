@@ -21,8 +21,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - name: Clippy (ext4, oci-registry)
-        run: cargo clippy -p ext4 -p oci-registry --tests
+      - name: Clippy (ext4, oci-registry, oci-distribution)
+        run: cargo clippy -p ext4 -p oci-registry -p oci-distribution --tests
       - name: Clippy (glidefs)
         run: cargo clippy -p glidefs --features test-utils --tests --benches
 
@@ -35,8 +35,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - name: Test (ext4, oci-registry)
-        run: cargo test -p ext4 -p oci-registry --verbose
+      - name: Test (ext4, oci-registry, oci-distribution)
+        run: cargo test -p ext4 -p oci-registry -p oci-distribution --verbose
       - name: Test (glidefs)
         run: cargo test -p glidefs --features test-utils --verbose
 

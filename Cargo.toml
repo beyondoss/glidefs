@@ -1,5 +1,5 @@
 [workspace]
-members = ["glidefs", "ext4", "oci-registry"]
+members = ["glidefs", "ext4", "oci-registry", "oci-distribution"]
 exclude = ["bench"]
 resolver = "2"
 

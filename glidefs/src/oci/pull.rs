@@ -77,7 +77,7 @@ async fn pull_and_ingest_layer(
         Ok::<_, io::Error>(())
     })
     .await
-    .map_err(|e| PullError::Io(io::Error::new(io::ErrorKind::Other, format!("task panicked: {e}"))))?;
+    .map_err(|e| PullError::Io(io::Error::other(format!("task panicked: {e}"))))?;
 
     Ok(result?)
 }

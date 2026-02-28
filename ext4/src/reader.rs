@@ -52,7 +52,7 @@ impl<R: Read + Seek> Reader<R> {
         } else {
             GROUP_DESCRIPTOR_SIZE
         };
-        let num_groups = (sb.inodes_count + sb.inodes_per_group - 1) / sb.inodes_per_group;
+        let num_groups = sb.inodes_count.div_ceil(sb.inodes_per_group);
         inner.seek(SeekFrom::Start(BLOCK_SIZE))?;
 
         let mut group_descs = Vec::with_capacity(num_groups as usize);

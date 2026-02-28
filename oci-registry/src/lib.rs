@@ -168,7 +168,7 @@ impl RegistryClient {
 
         use futures::StreamExt;
         let mapped = stream.map(|r| {
-            r.map_err(|e| oci_client::errors::OciDistributionError::IoError(e))
+            r.map_err(oci_client::errors::OciDistributionError::IoError)
         });
 
         let url = self
