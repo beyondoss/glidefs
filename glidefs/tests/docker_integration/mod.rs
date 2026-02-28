@@ -814,6 +814,7 @@ mod ext4_verify;
 mod fork_roundtrip;
 mod live_migration;
 mod multi_export;
+mod oci_push;
 mod persistence;
 mod range_reads;
 mod resize;

@@ -2,11 +2,11 @@ mod error;
 mod types;
 
 pub use error::Error;
+pub use oci_client::client::{ClientConfig, ClientProtocol};
 pub use types::*;
 
 use bytes::Bytes;
 use futures::Stream;
-use oci_client::client::ClientConfig;
 use oci_client::manifest::OciManifest;
 use std::io;
 use std::time::Duration;
