@@ -5,6 +5,9 @@ edition = "2024"
 publish = false
 description = "Loom concurrency tests for GlideFS state machine"
 
+# Standalone crate — not part of the workspace.
+[workspace]
+
 # This crate ONLY contains loom tests - no regular tests
 # Run with: cd loom-tests && cargo test --release
 

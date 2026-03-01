@@ -93,6 +93,9 @@ jobs:
           # x86_64/aarch64. This flag tells it to use those bindings on other
           # architectures where the io_uring ABI is identical.
           RUSTFLAGS: '--cfg=io_uring_skip_arch_check --cfg tokio_unstable'
+          # aws-lc-sys's default cc builder rejects certain GCC versions due to
+          # a memcmp bug (GCC#95189). The cmake builder avoids this check.
+          AWS_LC_SYS_CMAKE_BUILDER: "1"
         run: |
           cross build -p glidefs -p oci-distribution --profile ci --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
 
