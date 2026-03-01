@@ -120,6 +120,13 @@ fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response<BoxBody
         .unwrap()
 }
 
+fn empty_response(status: StatusCode) -> Response<BoxBody> {
+    Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::new()))
+        .unwrap()
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     json_response(status, &ApiResponse::error(message))
 }
@@ -131,7 +138,9 @@ fn is_valid_export_name(name: &str) -> bool {
         return false;
     }
     let mut chars = name.chars();
-    let first = chars.next().unwrap();
+    let Some(first) = chars.next() else {
+        return false; // unreachable: checked is_empty above
+    };
     first.is_ascii_alphanumeric()
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
@@ -626,14 +635,8 @@ where
                 return Ok(error_response(StatusCode::BAD_REQUEST, "Invalid path"));
             }
             match router.head_manifest(s3_prefix, manifest_name).await {
-                Ok(true) => Response::builder()
-                    .status(StatusCode::OK)
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
-                Ok(false) => Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
+                Ok(true) => empty_response(StatusCode::OK),
+                Ok(false) => empty_response(StatusCode::NOT_FOUND),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
@@ -669,21 +672,20 @@ where
                 let sm = router.scrubber_metrics();
                 let checked = sm.blocks_checked.load(Ordering::Relaxed);
                 let evicted = sm.blocks_evicted.load(Ordering::Relaxed);
+                // writeln! to String is infallible
                 use std::fmt::Write;
-                writeln!(output, "# HELP glidefs_scrubber_blocks_checked_total Blocks verified by background scrubber").unwrap();
-                writeln!(
+                let _ = writeln!(output, "# HELP glidefs_scrubber_blocks_checked_total Blocks verified by background scrubber");
+                let _ = writeln!(
                     output,
                     "# TYPE glidefs_scrubber_blocks_checked_total counter"
-                )
-                .unwrap();
-                writeln!(output, "glidefs_scrubber_blocks_checked_total {checked}").unwrap();
-                writeln!(output, "# HELP glidefs_scrubber_blocks_evicted_total Corrupted blocks evicted by scrubber").unwrap();
-                writeln!(
+                );
+                let _ = writeln!(output, "glidefs_scrubber_blocks_checked_total {checked}");
+                let _ = writeln!(output, "# HELP glidefs_scrubber_blocks_evicted_total Corrupted blocks evicted by scrubber");
+                let _ = writeln!(
                     output,
                     "# TYPE glidefs_scrubber_blocks_evicted_total counter"
-                )
-                .unwrap();
-                writeln!(output, "glidefs_scrubber_blocks_evicted_total {evicted}").unwrap();
+                );
+                let _ = writeln!(output, "glidefs_scrubber_blocks_evicted_total {evicted}");
             }
             // S3 circuit breaker state (0=closed, 1=open, 2=half-open)
             {
@@ -694,22 +696,21 @@ where
                     CircuitState::Open => 1,
                     CircuitState::HalfOpen { .. } => 2,
                 };
-                writeln!(output, "# HELP glidefs_s3_circuit_breaker_state S3 circuit breaker state (0=closed, 1=open, 2=half-open)").unwrap();
-                writeln!(output, "# TYPE glidefs_s3_circuit_breaker_state gauge").unwrap();
-                writeln!(output, "glidefs_s3_circuit_breaker_state {cb_value}").unwrap();
+                let _ = writeln!(output, "# HELP glidefs_s3_circuit_breaker_state S3 circuit breaker state (0=closed, 1=open, 2=half-open)");
+                let _ = writeln!(output, "# TYPE glidefs_s3_circuit_breaker_state gauge");
+                let _ = writeln!(output, "glidefs_s3_circuit_breaker_state {cb_value}");
             }
             // (pack index metric removed — replaced by ChunkMetaCache)
             // SSD capacity
             {
                 use std::fmt::Write;
                 let utilization = router.ssd_utilization();
-                writeln!(
+                let _ = writeln!(
                     output,
                     "# HELP glidefs_ssd_utilization_ratio Fraction of local SSD capacity used"
-                )
-                .unwrap();
-                writeln!(output, "# TYPE glidefs_ssd_utilization_ratio gauge").unwrap();
-                writeln!(output, "glidefs_ssd_utilization_ratio {utilization:.6}").unwrap();
+                );
+                let _ = writeln!(output, "# TYPE glidefs_ssd_utilization_ratio gauge");
+                let _ = writeln!(output, "glidefs_ssd_utilization_ratio {utilization:.6}");
             }
             Response::builder()
                 .status(StatusCode::OK)

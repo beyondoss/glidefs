@@ -277,7 +277,9 @@ fn validate_export_name(name: &str) -> Result<(), RouterError> {
         return Err(RouterError::InvalidExportName(name.to_string()));
     }
     let mut chars = name.chars();
-    let first = chars.next().unwrap();
+    let Some(first) = chars.next() else {
+        return Err(RouterError::InvalidExportName(name.to_string())); // unreachable: checked is_empty above
+    };
     if !first.is_ascii_alphanumeric() {
         return Err(RouterError::InvalidExportName(name.to_string()));
     }
