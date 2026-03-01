@@ -1,6 +1,8 @@
 pub mod api;
+#[allow(unsafe_code)] // Lock-free AtomicPtr page table requires raw pointer ops
 pub mod block_map;
 pub mod cache;
+#[allow(unsafe_code)] // libc::statvfs FFI
 pub mod capacity_monitor;
 pub mod error;
 pub mod flush_scheduler;
@@ -20,15 +22,18 @@ pub mod state;
 pub mod sync;
 pub mod wal;
 pub mod volume_manifest;
+#[allow(unsafe_code)] // SIMD zero-check, positional I/O, SyncFile
 pub mod write_cache;
 pub mod write_trace;
 
 // NBD kernel device management via netlink (Linux 4.10+)
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // Netlink socket FFI
 pub mod nbd;
 
 // ublk transport (Linux 6.0+, io_uring-based userspace block device)
 #[cfg(all(target_os = "linux", feature = "ublk"))]
+#[allow(unsafe_code)] // io_uring + eventfd FFI, single-threaded executor
 pub mod ublk;
 
 // Re-export protocol types for fuzzing
