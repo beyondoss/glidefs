@@ -1,4 +1,0 @@
-[build.env]
-# aws-lc-sys's cc builder rejects certain GCC versions (bug 95189 check).
-# The cmake builder does not have this check and works across all cross targets.
-passthrough = ["AWS_LC_SYS_CMAKE_BUILDER"]
