@@ -1,0 +1,15 @@
+[workspace]
+members = ["glidefs", "ext4", "oci-registry", "oci-distribution"]
+exclude = ["bench", "glidefs/loom-tests"]
+resolver = "2"
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+strip = true
+
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16

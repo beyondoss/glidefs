@@ -4,6 +4,7 @@ mod circuit_breaker;
 mod cli;
 mod config;
 mod block;
+mod oci;
 mod parse_object_store;
 mod storage_compatibility;
 mod task;
@@ -29,11 +30,25 @@ async fn main() -> Result<()> {
         }
         cli::Commands::Bless {
             image,
+            oci,
             name,
             s3_prefix,
             config,
         } => {
-            cli::bless::run_bless(image, name, s3_prefix, config).await?;
+            if let Some(image_path) = image {
+                cli::bless::run_bless(image_path, name, s3_prefix, config).await?;
+            } else if let Some(image_ref) = oci {
+                cli::bless::run_bless_oci(image_ref, name, s3_prefix, config).await?;
+            }
+        }
+        cli::Commands::Push {
+            manifest,
+            image,
+            s3_prefix,
+            config,
+            base_manifest,
+        } => {
+            cli::push::run_push(manifest, image, s3_prefix, config, base_manifest).await?;
         }
         cli::Commands::Gc {
             config,

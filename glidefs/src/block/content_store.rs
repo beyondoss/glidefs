@@ -756,7 +756,7 @@ mod tests {
         use crate::block::pack::PackIndexEntry;
 
         let store = test_store("test-bucket");
-        let pack_id: u64 = 0x0123_4567_89AB_CDEF;
+        let pack_id: u64 =0x0123_4567_89AB_CDEF;
         let chunk_size: u32 = 128 * 1024;
 
         // Build 3 blocks with distinct data, out-of-order chunk offsets.
@@ -809,7 +809,7 @@ mod tests {
     #[tokio::test]
     async fn test_v4_chunk_pack_round_trip() {
         let store = test_store("test-bucket");
-        let pack_id: u64 = 0xDEADBEEF_CAFEBABE;
+        let pack_id: u64 =0xDEADBEEF_CAFEBABE;
         let data = b"fake pack data".to_vec();
 
         store

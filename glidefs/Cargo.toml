@@ -11,17 +11,6 @@ readme = "../README.md"
 keywords = ["nbd", "s3", "block-storage", "microvm", "storage"]
 categories = ["filesystem", "network-programming"]
 
-[profile.release]
-lto = true
-opt-level = 3
-codegen-units = 1
-strip = true
-
-[profile.ci]
-inherits = "release"
-lto = false
-codegen-units = 16
-
 [features]
 default = []
 tokio-console = ["dep:console-subscriber"]
@@ -40,7 +29,7 @@ fio-bench = ["ublk", "test-utils"]
 console-subscriber = { version = "0.5", optional = true }
 mimalloc = { version = "0.1", features = ["v3"] }
 tokio = { version = "1.49", features = ["full", "tracing"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "io", "io-util"] }
 hyper = { version = "1.6", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 http-body-util = "0.1"
@@ -72,6 +61,12 @@ rayon = "1.11"
 tempfile = "3.21"
 parking_lot = "0.12"
 chrono = { version = "0.4.43", features = ["serde"] }
+bitflags = "2"
+tar = "0.4"
+ext4 = { path = "../ext4" }
+oci-registry = { path = "../oci-registry" }
+flate2 = "1"
+sha2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ublk-core = { path = "ublk-core", optional = true }

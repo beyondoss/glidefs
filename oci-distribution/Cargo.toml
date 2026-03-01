@@ -1,0 +1,27 @@
+[package]
+name = "oci-distribution"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "glidefs-registry"
+path = "src/main.rs"
+
+[dependencies]
+glidefs = { path = "../glidefs" }
+ext4 = { path = "../ext4" }
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.49", features = ["full"] }
+hyper = { version = "1.6", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http-body-util = "0.1"
+object_store = { version = "0.12.4", features = ["aws", "azure", "gcp"] }
+bytes = "1.10"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3.21"
+anyhow = "1.0"
+parking_lot = "0.12"

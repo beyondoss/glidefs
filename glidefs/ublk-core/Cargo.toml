@@ -33,3 +33,28 @@ io-uring = { version = "^0.7", features = ["bindgen"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "allow"
+dead_code = "allow"
+unused_imports = "allow"
+
+# Vendored crate — suppress clippy warnings rather than modifying upstream code.
+[lints.clippy]
+uninit_vec = "allow"
+empty_line_after_doc_comments = "allow"
+too_many_arguments = "allow"
+doc_overindented_list_items = "allow"
+doc_lazy_continuation = "allow"
+needless_borrows_for_generic_args = "allow"
+redundant_pattern_matching = "allow"
+manual_ok_err = "allow"
+explicit_auto_deref = "allow"
+missing_const_for_thread_local = "allow"
+unnecessary_cast = "allow"
+cmp_null = "allow"
+collapsible_if = "allow"
+len_zero = "allow"
+needless_return = "allow"
+while_let_loop = "allow"
+manual_strip = "allow"
+borrow_deref_ref = "allow"
+await_holding_lock = "allow"
+macro_metavars_in_unsafe = "allow"
