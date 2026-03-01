@@ -166,7 +166,6 @@ A comprehensive checklist for auditing Rust codebases, focused on patterns that 
 
 - [ ] Clippy runs with `-D warnings` (deny, not warn)
 - [ ] `#[deny(unsafe_code)]` at crate root for application crates
-- [ ] `#[deny(clippy::unwrap_used)]` at crate root
 - [ ] `#[deny(unused_must_use)]` at crate root
 - [ ] Clippy lints cannot be overridden by local `#[allow]` without review (enforce via CI grep or policy)
 
