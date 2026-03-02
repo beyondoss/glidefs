@@ -1207,6 +1207,12 @@ async fn dispatch_io(
     buffer: &mut IoBuf<u8>,
     handler: &BlockHandler,
 ) -> i32 {
+    // Handle metadata-only ops (FLUSH, DISCARD, WRITE_ZEROES) before slicing the
+    // buffer — these don't need data and their length may exceed the buffer size
+    // (e.g. max_discard_sectors = 16MB vs 512KB IO_BUF_BYTES).
+    if let Some(result) = dispatch_passthrough(op, offset, length, fua, handler) {
+        return result;
+    }
     let buf = &mut buffer.as_mut_slice()[..length as usize];
     handle_io(op, offset, length, fua, buf, handler).await
 }
