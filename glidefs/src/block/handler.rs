@@ -192,7 +192,20 @@ impl BlockHandler {
                 continue;
             }
 
-            // Partial write to a block only in S3: fetch full block
+            // Check if the block has S3 data that needs preserving.
+            // Fresh blocks (never flushed to S3) have no manifest entry — skip them.
+            {
+                let vm = self.volume_manifest.read();
+                let chunk_idx = vm.chunk_idx_for_block(block_idx);
+                if vm
+                    .chunk_pack_ids(chunk_idx)
+                    .map_or(true, |ids| ids.is_empty())
+                {
+                    continue;
+                }
+            }
+
+            // Partial write to a block in S3: fetch full block to preserve unwritten data
             let block_data = self
                 .cache
                 .read(
