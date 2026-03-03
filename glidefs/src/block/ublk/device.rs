@@ -109,13 +109,17 @@ impl UblkDevice {
     /// Allocates a device ID, sets parameters, spawns per-queue I/O threads,
     /// and waits for the kernel to confirm the device is serving I/O.
     /// Returns once `/dev/ublkbN` is ready.
+    ///
+    /// `preferred_id`: request a specific device ID to reclaim a device path
+    /// after a crash. `None` = auto-assign.
     pub async fn register(
         handler: Arc<BlockHandler>,
         nr_queues: u16,
         export_name: String,
         features: &KernelFeatures,
+        preferred_id: Option<i32>,
     ) -> anyhow::Result<Self> {
-        Self::start_worker(handler, nr_queues, export_name, DeviceMode::Add, features).await
+        Self::start_worker(handler, nr_queues, export_name, DeviceMode::Add, features, preferred_id).await
     }
 
     /// Recover a QUIESCED ublk device after a daemon crash.
@@ -140,7 +144,7 @@ impl UblkDevice {
         })
         .await??;
 
-        Self::start_worker(handler, nr_queues, export_name, DeviceMode::Recover { dev_id }, features).await
+        Self::start_worker(handler, nr_queues, export_name, DeviceMode::Recover { dev_id }, features, None).await
     }
 
     /// Shared helper: spawn the worker thread running `run_device`.
@@ -150,6 +154,7 @@ impl UblkDevice {
         export_name: String,
         mode: DeviceMode,
         features: &KernelFeatures,
+        preferred_id: Option<i32>,
     ) -> anyhow::Result<Self> {
         let dev_size = handler.device_size();
         let tokio_handle = tokio::runtime::Handle::current();
@@ -163,7 +168,7 @@ impl UblkDevice {
         let worker = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                run_device(dev_size, nr_queues, handler, tokio_handle, ready_tx, export_name, mode, &features)
+                run_device(dev_size, nr_queues, handler, tokio_handle, ready_tx, export_name, mode, &features, preferred_id)
             })?;
 
         // Wait for device to be ready (or error during setup).
@@ -179,6 +184,11 @@ impl UblkDevice {
             dev_path,
             worker: Some(worker),
         })
+    }
+
+    /// The kernel-assigned device ID.
+    pub fn dev_id(&self) -> i32 {
+        self.dev_id
     }
 
     /// The block device path (e.g., `/dev/ublkb0`).
@@ -612,14 +622,16 @@ fn run_device(
     export_name: String,
     mode: DeviceMode,
     features: &KernelFeatures,
+    preferred_id: Option<i32>,
 ) -> anyhow::Result<()> {
     // Compute device + kernel feature flags from mode + features.
     let dev_flags = match mode {
         DeviceMode::Add => UblkFlags::UBLK_DEV_F_ADD_DEV,
         DeviceMode::Recover { .. } => UblkFlags::UBLK_DEV_F_RECOVER_DEV,
     };
+    // Preferred ID reclaims a specific /dev/ublkbN after crash; -1 = auto-assign.
     let dev_id: i32 = match mode {
-        DeviceMode::Add => -1,
+        DeviceMode::Add => preferred_id.unwrap_or(-1),
         DeviceMode::Recover { dev_id } => dev_id,
     };
 
