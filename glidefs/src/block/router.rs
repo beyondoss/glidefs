@@ -333,7 +333,8 @@ impl ExportRouter {
         #[cfg(all(target_os = "linux", feature = "ublk"))]
         let ublk_server = tokio::sync::Mutex::new(
             crate::block::ublk::UblkServer::new()
-                .with_nr_queues(config.ublk_nr_queues),
+                .with_nr_queues(config.ublk_nr_queues)
+                .with_cache_dir(config.cache_dir.clone()),
         );
 
         Ok(Self {

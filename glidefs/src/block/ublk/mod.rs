@@ -29,6 +29,9 @@ use std::sync::Arc;
 /// Default number of I/O queues per device.
 const DEFAULT_NR_QUEUES: u16 = 1;
 
+/// Persisted device mapping filename.
+const DEVICE_MAP_FILE: &str = "ublk_devices.json";
+
 /// Manages ublk devices for exports.
 ///
 /// Each export gets its own `/dev/ublkbN` device. The caller provides
@@ -38,6 +41,8 @@ pub struct UblkServer {
     nr_queues: u16,
     features: KernelFeatures,
     devices: HashMap<String, device::UblkDevice>,
+    /// Directory for persisting device ID mapping (enables stable device paths).
+    cache_dir: Option<PathBuf>,
 }
 
 impl Default for UblkServer {
@@ -57,6 +62,7 @@ impl UblkServer {
             nr_queues: DEFAULT_NR_QUEUES,
             features,
             devices: HashMap::new(),
+            cache_dir: None,
         }
     }
 
@@ -64,6 +70,56 @@ impl UblkServer {
     pub fn with_nr_queues(mut self, nr_queues: u16) -> Self {
         self.nr_queues = nr_queues;
         self
+    }
+
+    /// Set the cache directory for persisting device ID mappings.
+    /// Required for stable device paths across restarts.
+    pub fn with_cache_dir(mut self, dir: PathBuf) -> Self {
+        self.cache_dir = Some(dir);
+        self
+    }
+
+    /// Load ALL persisted device IDs from a previous run.
+    ///
+    /// Returns `{export_name → dev_id}`. Stale entries are harmless —
+    /// the kernel rejects duplicate IDs and we fall back to auto-assign.
+    fn load_persisted_indices(&self) -> HashMap<String, i32> {
+        let Some(ref cache_dir) = self.cache_dir else {
+            return HashMap::new();
+        };
+        let path = cache_dir.join(DEVICE_MAP_FILE);
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            return HashMap::new();
+        };
+        let Ok(map): Result<HashMap<String, i32>, _> = serde_json::from_str(&data) else {
+            tracing::warn!("corrupt {DEVICE_MAP_FILE}, ignoring");
+            return HashMap::new();
+        };
+        for (name, dev_id) in &map {
+            tracing::debug!(export = %name, dev_id, "loaded persisted ublk device id");
+        }
+        map
+    }
+
+    /// Persist current device mapping to disk.
+    fn persist_devices(&self) {
+        let Some(ref cache_dir) = self.cache_dir else {
+            return;
+        };
+        let map: HashMap<&str, i32> = self
+            .devices
+            .iter()
+            .map(|(name, dev)| (name.as_str(), dev.dev_id()))
+            .collect();
+        let path = cache_dir.join(DEVICE_MAP_FILE);
+        match serde_json::to_string(&map) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to persist ublk device map");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to serialize ublk device map"),
+        }
     }
 
     /// Register a ublk device for an export. Returns the `/dev/ublkbN` path.
@@ -82,18 +138,36 @@ impl UblkServer {
             );
         }
 
+        let preferred_id = self.load_persisted_indices()
+            .get(export_name).copied();
+
         let name = export_name.to_string();
         let device =
-            device::UblkDevice::register(handler, self.nr_queues, name.clone(), &self.features)
+            device::UblkDevice::register(handler, self.nr_queues, name.clone(), &self.features, preferred_id)
                 .await?;
         let path = device.dev_path().to_path_buf();
         self.devices.insert(name, device);
+        self.persist_devices();
         Ok(path)
     }
 
     /// Get the device path for an export, if registered.
     pub fn get_device_path(&self, export_name: &str) -> Option<&Path> {
         self.devices.get(export_name).map(|d| d.dev_path())
+    }
+
+    /// Unregister a kernel device without updating the persisted map.
+    ///
+    /// Simulates a crash: the device dies but `ublk_devices.json` still has the
+    /// old ID. Used in tests to prove device path stability across restarts.
+    #[cfg(feature = "test-utils")]
+    pub async fn crash_remove(&mut self, export_name: &str) -> anyhow::Result<()> {
+        if let Some(device) = self.devices.remove(export_name) {
+            tracing::info!(export = %export_name, "crash_remove: killing ublk device (map preserved)");
+            device.unregister().await?;
+        }
+        // Intentionally NOT calling persist_devices() — the map still has the old ID.
+        Ok(())
     }
 
     /// Remove a ublk device for an export.
@@ -103,6 +177,7 @@ impl UblkServer {
         if let Some(device) = self.devices.remove(export_name) {
             tracing::info!(export = %export_name, "removing ublk device");
             device.unregister().await?;
+            self.persist_devices();
         } else {
             tracing::debug!(export = %export_name, "no ublk device registered, nothing to remove");
         }
@@ -217,6 +292,7 @@ impl UblkServer {
             }
         }
 
+        self.persist_devices();
         recovered
     }
 
@@ -226,6 +302,11 @@ impl UblkServer {
     /// returns an aggregated error describing which devices could not be
     /// unregistered.
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        // Remove persisted mapping — devices are being shut down.
+        if let Some(ref cache_dir) = self.cache_dir {
+            let _ = std::fs::remove_file(cache_dir.join(DEVICE_MAP_FILE));
+        }
+
         let mut set = tokio::task::JoinSet::new();
 
         for (name, device) in self.devices {

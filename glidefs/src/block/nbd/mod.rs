@@ -91,9 +91,12 @@ impl NbdDeviceManager {
         self
     }
 
-    /// Load persisted device mapping from previous run.
-    /// Returns `{export_name → dev_index}` for devices still alive in the kernel.
-    fn load_persisted_devices(&self) -> HashMap<String, i32> {
+    /// Load ALL persisted device indices from a previous run.
+    ///
+    /// Returns `{export_name → dev_index}` regardless of whether devices are
+    /// still alive in the kernel. Callers check liveness separately to decide
+    /// between reconfigure (alive) and fresh connect with preferred index (dead).
+    fn load_persisted_indices(&self) -> HashMap<String, i32> {
         let Some(ref cache_dir) = self.cache_dir else {
             return HashMap::new();
         };
@@ -105,16 +108,10 @@ impl NbdDeviceManager {
             warn!("corrupt {DEVICE_MAP_FILE}, ignoring");
             return HashMap::new();
         };
-        // Filter to devices that are still alive in the kernel.
-        map.into_iter()
-            .filter(|(name, index)| {
-                let alive = is_nbd_device_alive(*index);
-                if alive {
-                    debug!(export = %name, index, "found existing nbd device from previous run");
-                }
-                alive
-            })
-            .collect()
+        for (name, index) in &map {
+            debug!(export = %name, index, "loaded persisted nbd device index");
+        }
+        map
     }
 
     /// Persist current device mapping to disk.
@@ -158,9 +155,9 @@ impl NbdDeviceManager {
             );
         }
 
-        // Check if a device from a previous process is still alive.
-        let persisted = self.load_persisted_devices();
-        let existing_index = persisted.get(export_name).copied();
+        // Check for a persisted device index from a previous run.
+        let persisted = self.load_persisted_indices();
+        let preferred_index = persisted.get(export_name).copied();
 
         // Create a Unix socketpair. One end for the server (NBD session),
         // one end for the kernel (via netlink).
@@ -208,26 +205,43 @@ impl NbdDeviceManager {
         let std_stream = client_stream.into_std()?;
         let client_fd = std_stream.as_raw_fd();
 
-        let dev_index = if let Some(index) = existing_index {
-            // Hot reload: reconfigure existing device with new socket fd.
-            // Queued I/O resumes immediately on the new socket.
-            info!(
-                export = %export_name,
-                index,
-                "reconfiguring existing nbd device (hot reload)"
-            );
-            tokio::task::spawn_blocking(move || {
-                netlink::reconfigure(index, client_fd)
-            })
-            .await??;
-            index
+        let dev_index = if let Some(index) = preferred_index {
+            if is_nbd_device_alive(index) {
+                // Hot reload: reconfigure existing device with new socket fd.
+                // Queued I/O resumes immediately on the new socket.
+                info!(
+                    export = %export_name,
+                    index,
+                    "reconfiguring existing nbd device (hot reload)"
+                );
+                tokio::task::spawn_blocking(move || {
+                    netlink::reconfigure(index, client_fd)
+                })
+                .await??;
+                index
+            } else {
+                // Dead device from previous run — reclaim the same index so
+                // the box manager's /dev/nbdN reference stays valid.
+                debug!(
+                    export = %export_name,
+                    index,
+                    "reclaiming dead nbd device index"
+                );
+                let size = size_bytes;
+                let dead_conn_timeout = self.dead_conn_timeout;
+                let server_flags = TRANSMISSION_FLAGS as u64;
+                tokio::task::spawn_blocking(move || {
+                    netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, Some(index))
+                })
+                .await??
+            }
         } else {
-            // Fresh start: create a new device via netlink.
+            // First time for this export — auto-assign.
             let size = size_bytes;
             let dead_conn_timeout = self.dead_conn_timeout;
             let server_flags = TRANSMISSION_FLAGS as u64;
             tokio::task::spawn_blocking(move || {
-                netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout)
+                netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, None)
             })
             .await??
         };
@@ -241,7 +255,7 @@ impl NbdDeviceManager {
             export = %export_name,
             path = %dev_path.display(),
             index = dev_index,
-            reconfigured = existing_index.is_some(),
+            reclaimed = preferred_index.is_some(),
             "nbd kernel device registered"
         );
 
@@ -262,6 +276,27 @@ impl NbdDeviceManager {
     /// Get the device path for an export, if registered.
     pub fn get_device_path(&self, export_name: &str) -> Option<&Path> {
         self.devices.get(export_name).map(|d| d.dev_path.as_path())
+    }
+
+    /// Disconnect a kernel device without updating the persisted map.
+    ///
+    /// Simulates a crash: the device dies but `nbd_devices.json` still has the
+    /// old index. Used in tests to prove device path stability across restarts.
+    #[cfg(feature = "test-utils")]
+    pub async fn crash_disconnect(&mut self, export_name: &str) -> anyhow::Result<()> {
+        let Some(device) = self.devices.remove(export_name) else {
+            return Ok(());
+        };
+        let index = device.dev_index;
+        info!(export = %export_name, index, "crash_disconnect: killing kernel device (map preserved)");
+        if let Err(e) = tokio::task::spawn_blocking(move || netlink::disconnect(index)).await? {
+            warn!(export = %export_name, index, error = %e, "netlink disconnect failed");
+        }
+        device.shutdown.cancel();
+        device.session_handle.abort();
+        let _ = device.session_handle.await;
+        // Intentionally NOT calling persist_devices() — the map still has the old index.
+        Ok(())
     }
 
     /// Remove an NBD device for an export.

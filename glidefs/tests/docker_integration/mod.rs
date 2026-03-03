@@ -809,6 +809,7 @@ impl TestServer {
 mod cold_wake;
 mod concurrent;
 mod data_integrity;
+mod device_stability;
 mod export_discovery;
 mod ext4_verify;
 mod fork_roundtrip;

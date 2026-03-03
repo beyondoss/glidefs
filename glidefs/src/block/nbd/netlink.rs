@@ -280,12 +280,15 @@ fn resolve_nbd_family(fd: RawFd) -> io::Result<u16> {
 /// - `server_flags`: NBD transmission flags (NBD_FLAG_HAS_FLAGS | ...).
 /// - `dead_conn_timeout`: Seconds before the kernel declares the connection dead.
 ///   Set > 0 to enable I/O queueing during restarts (zero-downtime upgrades).
+/// - `preferred_index`: Request a specific device index (e.g., to reclaim a
+///   device path after a crash). `None` = auto-assign.
 pub fn connect(
     socket_fd: RawFd,
     size_bytes: u64,
     block_size: u32,
     server_flags: u64,
     dead_conn_timeout: u32,
+    preferred_index: Option<i32>,
 ) -> io::Result<i32> {
     let fd = open_genl_socket()?;
     let _guard = FdGuard(fd);
@@ -301,8 +304,9 @@ pub fn connect(
 
     // Build connect attributes
     let mut attrs = Vec::new();
-    // NBD_ATTR_INDEX = u32::MAX means auto-assign
-    put_nla_u32(&mut attrs, NBD_ATTR_INDEX, u32::MAX);
+    // Specific index = reclaim a known device path; u32::MAX = auto-assign.
+    let index = preferred_index.map(|i| i as u32).unwrap_or(u32::MAX);
+    put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index);
     put_nla_u64(&mut attrs, NBD_ATTR_SIZE_BYTES, size_bytes);
     put_nla_u32(&mut attrs, NBD_ATTR_BLOCK_SIZE_BYTES, block_size);
     put_nla_u64(&mut attrs, NBD_ATTR_SERVER_FLAGS, server_flags);
@@ -315,20 +319,8 @@ pub fn connect(
     let msg = build_genl_msg(family_id, NBD_CMD_CONNECT, 2, &attrs);
     nl_send(fd, &msg)?;
 
-    // The kernel responds with NLMSG_ERROR. errno=0 means success.
-    // The device index is in the error message's echoed request attributes.
-    // But with auto-assign, we need to parse the response to find the index.
-    //
-    // Actually, the kernel NBD netlink handler sends back an ACK on success
-    // and the device index is set via the NBD_ATTR_INDEX we passed (u32::MAX
-    // triggers auto-assign). The actual assigned index is returned in the
-    // multicast notification, or we can read it from /sys.
-    //
-    // Simpler: after successful ACK, scan /sys/block/nbd* to find our device.
-    // Or: try specific indices starting from 0.
-    //
-    // Best approach: don't use auto-assign. Instead, find the first free
-    // /dev/nbdN and request that specific index.
+    // The kernel echoes back the assigned device index in the ACK's
+    // NBD_ATTR_INDEX attribute. Parse it, with a sysfs scan as fallback.
     let mut buf = [0u8; 4096];
     let n = nl_recv(fd, &mut buf)?;
     let (_, msg_type, _, payload) = parse_nlmsghdr(&buf[..n])
