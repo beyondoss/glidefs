@@ -709,7 +709,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
 
                     tasks.spawn(async move {
                         let result = match write_data {
-                            Ok(data) => h.write(offset, &data, fua),
+                            Ok(data) => h.write(offset, &data, fua).await,
                             Err(e) => Err(e),
                         };
                         let response = match result {
@@ -747,7 +747,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let cookie = request.cookie;
 
                     tasks.spawn(async move {
-                        let result = h.trim(offset, length, fua);
+                        let result = h.trim(offset, length, fua).await;
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
                             Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
@@ -763,7 +763,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let cookie = request.cookie;
 
                     tasks.spawn(async move {
-                        let result = h.write_zeroes(offset, length, fua);
+                        let result = h.write_zeroes(offset, length, fua).await;
                         let response = match result {
                             Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
                             Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },

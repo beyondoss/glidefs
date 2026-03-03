@@ -346,6 +346,29 @@ impl WriteCache<Active> {
         self.inner.config.block_size
     }
 
+    /// Check if a block is present on local SSD.
+    #[inline]
+    pub fn is_block_present(&self, block_idx: usize) -> bool {
+        self.inner.is_present(block_idx)
+    }
+
+    /// Write a full block to the data file and mark it present.
+    ///
+    /// Used by the backfill path to populate the SSD with S3 data before
+    /// a sub-block write overlays partial data on top. The caller must
+    /// provide exactly `block_size` bytes.
+    pub fn backfill_block(&self, block_idx: usize, data: &[u8]) -> Result<(), CacheError> {
+        debug_assert_eq!(
+            data.len(),
+            self.inner.config.block_size,
+            "backfill_block requires exactly block_size bytes"
+        );
+        let offset = block_idx as u64 * self.inner.config.block_size as u64;
+        self.inner.data_file.write_all_at(data, offset)?;
+        self.inner.set_present(block_idx);
+        Ok(())
+    }
+
     /// Save metadata to disk.
     #[allow(dead_code)]
     pub fn save_metadata(&self) -> Result<(), CacheError> {

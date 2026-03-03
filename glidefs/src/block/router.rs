@@ -1846,7 +1846,7 @@ mod tests {
         // Write some data through the handler
         let handler = router.get_handler("vol1").await.unwrap();
         let data = vec![0xAB; 4096];
-        handler.write(0, &data, false).unwrap();
+        handler.write(0, &data, false).await.unwrap();
 
         // Drain should succeed
         let result = router.drain_export("vol1").await;
@@ -1909,7 +1909,7 @@ mod tests {
 
         // Write some data to create cache files
         let handler = router.get_handler("vol1").await.unwrap();
-        handler.write(0, &[0xAB; 4096], false).unwrap();
+        handler.write(0, &[0xAB; 4096], false).await.unwrap();
 
         // Remove with purge
         router.remove_export("vol1", true).await.unwrap();
@@ -1968,7 +1968,7 @@ mod tests {
 
         // Write some data
         let handler = router.get_handler("vol1").await.unwrap();
-        handler.write(0, &[0xAB; 4096], false).unwrap();
+        handler.write(0, &[0xAB; 4096], false).await.unwrap();
 
         let metrics = router.get_export_metrics("vol1").await;
         assert!(metrics.is_some(), "Should return metrics");
@@ -2026,8 +2026,8 @@ mod tests {
         let handler2 = router.get_handler("vol2").await.unwrap();
 
         // Write different data to each export
-        handler1.write(0, &[0x11; 4096], false).unwrap();
-        handler2.write(0, &[0x22; 4096], false).unwrap();
+        handler1.write(0, &[0x11; 4096], false).await.unwrap();
+        handler2.write(0, &[0x22; 4096], false).await.unwrap();
 
         // Read back and verify isolation
         let data1 = handler1.read(0, 4096).await.unwrap();
@@ -2210,8 +2210,8 @@ mod tests {
 
         // Write some data
         let handler = router.get_handler("snap-vol").await.unwrap();
-        handler.write(0, &[0xAA; 4096], false).unwrap();
-        handler.write(128 * 1024, &[0xBB; 4096], false).unwrap();
+        handler.write(0, &[0xAA; 4096], false).await.unwrap();
+        handler.write(128 * 1024, &[0xBB; 4096], false).await.unwrap();
 
         // Take snapshot
         let result = router.snapshot_export("snap-vol", None).await;
@@ -2253,7 +2253,7 @@ mod tests {
             .unwrap();
         let handler = router.get_handler("source").await.unwrap();
         let data = vec![0xCC; 128 * 1024]; // one full block
-        handler.write(0, &data, false).unwrap();
+        handler.write(0, &data, false).await.unwrap();
 
         // Snapshot source
         let snap = router.snapshot_export("source", None).await.unwrap();
@@ -2295,7 +2295,7 @@ mod tests {
             .await
             .unwrap();
         let src_handler = router.get_handler("src").await.unwrap();
-        src_handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
+        src_handler.write(0, &[0xAA; 128 * 1024], false).await.unwrap();
         router.snapshot_export("src", None).await.unwrap();
 
         // Fork
@@ -2315,7 +2315,7 @@ mod tests {
 
         // Write to fork
         let fork_handler = router.get_handler("fork-iso").await.unwrap();
-        fork_handler.write(0, &[0xFF; 128 * 1024], false).unwrap();
+        fork_handler.write(0, &[0xFF; 128 * 1024], false).await.unwrap();
 
         // Source should still see original data
         let src_data = src_handler.read(0, 128 * 1024).await.unwrap();
@@ -2343,9 +2343,10 @@ mod tests {
             .await
             .unwrap();
         let src_handler = router.get_handler("src").await.unwrap();
-        src_handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
+        src_handler.write(0, &[0xAA; 128 * 1024], false).await.unwrap();
         src_handler
             .write(128 * 1024, &[0xBB; 128 * 1024], false)
+            .await
             .unwrap();
         router.snapshot_export("src", None).await.unwrap();
 
@@ -2416,7 +2417,7 @@ mod tests {
             .await
             .unwrap();
         let a_handler = router.get_handler("a").await.unwrap();
-        a_handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
+        a_handler.write(0, &[0xAA; 128 * 1024], false).await.unwrap();
         router.snapshot_export("a", None).await.unwrap();
 
         // B: fork from A's manifest, same S3 prefix so packs are shared.
@@ -2437,6 +2438,7 @@ mod tests {
         let b_handler = router.get_handler("b").await.unwrap();
         b_handler
             .write(128 * 1024, &[0xBB; 128 * 1024], false)
+            .await
             .unwrap();
         router.snapshot_export("b", None).await.unwrap();
 
@@ -2555,7 +2557,7 @@ mod tests {
             .await
             .unwrap();
         let parent_handler = router.get_handler("parent").await.unwrap();
-        parent_handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
+        parent_handler.write(0, &[0xAA; 128 * 1024], false).await.unwrap();
         let _parent_snap = router.snapshot_export("parent", None).await.unwrap();
 
         // Fork from parent
@@ -2575,9 +2577,10 @@ mod tests {
 
         // Write different data to the fork
         let fork_handler = router.get_handler("child").await.unwrap();
-        fork_handler.write(0, &[0xFF; 128 * 1024], false).unwrap();
+        fork_handler.write(0, &[0xFF; 128 * 1024], false).await.unwrap();
         fork_handler
             .write(128 * 1024, &[0xDD; 128 * 1024], false)
+            .await
             .unwrap();
 
         // Snapshot the fork
@@ -2646,6 +2649,7 @@ mod tests {
         let write_offset = old_size - 128 * 1024; // near old boundary
         handler
             .write(write_offset, &[0xDD; 128 * 1024], false)
+            .await
             .unwrap();
 
         // Idempotent: resize to same size should be a no-op
@@ -2695,12 +2699,13 @@ mod tests {
         let handler = router.get_handler("retry-vol").await.unwrap();
 
         // First write + drain
-        handler.write(0, &[0x11; 128 * 1024], false).unwrap();
+        handler.write(0, &[0x11; 128 * 1024], false).await.unwrap();
         router.drain_export("retry-vol").await.unwrap();
 
         // Second write + drain with different data
         handler
             .write(128 * 1024, &[0x22; 128 * 1024], false)
+            .await
             .unwrap();
         router.drain_export("retry-vol").await.unwrap();
 
@@ -2742,9 +2747,10 @@ mod tests {
         let handler = router.get_handler("resize-dirty").await.unwrap();
 
         // Write dirty blocks before resize
-        handler.write(0, &[0xAA; 128 * 1024], false).unwrap();
+        handler.write(0, &[0xAA; 128 * 1024], false).await.unwrap();
         handler
             .write(128 * 1024, &[0xBB; 128 * 1024], false)
+            .await
             .unwrap();
 
         let old_size = {
@@ -2777,6 +2783,7 @@ mod tests {
         let new_region_offset = old_size; // first byte of new space
         handler
             .write(new_region_offset, &[0xCC; 128 * 1024], false)
+            .await
             .unwrap();
 
         let data_new = handler.read(new_region_offset, 128 * 1024).await.unwrap();
@@ -2869,6 +2876,7 @@ mod tests {
         for i in 0..50u64 {
             handler
                 .write(i * 128 * 1024, &[0xAA; 128 * 1024], false)
+                .await
                 .unwrap();
         }
 
@@ -2916,6 +2924,7 @@ mod tests {
         for i in 0..10u64 {
             handler
                 .write(i * 128 * 1024, &[0xBB; 128 * 1024], false)
+                .await
                 .unwrap();
         }
 
@@ -3136,6 +3145,7 @@ mod tests {
         let handler = router.get_handler("del-manifest").await.unwrap();
         handler
             .write(0, &vec![0xAA; 128 * 1024], false)
+            .await
             .unwrap();
         router.drain_export("del-manifest").await.unwrap();
         router.save_export(&config).await.unwrap();
@@ -3178,6 +3188,75 @@ mod tests {
         assert!(
             data.iter().all(|&b| b == 0),
             "deleted manifest should yield zero-filled reads"
+        );
+    }
+
+    /// Sub-block write to a forked export must NOT destroy unwritten portions
+    /// of the same write-cache block.
+    ///
+    /// Scenario: parent block is 128KB of 0xAA in S3. Fork writes only the
+    /// first 4KB with 0xBB. Reading the second 4KB must still return 0xAA
+    /// (parent data), not 0x00 (uninitialised data file).
+    ///
+    /// This reproduces the corruption seen when VMs do sub-block writes
+    /// (e.g., ext4 4KB filesystem blocks) against our 128KB write-cache blocks
+    /// on a forked/restored export.
+    #[tokio::test]
+    async fn test_sub_block_write_preserves_unwritten_portions_of_s3_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+        let block_size = 128 * 1024; // 128KB write-cache block
+
+        // --- Parent: write a full 128KB block of 0xAA, then snapshot ---
+        router
+            .create_export(test_export_config("parent"), false, None, None)
+            .await
+            .unwrap();
+        let parent = router.get_handler("parent").await.unwrap();
+        parent.write(0, &vec![0xAA; block_size], false).await.unwrap();
+        router.snapshot_export("parent", None).await.unwrap();
+
+        // --- Fork: fresh cache, data only in S3 ---
+        let fork_config = ExportConfig {
+            name: "child".to_string(),
+            size_gb: 0.01,
+            s3_prefix: Some("parent".to_string()),
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router
+            .create_export(fork_config, false, Some("parent"), None)
+            .await
+            .unwrap();
+        let child = router.get_handler("child").await.unwrap();
+
+        // Sanity: reading the full block from the fork returns parent data.
+        let pre_write = child.read(0, block_size as u32).await.unwrap();
+        assert!(
+            pre_write.iter().all(|&b| b == 0xAA),
+            "fork should serve parent data before any writes"
+        );
+
+        // --- Sub-block write: overwrite only the first 4KB with 0xBB ---
+        child.write(0, &[0xBB; 4096], false).await.unwrap();
+
+        // The written portion must reflect the new data.
+        let first_4k = child.read(0, 4096).await.unwrap();
+        assert!(
+            first_4k.iter().all(|&b| b == 0xBB),
+            "written sub-block should return new data"
+        );
+
+        // The UN-written portion (bytes 4096..8192) must still return parent
+        // data (0xAA), NOT zeros.
+        let second_4k = child.read(4096, 4096).await.unwrap();
+        assert!(
+            second_4k.iter().all(|&b| b == 0xAA),
+            "unwritten portion of block should return parent S3 data (0xAA), \
+             got 0x{:02x} — sub-block write destroyed unwritten data",
+            second_4k[0],
         );
     }
 }

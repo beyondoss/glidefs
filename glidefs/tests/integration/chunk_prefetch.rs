@@ -58,6 +58,7 @@ async fn test_prefetch_chunk_metas_cold_start() {
         let data = vec![0x10 + i; BLOCK_SIZE];
         handler
             .write(i as u64 * BLOCK_SIZE as u64, &data, false)
+            .await
             .unwrap();
     }
 

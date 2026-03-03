@@ -3,9 +3,9 @@
 /// Bridges the ext4 Writer/Reader (which use std::io traits) with the
 /// BlockHandler (which uses async byte-offset methods).
 ///
-/// BlockHandler::write() is synchronous (writes to local SSD cache), so
-/// the Write impl is straightforward. BlockHandler::read() is async, so
-/// the Read impl uses `Handle::block_on()` to bridge the gap.
+/// BlockHandler::write() is async (may fetch S3 data for sub-block backfill),
+/// so the Write impl uses `Handle::block_on()` like the Read impl.
+/// BlockHandler::read() is also async.
 ///
 /// **Must be used from a blocking context** (`spawn_blocking` or a dedicated
 /// thread). Calling `Read::read` from an async worker thread will panic.
@@ -44,8 +44,8 @@ impl Write for BlockAdapter<'_> {
             ));
         }
         let n = buf.len().min(remaining as usize);
-        self.handler
-            .write(self.pos, &buf[..n], false)
+        self.rt
+            .block_on(self.handler.write(self.pos, &buf[..n], false))
             .map_err(|e| io::Error::other(format!("{e:?}")))?;
         self.pos += n as u64;
         Ok(n)
