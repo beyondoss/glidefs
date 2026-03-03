@@ -11,7 +11,7 @@
 //! are immediately discoverable on cross-host recovery (host death without drain).
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rand::Rng;
 use tokio::sync::{Notify, watch};
@@ -49,7 +49,7 @@ async fn flush_and_sync(
     volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
     metrics: &ExportMetrics,
     flush_backoff: &mut Duration,
-    last_flush_failure: &mut Option<Instant>,
+    last_flush_failure: &mut Option<tokio::time::Instant>,
 ) -> Option<FlushResult> {
     match cache
         .flush_packs(content_store, pack_index_cache, volume_manifest)
@@ -106,7 +106,7 @@ async fn flush_and_sync(
             } else {
                 flush_backoff.saturating_mul(2).min(MAX_BACKOFF)
             };
-            *last_flush_failure = Some(Instant::now());
+            *last_flush_failure = Some(tokio::time::Instant::now());
             metrics.record_flush_error();
             warn!(
                 error = %e,
@@ -150,7 +150,7 @@ pub async fn flush_scheduler(
     // can retry S3 flushes after the backoff has elapsed. Without this,
     // dirty blocks can sit unsynced indefinitely if S3 recovers but no
     // new writes trigger flush_notify.
-    let mut last_flush_failure: Option<Instant> = None;
+    let mut last_flush_failure: Option<tokio::time::Instant> = None;
 
     // Pending manifest sync: if sync_manifest fails after a successful pack
     // flush, we retry on the next checkpoint tick to close the window where
@@ -185,7 +185,7 @@ pub async fn flush_scheduler(
                     }
                 }
 
-                let start = Instant::now();
+                let start = std::time::Instant::now();
                 let mut packs_uploaded = 0usize;
 
                 // Acquire global flush semaphore to limit how many exports

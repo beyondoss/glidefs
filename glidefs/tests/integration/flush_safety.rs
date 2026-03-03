@@ -84,6 +84,7 @@ async fn test_pressure_flush_syncs_manifest() {
                 &vec![(i + 1) as u8; BLOCK_SIZE],
                 false,
             )
+            .await
             .unwrap();
     }
 
@@ -132,6 +133,7 @@ async fn test_pressure_flush_concurrent_with_drain() {
                 &vec![(i + 1) as u8; BLOCK_SIZE],
                 false,
             )
+            .await
             .unwrap();
     }
 
@@ -232,6 +234,7 @@ async fn test_snapshot_does_not_block_create() {
                 &vec![(i + 1) as u8; BLOCK_SIZE],
                 false,
             )
+            .await
             .unwrap();
     }
 

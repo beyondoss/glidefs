@@ -992,7 +992,7 @@ async fn io_task_zc(
         let length = byte_len as u32;
         let addr = iod.addr;
 
-        let result = if let Some(r) = dispatch_passthrough(op, offset, length, fua, handler) {
+        let result = if let Some(r) = dispatch_passthrough(op, offset, length, fua, handler).await {
             r
         } else {
             match op {
@@ -1033,7 +1033,7 @@ async fn handle_write_zc(
     }
 
     // Phase 1: prepare metadata before data lands on disk.
-    if let Err(e) = handler.pre_write(offset, length as u64) {
+    if let Err(e) = handler.pre_write(offset, length as u64).await {
         return -e.to_linux_errno();
     }
 
@@ -1145,7 +1145,7 @@ async fn handle_read_zc(
 ///
 /// Returns `Some(result)` if the op was handled, `None` if it requires a
 /// data-path (READ/WRITE) which differs between ZC and non-ZC paths.
-fn dispatch_passthrough(
+async fn dispatch_passthrough(
     op: u32,
     offset: u64,
     length: u32,
@@ -1157,14 +1157,16 @@ fn dispatch_passthrough(
             Ok(()) => 0,
             Err(e) => -e.to_linux_errno(),
         }),
-        sys::UBLK_IO_OP_DISCARD => Some(match handler.trim(offset, length, fua) {
+        sys::UBLK_IO_OP_DISCARD => Some(match handler.trim(offset, length, fua).await {
             Ok(()) => 0,
             Err(e) => -e.to_linux_errno(),
         }),
-        sys::UBLK_IO_OP_WRITE_ZEROES => Some(match handler.write_zeroes(offset, length, fua) {
-            Ok(()) => 0,
-            Err(e) => -e.to_linux_errno(),
-        }),
+        sys::UBLK_IO_OP_WRITE_ZEROES => {
+            Some(match handler.write_zeroes(offset, length, fua).await {
+                Ok(()) => 0,
+                Err(e) => -e.to_linux_errno(),
+            })
+        }
         _ => None,
     }
 }
@@ -1184,7 +1186,7 @@ async fn handle_io(
     buf: &mut [u8],
     handler: &BlockHandler,
 ) -> i32 {
-    if let Some(result) = dispatch_passthrough(op, offset, length, fua, handler) {
+    if let Some(result) = dispatch_passthrough(op, offset, length, fua, handler).await {
         return result;
     }
     match op {
@@ -1197,7 +1199,7 @@ async fn handle_io(
         }
         sys::UBLK_IO_OP_WRITE => {
             debug_assert_eq!(buf.len(), length as usize, "write buf/length mismatch");
-            match handler.write(offset, buf, fua) {
+            match handler.write(offset, buf, fua).await {
                 Ok(()) => i32::try_from(length).unwrap_or(-libc::EIO),
                 Err(e) => -e.to_linux_errno(),
             }
@@ -1222,7 +1224,7 @@ async fn dispatch_io(
     // Handle metadata-only ops (FLUSH, DISCARD, WRITE_ZEROES) before slicing the
     // buffer — these don't need data and their length may exceed the buffer size
     // (e.g. max_discard_sectors = 16MB vs 512KB IO_BUF_BYTES).
-    if let Some(result) = dispatch_passthrough(op, offset, length, fua, handler) {
+    if let Some(result) = dispatch_passthrough(op, offset, length, fua, handler).await {
         return result;
     }
     let buf = &mut buffer.as_mut_slice()[..length as usize];

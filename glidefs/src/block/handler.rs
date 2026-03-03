@@ -164,6 +164,68 @@ impl BlockHandler {
     // Block I/O Operations
     // ========================================================================
 
+    /// Backfill cache blocks from S3 that would be partially overwritten.
+    ///
+    /// For writes smaller than the cache block size, if the affected block
+    /// exists in S3 but not on local SSD, we must fetch the full block
+    /// first to preserve the unwritten portions. Without this, `set_present()`
+    /// marks the block as local but only the written bytes have real data;
+    /// the rest would read back as zeros.
+    ///
+    /// Blocks that are already present locally or will be fully overwritten
+    /// are skipped — zero S3 fetches in the common case.
+    async fn backfill_missing_blocks(&self, offset: u64, length: u64) -> CommandResult<()> {
+        let block_size = self.cache.block_size() as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + length - 1) / block_size;
+
+        for block_idx in start_block..=end_block {
+            // Fast path: block is already on local SSD
+            if self.cache.is_block_present(block_idx as usize) {
+                continue;
+            }
+
+            // Check if the write fully covers this block — no fetch needed
+            let block_start = block_idx * block_size;
+            let block_end = block_start + block_size;
+            if offset <= block_start && offset + length >= block_end {
+                continue;
+            }
+
+            // Check if the block has S3 data that needs preserving.
+            // Fresh blocks (never flushed to S3) have no manifest entry — skip them.
+            {
+                let vm = self.volume_manifest.read();
+                let chunk_idx = vm.chunk_idx_for_block(block_idx);
+                if vm
+                    .chunk_pack_ids(chunk_idx)
+                    .map_or(true, |ids| ids.is_empty())
+                {
+                    continue;
+                }
+            }
+
+            // Partial write to a block in S3: fetch full block to preserve unwritten data
+            let block_data = self
+                .cache
+                .read(
+                    block_start,
+                    block_size as usize,
+                    self.clean_cache.as_ref(),
+                    &self.pack_index_cache,
+                    &self.volume_manifest,
+                    &self.content_store,
+                    &self.metrics,
+                )
+                .await?;
+
+            self.cache
+                .backfill_block(block_idx as usize, &block_data)?;
+        }
+
+        Ok(())
+    }
+
     /// Read data from the cache, fetching from S3 if not present locally.
     ///
     /// Uses read-through caching: blocks not present locally are fetched from S3.
@@ -258,7 +320,10 @@ impl BlockHandler {
     /// Writes go to local SSD immediately. S3 sync happens in background.
     /// Returns error if the export is readonly or SSD is near-full and
     /// the write touches blocks not yet present on SSD.
-    pub fn write(&self, offset: u64, data: &[u8], fua: bool) -> CommandResult<()> {
+    ///
+    /// For sub-block writes to blocks that exist only in S3, fetches the
+    /// full block from S3 first to preserve unwritten portions.
+    pub async fn write(&self, offset: u64, data: &[u8], fua: bool) -> CommandResult<()> {
         let start = Instant::now();
 
         if self.is_readonly() {
@@ -277,6 +342,9 @@ impl BlockHandler {
         if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, data.len()) {
             return Err(CommandError::NoSpace);
         }
+
+        self.backfill_missing_blocks(offset, data.len() as u64)
+            .await?;
 
         self.metrics.record_guest_write(data.len() as u64);
         self.cache.write(offset, data, self.clean_cache.as_ref())?;
@@ -302,7 +370,7 @@ impl BlockHandler {
     /// Writes zeros to the specified range using optimized platform-specific
     /// methods (fallocate on Linux, static buffer fallback elsewhere).
     /// Returns error if the export is readonly.
-    pub fn trim(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
+    pub async fn trim(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
         }
@@ -314,6 +382,8 @@ impl BlockHandler {
         if length == 0 {
             return Ok(());
         }
+
+        self.backfill_missing_blocks(offset, length as u64).await?;
 
         self.cache.zero_range(offset, length as u64)?;
         if let Some(ref tracer) = self.write_tracer {
@@ -335,7 +405,7 @@ impl BlockHandler {
     /// - Other: Static zero buffer to avoid per-call allocation
     ///
     /// Returns error if the export is readonly.
-    pub fn write_zeroes(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
+    pub async fn write_zeroes(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
         }
@@ -347,6 +417,8 @@ impl BlockHandler {
         if length == 0 {
             return Ok(());
         }
+
+        self.backfill_missing_blocks(offset, length as u64).await?;
 
         self.cache.zero_range(offset, length as u64)?;
         if let Some(ref tracer) = self.write_tracer {
@@ -399,7 +471,7 @@ impl BlockHandler {
     /// Validates the request (readonly, SSD-full, bounds), then marks blocks
     /// present and clears CRC32. Call BEFORE the io_uring write SQE.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
-    pub fn pre_write(&self, offset: u64, length: u64) -> CommandResult<()> {
+    pub async fn pre_write(&self, offset: u64, length: u64) -> CommandResult<()> {
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
         }
@@ -416,6 +488,8 @@ impl BlockHandler {
         if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, length as usize) {
             return Err(CommandError::NoSpace);
         }
+
+        self.backfill_missing_blocks(offset, length).await?;
 
         self.cache.pre_write(offset, length)?;
         Ok(())
@@ -584,7 +658,7 @@ mod tests {
         let (handler, _temp) = test_handler().await;
 
         let data = vec![42u8; 4096];
-        handler.write(0, &data, false).unwrap();
+        handler.write(0, &data, false).await.unwrap();
 
         let read_data = handler.read(0, 4096).await.unwrap();
         assert_eq!(read_data.as_ref(), &data[..]);
@@ -604,7 +678,7 @@ mod tests {
         let (handler, _temp) = test_handler().await;
 
         let data = vec![42u8; 4096];
-        let result = handler.write(1024 * 1024, &data, false);
+        let result = handler.write(1024 * 1024, &data, false).await;
         assert!(matches!(result, Err(CommandError::InvalidArgument)));
     }
 
@@ -613,7 +687,7 @@ mod tests {
         let (handler, _temp) = test_handler_with_readonly(true).await;
 
         let data = vec![42u8; 4096];
-        let result = handler.write(0, &data, false);
+        let result = handler.write(0, &data, false).await;
         assert!(matches!(result, Err(CommandError::ReadOnly)));
     }
 
@@ -621,7 +695,7 @@ mod tests {
     async fn test_readonly_rejects_trim() {
         let (handler, _temp) = test_handler_with_readonly(true).await;
 
-        let result = handler.trim(0, 4096, false);
+        let result = handler.trim(0, 4096, false).await;
         assert!(matches!(result, Err(CommandError::ReadOnly)));
     }
 
@@ -629,7 +703,7 @@ mod tests {
     async fn test_readonly_rejects_write_zeroes() {
         let (handler, _temp) = test_handler_with_readonly(true).await;
 
-        let result = handler.write_zeroes(0, 4096, false);
+        let result = handler.write_zeroes(0, 4096, false).await;
         assert!(matches!(result, Err(CommandError::ReadOnly)));
     }
 
@@ -649,7 +723,7 @@ mod tests {
         // Initially readonly - writes fail
         let data = vec![42u8; 4096];
         assert!(matches!(
-            handler.write(0, &data, false),
+            handler.write(0, &data, false).await,
             Err(CommandError::ReadOnly)
         ));
 
@@ -658,7 +732,7 @@ mod tests {
         assert!(!handler.is_readonly());
 
         // Now writes work
-        assert!(handler.write(0, &data, false).is_ok());
+        assert!(handler.write(0, &data, false).await.is_ok());
     }
 
     #[tokio::test]
@@ -674,7 +748,7 @@ mod tests {
         let (handler, _temp) = test_handler().await;
 
         let data = vec![42u8; 4096];
-        handler.write(0, &data, false).unwrap();
+        handler.write(0, &data, false).await.unwrap();
         handler.flush().unwrap();
 
         // Verify data persists
@@ -688,7 +762,7 @@ mod tests {
 
         let data = vec![42u8; 4096];
         // FUA flag should trigger flush
-        handler.write(0, &data, true).unwrap();
+        handler.write(0, &data, true).await.unwrap();
 
         let read_data = handler.read(0, 4096).await.unwrap();
         assert_eq!(read_data.as_ref(), &data[..]);
@@ -700,10 +774,10 @@ mod tests {
 
         // Write some data
         let data = vec![42u8; 4096];
-        handler.write(0, &data, false).unwrap();
+        handler.write(0, &data, false).await.unwrap();
 
         // Write zeros over it
-        handler.write_zeroes(0, 4096, false).unwrap();
+        handler.write_zeroes(0, 4096, false).await.unwrap();
 
         // Verify zeros
         let read_data = handler.read(0, 4096).await.unwrap();
@@ -716,10 +790,10 @@ mod tests {
 
         // Write some data
         let data = vec![42u8; 4096];
-        handler.write(0, &data, false).unwrap();
+        handler.write(0, &data, false).await.unwrap();
 
         // Trim the region
-        handler.trim(0, 4096, false).unwrap();
+        handler.trim(0, 4096, false).await.unwrap();
 
         // Verify zeros
         let read_data = handler.read(0, 4096).await.unwrap();
@@ -782,7 +856,7 @@ mod tests {
 
         // Write 200 blocks — well above any reasonable threshold
         for i in 0..200u64 {
-            handler.write(i * 4096, &[0xAA; 4096], false).unwrap();
+            handler.write(i * 4096, &[0xAA; 4096], false).await.unwrap();
         }
 
         // flush_notify should NOT have been triggered.
@@ -806,7 +880,7 @@ mod tests {
 
         // Write 4 blocks — below threshold, should NOT notify
         for i in 0..4u64 {
-            handler.write(i * 4096, &[0xBB; 4096], false).unwrap();
+            handler.write(i * 4096, &[0xBB; 4096], false).await.unwrap();
         }
 
         let notified_early = tokio::time::timeout(
@@ -818,7 +892,7 @@ mod tests {
         assert!(!notified_early, "should not notify below threshold (4 < 5)");
 
         // Write the 5th block — reaches threshold, SHOULD notify
-        handler.write(4 * 4096, &[0xCC; 4096], false).unwrap();
+        handler.write(4 * 4096, &[0xCC; 4096], false).await.unwrap();
 
         let notified_at_threshold = tokio::time::timeout(
             std::time::Duration::from_millis(10),
@@ -896,20 +970,20 @@ mod tests {
         let (handler, ssd_util, _temp) = test_handler_with_ssd_util().await;
 
         // Write block 0 at normal pressure — establishes it as "present" on SSD
-        handler.write(0, &[0xAA; 4096], false).unwrap();
+        handler.write(0, &[0xAA; 4096], false).await.unwrap();
 
         // Simulate 96% SSD utilization (above WRITE_REJECT_THRESHOLD of 0.95)
         ssd_util.store(0.96f64.to_bits(), Ordering::Relaxed);
 
         // Overwrite block 0 — should succeed (existing block, no new SSD allocation)
         assert!(
-            handler.write(0, &[0xBB; 4096], false).is_ok(),
+            handler.write(0, &[0xBB; 4096], false).await.is_ok(),
             "overwrite of existing block should succeed even at 96% utilization"
         );
 
         // Write to block 1 — should fail (new block requires SSD allocation)
         assert!(
-            matches!(handler.write(4096, &[0xCC; 4096], false), Err(CommandError::NoSpace)),
+            matches!(handler.write(4096, &[0xCC; 4096], false).await, Err(CommandError::NoSpace)),
             "write to new block should return ENOSPC at 96% utilization"
         );
 
@@ -918,7 +992,7 @@ mod tests {
 
         // Write to block 1 again — should succeed now
         assert!(
-            handler.write(4096, &[0xDD; 4096], false).is_ok(),
+            handler.write(4096, &[0xDD; 4096], false).await.is_ok(),
             "write to new block should succeed after pressure drops"
         );
     }

@@ -160,11 +160,11 @@ async fn test_fork_from_snapshot() {
 
     // Write block 0 with seed 0xAA and snapshot
     let handler = router.get_handler("vm1").await.unwrap();
-    handler.write(0, &[0xAA; BLOCK_SIZE], false).unwrap();
+    handler.write(0, &[0xAA; BLOCK_SIZE], false).await.unwrap();
     let snap1 = router.snapshot_export("vm1", None).await.unwrap();
 
     // Overwrite block 0 with seed 0xBB and snapshot again
-    handler.write(0, &[0xBB; BLOCK_SIZE], false).unwrap();
+    handler.write(0, &[0xBB; BLOCK_SIZE], false).await.unwrap();
     let _snap2 = router.snapshot_export("vm1", None).await.unwrap();
 
     // Fork from snap1 — should see 0xAA, not 0xBB
@@ -563,7 +563,7 @@ async fn test_snapshot_tag_and_fork() {
     router.create_export(config, false, None, None).await.unwrap();
 
     let handler = router.get_handler("vm1").await.unwrap();
-    handler.write(0, &[0xCC; BLOCK_SIZE], false).unwrap();
+    handler.write(0, &[0xCC; BLOCK_SIZE], false).await.unwrap();
 
     let snap = router.snapshot_export("vm1", Some("setup-abc123")).await.unwrap();
     assert_eq!(snap.tag.as_deref(), Some("setup-abc123"));
@@ -629,7 +629,7 @@ async fn test_standalone_tag() {
     router.create_export(config, false, None, None).await.unwrap();
 
     let handler = router.get_handler("vm1").await.unwrap();
-    handler.write(0, &[0xDD; BLOCK_SIZE], false).unwrap();
+    handler.write(0, &[0xDD; BLOCK_SIZE], false).await.unwrap();
 
     // Snapshot first (to flush data), then tag separately
     router.snapshot_export("vm1", None).await.unwrap();
@@ -1119,6 +1119,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
     for i in 0..3 {
         handler
             .write(i as u64 * BLOCK_SIZE as u64, &[0xAA; BLOCK_SIZE], false)
+            .await
             .unwrap();
     }
     let snap1 = router.snapshot_export("vm1", None).await.unwrap();
@@ -1131,6 +1132,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
                 &vec![0u8; BLOCK_SIZE],
                 false,
             )
+            .await
             .unwrap();
     }
     let _snap2 = router.snapshot_export("vm1", None).await.unwrap();
