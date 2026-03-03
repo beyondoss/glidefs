@@ -992,7 +992,7 @@ async fn io_task_zc(
         let length = byte_len as u32;
         let addr = iod.addr;
 
-        let result = if let Some(r) = dispatch_passthrough(op, offset, length, fua, handler) {
+        let result = if let Some(r) = dispatch_passthrough(op, offset, length, fua, handler).await {
             r
         } else {
             match op {
