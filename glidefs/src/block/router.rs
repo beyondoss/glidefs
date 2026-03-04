@@ -691,14 +691,10 @@ impl ExportRouter {
         let clean_cache = Arc::clone(&self.clean_cache);
         let pack_index_cache = Arc::clone(&self.pack_index_cache);
 
-        // Create write cache — either from manifest (fork) or fresh (normal)
-        let cache_config = WriteCacheConfig {
-            cache_dir: self.cache_dir.clone(),
-            device_name: name.clone(),
-            device_size: config.size_bytes(),
-            block_size,
-            wal_sync: self.wal_sync,
-        };
+        // Determine effective device size — for forks, must be at least as large
+        // as the base image (ext4 superblock records filesystem size, kernel rejects
+        // a device smaller than that).
+        let mut device_size = config.size_bytes();
 
         let (cache, volume_manifest) = if let Some(manifest_name) = manifest_name {
             // Fork path: try to load VolumeManifest from S3
@@ -740,12 +736,31 @@ impl ExportRouter {
                 }
             };
 
-            // Resize if the fork config has a different size
+            // Ensure fork is at least as large as the base
+            if device_size < fork_vm.size {
+                warn!(
+                    "Export '{}': requested size ({:.1} GB) is smaller than base image ({:.1} GB), \
+                     using base size to avoid ext4 geometry mismatch",
+                    name,
+                    device_size as f64 / 1e9,
+                    fork_vm.size as f64 / 1e9,
+                );
+                device_size = fork_vm.size;
+            }
+
             let mut vm = fork_vm;
-            vm.size = config.size_bytes();
+            vm.size = device_size;
 
             // Store the volume manifest for this export
             let volume_manifest = Arc::new(parking_lot::RwLock::new(vm));
+
+            let cache_config = WriteCacheConfig {
+                cache_dir: self.cache_dir.clone(),
+                device_name: name.clone(),
+                device_size,
+                block_size,
+                wal_sync: self.wal_sync,
+            };
 
             // Open a fresh cache (local SSD starts empty, reads go through VolumeManifest → ChunkMetaCache → S3)
             let cache = WriteCache::open_fresh_active(cache_config)?;
@@ -754,6 +769,13 @@ impl ExportRouter {
             (Arc::new(cache), volume_manifest)
         } else {
             // Normal path: open cache, recover from WAL
+            let cache_config = WriteCacheConfig {
+                cache_dir: self.cache_dir.clone(),
+                device_name: name.clone(),
+                device_size,
+                block_size,
+                wal_sync: self.wal_sync,
+            };
             let cache = WriteCache::open(cache_config)?;
             info!("Recovering write cache for export '{}'...", name);
             let cache = cache.finish_recovery().await?;
@@ -761,7 +783,7 @@ impl ExportRouter {
 
             // Empty volume manifest for new exports
             let volume_manifest = Arc::new(parking_lot::RwLock::new(
-                VolumeManifest::new(config.size_bytes(), block_size as u32),
+                VolumeManifest::new(device_size, block_size as u32),
             ));
 
             // Try to load existing volume manifest from S3
@@ -823,7 +845,7 @@ impl ExportRouter {
             Arc::clone(&clean_cache),
             Arc::clone(&pack_index_cache),
             Arc::clone(&volume_manifest),
-            config.size_bytes(),
+            device_size,
             readonly,
             Arc::clone(&metrics),
             Arc::clone(&self.ssd_utilization),
