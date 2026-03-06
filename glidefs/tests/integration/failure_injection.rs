@@ -37,6 +37,8 @@ struct FailingObjectStore {
     fail_puts: AtomicBool,
     /// When true, GET operations will fail.
     fail_gets: AtomicBool,
+    /// When true, DELETE operations will fail.
+    fail_deletes: AtomicBool,
     /// Count of PUT operations (for conditional failure).
     put_count: AtomicU32,
     /// Fail after this many PUTs (0 = disabled).
@@ -49,6 +51,7 @@ impl FailingObjectStore {
             inner: object_store::memory::InMemory::new(),
             fail_puts: AtomicBool::new(false),
             fail_gets: AtomicBool::new(false),
+            fail_deletes: AtomicBool::new(false),
             put_count: AtomicU32::new(0),
             fail_after_puts: AtomicU32::new(0),
         }
@@ -60,6 +63,10 @@ impl FailingObjectStore {
 
     fn set_fail_gets(&self, fail: bool) {
         self.fail_gets.store(fail, Ordering::SeqCst);
+    }
+
+    fn set_fail_deletes(&self, fail: bool) {
+        self.fail_deletes.store(fail, Ordering::SeqCst);
     }
 
     #[allow(dead_code)]
@@ -138,6 +145,15 @@ impl ObjectStore for FailingObjectStore {
     }
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        if self.fail_deletes.load(Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "FailingObjectStore",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Simulated S3 delete failure",
+                )),
+            });
+        }
         self.inner.delete(location).await
     }
 
@@ -860,4 +876,63 @@ async fn test_partial_pack_upload_preserves_dirty() {
             i
         );
     }
+}
+
+// =============================================================================
+// DELETE_ALL_SNAPSHOTS PARTIAL FAILURE
+// =============================================================================
+
+/// Test: delete_all_snapshots returns Ok even when individual deletes fail.
+///
+/// This documents the best-effort contract: callers (e.g. purge_export)
+/// cannot distinguish partial cleanup from full success. Orphaned snapshots
+/// remain and their referenced packs won't be collected by GC.
+#[tokio::test]
+async fn test_delete_all_snapshots_returns_ok_on_partial_failure() {
+    let s3 = Arc::new(FailingObjectStore::new());
+    let temp_dir = TempDir::new().unwrap();
+    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+        create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
+
+    // Write data and create two snapshots
+    let data = vec![0xAA; BLOCK_SIZE];
+    cache.write(0, &data, clean_cache.as_ref()).unwrap();
+    cache
+        .snapshot(&content_store, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    let data = vec![0xBB; BLOCK_SIZE];
+    cache
+        .write(BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+        .unwrap();
+    cache
+        .snapshot(&content_store, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    let snapshots = content_store.list_snapshots("vol1").await.unwrap();
+    assert_eq!(snapshots.len(), 2, "should have 2 snapshots");
+
+    // Enable delete failures — delete_all_snapshots should still return Ok
+    s3.set_fail_deletes(true);
+    let result = content_store.delete_all_snapshots("vol1").await;
+    assert!(
+        result.is_ok(),
+        "delete_all_snapshots should return Ok even when deletes fail"
+    );
+
+    // Snapshots should still exist (deletes failed)
+    s3.set_fail_deletes(false);
+    let remaining = content_store.list_snapshots("vol1").await.unwrap();
+    assert_eq!(
+        remaining.len(),
+        2,
+        "snapshots should survive failed delete_all_snapshots"
+    );
+
+    // Retry without failures — should succeed
+    content_store.delete_all_snapshots("vol1").await.unwrap();
+    let remaining = content_store.list_snapshots("vol1").await.unwrap();
+    assert_eq!(remaining.len(), 0, "all snapshots should be deleted on retry");
 }

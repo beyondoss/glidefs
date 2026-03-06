@@ -4,11 +4,20 @@
 //! 1. pressure_flush syncs the manifest so uploaded packs are always referenced
 //! 2. pressure_flush + concurrent drain don't corrupt data
 //! 3. snapshot_export does not hold the exports read lock during flush
+//! 4. drain_all returns per-export errors when S3 is unavailable
+//! 5. resize_export preserves data and rejects shrinks
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
 use object_store::memory::InMemory;
-use object_store::ObjectStore;
+use object_store::path::Path;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+};
 use tempfile::TempDir;
 
 use glidefs::block::cache::SimpleBlockCache;
@@ -16,6 +25,94 @@ use glidefs::block::content_store::ContentStore;
 use glidefs::block::router::{ExportRouter, RouterConfig};
 use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::config::ExportConfig;
+
+/// InMemory wrapper that can toggle PUT failures for router-level tests.
+#[derive(Debug)]
+struct FailingObjectStore {
+    inner: InMemory,
+    fail_puts: AtomicBool,
+}
+
+impl FailingObjectStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemory::new(),
+            fail_puts: AtomicBool::new(false),
+        }
+    }
+
+    fn set_fail_puts(&self, fail: bool) {
+        self.fail_puts.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Display for FailingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FailingObjectStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        if self.fail_puts.load(Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "FailingObjectStore",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Simulated S3 failure",
+                )),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        if self.fail_puts.load(Ordering::SeqCst) {
+            return Err(object_store::Error::Generic {
+                store: "FailingObjectStore",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Simulated S3 multipart failure",
+                )),
+            });
+        }
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
 
 const BLOCK_SIZE: usize = 128 * 1024;
 
@@ -263,4 +360,287 @@ async fn test_snapshot_does_not_block_create() {
     let names: Vec<_> = exports.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"export-a"), "export-a should exist");
     assert!(names.contains(&"export-b"), "export-b should exist");
+}
+
+// ---------------------------------------------------------------------------
+// drain_all returns per-export errors when S3 is unavailable
+// ---------------------------------------------------------------------------
+
+/// drain_all returns errors for each export that failed, without preventing
+/// other exports from draining. Callers (e.g. shutdown) use the returned
+/// errors to decide whether to retry or abort.
+#[tokio::test]
+async fn test_drain_all_returns_errors_on_s3_failure() {
+    let s3 = Arc::new(FailingObjectStore::new());
+    let dir = TempDir::new().unwrap();
+    let router = Arc::new(
+        ExportRouter::new(create_router_config(Arc::clone(&s3) as _, &dir))
+            .await
+            .unwrap(),
+    );
+
+    // Create two exports and write data to both
+    for name in &["vm1", "vm2"] {
+        router
+            .create_export(test_export_config(name), false, None, None)
+            .await
+            .unwrap();
+
+        let handler = router.get_handler(name).await.unwrap();
+        for i in 0..5 {
+            handler
+                .write(
+                    i as u64 * BLOCK_SIZE as u64,
+                    &vec![(i + 1) as u8; BLOCK_SIZE],
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    // Fail S3 — drain_all should return errors for both exports
+    s3.set_fail_puts(true);
+    let failed = router.drain_all().await;
+    assert_eq!(
+        failed.len(),
+        2,
+        "both exports should fail when S3 is unavailable"
+    );
+    let failed_names: Vec<_> = failed.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(failed_names.contains(&"vm1"), "vm1 should be in errors");
+    assert!(failed_names.contains(&"vm2"), "vm2 should be in errors");
+
+    // Fix S3 — drain_all should now succeed
+    s3.set_fail_puts(false);
+    let failed = router.drain_all().await;
+    assert!(
+        failed.is_empty(),
+        "drain_all should succeed after S3 recovers, got: {:?}",
+        failed.iter().map(|(n, e)| format!("{n}: {e}")).collect::<Vec<_>>()
+    );
+
+    // Verify data integrity from a cold reader for both exports
+    for name in &["vm1", "vm2"] {
+        let cs = ContentStore::new(Arc::clone(&s3) as _, &format!("test/exports/{name}"));
+        let manifest_data = cs
+            .get_manifest(name)
+            .await
+            .expect("should succeed")
+            .expect("manifest should exist after drain");
+        let vm = VolumeManifest::deserialize(&manifest_data).unwrap();
+        assert!(
+            !vm.chunks.is_empty(),
+            "{name} manifest should have chunk entries"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// resize_export: happy path + shrink rejection
+// ---------------------------------------------------------------------------
+
+/// resize_export grows the device, preserving existing data.
+#[tokio::test]
+async fn test_resize_export_preserves_data() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(create_router_config(Arc::clone(&s3), &dir))
+        .await
+        .unwrap();
+
+    // Create a 10MB export and write data
+    router
+        .create_export(test_export_config("vm1"), false, None, None)
+        .await
+        .unwrap();
+
+    let handler = router.get_handler("vm1").await.unwrap();
+    for i in 0..5 {
+        handler
+            .write(
+                i as u64 * BLOCK_SIZE as u64,
+                &vec![(i + 1) as u8; BLOCK_SIZE],
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Resize from 10MB (0.01 GB) to 20MB (0.02 GB)
+    router.resize_export("vm1", 0.02).await.unwrap();
+
+    // Export should have the new size
+    let handler = router.get_handler("vm1").await.unwrap();
+    let new_size = handler.device_size();
+    let expected_size = (0.02 * 1_000_000_000.0) as u64;
+    assert_eq!(new_size, expected_size, "device should be 20MB after resize");
+
+    // Original data should still be readable
+    for i in 0..5 {
+        let data = handler
+            .read(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            data[0],
+            (i + 1) as u8,
+            "block {} should have original data after resize",
+            i
+        );
+    }
+}
+
+/// resize_export rejects shrink attempts.
+#[tokio::test]
+async fn test_resize_export_rejects_shrink() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(create_router_config(Arc::clone(&s3), &dir))
+        .await
+        .unwrap();
+
+    router
+        .create_export(test_export_config("vm1"), false, None, None)
+        .await
+        .unwrap();
+
+    // Try to shrink — should fail
+    let result = router.resize_export("vm1", 0.005).await;
+    assert!(result.is_err(), "shrinking should be rejected");
+}
+
+/// resize_export is idempotent when requested size <= current size.
+#[tokio::test]
+async fn test_resize_export_idempotent_same_size() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(create_router_config(Arc::clone(&s3), &dir))
+        .await
+        .unwrap();
+
+    router
+        .create_export(test_export_config("vm1"), false, None, None)
+        .await
+        .unwrap();
+
+    // Resize to same size — should be a no-op
+    router.resize_export("vm1", 0.01).await.unwrap();
+
+    // Export should still work
+    let handler = router.get_handler("vm1").await.unwrap();
+    handler
+        .write(0, &vec![0xAA; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+    let data = handler.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert_eq!(data[0], 0xAA, "export should work after no-op resize");
+}
+
+// ---------------------------------------------------------------------------
+// create_export idempotency
+// ---------------------------------------------------------------------------
+
+/// create_export with the same name twice should not error or corrupt state.
+///
+/// CLAUDE.md requires: "Check before create; don't error if it exists."
+/// Data written before the second create_export call must survive.
+#[tokio::test]
+async fn test_create_export_idempotent_same_name() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(create_router_config(Arc::clone(&s3), &dir))
+        .await
+        .unwrap();
+
+    // First create
+    router
+        .create_export(test_export_config("vm1"), false, None, None)
+        .await
+        .unwrap();
+
+    // Write data to the export
+    let handler = router.get_handler("vm1").await.unwrap();
+    handler
+        .write(0, &vec![0xBB; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+
+    // Second create with same name — should succeed (idempotent)
+    let result = router
+        .create_export(test_export_config("vm1"), false, None, None)
+        .await;
+    assert!(
+        result.is_ok(),
+        "second create_export should not error: {:?}",
+        result.err()
+    );
+
+    // Data written before the second create should still be readable
+    let handler = router.get_handler("vm1").await.unwrap();
+    let data = handler.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert_eq!(
+        data[0], 0xBB,
+        "data from before second create_export should survive"
+    );
+
+    // Export list should contain exactly one "vm1"
+    let exports = router.list_exports().await;
+    let vm1_count = exports.iter().filter(|e| e.name == "vm1").count();
+    assert_eq!(vm1_count, 1, "should not duplicate the export");
+}
+
+// ---------------------------------------------------------------------------
+// promote_export idempotency + error paths
+// ---------------------------------------------------------------------------
+
+/// promote_export on an already read-write export is a no-op.
+#[tokio::test]
+async fn test_promote_export_already_readwrite() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(create_router_config(Arc::clone(&s3), &dir))
+        .await
+        .unwrap();
+
+    // Create a normal (read-write) export
+    router
+        .create_export(test_export_config("vm1"), false, None, None)
+        .await
+        .unwrap();
+
+    // Promote should succeed (idempotent no-op)
+    let result = router.promote_export("vm1").await;
+    assert!(
+        result.is_ok(),
+        "promote on already-writable export should succeed: {:?}",
+        result.err()
+    );
+
+    // Export should still work
+    let handler = router.get_handler("vm1").await.unwrap();
+    handler
+        .write(0, &vec![0xCC; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+    let data = handler.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert_eq!(data[0], 0xCC);
+}
+
+/// promote_export on a non-existent export returns ExportNotFound.
+#[tokio::test]
+async fn test_promote_export_not_found() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(create_router_config(Arc::clone(&s3), &dir))
+        .await
+        .unwrap();
+
+    let result = router.promote_export("nonexistent").await;
+    assert!(result.is_err(), "promote on missing export should fail");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("not found") || err.contains("Not found"),
+        "error should indicate export not found, got: {err}"
+    );
 }

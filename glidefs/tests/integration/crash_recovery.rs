@@ -655,3 +655,108 @@ async fn test_wal_recovery_multiple_crash_cycles() {
         assert_eq!(s3_data_1.as_ref(), &data_session_2[..], "block 1 in S3");
     }
 }
+
+// =============================================================================
+// WAL TRUNCATION AFTER FLUSH (CHECKPOINT)
+// =============================================================================
+
+/// Test: flush_to_s3 truncates the WAL via checkpoint(), so post-crash recovery
+/// only sees writes that happened after the last flush.
+///
+/// Scenario:
+/// 1. Write blocks 0,1 → flush_to_s3 (calls checkpoint → wal.truncate())
+/// 2. Write block 2 (new WAL entry)
+/// 3. Crash (drop without save_metadata)
+/// 4. Recovery: blocks 0,1 should be CLEAN (flushed to S3), block 2 dirty
+///
+/// This proves the WAL was truncated during flush — stale WAL entries for
+/// blocks 0,1 don't cause them to appear dirty after recovery.
+#[tokio::test]
+async fn test_flush_truncates_wal_before_crash() {
+    let s3_backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let temp_dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: temp_dir.path().to_path_buf(),
+        device_name: "wal_trunc".to_string(),
+        device_size: DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: true,
+    };
+
+    let flushed_data_0: Vec<u8> = vec![0x11; BLOCK_SIZE];
+    let flushed_data_1: Vec<u8> = vec![0x22; BLOCK_SIZE];
+    let unflushed_data_2: Vec<u8> = vec![0x33; BLOCK_SIZE];
+
+    // Session 1: write 2 blocks, flush to S3 (truncates WAL), write 1 more, crash
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+
+        let content_store =
+            glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
+        let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
+        ));
+
+        // Write blocks 0 and 1
+        cache.write(0, &flushed_data_0, &clean_cache).unwrap();
+        cache
+            .write(BLOCK_SIZE as u64, &flushed_data_1, &clean_cache)
+            .unwrap();
+        assert_eq!(cache.dirty_block_count(), 2);
+
+        // Flush to S3 — this calls checkpoint() which truncates the WAL
+        cache
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .await
+            .unwrap();
+        assert_eq!(cache.dirty_block_count(), 0, "blocks should be clean after flush");
+
+        // Write block 2 — new WAL entry appended after truncation
+        cache
+            .write(2 * BLOCK_SIZE as u64, &unflushed_data_2, &clean_cache)
+            .unwrap();
+        assert_eq!(cache.dirty_block_count(), 1);
+
+        // Crash — drop without save_metadata.
+        // WAL has only the block 2 entry (blocks 0,1 entries were truncated).
+    }
+
+    // Session 2: recovery should mark only block 2 as dirty
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // Block 2 should be dirty (recovered from WAL)
+        assert_eq!(
+            cache.dirty_block_count(),
+            1,
+            "only block 2 should be dirty — WAL for blocks 0,1 was truncated by flush"
+        );
+
+        // Block 2 data should be intact
+        let data = cache.read_local(2 * BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        assert_eq!(
+            data.as_ref(),
+            &unflushed_data_2[..],
+            "block 2 data should survive WAL recovery"
+        );
+
+        // Blocks 0,1 data should also be on SSD (pwrite'd) even though not dirty
+        let data_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert_eq!(
+            data_0.as_ref(),
+            &flushed_data_0[..],
+            "block 0 should still be readable from SSD"
+        );
+
+        let data_1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        assert_eq!(
+            data_1.as_ref(),
+            &flushed_data_1[..],
+            "block 1 should still be readable from SSD"
+        );
+    }
+}
