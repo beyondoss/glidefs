@@ -57,11 +57,11 @@ Remaining gaps:
 
 Basic trim-then-read is covered by `test_v2_read_trimmed_block` and `test_trim` (unit tests). These test the integration-level and edge-case gaps:
 
-- **`trim_partial_range`** — TRIM 512 bytes in the middle of a 4096-byte block. Read full block. Trimmed region must be zeros, rest must be original data.
-- **`trim_then_flush_to_s3`** — Write block, flush to S3, TRIM block, flush to S3. Cold reader must see zeros (tombstone in manifest). (Zero-write→S3 roundtrip covered indirectly by `prop_zero_block_roundtrip`, but not the TRIM command path specifically.)
-- **`trim_fork_semantics`** — Parent has block in S3. Fork child, TRIM that block on child. Read from child returns zeros. Read from parent returns original data. Tests that TRIM creates proper tombstones in fork context.
-- **`trim_crash_recovery`** — TRIM block, crash before metadata checkpoint. Recover. Read block. Result depends on WAL persistence — if TRIM was WAL'd, zeros; if not, original data. Either is correct, but it must be consistent.
-- **`trim_large_range`** — TRIM a 100MB range spanning many blocks. All must return zeros. Tests batch trim efficiency.
+- [x] **`trim_partial_range`** — TRIM 512 bytes in the middle of a block. Trimmed region zeros, rest unchanged. *(integration/trim.rs)*
+- [x] **`trim_then_flush_to_s3`** — Write block, flush, TRIM, flush again. Cold reader sees zeros (tombstone overrides). *(integration/trim.rs)*
+- [x] **`trim_fork_semantics`** — Parent has block in S3. Fork child, TRIM on child. Child zeros, parent unchanged. Cold reader verifies both. *(integration/trim.rs)*
+- [x] **`trim_crash_recovery`** — TRIM block, crash before checkpoint. WAL replay recovers the TRIM. *(integration/trim.rs)*
+- [x] **`trim_large_range`** — TRIM 100MB (800 blocks). All zeros. Flush produces tombstones (blocks_deduped=800, bytes_uploaded=0). *(integration/trim.rs)*
 
 ### 5. WRITE_ZEROES semantics
 
