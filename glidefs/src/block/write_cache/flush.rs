@@ -415,10 +415,9 @@ impl WriteCache<Active> {
     async fn checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
         crate::task::spawn_blocking_named("checkpoint", move || {
-            let mut wal = inner.wal.lock();
             inner.save_block_states()?;
-            wal.truncate()?;
-            inner.reappend_partial_entries(&mut wal)?;
+            let partials = inner.collect_partial_entries();
+            inner.wal.truncate_and_reappend(&partials)?;
             Ok(())
         })
         .await
@@ -439,9 +438,8 @@ impl WriteCache<Active> {
         crate::task::spawn_blocking_named("local-checkpoint", move || {
             compute_dirty_crc32s(&inner);
             inner.save_block_states()?;
-            let mut wal = inner.wal.lock();
-            wal.truncate()?;
-            inner.reappend_partial_entries(&mut wal)?;
+            let partials = inner.collect_partial_entries();
+            inner.wal.truncate_and_reappend(&partials)?;
             debug!("local checkpoint complete");
             Ok(())
         })

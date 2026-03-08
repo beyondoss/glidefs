@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -131,7 +130,7 @@ impl WriteCache<Initializing> {
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
             sequence,
-            wal: Mutex::new(wal),
+            wal,
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
@@ -183,7 +182,7 @@ impl WriteCache<Initializing> {
             dirty_block_count: AtomicU64::new(0),
             syncing_block_count: AtomicU64::new(0),
             sequence,
-            wal: Mutex::new(wal),
+            wal,
             export_name,
             zero_block_hash: zbh,
             zero_block_bytes: zbb,

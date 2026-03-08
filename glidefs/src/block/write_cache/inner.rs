@@ -272,10 +272,9 @@ pub(crate) struct CacheInner {
     pub(super) sequence: SequenceNumber,
 
     /// Write-ahead log for crash recovery.
-    /// Mutex is contended under concurrent writes (multiple NBD I/O tasks
-    /// per export), but each write batches all its WAL entries under a
-    /// single lock acquisition to minimize hold time.
-    pub(super) wal: Mutex<Wal>,
+    /// Uses O_APPEND for lock-free concurrent appends. The internal RwLock
+    /// only contends during checkpoint truncation (~every 5s).
+    pub(super) wal: Wal,
 
     /// Export name (used in WAL entries).
     pub(super) export_name: String,
@@ -369,8 +368,11 @@ impl CacheInner {
     /// - **Clean(1) -> Dirty(2)**: increments dirty_block_count.
     /// - **Syncing(3) -> Dirty(2)**: decrements syncing_block_count, increments dirty_block_count.
     /// - **Dirty(2) -> Dirty(2)**: no-op.
+    /// Returns `true` if the state actually changed (CLEAN→DIRTY or
+    /// SYNCING→DIRTY), `false` if the block was already DIRTY. Used by the
+    /// write path to skip redundant WAL entries.
     #[inline]
-    pub(super) fn transition_to_dirty(&self, idx: usize) {
+    pub(super) fn transition_to_dirty(&self, idx: usize) -> bool {
         loop {
             let current = self.state_map.get(idx);
 
@@ -381,7 +383,7 @@ impl CacheInner {
             );
 
             if current == SparseBlockState::DIRTY {
-                break;
+                return false;
             }
 
             if current == SparseBlockState::CLEAN {
@@ -391,7 +393,7 @@ impl CacheInner {
                     .is_ok()
                 {
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    break;
+                    return true;
                 }
             } else if current == SparseBlockState::SYNCING {
                 if self
@@ -401,10 +403,10 @@ impl CacheInner {
                 {
                     self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    break;
+                    return true;
                 }
             } else {
-                break;
+                return false;
             }
         }
     }
@@ -610,34 +612,25 @@ impl CacheInner {
         self.save_block_states()
     }
 
-    /// Re-append partial WAL entries after WAL truncation.
+    /// Collect partial WAL entries for re-appending after WAL truncation.
     ///
     /// Checkpoint truncates the WAL (entries are persisted in metadata).
     /// But partial block bitmaps live only in the WAL — without this,
     /// a crash after checkpoint would lose partial block tracking and the
     /// flush path could upload garbage sub-regions.
     ///
-    /// Must be called while holding the WAL lock.
-    pub(super) fn reappend_partial_entries(
-        &self,
-        wal: &mut crate::block::wal::Wal,
-    ) -> Result<(), CacheError> {
-        use crate::block::wal::PartialWalEntryRef;
-
-        for entry in self.partial_blocks.iter() {
-            let block_idx = *entry.key();
-            let bitmap = entry.value().bitmap.load(Ordering::Acquire);
-            let seq = self.sequence.next();
-            wal.append_partial(&PartialWalEntryRef {
-                block_index: block_idx as u64,
-                sequence: seq,
-                bitmap,
-            })?;
-        }
-        if !self.partial_blocks.is_empty() {
-            wal.flush_buf()?;
-        }
-        Ok(())
+    /// Returns `(block_index, sequence, bitmap)` tuples for use with
+    /// `Wal::truncate_and_reappend()`.
+    pub(super) fn collect_partial_entries(&self) -> Vec<(u64, u64, u32)> {
+        self.partial_blocks
+            .iter()
+            .map(|entry| {
+                let block_idx = *entry.key() as u64;
+                let bitmap = entry.value().bitmap.load(Ordering::Acquire);
+                let seq = self.sequence.next();
+                (block_idx, seq, bitmap)
+            })
+            .collect()
     }
 
     /// Load block states and presence from metadata file.
