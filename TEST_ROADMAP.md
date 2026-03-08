@@ -158,10 +158,10 @@ The existing `integrity_suite::soak_test` covers random write/read with a refere
 
 Existing `fio_bench.rs` runs throughput benchmarks but does NOT use fio's `--verify` mode. These add data integrity verification:
 
-- **`fio_verify_sequential`** — fio with `rw=write` then `rw=read`, `verify=crc32c`, sequential across full device. Catches: block offset calculation errors.
-- **`fio_verify_random`** — fio with `rw=randwrite` then `rw=randread`, `verify=crc32c`, 30 minutes. Catches: cache coherence bugs under random access patterns.
-- **`fio_verify_mixed`** — fio with `rw=randrw`, `verify=crc32c`, `rwmixwrite=50`, 30 minutes. Catches: read-write interleaving bugs.
-- **`fio_verify_after_cold_wake`** — fio write phase, drain to S3, restart server from manifest, fio verify phase. Catches: data loss through the full persistence path.
+- [x] **`fio_verify_sequential`** — fio with `rw=write` then `rw=read`, `verify=crc32c`, sequential across full device. Catches: block offset calculation errors. *(added in `fio_verify.rs::fio_verify_sequential`, CI: `kernel-devices` job)*
+- [x] **`fio_verify_random`** — fio with `rw=randwrite` then `rw=randread`, `verify=crc32c`, 30 seconds. Catches: cache coherence bugs under random access patterns. *(added in `fio_verify.rs::fio_verify_random`, CI: `kernel-devices` job)*
+- [x] **`fio_verify_mixed`** — fio with `rw=randrw`, `verify=crc32c`, `rwmixwrite=50`, 30 seconds. Catches: read-write interleaving bugs. *(added in `fio_verify.rs::fio_verify_mixed`, CI: `kernel-devices` job)*
+- [x] **`fio_verify_after_cold_wake`** — fio write phase, drain to S3, restart server from manifest, fio verify phase. Catches: data loss through the full persistence path. *(added in `fio_verify.rs::fio_verify_after_cold_wake`, CI: `kernel-devices` job)*
 
 ---
 

@@ -145,3 +145,8 @@ name = "fio_bench"
 path = "tests/fio_bench.rs"
 required-features = ["fio-bench"]
 
+[[test]]
+name = "fio_verify"
+path = "tests/fio_verify.rs"
+required-features = ["fio-bench"]
+
