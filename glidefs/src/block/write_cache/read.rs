@@ -169,6 +169,9 @@ impl WriteCache<Active> {
     /// The caller (io_task_zc) uses the plan to issue io_uring ops for `LocalSsd`
     /// chunks and memcpy for `InMemory` chunks, writing directly into the
     /// kernel-mapped bio pages.
+    ///
+    /// The cold path (S3 fetch) is boxed to keep the hot-path future small.
+    /// This matters because 128 per-tag io_task_zc futures share L1 cache.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     pub async fn resolve_read_plan(
         &self,
@@ -196,7 +199,6 @@ impl WriteCache<Active> {
         let chunk_size = self.inner.config.block_size as u64;
         let start_chunk = offset / chunk_size;
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
-        let num_chunks = (end_chunk - start_chunk + 1) as usize;
 
         // Fast path: all chunks present on local SSD and not partial →
         // single LocalSsd entry. Collapses N per-chunk SQEs into one io_uring Read.
@@ -212,6 +214,33 @@ impl WriteCache<Active> {
                 }],
             });
         }
+
+        // Cold path: some blocks need S3 fetch. Box to keep the parent future
+        // (io_task_zc) small — locate_block/fetch_coalesced have deep async
+        // call trees that inflate the state machine.
+        Box::pin(self.resolve_read_plan_cold(
+            offset, len, start_chunk, end_chunk, clean_cache,
+            pack_index_cache, volume_manifest, content_store, metrics,
+        )).await
+    }
+
+    /// Cold path for resolve_read_plan: locate blocks and fetch from S3.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_read_plan_cold(
+        &self,
+        offset: u64,
+        len: usize,
+        start_chunk: u64,
+        end_chunk: u64,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) -> Result<ReadPlan, CacheError> {
+        let chunk_size = self.inner.config.block_size as u64;
+        let num_chunks = (end_chunk - start_chunk + 1) as usize;
 
         // Locate all blocks concurrently, then coalesce S3 fetches.
         let locate_futures: Vec<_> = (start_chunk..=end_chunk)
