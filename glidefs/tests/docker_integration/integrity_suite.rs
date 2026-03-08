@@ -1434,8 +1434,24 @@ async fn fork_chain_integrity() {
     p_client.disconnect().await.unwrap();
     server.snapshot_export("parent").await;
 
-    // Phase 3: Fork grandchild from child
-    server.fork_export("grandchild", "parent", size_gb).await;
+    // Phase 3: Fork grandchild from parent's manifest (stored under grandparent's s3_prefix)
+    {
+        let config = glidefs::config::ExportConfig {
+            name: "grandchild".to_string(),
+            size_gb,
+            // s3_prefix = "grandparent" — that's where parent's manifest and all packs live
+            s3_prefix: Some("grandparent".to_string()),
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        server
+            .router
+            .create_export(config, false, Some("parent"), None)
+            .await
+            .unwrap();
+    }
     let mut gc_client = server.connect("grandchild").await;
 
     // Grandchild writes blocks 48..56
@@ -1951,4 +1967,152 @@ async fn multi_block_read() {
         errors
     );
     assert_eq!(errors, 0, "multi-block read verification failed for {} reads", errors);
+}
+
+// ---------------------------------------------------------------------------
+// 18. Unaligned cross-boundary read integrity
+// ---------------------------------------------------------------------------
+
+/// Reads starting at arbitrary offsets within a block, spanning across block
+/// boundaries. Verifies the read-coalescing path handles non-block-aligned
+/// offsets correctly — the offset math for slicing block data from S3 range
+/// fetches is separate from the aligned-read path.
+///
+/// Test cases:
+///   - Start mid-block (4KB in), read 3 blocks minus 4KB
+///   - Start 60KB into a block, read exactly 2 blocks
+///   - Start 1 byte in, read to 1 byte before a block boundary
+///   - Start at last 4KB of one block, read first 4KB of next
+#[tokio::test]
+#[ignore]
+async fn unaligned_cross_boundary_read() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-unaligned";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 64;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Write all blocks with deterministic patterns
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    let mut block_data: Vec<Vec<u8>> = Vec::with_capacity(num_blocks as usize);
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        client
+            .write(idx * BLOCK_SIZE as u64, &pattern)
+            .await
+            .unwrap();
+        block_data.push(pattern);
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+
+    // Cold restart — force all reads from S3
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut client2 = server2.connect("vol").await;
+
+    // Helper: build expected data for a byte-range read across blocks
+    let expected_range = |byte_offset: u64, byte_length: usize| -> Vec<u8> {
+        let mut result = Vec::with_capacity(byte_length);
+        let mut pos = byte_offset;
+        let end = byte_offset + byte_length as u64;
+        while pos < end {
+            let block_idx = (pos / BLOCK_SIZE as u64) as usize;
+            let offset_in_block = (pos % BLOCK_SIZE as u64) as usize;
+            let remaining_in_block = BLOCK_SIZE - offset_in_block;
+            let take = remaining_in_block.min((end - pos) as usize);
+            result.extend_from_slice(
+                &block_data[block_idx][offset_in_block..offset_in_block + take],
+            );
+            pos += take as u64;
+        }
+        result
+    };
+
+    // (offset_within_first_block, total_length_in_bytes, description)
+    let sub_block = 4096usize;
+    let test_cases: Vec<(u64, u32, &str)> = vec![
+        // Start 4KB into block 1, read across 3 block boundaries
+        (
+            BLOCK_SIZE as u64 + sub_block as u64,
+            (3 * BLOCK_SIZE - sub_block) as u32,
+            "4KB into block 1, span 3 blocks",
+        ),
+        // Start 60KB into block 2, read exactly 2 blocks of data
+        (
+            2 * BLOCK_SIZE as u64 + 60 * 1024,
+            (2 * BLOCK_SIZE) as u32,
+            "60KB into block 2, read 2 blocks",
+        ),
+        // Start 1 byte into block 5, read to 1 byte before block 7 boundary
+        (
+            5 * BLOCK_SIZE as u64 + 1,
+            (2 * BLOCK_SIZE - 2) as u32,
+            "1 byte into block 5, end 1 byte before block 7",
+        ),
+        // Cross exactly one boundary: last 4KB of block 10, first 4KB of block 11
+        (
+            11 * BLOCK_SIZE as u64 - sub_block as u64,
+            (2 * sub_block) as u32,
+            "last 4KB of block 10 + first 4KB of block 11",
+        ),
+        // Read within a single block (no boundary crossing) — baseline
+        (
+            20 * BLOCK_SIZE as u64 + sub_block as u64,
+            (BLOCK_SIZE - 2 * sub_block) as u32,
+            "mid-block read, no crossing",
+        ),
+        // Start at very end of block 30, read 5 full blocks + partial
+        (
+            31 * BLOCK_SIZE as u64 - 1,
+            (5 * BLOCK_SIZE + 2) as u32,
+            "1 byte before block 31, span 5+ blocks",
+        ),
+    ];
+
+    let mut errors = 0u64;
+    let mut reads_verified = 0u64;
+
+    for (offset, length, desc) in &test_cases {
+        let data = client2.read(*offset, *length).await.unwrap();
+        let expected = expected_range(*offset, *length as usize);
+
+        if data != expected {
+            let actual_hash = sha256(&data);
+            let expected_hash = sha256(&expected);
+            eprintln!(
+                "UNALIGNED MISMATCH [{}]: offset={} len={}: hash {:x?} vs {:x?}",
+                desc,
+                offset,
+                length,
+                &actual_hash[..8],
+                &expected_hash[..8]
+            );
+            errors += 1;
+        }
+        reads_verified += 1;
+    }
+
+    client2.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    eprintln!(
+        "[unaligned_cross_boundary_read] {} reads verified via S3 in {:.1}s — err={}",
+        reads_verified,
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(
+        errors, 0,
+        "unaligned cross-boundary read verification failed for {} reads",
+        errors
+    );
 }

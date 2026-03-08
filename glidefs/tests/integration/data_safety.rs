@@ -13,7 +13,7 @@
 //! Run with: `cargo test --features test-utils --test integration data_safety`
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1122,5 +1122,397 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     assert!(
         report.dead_found() > 0,
         "GC should find dead packs (old replaced packs + orphan from failed compaction)"
+    );
+}
+
+// =============================================================================
+// TEST 9: MANIFEST SAVE FAILURE IN DRAIN PATH
+// =============================================================================
+
+/// Object store that allows pack uploads but fails manifest PUT.
+///
+/// `put_opts` fails for paths containing "manifests/" when `fail_manifest` is set.
+/// `put_multipart_opts` always succeeds (pack uploads go through multipart).
+#[derive(Debug)]
+struct ManifestFailingObjectStore {
+    inner: InMemory,
+    fail_manifest: AtomicBool,
+    manifest_put_attempts: AtomicU64,
+}
+
+impl ManifestFailingObjectStore {
+    fn new() -> Self {
+        Self {
+            inner: InMemory::new(),
+            fail_manifest: AtomicBool::new(false),
+            manifest_put_attempts: AtomicU64::new(0),
+        }
+    }
+
+    fn set_fail_manifest(&self, fail: bool) {
+        self.fail_manifest.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl std::fmt::Display for ManifestFailingObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ManifestFailingObjectStore")
+    }
+}
+
+#[async_trait]
+impl ObjectStore for ManifestFailingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        if self.fail_manifest.load(Ordering::SeqCst)
+            && location.to_string().contains("manifests/")
+        {
+            self.manifest_put_attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(object_store::Error::Generic {
+                store: "ManifestFailingObjectStore",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "Simulated manifest upload failure",
+                )),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+/// Test: Manifest save failure in flush_to_s3 (drain path) preserves dirty
+/// blocks after crash, even though packs were uploaded and blocks marked CLEAN
+/// in memory.
+///
+/// flush_to_s3 sequence:
+///   1. flush_dirty_inner() — uploads packs, marks blocks CLEAN in memory
+///   2. put_manifest() — fails (3 retries)
+///   3. checkpoint() — skipped because manifest failed
+///
+/// After crash (drop without explicit checkpoint), blocks must be DIRTY on disk
+/// so WAL replay can recover them. A subsequent flush_to_s3 must succeed.
+#[tokio::test]
+async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
+    let s3 = Arc::new(ManifestFailingObjectStore::new());
+    let dir = TempDir::new().unwrap();
+
+    let config = test_config_wal_sync(dir.path(), "manifest-drain-fail");
+
+    let clean = Arc::new(SimpleBlockCache::new(1024));
+    let cs = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
+    let pic = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+    let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        DEVICE_SIZE,
+        BLOCK_SIZE as u32,
+    )));
+
+    // Session 1: Write blocks, flush_to_s3 with manifest failure, then "crash"
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = Arc::new(cache.skip_recovery_for_test());
+
+        let data0 = vec![0xAA; BLOCK_SIZE];
+        let data1 = vec![0xBB; BLOCK_SIZE];
+        let data2 = vec![0xCC; BLOCK_SIZE];
+        cache.write(0, &data0, clean.as_ref()).unwrap();
+        cache
+            .write(BLOCK_SIZE as u64, &data1, clean.as_ref())
+            .unwrap();
+        cache
+            .write(2 * BLOCK_SIZE as u64, &data2, clean.as_ref())
+            .unwrap();
+        assert_eq!(cache.dirty_block_count(), 3);
+
+        // Enable manifest failure — packs will upload fine, manifest save will fail
+        s3.set_fail_manifest(true);
+
+        let result = cache.flush_to_s3(&cs, &pic, &vm).await;
+        assert!(
+            result.is_err(),
+            "flush_to_s3 should fail when manifest save fails"
+        );
+
+        // Packs were uploaded to S3 (multipart succeeded).
+        // Blocks are CLEAN in memory (flush_dirty_inner transitioned them).
+        // But checkpoint() was NOT called, so on-disk state is still DIRTY.
+        assert_eq!(
+            cache.dirty_block_count(),
+            0,
+            "blocks are CLEAN in memory after pack upload"
+        );
+
+        // "Crash" — drop without any explicit save.
+        // The protection: checkpoint() was skipped, so .meta file still has blocks
+        // as DIRTY from the last save (or WAL entries exist for them).
+        drop(cache);
+    }
+
+    // Session 2: Recovery should find blocks dirty on disk
+    s3.set_fail_manifest(false);
+
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // Blocks should be dirty (recovered from WAL/metadata)
+        assert!(
+            cache.dirty_block_count() >= 3,
+            "blocks should be dirty after crash recovery, got {}",
+            cache.dirty_block_count()
+        );
+
+        // All data should be readable from local SSD
+        let block0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert_eq!(block0.as_ref(), &vec![0xAA; BLOCK_SIZE][..]);
+        let block1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        assert_eq!(block1.as_ref(), &vec![0xBB; BLOCK_SIZE][..]);
+        let block2 = cache
+            .read_local(2 * BLOCK_SIZE as u64, BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(block2.as_ref(), &vec![0xCC; BLOCK_SIZE][..]);
+
+        // Retry flush_to_s3 — should succeed now
+        let cache = Arc::new(cache);
+        let vm2 = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            DEVICE_SIZE,
+            BLOCK_SIZE as u32,
+        )));
+        let result = cache.flush_to_s3(&cs, &pic, &vm2).await;
+        assert!(
+            result.is_ok(),
+            "flush_to_s3 should succeed on retry: {:?}",
+            result.err()
+        );
+        assert_eq!(cache.dirty_block_count(), 0);
+    }
+
+    // Verify from cold reader — data should be in S3
+    let reader_dir = TempDir::new().unwrap();
+    let (reader, reader_cs, reader_pic, reader_vm, reader_cc, reader_m) =
+        create_reader(&reader_dir, "manifest-drain-fail", Arc::clone(&s3) as _).await;
+
+    for (i, expected_byte) in [(0u64, 0xAAu8), (1, 0xBB), (2, 0xCC)] {
+        let result = reader
+            .read(
+                i * BLOCK_SIZE as u64,
+                BLOCK_SIZE,
+                reader_cc.as_ref(),
+                &reader_pic,
+                &reader_vm,
+                &reader_cs,
+                &reader_m,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.as_ref(),
+            &vec![expected_byte; BLOCK_SIZE][..],
+            "block {} data mismatch after manifest failure recovery",
+            i
+        );
+    }
+}
+
+// =============================================================================
+// TEST 10: WAL DUPLICATE BLOCK REPLAY ORDERING
+// =============================================================================
+
+/// Test: WAL replay of two writes to the same block returns the last write.
+///
+/// Write block 0 with pattern A → write block 0 with pattern B → crash
+/// (drop without metadata save). WAL replay should apply entries in order
+/// and the final state should be pattern B, not pattern A.
+#[tokio::test]
+async fn test_wal_replay_same_block_last_write_wins() {
+    let dir = TempDir::new().unwrap();
+    let config = test_config_wal_sync(dir.path(), "wal-dup");
+    let clean = SimpleBlockCache::new(1024);
+
+    let data_a = vec![0xAA; BLOCK_SIZE];
+    let data_b = vec![0xBB; BLOCK_SIZE];
+
+    // Session 1: Write same block twice, crash without saving metadata
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.skip_recovery_for_test();
+
+        cache.write(0, &data_a, &clean).unwrap();
+        cache.write(0, &data_b, &clean).unwrap();
+
+        // Crash — drop without save_metadata()
+    }
+
+    // Session 2: WAL replay should give us data_b (last write wins)
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        let block0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert_eq!(
+            block0.as_ref(),
+            &data_b[..],
+            "WAL replay should return the LAST write to block 0, not the first"
+        );
+
+        assert_eq!(
+            cache.dirty_block_count(),
+            1,
+            "block 0 should be dirty after WAL replay"
+        );
+    }
+
+    // Session 3: Extend to 3 writes — also verify with a flush + cold read
+    let dir2 = TempDir::new().unwrap();
+    let config2 = test_config_wal_sync(dir2.path(), "wal-dup-3");
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    let data_c = vec![0xCC; BLOCK_SIZE];
+
+    {
+        let cache = WriteCache::<Initializing>::open(config2.clone()).unwrap();
+        let cache = cache.skip_recovery_for_test();
+
+        // Three writes to same block
+        cache.write(0, &data_a, &clean).unwrap();
+        cache.write(0, &data_b, &clean).unwrap();
+        cache.write(0, &data_c, &clean).unwrap();
+
+        // Crash
+    }
+
+    // Recover, flush, cold verify
+    {
+        let cache = WriteCache::<Initializing>::open(config2.clone()).unwrap();
+        let cache = Arc::new(cache.finish_recovery().await.unwrap());
+
+        let block0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert_eq!(
+            block0.as_ref(),
+            &data_c[..],
+            "3 writes to same block: WAL replay should give the last one"
+        );
+
+        let cs = ContentStore::new(Arc::clone(&s3), "test");
+        let pic = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+        let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            DEVICE_SIZE,
+            BLOCK_SIZE as u32,
+        )));
+
+        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        drop(cache);
+
+        // Cold reader should see data_c
+        let reader_dir = TempDir::new().unwrap();
+        let (reader, rcs, rpic, rvm, rcc, rm) =
+            super::create_cold_reader(&reader_dir, "wal-dup-3", Arc::clone(&s3)).await;
+
+        let result = reader
+            .read(0, BLOCK_SIZE, rcc.as_ref(), &rpic, &rvm, &rcs, &rm)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.as_ref(),
+            &data_c[..],
+            "cold reader should see the last write after WAL recovery + S3 roundtrip"
+        );
+    }
+}
+
+// =============================================================================
+// TEST 11: CONCURRENT WRITES TO SAME BLOCK
+// =============================================================================
+
+/// Test: Concurrent writers to the same block produce no torn data.
+///
+/// Two tasks race to write block 0 with different patterns. After both complete,
+/// the block should contain one of the two patterns entirely — never a mix.
+/// Flush to S3 and verify from cold reader.
+#[tokio::test]
+async fn test_concurrent_same_block_no_torn_write() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, _m) =
+        create_cache_with_store(&dir, "torn-write", Arc::clone(&s3)).await;
+
+    let pattern_a = vec![0xAA; BLOCK_SIZE];
+    let pattern_b = vec![0xBB; BLOCK_SIZE];
+
+    // Run many rounds to exercise the race
+    for _ in 0..50 {
+        let cache_ref = &cache;
+        let cc_ref = cc.as_ref();
+        let pa = &pattern_a;
+        let pb = &pattern_b;
+
+        let (r1, r2) = tokio::join!(
+            async { cache_ref.write(0, pa, cc_ref) },
+            async { cache_ref.write(0, pb, cc_ref) },
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        // Read back — should be entirely one pattern, never a mix
+        let data = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert!(
+            data.as_ref() == &pattern_a[..] || data.as_ref() == &pattern_b[..],
+            "block 0 should be entirely pattern A or B, got mixed data: first={:#x} last={:#x}",
+            data[0],
+            data[BLOCK_SIZE - 1]
+        );
+    }
+
+    // Flush and verify from cold reader
+    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    assert_eq!(cache.dirty_block_count(), 0);
+
+    drop(cache);
+    let reader_dir = TempDir::new().unwrap();
+    let (reader, rcs, rpic, rvm, rcc, rm) =
+        super::create_cold_reader(&reader_dir, "torn-write", Arc::clone(&s3)).await;
+
+    let result = reader
+        .read(0, BLOCK_SIZE, rcc.as_ref(), &rpic, &rvm, &rcs, &rm)
+        .await
+        .unwrap();
+    assert!(
+        result.as_ref() == &pattern_a[..] || result.as_ref() == &pattern_b[..],
+        "cold reader should see entire pattern A or B from S3"
     );
 }

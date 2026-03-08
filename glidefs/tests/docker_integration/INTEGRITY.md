@@ -69,6 +69,7 @@ Every test follows the same pattern:
 | `snapshot_rollback` | Write A → snapshot → write B → fork from snapshot → get A not B | 16 MB |
 | `wal_crash_recovery` | Write → drain → write more → crash (no drain) → WAL replay → S3 verify | 32 MB |
 | `multi_block_read` | Multi-block reads (2–16 blocks) across block boundaries from S3 | 17 MB |
+| `unaligned_cross_boundary_read` | Reads at arbitrary byte offsets spanning block boundaries from S3 | 8 MB |
 
 ### What each test catches
 
@@ -168,6 +169,14 @@ phase 2 that were already in S3 from phase 1).
 read from S3. Verifies the read coalescing logic returns correctly concatenated
 block data. Catches offset calculation bugs in coalesced S3 range fetches.
 
+**unaligned_cross_boundary_read** — Reads at arbitrary byte offsets within
+blocks, spanning across block boundaries. Test cases: 4KB into a block spanning
+3 boundaries, 60KB offset spanning 2 blocks, 1-byte offset, last/first 4KB of
+adjacent blocks, and a 5+ block span starting 1 byte before a boundary. Catches
+offset calculation bugs in the read path's block-slicing logic that aligned reads
+wouldn't exercise — the non-aligned path has separate math for computing the
+start offset within the first block and the end offset within the last block.
+
 ## Data path coverage
 
 The suite exercises every stage of the GlideFS data pipeline:
@@ -199,3 +208,4 @@ The suite exercises every stage of the GlideFS data pipeline:
 | Sub-block writes (partial blocks) | `sub_block_basic`, `sub_block_stress` |
 | Backfill merge (S3 + local overlay) | `sub_block_basic`, `sub_block_stress` |
 | Read coalescing (multi-block) | `multi_block_read` |
+| Unaligned cross-boundary reads | `unaligned_cross_boundary_read` |
