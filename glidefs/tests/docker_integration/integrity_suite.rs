@@ -1285,6 +1285,586 @@ async fn sub_block_stress() {
 // 12. Multi-block read integrity — reads spanning multiple blocks
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 12. Zero-block integrity — SIMD detection + tombstone entries through S3
+// ---------------------------------------------------------------------------
+
+/// Writes non-zero data, drains to S3, overwrites ALL blocks with zeros,
+/// drains again, cold restart, verifies every block is zeros.
+///
+/// Exercises: SIMD is_zero_block() detection (AVX2/NEON), tombstone entries
+/// (comp_length=0 in pack index), "newest wins" semantics that prevent stale
+/// non-zero data from showing through after a zero overwrite.
+#[tokio::test]
+#[ignore]
+async fn zero_block_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-zeroblock";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 256; // 32 MB
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Phase 1: Write non-zero data to all blocks, drain to S3
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+    server.drain_all().await;
+
+    // Verify non-zero data is in S3
+    server.shutdown().await;
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut client2 = server2.connect("vol").await;
+
+    // Spot-check a few blocks are non-zero from S3
+    let zero_block = vec![0u8; BLOCK_SIZE];
+    for idx in [0, 1, 127, 255] {
+        let data = client2.read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32).await.unwrap();
+        assert_ne!(&data[..], &zero_block[..], "block {} should be non-zero after first drain", idx);
+    }
+
+    // Phase 2: Overwrite ALL blocks with zeros
+    for idx in 0..num_blocks {
+        client2.write(idx * BLOCK_SIZE as u64, &zero_block).await.unwrap();
+        if idx % 64 == 0 {
+            client2.flush().await.unwrap();
+        }
+    }
+    client2.flush().await.unwrap();
+    client2.disconnect().await.unwrap();
+
+    // Drain the zero-block tombstone entries to S3
+    server2.drain_all().await;
+    server2.shutdown().await;
+
+    // Phase 3: Cold restart — fresh server, restore from S3
+    let server3 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server3.restore_export("vol", size_gb).await;
+    let mut client3 = server3.connect("vol").await;
+
+    // Verify EVERY block is zeros (tombstone entries must win over old non-zero packs)
+    let zero_hash = sha256(&zero_block);
+    let mut errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = client3.read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32).await.unwrap();
+        let actual = sha256(&data);
+        if actual != zero_hash {
+            // Check if we got stale non-zero data
+            let stale = block_pattern(idx, BLOCK_SIZE);
+            let stale_hash = sha256(&stale);
+            if actual == stale_hash {
+                eprintln!("STALE DATA block {}: tombstone entry did NOT supersede old pack", idx);
+            } else {
+                eprintln!("CORRUPTION block {}: neither zeros nor original pattern", idx);
+            }
+            errors += 1;
+        }
+    }
+
+    client3.disconnect().await.unwrap();
+    server3.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[zero_block_integrity] {} verified via S3 (zero tombstones) in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "zero-block verification failed for {} blocks", errors);
+}
+
+// ---------------------------------------------------------------------------
+// 13. Fork chain integrity — grandchild resolves grandparent data
+// ---------------------------------------------------------------------------
+
+/// Parent writes data → snapshot → fork child → child writes more → snapshot →
+/// fork grandchild. Grandchild must resolve blocks from both parent and child
+/// through the inherited pack list. Cold restart and verify from S3.
+#[tokio::test]
+#[ignore]
+async fn fork_chain_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-forkchain";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 64;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+
+    // Phase 1: Parent writes blocks 0..32
+    server.create_export("grandparent", size_gb).await;
+    let mut gp_client = server.connect("grandparent").await;
+
+    let mut expected: HashMap<u64, [u8; 32]> = HashMap::new();
+    for idx in 0..32 {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        expected.insert(idx, blake3_hash(&pattern));
+        gp_client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    gp_client.flush().await.unwrap();
+    gp_client.disconnect().await.unwrap();
+    server.snapshot_export("grandparent").await;
+
+    // Phase 2: Fork child from grandparent, child writes blocks 32..48
+    server.fork_export("parent", "grandparent", size_gb).await;
+    let mut p_client = server.connect("parent").await;
+
+    for idx in 32..48 {
+        let pattern = block_pattern(idx + 100_000, BLOCK_SIZE);
+        expected.insert(idx, blake3_hash(&pattern));
+        p_client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    // Also overwrite block 0 in child (different from grandparent)
+    let p_block0 = block_pattern(200_000, BLOCK_SIZE);
+    expected.insert(0, blake3_hash(&p_block0));
+    p_client.write(0, &p_block0).await.unwrap();
+    p_client.flush().await.unwrap();
+    p_client.disconnect().await.unwrap();
+    server.snapshot_export("parent").await;
+
+    // Phase 3: Fork grandchild from child
+    server.fork_export("grandchild", "parent", size_gb).await;
+    let mut gc_client = server.connect("grandchild").await;
+
+    // Grandchild writes blocks 48..56
+    for idx in 48..56 {
+        let pattern = block_pattern(idx + 300_000, BLOCK_SIZE);
+        expected.insert(idx, blake3_hash(&pattern));
+        gc_client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    gc_client.flush().await.unwrap();
+    gc_client.disconnect().await.unwrap();
+
+    // Phase 4: Cold restart grandchild, verify ALL blocks from S3
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_forked_export("grandchild", "grandparent", size_gb).await;
+    let mut reader = server2.connect("grandchild").await;
+
+    let zero_hash = blake3_hash(&vec![0u8; BLOCK_SIZE]);
+    let mut errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = reader.read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32).await.unwrap();
+        let actual = blake3_hash(&data);
+        let expect = expected.get(&idx).unwrap_or(&zero_hash);
+        if &actual != expect {
+            let source = if idx < 32 && idx != 0 {
+                "grandparent"
+            } else if idx == 0 || (32..48).contains(&idx) {
+                "parent"
+            } else if (48..56).contains(&idx) {
+                "grandchild"
+            } else {
+                "unwritten (should be zero)"
+            };
+            eprintln!("FORK CHAIN MISMATCH block {} (source: {})", idx, source);
+            errors += 1;
+        }
+    }
+
+    reader.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[fork_chain_integrity] {} verified via S3 (3-level fork) in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "fork chain verification failed for {} blocks", errors);
+}
+
+// ---------------------------------------------------------------------------
+// 14. Write-during-drain integrity — concurrent writes + flush + S3 verify
+// ---------------------------------------------------------------------------
+
+/// Launches drain while simultaneously writing new blocks. After drain
+/// completes, does another drain to pick up the stragglers, then cold restart
+/// and verify ALL data from S3.
+///
+/// Exercises: CAS DIRTY→SYNCING state machine, CRC sentinel handling,
+/// block re-dirtying during flush, drain iteration recovery.
+#[tokio::test]
+#[ignore]
+async fn write_during_drain() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-drain-race";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 512;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+
+    // Phase 1: Write initial data to all blocks
+    let mut client = server.connect("vol").await;
+    let mut expected: HashMap<u64, [u8; 32]> = HashMap::new();
+
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        expected.insert(idx, sha256(&pattern));
+        client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+        if idx % 128 == 0 {
+            client.flush().await.unwrap();
+        }
+    }
+    client.flush().await.unwrap();
+
+    // Phase 2: Start drain while simultaneously writing new data
+    // The writer overwrites ~25% of blocks with new patterns during the drain.
+    let info = server.connect_info("vol").await;
+    let router = Arc::clone(&server.router);
+
+    let expected_arc = Arc::new(tokio::sync::Mutex::new(expected));
+    let expected_clone = Arc::clone(&expected_arc);
+
+    // Spawn concurrent writer
+    let writer_handle = tokio::spawn(async move {
+        let mut writer = info.connect().await.unwrap();
+        let mut rng = StdRng::seed_from_u64(0xDBA1_BACE_0000);
+        let mut writes = 0u64;
+
+        // Write in small batches, yielding between to interleave with drain
+        for _ in 0..128 {
+            let idx = rng.gen_range(0..num_blocks);
+            let pattern = block_pattern(idx + 5_000_000, BLOCK_SIZE);
+            let hash = sha256(&pattern);
+            writer.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+            expected_clone.lock().await.insert(idx, hash);
+            writes += 1;
+            // Let drain make progress
+            tokio::task::yield_now().await;
+        }
+        writer.flush().await.unwrap();
+        writer.disconnect().await.unwrap();
+        writes
+    });
+
+    // Concurrent drain (will compete with the writer)
+    let drain_errors = router.drain_all().await;
+    assert!(
+        drain_errors.is_empty(),
+        "first drain had errors: {:?}",
+        drain_errors.iter().map(|(n, e)| format!("{n}: {e}")).collect::<Vec<_>>()
+    );
+
+    let writes_during_drain = writer_handle.await.unwrap();
+    eprintln!("  {} writes completed during drain", writes_during_drain);
+
+    // Phase 3: Second drain to pick up blocks dirtied during the first drain
+    client.disconnect().await.unwrap();
+    let drain_errors2 = router.drain_all().await;
+    assert!(
+        drain_errors2.is_empty(),
+        "second drain had errors: {:?}",
+        drain_errors2.iter().map(|(n, e)| format!("{n}: {e}")).collect::<Vec<_>>()
+    );
+
+    server.shutdown().await;
+
+    // Phase 4: Cold restart — verify all blocks from S3
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut reader = server2.connect("vol").await;
+
+    let expected = Arc::try_unwrap(expected_arc).unwrap().into_inner();
+    let mut errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = reader.read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32).await.unwrap();
+        let actual = sha256(&data);
+        let expect = expected.get(&idx).unwrap();
+        if &actual != expect {
+            eprintln!("DRAIN RACE MISMATCH block {}", idx);
+            errors += 1;
+        }
+    }
+
+    reader.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[write_during_drain] {} verified via S3 ({} concurrent writes) in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        writes_during_drain,
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "drain race verification failed for {} blocks", errors);
+}
+
+// ---------------------------------------------------------------------------
+// 15. Snapshot rollback integrity — point-in-time restore
+// ---------------------------------------------------------------------------
+
+/// Write data A → snapshot(seq=N) → overwrite with data B → fork from
+/// snapshot seq=N → verify fork has data A, not data B.
+///
+/// Proves versioned manifest restore returns point-in-time data.
+#[tokio::test]
+#[ignore]
+async fn snapshot_rollback() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-snapshot-rollback";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 128;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    // Phase 1: Write pattern A to all blocks
+    let mut pattern_a_hashes: Vec<[u8; 32]> = Vec::with_capacity(num_blocks as usize);
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        pattern_a_hashes.push(sha256(&pattern));
+        client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+
+    // Snapshot — captures pattern A at this point in time
+    let snap_resp = server.snapshot_export("vol").await;
+    let snap_seq = snap_resp.sequence;
+    eprintln!("  snapshot captured at sequence {}", snap_seq);
+
+    // Phase 2: Overwrite ALL blocks with pattern B (different seed space)
+    let mut client2 = server.connect("vol").await;
+    let mut pattern_b_hashes: Vec<[u8; 32]> = Vec::with_capacity(num_blocks as usize);
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx + 20_000_000, BLOCK_SIZE);
+        pattern_b_hashes.push(sha256(&pattern));
+        client2.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    client2.flush().await.unwrap();
+    client2.disconnect().await.unwrap();
+
+    // Snapshot again (captures pattern B)
+    server.snapshot_export("vol").await;
+
+    // Phase 3: Fork from the FIRST snapshot (should get pattern A, not B)
+    server.fork_export_from_snapshot("rollback", "vol", size_gb, snap_seq).await;
+    let mut rb_client = server.connect("rollback").await;
+
+    let mut errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = rb_client.read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32).await.unwrap();
+        let actual = sha256(&data);
+        if actual != pattern_a_hashes[idx as usize] {
+            if actual == pattern_b_hashes[idx as usize] {
+                eprintln!("ROLLBACK FAIL block {}: got pattern B instead of A", idx);
+            } else {
+                eprintln!("CORRUPTION block {}: neither pattern A nor B", idx);
+            }
+            errors += 1;
+        }
+    }
+    rb_client.disconnect().await.unwrap();
+
+    // Phase 4: Cold restart the rollback fork, verify from S3
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_forked_export("rollback", "vol", size_gb).await;
+    let mut reader = server2.connect("rollback").await;
+
+    let mut s3_errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = reader.read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32).await.unwrap();
+        let actual = sha256(&data);
+        if actual != pattern_a_hashes[idx as usize] {
+            if actual == pattern_b_hashes[idx as usize] {
+                eprintln!("S3 ROLLBACK FAIL block {}: got pattern B instead of A", idx);
+            } else {
+                eprintln!("S3 CORRUPTION block {}: neither A nor B", idx);
+            }
+            s3_errors += 1;
+        }
+    }
+
+    reader.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[snapshot_rollback] {} verified (pre-drain + S3) in {:.1}s — err={}/{}",
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+        errors,
+        s3_errors
+    );
+    assert_eq!(errors, 0, "pre-drain rollback failed for {} blocks", errors);
+    assert_eq!(s3_errors, 0, "S3 rollback failed for {} blocks", s3_errors);
+}
+
+// ---------------------------------------------------------------------------
+// 16. WAL crash recovery integrity — unclean shutdown + WAL replay + S3 verify
+// ---------------------------------------------------------------------------
+
+/// Writes data, drains some to S3, writes MORE data without draining, shuts
+/// down (simulating crash). Restarts with the SAME cache dir → WAL replays
+/// recovered dirty blocks. Drains, cold restart with fresh TempDir, verify
+/// ALL data from S3.
+///
+/// Exercises: WAL append + replay, SSD pwrite persistence, metadata
+/// checkpoint reconstruction, dirty block recovery after crash.
+#[tokio::test]
+#[ignore]
+async fn wal_crash_recovery() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-wal-crash";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 256; // 32 MB
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // We manage the cache dir ourselves so it survives across restarts
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache_path = cache_dir.path().to_path_buf();
+
+    // Phase 1: Write first half of blocks, drain to S3 (establishes manifest)
+    let server = TestServer::start_with_cache_dir(
+        Arc::clone(&ctx.object_store),
+        db_path,
+        transport,
+        cache_path.clone(),
+    )
+    .await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    let mut expected: HashMap<u64, [u8; 32]> = HashMap::new();
+    for idx in 0..num_blocks / 2 {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        expected.insert(idx, sha256(&pattern));
+        client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+
+    // Drain first batch to S3 (creates manifest + packs)
+    server.drain_all().await;
+    eprintln!("  phase 1: {} blocks drained to S3", num_blocks / 2);
+
+    // Phase 2: Write second half WITHOUT draining — data is only in WAL + SSD
+    let mut client2 = server.connect("vol").await;
+    for idx in num_blocks / 2..num_blocks {
+        let pattern = block_pattern(idx + 7_000_000, BLOCK_SIZE);
+        expected.insert(idx, sha256(&pattern));
+        client2.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    // Also overwrite some blocks from phase 1 (tests WAL overwrites)
+    for idx in [0, 1, 10, 50, 100] {
+        let pattern = block_pattern(idx + 8_000_000, BLOCK_SIZE);
+        expected.insert(idx, sha256(&pattern));
+        client2.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    client2.flush().await.unwrap();
+    client2.disconnect().await.unwrap();
+    eprintln!(
+        "  phase 2: {} blocks written to WAL (not drained)",
+        num_blocks / 2 + 5
+    );
+
+    // Shutdown WITHOUT draining — simulates crash
+    // WAL + SSD data file persist in cache_path
+    server.shutdown().await;
+
+    // Phase 3: Restart with SAME cache dir — WAL recovery
+    let server2 = TestServer::start_with_cache_dir(
+        Arc::clone(&ctx.object_store),
+        db_path,
+        transport,
+        cache_path.clone(),
+    )
+    .await;
+    // create_export with manifest_name=None triggers WAL replay + loads manifest from S3
+    server2.create_export("vol", size_gb).await;
+
+    // Verify all blocks are readable (phase 1 from S3 manifest, phase 2 from WAL recovery)
+    let mut client3 = server2.connect("vol").await;
+    let mut recovery_errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = client3
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = sha256(&data);
+        let zero_hash = sha256(&vec![0u8; BLOCK_SIZE]);
+        let expect = expected.get(&idx).unwrap_or(&zero_hash);
+        if &actual != expect {
+            eprintln!("RECOVERY MISMATCH block {} (phase {})", idx, if idx < num_blocks / 2 { 1 } else { 2 });
+            recovery_errors += 1;
+        }
+    }
+    client3.disconnect().await.unwrap();
+    eprintln!("  WAL recovery verification: err={}", recovery_errors);
+    assert_eq!(recovery_errors, 0, "WAL recovery had {} mismatches", recovery_errors);
+
+    // Phase 4: Now drain the recovered dirty blocks to S3
+    server2.drain_all().await;
+    server2.shutdown().await;
+
+    // Phase 5: Cold restart with FRESH TempDir — verify everything from S3
+    let server3 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server3.restore_export("vol", size_gb).await;
+    let mut reader = server3.connect("vol").await;
+
+    let mut s3_errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = reader
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = sha256(&data);
+        let zero_hash = sha256(&vec![0u8; BLOCK_SIZE]);
+        let expect = expected.get(&idx).unwrap_or(&zero_hash);
+        if &actual != expect {
+            eprintln!("S3 MISMATCH block {} after WAL recovery + drain", idx);
+            s3_errors += 1;
+        }
+    }
+
+    reader.disconnect().await.unwrap();
+    server3.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[wal_crash_recovery] {} verified (WAL recovery + S3) in {:.1}s — recovery_err={}, s3_err={}",
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+        recovery_errors,
+        s3_errors
+    );
+    assert_eq!(s3_errors, 0, "S3 verification after WAL recovery failed for {} blocks", s3_errors);
+}
+
+// ---------------------------------------------------------------------------
+// 17. Multi-block read integrity — reads spanning multiple blocks
+// ---------------------------------------------------------------------------
+
 /// Writes individual blocks, then reads across block boundaries in various
 /// sizes (2 blocks, 4 blocks, 7 blocks). Verifies the coalesced read returns
 /// the correct concatenation of block data.

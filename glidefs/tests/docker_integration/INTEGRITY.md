@@ -63,6 +63,11 @@ Every test follows the same pattern:
 | `concurrent_stress` | 4 parallel writers to disjoint regions → cold restart → verify | 128 MB |
 | `sub_block_basic` | 4KB sub-region writes into forked 128KB blocks → S3 verify | 8 MB |
 | `sub_block_stress` | 500 random 4KB–16KB writes into forked blocks, 5 rounds + verify | 5 MB |
+| `zero_block_integrity` | Non-zero → zeros → S3 → verify tombstones win (SIMD detection) | 32 MB |
+| `fork_chain_integrity` | Parent → child → grandchild, multi-level pack resolution | 8 MB |
+| `write_during_drain` | Concurrent writes during drain → second drain → S3 verify | 64 MB |
+| `snapshot_rollback` | Write A → snapshot → write B → fork from snapshot → get A not B | 16 MB |
+| `wal_crash_recovery` | Write → drain → write more → crash (no drain) → WAL replay → S3 verify | 32 MB |
 | `multi_block_read` | Multi-block reads (2–16 blocks) across block boundaries from S3 | 17 MB |
 
 ### What each test catches
@@ -125,6 +130,40 @@ Uses 4KB alignment to match real filesystem I/O (ext4/btrfs/xfs minimum block
 size). Note: writes below 4KB are not filesystem-reachable but would expose a
 sub-region bitmap granularity limitation in the backfill path.
 
+**zero_block_integrity** — Writes non-zero data to all blocks, drains to S3,
+overwrites ALL blocks with zeros, drains again (creating tombstone entries with
+`comp_length=0`), cold restart, verifies every block is zeros. Catches: SIMD
+`is_zero_block()` detection failures (AVX2/NEON/u64 fallback), missing tombstone
+entries in pack index, "newest wins" resolution bugs where stale non-zero pack
+data shows through after a zero overwrite.
+
+**fork_chain_integrity** — Three-level fork chain: grandparent writes blocks 0–31,
+child overwrites block 0 and writes blocks 32–47, grandchild writes blocks 48–55.
+Cold restart, verify grandchild resolves all blocks correctly through the inherited
+pack list. Catches: multi-level manifest pack resolution bugs, pack ordering errors
+in forked manifests, block resolution across shared S3 prefixes.
+
+**write_during_drain** — Writes initial data, then starts drain and concurrent
+writer simultaneously. The writer overwrites ~25% of blocks during the drain.
+After drain completes, a second drain picks up re-dirtied blocks. Cold restart,
+verify ALL blocks from S3. Catches: CAS DIRTY→SYNCING state machine races,
+CRC sentinel handling (u32::MAX), block re-dirtying during flush compute phase,
+drain iteration recovery for blocks skipped due to concurrent writes.
+
+**snapshot_rollback** — Writes pattern A → snapshot (captures seq=N) → overwrites
+with pattern B → snapshot again → forks from seq=N → verifies pattern A, not B.
+Cold restart, verify from S3. Catches: versioned manifest restore bugs, snapshot
+sequence lookup errors, stale manifest data in fork-from-snapshot path.
+
+**wal_crash_recovery** — Writes initial data and drains to S3, then writes MORE
+data without draining and shuts down (simulating crash). Restarts with the SAME
+cache directory → WAL replays recovered dirty blocks. Verifies all data readable
+(phase 1 from manifest, phase 2 from WAL). Drains recovered blocks, cold restart
+with fresh TempDir, verifies everything from S3. Catches: WAL append/replay bugs,
+SSD pwrite persistence issues, metadata checkpoint reconstruction, dirty block
+recovery after unclean shutdown, WAL overwrite handling (re-written blocks during
+phase 2 that were already in S3 from phase 1).
+
 **multi_block_read** — Reads spanning 2–16 contiguous blocks in a single NBD
 read from S3. Verifies the read coalescing logic returns correctly concatenated
 block data. Catches offset calculation bugs in coalesced S3 range fetches.
@@ -143,12 +182,20 @@ The suite exercises every stage of the GlideFS data pipeline:
 | Manifest save/restore (GLVM v5) | All tests (cold restart cycle) |
 | S3 multipart upload | All tests (drain phase) |
 | S3 range read | All tests (verification phase) |
-| Zero-block handling | `sparse_integrity`, `soak_test` |
+| Zero-block handling | `sparse_integrity`, `soak_test`, `zero_block_integrity` |
+| Zero-block tombstone entries | `zero_block_integrity` (explicit non-zero→zero→S3→verify) |
+| SIMD is_zero_block() detection | `zero_block_integrity` (all blocks zeroed, verified from S3) |
 | Overwrite semantics | `overwrite_integrity`, `hash_stress` |
-| Fork/snapshot (COW) | `fork_integrity` |
-| Concurrent flush scheduling | `concurrent_stress` |
+| Fork/snapshot (COW) | `fork_integrity`, `fork_chain_integrity` |
+| Multi-level fork resolution | `fork_chain_integrity` (3-level: grandparent→parent→child) |
+| Concurrent flush scheduling | `concurrent_stress`, `write_during_drain` |
+| CAS state machine (DIRTY→SYNCING) | `write_during_drain` (writes during active drain) |
 | Pack index cache | `hash_stress` (multi-pass), `soak_test` (periodic restart) |
 | Manifest CRC32 validation | All tests (implicit — corrupt manifest would fail restore) |
+| Versioned snapshot restore | `snapshot_rollback` (fork from specific sequence) |
+| WAL append + replay | `wal_crash_recovery` (crash without drain → WAL recovery) |
+| SSD pwrite persistence | `wal_crash_recovery` (block data survives unclean shutdown) |
+| Metadata checkpoint recovery | `wal_crash_recovery` (state map reconstruction from WAL) |
 | Sub-block writes (partial blocks) | `sub_block_basic`, `sub_block_stress` |
 | Backfill merge (S3 + local overlay) | `sub_block_basic`, `sub_block_stress` |
 | Read coalescing (multi-block) | `multi_block_read` |
