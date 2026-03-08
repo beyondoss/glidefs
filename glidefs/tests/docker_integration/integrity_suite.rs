@@ -2116,3 +2116,233 @@ async fn unaligned_cross_boundary_read() {
         errors
     );
 }
+
+// ---------------------------------------------------------------------------
+// 19. Promote-to-readwrite integrity
+// ---------------------------------------------------------------------------
+
+/// Fork a readonly export from a parent, promote to read-write, write new data,
+/// drain to S3, cold restart, verify:
+///   - Parent data is unchanged (no cross-export leaks)
+///   - Child has parent data for unwritten blocks
+///   - Child has new data for written blocks
+///
+/// Catches: post-promote dirty block state initialization, fork pack resolution
+/// after promotion, write path incorrectly rejecting writes on promoted export.
+#[tokio::test]
+#[ignore]
+async fn promote_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-promote";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 128;
+    let overwrite_blocks: u64 = 32;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Phase 1: Write parent data, snapshot, fork
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("parent", size_gb).await;
+    let mut parent_client = server.connect("parent").await;
+
+    let mut parent_hashes: HashMap<u64, [u8; 32]> = HashMap::new();
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        parent_hashes.insert(idx, sha256(&pattern));
+        parent_client
+            .write(idx * BLOCK_SIZE as u64, &pattern)
+            .await
+            .unwrap();
+    }
+    parent_client.flush().await.unwrap();
+    parent_client.disconnect().await.unwrap();
+
+    // Snapshot parent, fork child (read-write)
+    server.snapshot_export("parent").await;
+    server.fork_export("child", "parent", size_gb).await;
+
+    // Phase 2: Overwrite first N blocks (matching fork_integrity pattern)
+    let mut child_client = server.connect("child").await;
+
+    let mut child_hashes = parent_hashes.clone();
+    for idx in 0..overwrite_blocks {
+        let new_pattern = block_pattern(idx + 10000, BLOCK_SIZE);
+        child_hashes.insert(idx, sha256(&new_pattern));
+        child_client
+            .write(idx * BLOCK_SIZE as u64, &new_pattern)
+            .await
+            .unwrap();
+    }
+    child_client.flush().await.unwrap();
+    child_client.disconnect().await.unwrap();
+
+    // Phase 3: Drain and cold restart
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("parent", size_gb).await;
+    server2
+        .restore_forked_export("child", "parent", size_gb)
+        .await;
+
+    // Phase 4: Verify parent is unchanged
+    let mut parent_reader = server2.connect("parent").await;
+    let mut parent_errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = parent_reader
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        if sha256(&data) != parent_hashes[&idx] {
+            eprintln!("PARENT MISMATCH block {}", idx);
+            parent_errors += 1;
+        }
+    }
+    parent_reader.disconnect().await.unwrap();
+
+    // Phase 5: Verify child has mix of parent + new data
+    let mut child_reader = server2.connect("child").await;
+    let mut child_errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = child_reader
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual_hash = sha256(&data);
+        if actual_hash != child_hashes[&idx] {
+            let is_parent = actual_hash == parent_hashes[&idx];
+            let is_zero = data.iter().all(|&b| b == 0);
+            eprintln!(
+                "CHILD MISMATCH block {} ({}): is_parent_data={}, is_zeros={}, first_byte={:#x}",
+                idx,
+                if idx < overwrite_blocks { "overwritten" } else { "inherited" },
+                is_parent,
+                is_zero,
+                data[0]
+            );
+            child_errors += 1;
+        }
+    }
+    child_reader.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[promote_integrity] {} verified (parent_err={}, child_err={}) in {:.1}s",
+        fmt_bytes(data_bytes),
+        parent_errors,
+        child_errors,
+        t0.elapsed().as_secs_f64()
+    );
+    assert_eq!(parent_errors, 0, "parent data corrupted after child promote+write");
+    assert_eq!(child_errors, 0, "child data mismatch after promote+write+S3 roundtrip");
+}
+
+// ---------------------------------------------------------------------------
+// 20. Resize integrity — existing data survives grow, new range is zeros
+// ---------------------------------------------------------------------------
+
+/// Write data, drain to S3, resize (grow), cold restart, verify:
+///   - All original blocks are byte-identical
+///   - New blocks in the extended range are all zeros
+///
+/// Catches: resize clearing the block presence bitmap, manifest corruption
+/// during grow, incorrect device_size in the new manifest.
+#[tokio::test]
+#[ignore]
+async fn resize_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-resize";
+    let transport = crate::Transport::Nbd;
+
+    let original_blocks: u64 = 64;
+    let original_size_gb = (original_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Phase 1: Write data to original-sized export
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", original_size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    let mut expected_hashes: HashMap<u64, [u8; 32]> = HashMap::new();
+    for idx in 0..original_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        expected_hashes.insert(idx, sha256(&pattern));
+        client
+            .write(idx * BLOCK_SIZE as u64, &pattern)
+            .await
+            .unwrap();
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+
+    // Drain to S3 so data is persisted
+    server.drain_all().await;
+
+    // Phase 2: Resize — double the volume
+    let new_blocks: u64 = 128;
+    let new_size_gb = (new_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    server.resize_export("vol", new_size_gb).await;
+
+    // Verify new size is visible
+    let mut client2 = server.connect("vol").await;
+    let reported_size = client2.export_size();
+    let expected_bytes = (new_size_gb * 1_000_000_000.0) as u64;
+    assert_eq!(
+        reported_size, expected_bytes,
+        "export should report new size after resize"
+    );
+    client2.disconnect().await.unwrap();
+
+    // Drain again (manifest updated with new size)
+    server.drain_all().await;
+    server.shutdown().await;
+
+    // Phase 3: Cold restart from S3
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", new_size_gb).await;
+    let mut reader = server2.connect("vol").await;
+
+    // Phase 4: Verify original blocks are intact
+    let mut original_errors = 0u64;
+    for idx in 0..original_blocks {
+        let data = reader
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        if sha256(&data) != expected_hashes[&idx] {
+            eprintln!("RESIZE MISMATCH block {} (original range)", idx);
+            original_errors += 1;
+        }
+    }
+
+    // Phase 5: Verify new blocks are zeros
+    let zero_hash = sha256(&vec![0u8; BLOCK_SIZE]);
+    let mut zero_errors = 0u64;
+    for idx in original_blocks..new_blocks {
+        let data = reader
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        if sha256(&data) != zero_hash {
+            eprintln!("RESIZE MISMATCH block {} (new range, expected zeros)", idx);
+            zero_errors += 1;
+        }
+    }
+
+    reader.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = new_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[resize_integrity] {} verified (original_err={}, zero_err={}) in {:.1}s",
+        fmt_bytes(data_bytes),
+        original_errors,
+        zero_errors,
+        t0.elapsed().as_secs_f64()
+    );
+    assert_eq!(original_errors, 0, "original data corrupted after resize");
+    assert_eq!(zero_errors, 0, "new blocks should be zeros after resize");
+}

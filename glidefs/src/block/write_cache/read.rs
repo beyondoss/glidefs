@@ -539,11 +539,23 @@ impl WriteCache<Active> {
             return Ok(BlockLocation::Zero);
         }
 
-        // Iterate packs newest-first (last element = newest)
+        // Iterate packs newest-first (last element = newest).
+        // Critical: once we encounter an uncached pack we must NOT resolve from
+        // older cached packs — the uncached pack might contain a newer version of
+        // the block. We stop the first-pass search and fall through to the fetch
+        // path which will load all uncached packs and re-resolve in order.
         let mut resolved = None;
         let mut uncached_packs: Vec<PackId> = Vec::new();
 
         for &pack_id in pack_ids.iter().rev() {
+            if !uncached_packs.is_empty() {
+                // Already have uncached newer packs — collect remaining uncached
+                // but don't resolve from older cached entries.
+                if pack_index_cache.get_entries(pack_id).await.is_none() {
+                    uncached_packs.push(pack_id);
+                }
+                continue;
+            }
             match pack_index_cache.lookup_block(pack_id, block_offset).await {
                 Some((hash, pack_offset, comp_length)) => {
                     resolved = Some((pack_id, hash, pack_offset, comp_length));
@@ -559,7 +571,7 @@ impl WriteCache<Active> {
         }
 
         // On cache miss: parallel prefetch ALL uncached pack indices for this chunk
-        if resolved.is_none() && !uncached_packs.is_empty() {
+        if !uncached_packs.is_empty() {
             for &pack_id in &pack_ids {
                 if !uncached_packs.contains(&pack_id)
                     && pack_index_cache.get_entries(pack_id).await.is_none()

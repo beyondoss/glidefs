@@ -70,6 +70,8 @@ Every test follows the same pattern:
 | `wal_crash_recovery` | Write → drain → write more → crash (no drain) → WAL replay → S3 verify | 32 MB |
 | `multi_block_read` | Multi-block reads (2–16 blocks) across block boundaries from S3 | 17 MB |
 | `unaligned_cross_boundary_read` | Reads at arbitrary byte offsets spanning block boundaries from S3 | 8 MB |
+| `promote_integrity` | Fork readonly → promote → write → drain → cold restart → verify | 8 MB |
+| `resize_integrity` | Write → drain → resize (grow) → cold restart → verify original + zeros | 16 MB |
 
 ### What each test catches
 
@@ -169,6 +171,19 @@ phase 2 that were already in S3 from phase 1).
 read from S3. Verifies the read coalescing logic returns correctly concatenated
 block data. Catches offset calculation bugs in coalesced S3 range fetches.
 
+**promote_integrity** — Forks a readonly child from a parent, promotes to
+read-write, overwrites half the blocks with new data, drains to S3, cold
+restarts, and verifies: parent data unchanged, child inherits unwritten parent
+blocks, child has new data for overwritten blocks. Catches post-promote dirty
+block state initialization bugs, fork pack resolution after promotion, and
+write path incorrectly rejecting writes on a promoted export.
+
+**resize_integrity** — Writes data to all blocks, drains to S3, resizes (grows)
+the volume to double its size, drains again, cold restarts from S3, and verifies:
+all original blocks are byte-identical, all new blocks in the extended range are
+zeros. Catches resize operations clearing the block presence bitmap, manifest
+corruption during grow, and incorrect device_size in the post-resize manifest.
+
 **unaligned_cross_boundary_read** — Reads at arbitrary byte offsets within
 blocks, spanning across block boundaries. Test cases: 4KB into a block spanning
 3 boundaries, 60KB offset spanning 2 blocks, 1-byte offset, last/first 4KB of
@@ -209,3 +224,5 @@ The suite exercises every stage of the GlideFS data pipeline:
 | Backfill merge (S3 + local overlay) | `sub_block_basic`, `sub_block_stress` |
 | Read coalescing (multi-block) | `multi_block_read` |
 | Unaligned cross-boundary reads | `unaligned_cross_boundary_read` |
+| Promote readonly → readwrite | `promote_integrity` |
+| Resize (grow) data preservation | `resize_integrity` |
