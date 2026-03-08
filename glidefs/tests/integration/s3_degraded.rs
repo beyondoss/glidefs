@@ -171,7 +171,7 @@ impl IntermittentObjectStore {
         let n = self.fail_every_n.load(Ordering::SeqCst);
         if n > 0 {
             let count = self.put_count.fetch_add(1, Ordering::SeqCst) + 1;
-            return count % n == 0; // fail every Nth
+            return count.is_multiple_of(n); // fail every Nth
         }
         false
     }
@@ -486,11 +486,9 @@ async fn test_s3_intermittent_failures_eventual_success() {
     }
 
     // First flush attempt may partially succeed or fail entirely
-    let mut total_claimed = 0u64;
     for attempt in 0..10 {
         match cache.flush_to_s3(&cs, &pic, &vm).await {
-            Ok(stats) => {
-                total_claimed += stats.blocks_claimed as u64;
+            Ok(_stats) => {
                 if cache.dirty_block_count() == 0 {
                     break;
                 }
@@ -676,7 +674,7 @@ async fn test_s3_upload_semaphore_exhaustion() {
         BLOCK_SIZE as u32,
     )));
     let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-    let metrics = Arc::new(ExportMetrics::new());
+    let _metrics = Arc::new(ExportMetrics::new());
 
     let cache = WriteCache::open(config).unwrap();
     let cache = Arc::new(cache.skip_recovery_for_test());

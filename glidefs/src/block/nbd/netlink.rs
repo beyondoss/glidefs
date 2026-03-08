@@ -319,46 +319,66 @@ pub fn connect(
     let msg = build_genl_msg(family_id, NBD_CMD_CONNECT, 2, &attrs);
     nl_send(fd, &msg)?;
 
-    // The kernel echoes back the assigned device index in the ACK's
-    // NBD_ATTR_INDEX attribute. Parse it, with a sysfs scan as fallback.
+    // The kernel may send up to two messages:
+    //   1. A genl reply (msg_type = family_id) containing NBD_ATTR_INDEX
+    //   2. An NLMSG_ERROR ACK (errno = 0) echoing the request
+    // On some kernels only the ACK is sent. We try to parse both.
     let mut buf = [0u8; 4096];
-    let n = nl_recv(fd, &mut buf)?;
-    let (_, msg_type, _, payload) = parse_nlmsghdr(&buf[..n])
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated response"))?;
 
-    if msg_type == NLMSG_ERROR
-        && payload.len() >= 4
-    {
-        let errno = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        if errno == 0 {
-            // Success — but we used u32::MAX so we need to find the assigned index.
-            // Parse the echoed attributes in the error response.
-            // The kernel echoes back the original message after the error code.
+    for _msg_attempt in 0..2 {
+        let n = nl_recv(fd, &mut buf)?;
+        let (_, msg_type, _, payload) = parse_nlmsghdr(&buf[..n])
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "truncated response")
+            })?;
+
+        if msg_type == NLMSG_ERROR && payload.len() >= 4 {
+            let errno =
+                i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(-errno));
+            }
+            // ACK (errno=0) — try to extract NBD_ATTR_INDEX from echoed attrs.
             if payload.len() >= 4 + 16 + 4 {
                 // error(4) + nlmsghdr(16) + genlmsghdr(4) + attrs
                 let echoed_attrs = &payload[4 + 16 + 4..];
                 for (attr_type, attr_data) in parse_nla(echoed_attrs) {
                     if attr_type == NBD_ATTR_INDEX && attr_data.len() >= 4 {
-                        let index = u32::from_ne_bytes([
+                        let idx = u32::from_ne_bytes([
                             attr_data[0],
                             attr_data[1],
                             attr_data[2],
                             attr_data[3],
                         ]);
-                        return Ok(index as i32);
+                        return Ok(idx as i32);
                     }
                 }
             }
-            // Fallback: scan /sys/block for the newest nbd device
-            return find_newest_nbd_device();
+            // ACK without index — fall through to sysfs scan below
+            break;
         }
-        return Err(io::Error::from_raw_os_error(-errno));
+
+        // Genl reply (msg_type = family_id): parse NBD_ATTR_INDEX from payload.
+        if payload.len() >= 4 {
+            // Skip genlmsghdr (4 bytes) to reach the attributes
+            let genl_attrs = &payload[4..];
+            for (attr_type, attr_data) in parse_nla(genl_attrs) {
+                if attr_type == NBD_ATTR_INDEX && attr_data.len() >= 4 {
+                    let idx = u32::from_ne_bytes([
+                        attr_data[0],
+                        attr_data[1],
+                        attr_data[2],
+                        attr_data[3],
+                    ]);
+                    return Ok(idx as i32);
+                }
+            }
+        }
+        // Unrecognized message — try reading the next one (might be the ACK)
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("unexpected response type {msg_type} to NBD_CMD_CONNECT"),
-    ))
+    // Fallback: scan /sys/block for the newest nbd device
+    find_newest_nbd_device()
 }
 
 /// Disconnect an NBD device via generic netlink.
@@ -400,28 +420,30 @@ pub fn reconfigure(index: i32, socket_fd: RawFd) -> io::Result<()> {
     wait_for_ack(fd)
 }
 
-/// Find the most recently created /dev/nbdN device by scanning /sys/block.
+/// Find the most recently connected /dev/nbdN device by scanning /sys/block.
 ///
-/// Retries a few times with a short sleep because the kernel may not have
-/// populated `/sys/block/nbdN/pid` yet when this runs immediately after
-/// a successful `NBD_CMD_CONNECT` netlink call.
+/// Checks both `pid` (older kernels) and `size` (non-zero = connected) to
+/// detect connected NBD devices. Retries because the kernel may not have
+/// fully initialized the sysfs entry right after netlink connect.
 fn find_newest_nbd_device() -> io::Result<i32> {
-    for attempt in 0..10 {
+    for attempt in 0..20 {
         let mut best: Option<(i32, std::time::SystemTime)> = None;
         if let Ok(entries) = std::fs::read_dir("/sys/block") {
-            for entry in entries {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
+            for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if let Some(index_str) = name.strip_prefix("nbd")
                     && let Ok(index) = index_str.parse::<i32>()
                 {
-                    // Check if the device has a pid (is connected)
-                    let pid_path = entry.path().join("pid");
-                    if pid_path.exists()
+                    let path = entry.path();
+                    // A connected NBD device has either a `pid` file or
+                    // a non-zero `size` (in 512-byte sectors).
+                    let connected = path.join("pid").exists()
+                        || std::fs::read_to_string(path.join("size"))
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                            .is_some_and(|sz| sz > 0);
+                    if connected
                         && let Ok(meta) = entry.metadata()
                         && let Ok(modified) = meta.modified()
                         && (best.is_none() || modified > best.as_ref().unwrap().1)
@@ -434,12 +456,12 @@ fn find_newest_nbd_device() -> io::Result<i32> {
         if let Some((idx, _)) = best {
             return Ok(idx);
         }
-        if attempt < 9 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        if attempt < 19 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "no connected nbd device found after 10 retries",
+        "no connected nbd device found after 20 retries",
     ))
 }
