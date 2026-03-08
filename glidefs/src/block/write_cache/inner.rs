@@ -311,14 +311,29 @@ pub(crate) struct CacheInner {
 
     /// Partial block tracking for async sub-block backfill.
     ///
-    /// Maps block_index → 32-bit bitmap of valid 4KB sub-regions. A set bit
+    /// Maps block_index → partial block state (bitmap + write lock). A set bit
     /// means the guest has written to that sub-region (or backfill has filled
     /// it). Background backfill skips set bits when writing S3 data to SSD.
     ///
     /// Entries are transient: inserted when a sub-block write hits a NOT_PRESENT
     /// block with S3 data, removed when backfill completes (all 32 bits set or
     /// full block fetched from S3). Hard cap at MAX_PARTIAL_BLOCKS.
-    pub(crate) partial_blocks: DashMap<usize, AtomicU32>,
+    pub(crate) partial_blocks: DashMap<usize, PartialBlockState>,
+}
+
+/// Per-block state for partial block tracking.
+///
+/// The `write_lock` serializes backfill writes with guest re-pwrites to prevent
+/// a TOCTOU race where backfill reads bitmap (bit=0), a guest marks the bit and
+/// pwrites, then backfill overwrites the guest data with stale S3 data.
+///
+/// Protocol:
+/// - **Backfill**: acquires `write_lock`, re-reads bitmap, writes only unset sub-regions.
+/// - **Guest write**: marks bitmap (atomic, no lock), does main pwrite (no lock),
+///   then acquires `write_lock` and re-pwrites to guarantee guest data wins.
+pub(crate) struct PartialBlockState {
+    pub(crate) bitmap: AtomicU32,
+    pub(crate) write_lock: Mutex<()>,
 }
 
 impl CacheInner {
@@ -462,7 +477,7 @@ impl CacheInner {
                     mask |= 1 << sub;
                 }
             }
-            entry.value().fetch_or(mask, Ordering::Release);
+            entry.value().bitmap.fetch_or(mask, Ordering::Release);
         }
     }
 
@@ -477,7 +492,7 @@ impl CacheInner {
     pub(crate) fn partial_bitmap(&self, block_idx: usize) -> Option<u32> {
         self.partial_blocks
             .get(&block_idx)
-            .map(|entry| entry.value().load(Ordering::Acquire))
+            .map(|entry| entry.value().bitmap.load(Ordering::Acquire))
     }
 
     /// Write a sub-region to the data file (for background backfill).
@@ -611,7 +626,7 @@ impl CacheInner {
 
         for entry in self.partial_blocks.iter() {
             let block_idx = *entry.key();
-            let bitmap = entry.value().load(Ordering::Acquire);
+            let bitmap = entry.value().bitmap.load(Ordering::Acquire);
             let seq = self.sequence.next();
             wal.append_partial(&PartialWalEntryRef {
                 block_index: block_idx as u64,

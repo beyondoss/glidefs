@@ -813,6 +813,7 @@ mod device_stability;
 mod export_discovery;
 mod ext4_verify;
 mod fork_roundtrip;
+mod integrity_suite;
 mod live_migration;
 mod multi_export;
 mod oci_distribution;

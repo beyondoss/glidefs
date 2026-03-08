@@ -76,6 +76,29 @@ impl WriteCache<Active> {
         // Now write to local file (after claiming blocks via set_present)
         self.inner.data_file.write_all_at(data, offset)?;
 
+        // Re-pwrite under per-block write_lock for any partial blocks.
+        // This guarantees guest data wins over a concurrent backfill write
+        // that may have overwritten our pwrite above using stale S3 data.
+        // Only touches partial blocks (transient state, ~ms lifetime).
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                if let Some(state) = self.inner.partial_blocks.get(&idx) {
+                    let _guard = state.value().write_lock.lock();
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end =
+                        (offset + data.len() as u64).min(block_start_byte + block_size);
+                    let data_offset = (write_start - offset) as usize;
+                    let write_len = (write_end - write_start) as usize;
+                    self.inner.data_file.write_all_at(
+                        &data[data_offset..data_offset + write_len],
+                        write_start,
+                    )?;
+                }
+            }
+        }
+
         // Mark affected blocks as dirty, invalidate stale CRC32 checksums,
         // and record in WAL. Combined into a single pass under the WAL lock
         // to minimize loop overhead on multi-block writes. The CAS and
@@ -197,6 +220,25 @@ impl WriteCache<Active> {
         #[cfg(not(target_os = "linux"))]
         {
             self.zero_range_fallback(offset, len)?;
+        }
+
+        // Re-zero under per-block write_lock for any partial blocks (same
+        // rationale as the re-pwrite in write()).
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                if let Some(state) = self.inner.partial_blocks.get(&idx) {
+                    let _guard = state.value().write_lock.lock();
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end = (offset + len).min(block_start_byte + block_size);
+                    let zero_len = (write_end - write_start) as usize;
+                    let zeros = vec![0u8; zero_len];
+                    self.inner
+                        .data_file
+                        .write_all_at(&zeros, write_start)?;
+                }
+            }
         }
 
         // Mark affected blocks as dirty, invalidate stale CRCs, and record

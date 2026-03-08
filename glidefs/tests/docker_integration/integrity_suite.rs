@@ -1,0 +1,941 @@
+//! Data integrity test suite.
+//!
+//! Every test writes data through the full NBD stack, forces S3 reads via cold
+//! restart (fresh TempDir = no local cache), and verifies every block with
+//! cryptographic hashes. No mocks, no fakes — real MinIO, real packs, real S3.
+//!
+//! Run on demand (not part of the normal docker test suite):
+//!
+//! ```bash
+//! # Full suite
+//! cargo test --features docker-tests --test docker_integration integrity_suite \
+//!     -- --ignored --nocapture
+//!
+//! # Single test
+//! cargo test --features docker-tests --test docker_integration integrity_suite::block_hash_verify \
+//!     -- --ignored --nocapture
+//!
+//! # Extended soak (5 minutes)
+//! SOAK_DURATION_SECS=300 cargo test --features docker-tests --test docker_integration \
+//!     integrity_suite::soak_test -- --ignored --nocapture
+//! ```
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use sha2::{Digest, Sha256};
+
+use crate::{TestContext, TestServer};
+
+const BLOCK_SIZE: usize = 128 * 1024; // 128 KiB
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Deterministic block pattern from index. Reproducible without storage.
+fn block_pattern(block_idx: u64, block_size: usize) -> Vec<u8> {
+    let mut rng = StdRng::seed_from_u64(block_idx.wrapping_mul(0x517cc1b727220a95));
+    let mut buf = vec![0u8; block_size];
+    rng.fill(&mut buf[..]);
+    buf
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+fn blake3_hash(data: &[u8]) -> [u8; 32] {
+    blake3::hash(data).into()
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1_000_000.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Block-level BLAKE3 verification through S3
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn block_hash_verify() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-blake3";
+    let transport = crate::Transport::Nbd;
+
+    // 256 MB = 2048 blocks
+    let num_blocks: u64 = 2048;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Phase 1: Write all blocks with deterministic patterns
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    let mut expected_hashes: Vec<[u8; 32]> = Vec::with_capacity(num_blocks as usize);
+
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        expected_hashes.push(blake3_hash(&pattern));
+        client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+        if idx % 256 == 0 {
+            client.flush().await.unwrap();
+        }
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+
+    // Phase 2: Cold restart — drain to S3, fresh server, restore from manifest
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut client2 = server2.connect("vol").await;
+
+    // Phase 3: Read every block from S3, verify BLAKE3
+    let mut errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = client2
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = blake3_hash(&data);
+        if actual != expected_hashes[idx as usize] {
+            eprintln!(
+                "BLAKE3 MISMATCH block {}: expected {:x?}, got {:x?}",
+                idx, &expected_hashes[idx as usize][..8], &actual[..8]
+            );
+            errors += 1;
+        }
+    }
+
+    client2.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_mb = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[block_hash_verify] {} ({} blocks) verified via S3 in {:.1}s — err={}",
+        fmt_bytes(data_mb),
+        num_blocks,
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "BLAKE3 verification failed for {} blocks", errors);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Sequential integrity — contiguous write/read through S3
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn sequential_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-seq";
+    let transport = crate::Transport::Nbd;
+
+    // 100 MB
+    let num_blocks: u64 = 800;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Write sequentially, building a running SHA-256 of the full stream
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    let mut write_hasher = Sha256::new();
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        write_hasher.update(&pattern);
+        client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+        if idx % 128 == 0 {
+            client.flush().await.unwrap();
+        }
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+    let expected_hash: [u8; 32] = write_hasher.finalize().into();
+
+    // Cold restart
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut client2 = server2.connect("vol").await;
+
+    // Read sequentially from S3, compute SHA-256
+    let mut read_hasher = Sha256::new();
+    for idx in 0..num_blocks {
+        let data = client2
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        read_hasher.update(&data);
+    }
+    let actual_hash: [u8; 32] = read_hasher.finalize().into();
+
+    client2.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[sequential_integrity] {} verified via S3 in {:.1}s",
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+    );
+    assert_eq!(
+        expected_hash, actual_hash,
+        "SHA-256 mismatch: sequential data corrupted during S3 roundtrip"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Hash stress — multi-pass random write + full S3 verify
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn hash_stress() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-stress";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 2048; // 256 MB
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let passes = 3;
+    let write_fraction = 0.6;
+
+    // Track expected SHA-256 per block (unwritten = zeros)
+    let zero_hash = sha256(&vec![0u8; BLOCK_SIZE]);
+    let mut expected: HashMap<u64, [u8; 32]> = HashMap::new();
+
+    let mut total_written: u64 = 0;
+    let mut total_read: u64 = 0;
+    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_CAFE);
+
+    for pass in 0..passes {
+        let pass_t0 = Instant::now();
+
+        // Write phase
+        let server = if pass == 0 {
+            let s = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+            s.create_export("vol", size_gb).await;
+            s
+        } else {
+            let s = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+            s.restore_export("vol", size_gb).await;
+            s
+        };
+
+        let mut client = server.connect("vol").await;
+
+        let blocks_to_write = (num_blocks as f64 * write_fraction) as u64;
+        for _ in 0..blocks_to_write {
+            let idx = rng.gen_range(0..num_blocks);
+            let pattern = block_pattern(rng.r#gen(), BLOCK_SIZE);
+            let hash = sha256(&pattern);
+            expected.insert(idx, hash);
+            client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+            total_written += BLOCK_SIZE as u64;
+        }
+        client.flush().await.unwrap();
+        client.disconnect().await.unwrap();
+
+        // Cold restart
+        server.drain_all().await;
+        server.shutdown().await;
+
+        let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+        server2.restore_export("vol", size_gb).await;
+        let mut client2 = server2.connect("vol").await;
+
+        // Full verification from S3
+        let mut errors = 0u64;
+        for idx in 0..num_blocks {
+            let data = client2
+                .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                .await
+                .unwrap();
+            let actual = sha256(&data);
+            let expect = expected.get(&idx).unwrap_or(&zero_hash);
+            if &actual != expect {
+                eprintln!(
+                    "MISMATCH pass {} block {}: expected {:x?}, got {:x?}",
+                    pass, idx, &expect[..8], &actual[..8]
+                );
+                errors += 1;
+            }
+            total_read += BLOCK_SIZE as u64;
+        }
+
+        client2.disconnect().await.unwrap();
+
+        eprintln!(
+            "  pass {}: {} blocks written, full verify from S3 in {:.1}s — err={}",
+            pass,
+            blocks_to_write,
+            pass_t0.elapsed().as_secs_f64(),
+            errors
+        );
+        assert_eq!(errors, 0, "pass {} had {} verification errors", pass, errors);
+
+        // Keep server2 alive only if we need it for next pass's restore
+        // (we don't — next pass does its own cold restart)
+        server2.shutdown().await;
+    }
+
+    eprintln!(
+        "[hash_stress] {} read + {} written in {:.1}s — err=0",
+        fmt_bytes(total_read),
+        fmt_bytes(total_written),
+        t0.elapsed().as_secs_f64(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Persistence integrity — write → S3 → cold restart → verify
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn persistence_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-persist";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 400; // ~50 MB
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Write blocks
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    let mut expected_hashes: Vec<[u8; 32]> = Vec::with_capacity(num_blocks as usize);
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        expected_hashes.push(sha256(&pattern));
+        client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+
+    // Cold restart
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut client2 = server2.connect("vol").await;
+
+    // Verify from S3
+    let mut errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = client2
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = sha256(&data);
+        if actual != expected_hashes[idx as usize] {
+            eprintln!(
+                "SHA-256 MISMATCH block {}: expected {:x?}, got {:x?}",
+                idx, &expected_hashes[idx as usize][..8], &actual[..8]
+            );
+            errors += 1;
+        }
+    }
+
+    client2.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[persistence_integrity] {} verified via S3 in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "persistence verification failed for {} blocks", errors);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Sparse integrity — blocks with holes through S3
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn sparse_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-sparse";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 512; // 64 MB
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Write ~25% of blocks at scattered offsets
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    let mut written: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut rng = StdRng::seed_from_u64(0x5BA2_5E00_0000);
+    for idx in 0..num_blocks {
+        if rng.gen_bool(0.25) {
+            let pattern = block_pattern(idx, BLOCK_SIZE);
+            written.insert(idx, sha256(&pattern));
+            client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+        }
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+
+    eprintln!(
+        "  wrote {} / {} blocks (holes: {})",
+        written.len(),
+        num_blocks,
+        num_blocks as usize - written.len()
+    );
+
+    // Cold restart
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut client2 = server2.connect("vol").await;
+
+    // Verify all blocks from S3
+    let zero_hash = sha256(&vec![0u8; BLOCK_SIZE]);
+    let mut errors = 0u64;
+    let mut holes_verified = 0u64;
+
+    for idx in 0..num_blocks {
+        let data = client2
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = sha256(&data);
+        if let Some(expected) = written.get(&idx) {
+            if &actual != expected {
+                eprintln!("MISMATCH written block {}", idx);
+                errors += 1;
+            }
+        } else {
+            // Hole — must be all zeros
+            if actual != zero_hash {
+                eprintln!("HOLE NOT ZERO block {}", idx);
+                errors += 1;
+            }
+            holes_verified += 1;
+        }
+    }
+
+    client2.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[sparse_integrity] {} verified via S3 ({} holes) in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        holes_verified,
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "sparse verification failed for {} blocks", errors);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Soak test — timed continuous R/W with periodic S3 verification
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn soak_test() {
+    let duration_secs: u64 = std::env::var("SOAK_DURATION_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-soak";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 4096; // 512 MB
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let verify_interval_secs = 10;
+
+    let mut rng = StdRng::seed_from_u64(0x50AE_7E57_5EED);
+    let zero_hash = blake3_hash(&vec![0u8; BLOCK_SIZE]);
+    let mut expected: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut total_written: u64 = 0;
+    let mut total_read: u64 = 0;
+    let mut total_ops: u64 = 0;
+    let mut verify_passes: u64 = 0;
+    let mut last_verify = Instant::now();
+
+    // Initial server
+    let mut server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    let deadline = t0 + std::time::Duration::from_secs(duration_secs);
+
+    while Instant::now() < deadline {
+        // Batch of writes
+        let batch_size = rng.gen_range(16..64);
+        for _ in 0..batch_size {
+            let idx = rng.gen_range(0..num_blocks);
+            let pattern = block_pattern(rng.r#gen(), BLOCK_SIZE);
+            expected.insert(idx, blake3_hash(&pattern));
+            client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+            total_written += BLOCK_SIZE as u64;
+            total_ops += 1;
+        }
+        client.flush().await.unwrap();
+
+        // Batch of reads (local cache verification)
+        let read_count = rng.gen_range(8..32);
+        for _ in 0..read_count {
+            let idx = rng.gen_range(0..num_blocks);
+            let data = client
+                .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                .await
+                .unwrap();
+            let actual = blake3_hash(&data);
+            let expect = expected.get(&idx).unwrap_or(&zero_hash);
+            assert_eq!(
+                &actual, expect,
+                "local read mismatch at block {} during soak",
+                idx
+            );
+            total_read += BLOCK_SIZE as u64;
+            total_ops += 1;
+        }
+
+        // Periodic S3 verification via cold restart
+        if last_verify.elapsed().as_secs() >= verify_interval_secs {
+            client.disconnect().await.unwrap();
+            server.drain_all().await;
+            server.shutdown().await;
+
+            let s2 =
+                TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+            s2.restore_export("vol", size_gb).await;
+            let mut c2 = s2.connect("vol").await;
+
+            // Verify all written blocks from S3
+            let mut verify_errors = 0u64;
+            for (&idx, expect) in &expected {
+                let data = c2
+                    .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                    .await
+                    .unwrap();
+                let actual = blake3_hash(&data);
+                if &actual != expect {
+                    verify_errors += 1;
+                }
+                total_read += BLOCK_SIZE as u64;
+                total_ops += 1;
+            }
+
+            // Spot-check some unwritten blocks are zeros
+            for _ in 0..100 {
+                let idx = rng.gen_range(0..num_blocks);
+                if !expected.contains_key(&idx) {
+                    let data = c2
+                        .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                        .await
+                        .unwrap();
+                    let actual = blake3_hash(&data);
+                    if actual != zero_hash {
+                        verify_errors += 1;
+                    }
+                    total_read += BLOCK_SIZE as u64;
+                    total_ops += 1;
+                }
+            }
+
+            verify_passes += 1;
+            eprintln!(
+                "  S3 verify pass {} ({} blocks): err={}",
+                verify_passes,
+                expected.len(),
+                verify_errors,
+            );
+            assert_eq!(
+                verify_errors, 0,
+                "S3 verification pass {} had {} errors",
+                verify_passes, verify_errors
+            );
+
+            // Continue with restored server
+            c2.disconnect().await.unwrap();
+            server = s2;
+            client = server.connect("vol").await;
+            last_verify = Instant::now();
+        }
+    }
+
+    client.disconnect().await.unwrap();
+
+    // Final S3 verification
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let final_server =
+        TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    final_server.restore_export("vol", size_gb).await;
+    let mut final_client = final_server.connect("vol").await;
+
+    let mut final_errors = 0u64;
+    for (&idx, expect) in &expected {
+        let data = final_client
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = blake3_hash(&data);
+        if &actual != expect {
+            final_errors += 1;
+        }
+        total_read += BLOCK_SIZE as u64;
+        total_ops += 1;
+    }
+
+    final_client.disconnect().await.unwrap();
+    final_server.shutdown().await;
+
+    verify_passes += 1;
+
+    eprintln!();
+    eprintln!("=== Soak Test Results ({}s) ===", duration_secs);
+    eprintln!("  Total written:      {}", fmt_bytes(total_written));
+    eprintln!("  Total read:         {}", fmt_bytes(total_read));
+    eprintln!("  Total I/O ops:      {}", total_ops);
+    eprintln!("  S3 verify passes:   {}", verify_passes);
+    eprintln!("  Unique blocks:      {}", expected.len());
+    eprintln!("  Final errors:       {}", final_errors);
+    eprintln!();
+
+    assert_eq!(final_errors, 0, "final soak verification had {} errors", final_errors);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Fork integrity — fork data isolation + S3 persistence
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn fork_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-fork";
+    let transport = crate::Transport::Nbd;
+
+    let parent_blocks: u64 = 128;
+    let overwrite_blocks: u64 = 32;
+    let size_gb = (parent_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Phase 1: Write parent blocks, snapshot
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("parent", size_gb).await;
+    let mut parent_client = server.connect("parent").await;
+
+    let mut parent_hashes: Vec<[u8; 32]> = Vec::with_capacity(parent_blocks as usize);
+    for idx in 0..parent_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        parent_hashes.push(blake3_hash(&pattern));
+        parent_client
+            .write(idx * BLOCK_SIZE as u64, &pattern)
+            .await
+            .unwrap();
+    }
+    parent_client.flush().await.unwrap();
+    parent_client.disconnect().await.unwrap();
+
+    server.snapshot_export("parent").await;
+
+    // Phase 2: Fork child — reads parent blocks from S3 (no local cache for them)
+    server.fork_export("child", "parent", size_gb).await;
+    let mut child_client = server.connect("child").await;
+
+    // Verify child reads parent data correctly
+    for idx in 0..parent_blocks {
+        let data = child_client
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = blake3_hash(&data);
+        assert_eq!(
+            actual, parent_hashes[idx as usize],
+            "child inherited block {} has wrong BLAKE3 hash",
+            idx
+        );
+    }
+    eprintln!("  child inherited {} parent blocks — verified", parent_blocks);
+
+    // Phase 3: Overwrite first N blocks in child with new patterns
+    let mut child_hashes = parent_hashes.clone();
+    for idx in 0..overwrite_blocks {
+        // Use a different seed space so patterns differ from parent
+        let pattern = block_pattern(idx + 1_000_000, BLOCK_SIZE);
+        child_hashes[idx as usize] = blake3_hash(&pattern);
+        child_client
+            .write(idx * BLOCK_SIZE as u64, &pattern)
+            .await
+            .unwrap();
+    }
+    child_client.flush().await.unwrap();
+    child_client.disconnect().await.unwrap();
+
+    // Verify parent is unchanged
+    let mut parent_client2 = server.connect("parent").await;
+    for idx in 0..overwrite_blocks {
+        let data = parent_client2
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = blake3_hash(&data);
+        assert_eq!(
+            actual, parent_hashes[idx as usize],
+            "parent block {} was corrupted by child write",
+            idx
+        );
+    }
+    parent_client2.disconnect().await.unwrap();
+    eprintln!("  parent isolation verified — {} blocks unchanged", overwrite_blocks);
+
+    // Phase 4: Cold restart child, verify all blocks from S3
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2
+        .restore_forked_export("child", "parent", size_gb)
+        .await;
+    let mut reader = server2.connect("child").await;
+
+    let mut errors = 0u64;
+    for idx in 0..parent_blocks {
+        let data = reader
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = blake3_hash(&data);
+        if actual != child_hashes[idx as usize] {
+            eprintln!(
+                "FORK MISMATCH block {} (overwritten={})",
+                idx,
+                idx < overwrite_blocks
+            );
+            errors += 1;
+        }
+    }
+
+    reader.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = parent_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[fork_integrity] {} verified via S3 in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "fork verification failed for {} blocks", errors);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Overwrite integrity — old data replaced through S3
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn overwrite_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-overwrite";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 256;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Phase 1: Write pattern A to all blocks, drain to S3
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+    server.drain_all().await;
+    server.shutdown().await;
+
+    // Phase 2: Restore, overwrite ALL blocks with pattern B, drain again
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut client2 = server2.connect("vol").await;
+
+    // Pattern B uses a different seed space (idx + 10_000_000)
+    let mut expected_hashes: Vec<[u8; 32]> = Vec::with_capacity(num_blocks as usize);
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx + 10_000_000, BLOCK_SIZE);
+        expected_hashes.push(sha256(&pattern));
+        client2.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+    }
+    client2.flush().await.unwrap();
+    client2.disconnect().await.unwrap();
+    server2.drain_all().await;
+    server2.shutdown().await;
+
+    // Phase 3: Cold restart — verify pattern B, NOT pattern A
+    let server3 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server3.restore_export("vol", size_gb).await;
+    let mut client3 = server3.connect("vol").await;
+
+    let mut errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = client3
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = sha256(&data);
+        if actual != expected_hashes[idx as usize] {
+            // Check if we got pattern A (stale data) vs random corruption
+            let stale_hash = sha256(&block_pattern(idx, BLOCK_SIZE));
+            if actual == stale_hash {
+                eprintln!("STALE DATA block {}: got pattern A instead of B", idx);
+            } else {
+                eprintln!("CORRUPTION block {}: neither pattern A nor B", idx);
+            }
+            errors += 1;
+        }
+    }
+
+    client3.disconnect().await.unwrap();
+    server3.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[overwrite_integrity] {} verified via S3 (2 drain cycles) in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "overwrite verification failed for {} blocks", errors);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Concurrent stress — parallel writers + S3 verification
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn concurrent_stress() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-concurrent";
+    let transport = crate::Transport::Nbd;
+
+    let num_clients: u64 = 4;
+    let blocks_per_client: u64 = 256;
+    let total_blocks = num_clients * blocks_per_client; // 1024 blocks = 128 MB
+    let size_gb = (total_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+
+    let info = server.connect_info("vol").await;
+
+    // Each client writes to a disjoint range of blocks with unique patterns
+    let mut handles = Vec::new();
+    for client_idx in 0..num_clients {
+        let info = info.clone();
+        let handle = tokio::spawn(async move {
+            let mut client = info.connect().await.unwrap();
+            let base_block = client_idx * blocks_per_client;
+
+            for b in 0..blocks_per_client {
+                let idx = base_block + b;
+                let pattern = block_pattern(idx, BLOCK_SIZE);
+                client
+                    .write(idx * BLOCK_SIZE as u64, &pattern)
+                    .await
+                    .unwrap();
+                if b % 64 == 0 {
+                    client.flush().await.unwrap();
+                }
+            }
+            client.flush().await.unwrap();
+            client.disconnect().await.unwrap();
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    // Cold restart
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut client = server2.connect("vol").await;
+
+    // Verify every block from S3
+    let mut errors = 0u64;
+    for idx in 0..total_blocks {
+        let data = client
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let expected = block_pattern(idx, BLOCK_SIZE);
+        let actual_hash = blake3_hash(&data);
+        let expected_hash = blake3_hash(&expected);
+        if actual_hash != expected_hash {
+            eprintln!(
+                "MISMATCH block {} (client {}): expected {:x?}, got {:x?}",
+                idx,
+                idx / blocks_per_client,
+                &expected_hash[..8],
+                &actual_hash[..8]
+            );
+            errors += 1;
+        }
+    }
+
+    client.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = total_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[concurrent_stress] {} verified via S3 ({} clients) in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        num_clients,
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "concurrent verification failed for {} blocks", errors);
+}

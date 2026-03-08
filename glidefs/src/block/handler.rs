@@ -188,8 +188,7 @@ impl BlockHandler {
     /// so the bitmap bits are set and the pwrite is done before the backfill
     /// task can race with the written data.
     async fn backfill_missing_blocks(&self, offset: u64, length: u64) -> CommandResult<Vec<u64>> {
-        use super::write_cache::inner::MAX_PARTIAL_BLOCKS;
-        use std::sync::atomic::AtomicU32;
+        use super::write_cache::inner::{MAX_PARTIAL_BLOCKS, PartialBlockState};
 
         let block_size = self.cache.block_size() as u64;
         let start_block = offset / block_size;
@@ -257,7 +256,10 @@ impl BlockHandler {
                 .inner()
                 .partial_blocks
                 .entry(idx)
-                .or_insert_with(|| AtomicU32::new(0));
+                .or_insert_with(|| PartialBlockState {
+                    bitmap: std::sync::atomic::AtomicU32::new(0),
+                    write_lock: parking_lot::Mutex::new(()),
+                });
 
             needs_backfill.push(block_idx);
         }
@@ -310,16 +312,19 @@ impl BlockHandler {
             };
 
             // Write each unwritten sub-region from S3 data to SSD.
-            // Re-read bitmap per sub-region to avoid overwriting guest data
-            // that arrived after the S3 fetch started.
+            // Hold the per-block write_lock to prevent TOCTOU race where a
+            // guest write marks the bitmap and pwrites between our bitmap
+            // read and our pwrite (the guest re-pwrites under the same lock).
             let inner = cache.inner();
             {
+                let state = match inner.partial_blocks.get(&idx) {
+                    Some(s) => s,
+                    None => return, // block was completed by on-demand read
+                };
+                let _guard = state.value().write_lock.lock();
+
                 for sub in 0..(block_size / SUB_BLOCK_SIZE) {
-                    // Re-check bitmap atomically for each sub-region
-                    let bitmap = match inner.partial_bitmap(idx) {
-                        Some(b) => b,
-                        None => break, // block was completed by on-demand read
-                    };
+                    let bitmap = state.value().bitmap.load(std::sync::atomic::Ordering::Acquire);
                     if bitmap & (1 << sub) != 0 {
                         continue; // guest already wrote this sub-region
                     }

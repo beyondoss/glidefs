@@ -71,7 +71,7 @@ impl WriteCache<Initializing> {
         let mut max_wal_seq = persisted_max_seq;
 
         // Partial block bitmaps reconstructed from partial WAL entries.
-        let partial_blocks: DashMap<usize, std::sync::atomic::AtomicU32> = DashMap::new();
+        let partial_blocks: DashMap<usize, super::inner::PartialBlockState> = DashMap::new();
 
         for entry in &wal_entries {
             let block_index = entry.block_index as usize;
@@ -93,10 +93,13 @@ impl WriteCache<Initializing> {
 
                 // Reconstruct partial block bitmap from partial WAL entries
                 if let Some(bitmap) = entry.partial_bitmap {
-                    partial_blocks
+                    let entry = partial_blocks
                         .entry(block_index)
-                        .or_insert_with(|| std::sync::atomic::AtomicU32::new(0))
-                        .fetch_or(bitmap, std::sync::atomic::Ordering::Release);
+                        .or_insert_with(|| super::inner::PartialBlockState {
+                            bitmap: std::sync::atomic::AtomicU32::new(0),
+                            write_lock: parking_lot::Mutex::new(()),
+                        });
+                    entry.value().bitmap.fetch_or(bitmap, std::sync::atomic::Ordering::Release);
                 }
             }
         }

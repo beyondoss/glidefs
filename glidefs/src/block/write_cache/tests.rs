@@ -1448,6 +1448,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
 /// `insert` (e.g., acquiring `volume_manifest.read()` at handler.rs:222).
 #[tokio::test]
 async fn test_partial_blocks_insert_overwrites_bitmap_causing_data_loss() {
+    use super::inner::PartialBlockState;
     use std::sync::atomic::AtomicU32;
 
     let dir = TempDir::new().unwrap();
@@ -1464,14 +1465,19 @@ async fn test_partial_blocks_insert_overwrites_bitmap_causing_data_loss() {
 
     let block_idx = 0usize;
 
+    let new_state = || PartialBlockState {
+        bitmap: AtomicU32::new(0),
+        write_lock: parking_lot::Mutex::new(()),
+    };
+
     // Step 2: Thread A's backfill_missing_blocks inserts a partial entry.
-    inner.partial_blocks.insert(block_idx, AtomicU32::new(0));
+    inner.partial_blocks.insert(block_idx, new_state());
 
     // Step 3: Thread A's cache.write → mark_sub_regions sets bit for
     //         sub-region 0 (bytes [0..4096] of the block).
     inner.mark_sub_regions(block_idx, 0, 4096);
 
-    // Verify the bit IS set on Thread A's AtomicU32.
+    // Verify the bit IS set on Thread A's entry.
     let bitmap_before = inner.partial_bitmap(block_idx).unwrap();
     assert_eq!(
         bitmap_before & 1,
@@ -1482,14 +1488,14 @@ async fn test_partial_blocks_insert_overwrites_bitmap_causing_data_loss() {
     // Step 4: Thread B's backfill_missing_blocks calls insert() for the
     //         same block (Thread B checked is_partial=false before Thread A
     //         inserted, then got delayed on volume_manifest.read()).
-    //         DashMap::insert REPLACES Thread A's AtomicU32.
-    inner.partial_blocks.insert(block_idx, AtomicU32::new(0));
+    //         DashMap::insert REPLACES Thread A's entry.
+    inner.partial_blocks.insert(block_idx, new_state());
 
     // DATA LOSS: Thread A's bitmap bit for sub-region 0 is gone.
     let bitmap_after = inner.partial_bitmap(block_idx).unwrap();
     assert_eq!(
         bitmap_after, 0,
-        "DashMap::insert replaced AtomicU32, losing Thread A's bitmap bits"
+        "DashMap::insert replaced entry, losing Thread A's bitmap bits"
     );
 
     // Step 5 consequence: background backfill reads bitmap=0 for sub-region 0,
@@ -1504,14 +1510,14 @@ async fn test_partial_blocks_insert_overwrites_bitmap_causing_data_loss() {
     inner
         .partial_blocks
         .entry(block_idx)
-        .or_insert_with(|| AtomicU32::new(0));
+        .or_insert_with(new_state);
     inner.mark_sub_regions(block_idx, 0, 4096);
 
     // Thread B uses entry().or_insert_with() — does NOT replace
     inner
         .partial_blocks
         .entry(block_idx)
-        .or_insert_with(|| AtomicU32::new(0));
+        .or_insert_with(new_state);
 
     // Thread A's bits are preserved
     let bitmap_fixed = inner.partial_bitmap(block_idx).unwrap();
@@ -1535,6 +1541,7 @@ async fn test_partial_blocks_insert_overwrites_bitmap_causing_data_loss() {
 /// re-reads the bitmap per sub-region. `merge_partial_block` should do the same.
 #[tokio::test]
 async fn test_merge_partial_block_stale_bitmap_misses_concurrent_write() {
+    use super::inner::PartialBlockState;
     use std::sync::atomic::AtomicU32;
 
     let dir = TempDir::new().unwrap();
@@ -1553,7 +1560,13 @@ async fn test_merge_partial_block_stale_bitmap_misses_concurrent_write() {
     let block_idx = 0usize;
 
     // Set up: block is partial with bitmap=0 (no sub-regions written yet).
-    inner.partial_blocks.insert(block_idx, AtomicU32::new(0));
+    inner.partial_blocks.insert(
+        block_idx,
+        PartialBlockState {
+            bitmap: AtomicU32::new(0),
+            write_lock: parking_lot::Mutex::new(()),
+        },
+    );
     inner.set_present(block_idx);
 
     // merge_partial_block would snapshot the bitmap HERE:
@@ -1582,4 +1595,87 @@ async fn test_merge_partial_block_stale_bitmap_misses_concurrent_write() {
         "per-sub-region re-read catches the concurrent update"
     );
     // merge would skip sub-region 0, preserving the concurrent write's data.
+}
+
+/// Prove that the per-block write_lock prevents backfill from overwriting
+/// guest data on SSD.
+///
+/// The TOCTOU race (without the lock):
+/// 1. Backfill reads bitmap for sub-region N → bit=0
+/// 2. Guest write: mark_sub_regions (sets bit=1) + pwrite (guest data on SSD)
+/// 3. Backfill calls write_sub_region (overwrites guest data with S3 data)
+///
+/// The fix: backfill holds write_lock while checking bitmap + writing.
+/// Guest re-pwrites under the same lock after its main pwrite, guaranteeing
+/// guest data wins even if backfill's write lands between the two guest pwrites.
+#[tokio::test]
+async fn test_backfill_write_sub_region_overwrites_guest_data() {
+    use super::inner::{PartialBlockState, SUB_BLOCK_SIZE};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let dir = TempDir::new().unwrap();
+    let block_size = 128 * 1024;
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "backfill-race".to_string(),
+        device_size: block_size as u64,
+        block_size,
+        wal_sync: false,
+    };
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.skip_recovery_for_test();
+    let inner = cache.inner();
+
+    let block_idx = 0usize;
+
+    // Setup: block 0 is partial with empty bitmap.
+    inner.partial_blocks.insert(
+        block_idx,
+        PartialBlockState {
+            bitmap: AtomicU32::new(0),
+            write_lock: parking_lot::Mutex::new(()),
+        },
+    );
+    inner.set_present(block_idx);
+
+    let guest_data = vec![0xBBu8; SUB_BLOCK_SIZE];
+    let s3_data = vec![0xAAu8; SUB_BLOCK_SIZE];
+
+    // --- SIMULATE THE WORST-CASE INTERLEAVING ---
+    // Backfill acquires write_lock first, reads bitmap (bit=0).
+    {
+        let state = inner.partial_blocks.get(&block_idx).unwrap();
+        let _guard = state.value().write_lock.lock();
+        let bitmap = state.value().bitmap.load(Ordering::Acquire);
+        assert_eq!(bitmap & 1, 0, "backfill sees sub-region 0 as unwritten");
+
+        // Guest marks bit and does main pwrite (outside the lock — these are
+        // atomic/positional-IO and don't need the lock).
+        inner.mark_sub_regions(block_idx, 0, SUB_BLOCK_SIZE);
+        inner.data_file.write_all_at(&guest_data, 0).unwrap();
+
+        // Backfill writes S3 data (under lock, using stale bitmap).
+        // This overwrites the guest's main pwrite — but the guest will
+        // re-pwrite under the lock next.
+        inner.write_sub_region(0, &s3_data).unwrap();
+    }
+    // Backfill releases lock.
+
+    // Guest acquires write_lock and re-pwrites (THE FIX).
+    // This is what write.rs does after the main pwrite for partial blocks.
+    {
+        let state = inner.partial_blocks.get(&block_idx).unwrap();
+        let _guard = state.value().write_lock.lock();
+        inner.data_file.write_all_at(&guest_data, 0).unwrap();
+    }
+
+    // --- VERIFY: guest data survives ---
+    let mut readback = vec![0u8; SUB_BLOCK_SIZE];
+    inner.data_file.read_exact_at(&mut readback, 0).unwrap();
+
+    assert_eq!(
+        readback[0], 0xBB,
+        "sub-region 0 should have guest data (0xBB), not S3 data (0xAA) — \
+         guest re-pwrite under write_lock guarantees guest data wins"
+    );
 }

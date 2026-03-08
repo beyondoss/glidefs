@@ -482,7 +482,13 @@ impl WriteCache<Active> {
     #[allow(dead_code)]
     pub fn insert_partial_block_for_test(&self, block_idx: usize) {
         use std::sync::atomic::AtomicU32;
-        self.inner.partial_blocks.insert(block_idx, AtomicU32::new(0));
+        self.inner.partial_blocks.insert(
+            block_idx,
+            super::inner::PartialBlockState {
+                bitmap: AtomicU32::new(0),
+                write_lock: parking_lot::Mutex::new(()),
+            },
+        );
     }
 
     /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by

@@ -748,23 +748,31 @@ impl WriteCache<Active> {
         let block_start = block_index as u64 * block_size as u64;
 
         // Fill in unwritten sub-regions from S3 data.
-        // Re-read bitmap per sub-region (same as spawn_background_backfill)
-        // to catch concurrent writes that set bits after we started merging.
-        for sub in 0..(block_size / SUB_BLOCK_SIZE) {
-            let bitmap = match self.inner.partial_bitmap(block_index) {
-                Some(b) => b,
-                None => break, // block was completed by another path
+        // Hold the per-block write_lock to prevent TOCTOU race (same as
+        // spawn_background_backfill). Guest re-pwrites under the same lock.
+        {
+            let state = match self.inner.partial_blocks.get(&block_index) {
+                Some(s) => s,
+                None => {
+                    // Block was completed by another path — return local data as-is
+                    return Ok(Bytes::from(merged));
+                }
             };
-            if bitmap & (1 << sub) != 0 {
-                continue; // guest wrote this sub-region, keep SSD data
-            }
-            let start = sub * SUB_BLOCK_SIZE;
-            let end = start + SUB_BLOCK_SIZE;
-            merged[start..end].copy_from_slice(&s3_data[start..end]);
+            let _guard = state.value().write_lock.lock();
 
-            // Write S3 data to SSD to complete backfill for this sub-region
-            let sub_offset = block_start + start as u64;
-            self.inner.write_sub_region(sub_offset, &s3_data[start..end])?;
+            for sub in 0..(block_size / SUB_BLOCK_SIZE) {
+                let bitmap = state.value().bitmap.load(std::sync::atomic::Ordering::Acquire);
+                if bitmap & (1 << sub) != 0 {
+                    continue; // guest wrote this sub-region, keep SSD data
+                }
+                let start = sub * SUB_BLOCK_SIZE;
+                let end = start + SUB_BLOCK_SIZE;
+                merged[start..end].copy_from_slice(&s3_data[start..end]);
+
+                // Write S3 data to SSD to complete backfill for this sub-region
+                let sub_offset = block_start + start as u64;
+                self.inner.write_sub_region(sub_offset, &s3_data[start..end])?;
+            }
         }
 
         // Backfill complete — remove from partial tracking
