@@ -1516,3 +1516,122 @@ async fn test_concurrent_same_block_no_torn_write() {
         "cold reader should see entire pattern A or B from S3"
     );
 }
+
+// =============================================================================
+// WITHIN-BATCH DEDUPLICATION INTEGRITY
+// =============================================================================
+
+/// Test: Within-batch dedup produces correct data at all deduplicated offsets.
+///
+/// When multiple blocks in the same flush batch contain identical data,
+/// compute_flush_batch deduplicates them via `seen_hashes`: only one copy of
+/// the compressed data is kept, but ALL blocks get pack index entries (each
+/// with its own chunk_offset). After flush + cold restart, every original
+/// block offset must independently return the correct data via S3.
+///
+/// This catches bugs where the dedup path:
+/// - Drops a pack index entry for the second occurrence
+/// - Maps multiple chunk_offsets to the wrong pack byte offset
+/// - Breaks BLAKE3 verification due to shared compressed data
+#[tokio::test]
+async fn test_within_batch_dedup_all_offsets_readable() {
+    let s3 = Arc::new(object_store::memory::InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, _m) =
+        super::create_test_cache(&dir, "dedup-integrity", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
+
+    let identical_data = vec![0xDD; BLOCK_SIZE];
+
+    // Write the same data to 4 different block offsets in one batch.
+    // All 4 will land in the same flush and trigger within-batch dedup.
+    let offsets: Vec<u64> = (0..4).map(|i| i * BLOCK_SIZE as u64).collect();
+    for &offset in &offsets {
+        cache.write(offset, &identical_data, cc.as_ref()).unwrap();
+    }
+    assert_eq!(cache.dirty_block_count(), 4);
+
+    // Flush — 4 blocks claimed, 3 deduped (only the first unique hash uploads)
+    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    assert_eq!(stats.blocks_claimed, 4, "should claim all 4 dirty blocks");
+    assert_eq!(stats.blocks_deduped, 3, "3 of 4 identical blocks should be deduped");
+    assert_eq!(stats.packs_uploaded, 1, "all 4 blocks should fit in 1 pack");
+    assert_eq!(cache.dirty_block_count(), 0);
+
+    // Cold restart: drop the writer and restore from S3 manifest
+    drop(cache);
+    let reader_dir = TempDir::new().unwrap();
+    let (reader, rcs, rpic, rvm, rcc, rm) =
+        super::create_cold_reader(&reader_dir, "dedup-integrity", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
+
+    // Every deduplicated offset must independently return correct data
+    for &offset in &offsets {
+        let data = reader
+            .read(offset, BLOCK_SIZE, rcc.as_ref(), &rpic, &rvm, &rcs, &rm)
+            .await
+            .unwrap();
+        assert_eq!(
+            data.as_ref(),
+            &identical_data[..],
+            "block at offset {} should read correctly after dedup + cold restore",
+            offset
+        );
+    }
+}
+
+/// Test: Mixed dedup + unique blocks in same flush batch.
+///
+/// A flush batch with both deduplicated and unique blocks must preserve
+/// all data. This catches off-by-one errors in pack index construction
+/// where unique block entries shift deduped block offsets.
+#[tokio::test]
+async fn test_within_batch_dedup_mixed_unique_and_duplicate() {
+    let s3 = Arc::new(object_store::memory::InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, _m) =
+        super::create_test_cache(&dir, "dedup-mixed", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
+
+    // 3 blocks with identical data (will dedup to 1 upload)
+    let dup_data = vec![0xAA; BLOCK_SIZE];
+    for i in 0..3u64 {
+        cache.write(i * BLOCK_SIZE as u64, &dup_data, cc.as_ref()).unwrap();
+    }
+
+    // 2 blocks with unique data (each must upload separately)
+    let unique_a: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
+    let unique_b: Vec<u8> = (0..BLOCK_SIZE).map(|i| ((i + 127) % 253) as u8).collect();
+    cache.write(3 * BLOCK_SIZE as u64, &unique_a, cc.as_ref()).unwrap();
+    cache.write(4 * BLOCK_SIZE as u64, &unique_b, cc.as_ref()).unwrap();
+
+    assert_eq!(cache.dirty_block_count(), 5);
+
+    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    assert_eq!(stats.blocks_claimed, 5);
+    assert_eq!(stats.blocks_deduped, 2, "2 of 3 identical blocks deduped");
+
+    // Cold restart
+    drop(cache);
+    let reader_dir = TempDir::new().unwrap();
+    let (reader, rcs, rpic, rvm, rcc, rm) =
+        super::create_cold_reader(&reader_dir, "dedup-mixed", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
+
+    // Verify all 5 blocks independently
+    let expected: Vec<(&[u8], u64)> = vec![
+        (&dup_data, 0),
+        (&dup_data, 1),
+        (&dup_data, 2),
+        (unique_a.as_slice(), 3),
+        (unique_b.as_slice(), 4),
+    ];
+    for (data, idx) in expected {
+        let offset = idx * BLOCK_SIZE as u64;
+        let result = reader
+            .read(offset, BLOCK_SIZE, rcc.as_ref(), &rpic, &rvm, &rcs, &rm)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.as_ref(), data,
+            "block {} should read correctly after mixed dedup flush",
+            idx
+        );
+    }
+}

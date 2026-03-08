@@ -526,8 +526,14 @@ impl CacheInner {
     /// plus a trailing max_sequence u64. Uses atomic write pattern: temp file ->
     /// fsync -> rename.
     pub(super) fn save_block_states(&self) -> Result<(), CacheError> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = self.config.metadata_path();
-        let tmp_path = path.with_extension("meta.tmp");
+        // Use a unique temp file name to prevent a race between concurrent
+        // callers (flush_to_s3's checkpoint vs flush_scheduler's local_checkpoint).
+        // Without this, the first caller's rename moves .meta.tmp away and
+        // the second caller's rename fails with ENOENT.
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("meta.tmp.{id}"));
 
         let mut file = OpenOptions::new()
             .write(true)
