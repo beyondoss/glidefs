@@ -69,7 +69,6 @@ async fn test_trim_partial_range() {
 #[tokio::test]
 async fn test_trim_then_flush_to_s3() {
     let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let pic = Arc::clone(&*SHARED_PACK_INDEX_CACHE);
 
     // Writer: write block 0, flush to S3
     let writer_dir = TempDir::new().unwrap();
@@ -210,7 +209,6 @@ async fn test_trim_fork_semantics() {
 /// The trimmed block must be zeros (WAL entry records the TRIM).
 #[tokio::test]
 async fn test_trim_crash_recovery() {
-    let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
 
     let config = WriteCacheConfig {
@@ -305,9 +303,16 @@ async fn test_trim_large_range() {
 
     // Flush to S3 — all should create tombstones (zero blocks)
     let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
-    // All 800 blocks should be deduped (zero → tombstone), not uploaded as packs
-    assert!(
-        stats.is_some(),
-        "flush should report stats (blocks were dirty)"
+    // All 800 blocks should be claimed as dirty
+    assert_eq!(
+        stats.blocks_claimed, num_blocks,
+        "all {num_blocks} blocks should be claimed"
     );
+    // Zero blocks are deduped (tombstone): no compressed data uploaded, just index entries
+    assert_eq!(
+        stats.blocks_deduped, num_blocks,
+        "all {num_blocks} zero blocks should be deduped (tombstones)"
+    );
+    // No compressed block data should be uploaded (tombstones have comp_length=0)
+    assert_eq!(stats.bytes_uploaded, 0, "no block data should be uploaded for zero blocks");
 }
