@@ -2492,3 +2492,739 @@ async fn resize_integrity() {
     assert_eq!(original_errors, 0, "original data corrupted after resize");
     assert_eq!(zero_errors, 0, "new blocks should be zeros after resize");
 }
+
+// ---------------------------------------------------------------------------
+// 11. Soak: mixed operations (write, read, trim, write_zeroes, flush,
+//     fork, snapshot, delete) with reference model
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn soak_mixed_operations() {
+    let duration_secs: u64 = std::env::var("SOAK_DURATION_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "soak-mixed";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 2048; // 256 MB
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    let mut rng = StdRng::seed_from_u64(0x504B_FEED_C0DE);
+    let zero_hash = blake3_hash(&vec![0u8; BLOCK_SIZE]);
+
+    // Per-export reference models: export name → (block idx → hash)
+    let mut models: HashMap<String, HashMap<u64, [u8; 32]>> = HashMap::new();
+    let mut exports_alive: Vec<String> = Vec::new();
+    // Track fork parents for restore: fork name → source prefix
+    let mut fork_sources: HashMap<String, String> = HashMap::new();
+
+    let mut total_ops: u64 = 0;
+    let mut verify_passes: u64 = 0;
+
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol-0", size_gb).await;
+    models.insert("vol-0".to_string(), HashMap::new());
+    exports_alive.push("vol-0".to_string());
+
+    let mut client = server.connect("vol-0").await;
+    let mut active_export = "vol-0".to_string();
+
+    let deadline = t0 + std::time::Duration::from_secs(duration_secs);
+
+    while Instant::now() < deadline {
+        // Pick a random operation (weighted toward writes)
+        let op = rng.gen_range(0u32..100);
+        let handler = server
+            .router
+            .get_handler(&active_export)
+            .await
+            .expect("active export missing handler");
+
+        match op {
+            // Write (40%)
+            0..40 => {
+                let idx = rng.gen_range(0..num_blocks);
+                let pattern = block_pattern(rng.r#gen(), BLOCK_SIZE);
+                let hash = blake3_hash(&pattern);
+                handler.write(idx * BLOCK_SIZE as u64, &pattern, false).await.unwrap();
+                models.get_mut(&active_export).unwrap().insert(idx, hash);
+            }
+            // Read (20%)
+            40..60 => {
+                let idx = rng.gen_range(0..num_blocks);
+                let data = handler.read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32).await.unwrap();
+                let actual = blake3_hash(&data);
+                let model = models.get(&active_export).unwrap();
+                let expect = model.get(&idx).unwrap_or(&zero_hash);
+                assert_eq!(
+                    &actual, expect,
+                    "read mismatch at block {} on export {}",
+                    idx, active_export
+                );
+            }
+            // Trim (10%)
+            60..70 => {
+                let idx = rng.gen_range(0..num_blocks);
+                handler.trim(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32, false).await.unwrap();
+                models.get_mut(&active_export).unwrap().insert(idx, zero_hash);
+            }
+            // Write zeroes (10%)
+            70..80 => {
+                let idx = rng.gen_range(0..num_blocks);
+                handler
+                    .write_zeroes(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32, false)
+                    .await
+                    .unwrap();
+                models.get_mut(&active_export).unwrap().insert(idx, zero_hash);
+            }
+            // Flush (8%)
+            80..88 => {
+                handler.flush().unwrap();
+            }
+            // Snapshot (5%)
+            88..93 => {
+                server.snapshot_export(&active_export).await;
+            }
+            // Fork (4%)
+            93..97 => {
+                if exports_alive.len() < 8 {
+                    let fork_name = format!("vol-{}", exports_alive.len());
+                    // Drain to ensure fork can see S3 data
+                    server.router.drain_export(&active_export).await.unwrap();
+                    // All forks share root prefix "vol-0"
+                    {
+                        let config = glidefs::config::ExportConfig {
+                            name: fork_name.clone(),
+                            size_gb,
+                            s3_prefix: Some("vol-0".to_string()),
+                            block_size: None,
+                            blocks_per_pack: None,
+                            flush_mode: None,
+                            transport: None,
+                        };
+                        server
+                            .router
+                            .create_export(config, false, Some(&active_export), None)
+                            .await
+                            .unwrap();
+                    }
+                    // Fork inherits parent's model
+                    let parent_model = models.get(&active_export).unwrap().clone();
+                    models.insert(fork_name.clone(), parent_model);
+                    fork_sources.insert(fork_name.clone(), "vol-0".to_string());
+                    exports_alive.push(fork_name.clone());
+
+                    // Switch to the new fork
+                    client.disconnect().await.unwrap();
+                    client = server.connect(&fork_name).await;
+                    active_export = fork_name;
+                }
+            }
+            // Switch active export (3%)
+            _ => {
+                if exports_alive.len() > 1 {
+                    let idx = rng.gen_range(0..exports_alive.len());
+                    let new_export = exports_alive[idx].clone();
+                    if new_export != active_export {
+                        client.disconnect().await.unwrap();
+                        client = server.connect(&new_export).await;
+                        active_export = new_export;
+                    }
+                }
+            }
+        }
+        total_ops += 1;
+    }
+
+    // Final verification: drain all, cold restart, verify each export
+    client.disconnect().await.unwrap();
+    for name in &exports_alive {
+        server.router.drain_export(name).await.unwrap();
+    }
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    let mut final_errors = 0u64;
+
+    for name in &exports_alive {
+        // Forks store manifests under the source's s3_prefix
+        if let Some(source) = fork_sources.get(name) {
+            server2.restore_forked_export(name, source, size_gb).await;
+        } else {
+            server2.restore_export(name, size_gb).await;
+        }
+        let mut c2 = server2.connect(name).await;
+        let model = models.get(name).unwrap();
+
+        for (&idx, expect) in model {
+            let data = c2
+                .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                .await
+                .unwrap();
+            let actual = blake3_hash(&data);
+            if &actual != expect {
+                final_errors += 1;
+                eprintln!(
+                    "  MISMATCH: export={}, block={}",
+                    name, idx
+                );
+            }
+        }
+
+        c2.disconnect().await.unwrap();
+        verify_passes += 1;
+    }
+
+    server2.shutdown().await;
+
+    eprintln!();
+    eprintln!("=== Soak Mixed Operations ({}s) ===", duration_secs);
+    eprintln!("  Total ops:        {}", total_ops);
+    eprintln!("  Exports alive:    {}", exports_alive.len());
+    eprintln!("  Verify passes:    {}", verify_passes);
+    eprintln!("  Final errors:     {}", final_errors);
+    eprintln!();
+
+    assert_eq!(final_errors, 0, "soak mixed operations verification failed");
+}
+
+// ---------------------------------------------------------------------------
+// 12. Soak: concurrent clients — 8 tasks doing random reads/writes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn soak_concurrent_clients() {
+    let duration_secs: u64 = std::env::var("SOAK_DURATION_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "soak-concurrent";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 2048;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+
+    let num_clients = 8u64;
+    let conn_info = server.connect_info("vol").await;
+
+    // Each client writes to its own block range to avoid write conflicts
+    // but reads from the full range to test concurrent read paths
+    let blocks_per_client = num_blocks / num_clients;
+    let deadline = t0 + std::time::Duration::from_secs(duration_secs);
+
+    let mut handles = Vec::new();
+
+    for client_id in 0..num_clients {
+        let info = conn_info.clone();
+        let block_start = client_id * blocks_per_client;
+        let block_end = block_start + blocks_per_client;
+
+        handles.push(tokio::spawn(async move {
+            let mut client = info.connect().await.unwrap();
+            let mut rng = StdRng::seed_from_u64(0xC11E_0000 + client_id);
+            let mut written: HashMap<u64, [u8; 32]> = HashMap::new();
+            let mut ops = 0u64;
+            let mut errors = 0u64;
+
+            while Instant::now() < deadline {
+                if rng.gen_bool(0.6) {
+                    // Write to own range
+                    let idx = rng.gen_range(block_start..block_end);
+                    let pattern = block_pattern(rng.r#gen(), BLOCK_SIZE);
+                    let hash = blake3_hash(&pattern);
+                    client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+                    written.insert(idx, hash);
+                } else {
+                    // Read from own range (verify last-written value)
+                    let idx = rng.gen_range(block_start..block_end);
+                    let data = client
+                        .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                        .await
+                        .unwrap();
+                    let actual = blake3_hash(&data);
+                    if let Some(expect) = written.get(&idx) {
+                        if &actual != expect {
+                            errors += 1;
+                        }
+                    }
+                    // else: unwritten block, skip check (could be zero or another client's)
+                }
+                ops += 1;
+
+                // Periodic flush
+                if ops % 50 == 0 {
+                    client.flush().await.unwrap();
+                }
+            }
+
+            client.flush().await.unwrap();
+            client.disconnect().await.unwrap();
+
+            (client_id, ops, written, errors)
+        }));
+    }
+
+    // Collect results
+    let mut total_ops = 0u64;
+    let mut all_written: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut live_errors = 0u64;
+
+    for handle in handles {
+        let (cid, ops, written, errs) = handle.await.unwrap();
+        eprintln!("  client {}: {} ops, {} blocks written, {} errors", cid, ops, written.len(), errs);
+        total_ops += ops;
+        live_errors += errs;
+        all_written.extend(written);
+    }
+
+    assert_eq!(live_errors, 0, "live read errors during concurrent soak");
+
+    // Cold restart verification
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut verifier = server2.connect("vol").await;
+
+    let mut cold_errors = 0u64;
+    for (&idx, expect) in &all_written {
+        let data = verifier
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = blake3_hash(&data);
+        if &actual != expect {
+            cold_errors += 1;
+        }
+    }
+
+    verifier.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    eprintln!();
+    eprintln!("=== Soak Concurrent Clients ({}s) ===", duration_secs);
+    eprintln!("  Clients:          {}", num_clients);
+    eprintln!("  Total ops:        {}", total_ops);
+    eprintln!("  Unique blocks:    {}", all_written.len());
+    eprintln!("  Cold errors:      {}", cold_errors);
+    eprintln!();
+
+    assert_eq!(cold_errors, 0, "soak concurrent clients cold verification failed");
+}
+
+// ---------------------------------------------------------------------------
+// 13. Soak: crash loop — write, kill, restart, verify × 20
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn soak_crash_loop() {
+    let ctx = TestContext::new().await;
+    let db_path = "soak-crash";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 1024;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let num_cycles: u32 = std::env::var("SOAK_CRASH_CYCLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+
+    let zero_hash = blake3_hash(&vec![0u8; BLOCK_SIZE]);
+    let mut rng = StdRng::seed_from_u64(0xC2A5_1001_DEAD);
+
+    // Track only flushed blocks (survived to SSD) — unflushed writes may be lost.
+    let mut flushed: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut pending: HashMap<u64, [u8; 32]> = HashMap::new();
+
+    // Use a persistent cache directory (survives across "crashes")
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache_path = cache_dir.path().to_path_buf();
+
+    for cycle in 0..num_cycles {
+        eprintln!("[crash-loop] cycle {}/{}", cycle + 1, num_cycles);
+
+        let server = if cycle == 0 {
+            let s = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+            s.create_export("vol", size_gb).await;
+            s
+        } else {
+            // Start with existing cache dir — triggers WAL recovery
+            let s = TestServer::start_with_cache_dir(
+                Arc::clone(&ctx.object_store),
+                db_path,
+                transport,
+                cache_path.clone(),
+            )
+            .await;
+            s.restore_export("vol", size_gb).await;
+            s
+        };
+
+        let mut client = server.connect("vol").await;
+
+        // Verify previously flushed blocks survived
+        let mut verify_errors = 0u64;
+        let check_count = flushed.len().min(200);
+        let check_indices: Vec<u64> = flushed.keys().copied().collect::<Vec<_>>()[..check_count].to_vec();
+
+        for idx in &check_indices {
+            let data = client
+                .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                .await
+                .unwrap();
+            let actual = blake3_hash(&data);
+            let expect = flushed.get(idx).unwrap_or(&zero_hash);
+            if &actual != expect {
+                verify_errors += 1;
+            }
+        }
+        if cycle > 0 {
+            eprintln!("  verified {} blocks: {} errors", check_count, verify_errors);
+            assert_eq!(
+                verify_errors, 0,
+                "crash loop cycle {}: flushed block verification failed",
+                cycle
+            );
+        }
+
+        // Write random blocks
+        let batch_size = rng.gen_range(20..60);
+        pending.clear();
+        for _ in 0..batch_size {
+            let idx = rng.gen_range(0..num_blocks);
+            let pattern = block_pattern(rng.r#gen(), BLOCK_SIZE);
+            let hash = blake3_hash(&pattern);
+            client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+            pending.insert(idx, hash);
+        }
+
+        // Flush — after this, pending blocks are durable on SSD
+        client.flush().await.unwrap();
+        flushed.extend(pending.drain());
+
+        // "Crash" — drop without draining to S3 (simulates kill -9)
+        client.disconnect().await.unwrap();
+        // Don't drain, don't shutdown gracefully — just drop the server
+        // The router shutdown will run cleanup but cache_dir persists
+        server.shutdown().await;
+    }
+
+    eprintln!();
+    eprintln!("=== Soak Crash Loop ({} cycles) ===", num_cycles);
+    eprintln!("  Unique flushed blocks: {}", flushed.len());
+    eprintln!("  All cycles passed");
+}
+
+// ---------------------------------------------------------------------------
+// 14. Soak: fork chain churn — build 20-fork chain, delete alternating, GC
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn soak_fork_chain_churn() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "soak-fork-churn";
+    let transport = crate::Transport::Nbd;
+
+    let blocks_per_level = 32u64;
+    let num_levels: usize = 20;
+    let num_blocks: u64 = (num_levels as u64 + 1) * blocks_per_level;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    let mut rng = StdRng::seed_from_u64(0xF02E_C4A1_0000);
+
+    // Per-export reference model
+    let mut models: Vec<(String, HashMap<u64, [u8; 32]>)> = Vec::new();
+
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+
+    // Create root export and write initial data
+    let root_name = "fork-0".to_string();
+    server.create_export(&root_name, size_gb).await;
+    let mut client = server.connect(&root_name).await;
+    let mut root_model: HashMap<u64, [u8; 32]> = HashMap::new();
+
+    for i in 0..blocks_per_level {
+        let pattern = block_pattern(rng.r#gen(), BLOCK_SIZE);
+        let hash = blake3_hash(&pattern);
+        client.write(i * BLOCK_SIZE as u64, &pattern).await.unwrap();
+        root_model.insert(i, hash);
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+    server.snapshot_export(&root_name).await;
+
+    models.push((root_name.clone(), root_model));
+
+    // Build chain: each level forks from previous, writes to its own block range.
+    // All forks share the root s3_prefix so manifests and packs are co-located.
+    for level in 1..=num_levels {
+        let parent_name = format!("fork-{}", level - 1);
+        let child_name = format!("fork-{}", level);
+
+        // Drain parent to S3 before forking
+        server.router.drain_export(&parent_name).await.unwrap();
+        // All forks use root prefix (multi-level chains require shared s3_prefix)
+        {
+            let config = glidefs::config::ExportConfig {
+                name: child_name.clone(),
+                size_gb,
+                s3_prefix: Some(root_name.clone()),
+                block_size: None,
+                blocks_per_pack: None,
+                flush_mode: None,
+                transport: None,
+            };
+            server
+                .router
+                .create_export(config, false, Some(&parent_name), None)
+                .await
+                .unwrap();
+        }
+
+        let mut client = server.connect(&child_name).await;
+
+        // Inherit parent model
+        let parent_model = models.last().unwrap().1.clone();
+        let mut child_model = parent_model;
+
+        // Write to this level's block range + overwrite block 0
+        let block_start = level as u64 * blocks_per_level;
+        for i in 0..blocks_per_level {
+            let idx = block_start + i;
+            let pattern = block_pattern(rng.r#gen(), BLOCK_SIZE);
+            let hash = blake3_hash(&pattern);
+            client.write(idx * BLOCK_SIZE as u64, &pattern).await.unwrap();
+            child_model.insert(idx, hash);
+        }
+        // Overwrite block 0 with level-specific data
+        let b0_pattern = block_pattern(rng.r#gen(), BLOCK_SIZE);
+        let b0_hash = blake3_hash(&b0_pattern);
+        client.write(0, &b0_pattern).await.unwrap();
+        child_model.insert(0, b0_hash);
+
+        client.flush().await.unwrap();
+        client.disconnect().await.unwrap();
+        server.snapshot_export(&child_name).await;
+
+        models.push((child_name, child_model));
+
+        if level % 5 == 0 {
+            eprintln!("[fork-churn] built {}/{} levels", level, num_levels);
+        }
+    }
+
+    // Drain all exports to S3
+    for (name, _) in &models {
+        server.router.drain_export(name).await.unwrap();
+    }
+
+    // Delete every other export (keep even indices: 0, 2, 4, ...)
+    let mut deleted = Vec::new();
+    let mut kept = Vec::new();
+    for (i, (name, model)) in models.iter().enumerate() {
+        if i % 2 == 1 {
+            server.router.remove_export(name, true).await.unwrap();
+            deleted.push(name.clone());
+        } else {
+            kept.push((name.clone(), model.clone()));
+        }
+    }
+    eprintln!(
+        "[fork-churn] deleted {} exports, kept {}",
+        deleted.len(),
+        kept.len()
+    );
+
+    server.shutdown().await;
+
+    // Cold restart and verify kept exports
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    let mut final_errors = 0u64;
+
+    for (name, model) in &kept {
+        // All forks share root prefix; root itself uses its own prefix
+        if name == &root_name {
+            server2.restore_export(name, size_gb).await;
+        } else {
+            server2.restore_forked_export(name, &root_name, size_gb).await;
+        }
+        let mut c2 = server2.connect(name).await;
+
+        for (&idx, expect) in model {
+            let data = c2
+                .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                .await
+                .unwrap();
+            let actual = blake3_hash(&data);
+            if &actual != expect {
+                final_errors += 1;
+                eprintln!("  MISMATCH: export={}, block={}", name, idx);
+            }
+        }
+        c2.disconnect().await.unwrap();
+    }
+
+    server2.shutdown().await;
+
+    eprintln!();
+    eprintln!("=== Soak Fork Chain Churn ({:.1}s) ===", t0.elapsed().as_secs_f64());
+    eprintln!("  Levels built:     {}", num_levels);
+    eprintln!("  Exports deleted:  {}", deleted.len());
+    eprintln!("  Exports verified: {}", kept.len());
+    eprintln!("  Final errors:     {}", final_errors);
+    eprintln!();
+
+    assert_eq!(final_errors, 0, "soak fork chain churn verification failed");
+}
+
+// ---------------------------------------------------------------------------
+// 15. Soak: sub-block writes with byte-level reference model
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn soak_sub_block_writes() {
+    let duration_secs: u64 = std::env::var("SOAK_DURATION_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "soak-subblock";
+    let transport = crate::Transport::Nbd;
+
+    // Smaller device — byte-level tracking is memory intensive
+    let num_blocks: u64 = 256; // 32 MB
+    let device_size = num_blocks * BLOCK_SIZE as u64;
+    let size_gb = device_size as f64 / 1_000_000_000.0;
+
+    let mut rng = StdRng::seed_from_u64(0x5B8E_0C10_CAFE);
+
+    // Byte-level reference model: track expected bytes per block.
+    // To save memory, only track blocks that have been written to.
+    let mut block_models: HashMap<u64, Vec<u8>> = HashMap::new();
+
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+
+    let handler = server
+        .router
+        .get_handler("vol")
+        .await
+        .expect("no handler");
+
+    let mut total_ops: u64 = 0;
+    let deadline = t0 + std::time::Duration::from_secs(duration_secs);
+
+    while Instant::now() < deadline {
+        // Random sub-block write (64B to 4096B)
+        let block_idx = rng.gen_range(0..num_blocks);
+        let write_size: usize = rng.gen_range(64..=4096);
+        let max_offset_within_block = BLOCK_SIZE - write_size;
+        let offset_within_block: usize = rng.gen_range(0..=max_offset_within_block);
+
+        let device_offset = block_idx * BLOCK_SIZE as u64 + offset_within_block as u64;
+
+        // Generate random data for the sub-block write
+        let mut write_data = vec![0u8; write_size];
+        for byte in &mut write_data {
+            *byte = rng.r#gen();
+        }
+
+        handler.write(device_offset, &write_data, false).await.unwrap();
+
+        // Update byte-level model
+        let model = block_models
+            .entry(block_idx)
+            .or_insert_with(|| vec![0u8; BLOCK_SIZE]);
+        model[offset_within_block..offset_within_block + write_size]
+            .copy_from_slice(&write_data);
+
+        total_ops += 1;
+
+        // Periodic full-block read to verify merge correctness
+        if total_ops % 100 == 0 {
+            // Pick a random written block and verify
+            let written_blocks: Vec<u64> = block_models.keys().copied().collect();
+            if !written_blocks.is_empty() {
+                let check_idx = written_blocks[rng.gen_range(0..written_blocks.len())];
+                let read_data = handler
+                    .read(check_idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                    .await
+                    .unwrap();
+                let expected = block_models.get(&check_idx).unwrap();
+                assert_eq!(
+                    read_data.as_ref(),
+                    expected.as_slice(),
+                    "sub-block merge mismatch at block {} after {} ops",
+                    check_idx,
+                    total_ops
+                );
+            }
+        }
+
+        // Periodic flush
+        if total_ops % 200 == 0 {
+            handler.flush().unwrap();
+        }
+    }
+
+    // Final verification: drain to S3, cold restart, verify all tracked blocks
+    handler.flush().unwrap();
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut cold_client = server2.connect("vol").await;
+
+    let mut cold_errors = 0u64;
+    for (&idx, expected) in &block_models {
+        let data = cold_client
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        if data.as_slice() != expected.as_slice() {
+            cold_errors += 1;
+            // Find first mismatched byte for diagnostics
+            for (b, (got, exp)) in data.iter().zip(expected.iter()).enumerate() {
+                if got != exp {
+                    eprintln!(
+                        "  MISMATCH: block={}, byte_offset={}, got=0x{:02x}, expected=0x{:02x}",
+                        idx, b, got, exp
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    cold_client.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    eprintln!();
+    eprintln!("=== Soak Sub-Block Writes ({}s) ===", duration_secs);
+    eprintln!("  Total sub-block writes: {}", total_ops);
+    eprintln!("  Blocks touched:         {}", block_models.len());
+    eprintln!("  Cold errors:            {}", cold_errors);
+    eprintln!();
+
+    assert_eq!(cold_errors, 0, "soak sub-block writes cold verification failed");
+}

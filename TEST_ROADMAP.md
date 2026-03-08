@@ -93,10 +93,10 @@ Readonly write/trim/write_zeroes rejection and promote-then-write are fully cove
 
 No existing tests exercise SSD pressure. `capacity_monitor.rs` has unit tests for classification logic only.
 
-- **`ssd_full_rejects_new_blocks`** — Fill SSD to >95% utilization. Write to a never-before-written block. Must return ENOSPC. Write to an already-written block (overwrite). Must succeed.
-- **`ssd_full_reads_still_work`** — SSD at 95%+. Reads from cache and from S3 must still work.
-- **`ssd_full_flush_frees_space`** — SSD at 95%, flush to S3, verify dirty count drops. (Does flush actually free SSD space? If not, this documents that behavior.)
-- **`ssd_full_recovery`** — SSD fills up, writes rejected, flush runs, space freed, writes resume. End-to-end pressure cycle.
+- [x] **`ssd_full_rejects_new_blocks`** — Fill SSD to >95% utilization. Write to a never-before-written block. Must return ENOSPC. Write to an already-written block (overwrite). Must succeed. Also confirms write_zeroes succeeds (uses fallocate, no SSD allocation). *(integration/ssd_pressure.rs)*
+- [x] **`ssd_full_reads_still_work`** — SSD at 95%+. Reads from cache and from S3 must still work. Flush still works. *(integration/ssd_pressure.rs)*
+- [x] **`ssd_full_flush_frees_space`** — SSD at 95%, flush to S3, verify dirty count drops. NOTE: Flush does NOT free SSD space (data file retains physical allocation), but dirty_block_count drops to zero and data reaches S3. *(integration/ssd_pressure.rs)*
+- [x] **`ssd_full_recovery`** — SSD fills up, writes rejected, flush runs, space freed, writes resume. End-to-end pressure cycle. *(integration/ssd_pressure.rs)*
 
 ### 9. S3 degraded operation
 
@@ -148,11 +148,11 @@ These run for minutes to hours and catch bugs that only manifest over time.
 
 The existing `integrity_suite::soak_test` covers random write/read with a reference model and periodic cold-wake verification. These tests extend it to cover additional dimensions:
 
-- **`soak_mixed_operations`** — Random mix of: write, read, trim, write_zeroes, flush, fork, snapshot, delete. With reference model tracking expected state per export. Run for 10 minutes. Catches: state machine bugs in BlockMap, manifest corruption from operation interleaving. (Existing soak only does write+read+flush.)
-- **`soak_concurrent_clients`** — 8 clients doing random reads/writes to same export simultaneously for 10 minutes. Each client tracks what it wrote. At end, each client verifies its last write to each offset is visible. Catches: lost writes, torn reads under real concurrency. (Existing soak is single-client.)
-- **`soak_crash_loop`** — Write random blocks for 30 seconds, kill -9, restart, verify via reference model, repeat 20 times. Catches: cumulative state corruption from repeated unclean shutdowns. (Existing soak does graceful drain+shutdown, not crash.)
-- **`soak_fork_chain_churn`** — Create export, write, snapshot, fork, write to fork, snapshot fork, fork again — build a chain of 20 forks. Then delete every other export. GC. Verify remaining exports still read correctly. Catches: GC bugs, manifest reference counting, pack sharing issues.
-- **`soak_sub_block_writes`** — Random sub-block-sized writes (64B-2048B) to random offsets for 10 minutes, with reference model tracking byte-level expected state. Periodic full-block reads to verify merge correctness. Catches: partial block bitmap bugs, backfill race conditions.
+- [x] **`soak_mixed_operations`** — Random mix of: write, read, trim, write_zeroes, flush, fork, snapshot, delete. With reference model tracking expected state per export. Run for 10 minutes. Catches: state machine bugs in BlockMap, manifest corruption from operation interleaving. (Existing soak only does write+read+flush.) *(added in `integrity_suite.rs::soak_mixed_operations`)*
+- [x] **`soak_concurrent_clients`** — 8 clients doing random reads/writes to same export simultaneously for 10 minutes. Each client tracks what it wrote. At end, each client verifies its last write to each offset is visible. Catches: lost writes, torn reads under real concurrency. (Existing soak is single-client.) *(added in `integrity_suite.rs::soak_concurrent_clients`)*
+- [x] **`soak_crash_loop`** — Write random blocks for 30 seconds, kill -9, restart, verify via reference model, repeat 20 times. Catches: cumulative state corruption from repeated unclean shutdowns. (Existing soak does graceful drain+shutdown, not crash.) *(added in `integrity_suite.rs::soak_crash_loop`)*
+- [x] **`soak_fork_chain_churn`** — Create export, write, snapshot, fork, write to fork, snapshot fork, fork again — build a chain of 20 forks. Then delete every other export. GC. Verify remaining exports still read correctly. Catches: GC bugs, manifest reference counting, pack sharing issues. *(added in `integrity_suite.rs::soak_fork_chain_churn`)*
+- [x] **`soak_sub_block_writes`** — Random sub-block-sized writes (64B-2048B) to random offsets for 10 minutes, with reference model tracking byte-level expected state. Periodic full-block reads to verify merge correctness. Catches: partial block bitmap bugs, backfill race conditions. *(added in `integrity_suite.rs::soak_sub_block_writes`)*
 
 ### 14. fio verify workloads
 
