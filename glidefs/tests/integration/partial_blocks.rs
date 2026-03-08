@@ -13,14 +13,24 @@
 //!
 //! Run with: `cargo test --features test-utils --test integration partial_blocks`
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
 use object_store::memory::InMemory;
+use object_store::path::Path;
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
+};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
-use glidefs::block::cache::SimpleBlockCache;
+use glidefs::block::cache::{BlockCache, SimpleBlockCache};
 use glidefs::block::content_store::ContentStore;
+use glidefs::block::handler::BlockHandler;
 use glidefs::block::metrics::ExportMetrics;
 use glidefs::block::state::Initializing;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -305,6 +315,181 @@ async fn test_partial_block_crash_after_checkpoint_recovery() {
 }
 
 // =============================================================================
+// CRASH DURING BACKFILL: PARTIAL BLOCK STAYS RECOVERABLE
+// =============================================================================
+
+/// Crash after sub-block write but before background backfill completes.
+///
+/// The backfill task fetches the full block from S3 and fills unwritten sub-regions.
+/// If we crash before the backfill completes, the partial block should:
+/// 1. Survive recovery (WAL has the partial entry)
+/// 2. Still have the guest-written sub-regions on SSD
+/// 3. Be marked dirty so it will be backfilled on next handler startup
+///
+/// Note: The on-demand merge (filling unwritten regions from S3) happens at the
+/// BlockHandler level, not WriteCache level. WriteCache::read() returns local SSD
+/// data as-is. This test verifies the WriteCache-level contract: guest data survives
+/// crash and the block is dirty after recovery.
+#[tokio::test]
+async fn test_partial_block_crash_during_backfill() {
+    let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+    // --- Fork child: write sub-block, checkpoint, then crash ---
+    // This simulates: sub-block write triggers backfill, but crash happens
+    // before backfill task completes (we never spawn it).
+    let child_dir = TempDir::new().unwrap();
+    {
+        let config = WriteCacheConfig {
+            cache_dir: child_dir.path().to_path_buf(),
+            device_name: "child-crash".to_string(),
+            device_size: DEVICE_SIZE,
+            block_size: BLOCK_SIZE,
+            wal_sync: true,
+        };
+        let cache = WriteCache::open_fresh_active(config.clone()).unwrap();
+
+        // Mark block 0 as partial (simulating what backfill_missing_blocks does)
+        cache.insert_partial_block_for_test(0);
+
+        // Write first 4KB with guest data
+        cache.write(0, &[0xBB; SUB_BLOCK], cc.as_ref()).unwrap();
+
+        // Also write a non-partial block to verify both survive
+        cache
+            .write(BLOCK_SIZE as u64, &vec![0xDD; BLOCK_SIZE], cc.as_ref())
+            .unwrap();
+
+        // Save metadata (checkpoint), then crash without completing backfill
+        cache.save_metadata().unwrap();
+        drop(cache);
+    }
+
+    // --- Recovery: reopen, verify guest data survived ---
+    {
+        let child_config = WriteCacheConfig {
+            cache_dir: child_dir.path().to_path_buf(),
+            device_name: "child-crash".to_string(),
+            device_size: DEVICE_SIZE,
+            block_size: BLOCK_SIZE,
+            wal_sync: true,
+        };
+
+        let cache = WriteCache::<Initializing>::open(child_config).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // Block 0 should be dirty (partial write survived via WAL/metadata)
+        assert!(
+            cache.dirty_block_count() >= 2,
+            "both blocks should be dirty after recovery, got {}",
+            cache.dirty_block_count()
+        );
+
+        // Guest-written sub-region should be on SSD
+        let raw = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert!(
+            raw[..SUB_BLOCK].iter().all(|&b| b == 0xBB),
+            "guest-written sub-region (0xBB) should survive crash"
+        );
+
+        // Unwritten sub-regions are zeros on local SSD (backfill never completed)
+        // This is correct — the BlockHandler is responsible for merging S3 data
+        // on the next read via spawn_background_backfill.
+        assert!(
+            raw[SUB_BLOCK..].iter().all(|&b| b == 0),
+            "unbackfilled sub-regions should be zeros on SSD"
+        );
+
+        // Non-partial block should also survive fully
+        let block1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        assert!(
+            block1.iter().all(|&b| b == 0xDD),
+            "non-partial block should survive intact"
+        );
+    }
+}
+
+/// Two concurrent sub-block writes to the same block — second write must win
+/// for the overlapping region.
+///
+/// Write 4KB at offset 0 (value 0xBB), immediately write 4KB at offset 0 again
+/// (value 0xCC). The second write must win because writes are serialized by the
+/// per-block write_lock.
+#[tokio::test]
+async fn test_partial_block_concurrent_write_same_subregion() {
+    let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let cs = ContentStore::new(Arc::clone(&s3), "test");
+    let pic = Arc::clone(&*SHARED_PACK_INDEX_CACHE);
+    let metrics = Arc::new(ExportMetrics::new());
+    let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+    // --- Parent: write block 0 with 0xAA, flush to S3 ---
+    let parent_dir = TempDir::new().unwrap();
+    {
+        let (cache, cs2, pic2, vm, cc2, _m) =
+            super::create_test_cache(&parent_dir, "parent2", Arc::clone(&s3)).await;
+        cache
+            .write(0, &vec![0xAA; BLOCK_SIZE], cc2.as_ref())
+            .unwrap();
+        cache.flush_to_s3(&cs2, &pic2, &vm).await.unwrap();
+        let manifest_bytes = vm.read().serialize();
+        cs.put_manifest("parent2", manifest_bytes).await.unwrap();
+    }
+
+    // --- Fork child: two writes to same sub-region ---
+    let child_dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: child_dir.path().to_path_buf(),
+        device_name: "child-overwrite".to_string(),
+        device_size: DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: false,
+    };
+    let cache = WriteCache::open_fresh_active(config).unwrap();
+
+    // Mark block 0 as partial
+    cache.insert_partial_block_for_test(0);
+
+    // First write: 4KB at offset 0 with 0xBB
+    cache.write(0, &[0xBB; SUB_BLOCK], cc.as_ref()).unwrap();
+
+    // Second write: 4KB at offset 0 with 0xCC — must overwrite
+    cache.write(0, &[0xCC; SUB_BLOCK], cc.as_ref()).unwrap();
+
+    // Fetch parent manifest for on-demand read
+    let manifest_data = cs
+        .get_manifest("parent2")
+        .await
+        .unwrap()
+        .expect("parent manifest should exist");
+    let parent_manifest =
+        glidefs::block::volume_manifest::VolumeManifest::deserialize(&manifest_data).unwrap();
+    let child_vm = Arc::new(parking_lot::RwLock::new(parent_manifest));
+
+    // Read full block: should see 0xCC (second write wins) + 0xAA (parent)
+    let data = cache
+        .read(
+            0,
+            BLOCK_SIZE,
+            cc.as_ref(),
+            &pic,
+            &child_vm,
+            &cs,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        data[..SUB_BLOCK].iter().all(|&b| b == 0xCC),
+        "first 4KB should be 0xCC (second write wins)"
+    );
+    assert!(
+        data[SUB_BLOCK..].iter().all(|&b| b == 0xAA),
+        "remaining should be 0xAA from parent"
+    );
+}
+
+// =============================================================================
 // PROPERTY TESTS: RANDOM SUB-BLOCK WRITES
 // =============================================================================
 
@@ -415,5 +600,179 @@ proptest! {
 
             Ok(())
         })?;
+    }
+}
+
+// =============================================================================
+// MAX_PARTIAL_BLOCKS CAP OVERFLOW
+// =============================================================================
+
+/// ObjectStore wrapper that adds a configurable delay to GET operations.
+/// Used to slow down background backfills so partial_blocks fills to capacity.
+#[derive(Debug)]
+struct DelayedGetObjectStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    delay_ms: AtomicU64,
+}
+
+impl std::fmt::Display for DelayedGetObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DelayedGetObjectStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for DelayedGetObjectStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> ObjectStoreResult<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> ObjectStoreResult<GetResult> {
+        let ms = self.delay_ms.load(Ordering::Relaxed);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+        self.inner.delete(location).await
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> ObjectStoreResult<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy(from, to).await
+    }
+
+    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+}
+
+/// Write 4KB to 1025 S3-only blocks (exceeding MAX_PARTIAL_BLOCKS=1024).
+/// Background backfills are delayed so partial_blocks fills to capacity.
+/// The 1025th block falls back to synchronous backfill.
+/// All reads return correct merged data (guest write + parent data).
+#[tokio::test]
+async fn test_partial_block_cap_overflow() {
+    let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let pic = Arc::clone(&*SHARED_PACK_INDEX_CACHE);
+
+    // --- Parent: write 1025 blocks with unique data, flush to S3 ---
+    let parent_dir = TempDir::new().unwrap();
+    let parent_manifest = {
+        let (cache, cs, pic, vm, cc, _m) =
+            super::create_test_cache(&parent_dir, "parent-cap", Arc::clone(&s3)).await;
+
+        for i in 0..1025u64 {
+            let fill = (i % 251) as u8 + 1; // non-zero, unique per block
+            cache
+                .write(i * BLOCK_SIZE as u64, &vec![fill; BLOCK_SIZE], cc.as_ref())
+                .unwrap();
+        }
+        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        vm.read().clone()
+    };
+
+    // --- Fork child with delayed GETs (background backfills take 200ms each) ---
+    let delayed_s3 = Arc::new(DelayedGetObjectStore {
+        inner: Arc::clone(&s3),
+        delay_ms: AtomicU64::new(200),
+    });
+
+    let child_dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: child_dir.path().to_path_buf(),
+        device_name: "child-cap".to_string(),
+        device_size: DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: false,
+    };
+    let cache = Arc::new(WriteCache::open_fresh_active(config).unwrap());
+
+    let content_store = Arc::new(ContentStore::new(
+        delayed_s3.clone() as Arc<dyn object_store::ObjectStore>,
+        "test",
+    ));
+    let vm = Arc::new(parking_lot::RwLock::new(parent_manifest));
+    let cc: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(256 * 1024 * 1024));
+    let metrics = Arc::new(ExportMetrics::new());
+
+    let handler = BlockHandler::new(
+        Arc::clone(&cache),
+        content_store,
+        Arc::clone(&cc),
+        Arc::clone(&pic),
+        Arc::clone(&vm),
+        DEVICE_SIZE,
+        false,
+        metrics,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(tokio::sync::Notify::new()),
+        500,
+        None,
+    );
+
+    // --- Write 4KB (one sub-region) to each of 1025 blocks ---
+    // With 200ms GET delay, background backfills won't complete before we finish
+    // writing (~10ms total), so partial_blocks fills to MAX_PARTIAL_BLOCKS=1024.
+    // Block 1024 hits the cap and falls back to synchronous backfill.
+    for i in 0..1025u64 {
+        handler
+            .write(i * BLOCK_SIZE as u64, &vec![0xFF; SUB_BLOCK], false)
+            .await
+            .unwrap();
+    }
+
+    // Disable delay so reads (and remaining backfills) complete quickly
+    delayed_s3.delay_ms.store(0, Ordering::Relaxed);
+
+    // --- Verify all 1025 blocks: guest 4KB + parent data for the rest ---
+    for i in 0..1025u64 {
+        let data = handler
+            .read(i * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+
+        let parent_fill = (i % 251) as u8 + 1;
+
+        // First SUB_BLOCK bytes: our write
+        assert!(
+            data[..SUB_BLOCK].iter().all(|&b| b == 0xFF),
+            "block {i}: first {SUB_BLOCK} bytes should be 0xFF (our write)",
+        );
+
+        // Remaining bytes: parent data
+        assert!(
+            data[SUB_BLOCK..].iter().all(|&b| b == parent_fill),
+            "block {i}: remaining bytes should be parent 0x{parent_fill:02X}",
+        );
     }
 }

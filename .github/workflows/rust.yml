@@ -118,3 +118,5 @@ jobs:
         run: cargo test -p glidefs --features ublk,test-utils --verbose
       - name: Docker integration (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose
+      - name: Filesystem crash recovery (nbd + ublk)
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration fs_crash -- --nocapture --verbose

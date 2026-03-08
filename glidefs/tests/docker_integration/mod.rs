@@ -926,6 +926,7 @@ mod device_stability;
 mod export_discovery;
 mod ext4_verify;
 mod fork_roundtrip;
+mod fs_crash_recovery;
 mod integrity_suite;
 mod live_migration;
 mod multi_export;

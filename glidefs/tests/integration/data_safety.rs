@@ -1635,3 +1635,258 @@ async fn test_within_batch_dedup_mixed_unique_and_duplicate() {
         );
     }
 }
+
+// =============================================================================
+// TEST: COMPACTION DURING ACTIVE WRITES
+// =============================================================================
+
+/// Continuously write while compaction runs. No block data should be lost.
+/// New writes should not be compacted mid-flight.
+#[tokio::test]
+async fn test_compaction_during_active_writes() {
+    use glidefs::block::write_cache::compact::compact_if_needed;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, _m) =
+        create_cache_with_store(&dir, "compact-writes", Arc::clone(&s3)).await;
+
+    // Build up 17 packs to exceed compaction threshold of 16
+    for i in 0..17u8 {
+        let data = vec![i; BLOCK_SIZE];
+        cache.write(0, &data, cc.as_ref()).unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    }
+
+    // Spawn continuous writes to multiple blocks while compaction runs
+    let cache2 = Arc::clone(&cache);
+    let cc2 = Arc::clone(&cc);
+    let write_handle = tokio::spawn(async move {
+        for round in 0..20u8 {
+            // Write to blocks 0-4 with unique data per round
+            for block in 0..5u64 {
+                let data = vec![round.wrapping_add(0x80); BLOCK_SIZE];
+                cache2
+                    .write(block * BLOCK_SIZE as u64, &data, cc2.as_ref())
+                    .unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // Run compaction concurrently
+    let compact_result = compact_if_needed(16, &cs, &pic, &vm).await;
+
+    write_handle.await.unwrap();
+
+    // Compaction may succeed or abort via CAS — both are correct
+    if let Err(e) = &compact_result {
+        assert!(
+            e.to_string().contains("concurrent")
+                || e.to_string().contains("aborted")
+                || e.to_string().contains("Io"),
+            "unexpected compaction error: {e}"
+        );
+    }
+
+    // Flush remaining dirty blocks
+    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    assert_eq!(cache.dirty_block_count(), 0, "all blocks should be clean after flush");
+
+    // Cold read: verify all blocks have the last written data (0xF0 + 19 = 0x03 wrapping)
+    drop(cache);
+    let reader_dir = TempDir::new().unwrap();
+    let (reader, rcs, rpic, rvm, rcc, rm) =
+        create_reader(&reader_dir, "compact-writes", Arc::clone(&s3)).await;
+
+    for block in 0..5u64 {
+        let data = reader
+            .read(
+                block * BLOCK_SIZE as u64,
+                BLOCK_SIZE,
+                rcc.as_ref(),
+                &rpic,
+                &rvm,
+                &rcs,
+                &rm,
+            )
+            .await
+            .unwrap();
+        // Last round wrote 19 + 0x80 = 0x93
+        let expected = 19u8.wrapping_add(0x80);
+        assert_eq!(
+            data[0], expected,
+            "block {} should have last written data (0x{:02x}), got 0x{:02x}",
+            block, expected, data[0]
+        );
+    }
+}
+
+// =============================================================================
+// TEST: COMPACTION CRASH MIDWAY
+// =============================================================================
+
+/// Start compaction, crash after new base pack is uploaded but before manifest
+/// update. Restart. Either old or new packs should be valid — no orphaned refs.
+#[tokio::test]
+async fn test_compaction_crash_midway() {
+    use glidefs::block::write_cache::compact::compact_chunk;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, _m) =
+        create_cache_with_store(&dir, "compact-crash", Arc::clone(&s3)).await;
+
+    // Build up 3 packs so we have something to compact
+    for i in 0..3u8 {
+        let data = vec![i + 1; BLOCK_SIZE];
+        cache.write(0, &data, cc.as_ref()).unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    }
+    cache.sync_manifest(&cs, &vm).await.unwrap();
+
+    // Snapshot the pack list before compaction
+    let packs_before: Vec<u64> = vm.read().chunk_pack_ids(0).unwrap().to_vec();
+    assert_eq!(packs_before.len(), 3);
+
+    // Run compaction — this uploads a new base pack and updates the manifest
+    let blocks_per_chunk = vm.read().blocks_per_chunk();
+    let result = compact_chunk(0, &packs_before, blocks_per_chunk, &cs, &pic, &vm)
+        .await
+        .unwrap();
+
+    // Simulate crash: DON'T sync the manifest to S3.
+    // The in-memory manifest has been updated (replace_packs_cas succeeded),
+    // but S3 still has the old manifest.
+
+    // "Restart": load manifest from S3 (old state, references old packs)
+    let reader_dir = TempDir::new().unwrap();
+    let (reader, reader_cs, reader_pic, reader_vm, reader_cc, reader_m) =
+        create_reader(&reader_dir, "compact-crash", Arc::clone(&s3)).await;
+
+    // Old packs should still be on S3 — compaction doesn't delete them
+    // (GC handles deletion). So the old manifest should read correctly.
+    let data = reader
+        .read(0, BLOCK_SIZE, reader_cc.as_ref(), &reader_pic, &reader_vm, &reader_cs, &reader_m)
+        .await
+        .unwrap();
+    assert_eq!(
+        data[0], 3,
+        "cold reader with old manifest should see seed=3 (last write), got {}",
+        data[0]
+    );
+
+    // Also verify: the NEW base pack uploaded by compaction is on S3
+    let new_pack_id = result.new_pack_id;
+    let chunk_packs = cs.list_chunk_packs(0).await.unwrap();
+    assert!(
+        chunk_packs.iter().any(|p| p.contains(&format!("{new_pack_id:016x}"))),
+        "new base pack from compaction should exist on S3 (orphaned but not lost)"
+    );
+
+    // Now sync the updated manifest and verify it also reads correctly
+    cache.sync_manifest(&cs, &vm).await.unwrap();
+    let reader_dir2 = TempDir::new().unwrap();
+    let (reader2, rcs2, rpic2, rvm2, rcc2, rm2) =
+        create_reader(&reader_dir2, "compact-crash", Arc::clone(&s3)).await;
+
+    let data2 = reader2
+        .read(0, BLOCK_SIZE, rcc2.as_ref(), &rpic2, &rvm2, &rcs2, &rm2)
+        .await
+        .unwrap();
+    assert_eq!(
+        data2[0], 3,
+        "cold reader with new manifest should also see seed=3, got {}",
+        data2[0]
+    );
+}
+
+// =============================================================================
+// TEST: COMPACTION DEDUP CORRECTNESS
+// =============================================================================
+
+/// Write same data to 100 different blocks. Compact. Verify dedup occurs
+/// (fewer packs, smaller size). Read all 100 blocks, verify data.
+#[tokio::test]
+async fn test_compaction_dedup_correctness() {
+    use glidefs::block::write_cache::compact::compact_if_needed;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, _m) =
+        create_cache_with_store(&dir, "compact-dedup", Arc::clone(&s3)).await;
+
+    // Write the SAME data to 100 different blocks
+    let dedup_data = vec![0xDD; BLOCK_SIZE];
+    for i in 0..100u64 {
+        cache
+            .write(i * BLOCK_SIZE as u64, &dedup_data, cc.as_ref())
+            .unwrap();
+    }
+
+    // Flush in two batches to create multiple packs
+    // (flush_to_s3 creates packs based on blocks_per_pack)
+    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+
+    let _packs_before_compact = vm.read().chunk_pack_ids(0).unwrap().len();
+
+    // Write the same data again (to force a second pack) and flush
+    for i in 0..100u64 {
+        cache
+            .write(i * BLOCK_SIZE as u64, &dedup_data, cc.as_ref())
+            .unwrap();
+    }
+    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+
+    let packs_after_second_flush = vm.read().chunk_pack_ids(0).unwrap().len();
+    assert!(
+        packs_after_second_flush >= 2,
+        "should have at least 2 packs before compaction, got {}",
+        packs_after_second_flush
+    );
+
+    // Compact
+    let results = compact_if_needed(1, &cs, &pic, &vm).await.unwrap();
+    assert!(
+        !results.is_empty(),
+        "compaction should have run (threshold=1, have {} packs)",
+        packs_after_second_flush
+    );
+
+    let packs_after_compact = vm.read().chunk_pack_ids(0).unwrap().len();
+    assert!(
+        packs_after_compact < packs_after_second_flush,
+        "compaction should reduce pack count from {} to fewer, got {}",
+        packs_after_second_flush,
+        packs_after_compact
+    );
+
+    // Sync manifest and cold-read all 100 blocks
+    cache.sync_manifest(&cs, &vm).await.unwrap();
+    drop(cache);
+
+    let reader_dir = TempDir::new().unwrap();
+    let (reader, rcs, rpic, rvm, rcc, rm) =
+        create_reader(&reader_dir, "compact-dedup", Arc::clone(&s3)).await;
+
+    for i in 0..100u64 {
+        let data = reader
+            .read(
+                i * BLOCK_SIZE as u64,
+                BLOCK_SIZE,
+                rcc.as_ref(),
+                &rpic,
+                &rvm,
+                &rcs,
+                &rm,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            data.as_ref(),
+            &dedup_data[..],
+            "block {} should have dedup data (0xDD) after compaction",
+            i
+        );
+    }
+}

@@ -1506,6 +1506,152 @@ async fn fork_chain_integrity() {
 }
 
 // ---------------------------------------------------------------------------
+// 13b. Deep fork chain read-through (5 levels)
+// ---------------------------------------------------------------------------
+
+/// Creates A → B → C → D → E (5-level fork chain). Each level writes unique
+/// blocks and overwrites one block from its parent. Cold restart and verify all
+/// blocks from E resolve correctly through the full inheritance chain.
+///
+/// All exports share the root s3_prefix ("level-a") so manifests and packs are
+/// co-located — matching the pattern used by `fork_chain_integrity`.
+#[tokio::test]
+#[ignore]
+async fn fork_deep_chain_read_through() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-deepfork";
+    let transport = crate::Transport::Nbd;
+
+    // 128 blocks total — each level writes to a unique range of 20 blocks
+    // plus overwrites block 0 with its own pattern.
+    let num_blocks: u64 = 128;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let blocks_per_level = 20u64;
+
+    let levels = ["level-a", "level-b", "level-c", "level-d", "level-e"];
+    let root_prefix = levels[0]; // All manifests/packs stored under root's s3_prefix
+
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+
+    // Track expected hash for every block index
+    let mut expected: HashMap<u64, [u8; 32]> = HashMap::new();
+
+    for (i, &name) in levels.iter().enumerate() {
+        if i == 0 {
+            // Create root export
+            server.create_export(name, size_gb).await;
+        } else {
+            // Fork from parent — all share the root s3_prefix
+            let parent = levels[i - 1];
+            let config = glidefs::config::ExportConfig {
+                name: name.to_string(),
+                size_gb,
+                s3_prefix: Some(root_prefix.to_string()),
+                block_size: None,
+                blocks_per_pack: None,
+                flush_mode: None,
+                transport: None,
+            };
+            server
+                .router
+                .create_export(config, false, Some(parent), None)
+                .await
+                .unwrap();
+        }
+
+        let mut client = server.connect(name).await;
+
+        // Each level writes blocks [i*20 .. i*20+20) with a unique seed
+        let base = i as u64 * blocks_per_level;
+        for j in 0..blocks_per_level {
+            let idx = base + j;
+            if idx >= num_blocks {
+                break;
+            }
+            let seed = idx + (i as u64 + 1) * 1_000_000;
+            let pattern = block_pattern(seed, BLOCK_SIZE);
+            expected.insert(idx, blake3_hash(&pattern));
+            client
+                .write(idx * BLOCK_SIZE as u64, &pattern)
+                .await
+                .unwrap();
+        }
+
+        // Every level overwrites block 0 with its own pattern
+        let block0_seed = (i as u64 + 1) * 9_999_999;
+        let block0_pattern = block_pattern(block0_seed, BLOCK_SIZE);
+        expected.insert(0, blake3_hash(&block0_pattern));
+        client.write(0, &block0_pattern).await.unwrap();
+
+        client.flush().await.unwrap();
+        client.disconnect().await.unwrap();
+
+        if i < levels.len() - 1 {
+            // Snapshot so the next level can fork
+            server.snapshot_export(name).await;
+        }
+    }
+
+    // Drain everything to S3, then cold restart
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    // Restore the leaf (level-e) from S3 via the shared root prefix
+    server2
+        .restore_forked_export("level-e", root_prefix, size_gb)
+        .await;
+    let mut reader = server2.connect("level-e").await;
+
+    let zero_hash = blake3_hash(&vec![0u8; BLOCK_SIZE]);
+    let mut errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = reader
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = blake3_hash(&data);
+        let expect = expected.get(&idx).unwrap_or(&zero_hash);
+        if &actual != expect {
+            eprintln!(
+                "DEEP FORK MISMATCH block {} (expected from level {})",
+                idx,
+                if idx == 0 {
+                    "e (last overwrite)"
+                } else {
+                    match idx / blocks_per_level {
+                        0 => "a",
+                        1 => "b",
+                        2 => "c",
+                        3 => "d",
+                        4 => "e",
+                        _ => "unwritten",
+                    }
+                }
+            );
+            errors += 1;
+        }
+    }
+
+    reader.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[fork_deep_chain_read_through] {} verified via S3 (5-level fork) in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(
+        errors, 0,
+        "deep fork chain verification failed for {} blocks",
+        errors
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 14. Write-during-drain integrity — concurrent writes + flush + S3 verify
 // ---------------------------------------------------------------------------
 

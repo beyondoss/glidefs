@@ -60,6 +60,46 @@ transport_test! {
     }
 }
 
+// Client A writes + flushes, client B reads — must see A's write.
+// Tests multi-client cache coherence after flush.
+transport_test! {
+    async fn test_flush_write_visibility_across_clients(transport) {
+        let ctx = TestContext::new().await;
+        let server = TestServer::start(Arc::clone(&ctx.object_store), "flush-visibility", transport).await;
+        server.create_export("vol1", 0.01).await;
+
+        let pattern = vec![0xDDu8; BLOCK_SIZE];
+
+        // Client A: write block 0, flush
+        let mut client_a = server.connect("vol1").await;
+        client_a.write(0, &pattern).await.unwrap();
+        client_a.flush().await.unwrap();
+
+        // Client B: read block 0 — must see A's write
+        let mut client_b = server.connect("vol1").await;
+        let data = client_b.read(0, BLOCK_SIZE as u32).await.unwrap();
+        assert_eq!(
+            data, pattern,
+            "client B must see client A's write after flush"
+        );
+
+        // Write from B, flush from B, read from A — must see B's write
+        let pattern_b = vec![0xEEu8; BLOCK_SIZE];
+        client_b.write(BLOCK_SIZE as u64, &pattern_b).await.unwrap();
+        client_b.flush().await.unwrap();
+
+        let data = client_a.read(BLOCK_SIZE as u64, BLOCK_SIZE as u32).await.unwrap();
+        assert_eq!(
+            data, pattern_b,
+            "client A must see client B's write after flush"
+        );
+
+        client_a.disconnect().await.unwrap();
+        client_b.disconnect().await.unwrap();
+        server.shutdown().await;
+    }
+}
+
 transport_test! {
     async fn test_drain_during_active_writes(transport) {
         let ctx = TestContext::new().await;
