@@ -368,6 +368,7 @@ impl CacheInner {
     /// - **Clean(1) -> Dirty(2)**: increments dirty_block_count.
     /// - **Syncing(3) -> Dirty(2)**: decrements syncing_block_count, increments dirty_block_count.
     /// - **Dirty(2) -> Dirty(2)**: no-op.
+    ///
     /// Returns `true` if the state actually changed (CLEAN→DIRTY or
     /// SYNCING→DIRTY), `false` if the block was already DIRTY. Used by the
     /// write path to skip redundant WAL entries.

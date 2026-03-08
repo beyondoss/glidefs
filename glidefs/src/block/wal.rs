@@ -113,7 +113,6 @@ impl Wal {
             .create(true)
             .truncate(false)
             .read(true)
-            .write(true)
             .append(true)
             .open(path)?;
 
