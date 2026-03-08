@@ -54,7 +54,7 @@ mod fio_bench {
                     max_s3_uploads: 128,
                     max_s3_downloads: 512,
                     default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
-                    ublk_nr_queues: 1,
+                    ublk_nr_queues: 4,
                     nbd_dead_conn_timeout: 0,
                 })
                 .await
