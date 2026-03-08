@@ -282,7 +282,11 @@ mod fio_verify {
 
     /// Write with fio, drain to S3, cold restart from manifest, verify with fio.
     /// Catches: data loss through the full persistence path (write → SSD → pack → S3 → cold-wake → read).
-    #[tokio::test]
+    ///
+    /// Must use multi_thread: the blocking `fio` command occupies a thread while
+    /// ublk I/O handlers need the tokio runtime to serve cold reads from S3.
+    /// With current_thread, fio blocks the only worker and ublk I/O deadlocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fio_verify_after_cold_wake() {
         if skip_unless_ready() { return; }
 
