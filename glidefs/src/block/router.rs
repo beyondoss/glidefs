@@ -854,6 +854,9 @@ impl ExportRouter {
             None, // TODO: wire up write_trace_path from ExportConfig
         ));
 
+        // Spawn background backfill for any partial blocks recovered from WAL
+        handler.spawn_recovery_backfills();
+
         // Start flush scheduler for this export
         let (flush_shutdown_tx, flush_shutdown_rx) = watch::channel(false);
         let flush_cache = Arc::clone(&cache);
@@ -3211,6 +3214,257 @@ mod tests {
             data.iter().all(|&b| b == 0),
             "deleted manifest should yield zero-filled reads"
         );
+    }
+
+    // =========================================================================
+    // Partial block / async sub-block backfill tests
+    // =========================================================================
+
+    /// Helper: set up a parent export with block_size bytes of 0xAA flushed to
+    /// S3, then return a freshly forked child router on the same InMemory store.
+    async fn setup_parent_fork(
+        temp_dir: &TempDir,
+        parent_fill: u8,
+    ) -> (ExportRouter, Arc<dyn object_store::ObjectStore>) {
+        use object_store::ObjectStore as _;
+        let s3: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let router = ExportRouter::new(RouterConfig {
+            object_store: Arc::clone(&s3),
+            db_path: "test".to_string(),
+            cache_dir: temp_dir.path().join("parent"),
+            block_size: 128 * 1024,
+            clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+        })
+        .await
+        .unwrap();
+
+        router
+            .create_export(test_export_config("parent"), false, None, None)
+            .await
+            .unwrap();
+        let parent = router.get_handler("parent").await.unwrap();
+        // Write one full block of parent_fill
+        parent
+            .write(0, &vec![parent_fill; 128 * 1024], false)
+            .await
+            .unwrap();
+        router.snapshot_export("parent", None).await.unwrap();
+        drop(parent);
+
+        let fork_router = ExportRouter::new(RouterConfig {
+            object_store: Arc::clone(&s3),
+            db_path: "test".to_string(),
+            cache_dir: temp_dir.path().join("child"),
+            block_size: 128 * 1024,
+            clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+        })
+        .await
+        .unwrap();
+
+        let fork_config = ExportConfig {
+            name: "child".to_string(),
+            size_gb: 0.01,
+            s3_prefix: Some("parent".to_string()),
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        fork_router
+            .create_export(fork_config, false, Some("parent"), None)
+            .await
+            .unwrap();
+
+        (fork_router, s3)
+    }
+
+    /// Multiple sub-block writes to the same 128KB block must all be preserved.
+    ///
+    /// Writes 4KB at offsets 0, 16384, and 122880 within the same block (which
+    /// has parent data 0xAA in S3). Reads back all three regions and the
+    /// unwritten regions — all must be correct.
+    #[tokio::test]
+    async fn test_multiple_sub_block_writes_same_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let (router, _s3) = setup_parent_fork(&temp_dir, 0xAA).await;
+        let child = router.get_handler("child").await.unwrap();
+
+        let block_size = 128 * 1024usize;
+        let sub = 4096usize;
+
+        // Three non-overlapping 4KB writes within block 0
+        child.write(0, &[0xBB; 4096], false).await.unwrap();
+        child.write(16384, &[0xCC; 4096], false).await.unwrap();
+        child.write(122880, &[0xDD; 4096], false).await.unwrap();
+
+        // Allow background backfill to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Read the full block
+        let full = child.read(0, block_size as u32).await.unwrap();
+        assert_eq!(full.len(), block_size);
+
+        // Offset 0..4096: 0xBB (written)
+        assert!(full[0..sub].iter().all(|&b| b == 0xBB), "sub-region 0 should be 0xBB");
+        // Offset 4096..16384: 0xAA (parent, unwritten)
+        assert!(full[sub..16384].iter().all(|&b| b == 0xAA), "gap 1 should be 0xAA");
+        // Offset 16384..20480: 0xCC (written)
+        assert!(full[16384..20480].iter().all(|&b| b == 0xCC), "sub-region 4 should be 0xCC");
+        // Offset 20480..122880: 0xAA (parent, unwritten)
+        assert!(full[20480..122880].iter().all(|&b| b == 0xAA), "gap 2 should be 0xAA");
+        // Offset 122880..126976: 0xDD (written)
+        assert!(full[122880..126976].iter().all(|&b| b == 0xDD), "sub-region 30 should be 0xDD");
+        // Offset 126976..131072: 0xAA (parent, unwritten)
+        assert!(full[126976..].iter().all(|&b| b == 0xAA), "tail should be 0xAA");
+    }
+
+    /// Sub-block write + flush to S3 + cold wake must serve correct merged data.
+    ///
+    /// Writes 4KB of 0xBB to a forked block (parent is 0xAA), flushes to S3,
+    /// then a cold reader must see: [0xBB; 4KB] + [0xAA; 124KB].
+    #[tokio::test]
+    async fn test_sub_block_write_flush_cold_wake() {
+        let temp_dir = TempDir::new().unwrap();
+        let (router, s3) = setup_parent_fork(&temp_dir, 0xAA).await;
+        let child = router.get_handler("child").await.unwrap();
+        let block_size = 128 * 1024u32;
+
+        // Sub-block write: only the first 4KB
+        child.write(0, &[0xBB; 4096], false).await.unwrap();
+
+        // Wait for background backfill to complete before flushing
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Flush child to S3
+        router.drain_export("child").await.unwrap();
+        router.save_export(&ExportConfig {
+            name: "child".to_string(),
+            size_gb: 0.01,
+            s3_prefix: Some("parent".to_string()),
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        }).await.unwrap();
+        drop(child);
+
+        // Cold reader from a fresh directory
+        let reader_dir = TempDir::new().unwrap();
+        let cold_router = ExportRouter::new(RouterConfig {
+            object_store: Arc::clone(&s3),
+            db_path: "test".to_string(),
+            cache_dir: reader_dir.path().to_path_buf(),
+            block_size: 128 * 1024,
+            clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+        })
+        .await
+        .unwrap();
+        cold_router
+            .create_export(
+                ExportConfig {
+                    name: "child".to_string(),
+                    size_gb: 0.01,
+                    s3_prefix: Some("parent".to_string()),
+                    block_size: None,
+                    blocks_per_pack: None,
+                    flush_mode: None,
+                    transport: None,
+                },
+                false,
+                Some("child"),
+                None,
+            )
+            .await
+            .unwrap();
+        let cold_handler = cold_router.get_handler("child").await.unwrap();
+
+        let data = cold_handler.read(0, block_size).await.unwrap();
+        assert_eq!(data.len(), block_size as usize);
+        assert!(
+            data[..4096].iter().all(|&b| b == 0xBB),
+            "cold wake: first 4KB should be 0xBB"
+        );
+        assert!(
+            data[4096..].iter().all(|&b| b == 0xAA),
+            "cold wake: rest should be 0xAA"
+        );
+    }
+
+    /// Concurrent sub-block writes to different sub-regions of the same block.
+    ///
+    /// 4 tasks each write 4KB to a distinct sub-region. After all complete
+    /// and backfill runs, each written sub-region must have the task's data
+    /// and all other sub-regions must have parent data (0xAA).
+    #[tokio::test]
+    async fn test_concurrent_sub_block_writes_same_block() {
+        let temp_dir = TempDir::new().unwrap();
+        let (router, _s3) = setup_parent_fork(&temp_dir, 0xAA).await;
+        let child = Arc::new(router.get_handler("child").await.unwrap());
+
+        // Write to 4 distinct sub-regions concurrently using different task data
+        let offsets_and_fills: Vec<(u64, u8)> = vec![
+            (0, 0xB1),
+            (8192, 0xB2),
+            (32768, 0xB3),
+            (65536, 0xB4),
+        ];
+
+        let mut handles = Vec::new();
+        for (offset, fill) in offsets_and_fills.clone() {
+            let child_clone = Arc::clone(&child);
+            handles.push(tokio::spawn(async move {
+                child_clone
+                    .write(offset, &[fill; 4096], false)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Allow background backfill to settle
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let block_size = 128 * 1024u32;
+        let data = child.read(0, block_size).await.unwrap();
+
+        for (offset, fill) in &offsets_and_fills {
+            let start = *offset as usize;
+            let end = start + 4096;
+            assert!(
+                data[start..end].iter().all(|&b| b == *fill),
+                "sub-region at offset {} should be 0x{:02X}",
+                offset,
+                fill
+            );
+        }
+
+        // Verify unwritten sub-regions have parent data
+        // Check middle of the gaps
+        assert_eq!(data[4096], 0xAA, "gap at 4096 should be 0xAA");
+        assert_eq!(data[16384], 0xAA, "gap at 16384 should be 0xAA");
+        assert_eq!(data[40960], 0xAA, "gap at 40960 should be 0xAA");
+        assert_eq!(data[73728], 0xAA, "gap at 73728 should be 0xAA");
     }
 
     /// Sub-block write to a forked export must NOT destroy unwritten portions

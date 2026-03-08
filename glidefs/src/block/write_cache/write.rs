@@ -2,7 +2,7 @@ use tracing::{debug, instrument};
 
 use crate::block::cache::BlockCache;
 use crate::block::state::Active;
-use crate::block::wal::WalEntryRef;
+use crate::block::wal::{serialize_entry, serialize_partial_entry};
 
 use super::{CacheError, WriteCache};
 
@@ -17,7 +17,7 @@ impl WriteCache<Active> {
     /// Uses CAS operations for state transitions:
     /// - Clean → Dirty: increment dirty_count
     /// - Syncing → Dirty: decrement syncing_count, increment dirty_count
-    /// - Dirty → Dirty: no-op
+    /// - Dirty → Dirty: no-op (WAL entry skipped — already recorded)
     /// Hash computation is deferred to flush-to-S3 time. The write path only
     /// does: set_present → pwrite → mark dirty → invalidate CRC → WAL append.
     #[instrument(skip(self, data, _clean_cache), fields(offset = offset, len = data.len()))]
@@ -52,42 +52,82 @@ impl WriteCache<Active> {
         //
         // By setting present first, prefetch's CAS will fail if we've claimed the block,
         // or if prefetch wins the CAS, our pwrite will overwrite their stale S3 data.
+        //
+        // For partial blocks: mark sub-regions BEFORE pwrite (same invariant).
+        // This ensures background backfill sees the bit set and skips sub-regions
+        // the guest is about to write.
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
+                if self.inner.is_partial(idx) {
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end = (offset + data.len() as u64).min(block_start_byte + block_size);
+                    self.inner.mark_sub_regions(
+                        idx,
+                        (write_start - block_start_byte) as usize,
+                        (write_end - write_start) as usize,
+                    );
+                }
             }
         }
 
         // Now write to local file (after claiming blocks via set_present)
         self.inner.data_file.write_all_at(data, offset)?;
 
-        // Mark affected blocks as dirty, invalidate stale CRC32 checksums,
-        // and record in WAL. Combined into a single pass under the WAL lock
-        // to minimize loop overhead on multi-block writes. The CAS and
-        // DashMap insert are fast (~ns), so holding the WAL lock is fine.
-        {
-            let mut wal = self.inner.wal.lock();
-            for block in start_block..=end_block {
-                let idx = block as usize;
-                if idx >= self.inner.num_blocks {
-                    continue;
+        // Re-pwrite under per-block write_lock for any partial blocks.
+        // This guarantees guest data wins over a concurrent backfill write
+        // that may have overwritten our pwrite above using stale S3 data.
+        // Only touches partial blocks (transient state, ~ms lifetime).
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                if let Some(state) = self.inner.partial_blocks.get(&idx) {
+                    let _guard = state.value().write_lock.lock();
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end =
+                        (offset + data.len() as u64).min(block_start_byte + block_size);
+                    let data_offset = (write_start - offset) as usize;
+                    let write_len = (write_end - write_start) as usize;
+                    self.inner.data_file.write_all_at(
+                        &data[data_offset..data_offset + write_len],
+                        write_start,
+                    )?;
                 }
-                self.inner.transition_to_dirty(idx);
-                self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
-
-                let seq = self.inner.sequence.next();
-                let wal_entry = WalEntryRef {
-                    block_index: block,
-                    sequence: seq,
-                };
-                wal.append(&wal_entry)?;
             }
+        }
 
+        // Mark affected blocks as dirty, invalidate stale CRC32 checksums,
+        // and batch WAL entries. Lock-free: O_APPEND WAL handles concurrency.
+        // Skip WAL append for blocks already dirty (redundant — already recorded).
+        let mut batch = Vec::new();
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx >= self.inner.num_blocks {
+                continue;
+            }
+            let state_changed = self.inner.transition_to_dirty(idx);
+            self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
+
+            let partial_bitmap = self.inner.partial_bitmap(idx);
+            if state_changed || partial_bitmap.is_some() {
+                let seq = self.inner.sequence.next();
+                if let Some(bitmap) = partial_bitmap {
+                    serialize_partial_entry(&mut batch, block, seq, bitmap);
+                } else {
+                    serialize_entry(&mut batch, block, seq);
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            self.inner.wal.append_batch(&batch)?;
             if self.inner.config.wal_sync {
-                wal.sync()?;
+                self.inner.wal.sync()?;
             } else {
-                wal.flush_buf()?;
+                self.inner.wal.flush()?;
             }
         }
 
@@ -121,6 +161,7 @@ impl WriteCache<Active> {
         // CRITICAL: Mark blocks as present BEFORE writing zeros to file.
         // Same invariant as write() — prevents prefetch race where prefetch
         // could overwrite our zeros with stale S3 data.
+        // For partial blocks: mark sub-regions before zeroing.
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (offset + len - 1) / block_size;
@@ -128,6 +169,16 @@ impl WriteCache<Active> {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
+                if self.inner.is_partial(idx) {
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end = (offset + len).min(block_start_byte + block_size);
+                    self.inner.mark_sub_regions(
+                        idx,
+                        (write_start - block_start_byte) as usize,
+                        (write_end - write_start) as usize,
+                    );
+                }
             }
         }
 
@@ -167,34 +218,58 @@ impl WriteCache<Active> {
             self.zero_range_fallback(offset, len)?;
         }
 
-        // Mark affected blocks as dirty, invalidate stale CRCs, and record
-        // in WAL. Combined into a single pass under the WAL lock.
+        // Re-zero under per-block write_lock for any partial blocks (same
+        // rationale as the re-pwrite in write()).
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                if let Some(state) = self.inner.partial_blocks.get(&idx) {
+                    let _guard = state.value().write_lock.lock();
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end = (offset + len).min(block_start_byte + block_size);
+                    let zero_len = (write_end - write_start) as usize;
+                    self.inner
+                        .data_file
+                        .write_all_at(&self.inner.zero_block_bytes[..zero_len], write_start)?;
+                }
+            }
+        }
+
+        // Mark affected blocks as dirty, invalidate stale CRCs, and batch
+        // WAL entries. Skip redundant entries for already-dirty blocks.
         {
             let block_size = self.inner.config.block_size as u64;
             let start_block = offset / block_size;
             let end_block = (offset + len - 1) / block_size;
 
-            let mut wal = self.inner.wal.lock();
+            let mut batch = Vec::new();
             for block in start_block..=end_block {
                 let idx = block as usize;
                 if idx >= self.inner.num_blocks {
                     continue;
                 }
-                self.inner.transition_to_dirty(idx);
+                let state_changed = self.inner.transition_to_dirty(idx);
                 self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
 
-                let seq = self.inner.sequence.next();
-                let wal_entry = WalEntryRef {
-                    block_index: block,
-                    sequence: seq,
-                };
-                wal.append(&wal_entry)?;
+                let partial_bitmap = self.inner.partial_bitmap(idx);
+                if state_changed || partial_bitmap.is_some() {
+                    let seq = self.inner.sequence.next();
+                    if let Some(bitmap) = partial_bitmap {
+                        serialize_partial_entry(&mut batch, block, seq, bitmap);
+                    } else {
+                        serialize_entry(&mut batch, block, seq);
+                    }
+                }
             }
 
-            if self.inner.config.wal_sync {
-                wal.sync()?;
-            } else {
-                wal.flush_buf()?;
+            if !batch.is_empty() {
+                self.inner.wal.append_batch(&batch)?;
+                if self.inner.config.wal_sync {
+                    self.inner.wal.sync()?;
+                } else {
+                    self.inner.wal.flush()?;
+                }
             }
         }
 
@@ -276,6 +351,16 @@ impl WriteCache<Active> {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
+                if self.inner.is_partial(idx) {
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end = (offset + len).min(block_start_byte + block_size);
+                    self.inner.mark_sub_regions(
+                        idx,
+                        (write_start - block_start_byte) as usize,
+                        (write_end - write_start) as usize,
+                    );
+                }
             }
         }
 
@@ -296,33 +381,34 @@ impl WriteCache<Active> {
         let start_block = offset / block_size;
         let end_block = (offset + len - 1) / block_size;
 
-        // Mark affected blocks as dirty, invalidate stale CRCs, and record
-        // in WAL. Combined into a single pass under the WAL lock to prevent
-        // a crash-safety gap: without the lock, a crash between
-        // transition_to_dirty and WAL append would leave a block appearing
-        // CLEAN after recovery despite having new data on SSD.
-        {
-            let mut wal = self.inner.wal.lock();
-            for block in start_block..=end_block {
-                let idx = block as usize;
-                if idx >= self.inner.num_blocks {
-                    continue;
-                }
-                self.inner.transition_to_dirty(idx);
-                self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
-
-                let seq = self.inner.sequence.next();
-                let wal_entry = WalEntryRef {
-                    block_index: block,
-                    sequence: seq,
-                };
-                wal.append(&wal_entry)?;
+        // Mark affected blocks as dirty, invalidate stale CRCs, and batch
+        // WAL entries. Skip redundant entries for already-dirty blocks.
+        let mut batch = Vec::new();
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx >= self.inner.num_blocks {
+                continue;
             }
+            let state_changed = self.inner.transition_to_dirty(idx);
+            self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
 
+            let partial_bitmap = self.inner.partial_bitmap(idx);
+            if state_changed || partial_bitmap.is_some() {
+                let seq = self.inner.sequence.next();
+                if let Some(bitmap) = partial_bitmap {
+                    serialize_partial_entry(&mut batch, block, seq, bitmap);
+                } else {
+                    serialize_entry(&mut batch, block, seq);
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            self.inner.wal.append_batch(&batch)?;
             if self.inner.config.wal_sync {
-                wal.sync()?;
+                self.inner.wal.sync()?;
             } else {
-                wal.flush_buf()?;
+                self.inner.wal.flush()?;
             }
         }
 

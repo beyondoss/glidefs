@@ -564,17 +564,14 @@ impl ContentStore {
     ) -> Result<Vec<super::pack::PackIndexEntry>, ContentStoreError> {
         use super::pack::{PACK_INDEX_ENTRY_SIZE, TRAILER_SIZE, parse_pack_index};
 
-        // 128 MiB chunk / 128 KB block = 1024 max blocks per pack.
-        const MAX_BLOCKS: usize = 1024;
+        // Maximum blocks per chunk: chunk_size / min_block_size = 128 MiB / 4 KB = 32768.
+        // block_size is configurable (4KB–1MB) so we must size the suffix read for the
+        // worst case, not just the default (128KB → 1024 blocks). With 32768 entries at
+        // 28 bytes each + 8 byte trailer, the suffix read is ~896 KB — negligible for S3.
+        const MIN_BLOCK_SIZE: usize = 4096;
+        const MAX_BLOCKS: usize =
+            super::volume_manifest::DEFAULT_CHUNK_SIZE as usize / MIN_BLOCK_SIZE;
         const MAX_SUFFIX: u64 = (MAX_BLOCKS * PACK_INDEX_ENTRY_SIZE + TRAILER_SIZE) as u64;
-
-        // Compile-time: if chunk_size or block_size defaults change, this range-read
-        // must be updated to cover the new max blocks per chunk.
-        const _: () = assert!(
-            super::volume_manifest::DEFAULT_CHUNK_SIZE as usize
-                / crate::config::NbdConfig::DEFAULT_BLOCK_SIZE
-                == MAX_BLOCKS
-        );
 
         let key = format!(
             "{}/chunks/{:04}/{:016x}.pack",
@@ -843,5 +840,72 @@ mod tests {
             .expect("manifest should exist");
 
         assert_eq!(got, data);
+    }
+
+    /// Regression: suffix read window must handle packs with >1024 blocks.
+    ///
+    /// With block_size < 128KB, a chunk can hold more than 1024 blocks.
+    /// A drain of a full chunk creates a single pack with all those blocks.
+    /// The suffix read in get_pack_index must be large enough to read the
+    /// entire footer index, or the pack becomes unreadable after upload —
+    /// data loss on cold restart.
+    ///
+    /// This test creates a pack with 2048 blocks (simulating 64KB block_size
+    /// with 128 MiB chunk_size) and verifies the suffix read can parse it.
+    #[tokio::test]
+    async fn test_suffix_read_handles_large_pack() {
+        use crate::block::block_map::{blake3_128, lz4_compress, lz4_decompress};
+
+        let store = test_store("test-bucket");
+        let pack_id: u64 = 0xDEAD_BEEF_0000_2048;
+        let block_size: u32 = 64 * 1024; // 64KB blocks
+        let block_count: u32 = 2048; // > old MAX_BLOCKS of 1024
+
+        // Build 2048 blocks with distinct data
+        let mut originals = Vec::new();
+        let mut blocks = Vec::new();
+        for chunk_offset in 0..block_count {
+            let data: Vec<u8> = (0..block_size as usize)
+                .map(|j| ((chunk_offset as usize * 31 + j * 7) % 256) as u8)
+                .collect();
+            let hash = blake3_128(&data);
+            let compressed = lz4_compress(&data);
+            originals.push((chunk_offset, data));
+            blocks.push((hash, chunk_offset, compressed));
+        }
+
+        // Upload via streaming path
+        let entries = store
+            .stream_chunk_pack(0, pack_id, blocks, block_size)
+            .await
+            .expect("stream_chunk_pack should succeed with 2048 blocks");
+        assert_eq!(entries.len(), block_count as usize);
+
+        // Read back via suffix-based index parse — this was the bug:
+        // old MAX_BLOCKS=1024 would fail with "suffix too small for index"
+        let index_entries = store
+            .get_pack_index(0, pack_id)
+            .await
+            .expect("get_pack_index should handle >1024-block packs");
+        assert_eq!(index_entries.len(), block_count as usize);
+
+        // Spot-check a few blocks decompress correctly
+        for &check_offset in &[0, 1023, 1024, 2047] {
+            let entry = index_entries
+                .iter()
+                .find(|e| e.chunk_offset == check_offset)
+                .unwrap_or_else(|| panic!("no entry for chunk_offset {check_offset}"));
+            let compressed = store
+                .get_chunk_block(0, pack_id, entry.offset, entry.comp_length)
+                .await
+                .unwrap();
+            let decompressed =
+                lz4_decompress(&compressed).expect("LZ4 decompression should succeed");
+            let original = &originals[check_offset as usize].1;
+            assert_eq!(
+                &decompressed, original,
+                "data mismatch at chunk_offset {check_offset}"
+            );
+        }
     }
 }

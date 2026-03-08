@@ -992,18 +992,19 @@ async fn io_task_zc(
         let length = byte_len as u32;
         let addr = iod.addr;
 
-        let result = if let Some(r) = dispatch_passthrough(op, offset, length, fua, handler).await {
-            r
-        } else {
-            match op {
-                sys::UBLK_IO_OP_WRITE => {
-                    handle_write_zc(q, offset, length, fua, addr, handler).await
-                }
-                sys::UBLK_IO_OP_READ => {
-                    handle_read_zc(q, offset, length, addr, handler).await
-                }
-                _ => -libc::EINVAL,
+        let result = match op {
+            sys::UBLK_IO_OP_READ => {
+                handle_read_zc(q, offset, length, addr, handler).await
             }
+            sys::UBLK_IO_OP_WRITE => {
+                handle_write_zc(q, offset, length, fua, addr, handler).await
+            }
+            // Cold ops: Box::pin to keep their large async state machines
+            // off the io_task_zc future enum. trim/write_zeroes chain into
+            // backfill_missing_blocks → cache.read → locate_block → S3,
+            // producing multi-KB futures that inflate L1 cache footprint
+            // for the hot read/write paths if left inline.
+            _ => Box::pin(dispatch_cold(op, offset, length, fua, handler)).await,
         };
 
         q.submit_io_commit_cmd(tag, BufDesc::AutoReg(auto_reg), result)
@@ -1033,7 +1034,10 @@ async fn handle_write_zc(
     }
 
     // Phase 1: prepare metadata before data lands on disk.
-    if let Err(e) = handler.pre_write(offset, length as u64).await {
+    // Box::pin: pre_write chains into backfill_missing_blocks (deep async tree).
+    // Without boxing, its state machine inflates the io_task_zc future and
+    // hurts L1 cache locality on the hot read path.
+    if let Err(e) = Box::pin(handler.pre_write(offset, length as u64)).await {
         return -e.to_linux_errno();
     }
 
@@ -1141,33 +1145,31 @@ async fn handle_read_zc(
     length as i32
 }
 
-/// Dispatch a metadata-only I/O op (FLUSH, DISCARD, WRITE_ZEROES) to the handler.
+/// Handle cold I/O ops (FLUSH, DISCARD, WRITE_ZEROES).
 ///
-/// Returns `Some(result)` if the op was handled, `None` if it requires a
-/// data-path (READ/WRITE) which differs between ZC and non-ZC paths.
-async fn dispatch_passthrough(
+/// Called via `Box::pin` from the I/O loop so these large async state machines
+/// (trim/write_zeroes chain into backfill → S3) don't inflate the hot future.
+async fn dispatch_cold(
     op: u32,
     offset: u64,
     length: u32,
     fua: bool,
     handler: &BlockHandler,
-) -> Option<i32> {
+) -> i32 {
     match op {
-        sys::UBLK_IO_OP_FLUSH => Some(match handler.flush() {
+        sys::UBLK_IO_OP_FLUSH => match handler.flush() {
             Ok(()) => 0,
             Err(e) => -e.to_linux_errno(),
-        }),
-        sys::UBLK_IO_OP_DISCARD => Some(match handler.trim(offset, length, fua).await {
+        },
+        sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua).await {
             Ok(()) => 0,
             Err(e) => -e.to_linux_errno(),
-        }),
-        sys::UBLK_IO_OP_WRITE_ZEROES => {
-            Some(match handler.write_zeroes(offset, length, fua).await {
-                Ok(()) => 0,
-                Err(e) => -e.to_linux_errno(),
-            })
-        }
-        _ => None,
+        },
+        sys::UBLK_IO_OP_WRITE_ZEROES => match handler.write_zeroes(offset, length, fua).await {
+            Ok(()) => 0,
+            Err(e) => -e.to_linux_errno(),
+        },
+        _ => -libc::EINVAL,
     }
 }
 
@@ -1186,9 +1188,6 @@ async fn handle_io(
     buf: &mut [u8],
     handler: &BlockHandler,
 ) -> i32 {
-    if let Some(result) = dispatch_passthrough(op, offset, length, fua, handler).await {
-        return result;
-    }
     match op {
         sys::UBLK_IO_OP_READ => {
             debug_assert!(buf.len() >= length as usize, "read buf too small");
@@ -1204,7 +1203,7 @@ async fn handle_io(
                 Err(e) => -e.to_linux_errno(),
             }
         }
-        _ => -libc::EINVAL,
+        _ => Box::pin(dispatch_cold(op, offset, length, fua, handler)).await,
     }
 }
 
@@ -1224,8 +1223,11 @@ async fn dispatch_io(
     // Handle metadata-only ops (FLUSH, DISCARD, WRITE_ZEROES) before slicing the
     // buffer — these don't need data and their length may exceed the buffer size
     // (e.g. max_discard_sectors = 16MB vs 512KB IO_BUF_BYTES).
-    if let Some(result) = dispatch_passthrough(op, offset, length, fua, handler).await {
-        return result;
+    match op {
+        sys::UBLK_IO_OP_FLUSH | sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
+            return Box::pin(dispatch_cold(op, offset, length, fua, handler)).await;
+        }
+        _ => {}
     }
     let buf = &mut buffer.as_mut_slice()[..length as usize];
     handle_io(op, offset, length, fua, buf, handler).await

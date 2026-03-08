@@ -52,6 +52,18 @@ jobs:
       - name: Run docker integration tests
         run: cargo test -p glidefs --features docker-tests --test docker_integration --verbose
 
+  integrity-suite:
+    name: Data Integrity Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Run integrity suite
+        run: cargo test -p glidefs --features docker-tests --test docker_integration integrity_suite -- --ignored --nocapture
+
   loom:
     name: Loom Concurrency Tests
     runs-on: ubuntu-latest

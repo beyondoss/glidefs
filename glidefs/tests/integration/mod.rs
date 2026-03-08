@@ -13,6 +13,7 @@ mod data_safety;
 mod failure_injection;
 mod flush_safety;
 mod gc;
+mod partial_blocks;
 mod property_tests;
 mod snapshots;
 mod wake_any_node;

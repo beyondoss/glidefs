@@ -355,7 +355,8 @@ pub struct TestServer {
     addr: SocketAddr,
     transport: Transport,
     pub shutdown: CancellationToken,
-    pub _cache_dir: TempDir,
+    /// Owns the cache dir lifetime. None = externally managed (won't delete on drop).
+    pub _cache_dir: Option<TempDir>,
     _server_handle: tokio::task::JoinHandle<()>,
     #[cfg(target_os = "linux")]
     nbd_kernel: Option<NbdKernelState>,
@@ -444,7 +445,94 @@ impl TestServer {
             addr,
             transport,
             shutdown,
-            _cache_dir: cache_dir,
+            _cache_dir: Some(cache_dir),
+            _server_handle: server_handle,
+            #[cfg(target_os = "linux")]
+            nbd_kernel,
+            #[cfg(all(target_os = "linux", feature = "ublk"))]
+            ublk,
+        }
+    }
+
+    /// Start a GlideFS server reusing an existing cache directory (for WAL
+    /// recovery testing). The cache dir is NOT owned by this server — it won't
+    /// be deleted on shutdown.
+    pub async fn start_with_cache_dir(
+        object_store: Arc<dyn ObjectStore>,
+        db_path: &str,
+        transport: Transport,
+        cache_dir: std::path::PathBuf,
+    ) -> Self {
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let shutdown = CancellationToken::new();
+
+        let router = Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store,
+                db_path: db_path.to_string(),
+                cache_dir: cache_dir.clone(),
+                block_size: 128 * 1024,
+                clean_cache,
+                wal_sync: false,
+                max_s3_uploads: 128,
+                max_s3_downloads: 512,
+                default_blocks_per_pack: glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK,
+                ublk_nr_queues: 1,
+                nbd_dead_conn_timeout: 0,
+            })
+            .await
+            .expect("failed to create test router"),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let nbd_server = NBDServer::new_tcp(Arc::clone(&router), addr);
+        let shutdown_clone = shutdown.clone();
+
+        let server_handle = tokio::spawn(async move {
+            if let Err(e) = nbd_server.start(shutdown_clone).await {
+                eprintln!("NBD server error: {}", e);
+            }
+        });
+
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        #[cfg(target_os = "linux")]
+        let nbd_kernel = if matches!(transport, Transport::NbdKernel) {
+            Some(NbdKernelState {
+                manager: tokio::sync::Mutex::new(
+                    glidefs::block::nbd::NbdDeviceManager::new()
+                        .with_cache_dir(cache_dir)
+                        .with_dead_conn_timeout(0),
+                ),
+            })
+        } else {
+            None
+        };
+
+        #[cfg(all(target_os = "linux", feature = "ublk"))]
+        let ublk = if matches!(transport, Transport::Ublk) {
+            Some(UblkState {
+                server: tokio::sync::Mutex::new(glidefs::block::ublk::UblkServer::new()),
+                dev_paths: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            })
+        } else {
+            None
+        };
+
+        Self {
+            router,
+            addr,
+            transport,
+            shutdown,
+            _cache_dir: None, // externally managed
             _server_handle: server_handle,
             #[cfg(target_os = "linux")]
             nbd_kernel,
@@ -621,6 +709,31 @@ impl TestServer {
         };
         self.router
             .create_export(config, false, Some(source_manifest), None)
+            .await
+            .unwrap();
+        self.register_nbd_kernel_device(name).await;
+        self.register_ublk_device(name).await;
+    }
+
+    /// Fork an export from a specific snapshot sequence.
+    pub async fn fork_export_from_snapshot(
+        &self,
+        name: &str,
+        source_manifest: &str,
+        size_gb: f64,
+        snapshot_sequence: u64,
+    ) {
+        let config = ExportConfig {
+            name: name.to_string(),
+            size_gb,
+            s3_prefix: Some(source_manifest.to_string()),
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        self.router
+            .create_export(config, false, Some(source_manifest), Some(snapshot_sequence))
             .await
             .unwrap();
         self.register_nbd_kernel_device(name).await;
@@ -813,6 +926,7 @@ mod device_stability;
 mod export_discovery;
 mod ext4_verify;
 mod fork_roundtrip;
+mod integrity_suite;
 mod live_migration;
 mod multi_export;
 mod oci_distribution;
