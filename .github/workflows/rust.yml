@@ -91,6 +91,26 @@ jobs:
       - name: Run benchmarks
         run: cargo bench -p glidefs --features test-utils --benches
 
+  blktests:
+    name: blktests (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Install kernel modules + build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r) build-essential fio
+      - name: Load kernel modules
+        run: |
+          sudo modprobe nbd || echo "nbd not available"
+          sudo modprobe ublk_drv || echo "ublk_drv not available"
+      - name: Run blktests
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features blktests --test blktests -- --nocapture
+
   kernel-devices:
     name: Kernel Devices (Linux)
     runs-on: ubuntu-24.04

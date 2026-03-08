@@ -310,7 +310,7 @@ mod fio_verify {
         let router2 = Arc::new(
             ExportRouter::new(RouterConfig {
                 object_store: Arc::clone(&s3),
-                db_path: "verify2".to_string(),
+                db_path: "verify".to_string(),
                 cache_dir: cache_dir2.path().to_path_buf(),
                 block_size: 128 * 1024,
                 clean_cache,
