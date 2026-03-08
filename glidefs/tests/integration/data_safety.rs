@@ -1982,14 +1982,17 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
 
     // === Assertion 2: No duplicate chunk_offset entries within any pack ===
     {
-        let guard = vm.read();
-        for (&chunk_idx, entry) in &guard.chunks {
-            for &pack_id in &entry.packs {
+        let chunks_snapshot: Vec<(u32, Vec<glidefs::block::pack::PackId>)> = {
+            let guard = vm.read();
+            guard.chunks.iter().map(|(&k, v)| (k, v.packs.clone())).collect()
+        };
+        for (chunk_idx, packs) in &chunks_snapshot {
+            for &pack_id in packs {
                 let entries = match pic.get_entries(pack_id).await {
                     Some(e) => e,
                     None => {
                         // Fetch from S3 if not cached
-                        let fetched = cs.get_pack_index(chunk_idx, pack_id).await
+                        let fetched = cs.get_pack_index(*chunk_idx, pack_id).await
                             .expect("pack index should be fetchable");
                         pic.insert_entries(pack_id, &fetched);
                         fetched
