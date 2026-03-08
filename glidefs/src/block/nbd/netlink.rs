@@ -401,28 +401,45 @@ pub fn reconfigure(index: i32, socket_fd: RawFd) -> io::Result<()> {
 }
 
 /// Find the most recently created /dev/nbdN device by scanning /sys/block.
+///
+/// Retries a few times with a short sleep because the kernel may not have
+/// populated `/sys/block/nbdN/pid` yet when this runs immediately after
+/// a successful `NBD_CMD_CONNECT` netlink call.
 fn find_newest_nbd_device() -> io::Result<i32> {
-    let mut best: Option<(i32, std::time::SystemTime)> = None;
-    let entries = std::fs::read_dir("/sys/block")?;
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(index_str) = name.strip_prefix("nbd")
-            && let Ok(index) = index_str.parse::<i32>()
-        {
-            // Check if the device has a pid (is connected)
-            let pid_path = entry.path().join("pid");
-            if pid_path.exists()
-                && let Ok(meta) = entry.metadata()
-                && let Ok(modified) = meta.modified()
-                && (best.is_none() || modified > best.as_ref().unwrap().1)
-            {
-                best = Some((index, modified));
+    for attempt in 0..10 {
+        let mut best: Option<(i32, std::time::SystemTime)> = None;
+        if let Ok(entries) = std::fs::read_dir("/sys/block") {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(index_str) = name.strip_prefix("nbd")
+                    && let Ok(index) = index_str.parse::<i32>()
+                {
+                    // Check if the device has a pid (is connected)
+                    let pid_path = entry.path().join("pid");
+                    if pid_path.exists()
+                        && let Ok(meta) = entry.metadata()
+                        && let Ok(modified) = meta.modified()
+                        && (best.is_none() || modified > best.as_ref().unwrap().1)
+                    {
+                        best = Some((index, modified));
+                    }
+                }
             }
         }
+        if let Some((idx, _)) = best {
+            return Ok(idx);
+        }
+        if attempt < 9 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
-    best.map(|(idx, _)| idx).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "no connected nbd device found")
-    })
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no connected nbd device found after 10 retries",
+    ))
 }

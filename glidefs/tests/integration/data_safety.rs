@@ -1890,3 +1890,145 @@ async fn test_compaction_dedup_correctness() {
         );
     }
 }
+
+// =============================================================================
+// TEST: CONCURRENT COMPACTION + FLUSH NO DUPLICATE BLOCK REFS
+// =============================================================================
+
+/// Concurrent compaction + flush must not produce duplicate block references.
+///
+/// After both operations complete, verify:
+/// 1. No duplicate pack IDs in any chunk's pack list
+/// 2. No duplicate chunk_offset entries within any single pack
+/// 3. All written data is still readable with correct content
+#[tokio::test]
+async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
+    use std::collections::HashSet;
+    use glidefs::block::write_cache::compact::compact_if_needed;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, _m) =
+        create_cache_with_store(&dir, "dedup-refs", Arc::clone(&s3)).await;
+
+    // Write distinct data to 10 different blocks across 18 flush cycles
+    // to accumulate >16 packs in chunk 0 (triggering compaction threshold).
+    for flush_round in 0..18u8 {
+        for block_idx in 0..10u64 {
+            let data = vec![flush_round.wrapping_add(block_idx as u8); BLOCK_SIZE];
+            cache
+                .write(block_idx * BLOCK_SIZE as u64, &data, cc.as_ref())
+                .unwrap();
+        }
+        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    }
+
+    // Verify we have >16 packs before starting
+    let pack_count_before = {
+        let guard = vm.read();
+        guard.chunk_pack_ids(0).map(|ids| ids.len()).unwrap_or(0)
+    };
+    assert!(
+        pack_count_before > 16,
+        "should have >16 packs before test, got {pack_count_before}"
+    );
+
+    // Write fresh data that will be flushed concurrently with compaction
+    for block_idx in 0..10u64 {
+        let data = vec![0xFF; BLOCK_SIZE];
+        cache
+            .write(block_idx * BLOCK_SIZE as u64, &data, cc.as_ref())
+            .unwrap();
+    }
+
+    // Run compaction and flush concurrently
+    let cache_clone = Arc::clone(&cache);
+    let cs_clone = ContentStore::new(Arc::clone(&s3), "test");
+    let pic_clone = Arc::clone(&pic);
+    let vm_clone = Arc::clone(&vm);
+
+    let (compact_result, flush_result) = tokio::join!(
+        compact_if_needed(16, &cs, &pic, &vm),
+        async {
+            tokio::task::yield_now().await;
+            cache_clone.flush_to_s3(&cs_clone, &pic_clone, &vm_clone).await
+        }
+    );
+
+    // Compaction may CAS-abort; flush must succeed
+    if let Err(e) = &compact_result {
+        assert!(
+            e.to_string().contains("concurrent")
+                || e.to_string().contains("aborted")
+                || e.to_string().contains("Io"),
+            "unexpected compaction error: {e}"
+        );
+    }
+    flush_result.expect("flush should succeed");
+
+    // === Assertion 1: No duplicate pack IDs in any chunk's pack list ===
+    {
+        let guard = vm.read();
+        for (&chunk_idx, entry) in &guard.chunks {
+            let mut seen = HashSet::new();
+            for &pack_id in &entry.packs {
+                assert!(
+                    seen.insert(pack_id),
+                    "chunk {chunk_idx} has duplicate pack ID {pack_id}"
+                );
+            }
+        }
+    }
+
+    // === Assertion 2: No duplicate chunk_offset entries within any pack ===
+    {
+        let guard = vm.read();
+        for (&chunk_idx, entry) in &guard.chunks {
+            for &pack_id in &entry.packs {
+                let entries = match pic.get_entries(pack_id).await {
+                    Some(e) => e,
+                    None => {
+                        // Fetch from S3 if not cached
+                        let fetched = cs.get_pack_index(chunk_idx, pack_id).await
+                            .expect("pack index should be fetchable");
+                        pic.insert_entries(pack_id, &fetched);
+                        fetched
+                    }
+                };
+                let mut offsets_seen = HashSet::new();
+                for entry in &entries {
+                    assert!(
+                        offsets_seen.insert(entry.chunk_offset),
+                        "pack {pack_id} in chunk {chunk_idx} has duplicate chunk_offset {}",
+                        entry.chunk_offset
+                    );
+                }
+            }
+        }
+    }
+
+    // === Assertion 3: All data readable with correct content ===
+    drop(cache);
+    let reader_dir = TempDir::new().unwrap();
+    let (reader, reader_cs, reader_pic, reader_vm, reader_cc, reader_m) =
+        create_reader(&reader_dir, "dedup-refs", Arc::clone(&s3)).await;
+
+    for block_idx in 0..10u64 {
+        let data = reader
+            .read(
+                block_idx * BLOCK_SIZE as u64,
+                BLOCK_SIZE,
+                reader_cc.as_ref(),
+                &reader_pic,
+                &reader_vm,
+                &reader_cs,
+                &reader_m,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            data[0], 0xFF,
+            "block {block_idx} should have latest data (0xFF) after concurrent compaction+flush"
+        );
+    }
+}

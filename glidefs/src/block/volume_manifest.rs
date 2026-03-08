@@ -519,4 +519,40 @@ mod tests {
         assert_eq!(m.block_offset_in_chunk(1024), 0);
         assert_eq!(m.block_offset_in_chunk(1025), 1);
     }
+
+    #[test]
+    fn test_v4_deserialize_empty() {
+        let err = VolumeManifest::deserialize(&[]).unwrap_err();
+        assert!(matches!(err, VolumeManifestError::TooShort));
+    }
+
+    #[test]
+    fn test_v4_deserialize_random_bytes() {
+        // 64 bytes of garbage — long enough to pass the length check,
+        // but CRC won't match.
+        let garbage: Vec<u8> = (0u8..64).collect();
+        let err = VolumeManifest::deserialize(&garbage).unwrap_err();
+        assert!(matches!(err, VolumeManifestError::CrcMismatch { .. }));
+    }
+
+    #[test]
+    fn test_v4_deserialize_truncated_entry() {
+        // Serialize a valid manifest, then chop it so the chunk entry data
+        // is incomplete. We re-compute the CRC over the truncated payload
+        // so that the CRC check passes but entry parsing hits TooShort.
+        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        m.append_pack(0, 42);
+        m.append_pack(0, 43);
+
+        let full = m.serialize();
+        // Keep header + partial entry (first 6 bytes = chunk_idx + pack_count,
+        // but not the pack data). Then append a valid CRC for this truncated body.
+        let body = &full[..GLVM_HEADER_SIZE + 6];
+        let mut truncated = body.to_vec();
+        let crc = crc32fast::hash(&truncated);
+        truncated.extend_from_slice(&crc.to_le_bytes());
+
+        let err = VolumeManifest::deserialize(&truncated).unwrap_err();
+        assert!(matches!(err, VolumeManifestError::TooShort));
+    }
 }
