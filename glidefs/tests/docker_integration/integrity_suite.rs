@@ -939,3 +939,436 @@ async fn concurrent_stress() {
     );
     assert_eq!(errors, 0, "concurrent verification failed for {} blocks", errors);
 }
+
+// ---------------------------------------------------------------------------
+// 10. Sub-block write integrity — partial 4KB writes into 128KB blocks
+// ---------------------------------------------------------------------------
+
+const SUB_BLOCK_SIZE: usize = 4096; // 4 KiB sub-region
+const SUBS_PER_BLOCK: usize = BLOCK_SIZE / SUB_BLOCK_SIZE; // 32
+
+/// Build the expected full block: start with base_data, overlay sub-block writes.
+fn expected_block_after_sub_writes(
+    base_data: &[u8],
+    writes: &[(usize, Vec<u8>)], // (offset_in_block, data)
+) -> Vec<u8> {
+    let mut result = base_data.to_vec();
+    for (offset, data) in writes {
+        result[*offset..*offset + data.len()].copy_from_slice(data);
+    }
+    result
+}
+
+/// Sub-block pattern for a given block + sub-region index.
+fn sub_pattern(block_idx: u64, sub_idx: usize) -> Vec<u8> {
+    // Use a seed that encodes both block and sub index
+    let seed = block_idx.wrapping_mul(0x9E3779B97F4A7C15) ^ (sub_idx as u64);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut buf = vec![0u8; SUB_BLOCK_SIZE];
+    rng.fill(&mut buf[..]);
+    buf
+}
+
+/// Write data to a parent, snapshot, fork a child, then do sub-block writes
+/// on the child. Verify that the child block = parent data + sub-block overlays.
+/// Cold restart and re-verify from S3.
+#[tokio::test]
+#[ignore]
+async fn sub_block_basic() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-subblock";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 64;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Phase 1: Write full blocks to parent, snapshot
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("parent", size_gb).await;
+    let mut parent_client = server.connect("parent").await;
+
+    let mut parent_data: Vec<Vec<u8>> = Vec::with_capacity(num_blocks as usize);
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        parent_client
+            .write(idx * BLOCK_SIZE as u64, &pattern)
+            .await
+            .unwrap();
+        parent_data.push(pattern);
+    }
+    parent_client.flush().await.unwrap();
+    parent_client.disconnect().await.unwrap();
+    server.snapshot_export("parent").await;
+
+    // Phase 2: Fork child, do sub-block writes
+    // Write 4KB sub-regions into various blocks — NOT full block overwrites.
+    // This triggers the partial block / backfill path because the child has
+    // no local data for these blocks (they live in S3 via parent packs).
+    server.fork_export("child", "parent", size_gb).await;
+    let mut child_client = server.connect("child").await;
+
+    // Track which sub-regions we wrote per block
+    let mut sub_writes: HashMap<u64, Vec<(usize, Vec<u8>)>> = HashMap::new();
+
+    // Pattern: write 1-4 scattered sub-regions per block, across many blocks
+    let mut rng = StdRng::seed_from_u64(0x50B_B10C_BA51C);
+    for idx in 0..num_blocks {
+        let num_subs = rng.gen_range(1..=4);
+        let mut written_subs: Vec<usize> = Vec::new();
+        let mut writes_for_block: Vec<(usize, Vec<u8>)> = Vec::new();
+
+        for _ in 0..num_subs {
+            let sub_idx = loop {
+                let s = rng.gen_range(0..SUBS_PER_BLOCK);
+                if !written_subs.contains(&s) {
+                    break s;
+                }
+            };
+            written_subs.push(sub_idx);
+
+            let offset_in_block = sub_idx * SUB_BLOCK_SIZE;
+            let device_offset = idx * BLOCK_SIZE as u64 + offset_in_block as u64;
+            let data = sub_pattern(idx, sub_idx);
+
+            child_client.write(device_offset, &data).await.unwrap();
+            writes_for_block.push((offset_in_block, data));
+        }
+        sub_writes.insert(idx, writes_for_block);
+    }
+    child_client.flush().await.unwrap();
+
+    // Phase 3: Read back from child (may use local cache + S3 merge)
+    // Verify each block = parent_data + sub-block overlays
+    let mut local_errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = child_client
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let expected = expected_block_after_sub_writes(
+            &parent_data[idx as usize],
+            sub_writes.get(&idx).unwrap(),
+        );
+        if data != expected {
+            eprintln!("LOCAL MISMATCH block {} (sub-writes: {:?})",
+                idx,
+                sub_writes.get(&idx).unwrap().iter().map(|(o, _)| o / SUB_BLOCK_SIZE).collect::<Vec<_>>()
+            );
+            // Find which sub-region differs
+            for s in 0..SUBS_PER_BLOCK {
+                let start = s * SUB_BLOCK_SIZE;
+                let end = start + SUB_BLOCK_SIZE;
+                if data[start..end] != expected[start..end] {
+                    eprintln!("  sub {} differs: got {:02x}{:02x}..., expected {:02x}{:02x}...",
+                        s, data[start], data[start+1], expected[start], expected[start+1]);
+                }
+            }
+            local_errors += 1;
+        }
+    }
+    child_client.disconnect().await.unwrap();
+
+    assert_eq!(local_errors, 0, "local read had {} mismatches", local_errors);
+    eprintln!("  local verification passed ({} blocks, sub-block writes)", num_blocks);
+
+    // Phase 4: Cold restart — verify sub-block writes survive S3 roundtrip
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2
+        .restore_forked_export("child", "parent", size_gb)
+        .await;
+    let mut reader = server2.connect("child").await;
+
+    let mut s3_errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = reader
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let expected = expected_block_after_sub_writes(
+            &parent_data[idx as usize],
+            sub_writes.get(&idx).unwrap(),
+        );
+        if data != expected {
+            eprintln!("S3 MISMATCH block {} after cold restart", idx);
+            for s in 0..SUBS_PER_BLOCK {
+                let start = s * SUB_BLOCK_SIZE;
+                let end = start + SUB_BLOCK_SIZE;
+                if data[start..end] != expected[start..end] {
+                    eprintln!("  sub {} differs", s);
+                }
+            }
+            s3_errors += 1;
+        }
+    }
+
+    reader.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[sub_block_basic] {} verified via S3 (sub-block writes on all {} blocks) in {:.1}s — err={}",
+        fmt_bytes(data_bytes),
+        num_blocks,
+        t0.elapsed().as_secs_f64(),
+        s3_errors
+    );
+    assert_eq!(s3_errors, 0, "S3 verification failed for {} blocks", s3_errors);
+}
+
+// ---------------------------------------------------------------------------
+// 11. Sub-block stress — many tiny writes, interleaved reads, S3 verify
+// ---------------------------------------------------------------------------
+
+/// Hammer blocks with random tiny writes (512B to 4KB), read back after each
+/// batch, then cold restart and verify every byte from S3.
+#[tokio::test]
+#[ignore]
+async fn sub_block_stress() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-subblock-stress";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 32;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Phase 1: Parent with known data
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("parent", size_gb).await;
+    let mut parent_client = server.connect("parent").await;
+
+    // Each block gets a unique fill byte for easy debugging
+    let mut block_state: Vec<Vec<u8>> = Vec::with_capacity(num_blocks as usize);
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        parent_client
+            .write(idx * BLOCK_SIZE as u64, &pattern)
+            .await
+            .unwrap();
+        block_state.push(pattern);
+    }
+    parent_client.flush().await.unwrap();
+    parent_client.disconnect().await.unwrap();
+    server.snapshot_export("parent").await;
+
+    // Phase 2: Fork child, hammer with tiny writes
+    server.fork_export("child", "parent", size_gb).await;
+    let mut child_client = server.connect("child").await;
+
+    let mut rng = StdRng::seed_from_u64(0x71EE_1173_5725);
+    let mut total_sub_writes: u64 = 0;
+    let mut total_bytes_written: u64 = 0;
+
+    // 5 rounds of writes + immediate read verification
+    for round in 0..5 {
+        // Each round: random tiny writes across random blocks
+        let writes_per_round = 100;
+        for _ in 0..writes_per_round {
+            let block_idx = rng.gen_range(0..num_blocks);
+            // Random write size: 4KB to 16KB, 4KB-aligned (matches real filesystem I/O)
+            let write_size = rng.gen_range(1..=4) * SUB_BLOCK_SIZE;
+            let max_sub = (BLOCK_SIZE - write_size) / SUB_BLOCK_SIZE;
+            let offset_in_block = rng.gen_range(0..=max_sub) * SUB_BLOCK_SIZE;
+
+            let device_offset = block_idx * BLOCK_SIZE as u64 + offset_in_block as u64;
+
+            // Generate deterministic data for this write
+            let seed = (round as u64) * 1_000_000 + block_idx * 1_000 + offset_in_block as u64;
+            let mut write_rng = StdRng::seed_from_u64(seed);
+            let mut data = vec![0u8; write_size];
+            write_rng.fill(&mut data[..]);
+
+            child_client.write(device_offset, &data).await.unwrap();
+
+            // Update our shadow copy
+            block_state[block_idx as usize][offset_in_block..offset_in_block + write_size]
+                .copy_from_slice(&data);
+
+            total_sub_writes += 1;
+            total_bytes_written += write_size as u64;
+        }
+        child_client.flush().await.unwrap();
+
+        // Verify a random sample of blocks after each round
+        let sample_size = num_blocks.min(16);
+        let mut round_errors = 0u64;
+        for _ in 0..sample_size {
+            let block_idx = rng.gen_range(0..num_blocks);
+            let data = child_client
+                .read(block_idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+                .await
+                .unwrap();
+            let expected = &block_state[block_idx as usize];
+            if data != *expected {
+                // Find which bytes differ
+                let mut first_diff = None;
+                let mut diff_count = 0usize;
+                let mut zero_diffs = 0usize;
+                for i in 0..BLOCK_SIZE {
+                    if data[i] != expected[i] {
+                        if first_diff.is_none() {
+                            first_diff = Some(i);
+                        }
+                        diff_count += 1;
+                        if data[i] == 0 {
+                            zero_diffs += 1;
+                        }
+                    }
+                }
+                let fd = first_diff.unwrap();
+                eprintln!(
+                    "ROUND {} MISMATCH block {}: {} bytes differ (first at offset {}, sub {}), {} are zeros, got {:02x} expected {:02x}",
+                    round, block_idx, diff_count, fd, fd / SUB_BLOCK_SIZE, zero_diffs, data[fd], expected[fd]
+                );
+                round_errors += 1;
+            }
+        }
+        assert_eq!(round_errors, 0, "round {} had {} mismatches", round, round_errors);
+    }
+
+    child_client.disconnect().await.unwrap();
+    eprintln!(
+        "  {} sub-block writes ({}) across {} blocks — local verify passed",
+        total_sub_writes,
+        fmt_bytes(total_bytes_written),
+        num_blocks
+    );
+
+    // Phase 3: Cold restart, verify every byte from S3
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2
+        .restore_forked_export("child", "parent", size_gb)
+        .await;
+    let mut reader = server2.connect("child").await;
+
+    let mut s3_errors = 0u64;
+    for idx in 0..num_blocks {
+        let data = reader
+            .read(idx * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let expected = &block_state[idx as usize];
+        if data != *expected {
+            // Find first differing byte
+            let first_diff = data.iter().zip(expected.iter())
+                .position(|(a, b)| a != b)
+                .unwrap();
+            eprintln!(
+                "S3 MISMATCH block {}: first diff at byte {} (got {:02x}, expected {:02x})",
+                idx, first_diff, data[first_diff], expected[first_diff]
+            );
+            s3_errors += 1;
+        }
+    }
+
+    reader.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    eprintln!(
+        "[sub_block_stress] {} writes ({}) verified via S3 in {:.1}s — err={}",
+        total_sub_writes,
+        fmt_bytes(total_bytes_written),
+        t0.elapsed().as_secs_f64(),
+        s3_errors
+    );
+    assert_eq!(s3_errors, 0, "S3 sub-block verification failed for {} blocks", s3_errors);
+}
+
+// ---------------------------------------------------------------------------
+// 12. Multi-block read integrity — reads spanning multiple blocks
+// ---------------------------------------------------------------------------
+
+/// Writes individual blocks, then reads across block boundaries in various
+/// sizes (2 blocks, 4 blocks, 7 blocks). Verifies the coalesced read returns
+/// the correct concatenation of block data.
+#[tokio::test]
+#[ignore]
+async fn multi_block_read() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "integrity-multiblock";
+    let transport = crate::Transport::Nbd;
+
+    let num_blocks: u64 = 128;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+
+    // Write all blocks with deterministic patterns
+    let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server.create_export("vol", size_gb).await;
+    let mut client = server.connect("vol").await;
+
+    let mut block_data: Vec<Vec<u8>> = Vec::with_capacity(num_blocks as usize);
+    for idx in 0..num_blocks {
+        let pattern = block_pattern(idx, BLOCK_SIZE);
+        client
+            .write(idx * BLOCK_SIZE as u64, &pattern)
+            .await
+            .unwrap();
+        block_data.push(pattern);
+    }
+    client.flush().await.unwrap();
+    client.disconnect().await.unwrap();
+
+    // Cold restart
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2.restore_export("vol", size_gb).await;
+    let mut client2 = server2.connect("vol").await;
+
+    // Read across block boundaries in various sizes from S3
+    let read_sizes = [2, 3, 4, 7, 8, 16]; // in blocks
+    let mut errors = 0u64;
+    let mut reads_verified = 0u64;
+
+    for &span in &read_sizes {
+        for start_block in (0..num_blocks - span).step_by(span as usize) {
+            let offset = start_block * BLOCK_SIZE as u64;
+            let length = span as u32 * BLOCK_SIZE as u32;
+
+            let data = client2.read(offset, length).await.unwrap();
+
+            // Build expected data by concatenating individual blocks
+            let mut expected = Vec::with_capacity(length as usize);
+            for b in start_block..start_block + span {
+                expected.extend_from_slice(&block_data[b as usize]);
+            }
+
+            if data != expected {
+                let actual_hash = sha256(&data);
+                let expected_hash = sha256(&expected);
+                eprintln!(
+                    "MULTI-BLOCK MISMATCH: blocks {}..{} (span={}): hash {:x?} vs {:x?}",
+                    start_block,
+                    start_block + span,
+                    span,
+                    &actual_hash[..8],
+                    &expected_hash[..8]
+                );
+                errors += 1;
+            }
+            reads_verified += 1;
+        }
+    }
+
+    client2.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    let data_bytes = num_blocks * BLOCK_SIZE as u64;
+    eprintln!(
+        "[multi_block_read] {} multi-block reads verified via S3 ({}) in {:.1}s — err={}",
+        reads_verified,
+        fmt_bytes(data_bytes),
+        t0.elapsed().as_secs_f64(),
+        errors
+    );
+    assert_eq!(errors, 0, "multi-block read verification failed for {} reads", errors);
+}

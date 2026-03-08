@@ -517,26 +517,11 @@ impl WriteCache<Active> {
             return Ok(BlockLocation::Local(data));
         }
 
-        // Partial block: merge SSD data (guest-written sub-regions) with S3 data.
-        // This also completes the backfill on-demand.
-        if self.inner.is_present(block_index) && self.inner.is_partial(block_index) {
-            // Read the full block from SSD (has guest data in written sub-regions)
-            let local_data = self.sync_read_local_block(block_index as u64)?;
-            let bitmap = self.inner.partial_bitmap(block_index).unwrap_or(0);
-
-            // If all bits set, block is fully populated — just complete and return
-            let block_size = self.inner.config.block_size;
-            let subs = block_size / super::inner::SUB_BLOCK_SIZE;
-            let full_mask = if subs >= 32 { u32::MAX } else { (1u32 << subs) - 1 };
-            if bitmap == full_mask {
-                self.inner.complete_partial(block_index);
-                return Ok(BlockLocation::Local(local_data));
-            }
-
-            // Need S3 data for unwritten sub-regions — return as NeedsFetch
-            // so the caller fetches from S3. We'll merge in resolve_block.
-            // Fall through to the normal S3 resolution path below.
-        }
+        // Partial block: need S3 data for unwritten sub-regions.
+        // Don't read SSD here — merge_partial_block will do the single
+        // authoritative read under the write_lock. Fall through to the
+        // S3 resolution path so resolve_block can fetch + merge.
+        // (is_present but partial blocks are handled by the cold path below)
 
         // Cold path: resolve via VolumeManifest → PackIndexCache
         let (chunk_idx, block_offset, pack_ids) = {

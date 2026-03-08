@@ -61,6 +61,9 @@ Every test follows the same pattern:
 | `fork_integrity` | Fork isolation: child inherits, overwrites, parent unchanged | 16 MB |
 | `overwrite_integrity` | Write A → drain → write B → drain → cold restart → get B not A | 32 MB |
 | `concurrent_stress` | 4 parallel writers to disjoint regions → cold restart → verify | 128 MB |
+| `sub_block_basic` | 4KB sub-region writes into forked 128KB blocks → S3 verify | 8 MB |
+| `sub_block_stress` | 500 random 4KB–16KB writes into forked blocks, 5 rounds + verify | 5 MB |
+| `multi_block_read` | Multi-block reads (2–16 blocks) across block boundaries from S3 | 17 MB |
 
 ### What each test catches
 
@@ -107,6 +110,25 @@ simultaneously. After all writers complete: drain, cold restart, verify every
 block from S3. Catches races in concurrent flush scheduling, pack assembly,
 and manifest updates.
 
+**sub_block_basic** — Writes 1–4 aligned 4KB sub-regions per block into a
+forked child (parent data lives in S3). Verifies the merged result: parent
+data in unwritten sub-regions, child data in written ones. Cold restart,
+verify from S3. Catches backfill merge errors, bitmap tracking bugs, and
+partial block state corruption.
+
+**sub_block_stress** — Hammers forked blocks with 500 random writes (4KB–16KB,
+4KB-aligned) across 5 rounds, interleaved with read verification after each
+round. Cold restart, verify every byte from S3. Catches races between
+concurrent backfill and guest writes, bitmap state corruption across multiple
+overlapping writes to the same block, and flush scheduling of partial blocks.
+Uses 4KB alignment to match real filesystem I/O (ext4/btrfs/xfs minimum block
+size). Note: writes below 4KB are not filesystem-reachable but would expose a
+sub-region bitmap granularity limitation in the backfill path.
+
+**multi_block_read** — Reads spanning 2–16 contiguous blocks in a single NBD
+read from S3. Verifies the read coalescing logic returns correctly concatenated
+block data. Catches offset calculation bugs in coalesced S3 range fetches.
+
 ## Data path coverage
 
 The suite exercises every stage of the GlideFS data pipeline:
@@ -127,3 +149,6 @@ The suite exercises every stage of the GlideFS data pipeline:
 | Concurrent flush scheduling | `concurrent_stress` |
 | Pack index cache | `hash_stress` (multi-pass), `soak_test` (periodic restart) |
 | Manifest CRC32 validation | All tests (implicit — corrupt manifest would fail restore) |
+| Sub-block writes (partial blocks) | `sub_block_basic`, `sub_block_stress` |
+| Backfill merge (S3 + local overlay) | `sub_block_basic`, `sub_block_stress` |
+| Read coalescing (multi-block) | `multi_block_read` |

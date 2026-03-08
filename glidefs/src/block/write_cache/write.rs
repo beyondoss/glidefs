@@ -233,10 +233,9 @@ impl WriteCache<Active> {
                     let write_start = offset.max(block_start_byte);
                     let write_end = (offset + len).min(block_start_byte + block_size);
                     let zero_len = (write_end - write_start) as usize;
-                    let zeros = vec![0u8; zero_len];
                     self.inner
                         .data_file
-                        .write_all_at(&zeros, write_start)?;
+                        .write_all_at(&self.inner.zero_block_bytes[..zero_len], write_start)?;
                 }
             }
         }
