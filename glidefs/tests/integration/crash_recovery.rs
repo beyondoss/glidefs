@@ -760,3 +760,286 @@ async fn test_flush_truncates_wal_before_crash() {
         );
     }
 }
+
+// =============================================================================
+// WAL LOSS WITH INTACT SSD DATA
+// =============================================================================
+
+/// Test: WAL file lost (truncated to zero) while SSD has written data.
+///
+/// Scenario: Write blocks with wal_sync=true, then simulate WAL loss by
+/// truncating to zero. The metadata file was never saved.
+///
+/// Expected: Without WAL entries AND without metadata, the blocks appear
+/// NOT_PRESENT after recovery. This is correct — the write path returns
+/// Ok (ACKs to guest) only after WAL append + sync. If the WAL is lost,
+/// the crash must have occurred before write() returned, meaning the guest
+/// never received an ACK. From the guest's perspective, those writes never
+/// happened — its filesystem journal handles recovery.
+///
+/// This test verifies the cache starts clean when both WAL and metadata are absent.
+#[tokio::test]
+async fn test_wal_lost_blocks_since_last_checkpoint_are_lost() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: temp_dir.path().to_path_buf(),
+        device_name: "wal_lost".to_string(),
+        device_size: DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: true,
+    };
+
+    let test_data: Vec<u8> = vec![0xEE; BLOCK_SIZE];
+
+    // Session 1: Write blocks, WAL is durable, but do NOT save metadata
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+
+        cache.write(0, &test_data, &clean_cache).unwrap();
+        cache
+            .write(BLOCK_SIZE as u64, &test_data, &clean_cache)
+            .unwrap();
+
+        assert_eq!(cache.dirty_block_count(), 2);
+        // Do NOT save metadata — crash scenario
+    }
+
+    // Simulate WAL loss: truncate WAL file to zero
+    let wal_path = config.wal_path();
+    std::fs::write(&wal_path, b"").unwrap();
+
+    // Session 2: Reopen — WAL is empty, metadata doesn't exist
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // Without WAL or metadata, the cache starts fresh (all NOT_PRESENT).
+        // This is correct: if the WAL is gone, the crash happened before
+        // write() returned, so the guest never got an ACK for those writes.
+        assert_eq!(
+            cache.dirty_block_count(),
+            0,
+            "cache should start fresh when WAL and metadata are both absent"
+        );
+    }
+}
+
+/// Test: WAL file lost, but metadata was saved before the writes.
+///
+/// Scenario: Checkpoint saves metadata (blocks 0,1 are dirty). Then write
+/// block 2 (WAL entry appended). WAL is lost. On recovery, blocks 0,1 are
+/// recovered from metadata, block 2 is not — its write was never ACK'd
+/// (WAL loss implies crash before write() returned).
+///
+/// Verifies checkpointed blocks survive independently of the WAL.
+#[tokio::test]
+async fn test_wal_lost_preserves_checkpointed_blocks() {
+    let s3_backend: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let temp_dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: temp_dir.path().to_path_buf(),
+        device_name: "wal_partial_loss".to_string(),
+        device_size: DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: true,
+    };
+
+    let old_data: Vec<u8> = vec![0x11; BLOCK_SIZE];
+    let new_data: Vec<u8> = vec![0x22; BLOCK_SIZE];
+
+    // Session 1: Write blocks 0,1 and save metadata (checkpoint).
+    // Then write block 2 without saving metadata again.
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+
+        // Write blocks 0 and 1
+        cache.write(0, &old_data, &clean_cache).unwrap();
+        cache
+            .write(BLOCK_SIZE as u64, &old_data, &clean_cache)
+            .unwrap();
+
+        // Save metadata — blocks 0,1 are now persisted in .meta
+        cache.save_metadata().unwrap();
+
+        // Write block 2 — WAL entry appended, but no metadata save
+        cache
+            .write(2 * BLOCK_SIZE as u64, &new_data, &clean_cache)
+            .unwrap();
+        assert_eq!(cache.dirty_block_count(), 3);
+    }
+
+    // Simulate WAL loss
+    let wal_path = config.wal_path();
+    std::fs::write(&wal_path, b"").unwrap();
+
+    // Session 2: Recovery
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // Blocks 0,1 should survive (from metadata)
+        assert_eq!(
+            cache.dirty_block_count(),
+            2,
+            "blocks 0,1 should be dirty from metadata; block 2 lost with WAL"
+        );
+
+        // Blocks 0,1 data should be intact on SSD
+        let data_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert_eq!(data_0.as_ref(), &old_data[..], "block 0 data from metadata");
+
+        let data_1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        assert_eq!(data_1.as_ref(), &old_data[..], "block 1 data from metadata");
+
+        // Block 2's WAL entry was lost, so it's not tracked.
+        // Verify only the 2 checkpointed blocks flush to S3.
+        let content_store =
+            glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
+        let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
+        ));
+        let stats = cache
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.blocks_claimed, 2,
+            "only checkpointed blocks should flush"
+        );
+    }
+}
+
+// =============================================================================
+// SYNCING STATE ON CRASH RECOVERY
+// =============================================================================
+
+/// Test: Blocks in SYNCING state at crash time are recovered as DIRTY.
+///
+/// Scenario: Metadata is saved while blocks are mid-flush (SYNCING state),
+/// then the process crashes. On recovery, SYNCING blocks must be treated as
+/// DIRTY because the S3 upload may not have completed.
+///
+/// The code does this at inner.rs:740-741 — this test is a regression guard.
+#[tokio::test]
+async fn test_syncing_blocks_at_crash_become_dirty() {
+    let temp_dir = TempDir::new().unwrap();
+    let config = test_config(&temp_dir, "syncing_crash");
+
+    let test_data: Vec<u8> = vec![0xFF; BLOCK_SIZE];
+
+    // Session 1: Write blocks, manually transition some to SYNCING,
+    // save metadata, then "crash" (drop without completing flush).
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+
+        // Write 3 blocks — all become DIRTY
+        for i in 0..3 {
+            cache
+                .write(i as u64 * BLOCK_SIZE as u64, &test_data, &clean_cache)
+                .unwrap();
+        }
+        assert_eq!(cache.dirty_block_count(), 3);
+
+        // Save metadata with all 3 blocks dirty
+        cache.save_metadata().unwrap();
+    }
+
+    // Manually edit the metadata to mark blocks 0 and 1 as SYNCING (state=3).
+    // This simulates a crash that happened after flush started CAS DIRTY→SYNCING
+    // but metadata was saved with blocks in SYNCING state.
+    //
+    // Rather than binary-editing the metadata, we'll use a two-step approach:
+    // write blocks, start a flush (which transitions DIRTY→SYNCING), save
+    // metadata while blocks are SYNCING, then crash.
+    //
+    // But since we can't easily pause mid-flush, we'll re-create the scenario
+    // by writing metadata with SYNCING state directly.
+    {
+        // Reopen and manually force blocks to SYNCING before saving
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.skip_recovery_for_test();
+
+        // All 3 blocks are dirty from metadata + WAL replay. Force 2 to SYNCING.
+        // Use the flush path's internal transition.
+        // We can't easily access transition_dirty_to_syncing from tests, so
+        // we'll save metadata first, then verify on reload that SYNCING→DIRTY
+        // conversion works by directly constructing metadata with SYNCING state.
+        cache.save_metadata().unwrap();
+    }
+
+    // Directly write metadata with SYNCING blocks to test the load_metadata conversion.
+    {
+        let meta_path = config.metadata_path();
+        let num_blocks = config.num_blocks();
+
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buf = Vec::new();
+
+        macro_rules! write_hashed {
+            ($data:expr) => {{
+                let d: &[u8] = $data;
+                buf.extend_from_slice(d);
+                hasher.update(d);
+            }};
+        }
+
+        // Header
+        write_hashed!(b"ZFSCACHE");
+        write_hashed!(&5u32.to_le_bytes()); // version 5
+        write_hashed!(&config.device_size.to_le_bytes());
+        write_hashed!(&(config.block_size as u64).to_le_bytes());
+        write_hashed!(&(num_blocks as u64).to_le_bytes());
+
+        // 3 entries: block 0 = SYNCING(3), block 1 = SYNCING(3), block 2 = DIRTY(2)
+        write_hashed!(&3u64.to_le_bytes()); // entry_count
+        write_hashed!(&0u32.to_le_bytes()); // block 0
+        write_hashed!(&[3u8]); // SYNCING
+        write_hashed!(&1u32.to_le_bytes()); // block 1
+        write_hashed!(&[3u8]); // SYNCING
+        write_hashed!(&2u32.to_le_bytes()); // block 2
+        write_hashed!(&[2u8]); // DIRTY
+
+        // v5: max_sequence
+        write_hashed!(&100u64.to_le_bytes());
+
+        // CRC32 trailer
+        let crc = hasher.finalize();
+        buf.extend_from_slice(&crc.to_le_bytes());
+
+        std::fs::write(&meta_path, &buf).unwrap();
+    }
+
+    // Clear the WAL so recovery relies entirely on metadata
+    let wal_path = config.wal_path();
+    std::fs::write(&wal_path, b"").unwrap();
+
+    // Session 3: Recovery should convert SYNCING → DIRTY
+    {
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // All 3 blocks should be dirty:
+        // - Blocks 0,1 were SYNCING → converted to DIRTY by load_metadata
+        // - Block 2 was already DIRTY
+        assert_eq!(
+            cache.dirty_block_count(),
+            3,
+            "SYNCING blocks must be converted to DIRTY on recovery"
+        );
+
+        // All data should be readable from SSD
+        for i in 0..3 {
+            let data = cache
+                .read_local(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE)
+                .unwrap();
+            assert_eq!(data.as_ref(), &test_data[..], "block {} data intact", i);
+        }
+    }
+}
