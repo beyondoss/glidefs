@@ -186,7 +186,8 @@ mod blktests {
                     .unwrap();
 
                 let size = (DEVICE_SIZE_GB * 1024.0 * 1024.0 * 1024.0) as u64;
-                let mut mgr = NbdDeviceManager::new();
+                let mut mgr = NbdDeviceManager::new()
+                    .with_dead_conn_timeout(0);
                 let dev = mgr
                     .add_device("blktest-nbd", Arc::clone(&router), size)
                     .await
