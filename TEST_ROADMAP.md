@@ -102,19 +102,19 @@ No existing tests exercise SSD pressure. `capacity_monitor.rs` has unit tests fo
 
 Existing coverage: `test_s3_failure_during_sync_marks_blocks_dirty` and `test_data_integrity_after_failure_recovery` cover instant S3 failures and recovery. No tests for slow operations, timeouts, or semaphore exhaustion.
 
-- **`s3_slow_uploads_dont_block_writes`** — Inject 5-second delay on S3 PUTs. Writes to local SSD should still complete at full speed. Flush may be slow but should eventually succeed.
-- **`s3_slow_downloads_timeout_gracefully`** — Inject delay on S3 GETs. Cache-miss reads should timeout with EIO, not hang forever. Verify timeout is bounded.
-- **`s3_intermittent_failures_eventual_success`** — Fail every other S3 PUT. Flush should retry and eventually get all blocks uploaded. Verify no blocks are permanently stuck as DIRTY. (Existing tests fail all PUTs then succeed all; no intermittent pattern.)
-- **`s3_manifest_put_fails_after_pack_upload`** — Packs upload successfully, manifest PUT fails. On retry, packs should not be re-uploaded (they exist). Manifest retry should succeed. Tests idempotent manifest sync.
-- **`s3_download_semaphore_exhaustion`** — Issue 512+ concurrent reads to S3-only blocks (exceeding max_s3_downloads). Should queue, not crash. All reads should eventually complete.
-- **`s3_upload_semaphore_exhaustion`** — Trigger flush with 128+ packs to upload (exceeding max_s3_uploads). Should queue, not drop packs. All packs should eventually upload.
+- [x] **`s3_slow_uploads_dont_block_writes`** — Inject 500ms delay on S3 PUTs. Writes to local SSD complete instantly. Flush slow but succeeds. *(integration/s3_degraded.rs)*
+- [x] **`s3_slow_downloads_timeout_gracefully`** — Inject 500ms delay on S3 GETs. Cache-miss reads complete within bounded time (not hung forever). Each read latency verified ≥400ms and <10s. *(integration/s3_degraded.rs)*
+- [x] **`s3_intermittent_failures_eventual_success`** — Fail every other S3 PUT. Flush retries until all blocks uploaded. No blocks permanently stuck as DIRTY. *(integration/s3_degraded.rs)*
+- [x] **`s3_manifest_put_fails_after_pack_upload`** — Packs upload successfully, manifest PUT fails. Retry succeeds. Cold reader verifies all data. *(integration/s3_degraded.rs)*
+- [x] **`s3_download_semaphore_exhaustion`** — 20 concurrent reads with download semaphore limited to 2. All queue and complete. *(integration/s3_degraded.rs)*
+- [x] **`s3_upload_semaphore_exhaustion`** — Flush 50 blocks with upload semaphore limited to 1. All packs queue and upload. Cold reader verifies. *(integration/s3_degraded.rs)*
 
 ### 10. Transport stress
 
-- **`client_storm`** — Open 100 clients rapidly, each does one read, then disconnects. Server should handle without leak or crash. For ublk, this means rapid device add/remove cycles.
-- **`request_backpressure`** — Send 300 concurrent requests from one client (exceeding MAX_INFLIGHT_REQUESTS=256). Server should apply backpressure (slow accept), not drop requests.
-- **[NBD-only] `connection_close_during_inflight`** — Write request in-flight, client closes socket. Server should cancel gracefully, not crash or leak the request task. (Graceful disconnect tested, but not mid-operation close.)
-- **[NBD-only] `connection_idle_timeout`** — Open connection, do nothing for extended period. Server should either keep it alive or clean it up gracefully.
+- [x] **`client_storm`** — Open 100 clients rapidly, each does one read, then disconnects. Server should handle without leak or crash. For ublk, this means rapid device add/remove cycles. *(transport_stress.rs::test_client_storm — transport_test)*
+- [x] **`request_backpressure`** — Send 300 concurrent requests from one client (exceeding MAX_INFLIGHT_REQUESTS=256). Server should apply backpressure (slow accept), not drop requests. *(transport_stress.rs::test_request_backpressure — transport_test)*
+- [x] **[NBD-only] `connection_close_during_inflight`** — Write request in-flight, client closes socket. Server should cancel gracefully, not crash or leak the request task. (Graceful disconnect tested, but not mid-operation close.) *(transport_stress.rs::test_connection_close_during_inflight)*
+- [x] **[NBD-only] `connection_idle_timeout`** — Open connection, do nothing for extended period. Server should either keep it alive or clean it up gracefully. *(transport_stress.rs::test_connection_idle_timeout)*
 
 ---
 

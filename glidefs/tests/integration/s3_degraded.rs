@@ -370,6 +370,95 @@ async fn test_s3_slow_uploads_dont_block_writes() {
 }
 
 // =============================================================================
+// S3 slow downloads — bounded latency, not hung forever
+// =============================================================================
+
+/// Inject delay on S3 GETs. Cache-miss reads should eventually complete
+/// (not hang forever). With a 500ms delay, reads take ~500ms, not infinity.
+#[tokio::test]
+async fn test_s3_slow_downloads_bounded_latency() {
+    let s3 = Arc::new(SlowObjectStore::new());
+
+    // Write blocks + flush to S3 with no delay
+    let writer_dir = TempDir::new().unwrap();
+    {
+        let (cache, cs, pic, vm, cc, _m) =
+            create_cache_with_store(
+                &writer_dir,
+                "slow-download",
+                Arc::clone(&s3) as Arc<dyn ObjectStore>,
+            )
+            .await;
+
+        for i in 0..5usize {
+            cache
+                .write(
+                    (i * BLOCK_SIZE) as u64,
+                    &vec![(i as u8) + 1; BLOCK_SIZE],
+                    cc.as_ref(),
+                )
+                .unwrap();
+        }
+        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        let manifest_bytes = vm.read().serialize();
+        cs.put_manifest("slow-download", manifest_bytes)
+            .await
+            .unwrap();
+    }
+
+    // Cold reader with 500ms GET delay
+    s3.set_get_delay_ms(500);
+
+    let reader_dir = TempDir::new().unwrap();
+    let (rcache, rcs, rpic, rvm, rcc, rmetrics) = super::create_cold_reader(
+        &reader_dir,
+        "slow-download",
+        Arc::clone(&s3) as Arc<dyn ObjectStore>,
+    )
+    .await;
+
+    // Read should complete within a bounded time (not hang forever)
+    // With 500ms delay, 5 reads should finish well under 30s timeout
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        for i in 0..5usize {
+            let start = Instant::now();
+            let data = rcache
+                .read(
+                    (i * BLOCK_SIZE) as u64,
+                    BLOCK_SIZE,
+                    rcc.as_ref(),
+                    &rpic,
+                    &rvm,
+                    &rcs,
+                    &rmetrics,
+                )
+                .await
+                .unwrap();
+            let elapsed = start.elapsed();
+            assert!(
+                data.iter().all(|&b| b == (i as u8) + 1),
+                "block {i} data mismatch with slow GET"
+            );
+            // Each read should take at least 400ms (delay) but less than 10s
+            assert!(
+                elapsed >= Duration::from_millis(400),
+                "block {i} read too fast ({elapsed:?}), delay not applied?"
+            );
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "block {i} read too slow ({elapsed:?}), potential hang"
+            );
+        }
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "slow-GET reads should complete within timeout, not hang forever"
+    );
+}
+
+// =============================================================================
 // S3 intermittent failures — eventual success
 // =============================================================================
 

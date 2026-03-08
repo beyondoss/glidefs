@@ -185,3 +185,51 @@ async fn test_rapid_reconnect() {
 
     server.shutdown().await;
 }
+
+// =============================================================================
+// [NBD-only] Connection idle timeout — idle connection stays alive
+// =============================================================================
+
+/// Open connection, do nothing for several seconds, then issue a request.
+/// Server should keep the connection alive (no idle timeout by default).
+#[tokio::test]
+async fn test_connection_idle_timeout() {
+    let ctx = TestContext::new().await;
+    let server = TestServer::start(
+        Arc::clone(&ctx.object_store),
+        "idle-timeout",
+        crate::Transport::Nbd,
+    )
+    .await;
+    server.create_export("vol1", 0.01).await;
+
+    // Write initial data
+    let mut setup = server.connect("vol1").await;
+    setup.write(0, &vec![0xCC; BLOCK_SIZE]).await.unwrap();
+    setup.flush().await.unwrap();
+    setup.disconnect().await.unwrap();
+
+    // Connect and sit idle for 5 seconds
+    let mut client = server.connect("vol1").await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // Should still be able to read after idle period
+    let data = client.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert!(
+        data.iter().all(|&b| b == 0xCC),
+        "read after idle should return correct data"
+    );
+
+    // Write should also work after idle
+    client.write(0, &vec![0xDD; BLOCK_SIZE]).await.unwrap();
+    client.flush().await.unwrap();
+
+    let data2 = client.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert!(
+        data2.iter().all(|&b| b == 0xDD),
+        "write after idle should succeed"
+    );
+
+    client.disconnect().await.unwrap();
+    server.shutdown().await;
+}
