@@ -2,7 +2,7 @@ use tracing::{debug, instrument};
 
 use crate::block::cache::BlockCache;
 use crate::block::state::Active;
-use crate::block::wal::WalEntryRef;
+use crate::block::wal::{PartialWalEntryRef, WalEntryRef};
 
 use super::{CacheError, WriteCache};
 
@@ -52,10 +52,24 @@ impl WriteCache<Active> {
         //
         // By setting present first, prefetch's CAS will fail if we've claimed the block,
         // or if prefetch wins the CAS, our pwrite will overwrite their stale S3 data.
+        //
+        // For partial blocks: mark sub-regions BEFORE pwrite (same invariant).
+        // This ensures background backfill sees the bit set and skips sub-regions
+        // the guest is about to write.
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
+                if self.inner.is_partial(idx) {
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end = (offset + data.len() as u64).min(block_start_byte + block_size);
+                    self.inner.mark_sub_regions(
+                        idx,
+                        (write_start - block_start_byte) as usize,
+                        (write_end - write_start) as usize,
+                    );
+                }
             }
         }
 
@@ -77,11 +91,18 @@ impl WriteCache<Active> {
                 self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
 
                 let seq = self.inner.sequence.next();
-                let wal_entry = WalEntryRef {
-                    block_index: block,
-                    sequence: seq,
-                };
-                wal.append(&wal_entry)?;
+                if let Some(bitmap) = self.inner.partial_bitmap(idx) {
+                    wal.append_partial(&PartialWalEntryRef {
+                        block_index: block,
+                        sequence: seq,
+                        bitmap,
+                    })?;
+                } else {
+                    wal.append(&WalEntryRef {
+                        block_index: block,
+                        sequence: seq,
+                    })?;
+                }
             }
 
             if self.inner.config.wal_sync {
@@ -121,6 +142,7 @@ impl WriteCache<Active> {
         // CRITICAL: Mark blocks as present BEFORE writing zeros to file.
         // Same invariant as write() — prevents prefetch race where prefetch
         // could overwrite our zeros with stale S3 data.
+        // For partial blocks: mark sub-regions before zeroing.
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (offset + len - 1) / block_size;
@@ -128,6 +150,16 @@ impl WriteCache<Active> {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
+                if self.inner.is_partial(idx) {
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end = (offset + len).min(block_start_byte + block_size);
+                    self.inner.mark_sub_regions(
+                        idx,
+                        (write_start - block_start_byte) as usize,
+                        (write_end - write_start) as usize,
+                    );
+                }
             }
         }
 
@@ -184,11 +216,18 @@ impl WriteCache<Active> {
                 self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
 
                 let seq = self.inner.sequence.next();
-                let wal_entry = WalEntryRef {
-                    block_index: block,
-                    sequence: seq,
-                };
-                wal.append(&wal_entry)?;
+                if let Some(bitmap) = self.inner.partial_bitmap(idx) {
+                    wal.append_partial(&PartialWalEntryRef {
+                        block_index: block,
+                        sequence: seq,
+                        bitmap,
+                    })?;
+                } else {
+                    wal.append(&WalEntryRef {
+                        block_index: block,
+                        sequence: seq,
+                    })?;
+                }
             }
 
             if self.inner.config.wal_sync {
@@ -276,6 +315,16 @@ impl WriteCache<Active> {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
+                if self.inner.is_partial(idx) {
+                    let block_start_byte = block * block_size;
+                    let write_start = offset.max(block_start_byte);
+                    let write_end = (offset + len).min(block_start_byte + block_size);
+                    self.inner.mark_sub_regions(
+                        idx,
+                        (write_start - block_start_byte) as usize,
+                        (write_end - write_start) as usize,
+                    );
+                }
             }
         }
 
@@ -312,11 +361,18 @@ impl WriteCache<Active> {
                 self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
 
                 let seq = self.inner.sequence.next();
-                let wal_entry = WalEntryRef {
-                    block_index: block,
-                    sequence: seq,
-                };
-                wal.append(&wal_entry)?;
+                if let Some(bitmap) = self.inner.partial_bitmap(idx) {
+                    wal.append_partial(&PartialWalEntryRef {
+                        block_index: block,
+                        sequence: seq,
+                        bitmap,
+                    })?;
+                } else {
+                    wal.append(&WalEntryRef {
+                        block_index: block,
+                        sequence: seq,
+                    })?;
+                }
             }
 
             if self.inner.config.wal_sync {

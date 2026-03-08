@@ -70,6 +70,9 @@ impl WriteCache<Initializing> {
         // (which was pwrite'd before the WAL entry was appended).
         let mut max_wal_seq = persisted_max_seq;
 
+        // Partial block bitmaps reconstructed from partial WAL entries.
+        let partial_blocks: DashMap<usize, std::sync::atomic::AtomicU32> = DashMap::new();
+
         for entry in &wal_entries {
             let block_index = entry.block_index as usize;
             max_wal_seq = max_wal_seq.max(entry.sequence);
@@ -86,6 +89,14 @@ impl WriteCache<Initializing> {
                         let _ = state_map.cas(block_index, current, SparseBlockState::DIRTY);
                     }
                     dirty_count += 1;
+                }
+
+                // Reconstruct partial block bitmap from partial WAL entries
+                if let Some(bitmap) = entry.partial_bitmap {
+                    partial_blocks
+                        .entry(block_index)
+                        .or_insert_with(|| std::sync::atomic::AtomicU32::new(0))
+                        .fetch_or(bitmap, std::sync::atomic::Ordering::Release);
                 }
             }
         }
@@ -108,6 +119,7 @@ impl WriteCache<Initializing> {
         let zbh = zero_block_hash(block_size);
         let zbb = Bytes::from(vec![0u8; block_size]);
 
+        let partial_count = partial_blocks.len();
         let inner = Arc::new(CacheInner {
             config,
             data_file,
@@ -123,11 +135,13 @@ impl WriteCache<Initializing> {
             recovery_warnings: AtomicU64::new(recovery_warning_count),
             crc_map: DashMap::new(),
             flush_lock: tokio::sync::Mutex::new(()),
+            partial_blocks,
         });
 
         info!(
             dirty_blocks = dirty_count,
             present_blocks = present_count,
+            partial_blocks = partial_count,
             recovery_warnings = recovery_warning_count,
             "cache opened, transitioning to Recovering"
         );
@@ -173,6 +187,7 @@ impl WriteCache<Initializing> {
             recovery_warnings: AtomicU64::new(0),
             crc_map: DashMap::new(),
             flush_lock: tokio::sync::Mutex::new(()),
+            partial_blocks: DashMap::new(),
         });
 
         info!("cache opened fresh for fork, directly Active");

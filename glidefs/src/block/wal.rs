@@ -10,6 +10,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write as IoWrite, Seek, SeekFrom, BufWriter};
 use std::path::{Path, PathBuf};
 
+/// Bit flag set on block_index to indicate a partial WAL entry (24 bytes
+/// instead of 20). Block indices are at most ~80K (10GB / 128KB), so the
+/// high bit of the u64 is always 0 in normal entries.
+pub const PARTIAL_WAL_FLAG: u64 = 1 << 63;
+
 /// A single WAL entry: records that a chunk was modified.
 ///
 /// Block data is NOT stored in the WAL — on recovery, the SSD cache file
@@ -21,12 +26,21 @@ use std::path::{Path, PathBuf};
 pub struct WalEntry {
     pub block_index: u64,
     pub sequence: u64,
+    /// For partial blocks: bitmap of valid 4KB sub-regions. `None` for normal entries.
+    pub partial_bitmap: Option<u32>,
 }
 
 /// Borrowed WAL entry for zero-alloc appends on the write hot path.
 pub struct WalEntryRef {
     pub block_index: u64,
     pub sequence: u64,
+}
+
+/// Borrowed partial WAL entry: includes sub-region bitmap for partial blocks.
+pub struct PartialWalEntryRef {
+    pub block_index: u64,
+    pub sequence: u64,
+    pub bitmap: u32,
 }
 
 /// Append-only write-ahead log backed by a file on local SSD.
@@ -79,6 +93,35 @@ impl Wal {
         self.writer.write_all(&crc.to_le_bytes())?;
 
         self.offset += 20; // 8 + 8 + 4
+
+        Ok(())
+    }
+
+    /// Serialize and append a partial WAL entry (for partial blocks).
+    ///
+    /// Wire format: [block_index|HIGH_BIT:u64][sequence:u64][bitmap:u32][crc32:u32] (24 bytes)
+    ///
+    /// The high bit on block_index distinguishes this from a normal 20-byte entry.
+    pub fn append_partial(&mut self, entry: &PartialWalEntryRef) -> io::Result<()> {
+        let mut hasher = crc32fast::Hasher::new();
+
+        let tagged_index = entry.block_index | PARTIAL_WAL_FLAG;
+        let block_index_le = tagged_index.to_le_bytes();
+        hasher.update(&block_index_le);
+        self.writer.write_all(&block_index_le)?;
+
+        let sequence_le = entry.sequence.to_le_bytes();
+        hasher.update(&sequence_le);
+        self.writer.write_all(&sequence_le)?;
+
+        let bitmap_le = entry.bitmap.to_le_bytes();
+        hasher.update(&bitmap_le);
+        self.writer.write_all(&bitmap_le)?;
+
+        let crc = hasher.finalize();
+        self.writer.write_all(&crc.to_le_bytes())?;
+
+        self.offset += 24; // 8 + 8 + 4 + 4
 
         Ok(())
     }
@@ -155,7 +198,7 @@ impl Wal {
     fn read_entry(reader: &mut impl Read) -> io::Result<Option<WalEntry>> {
         let mut hasher = crc32fast::Hasher::new();
 
-        // block_index
+        // block_index (may have high bit set for partial entries)
         let mut buf8 = [0u8; 8];
         match reader.read_exact(&mut buf8) {
             Ok(()) => {}
@@ -163,12 +206,24 @@ impl Wal {
             Err(e) => return Err(e),
         }
         hasher.update(&buf8);
-        let block_index = u64::from_le_bytes(buf8);
+        let raw_block_index = u64::from_le_bytes(buf8);
+        let is_partial = raw_block_index & PARTIAL_WAL_FLAG != 0;
+        let block_index = raw_block_index & !PARTIAL_WAL_FLAG;
 
         // sequence
         reader.read_exact(&mut buf8)?;
         hasher.update(&buf8);
         let sequence = u64::from_le_bytes(buf8);
+
+        // For partial entries: read bitmap before CRC
+        let partial_bitmap = if is_partial {
+            let mut buf4 = [0u8; 4];
+            reader.read_exact(&mut buf4)?;
+            hasher.update(&buf4);
+            Some(u32::from_le_bytes(buf4))
+        } else {
+            None
+        };
 
         // crc32
         let mut buf4 = [0u8; 4];
@@ -186,6 +241,7 @@ impl Wal {
         Ok(Some(WalEntry {
             block_index,
             sequence,
+            partial_bitmap,
         }))
     }
 }

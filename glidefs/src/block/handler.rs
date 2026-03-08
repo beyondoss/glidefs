@@ -164,28 +164,52 @@ impl BlockHandler {
     // Block I/O Operations
     // ========================================================================
 
-    /// Backfill cache blocks from S3 that would be partially overwritten.
+    /// Prepare cache blocks for sub-block writes.
     ///
     /// For writes smaller than the cache block size, if the affected block
-    /// exists in S3 but not on local SSD, we must fetch the full block
-    /// first to preserve the unwritten portions. Without this, `set_present()`
-    /// marks the block as local but only the written bytes have real data;
-    /// the rest would read back as zeros.
+    /// exists in S3 but not on local SSD, we track it as a "partial block"
+    /// and spawn a background task to fetch the full block from S3. The
+    /// write proceeds immediately on the SSD without waiting for S3.
     ///
-    /// Blocks that are already present locally or will be fully overwritten
-    /// are skipped — zero S3 fetches in the common case.
-    async fn backfill_missing_blocks(&self, offset: u64, length: u64) -> CommandResult<()> {
+    /// The bitmap in partial_blocks tracks which 4KB sub-regions have valid
+    /// guest data. Background backfill fills unwritten sub-regions from S3.
+    /// The read and flush paths are aware of partial blocks and handle them
+    /// correctly.
+    ///
+    /// Falls back to synchronous S3 fetch when:
+    /// - MAX_PARTIAL_BLOCKS cap is reached (memory bound)
+    /// - Block is already fully present and not partial
+    /// - Write fully covers the block (no preservation needed)
+    /// - Block has no S3 data (fresh block, zeros are fine)
+    /// Prepare partial-block tracking for sub-block writes.
+    ///
+    /// Returns the list of block indices that need background backfill.
+    /// The caller MUST spawn background backfill AFTER the guest write completes,
+    /// so the bitmap bits are set and the pwrite is done before the backfill
+    /// task can race with the written data.
+    async fn backfill_missing_blocks(&self, offset: u64, length: u64) -> CommandResult<Vec<u64>> {
+        use super::write_cache::inner::MAX_PARTIAL_BLOCKS;
+        use std::sync::atomic::AtomicU32;
+
         let block_size = self.cache.block_size() as u64;
         let start_block = offset / block_size;
         let end_block = (offset + length - 1) / block_size;
+        let mut needs_backfill = Vec::new();
 
         for block_idx in start_block..=end_block {
-            // Fast path: block is already on local SSD
-            if self.cache.is_block_present(block_idx as usize) {
+            let idx = block_idx as usize;
+
+            // Fast path: block is fully present on local SSD (not partial)
+            if self.cache.is_block_present(idx) && !self.cache.inner().is_partial(idx) {
                 continue;
             }
 
-            // Check if the write fully covers this block — no fetch needed
+            // Already tracked as partial — bitmap will be updated in write path
+            if self.cache.inner().is_partial(idx) {
+                continue;
+            }
+
+            // Check if the write fully covers this block — no preservation needed
             let block_start = block_idx * block_size;
             let block_end = block_start + block_size;
             if offset <= block_start && offset + length >= block_end {
@@ -194,36 +218,155 @@ impl BlockHandler {
 
             // Check if the block has S3 data that needs preserving.
             // Fresh blocks (never flushed to S3) have no manifest entry — skip them.
-            {
+            let has_s3_data = {
                 let vm = self.volume_manifest.read();
                 let chunk_idx = vm.chunk_idx_for_block(block_idx);
-                if vm
-                    .chunk_pack_ids(chunk_idx)
-                    .map_or(true, |ids| ids.is_empty())
-                {
-                    continue;
+                vm.chunk_pack_ids(chunk_idx)
+                    .map_or(false, |ids| !ids.is_empty())
+            };
+            if !has_s3_data {
+                continue;
+            }
+
+            // Check MAX_PARTIAL_BLOCKS cap — fall back to sync backfill if exceeded
+            if self.cache.inner().partial_blocks.len() >= MAX_PARTIAL_BLOCKS {
+                // Synchronous fallback: fetch full block from S3
+                let block_data = self
+                    .cache
+                    .read(
+                        block_start,
+                        block_size as usize,
+                        self.clean_cache.as_ref(),
+                        &self.pack_index_cache,
+                        &self.volume_manifest,
+                        &self.content_store,
+                        &self.metrics,
+                    )
+                    .await?;
+                self.cache.backfill_block(idx, &block_data)?;
+                continue;
+            }
+
+            // Insert as partial block with empty bitmap (no sub-regions valid yet).
+            // The write path will set bits for sub-regions it writes.
+            // Use entry().or_insert_with() — NOT insert() — to avoid replacing
+            // an existing AtomicU32 if a concurrent write already inserted one.
+            // DashMap::insert would drop the existing AtomicU32 and any bitmap
+            // bits set by the other write's mark_sub_regions.
+            self.cache
+                .inner()
+                .partial_blocks
+                .entry(idx)
+                .or_insert_with(|| AtomicU32::new(0));
+
+            needs_backfill.push(block_idx);
+        }
+
+        Ok(needs_backfill)
+    }
+
+    /// Spawn a background task to backfill a partial block from S3.
+    ///
+    /// Fetches the full block from S3, writes unwritten sub-regions to SSD
+    /// (checking the bitmap to skip guest-written sub-regions), and removes
+    /// the entry from partial_blocks.
+    fn spawn_background_backfill(&self, block_idx: u64) {
+        use super::write_cache::inner::SUB_BLOCK_SIZE;
+
+        let cache = Arc::clone(&self.cache);
+        let content_store = Arc::clone(&self.content_store);
+        let clean_cache = Arc::clone(&self.clean_cache);
+        let pack_index_cache = Arc::clone(&self.pack_index_cache);
+        let volume_manifest = Arc::clone(&self.volume_manifest);
+        let metrics = Arc::clone(&self.metrics);
+        let block_size = self.cache.block_size();
+
+        tokio::spawn(async move {
+            let block_start = block_idx * block_size as u64;
+            let idx = block_idx as usize;
+
+            // Fetch full block from S3 via the read path (uses download semaphore)
+            let s3_data = match cache
+                .read(
+                    block_start,
+                    block_size,
+                    clean_cache.as_ref(),
+                    &pack_index_cache,
+                    &volume_manifest,
+                    &content_store,
+                    &metrics,
+                )
+                .await
+            {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::warn!(
+                        block_idx,
+                        error = %e,
+                        "background backfill failed — block stays partial, on-demand read will complete it"
+                    );
+                    return;
+                }
+            };
+
+            // Write each unwritten sub-region from S3 data to SSD.
+            // Re-read bitmap per sub-region to avoid overwriting guest data
+            // that arrived after the S3 fetch started.
+            let inner = cache.inner();
+            {
+                for sub in 0..(block_size / SUB_BLOCK_SIZE) {
+                    // Re-check bitmap atomically for each sub-region
+                    let bitmap = match inner.partial_bitmap(idx) {
+                        Some(b) => b,
+                        None => break, // block was completed by on-demand read
+                    };
+                    if bitmap & (1 << sub) != 0 {
+                        continue; // guest already wrote this sub-region
+                    }
+                    let sub_offset = block_start + (sub * SUB_BLOCK_SIZE) as u64;
+                    let sub_data = &s3_data[sub * SUB_BLOCK_SIZE..(sub + 1) * SUB_BLOCK_SIZE];
+                    if let Err(e) = inner.write_sub_region(sub_offset, sub_data) {
+                        tracing::warn!(
+                            block_idx,
+                            sub_region = sub,
+                            error = %e,
+                            "backfill pwrite failed"
+                        );
+                        return;
+                    }
                 }
             }
 
-            // Partial write to a block in S3: fetch full block to preserve unwritten data
-            let block_data = self
-                .cache
-                .read(
-                    block_start,
-                    block_size as usize,
-                    self.clean_cache.as_ref(),
-                    &self.pack_index_cache,
-                    &self.volume_manifest,
-                    &self.content_store,
-                    &self.metrics,
-                )
-                .await?;
+            // Backfill complete — remove from partial tracking.
+            // If an on-demand read already completed it, this is a no-op.
+            inner.complete_partial(idx);
+        });
+    }
 
-            self.cache
-                .backfill_block(block_idx as usize, &block_data)?;
+    /// Spawn background backfill for all partial blocks recovered from WAL.
+    ///
+    /// Call this after the handler is fully constructed (following crash recovery)
+    /// so that partial blocks get filled from S3 even if the guest never reads them.
+    /// Without this, partial blocks would stay dirty and unflushed until a guest read
+    /// triggers on-demand merge.
+    pub fn spawn_recovery_backfills(&self) {
+        let partial_block_indices: Vec<u64> = self
+            .cache
+            .inner()
+            .partial_blocks
+            .iter()
+            .map(|entry| *entry.key() as u64)
+            .collect();
+
+        if !partial_block_indices.is_empty() {
+            tracing::info!(
+                count = partial_block_indices.len(),
+                "spawning background backfill for recovered partial blocks"
+            );
+            for block_idx in partial_block_indices {
+                self.spawn_background_backfill(block_idx);
+            }
         }
-
-        Ok(())
     }
 
     /// Read data from the cache, fetching from S3 if not present locally.
@@ -343,11 +486,20 @@ impl BlockHandler {
             return Err(CommandError::NoSpace);
         }
 
-        self.backfill_missing_blocks(offset, data.len() as u64)
+        let backfill_blocks = self
+            .backfill_missing_blocks(offset, data.len() as u64)
             .await?;
 
         self.metrics.record_guest_write(data.len() as u64);
         self.cache.write(offset, data, self.clean_cache.as_ref())?;
+
+        // Spawn background backfill AFTER write completes — the bitmap bits are
+        // now set and the pwrite is done, so the backfill task won't race with
+        // guest-written data.
+        for block_idx in backfill_blocks {
+            self.spawn_background_backfill(block_idx);
+        }
+
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(
                 offset,
@@ -383,9 +535,17 @@ impl BlockHandler {
             return Ok(());
         }
 
-        self.backfill_missing_blocks(offset, length as u64).await?;
+        let backfill_blocks = self
+            .backfill_missing_blocks(offset, length as u64)
+            .await?;
 
         self.cache.zero_range(offset, length as u64)?;
+
+        // Spawn background backfill AFTER zero_range completes
+        for block_idx in backfill_blocks {
+            self.spawn_background_backfill(block_idx);
+        }
+
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(offset, length as u64, super::write_trace::TraceOp::Trim);
         }
@@ -418,9 +578,16 @@ impl BlockHandler {
             return Ok(());
         }
 
-        self.backfill_missing_blocks(offset, length as u64).await?;
+        let backfill_blocks = self
+            .backfill_missing_blocks(offset, length as u64)
+            .await?;
 
         self.cache.zero_range(offset, length as u64)?;
+
+        for block_idx in backfill_blocks {
+            self.spawn_background_backfill(block_idx);
+        }
+
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(
                 offset,
@@ -489,9 +656,15 @@ impl BlockHandler {
             return Err(CommandError::NoSpace);
         }
 
-        self.backfill_missing_blocks(offset, length).await?;
+        let backfill_blocks = self.backfill_missing_blocks(offset, length).await?;
 
         self.cache.pre_write(offset, length)?;
+
+        // Spawn after pre_write — bitmap bits are set, safe for backfill
+        for block_idx in backfill_blocks {
+            self.spawn_background_backfill(block_idx);
+        }
+
         Ok(())
     }
 

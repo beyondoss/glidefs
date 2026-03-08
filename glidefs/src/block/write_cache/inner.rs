@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::block::block_map::{Blake3Hash, SequenceNumber, SparseBlockState, SparseStateMap};
@@ -18,6 +18,16 @@ use bytes::Bytes;
 pub(super) const METADATA_MAGIC: &[u8; 8] = b"ZFSCACHE";
 /// Version 5: sparse state map + trailing max_sequence u64
 pub(super) const METADATA_VERSION: u32 = 5;
+
+/// Size of each sub-region tracked in the partial block bitmap.
+pub(crate) const SUB_BLOCK_SIZE: usize = 4096;
+
+/// Number of sub-regions per block (128KB / 4KB = 32).
+pub(crate) const SUBS_PER_BLOCK: usize = 32;
+
+/// Maximum number of partial blocks tracked simultaneously.
+/// Beyond this, fall back to synchronous backfill.
+pub(crate) const MAX_PARTIAL_BLOCKS: usize = 1024;
 
 /// Sealed module for `SyncFile`. The `File` field is private to this module,
 /// preventing any code outside from accessing seek-based methods. This makes
@@ -298,6 +308,17 @@ pub(crate) struct CacheInner {
     /// serialize the in-memory VolumeManifest at different points, and
     /// last-writer-wins on S3 can overwrite a correct manifest with a stale one.
     pub(crate) flush_lock: tokio::sync::Mutex<()>,
+
+    /// Partial block tracking for async sub-block backfill.
+    ///
+    /// Maps block_index → 32-bit bitmap of valid 4KB sub-regions. A set bit
+    /// means the guest has written to that sub-region (or backfill has filled
+    /// it). Background backfill skips set bits when writing S3 data to SSD.
+    ///
+    /// Entries are transient: inserted when a sub-block write hits a NOT_PRESENT
+    /// block with S3 data, removed when backfill completes (all 32 bits set or
+    /// full block fetched from S3). Hard cap at MAX_PARTIAL_BLOCKS.
+    pub(crate) partial_blocks: DashMap<usize, AtomicU32>,
 }
 
 impl CacheInner {
@@ -417,6 +438,54 @@ impl CacheInner {
         self.state_map.count_present()
     }
 
+    // -- Partial block methods (for async sub-block backfill) ------------------
+
+    /// Check if a block is tracked as partial (has incomplete backfill).
+    #[inline]
+    pub(crate) fn is_partial(&self, block_idx: usize) -> bool {
+        self.partial_blocks.contains_key(&block_idx)
+    }
+
+    /// Mark sub-regions as valid in a partial block's bitmap.
+    ///
+    /// Computes which 4KB sub-regions are covered by the byte range
+    /// [offset_in_block..offset_in_block+len) and sets those bits
+    /// via atomic fetch_or.
+    #[inline]
+    pub(crate) fn mark_sub_regions(&self, block_idx: usize, offset_in_block: usize, len: usize) {
+        if let Some(entry) = self.partial_blocks.get(&block_idx) {
+            let start_sub = offset_in_block / SUB_BLOCK_SIZE;
+            let end_sub = (offset_in_block + len - 1) / SUB_BLOCK_SIZE;
+            let mut mask: u32 = 0;
+            for sub in start_sub..=end_sub {
+                if sub < SUBS_PER_BLOCK {
+                    mask |= 1 << sub;
+                }
+            }
+            entry.value().fetch_or(mask, Ordering::Release);
+        }
+    }
+
+    /// Remove a block from partial tracking (backfill complete).
+    #[inline]
+    pub(crate) fn complete_partial(&self, block_idx: usize) {
+        self.partial_blocks.remove(&block_idx);
+    }
+
+    /// Get the current bitmap for a partial block, or None if not partial.
+    #[inline]
+    pub(crate) fn partial_bitmap(&self, block_idx: usize) -> Option<u32> {
+        self.partial_blocks
+            .get(&block_idx)
+            .map(|entry| entry.value().load(Ordering::Acquire))
+    }
+
+    /// Write a sub-region to the data file (for background backfill).
+    #[inline]
+    pub(crate) fn write_sub_region(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.data_file.write_all_at(data, offset)
+    }
+
     // -- CRC32 DashMap methods (for dirty-block corruption detection) ----------
 
     /// Store a CRC32 checksum for a dirty block (checkpoint path).
@@ -524,6 +593,36 @@ impl CacheInner {
     /// Persist block states and presence.
     pub(super) fn save_metadata(&self) -> Result<(), CacheError> {
         self.save_block_states()
+    }
+
+    /// Re-append partial WAL entries after WAL truncation.
+    ///
+    /// Checkpoint truncates the WAL (entries are persisted in metadata).
+    /// But partial block bitmaps live only in the WAL — without this,
+    /// a crash after checkpoint would lose partial block tracking and the
+    /// flush path could upload garbage sub-regions.
+    ///
+    /// Must be called while holding the WAL lock.
+    pub(super) fn reappend_partial_entries(
+        &self,
+        wal: &mut crate::block::wal::Wal,
+    ) -> Result<(), CacheError> {
+        use crate::block::wal::PartialWalEntryRef;
+
+        for entry in self.partial_blocks.iter() {
+            let block_idx = *entry.key();
+            let bitmap = entry.value().load(Ordering::Acquire);
+            let seq = self.sequence.next();
+            wal.append_partial(&PartialWalEntryRef {
+                block_index: block_idx as u64,
+                sequence: seq,
+                bitmap,
+            })?;
+        }
+        if !self.partial_blocks.is_empty() {
+            wal.flush_buf()?;
+        }
+        Ok(())
     }
 
     /// Load block states and presence from metadata file.

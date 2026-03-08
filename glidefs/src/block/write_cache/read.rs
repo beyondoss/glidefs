@@ -77,7 +77,10 @@ impl WriteCache<Active> {
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (offset + len as u64 - 1) / block_size;
-        if !(start_block..=end_block).all(|i| self.inner.is_present(i as usize)) {
+        if !(start_block..=end_block).all(|i| {
+            let idx = i as usize;
+            self.inner.is_present(idx) && !self.inner.is_partial(idx)
+        }) {
             return None;
         }
         Some(match self.inner.data_file.read_exact_at(&mut buf[..len], offset) {
@@ -195,9 +198,12 @@ impl WriteCache<Active> {
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
         let num_chunks = (end_chunk - start_chunk + 1) as usize;
 
-        // Fast path: all chunks present on local SSD → single LocalSsd entry.
-        // Collapses N per-chunk SQEs into one io_uring Read of exact bytes.
-        if (start_chunk..=end_chunk).all(|i| self.inner.is_present(i as usize)) {
+        // Fast path: all chunks present on local SSD and not partial →
+        // single LocalSsd entry. Collapses N per-chunk SQEs into one io_uring Read.
+        if (start_chunk..=end_chunk).all(|i| {
+            let idx = i as usize;
+            self.inner.is_present(idx) && !self.inner.is_partial(idx)
+        }) {
             return Ok(ReadPlan {
                 entries: vec![ChunkPlanEntry {
                     source: ChunkSource::LocalSsd { file_offset: offset },
@@ -352,9 +358,12 @@ impl WriteCache<Active> {
         let end_block = (offset + len as u64 - 1) / block_size;
         let num_blocks = (end_block - start_block + 1) as usize;
 
-        // Fast path: all blocks present on local SSD → single pread of exact bytes.
-        // Bypasses per-block resolution, full-block allocation, and Bytes wrapping.
-        if (start_block..=end_block).all(|i| self.inner.is_present(i as usize)) {
+        // Fast path: all blocks present on local SSD and not partial →
+        // single pread of exact bytes. Bypasses per-block resolution.
+        if (start_block..=end_block).all(|i| {
+            let idx = i as usize;
+            self.inner.is_present(idx) && !self.inner.is_partial(idx)
+        }) {
             let mut buf = vec![0u8; len];
             self.inner.data_file.read_exact_at(&mut buf, offset)?;
             return Ok(Bytes::from(buf));
@@ -378,64 +387,91 @@ impl WriteCache<Active> {
             return Ok(block_data.slice(slice_start..std::cmp::min(slice_end, block_data.len())));
         }
 
-        // Multi-block: locate all blocks concurrently, then coalesce S3 fetches
-        let locate_futures: Vec<_> = (start_block..=end_block)
-            .map(|block_idx| {
-                self.locate_block(
-                    block_idx as usize,
-                    clean_cache,
-                    pack_index_cache,
-                    volume_manifest,
-                    content_store,
-                    Some(metrics),
-                )
-            })
-            .collect();
-        let locations = futures::future::try_join_all(locate_futures).await?;
+        // Multi-block: check if any blocks are partial. If none are partial,
+        // use the fast coalesced path. If any are partial, resolve per-block
+        // (which handles merging SSD + S3 data for partial blocks).
+        let has_partial = (start_block..=end_block)
+            .any(|i| self.inner.is_partial(i as usize));
 
-        // Partition: resolved blocks go directly into results,
-        // NeedsFetch blocks get coalesced S3 fetches
-        let mut resolved_blocks: HashMap<usize, Bytes> = HashMap::new();
-        let mut fetch_entries = Vec::new();
+        let block_data_vec: Vec<Bytes> = if !has_partial {
+            // Fast path: no partial blocks — locate + coalesce S3 fetches
+            let locate_futures: Vec<_> = (start_block..=end_block)
+                .map(|block_idx| {
+                    self.locate_block(
+                        block_idx as usize,
+                        clean_cache,
+                        pack_index_cache,
+                        volume_manifest,
+                        content_store,
+                        Some(metrics),
+                    )
+                })
+                .collect();
+            let locations = futures::future::try_join_all(locate_futures).await?;
 
-        for (i, location) in locations.into_iter().enumerate() {
-            match location {
-                BlockLocation::Local(data) | BlockLocation::Cached(data) => {
-                    resolved_blocks.insert(i, data);
-                }
-                BlockLocation::Zero => {
-                    resolved_blocks.insert(i, self.inner.zero_block_bytes.clone());
-                }
-                BlockLocation::NeedsFetch {
-                    pack_id,
-                    chunk_idx,
-                    expected_hash,
-                    pack_offset,
-                    comp_length,
-                } => {
-                    fetch_entries.push((i, pack_id, chunk_idx, expected_hash, pack_offset, comp_length));
+            let mut resolved_blocks: HashMap<usize, Bytes> = HashMap::new();
+            let mut fetch_entries = Vec::new();
+
+            for (i, location) in locations.into_iter().enumerate() {
+                match location {
+                    BlockLocation::Local(data) | BlockLocation::Cached(data) => {
+                        resolved_blocks.insert(i, data);
+                    }
+                    BlockLocation::Zero => {
+                        resolved_blocks.insert(i, self.inner.zero_block_bytes.clone());
+                    }
+                    BlockLocation::NeedsFetch {
+                        pack_id,
+                        chunk_idx,
+                        expected_hash,
+                        pack_offset,
+                        comp_length,
+                    } => {
+                        fetch_entries.push((i, pack_id, chunk_idx, expected_hash, pack_offset, comp_length));
+                    }
                 }
             }
-        }
 
-        // Coalesced S3 fetch for all NeedsFetch blocks
-        if !fetch_entries.is_empty() {
-            let fetched = Self::fetch_coalesced(
-                &fetch_entries,
-                content_store,
-                clean_cache,
-                Some(metrics),
-            )
-            .await?;
-            resolved_blocks.extend(fetched);
-        }
+            if !fetch_entries.is_empty() {
+                let fetched = Self::fetch_coalesced(
+                    &fetch_entries,
+                    content_store,
+                    clean_cache,
+                    Some(metrics),
+                )
+                .await?;
+                resolved_blocks.extend(fetched);
+            }
+
+            let mut vec = Vec::with_capacity(num_blocks);
+            for i in 0..num_blocks {
+                let data = resolved_blocks.remove(&i).ok_or_else(|| {
+                    CacheError::DecompressFailed("missing block in coalesced read".to_string())
+                })?;
+                vec.push(data);
+            }
+            vec
+        } else {
+            // Slow path: some blocks are partial — resolve per-block
+            // to ensure proper SSD + S3 merge for partial blocks.
+            let resolve_futures: Vec<_> = (start_block..=end_block)
+                .map(|block_idx| {
+                    self.resolve_block(
+                        block_idx as usize,
+                        clean_cache,
+                        pack_index_cache,
+                        volume_manifest,
+                        content_store,
+                        Some(metrics),
+                    )
+                })
+                .collect();
+            futures::future::try_join_all(resolve_futures).await?
+        };
 
         // Assemble result in block order
         let mut result = Vec::with_capacity(len);
-        for i in 0..num_blocks {
-            let block_data = resolved_blocks.get(&i).ok_or_else(|| {
-                CacheError::DecompressFailed("missing block in coalesced read".to_string())
-            })?;
+        for (i, block_data) in block_data_vec.iter().enumerate() {
             let block_idx = start_block + i as u64;
             let block_start_byte = block_idx * block_size;
             let slice_start = if block_idx == start_block {
@@ -460,11 +496,12 @@ impl WriteCache<Active> {
     /// Locate where a block lives without fetching from S3.
     ///
     /// Resolution order:
-    /// 1. is_present → Local (pread from SSD)
-    /// 2. VolumeManifest → PackIndexCache → clean_cache → Cached
-    /// 3. PackIndexCache miss → parallel prefetch ALL pack indices for chunk
-    /// 4. Block found → NeedsFetch (S3 coordinates)
-    /// 5. Block not in any pack → Zero
+    /// 1. is_present AND not partial → Local (pread from SSD)
+    /// 2. is_present AND partial → fetch from S3, merge with SSD, complete backfill
+    /// 3. VolumeManifest → PackIndexCache → clean_cache → Cached
+    /// 4. PackIndexCache miss → parallel prefetch ALL pack indices for chunk
+    /// 5. Block found → NeedsFetch (S3 coordinates)
+    /// 6. Block not in any pack → Zero
     async fn locate_block(
         &self,
         block_index: usize,
@@ -474,10 +511,31 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<BlockLocation, CacheError> {
-        // Hot path: block is present on local SSD
-        if self.inner.is_present(block_index) {
+        // Hot path: block is present on local SSD and fully backfilled
+        if self.inner.is_present(block_index) && !self.inner.is_partial(block_index) {
             let data = self.sync_read_local_block(block_index as u64)?;
             return Ok(BlockLocation::Local(data));
+        }
+
+        // Partial block: merge SSD data (guest-written sub-regions) with S3 data.
+        // This also completes the backfill on-demand.
+        if self.inner.is_present(block_index) && self.inner.is_partial(block_index) {
+            // Read the full block from SSD (has guest data in written sub-regions)
+            let local_data = self.sync_read_local_block(block_index as u64)?;
+            let bitmap = self.inner.partial_bitmap(block_index).unwrap_or(0);
+
+            // If all bits set, block is fully populated — just complete and return
+            let block_size = self.inner.config.block_size;
+            let subs = block_size / super::inner::SUB_BLOCK_SIZE;
+            let full_mask = if subs >= 32 { u32::MAX } else { (1u32 << subs) - 1 };
+            if bitmap == full_mask {
+                self.inner.complete_partial(block_index);
+                return Ok(BlockLocation::Local(local_data));
+            }
+
+            // Need S3 data for unwritten sub-regions — return as NeedsFetch
+            // so the caller fetches from S3. We'll merge in resolve_block.
+            // Fall through to the normal S3 resolution path below.
         }
 
         // Cold path: resolve via VolumeManifest → PackIndexCache
@@ -602,7 +660,9 @@ impl WriteCache<Active> {
 
     /// Resolve a single block through the full tier hierarchy (single-block path).
     ///
-    /// Calls `locate_block`, then fetches from S3 if needed.
+    /// Calls `locate_block`, then fetches from S3 if needed. For partial blocks,
+    /// merges SSD data (guest-written sub-regions) with S3 data and completes
+    /// the backfill on-demand.
     async fn resolve_block(
         &self,
         block_index: usize,
@@ -612,6 +672,8 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<Bytes, CacheError> {
+        let is_partial = self.inner.is_present(block_index) && self.inner.is_partial(block_index);
+
         let location = self
             .locate_block(
                 block_index,
@@ -623,9 +685,21 @@ impl WriteCache<Active> {
             )
             .await?;
 
-        match location {
-            BlockLocation::Local(data) | BlockLocation::Cached(data) => Ok(data),
-            BlockLocation::Zero => Ok(self.inner.zero_block_bytes.clone()),
+        let s3_data = match location {
+            BlockLocation::Local(data) => return Ok(data),
+            BlockLocation::Cached(data) => {
+                if !is_partial {
+                    return Ok(data);
+                }
+                data
+            }
+            BlockLocation::Zero => {
+                if is_partial {
+                    self.inner.zero_block_bytes.clone()
+                } else {
+                    return Ok(self.inner.zero_block_bytes.clone());
+                }
+            }
             BlockLocation::NeedsFetch {
                 pack_id,
                 chunk_idx,
@@ -633,7 +707,7 @@ impl WriteCache<Active> {
                 pack_offset,
                 comp_length,
             } => {
-                Self::fetch_single_block(
+                let data = Self::fetch_single_block(
                     content_store,
                     clean_cache,
                     metrics,
@@ -643,9 +717,60 @@ impl WriteCache<Active> {
                     pack_offset,
                     comp_length,
                 )
-                .await
+                .await?;
+                if !is_partial {
+                    return Ok(data);
+                }
+                data
             }
+        };
+
+        // Merge: SSD data for written sub-regions, S3 data for the rest
+        self.merge_partial_block(block_index, &s3_data)
+    }
+
+    /// Merge a partial block's SSD data with S3 data and complete backfill.
+    ///
+    /// For each sub-region: if the bitmap bit is set (guest wrote it), use SSD data.
+    /// Otherwise, use S3 data and write it to SSD to complete the backfill.
+    fn merge_partial_block(
+        &self,
+        block_index: usize,
+        s3_data: &[u8],
+    ) -> Result<Bytes, CacheError> {
+        use super::inner::SUB_BLOCK_SIZE;
+
+        let block_size = self.inner.config.block_size;
+
+        // Read current SSD data (has guest writes in marked sub-regions)
+        let local_data = self.sync_read_local_block(block_index as u64)?;
+        let mut merged = local_data.to_vec();
+        let block_start = block_index as u64 * block_size as u64;
+
+        // Fill in unwritten sub-regions from S3 data.
+        // Re-read bitmap per sub-region (same as spawn_background_backfill)
+        // to catch concurrent writes that set bits after we started merging.
+        for sub in 0..(block_size / SUB_BLOCK_SIZE) {
+            let bitmap = match self.inner.partial_bitmap(block_index) {
+                Some(b) => b,
+                None => break, // block was completed by another path
+            };
+            if bitmap & (1 << sub) != 0 {
+                continue; // guest wrote this sub-region, keep SSD data
+            }
+            let start = sub * SUB_BLOCK_SIZE;
+            let end = start + SUB_BLOCK_SIZE;
+            merged[start..end].copy_from_slice(&s3_data[start..end]);
+
+            // Write S3 data to SSD to complete backfill for this sub-region
+            let sub_offset = block_start + start as u64;
+            self.inner.write_sub_region(sub_offset, &s3_data[start..end])?;
         }
+
+        // Backfill complete — remove from partial tracking
+        self.inner.complete_partial(block_index);
+
+        Ok(Bytes::from(merged))
     }
 
     /// Fetch, decompress, verify, and cache a single block from S3.

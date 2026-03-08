@@ -70,6 +70,16 @@ fn compute_flush_batch(
     let per_block: Vec<Result<BlockResult, CacheError>> = snapshot
         .par_iter()
         .map(|&chunk_index| {
+            // Skip partial blocks — their unbackfilled sub-regions contain
+            // garbage. They stay DIRTY and will be flushed after backfill.
+            if inner.is_partial(chunk_index) {
+                return Ok(BlockResult::Skipped {
+                    chunk_index,
+                    cas_failed: true,
+                    corrupted: false,
+                });
+            }
+
             let mut chunk_buf = vec![0u8; block_size];
 
             let offset = chunk_index as u64 * block_size as u64;
@@ -399,12 +409,16 @@ impl WriteCache<Active> {
     /// Runs on a blocking thread via `spawn_blocking` to avoid blocking
     /// the Tokio runtime with `sync_all()` + `rename()` syscalls in
     /// `save_block_states`.
+    ///
+    /// After truncation, re-appends partial WAL entries so partial block
+    /// bitmaps survive a crash between checkpoint and backfill completion.
     async fn checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
         crate::task::spawn_blocking_named("checkpoint", move || {
             let mut wal = inner.wal.lock();
             inner.save_block_states()?;
             wal.truncate()?;
+            inner.reappend_partial_entries(&mut wal)?;
             Ok(())
         })
         .await
@@ -425,7 +439,9 @@ impl WriteCache<Active> {
         crate::task::spawn_blocking_named("local-checkpoint", move || {
             compute_dirty_crc32s(&inner);
             inner.save_block_states()?;
-            inner.wal.lock().truncate()?;
+            let mut wal = inner.wal.lock();
+            wal.truncate()?;
+            inner.reappend_partial_entries(&mut wal)?;
             debug!("local checkpoint complete");
             Ok(())
         })
@@ -446,6 +462,27 @@ impl WriteCache<Active> {
     #[allow(dead_code)]
     pub(crate) fn inner(&self) -> Arc<CacheInner> {
         Arc::clone(&self.inner)
+    }
+
+    /// Check whether a block is in the partial_blocks map (has unfilled sub-regions).
+    ///
+    /// TEST ONLY — exposed via `test-utils` feature for integration test assertions.
+    #[cfg(feature = "test-utils")]
+    #[allow(dead_code)]
+    pub fn is_block_partial(&self, block_idx: usize) -> bool {
+        self.inner.is_partial(block_idx)
+    }
+
+    /// Insert a block into partial_blocks with an empty bitmap (all sub-regions
+    /// marked as unfilled). Simulates what `backfill_missing_blocks` does before
+    /// the actual write.
+    ///
+    /// TEST ONLY — exposed via `test-utils` feature for integration test setup.
+    #[cfg(feature = "test-utils")]
+    #[allow(dead_code)]
+    pub fn insert_partial_block_for_test(&self, block_idx: usize) {
+        use std::sync::atomic::AtomicU32;
+        self.inner.partial_blocks.insert(block_idx, AtomicU32::new(0));
     }
 
     /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by

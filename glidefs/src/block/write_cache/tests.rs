@@ -1424,3 +1424,162 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     assert_eq!(stats.blocks_corrupted, 0);
     assert_eq!(cache.dirty_block_count(), 0);
 }
+
+// =========================================================================
+// Partial block data integrity tests
+// =========================================================================
+
+/// Prove that `DashMap::insert` overwrites an existing `AtomicU32`, losing
+/// bitmap bits set by `mark_sub_regions`. This is the mechanism behind the
+/// TOCTOU race in `backfill_missing_blocks`: two concurrent writes to the
+/// same block can both see `is_partial=false`, both call `insert`, and the
+/// second `insert` replaces the first's AtomicU32 — dropping any bitmap
+/// bits the first write's `mark_sub_regions` had set.
+///
+/// The race window in handler.rs write():
+/// 1. T2: is_partial(idx)=false  (before T1 inserts)
+/// 2. T1: partial_blocks.insert(idx, AtomicU32(0))
+/// 3. T1: cache.write → mark_sub_regions sets bits on T1's AtomicU32
+/// 4. T2: partial_blocks.insert(idx, AtomicU32(0)) → REPLACES T1's entry
+/// 5. Background backfill reads bitmap=0 for T1's sub-regions → overwrites
+///    T1's pwrite with stale S3 data.
+///
+/// Step 4 follows step 1 because T2 was delayed between `is_partial` and
+/// `insert` (e.g., acquiring `volume_manifest.read()` at handler.rs:222).
+#[tokio::test]
+async fn test_partial_blocks_insert_overwrites_bitmap_causing_data_loss() {
+    use std::sync::atomic::AtomicU32;
+
+    let dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "partial-test".to_string(),
+        device_size: 128 * 1024, // 1 block at 128KB
+        block_size: 128 * 1024,  // 128KB blocks → 32 sub-regions of 4KB
+        wal_sync: false,
+    };
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.skip_recovery_for_test();
+    let inner = cache.inner();
+
+    let block_idx = 0usize;
+
+    // Step 2: Thread A's backfill_missing_blocks inserts a partial entry.
+    inner.partial_blocks.insert(block_idx, AtomicU32::new(0));
+
+    // Step 3: Thread A's cache.write → mark_sub_regions sets bit for
+    //         sub-region 0 (bytes [0..4096] of the block).
+    inner.mark_sub_regions(block_idx, 0, 4096);
+
+    // Verify the bit IS set on Thread A's AtomicU32.
+    let bitmap_before = inner.partial_bitmap(block_idx).unwrap();
+    assert_eq!(
+        bitmap_before & 1,
+        1,
+        "sub-region 0 should be marked as written"
+    );
+
+    // Step 4: Thread B's backfill_missing_blocks calls insert() for the
+    //         same block (Thread B checked is_partial=false before Thread A
+    //         inserted, then got delayed on volume_manifest.read()).
+    //         DashMap::insert REPLACES Thread A's AtomicU32.
+    inner.partial_blocks.insert(block_idx, AtomicU32::new(0));
+
+    // DATA LOSS: Thread A's bitmap bit for sub-region 0 is gone.
+    let bitmap_after = inner.partial_bitmap(block_idx).unwrap();
+    assert_eq!(
+        bitmap_after, 0,
+        "DashMap::insert replaced AtomicU32, losing Thread A's bitmap bits"
+    );
+
+    // Step 5 consequence: background backfill reads bitmap=0 for sub-region 0,
+    // writes stale S3 data over Thread A's pwrite. Thread A's write is lost.
+
+    // ---------------------------------------------------------------
+    // Proof that entry().or_insert_with() preserves existing bits:
+    // ---------------------------------------------------------------
+    inner.partial_blocks.remove(&block_idx);
+
+    // Thread A inserts and sets bitmap bits
+    inner
+        .partial_blocks
+        .entry(block_idx)
+        .or_insert_with(|| AtomicU32::new(0));
+    inner.mark_sub_regions(block_idx, 0, 4096);
+
+    // Thread B uses entry().or_insert_with() — does NOT replace
+    inner
+        .partial_blocks
+        .entry(block_idx)
+        .or_insert_with(|| AtomicU32::new(0));
+
+    // Thread A's bits are preserved
+    let bitmap_fixed = inner.partial_bitmap(block_idx).unwrap();
+    assert_eq!(
+        bitmap_fixed & 1,
+        1,
+        "entry().or_insert_with() preserves existing bitmap bits"
+    );
+}
+
+/// Prove that `merge_partial_block` reads the bitmap once at the start,
+/// missing concurrent writes that set bits during the merge loop.
+///
+/// The race: a read request hits a partial block and calls merge_partial_block.
+/// merge reads bitmap=0 for sub-region N. Concurrently, a write sets bit N
+/// (via mark_sub_regions with Release ordering) and pwrite's new data to SSD.
+/// merge then writes stale S3 data to sub-region N on SSD, overwriting the
+/// concurrent write's data.
+///
+/// The background backfill task (`spawn_background_backfill`) correctly
+/// re-reads the bitmap per sub-region. `merge_partial_block` should do the same.
+#[tokio::test]
+async fn test_merge_partial_block_stale_bitmap_misses_concurrent_write() {
+    use std::sync::atomic::AtomicU32;
+
+    let dir = TempDir::new().unwrap();
+    let block_size = 128 * 1024; // 128KB → 32 sub-regions of 4KB
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "merge-test".to_string(),
+        device_size: block_size as u64,
+        block_size,
+        wal_sync: false,
+    };
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.skip_recovery_for_test();
+    let inner = cache.inner();
+
+    let block_idx = 0usize;
+
+    // Set up: block is partial with bitmap=0 (no sub-regions written yet).
+    inner.partial_blocks.insert(block_idx, AtomicU32::new(0));
+    inner.set_present(block_idx);
+
+    // merge_partial_block would snapshot the bitmap HERE:
+    let bitmap_snapshot = inner.partial_bitmap(block_idx).unwrap();
+    assert_eq!(bitmap_snapshot, 0, "no sub-regions written yet");
+
+    // Concurrent write arrives: marks sub-region 0 with Release ordering
+    // (happens between merge's bitmap snapshot and its write_sub_region loop).
+    inner.mark_sub_regions(block_idx, 0, 4096);
+
+    // The snapshot is STALE — it doesn't see the concurrent write's bit.
+    assert_eq!(
+        bitmap_snapshot & 1,
+        0,
+        "snapshot is stale — concurrent write to sub-region 0 was missed"
+    );
+
+    // merge_partial_block would proceed to write S3 data to sub-region 0,
+    // overwriting the concurrent write's pwrite data. DATA LOSS.
+
+    // With a per-sub-region re-read (the fix), the concurrent bit IS visible:
+    let fresh_bitmap = inner.partial_bitmap(block_idx).unwrap();
+    assert_eq!(
+        fresh_bitmap & 1,
+        1,
+        "per-sub-region re-read catches the concurrent update"
+    );
+    // merge would skip sub-region 0, preserving the concurrent write's data.
+}
