@@ -109,7 +109,7 @@ jobs:
           sudo modprobe nbd || echo "nbd not available"
           sudo modprobe ublk_drv || echo "ublk_drv not available"
       - name: Run blktests
-        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features blktests --test blktests -- --nocapture || (dmesg | tail -40; false)
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features blktests --test blktests -- --nocapture
 
   kernel-devices:
     name: Kernel Devices (Linux)

@@ -310,7 +310,7 @@ mod fio_verify {
             for block in [0u64, 512, 960, 1023] {
                 let offset = block * 128 * 1024;
                 let data = handler.read(offset, 4096).await
-                    .unwrap_or_else(|e| panic!("[diag] handler read at block {block} (offset {offset}) failed: {e}"));
+                    .unwrap_or_else(|e| panic!("[diag] handler read at block {block} (offset {offset}) failed: {e:?}"));
                 let nonzero = data.iter().any(|&b| b != 0);
                 eprintln!("[diag] block {block} (offset {offset}): len={}, nonzero={nonzero}, first4=[{:#04x},{:#04x},{:#04x},{:#04x}]",
                     data.len(), data[0], data[1], data[2], data[3]);
@@ -390,7 +390,7 @@ mod fio_verify {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[diag-cold] block {block} read ERROR: {e}");
+                        eprintln!("[diag-cold] block {block} read ERROR: {e:?}");
                         cold_failures.push(block);
                     }
                 }
