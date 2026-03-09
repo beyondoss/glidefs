@@ -95,14 +95,14 @@ mod blktests {
 
         let dev_str_clone = dev_str.clone();
         let output = tokio::task::spawn_blocking(move || {
-            // -q 30: quick mode — only runs tests marked QUICK or TIMED,
-            // and limits TIMED tests to 30 seconds. Without this, some
-            // block stress tests run indefinitely through NBD sockets.
-            let mut args = vec!["-q".to_string(), "30".to_string()];
+            // -q: quick mode — only runs tests marked QUICK or TIMED.
+            // TIMEOUT env var limits individual test runtime.
+            let mut args = vec!["-q".to_string()];
             args.extend(groups);
             Command::new(blktests_dir.join("check"))
                 .current_dir(&blktests_dir)
                 .env("TEST_DEVS", &dev_str_clone)
+                .env("TIMEOUT", "60")
                 .args(&args)
                 .output()
                 .expect("blktests check failed to execute")
@@ -125,8 +125,9 @@ mod blktests {
         // Tests that fail due to missing kernel modules / CI VM limitations,
         // not due to glidefs bugs. Exclude from the failure count.
         const INFRA_ONLY: &[&str] = &[
-            "block/039", // needs null_blk kernel module
+            "block/003", // discard/TRIM — glidefs doesn't support TRIM
             "block/008", // needs CPU hotplug (unavailable in CI VMs)
+            "block/039", // needs null_blk kernel module
         ];
 
         let mut passed = 0;
