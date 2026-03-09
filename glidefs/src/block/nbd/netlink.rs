@@ -417,7 +417,7 @@ pub fn reconfigure(index: i32, socket_fd: RawFd) -> io::Result<()> {
     let mut sock_attrs = Vec::new();
     let mut sock_entry = Vec::new();
     put_nla_u32(&mut sock_entry, NBD_SOCK_FD, socket_fd as u32);
-    put_nla(&mut sock_attrs, NLA_F_NESTED, &sock_entry);
+    put_nla(&mut sock_attrs, NBD_SOCK_ITEM | NLA_F_NESTED, &sock_entry);
 
     let mut attrs = Vec::new();
     put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index as u32);

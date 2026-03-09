@@ -381,6 +381,16 @@ impl BlockHandler {
         let start = Instant::now();
 
         if offset + length as u64 > self.device_size() {
+            tracing::warn!(
+                offset,
+                length,
+                device_size = self.device_size(),
+                "read beyond device boundary"
+            );
+            eprintln!(
+                "[handler] read out of bounds: offset={offset}, length={length}, device_size={}",
+                self.device_size()
+            );
             return Err(CommandError::InvalidArgument);
         }
 

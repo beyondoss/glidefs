@@ -95,11 +95,15 @@ mod blktests {
 
         let dev_str_clone = dev_str.clone();
         let output = tokio::task::spawn_blocking(move || {
+            // -q 30: quick mode — only runs tests marked QUICK or TIMED,
+            // and limits TIMED tests to 30 seconds. Without this, some
+            // block stress tests run indefinitely through NBD sockets.
+            let mut args = vec!["-q".to_string(), "30".to_string()];
+            args.extend(groups);
             Command::new(blktests_dir.join("check"))
                 .current_dir(&blktests_dir)
                 .env("TEST_DEVS", &dev_str_clone)
-                .env("TIMEOUT", "30") // per-test timeout in seconds
-                .args(&groups)
+                .args(&args)
                 .output()
                 .expect("blktests check failed to execute")
         })
