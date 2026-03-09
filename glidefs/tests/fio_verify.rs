@@ -413,4 +413,208 @@ mod fio_verify {
             eprintln!("router shutdown error: {e}");
         }
     }
+
+    /// Stress variant: cold-wake cycle repeated 5 times with higher concurrency.
+    ///
+    /// Increases surface area for timing-dependent bugs by:
+    /// - Running multiple write→drain→cold-wake→verify cycles
+    /// - Using 4 fio jobs (4× concurrent ublk writers)
+    /// - Using iodepth=64 (more in-flight operations per job)
+    /// - Writing 256MB per cycle (2048 blocks, spans multiple packs)
+    ///
+    /// Catches: races between flush scheduler and ublk writes under load,
+    /// manifest corruption across multiple drain cycles, pack index cache
+    /// staleness after cold restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn fio_verify_cold_wake_stress() {
+        if skip_unless_ready() { return; }
+
+        const ITERATIONS: usize = 5;
+        const WRITE_SIZE: &str = "256m";
+
+        for iteration in 0..ITERATIONS {
+            eprintln!("\n[stress] === iteration {}/{ITERATIONS} ===", iteration + 1);
+
+            let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+            // Phase 1: write with high concurrency
+            let server = VerifyServer::start(Arc::clone(&s3)).await;
+            let dev = &server.dev_path;
+
+            fio_write("stress-write", "write", dev, &[
+                &format!("--size={WRITE_SIZE}"),
+                "--numjobs=4",
+                "--iodepth=64",
+            ]);
+
+            // Drain to S3
+            eprintln!("[stress] draining to S3...");
+            server.router.drain_export("verify").await.unwrap();
+            server.shutdown().await;
+
+            // Phase 2: cold restart + verify
+            eprintln!("[stress] cold restart from S3...");
+            let cache_dir2 = TempDir::new().unwrap();
+            let clean_cache: Arc<dyn BlockCache> =
+                Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+            let router2 = Arc::new(
+                ExportRouter::new(RouterConfig {
+                    object_store: Arc::clone(&s3),
+                    db_path: "verify".to_string(),
+                    cache_dir: cache_dir2.path().to_path_buf(),
+                    block_size: 128 * 1024,
+                    clean_cache,
+                    wal_sync: false,
+                    max_s3_uploads: 128,
+                    max_s3_downloads: 512,
+                    default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                    ublk_nr_queues: 4,
+                    nbd_dead_conn_timeout: 0,
+                })
+                .await
+                .expect("failed to create router"),
+            );
+
+            let config = ExportConfig {
+                name: "verify".to_string(),
+                size_gb: DEVICE_SIZE_GB,
+                s3_prefix: None,
+                block_size: None,
+                blocks_per_pack: None,
+                flush_mode: None,
+                transport: None,
+            };
+            router2
+                .create_export(config, false, Some("verify"), None)
+                .await
+                .unwrap();
+
+            let handler = router2
+                .get_handler("verify")
+                .await
+                .expect("no handler after cold wake");
+
+            let mut ublk_server2 = UblkServer::new();
+            let dev_path2 = ublk_server2
+                .add_device("verify", handler)
+                .await
+                .expect("failed to register ublk device");
+
+            fio_verify_read("stress-verify", "read", &dev_path2, &[
+                &format!("--size={WRITE_SIZE}"),
+                "--numjobs=4",
+                "--iodepth=64",
+            ]);
+
+            eprintln!("[stress] iteration {} passed", iteration + 1);
+
+            if let Err(e) = ublk_server2.shutdown().await {
+                eprintln!("ublk shutdown error: {e}");
+            }
+            if let Err(e) = router2.shutdown().await {
+                eprintln!("router shutdown error: {e}");
+            }
+        }
+
+        eprintln!("[stress] all {ITERATIONS} iterations passed");
+    }
+
+    /// Write with concurrent flush scheduler activity, then cold-wake verify.
+    ///
+    /// Unlike `fio_verify_after_cold_wake` which writes sequentially then drains,
+    /// this test uses random writes with a longer runtime so the flush scheduler
+    /// fires multiple times during the write phase. This maximizes the window
+    /// for flush scheduler / ublk write interactions.
+    ///
+    /// Catches: data loss when flush scheduler claims blocks while ublk writes
+    /// are in-flight (between pre_write and post_write).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn fio_verify_random_cold_wake() {
+        if skip_unless_ready() { return; }
+
+        let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // Phase 1: random writes for 60s with high concurrency.
+        // The flush scheduler should fire multiple times during this window
+        // (threshold = DEFAULT_BLOCKS_PER_PACK = 500 dirty blocks).
+        let server = VerifyServer::start(Arc::clone(&s3)).await;
+        let dev = &server.dev_path;
+
+        // Write phase: random writes across 512MB region
+        fio_write("rand-cold-write", "randwrite", dev, &[
+            "--size=512m",
+            "--runtime=60",
+            "--time_based",
+            "--numjobs=4",
+            "--iodepth=64",
+        ]);
+
+        // Now do a sequential write pass so we have known data for verification.
+        // This overwrites everything with verifiable CRC32C headers.
+        fio_write("rand-cold-seq", "write", dev, &["--size=512m"]);
+
+        // Drain
+        eprintln!("[rand-cold] draining to S3...");
+        server.router.drain_export("verify").await.unwrap();
+        server.shutdown().await;
+
+        // Phase 2: cold restart + verify
+        eprintln!("[rand-cold] cold restart from S3...");
+        let cache_dir2 = TempDir::new().unwrap();
+        let clean_cache: Arc<dyn BlockCache> =
+            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+        let router2 = Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store: Arc::clone(&s3),
+                db_path: "verify".to_string(),
+                cache_dir: cache_dir2.path().to_path_buf(),
+                block_size: 128 * 1024,
+                clean_cache,
+                wal_sync: false,
+                max_s3_uploads: 128,
+                max_s3_downloads: 512,
+                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                ublk_nr_queues: 4,
+                nbd_dead_conn_timeout: 0,
+            })
+            .await
+            .expect("failed to create router"),
+        );
+
+        let config = ExportConfig {
+            name: "verify".to_string(),
+            size_gb: DEVICE_SIZE_GB,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router2
+            .create_export(config, false, Some("verify"), None)
+            .await
+            .unwrap();
+
+        let handler = router2
+            .get_handler("verify")
+            .await
+            .expect("no handler after cold wake");
+
+        let mut ublk_server2 = UblkServer::new();
+        let dev_path2 = ublk_server2
+            .add_device("verify", handler)
+            .await
+            .expect("failed to register ublk device");
+
+        fio_verify_read("rand-cold-verify", "read", &dev_path2, &["--size=512m"]);
+
+        if let Err(e) = ublk_server2.shutdown().await {
+            eprintln!("ublk shutdown error: {e}");
+        }
+        if let Err(e) = router2.shutdown().await {
+            eprintln!("router shutdown error: {e}");
+        }
+    }
 }

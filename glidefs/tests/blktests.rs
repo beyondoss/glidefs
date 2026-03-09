@@ -93,10 +93,11 @@ mod blktests {
             dev_str
         );
 
+        let dev_str_clone = dev_str.clone();
         let output = tokio::task::spawn_blocking(move || {
             Command::new(blktests_dir.join("check"))
                 .current_dir(&blktests_dir)
-                .env("TEST_DEVS", &dev_str)
+                .env("TEST_DEVS", &dev_str_clone)
                 .args(&groups)
                 .output()
                 .expect("blktests check failed to execute")
