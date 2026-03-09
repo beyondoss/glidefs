@@ -220,18 +220,38 @@ impl NbdDeviceManager {
         for attempt in 0..MAX_RETRIES {
             let result = if let Some(index) = preferred_index {
                 if is_nbd_device_alive(index) {
-                    // Hot reload: reconfigure existing device with new socket fd.
-                    // Queued I/O resumes immediately on the new socket.
+                    // Try hot reload first: reconfigure existing device with
+                    // new socket fd. If the device was just disconnected but
+                    // the pid file hasn't been cleaned up yet, reconfigure
+                    // fails with EINVAL ("not configured") — fall through to
+                    // connect in that case.
                     info!(
                         export = %export_name,
                         index,
                         "reconfiguring existing nbd device (hot reload)"
                     );
-                    tokio::task::spawn_blocking(move || {
+                    let reconf = tokio::task::spawn_blocking(move || {
                         netlink::reconfigure(index, client_fd)
                     })
-                    .await?
-                    .map(|_| index)
+                    .await?;
+                    match reconf {
+                        Ok(()) => Ok(index),
+                        Err(e) => {
+                            warn!(
+                                export = %export_name,
+                                index,
+                                error = %e,
+                                "reconfigure failed, falling back to connect"
+                            );
+                            let size = size_bytes;
+                            let dead_conn_timeout = self.dead_conn_timeout;
+                            let server_flags = TRANSMISSION_FLAGS as u64;
+                            tokio::task::spawn_blocking(move || {
+                                netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, Some(index))
+                            })
+                            .await?
+                        }
+                    }
                 } else {
                     // Dead device from previous run — reclaim the same index so
                     // the box manager's /dev/nbdN reference stays valid.
@@ -265,13 +285,16 @@ impl NbdDeviceManager {
                     break;
                 }
                 Err(e) => {
-                    let is_busy = e.to_string().contains("os error 16")
-                        || e.to_string().contains("Device or resource busy");
-                    if is_busy && attempt + 1 < MAX_RETRIES {
+                    let is_transient = e.to_string().contains("os error 16")
+                        || e.to_string().contains("Device or resource busy")
+                        || e.to_string().contains("os error 22")
+                        || e.to_string().contains("Invalid argument");
+                    if is_transient && attempt + 1 < MAX_RETRIES {
                         debug!(
                             export = %export_name,
                             attempt,
-                            "nbd device busy, retrying after {:?}",
+                            error = %e,
+                            "nbd device not ready, retrying after {:?}",
                             RETRY_DELAY
                         );
                         tokio::time::sleep(RETRY_DELAY).await;

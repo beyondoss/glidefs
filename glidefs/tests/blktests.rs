@@ -98,6 +98,7 @@ mod blktests {
             Command::new(blktests_dir.join("check"))
                 .current_dir(&blktests_dir)
                 .env("TEST_DEVS", &dev_str_clone)
+                .env("TIMEOUT", "30") // per-test timeout in seconds
                 .args(&groups)
                 .output()
                 .expect("blktests check failed to execute")
