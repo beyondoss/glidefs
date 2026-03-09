@@ -75,27 +75,34 @@ mod blktests {
     }
 
     /// Run blktests against a device, returning (passed, failed, skipped).
-    fn run_blktests(
+    ///
+    /// Uses spawn_blocking to avoid blocking a tokio worker thread — the
+    /// NBD server tasks need worker threads to service kernel I/O requests.
+    async fn run_blktests(
         blktests_dir: &Path,
         dev_path: &Path,
         groups: &[&str],
     ) -> (usize, usize, usize) {
-        let dev_str = dev_path.to_str().unwrap();
+        let dev_str = dev_path.to_str().unwrap().to_string();
+        let blktests_dir = blktests_dir.to_path_buf();
+        let groups: Vec<String> = groups.iter().map(|s| s.to_string()).collect();
+
         eprintln!(
             "[blktests] running {:?} against {}",
             groups,
             dev_str
         );
 
-        let mut args = vec![];
-        args.extend_from_slice(groups);
-
-        let output = Command::new(blktests_dir.join("check"))
-            .current_dir(blktests_dir)
-            .env("TEST_DEVS", dev_str)
-            .args(&args)
-            .output()
-            .expect("blktests check failed to execute");
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(blktests_dir.join("check"))
+                .current_dir(&blktests_dir)
+                .env("TEST_DEVS", &dev_str)
+                .args(&groups)
+                .output()
+                .expect("blktests check failed to execute")
+        })
+        .await
+        .expect("spawn_blocking panicked");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -285,7 +292,7 @@ mod blktests {
 
         // Run block/ tests against NBD device
         if let Some(ref dev) = server.nbd_dev {
-            let (passed, failed, skipped) = run_blktests(&blktests, dev, &["block"]);
+            let (passed, failed, skipped) = run_blktests(&blktests, dev, &["block"]).await;
             eprintln!(
                 "[blktests] NBD block/: {passed} passed, {failed} failed, {skipped} skipped"
             );
@@ -294,7 +301,7 @@ mod blktests {
 
         // Run nbd/ tests against NBD device
         if let Some(ref dev) = server.nbd_dev {
-            let (passed, failed, skipped) = run_blktests(&blktests, dev, &["nbd"]);
+            let (passed, failed, skipped) = run_blktests(&blktests, dev, &["nbd"]).await;
             eprintln!(
                 "[blktests] NBD nbd/: {passed} passed, {failed} failed, {skipped} skipped"
             );
@@ -303,7 +310,7 @@ mod blktests {
 
         // Run block/ tests against ublk device
         if let Some(ref dev) = server.ublk_dev {
-            let (passed, failed, skipped) = run_blktests(&blktests, dev, &["block"]);
+            let (passed, failed, skipped) = run_blktests(&blktests, dev, &["block"]).await;
             eprintln!(
                 "[blktests] ublk block/: {passed} passed, {failed} failed, {skipped} skipped"
             );
