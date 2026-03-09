@@ -277,7 +277,7 @@ impl NbdDeviceManager {
                         tokio::time::sleep(RETRY_DELAY).await;
                         continue;
                     }
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }
