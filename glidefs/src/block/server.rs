@@ -788,7 +788,14 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     });
                 }
                 NBDCommand::Unknown(cmd) => {
-                    warn!("Unknown NBD command: {}", cmd);
+                    warn!(
+                        cmd,
+                        flags = request.flags,
+                        offset = request.offset,
+                        length = request.length,
+                        cookie = request.cookie,
+                        "Unknown NBD command"
+                    );
                     let _ = response_tx.send(Response::Simple {
                         cookie: request.cookie,
                         error: super::error::CommandError::InvalidArgument.to_nbd_errno(),

@@ -24,6 +24,8 @@ fuzz = []
 ublk = ["dep:ublk-core", "dep:io-uring"]
 # End-to-end fio benchmark through ublk block device
 fio-bench = ["ublk", "test-utils"]
+# Linux blktests suite against ublk + nbd kernel devices
+blktests = ["ublk", "test-utils"]
 
 [dependencies]
 console-subscriber = { version = "0.5", optional = true }
@@ -143,5 +145,10 @@ required-features = ["docker-tests"]
 [[test]]
 name = "fio_bench"
 path = "tests/fio_bench.rs"
+required-features = ["fio-bench"]
+
+[[test]]
+name = "fio_verify"
+path = "tests/fio_verify.rs"
 required-features = ["fio-bench"]
 

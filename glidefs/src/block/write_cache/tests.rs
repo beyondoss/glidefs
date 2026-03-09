@@ -1093,7 +1093,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
 
     // Verify CRC32 was computed (present in crc_map).
     let inner = h.cache.inner();
-    let crc_after_checkpoint = *inner.crc_map.get(&0).expect("checkpoint should compute CRC32");
+    let crc_after_checkpoint = inner.crc_map.load(0).expect("checkpoint should compute CRC32");
     assert_ne!(crc_after_checkpoint, 0);
 
     // Corrupt the block on SSD (simulate bit rot after checkpoint).
@@ -1114,11 +1114,11 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     assert_eq!(h.cache.dirty_block_count(), 1, "block should remain dirty");
 
     // CRC32 consumed by flush (crc_take removes it).
-    assert!(inner.crc_map.get(&0).is_none(), "CRC32 consumed after flush");
+    assert!(inner.crc_map.load(0).is_none(), "CRC32 consumed after flush");
 
     // Next checkpoint recomputes CRC32 from the (still corrupted) SSD data.
     h.cache.local_checkpoint().await.unwrap();
-    let crc_recomputed = *inner.crc_map.get(&0).expect("checkpoint should recompute CRC32");
+    let crc_recomputed = inner.crc_map.load(0).expect("checkpoint should recompute CRC32");
     assert_ne!(
         crc_recomputed, crc_after_checkpoint,
         "new CRC32 should differ (different data)"
@@ -1148,14 +1148,14 @@ async fn test_crc32_cleared_on_write() {
     h.cache.local_checkpoint().await.unwrap();
 
     let inner = h.cache.inner();
-    assert!(inner.crc_map.get(&0).is_some(), "checkpoint should set CRC32");
+    assert!(inner.crc_map.load(0).is_some(), "checkpoint should set CRC32");
 
     // Write new data to the same block — CRC32 should be invalidated (sentinel).
     h.cache
         .write(0, &vec![0xBBu8; 4096], &h.clean_cache)
         .unwrap();
     assert_eq!(
-        *inner.crc_map.get(&0).expect("sentinel should exist"),
+        inner.crc_map.load(0).expect("sentinel should exist"),
         super::inner::CRC_SENTINEL,
         "write should set CRC sentinel"
     );
@@ -1190,7 +1190,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     let inner = h.cache.inner();
     for i in 0usize..5 {
         assert!(
-            inner.crc_map.get(&i).is_some(),
+            inner.crc_map.load(i).is_some(),
             "block {i} should have CRC32"
         );
     }
@@ -1223,13 +1223,13 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     );
 
     // CRC32 consumed by flush for all blocks.
-    assert!(inner.crc_map.get(&1).is_none(), "CRC consumed by flush");
-    assert!(inner.crc_map.get(&3).is_none(), "CRC consumed by flush");
+    assert!(inner.crc_map.load(1).is_none(), "CRC consumed by flush");
+    assert!(inner.crc_map.load(3).is_none(), "CRC consumed by flush");
 
     // Heal: checkpoint recomputes CRC32 from (still corrupted) SSD data.
     h.cache.local_checkpoint().await.unwrap();
-    assert!(inner.crc_map.get(&1).is_some(), "checkpoint recomputed CRC for block 1");
-    assert!(inner.crc_map.get(&3).is_some(), "checkpoint recomputed CRC for block 3");
+    assert!(inner.crc_map.load(1).is_some(), "checkpoint recomputed CRC for block 1");
+    assert!(inner.crc_map.load(3).is_some(), "checkpoint recomputed CRC for block 3");
 
     // Second flush succeeds for the remaining 2 blocks.
     let (stats2, _) = h
@@ -1267,7 +1267,7 @@ async fn test_crc32_happy_path_multi_cycle() {
     let inner = h.cache.inner();
     for i in 0usize..3 {
         assert!(
-            inner.crc_map.get(&i).is_some(),
+            inner.crc_map.load(i).is_some(),
             "cycle 1: block {i} should have CRC32"
         );
     }
@@ -1295,7 +1295,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     // Block 0's CRC32 should be invalidated by the overwrite (sentinel).
     assert_eq!(
-        *inner.crc_map.get(&0).expect("sentinel should exist"),
+        inner.crc_map.load(0).expect("sentinel should exist"),
         super::inner::CRC_SENTINEL,
         "overwrite should set CRC sentinel"
     );
@@ -1304,7 +1304,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     for idx in [0usize, 3, 4] {
         assert!(
-            inner.crc_map.get(&idx).is_some(),
+            inner.crc_map.load(idx).is_some(),
             "cycle 2: block {idx} should have CRC32"
         );
     }

@@ -39,10 +39,10 @@ const NLMSG_ERROR: u16 = 2;
 
 const NBD_GENL_FAMILY_NAME: &[u8] = b"nbd\0";
 
-// NBD commands
-const NBD_CMD_CONNECT: u8 = 0;
-const NBD_CMD_DISCONNECT: u8 = 1;
-const NBD_CMD_RECONFIGURE: u8 = 2;
+// NBD commands (kernel enum starts at _UNSPEC = 0)
+const NBD_CMD_CONNECT: u8 = 1;
+const NBD_CMD_DISCONNECT: u8 = 2;
+const NBD_CMD_RECONFIGURE: u8 = 3;
 
 // NBD attributes
 const NBD_ATTR_INDEX: u16 = 1;
@@ -53,8 +53,10 @@ const NBD_ATTR_SERVER_FLAGS: u16 = 5;
 const NBD_ATTR_SOCKETS: u16 = 7;
 const NBD_ATTR_DEAD_CONN_TIMEOUT: u16 = 8;
 
-// NBD socket attributes (nested)
-const NBD_SOCK_FD: u16 = 0;
+// NBD socket item (outer container for each socket in the list)
+const NBD_SOCK_ITEM: u16 = 1;
+// NBD socket attributes (inside each socket item)
+const NBD_SOCK_FD: u16 = 1;
 
 // Nested attribute flag
 const NLA_F_NESTED: u16 = 1 << 15;
@@ -257,7 +259,20 @@ fn resolve_nbd_family(fd: RawFd) -> io::Result<u16> {
 
     for (attr_type, attr_data) in parse_nla(nla_payload) {
         if attr_type == CTRL_ATTR_FAMILY_ID && attr_data.len() >= 2 {
-            return Ok(u16::from_ne_bytes([attr_data[0], attr_data[1]]));
+            let family_id = u16::from_ne_bytes([attr_data[0], attr_data[1]]);
+            // Drain the pending ACK (NLM_F_ACK causes the kernel to send a
+            // separate NLMSG_ERROR/errno=0 after the genl response). If it
+            // was already batched into the recv above, this is a no-op.
+            let mut drain = [0u8; 256];
+            unsafe {
+                libc::recv(
+                    fd,
+                    drain.as_mut_ptr() as *mut _,
+                    drain.len(),
+                    libc::MSG_DONTWAIT,
+                );
+            }
+            return Ok(family_id);
         }
     }
 
@@ -295,64 +310,77 @@ pub fn connect(
 
     let family_id = resolve_nbd_family(fd)?;
 
-    // Build socket list (nested attribute)
+    // Build socket list: NBD_ATTR_SOCKETS → [ NBD_SOCK_ITEM → NBD_SOCK_FD ]
     let mut sock_attrs = Vec::new();
-    // Each socket entry is itself nested
     let mut sock_entry = Vec::new();
     put_nla_u32(&mut sock_entry, NBD_SOCK_FD, socket_fd as u32);
-    put_nla(&mut sock_attrs, NLA_F_NESTED, &sock_entry);
+    put_nla(&mut sock_attrs, NBD_SOCK_ITEM | NLA_F_NESTED, &sock_entry);
 
-    // Build connect attributes
+    // Build connect attributes (matches nbd-client's netlink_configure)
     let mut attrs = Vec::new();
-    // Specific index = reclaim a known device path; u32::MAX = auto-assign.
-    let index = preferred_index.map(|i| i as u32).unwrap_or(u32::MAX);
-    put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index);
+    // Include NBD_ATTR_INDEX only when reclaiming a specific device path.
+    // Omitting it tells the kernel to auto-assign the lowest free index.
+    if let Some(index) = preferred_index {
+        put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index as u32);
+    }
     put_nla_u64(&mut attrs, NBD_ATTR_SIZE_BYTES, size_bytes);
-    put_nla_u32(&mut attrs, NBD_ATTR_BLOCK_SIZE_BYTES, block_size);
+    put_nla_u64(&mut attrs, NBD_ATTR_BLOCK_SIZE_BYTES, block_size as u64);
     put_nla_u64(&mut attrs, NBD_ATTR_SERVER_FLAGS, server_flags);
-    put_nla(&mut attrs, NBD_ATTR_SOCKETS | NLA_F_NESTED, &sock_attrs);
     if dead_conn_timeout > 0 {
         put_nla_u64(&mut attrs, NBD_ATTR_DEAD_CONN_TIMEOUT, dead_conn_timeout as u64);
     }
-    put_nla_u64(&mut attrs, NBD_ATTR_TIMEOUT, 0); // no I/O timeout
+    put_nla(&mut attrs, NBD_ATTR_SOCKETS | NLA_F_NESTED, &sock_attrs);
 
     let msg = build_genl_msg(family_id, NBD_CMD_CONNECT, 2, &attrs);
     nl_send(fd, &msg)?;
 
-    // The kernel echoes back the assigned device index in the ACK's
-    // NBD_ATTR_INDEX attribute. Parse it, with a sysfs scan as fallback.
+    // The kernel response depends on whether we requested a specific index:
+    //
+    // - Specific index: kernel sends NLMSG_ERROR ACK (errno=0 on success),
+    //   and the index is what we requested.
+    // - Auto-assign (no NBD_ATTR_INDEX): kernel sends a genl reply
+    //   (msg_type = family_id) containing NBD_ATTR_INDEX with the assigned
+    //   device number, followed by an NLMSG_ERROR ACK.
     let mut buf = [0u8; 4096];
     let n = nl_recv(fd, &mut buf)?;
     let (_, msg_type, _, payload) = parse_nlmsghdr(&buf[..n])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated response"))?;
 
-    if msg_type == NLMSG_ERROR
-        && payload.len() >= 4
-    {
+    // Case 1: NLMSG_ERROR — either an ACK (errno=0) or a real error.
+    if msg_type == NLMSG_ERROR && payload.len() >= 4 {
         let errno = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
         if errno == 0 {
-            // Success — but we used u32::MAX so we need to find the assigned index.
-            // Parse the echoed attributes in the error response.
-            // The kernel echoes back the original message after the error code.
+            // ACK for a specific-index connect — return the index we asked for.
+            if let Some(index) = preferred_index {
+                return Ok(index);
+            }
+            // Auto-assign ACK without a prior genl reply is unexpected.
+            // Try echoed attrs, then sysfs scan.
             if payload.len() >= 4 + 16 + 4 {
-                // error(4) + nlmsghdr(16) + genlmsghdr(4) + attrs
                 let echoed_attrs = &payload[4 + 16 + 4..];
                 for (attr_type, attr_data) in parse_nla(echoed_attrs) {
                     if attr_type == NBD_ATTR_INDEX && attr_data.len() >= 4 {
-                        let index = u32::from_ne_bytes([
-                            attr_data[0],
-                            attr_data[1],
-                            attr_data[2],
-                            attr_data[3],
-                        ]);
-                        return Ok(index as i32);
+                        return Ok(u32::from_ne_bytes([
+                            attr_data[0], attr_data[1], attr_data[2], attr_data[3],
+                        ]) as i32);
                     }
                 }
             }
-            // Fallback: scan /sys/block for the newest nbd device
             return find_newest_nbd_device();
         }
         return Err(io::Error::from_raw_os_error(-errno));
+    }
+
+    // Case 2: genl reply — parse NBD_ATTR_INDEX from the response attributes.
+    if payload.len() >= 4 {
+        // Skip genlmsghdr (4 bytes) to reach the attributes.
+        for (attr_type, attr_data) in parse_nla(&payload[4..]) {
+            if attr_type == NBD_ATTR_INDEX && attr_data.len() >= 4 {
+                return Ok(u32::from_ne_bytes([
+                    attr_data[0], attr_data[1], attr_data[2], attr_data[3],
+                ]) as i32);
+            }
+        }
     }
 
     Err(io::Error::new(
@@ -389,7 +417,7 @@ pub fn reconfigure(index: i32, socket_fd: RawFd) -> io::Result<()> {
     let mut sock_attrs = Vec::new();
     let mut sock_entry = Vec::new();
     put_nla_u32(&mut sock_entry, NBD_SOCK_FD, socket_fd as u32);
-    put_nla(&mut sock_attrs, NLA_F_NESTED, &sock_entry);
+    put_nla(&mut sock_attrs, NBD_SOCK_ITEM | NLA_F_NESTED, &sock_entry);
 
     let mut attrs = Vec::new();
     put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index as u32);

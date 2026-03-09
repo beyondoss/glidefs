@@ -314,7 +314,7 @@ where
             match existing {
                 Some(export) => {
                     // Export exists - check if resize needed
-                    let current_size_gb = export.size as f64 / 1_000_000_000.0;
+                    let current_size_gb = export.size as f64 / 1_073_741_824.0;
                     if put_req.size_gb > current_size_gb {
                         // Need to grow
                         match router.resize_export(name, put_req.size_gb).await {
@@ -331,7 +331,7 @@ where
                                     StatusCode::OK,
                                     &ExportInfoResponse {
                                         name: name.to_string(),
-                                        size_bytes: (put_req.size_gb * 1_000_000_000.0) as u64,
+                                        size_bytes: (put_req.size_gb * 1_073_741_824.0) as u64,
                                         readonly: export.readonly,
                                         transport: export.transport,
                                         device: device.map(|p| p.to_string_lossy().into_owned()),

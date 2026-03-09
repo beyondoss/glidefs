@@ -1345,3 +1345,770 @@ async fn test_head_manifest_not_found() {
     // No exports, no manifests — should return false, not error
     assert!(!router.head_manifest("nonexistent-prefix", "nonexistent-tag").await.unwrap());
 }
+
+// =========================================================================
+// Fork & Snapshot Correctness (TEST_ROADMAP §11-12)
+// =========================================================================
+
+/// Fork B from A, flush both to S3, remove A from router.
+/// Cold-wake B (without A). B must still read all inherited blocks from S3.
+#[tokio::test]
+async fn test_fork_parent_deleted_child_survives() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    // Create parent, write blocks 0-4
+    let parent_config = ExportConfig {
+        name: "parent".to_string(),
+        size_gb: 0.1,
+        s3_prefix: None,
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(parent_config, false, None, None)
+        .await
+        .unwrap();
+
+    let parent = router.get_handler("parent").await.unwrap();
+    for i in 0u8..5 {
+        let data = vec![0xA0 + i; BLOCK_SIZE];
+        parent
+            .write(i as u64 * BLOCK_SIZE as u64, &data, false)
+            .await
+            .unwrap();
+    }
+
+    // Snapshot parent so child can fork from it
+    router.snapshot_export("parent", None).await.unwrap();
+
+    // Fork child from parent
+    let child_config = ExportConfig {
+        name: "child".to_string(),
+        size_gb: 0.1,
+        s3_prefix: Some("parent".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(child_config, false, Some("parent"), None)
+        .await
+        .unwrap();
+
+    // Child writes blocks 5-9 and overwrites block 0
+    let child = router.get_handler("child").await.unwrap();
+    for i in 5u8..10 {
+        let data = vec![0xB0 + i; BLOCK_SIZE];
+        child
+            .write(i as u64 * BLOCK_SIZE as u64, &data, false)
+            .await
+            .unwrap();
+    }
+    child
+        .write(0, &vec![0xFF; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+
+    // Drain child to S3
+    router.drain_export("child").await.unwrap();
+
+    // Delete parent from router (not purge — leave S3 data for child's inherited packs)
+    router.remove_export("parent", false).await.unwrap();
+    assert!(router.get_handler("parent").await.is_none());
+
+    // Cold-wake child on a fresh router (simulates restart without parent)
+    let dir2 = TempDir::new().unwrap();
+    let router2 = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir2.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    // Restore child from S3 (parent is NOT in the router)
+    let restore_config = ExportConfig {
+        name: "child".to_string(),
+        size_gb: 0.1,
+        s3_prefix: Some("parent".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router2
+        .create_export(restore_config, false, Some("child"), None)
+        .await
+        .unwrap();
+
+    let child2 = router2.get_handler("child").await.unwrap();
+
+    // Block 0: child overwrote → 0xFF
+    let data = child2.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert!(
+        data.iter().all(|&b| b == 0xFF),
+        "block 0 should be child's overwrite (0xFF), got 0x{:02x}",
+        data[0]
+    );
+
+    // Blocks 1-4: inherited from parent
+    for i in 1u8..5 {
+        let data = child2
+            .read(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let expected = 0xA0 + i;
+        assert_eq!(
+            data[0], expected,
+            "block {} should be inherited from parent (0x{:02x}), got 0x{:02x}",
+            i, expected, data[0]
+        );
+    }
+
+    // Blocks 5-9: child's own writes
+    for i in 5u8..10 {
+        let data = child2
+            .read(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let expected = 0xB0 + i;
+        assert_eq!(
+            data[0], expected,
+            "block {} should be child's write (0x{:02x}), got 0x{:02x}",
+            i, expected, data[0]
+        );
+    }
+}
+
+/// Parent is actively receiving writes while fork is created.
+/// Fork should see a consistent snapshot, not a partial view.
+#[tokio::test]
+async fn test_fork_concurrent_parent_write_during_fork() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = Arc::new(
+        ExportRouter::new(RouterConfig {
+            object_store: Arc::clone(&s3),
+            db_path: "test".to_string(),
+            cache_dir: dir.path().to_path_buf(),
+            block_size: BLOCK_SIZE,
+            clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_blocks_per_pack: 500,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+        })
+        .await
+        .unwrap(),
+    );
+
+    // Create parent, write initial data
+    let config = ExportConfig {
+        name: "parent".to_string(),
+        size_gb: 0.1,
+        s3_prefix: None,
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(config, false, None, None)
+        .await
+        .unwrap();
+
+    let parent = router.get_handler("parent").await.unwrap();
+    // Write blocks 0-9 with seed 0xAA
+    for i in 0..10u64 {
+        parent
+            .write(i * BLOCK_SIZE as u64, &vec![0xAA; BLOCK_SIZE], false)
+            .await
+            .unwrap();
+    }
+
+    // Snapshot so fork has something to fork from
+    router.snapshot_export("parent", None).await.unwrap();
+
+    // Spawn concurrent writes to parent while forking
+    let parent2 = Arc::clone(&parent);
+    let write_handle = tokio::spawn(async move {
+        for i in 0..10u64 {
+            parent2
+                .write(i * BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE], false)
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // Fork concurrently
+    let fork_config = ExportConfig {
+        name: "fork".to_string(),
+        size_gb: 0.1,
+        s3_prefix: Some("parent".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(fork_config, false, Some("parent"), None)
+        .await
+        .unwrap();
+
+    write_handle.await.unwrap();
+
+    // Fork should see a consistent view: each block is either 0xAA or 0xBB,
+    // never partial or torn.
+    let fork = router.get_handler("fork").await.unwrap();
+    for i in 0..10u64 {
+        let data = fork
+            .read(i * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let first = data[0];
+        assert!(
+            first == 0xAA || first == 0xBB,
+            "block {} should be 0xAA or 0xBB, got 0x{:02x}",
+            i,
+            first
+        );
+        // Entire block should be uniform (no torn read)
+        assert!(
+            data.iter().all(|&b| b == first),
+            "block {} has torn data: starts with 0x{:02x} but not all bytes match",
+            i,
+            first
+        );
+    }
+}
+
+/// Fork B from A (A has 100 blocks). Overwrite all 100 blocks on B with new data.
+/// Flush B to S3. Cold-wake B. All blocks must be B's data, none of A's.
+#[tokio::test]
+async fn test_fork_inherit_then_overwrite_all() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    let num_blocks = 100u64;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
+
+    // Parent: write 100 blocks with 0xAA
+    let config = ExportConfig {
+        name: "parent".to_string(),
+        size_gb,
+        s3_prefix: None,
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(config, false, None, None)
+        .await
+        .unwrap();
+
+    let parent = router.get_handler("parent").await.unwrap();
+    for i in 0..num_blocks {
+        parent
+            .write(i * BLOCK_SIZE as u64, &vec![0xAA; BLOCK_SIZE], false)
+            .await
+            .unwrap();
+    }
+    router.snapshot_export("parent", None).await.unwrap();
+
+    // Fork child, overwrite ALL 100 blocks with 0xBB
+    let fork_config = ExportConfig {
+        name: "child".to_string(),
+        size_gb,
+        s3_prefix: Some("parent".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(fork_config, false, Some("parent"), None)
+        .await
+        .unwrap();
+
+    let child = router.get_handler("child").await.unwrap();
+    for i in 0..num_blocks {
+        child
+            .write(i * BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE], false)
+            .await
+            .unwrap();
+    }
+
+    // Drain child to S3
+    router.drain_export("child").await.unwrap();
+
+    // Cold-wake child on a fresh router
+    let dir2 = TempDir::new().unwrap();
+    let router2 = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir2.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    let restore_config = ExportConfig {
+        name: "child".to_string(),
+        size_gb,
+        s3_prefix: Some("parent".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router2
+        .create_export(restore_config, false, Some("child"), None)
+        .await
+        .unwrap();
+
+    let cold_child = router2.get_handler("child").await.unwrap();
+    for i in 0..num_blocks {
+        let data = cold_child
+            .read(i * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        assert!(
+            data.iter().all(|&b| b == 0xBB),
+            "block {} should be child's data (0xBB) after cold-wake, got 0x{:02x}",
+            i,
+            data[0]
+        );
+    }
+}
+
+/// Export is actively being written to. Take snapshot at seq=S. Continue writing.
+/// Fork from seq=S. Fork must see exactly the state at seq=S, not any later writes.
+#[tokio::test]
+async fn test_fork_from_snapshot_during_active_writes() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    let config = ExportConfig {
+        name: "vm1".to_string(),
+        size_gb: 0.01,
+        s3_prefix: None,
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(config, false, None, None)
+        .await
+        .unwrap();
+
+    let handler = router.get_handler("vm1").await.unwrap();
+
+    // Write block 0 with 0xAA and snapshot
+    handler
+        .write(0, &[0xAA; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+    let snap = router.snapshot_export("vm1", None).await.unwrap();
+
+    // Continue writing: overwrite block 0 with 0xBB, write block 1 with 0xCC
+    handler
+        .write(0, &[0xBB; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+    handler
+        .write(BLOCK_SIZE as u64, &[0xCC; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+    router.snapshot_export("vm1", None).await.unwrap();
+
+    // Fork from the earlier snapshot — should see exactly that state
+    let fork_config = ExportConfig {
+        name: "fork-at-snap".to_string(),
+        size_gb: 0.01,
+        s3_prefix: Some("vm1".to_string()),
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(fork_config, false, Some("vm1"), Some(snap.sequence))
+        .await
+        .unwrap();
+
+    let fork = router.get_handler("fork-at-snap").await.unwrap();
+
+    // Block 0: should be 0xAA (snapshot state), not 0xBB (later write)
+    let data = fork.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert!(
+        data.iter().all(|&b| b == 0xAA),
+        "fork from snapshot should see 0xAA (snapshot state), got 0x{:02x}",
+        data[0]
+    );
+
+    // Block 1: should be zeros (not written at snapshot time)
+    let data = fork.read(BLOCK_SIZE as u64, BLOCK_SIZE as u32).await.unwrap();
+    assert!(
+        data.iter().all(|&b| b == 0),
+        "block 1 should be zeros at snapshot time, got 0x{:02x}",
+        data[0]
+    );
+}
+
+/// Fork B and C from A. Write different data to same block on B and C.
+/// Verify B and C see their own data, not each other's. Tests sibling fork isolation.
+#[tokio::test]
+async fn test_fork_both_children_from_same_parent() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = ExportRouter::new(RouterConfig {
+        object_store: Arc::clone(&s3),
+        db_path: "test".to_string(),
+        cache_dir: dir.path().to_path_buf(),
+        block_size: BLOCK_SIZE,
+        clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        wal_sync: false,
+        max_s3_uploads: 0,
+        max_s3_downloads: 0,
+        default_blocks_per_pack: 500,
+        ublk_nr_queues: 1,
+        nbd_dead_conn_timeout: 0,
+    })
+    .await
+    .unwrap();
+
+    // Create parent with block 0 = 0xAA
+    let parent_config = ExportConfig {
+        name: "parent".to_string(),
+        size_gb: 0.01,
+        s3_prefix: None,
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(parent_config, false, None, None)
+        .await
+        .unwrap();
+
+    let parent = router.get_handler("parent").await.unwrap();
+    parent
+        .write(0, &[0xAA; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+    router.snapshot_export("parent", None).await.unwrap();
+
+    // Fork B and C from parent
+    for name in ["child-b", "child-c"] {
+        let config = ExportConfig {
+            name: name.to_string(),
+            size_gb: 0.01,
+            s3_prefix: Some("parent".to_string()),
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router
+            .create_export(config, false, Some("parent"), None)
+            .await
+            .unwrap();
+    }
+
+    // Write different data to block 0 on each child
+    let child_b = router.get_handler("child-b").await.unwrap();
+    child_b
+        .write(0, &[0xBB; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+
+    let child_c = router.get_handler("child-c").await.unwrap();
+    child_c
+        .write(0, &[0xCC; BLOCK_SIZE], false)
+        .await
+        .unwrap();
+
+    // Verify isolation
+    let b_data = child_b.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert!(
+        b_data.iter().all(|&b| b == 0xBB),
+        "child-b should see its own data (0xBB), got 0x{:02x}",
+        b_data[0]
+    );
+
+    let c_data = child_c.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert!(
+        c_data.iter().all(|&b| b == 0xCC),
+        "child-c should see its own data (0xCC), got 0x{:02x}",
+        c_data[0]
+    );
+
+    // Parent should still see its original data
+    let p_data = parent.read(0, BLOCK_SIZE as u32).await.unwrap();
+    assert!(
+        p_data.iter().all(|&b| b == 0xAA),
+        "parent should still see 0xAA, got 0x{:02x}",
+        p_data[0]
+    );
+}
+
+/// Take snapshot, start GC, delete snapshot during GC scan.
+/// GC must not delete packs that were live at scan start.
+#[tokio::test]
+async fn test_snapshot_gc_race() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
+
+    // Write blocks and flush to create packs
+    write_blocks(&cache, 0, 3, 1, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Take snapshot (pins the packs)
+    let snap = cache
+        .snapshot(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Overwrite with new data, flush (creates new packs, old packs only live via snapshot)
+    write_blocks(&cache, 0, 3, 2, cc.as_ref());
+    cache
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Start GC and delete the snapshot concurrently
+    let cs_delete = ContentStore::new(Arc::clone(&s3), "test");
+    let cs_gc = ContentStore::new(Arc::clone(&s3), "test");
+
+    let mut gc_state = new_gc_state_for_test();
+
+    // Run GC and snapshot deletion concurrently
+    let delete_handle = tokio::spawn(async move {
+        // Small yield to let GC start its scan
+        tokio::task::yield_now().await;
+        cs_delete
+            .delete_snapshot("vm1", snap.sequence)
+            .await
+            .unwrap();
+    });
+
+    let gc_handle = tokio::spawn(async move {
+        reconcile_prefix_for_test(
+            &cs_gc,
+            &mut gc_state,
+            Duration::from_secs(0),
+            1000,
+            false,
+        )
+        .await
+        .unwrap()
+    });
+
+    let (delete_result, gc_result) = tokio::join!(delete_handle, gc_handle);
+    delete_result.unwrap();
+    gc_result.unwrap();
+
+    // The critical invariant: after GC, the LIVE manifest's packs must still exist.
+    // Read all blocks through the current manifest to verify.
+    let reader_dir = TempDir::new().unwrap();
+    let (reader_cache, reader_cs, reader_pic, reader_vm, reader_cc, reader_m) =
+        super::create_cold_reader(&reader_dir, "vm1", Arc::clone(&s3)).await;
+
+    for i in 0..3usize {
+        let offset = (i * BLOCK_SIZE) as u64;
+        let data = reader_cache
+            .read(
+                offset,
+                BLOCK_SIZE,
+                reader_cc.as_ref(),
+                &reader_pic,
+                &reader_vm,
+                &reader_cs,
+                &reader_m,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            data[0], 2,
+            "block {} should have seed=2 (current data) after concurrent GC+snapshot-delete, got {}",
+            i, data[0]
+        );
+    }
+}
+
+/// Take 1000 snapshots with small writes between each.
+/// Verify manifest storage doesn't grow unboundedly.
+#[tokio::test]
+async fn test_snapshot_manifest_growth() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+        create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
+
+    let mut sequences = Vec::new();
+
+    // Take 100 snapshots (reduced from roadmap's 1000 for test speed) with
+    // small writes between each
+    for round in 0u16..100 {
+        // Write a single block with the round number as seed
+        let offset = (round as usize % 3) * BLOCK_SIZE;
+        let mut data = vec![0u8; BLOCK_SIZE];
+        data[0..2].copy_from_slice(&round.to_le_bytes());
+        cache.write(offset as u64, &data, cc.as_ref()).unwrap();
+
+        let snap = cache
+            .snapshot(&cs, &pack_index_cache, &volume_manifest)
+            .await
+            .unwrap();
+        sequences.push(snap.sequence);
+    }
+
+    // All snapshots should be listed
+    let listed = cs.list_snapshots("vm1").await.unwrap();
+    assert_eq!(
+        listed.len(),
+        sequences.len(),
+        "all snapshots should be listed"
+    );
+
+    // Measure total S3 storage used by snapshot manifests
+    let mut total_manifest_bytes = 0u64;
+    for &seq in &sequences {
+        let data = cs
+            .get_snapshot("vm1", seq)
+            .await
+            .unwrap()
+            .expect("snapshot should exist");
+        total_manifest_bytes += data.len() as u64;
+    }
+
+    // Current manifest size for reference
+    let current = cs
+        .get_manifest("vm1")
+        .await
+        .unwrap()
+        .expect("current manifest should exist");
+    let current_size = current.len() as u64;
+
+    eprintln!(
+        "[snapshot_manifest_growth] {} snapshots, current manifest = {} bytes, \
+         total snapshot storage = {} bytes ({:.1}x per snapshot vs current)",
+        sequences.len(),
+        current_size,
+        total_manifest_bytes,
+        total_manifest_bytes as f64 / (current_size as f64 * sequences.len() as f64)
+    );
+
+    // Sanity: each snapshot manifest should not be wildly larger than the current one.
+    // Allow 2x since snapshots may include slightly different pack lists.
+    let max_snapshot_size = current_size * 3;
+    for &seq in &sequences {
+        let data = cs
+            .get_snapshot("vm1", seq)
+            .await
+            .unwrap()
+            .expect("snapshot should exist");
+        assert!(
+            (data.len() as u64) <= max_snapshot_size,
+            "snapshot {} is {} bytes, >3x the current manifest ({} bytes) — possible growth issue",
+            seq,
+            data.len(),
+            current_size
+        );
+    }
+}

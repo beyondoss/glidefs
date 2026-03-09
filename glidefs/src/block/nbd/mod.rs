@@ -203,48 +203,108 @@ impl NbdDeviceManager {
         // kernel takes ownership. If the netlink call fails below, std_stream
         // drops normally and closes the fd (correct — kernel rejected it).
         let std_stream = client_stream.into_std()?;
+        // tokio sets sockets to non-blocking mode. The kernel NBD driver uses
+        // kernel_recvmsg/kernel_sendmsg which return -EAGAIN on non-blocking
+        // sockets when data isn't immediately available — treated as fatal EIO.
+        // Set back to blocking so the kernel can wait for our replies.
+        std_stream.set_nonblocking(false)?;
         let client_fd = std_stream.as_raw_fd();
 
-        let dev_index = if let Some(index) = preferred_index {
-            if is_nbd_device_alive(index) {
-                // Hot reload: reconfigure existing device with new socket fd.
-                // Queued I/O resumes immediately on the new socket.
-                info!(
-                    export = %export_name,
-                    index,
-                    "reconfiguring existing nbd device (hot reload)"
-                );
-                tokio::task::spawn_blocking(move || {
-                    netlink::reconfigure(index, client_fd)
-                })
-                .await??;
-                index
+        // Retry loop: kernel NBD device teardown is asynchronous — if we're
+        // reclaiming a device that was just disconnected, the kernel may still
+        // be releasing it (EBUSY). Retry a few times with a short delay.
+        const MAX_RETRIES: u32 = 10;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let mut dev_index = None;
+        for attempt in 0..MAX_RETRIES {
+            let result = if let Some(index) = preferred_index {
+                if is_nbd_device_alive(index) {
+                    // Try hot reload first: reconfigure existing device with
+                    // new socket fd. If the device was just disconnected but
+                    // the pid file hasn't been cleaned up yet, reconfigure
+                    // fails with EINVAL ("not configured") — fall through to
+                    // connect in that case.
+                    info!(
+                        export = %export_name,
+                        index,
+                        "reconfiguring existing nbd device (hot reload)"
+                    );
+                    let reconf = tokio::task::spawn_blocking(move || {
+                        netlink::reconfigure(index, client_fd)
+                    })
+                    .await?;
+                    match reconf {
+                        Ok(()) => Ok(index),
+                        Err(e) => {
+                            warn!(
+                                export = %export_name,
+                                index,
+                                error = %e,
+                                "reconfigure failed, falling back to connect"
+                            );
+                            let size = size_bytes;
+                            let dead_conn_timeout = self.dead_conn_timeout;
+                            let server_flags = TRANSMISSION_FLAGS as u64;
+                            tokio::task::spawn_blocking(move || {
+                                netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, Some(index))
+                            })
+                            .await?
+                        }
+                    }
+                } else {
+                    // Dead device from previous run — reclaim the same index so
+                    // the box manager's /dev/nbdN reference stays valid.
+                    debug!(
+                        export = %export_name,
+                        index,
+                        "reclaiming dead nbd device index"
+                    );
+                    let size = size_bytes;
+                    let dead_conn_timeout = self.dead_conn_timeout;
+                    let server_flags = TRANSMISSION_FLAGS as u64;
+                    tokio::task::spawn_blocking(move || {
+                        netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, Some(index))
+                    })
+                    .await?
+                }
             } else {
-                // Dead device from previous run — reclaim the same index so
-                // the box manager's /dev/nbdN reference stays valid.
-                debug!(
-                    export = %export_name,
-                    index,
-                    "reclaiming dead nbd device index"
-                );
+                // First time for this export — auto-assign.
                 let size = size_bytes;
                 let dead_conn_timeout = self.dead_conn_timeout;
                 let server_flags = TRANSMISSION_FLAGS as u64;
                 tokio::task::spawn_blocking(move || {
-                    netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, Some(index))
+                    netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, None)
                 })
-                .await??
+                .await?
+            };
+
+            match result {
+                Ok(index) => {
+                    dev_index = Some(index);
+                    break;
+                }
+                Err(e) => {
+                    let is_transient = e.to_string().contains("os error 16")
+                        || e.to_string().contains("Device or resource busy")
+                        || e.to_string().contains("os error 22")
+                        || e.to_string().contains("Invalid argument");
+                    if is_transient && attempt + 1 < MAX_RETRIES {
+                        debug!(
+                            export = %export_name,
+                            attempt,
+                            error = %e,
+                            "nbd device not ready, retrying after {:?}",
+                            RETRY_DELAY
+                        );
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
             }
-        } else {
-            // First time for this export — auto-assign.
-            let size = size_bytes;
-            let dead_conn_timeout = self.dead_conn_timeout;
-            let server_flags = TRANSMISSION_FLAGS as u64;
-            tokio::task::spawn_blocking(move || {
-                netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, None)
-            })
-            .await??
-        };
+        }
+        let dev_index = dev_index.expect("retry loop exited without result");
 
         // The kernel now owns the client_fd. Release ownership so Drop
         // doesn't close it.

@@ -1392,8 +1392,8 @@ impl ExportRouter {
             (current_size, readonly, block_size, s3_prefix, transport)
         };
 
-        let new_size_bytes = (new_size_gb * 1_000_000_000.0) as u64;
-        let current_size_gb = current_size as f64 / 1_000_000_000.0;
+        let new_size_bytes = (new_size_gb * 1_073_741_824.0) as u64;
+        let current_size_gb = current_size as f64 / 1_073_741_824.0;
 
         // Validate: grow only
         if new_size_bytes < current_size {

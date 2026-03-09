@@ -52,7 +52,7 @@ enum BlockResult {
 /// Phase 2 (sequential): within-batch dedup via seen_hashes (cheap hash-set insertions).
 ///
 /// All blocks in `snapshot` have already been claimed (CAS DIRTY→SYNCING).
-/// CRC verification uses the crc_map (DashMap) and state discrimination:
+/// CRC verification uses the crc_map (SparseCrcMap) and state discrimination:
 /// - CRC mismatch + state == SYNCING → real SSD corruption
 /// - CRC mismatch + state != SYNCING → concurrent write re-dirtied the block
 fn compute_flush_batch(
@@ -212,12 +212,12 @@ fn compute_flush_batch(
 
 /// Compute CRC32 checksums for dirty blocks that don't have one yet.
 ///
-/// Stores CRCs in the crc_map (DashMap) for later verification by the
+/// Stores CRCs in the crc_map (SparseCrcMap) for later verification by the
 /// flush path. Writes invalidate stale CRCs by storing CRC_SENTINEL.
 ///
 /// Sentinel handling: when we encounter a sentinel entry, we remove it
 /// before reading the block. If a concurrent write arrives between our
-/// remove and the subsequent `or_insert`, the write inserts a fresh
+/// remove and the subsequent `try_insert`, the write stores a fresh
 /// sentinel that prevents our (possibly stale) CRC from being stored.
 ///
 /// Capped at MAX_CRC_ENTRIES to bound memory. Blocks beyond the cap skip
@@ -228,14 +228,14 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) -> usize {
     use rayon::prelude::*;
     use std::sync::atomic::AtomicU64;
 
-    /// Maximum crc_map entries per export. 10M entries × ~20 bytes
-    /// (DashMap overhead: bucket metadata + alignment + load factor) ≈ 200MB.
+    /// Maximum crc_map entries per export. 10M entries × 4 bytes
+    /// (SparseCrcMap: AtomicU32 per entry, 4KB pages) ≈ 40MB.
     /// Covers a fully-dirty 1TB device (8M blocks of 128KB) with headroom.
     /// Prevents unbounded growth if device_size is ever misconfigured.
     const MAX_CRC_ENTRIES: usize = 10_000_000;
 
     // Already at cap — skip entirely.
-    if inner.crc_map.len() >= MAX_CRC_ENTRIES {
+    if inner.crc_map.count() >= MAX_CRC_ENTRIES {
         return 0;
     }
 
@@ -244,7 +244,7 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) -> usize {
     let dirty_indices: Vec<usize> = inner
         .state_map
         .iter_with_state(SparseBlockState::DIRTY)
-        .take(MAX_CRC_ENTRIES.saturating_sub(inner.crc_map.len()))
+        .take(MAX_CRC_ENTRIES.saturating_sub(inner.crc_map.count()))
         .collect();
 
     if dirty_indices.is_empty() {
@@ -261,24 +261,22 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) -> usize {
     dirty_indices.par_iter().for_each(|&idx| {
         // Soft cap: stop computing CRCs once the map is full. Racy but harmless —
         // exceeding the cap slightly is fine, the bound prevents runaway growth.
-        if inner.crc_map.len() >= MAX_CRC_ENTRIES {
+        if inner.crc_map.count() >= MAX_CRC_ENTRIES {
             return;
         }
 
         // Skip blocks that already have a valid CRC.
         // If a sentinel is present (invalidated by a concurrent write),
         // clear it and recompute.
-        if let Some(existing) = inner.crc_map.get(&idx) {
-            if *existing != CRC_SENTINEL {
+        if let Some(existing) = inner.crc_map.load(idx) {
+            if existing != CRC_SENTINEL {
                 return; // valid CRC exists, skip
             }
-            // Drop the read guard before removing (different shard lock).
-            drop(existing);
             // Clear sentinel before reading. If a concurrent write arrives
-            // between this remove and our or_insert below, the write will
-            // insert a fresh sentinel that prevents our (potentially stale)
+            // between this remove and our try_insert below, the write will
+            // store a fresh sentinel that prevents our (potentially stale)
             // CRC from being stored.
-            inner.crc_map.remove(&idx);
+            inner.crc_map.remove(idx);
         }
 
         let offset = idx as u64 * block_size as u64;

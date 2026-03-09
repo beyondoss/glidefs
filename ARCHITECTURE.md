@@ -80,7 +80,7 @@ Warm PackIndexCache for all affected chunks (cold start: fetch pack indices from
 For each chunk (one pack per chunk per flush cycle):
     ├── Build (hash, chunk_offset, compressed) triples via rayon parallel:
     │   ├── pread block from SSD
-    │   ├── CRC32 verify from crc_map (if available)
+    │   ├── CRC32 verify from SparseCrcMap (if available)
     │   ├── Skip zero blocks (well-known hash sentinel)
     │   ├── BLAKE3-128 hash → LZ4 compress
     │   └── Collect into Vec<(hash, chunk_offset, compressed)>
@@ -179,7 +179,9 @@ The write path avoids all locks. Three techniques make this possible:
 
 2. **Sparse state map** (CAS + sparse page table): `SparseStateMap` stores per-block state in a two-level page table with 2-bit packing — 4 entries per `AtomicU8`, 16,384 entries per 4KB page. Pages are allocated on first write via CAS — empty exports use ~4KB for the directory. State transitions (`set_present`, `transition_to_dirty`, `transition_dirty_to_syncing`, `transition_syncing_to_clean`) are CAS-on-byte loops with no global lock. (`block_map.rs:SparseStateMap`)
 
-3. **Sequence numbers**: A monotonic `AtomicU64` counter (`SequenceNumber`) provides WAL ordering. Each write bumps the sequence; the max sequence is persisted in `block_states` metadata so it survives crash recovery. (`block_map.rs:SequenceNumber`)
+3. **Sparse CRC map** (AtomicU32 page table): `SparseCrcMap` tracks CRC32 checksums for dirty blocks using the same two-level page table pattern as `SparseStateMap` — 1,024 `AtomicU32` entries per 4KB page, lazily allocated. Checkpoint computes CRC32s; flush verifies them to detect SSD corruption. Lock-free: stores, loads, and CAS operations on `AtomicU32` with no shard locks. (`block_map.rs:SparseCrcMap`)
+
+4. **Sequence numbers**: A monotonic `AtomicU64` counter (`SequenceNumber`) provides WAL ordering. Each write bumps the sequence; the max sequence is persisted in `block_states` metadata so it survives crash recovery. (`block_map.rs:SequenceNumber`)
 
 ### Content Addressing
 
@@ -540,11 +542,11 @@ Every layer has a verification mechanism. The goal: corruption is detected befor
 | GLPK pack | Block index + data | BLAKE3-128 per block | On block read from S3 | `HashMismatch` error |
 | WAL entries | Per-entry metadata | CRC32 trailer | On replay (crash recovery) | Stop replay, discard torn tail |
 | Block state metadata (.meta) | Per-block state + sequence | CRC32 trailer | On load (open/recovery) | Reject file (`InvalidMetadata`) |
-| Dirty blocks (SSD) | Block data between write and flush | CRC32 in `crc_map` | Flush time: before BLAKE3 computation | Skip block (stays dirty), do NOT launder to S3 |
+| Dirty blocks (SSD) | Block data between write and flush | CRC32 in `SparseCrcMap` | Flush time: before BLAKE3 computation | Skip block (stays dirty), do NOT launder to S3 |
 
 ### Dirty Block CRC32
 
-CRC32 is stored in `crc_map: DashMap<usize, u32>` on `CacheInner`. At checkpoint time (every ~5s), dirty blocks without a CRC get one computed. At flush time, the CRC is verified before BLAKE3 is computed. SYNCING state provides unambiguous discrimination:
+CRC32 is stored in `crc_map: SparseCrcMap` on `CacheInner` — a lock-free two-level page table with `AtomicU32` leaves (1,024 entries per 4KB page, lazily allocated). At checkpoint time (every ~5s), dirty blocks without a CRC get one computed. At flush time, the CRC is verified before BLAKE3 is computed. SYNCING state provides unambiguous discrimination:
 
 - CRC mismatch + state == SYNCING → real SSD corruption → skip block
 - CRC mismatch + state != SYNCING → concurrent write re-dirtied the block → stale CRC, not corruption
@@ -645,7 +647,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/write_cache/init.rs` | Cache initialization: `open()` (Initializing→Recovering), `open_fresh_active()` (forks) |
 | `block/write_cache/inner.rs` | `CacheInner`: shared state (data file, state map, WAL, sequence, CRC map) |
 | `block/write_cache/recovery.rs` | Crash recovery: Syncing→Dirty on startup |
-| `block/block_map.rs` | `SparseStateMap`, `Blake3Hash`, `blake3_128`, `lz4_compress`, `lz4_decompress` |
+| `block/block_map.rs` | `SparseStateMap`, `SparseCrcMap`, `Blake3Hash`, `blake3_128`, `lz4_compress`, `lz4_decompress` |
 | `block/cache.rs` | `BlockCache` trait (CleanCache) + Foyer implementation |
 | `block/flush_scheduler.rs` | Per-export flush scheduling: event-driven (dirty count threshold), periodic checkpoint |
 | `block/handler.rs` | `BlockHandler`: transport-agnostic read/write/flush/trim/write_zeroes |

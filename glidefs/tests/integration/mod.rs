@@ -10,12 +10,17 @@ mod chunk_prefetch;
 mod crash_recovery;
 mod crash_under_load;
 mod data_safety;
+mod flush_ordering;
 mod failure_injection;
 mod flush_safety;
 mod gc;
 mod partial_blocks;
 mod property_tests;
 mod snapshots;
+mod s3_degraded;
+mod ssd_pressure;
+mod transport_stress;
+mod trim;
 mod wake_any_node;
 
 use std::sync::{Arc, LazyLock};

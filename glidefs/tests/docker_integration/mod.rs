@@ -84,7 +84,7 @@ macro_rules! transport_test {
 
         #[cfg(target_os = "linux")]
         paste::paste! {
-            #[tokio::test]
+            #[tokio::test(flavor = "multi_thread")]
             async fn [< $name _nbd_kernel >]() {
                 if !$crate::nbd_kernel_available() {
                     eprintln!("nbd-kernel: skipping (nbd module not loaded or insufficient privileges)");
@@ -926,6 +926,7 @@ mod device_stability;
 mod export_discovery;
 mod ext4_verify;
 mod fork_roundtrip;
+mod fs_crash_recovery;
 mod integrity_suite;
 mod live_migration;
 mod multi_export;
@@ -934,4 +935,5 @@ mod oci_push;
 mod persistence;
 mod range_reads;
 mod resize;
+mod transport_stress;
 mod write_read;

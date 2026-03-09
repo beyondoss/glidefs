@@ -109,7 +109,7 @@ impl WriteCache<Active> {
                 continue;
             }
             let state_changed = self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
+            self.inner.crc_map.store(idx, super::inner::CRC_SENTINEL);
 
             let partial_bitmap = self.inner.partial_bitmap(idx);
             if state_changed || partial_bitmap.is_some() {
@@ -250,7 +250,7 @@ impl WriteCache<Active> {
                     continue;
                 }
                 let state_changed = self.inner.transition_to_dirty(idx);
-                self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
+                self.inner.crc_map.store(idx, super::inner::CRC_SENTINEL);
 
                 let partial_bitmap = self.inner.partial_bitmap(idx);
                 if state_changed || partial_bitmap.is_some() {
@@ -390,7 +390,7 @@ impl WriteCache<Active> {
                 continue;
             }
             let state_changed = self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.insert(idx, super::inner::CRC_SENTINEL);
+            self.inner.crc_map.store(idx, super::inner::CRC_SENTINEL);
 
             let partial_bitmap = self.inner.partial_bitmap(idx);
             if state_changed || partial_bitmap.is_some() {
