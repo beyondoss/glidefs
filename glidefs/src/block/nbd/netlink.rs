@@ -257,7 +257,20 @@ fn resolve_nbd_family(fd: RawFd) -> io::Result<u16> {
 
     for (attr_type, attr_data) in parse_nla(nla_payload) {
         if attr_type == CTRL_ATTR_FAMILY_ID && attr_data.len() >= 2 {
-            return Ok(u16::from_ne_bytes([attr_data[0], attr_data[1]]));
+            let family_id = u16::from_ne_bytes([attr_data[0], attr_data[1]]);
+            // Drain the pending ACK (NLM_F_ACK causes the kernel to send a
+            // separate NLMSG_ERROR/errno=0 after the genl response). If it
+            // was already batched into the recv above, this is a no-op.
+            let mut drain = [0u8; 256];
+            unsafe {
+                libc::recv(
+                    fd,
+                    drain.as_mut_ptr() as *mut _,
+                    drain.len(),
+                    libc::MSG_DONTWAIT,
+                );
+            }
+            return Ok(family_id);
         }
     }
 
@@ -323,24 +336,13 @@ pub fn connect(
     // NBD_ATTR_INDEX attribute. Parse it, with a sysfs scan as fallback.
     let mut buf = [0u8; 4096];
     let n = nl_recv(fd, &mut buf)?;
-    eprintln!(
-        "[nbd-netlink] connect response: {} bytes, hex: {:02x?}",
-        n,
-        &buf[..n.min(64)]
-    );
     let (_, msg_type, _, payload) = parse_nlmsghdr(&buf[..n])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated response"))?;
-
-    eprintln!(
-        "[nbd-netlink] msg_type={msg_type}, NLMSG_ERROR={NLMSG_ERROR}, payload_len={}",
-        payload.len()
-    );
 
     if msg_type == NLMSG_ERROR
         && payload.len() >= 4
     {
         let errno = i32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        eprintln!("[nbd-netlink] errno={errno}, full payload_len={}", payload.len());
         if errno == 0 {
             // Success — but we used u32::MAX so we need to find the assigned index.
             // Parse the echoed attributes in the error response.
@@ -348,12 +350,7 @@ pub fn connect(
             if payload.len() >= 4 + 16 + 4 {
                 // error(4) + nlmsghdr(16) + genlmsghdr(4) + attrs
                 let echoed_attrs = &payload[4 + 16 + 4..];
-                eprintln!("[nbd-netlink] echoed_attrs len={}", echoed_attrs.len());
                 for (attr_type, attr_data) in parse_nla(echoed_attrs) {
-                    eprintln!(
-                        "[nbd-netlink]   attr type={attr_type}, data_len={}",
-                        attr_data.len()
-                    );
                     if attr_type == NBD_ATTR_INDEX && attr_data.len() >= 4 {
                         let index = u32::from_ne_bytes([
                             attr_data[0],
@@ -361,53 +358,20 @@ pub fn connect(
                             attr_data[2],
                             attr_data[3],
                         ]);
-                        eprintln!("[nbd-netlink] found index={index} in echoed attrs");
                         return Ok(index as i32);
                     }
                 }
-            } else {
-                eprintln!(
-                    "[nbd-netlink] payload too short for echoed attrs: {} < {}",
-                    payload.len(),
-                    4 + 16 + 4
-                );
             }
             // Fallback: scan /sys/block for the newest nbd device
-            eprintln!("[nbd-netlink] falling back to sysfs scan");
-            dump_nbd_sysfs_state();
             return find_newest_nbd_device();
         }
         return Err(io::Error::from_raw_os_error(-errno));
     }
 
-    eprintln!("[nbd-netlink] unexpected response type {msg_type}");
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
         format!("unexpected response type {msg_type} to NBD_CMD_CONNECT"),
     ))
-}
-
-/// Dump sysfs state for all NBD devices (diagnostic).
-fn dump_nbd_sysfs_state() {
-    if let Ok(entries) = std::fs::read_dir("/sys/block") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("nbd") {
-                let path = entry.path();
-                let pid = std::fs::read_to_string(path.join("pid"))
-                    .unwrap_or_else(|_| "N/A".to_string());
-                let size = std::fs::read_to_string(path.join("size"))
-                    .unwrap_or_else(|_| "N/A".to_string());
-                eprintln!(
-                    "[nbd-netlink] sysfs {}: pid={}, size={}",
-                    name,
-                    pid.trim(),
-                    size.trim()
-                );
-            }
-        }
-    }
 }
 
 /// Disconnect an NBD device via generic netlink.
