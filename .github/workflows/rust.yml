@@ -110,6 +110,9 @@ jobs:
           sudo modprobe ublk_drv || echo "ublk_drv not available"
       - name: Run blktests
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features blktests --test blktests -- --nocapture
+      - name: Kernel logs (on failure)
+        if: failure()
+        run: sudo dmesg --color=never | tail -200
 
   kernel-devices:
     name: Kernel Devices (Linux)
@@ -142,3 +145,6 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose
       - name: Filesystem crash recovery (nbd + ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --verbose fs_crash -- --nocapture
+      - name: Kernel logs (on failure)
+        if: failure()
+        run: sudo dmesg --color=never | tail -200

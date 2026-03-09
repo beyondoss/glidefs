@@ -203,6 +203,11 @@ impl NbdDeviceManager {
         // kernel takes ownership. If the netlink call fails below, std_stream
         // drops normally and closes the fd (correct — kernel rejected it).
         let std_stream = client_stream.into_std()?;
+        // tokio sets sockets to non-blocking mode. The kernel NBD driver uses
+        // kernel_recvmsg/kernel_sendmsg which return -EAGAIN on non-blocking
+        // sockets when data isn't immediately available — treated as fatal EIO.
+        // Set back to blocking so the kernel can wait for our replies.
+        std_stream.set_nonblocking(false)?;
         let client_fd = std_stream.as_raw_fd();
 
         let dev_index = if let Some(index) = preferred_index {
