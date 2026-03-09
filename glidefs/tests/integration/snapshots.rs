@@ -1647,7 +1647,7 @@ async fn test_fork_inherit_then_overwrite_all() {
     .unwrap();
 
     let num_blocks = 100u64;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Parent: write 100 blocks with 0xAA
     let config = ExportConfig {

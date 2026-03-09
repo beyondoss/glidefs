@@ -240,9 +240,9 @@ impl ExportConfig {
         self.s3_prefix.as_deref().unwrap_or(&self.name)
     }
 
-    /// Get the device size in bytes.
+    /// Get the device size in bytes (binary GiB).
     pub fn size_bytes(&self) -> u64 {
-        (self.size_gb * 1_000_000_000.0) as u64
+        (self.size_gb * 1024.0 * 1024.0 * 1024.0) as u64
     }
 
     /// Get the block size, falling back to the provided default.

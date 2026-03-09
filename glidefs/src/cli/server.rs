@@ -323,7 +323,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         info!(
             "  - {} ({}GB, {}, transport={}{})",
             export.name,
-            export.size / 1_000_000_000,
+            export.size / 1_073_741_824,
             if export.readonly {
                 "readonly"
             } else {

@@ -473,7 +473,7 @@ async fn test_resize_export_preserves_data() {
     // Export should have the new size
     let handler = router.get_handler("vm1").await.unwrap();
     let new_size = handler.device_size();
-    let expected_size = (0.02 * 1_000_000_000.0) as u64;
+    let expected_size = (0.02 * 1_073_741_824.0) as u64;
     assert_eq!(new_size, expected_size, "device should be 20MB after resize");
 
     // Original data should still be readable

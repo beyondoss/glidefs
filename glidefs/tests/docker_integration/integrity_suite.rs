@@ -55,8 +55,8 @@ fn blake3_hash(data: &[u8]) -> [u8; 32] {
 }
 
 fn fmt_bytes(bytes: u64) -> String {
-    if bytes >= 1_000_000_000 {
-        format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GB", bytes as f64 / 1_073_741_824.0)
     } else {
         format!("{:.0} MB", bytes as f64 / 1_000_000.0)
     }
@@ -76,7 +76,7 @@ async fn block_hash_verify() {
 
     // 256 MB = 2048 blocks
     let num_blocks: u64 = 2048;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Phase 1: Write all blocks with deterministic patterns
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -149,7 +149,7 @@ async fn sequential_integrity() {
 
     // 100 MB
     let num_blocks: u64 = 800;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Write sequentially, building a running SHA-256 of the full stream
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -216,7 +216,7 @@ async fn hash_stress() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 2048; // 256 MB
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
     let passes = 3;
     let write_fraction = 0.6;
 
@@ -320,7 +320,7 @@ async fn persistence_integrity() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 400; // ~50 MB
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Write blocks
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -387,7 +387,7 @@ async fn sparse_integrity() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 512; // 64 MB
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Write ~25% of blocks at scattered offsets
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -479,7 +479,7 @@ async fn soak_test() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 4096; // 512 MB
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
     let verify_interval_secs = 10;
 
     let mut rng = StdRng::seed_from_u64(0x50AE_7E57_5EED);
@@ -651,7 +651,7 @@ async fn fork_integrity() {
 
     let parent_blocks: u64 = 128;
     let overwrite_blocks: u64 = 32;
-    let size_gb = (parent_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (parent_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Phase 1: Write parent blocks, snapshot
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -775,7 +775,7 @@ async fn overwrite_integrity() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 256;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Phase 1: Write pattern A to all blocks, drain to S3
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -860,7 +860,7 @@ async fn concurrent_stress() {
     let num_clients: u64 = 4;
     let blocks_per_client: u64 = 256;
     let total_blocks = num_clients * blocks_per_client; // 1024 blocks = 128 MB
-    let size_gb = (total_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (total_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
     server.create_export("vol", size_gb).await;
@@ -981,7 +981,7 @@ async fn sub_block_basic() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 64;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Phase 1: Write full blocks to parent, snapshot
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -1134,7 +1134,7 @@ async fn sub_block_stress() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 32;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Phase 1: Parent with known data
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -1304,7 +1304,7 @@ async fn zero_block_integrity() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 256; // 32 MB
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Phase 1: Write non-zero data to all blocks, drain to S3
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -1399,7 +1399,7 @@ async fn fork_chain_integrity() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 64;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
 
@@ -1526,7 +1526,7 @@ async fn fork_deep_chain_read_through() {
     // 128 blocks total — each level writes to a unique range of 20 blocks
     // plus overwrites block 0 with its own pattern.
     let num_blocks: u64 = 128;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
     let blocks_per_level = 20u64;
 
     let levels = ["level-a", "level-b", "level-c", "level-d", "level-e"];
@@ -1670,7 +1670,7 @@ async fn write_during_drain() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 512;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
     server.create_export("vol", size_gb).await;
@@ -1789,7 +1789,7 @@ async fn snapshot_rollback() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 128;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
     server.create_export("vol", size_gb).await;
@@ -1900,7 +1900,7 @@ async fn wal_crash_recovery() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 256; // 32 MB
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // We manage the cache dir ourselves so it survives across restarts
     let cache_dir = tempfile::TempDir::new().unwrap();
@@ -2039,7 +2039,7 @@ async fn multi_block_read() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 128;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Write all blocks with deterministic patterns
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -2138,7 +2138,7 @@ async fn unaligned_cross_boundary_read() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 64;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Write all blocks with deterministic patterns
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -2285,7 +2285,7 @@ async fn promote_integrity() {
 
     let num_blocks: u64 = 128;
     let overwrite_blocks: u64 = 32;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Phase 1: Write parent data, snapshot, fork
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -2405,7 +2405,7 @@ async fn resize_integrity() {
     let transport = crate::Transport::Nbd;
 
     let original_blocks: u64 = 64;
-    let original_size_gb = (original_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let original_size_gb = (original_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     // Phase 1: Write data to original-sized export
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
@@ -2429,13 +2429,13 @@ async fn resize_integrity() {
 
     // Phase 2: Resize — double the volume
     let new_blocks: u64 = 128;
-    let new_size_gb = (new_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let new_size_gb = (new_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
     server.resize_export("vol", new_size_gb).await;
 
     // Verify new size is visible
     let mut client2 = server.connect("vol").await;
     let reported_size = client2.export_size();
-    let expected_bytes = (new_size_gb * 1_000_000_000.0) as u64;
+    let expected_bytes = (new_size_gb * 1_073_741_824.0) as u64;
     assert_eq!(
         reported_size, expected_bytes,
         "export should report new size after resize"
@@ -2512,7 +2512,7 @@ async fn soak_mixed_operations() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 2048; // 256 MB
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     let mut rng = StdRng::seed_from_u64(0x504B_FEED_C0DE);
     let zero_hash = blake3_hash(&vec![0u8; BLOCK_SIZE]);
@@ -2711,7 +2711,7 @@ async fn soak_concurrent_clients() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 2048;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     let server = TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
     server.create_export("vol", size_gb).await;
@@ -2837,7 +2837,7 @@ async fn soak_crash_loop() {
     let transport = crate::Transport::Nbd;
 
     let num_blocks: u64 = 1024;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
     let num_cycles: u32 = std::env::var("SOAK_CRASH_CYCLES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -2944,7 +2944,7 @@ async fn soak_fork_chain_churn() {
     let blocks_per_level = 32u64;
     let num_levels: usize = 20;
     let num_blocks: u64 = (num_levels as u64 + 1) * blocks_per_level;
-    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_000_000_000.0;
+    let size_gb = (num_blocks as f64 * BLOCK_SIZE as f64) / 1_073_741_824.0;
 
     let mut rng = StdRng::seed_from_u64(0xF02E_C4A1_0000);
 
@@ -3113,7 +3113,7 @@ async fn soak_sub_block_writes() {
     // Smaller device — byte-level tracking is memory intensive
     let num_blocks: u64 = 256; // 32 MB
     let device_size = num_blocks * BLOCK_SIZE as u64;
-    let size_gb = device_size as f64 / 1_000_000_000.0;
+    let size_gb = device_size as f64 / 1_073_741_824.0;
 
     let mut rng = StdRng::seed_from_u64(0x5B8E_0C10_CAFE);
 

@@ -788,10 +788,6 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     });
                 }
                 NBDCommand::Unknown(cmd) => {
-                    eprintln!(
-                        "[nbd-server] unknown command: cmd={cmd}, flags={}, offset={}, length={}, cookie={}",
-                        request.flags, request.offset, request.length, request.cookie
-                    );
                     warn!(
                         cmd,
                         flags = request.flags,

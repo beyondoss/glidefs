@@ -14,7 +14,7 @@ use super::state::Active;
 use super::volume_manifest::VolumeManifest;
 use super::write_cache::WriteCache;
 use super::write_trace::WriteTracer;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -380,31 +380,31 @@ impl BlockHandler {
     pub async fn read(&self, offset: u64, length: u32) -> CommandResult<Bytes> {
         let start = Instant::now();
 
-        if offset + length as u64 > self.device_size() {
-            tracing::warn!(
-                offset,
-                length,
-                device_size = self.device_size(),
-                "read beyond device boundary"
-            );
-            eprintln!(
-                "[handler] read out of bounds: offset={offset}, length={length}, device_size={}",
-                self.device_size()
-            );
-            return Err(CommandError::InvalidArgument);
+        if offset >= self.device_size() {
+            // Entirely beyond the device — return zeros. The kernel NBD
+            // driver doesn't clamp requests to the device size for partition
+            // table probing, so we must handle this gracefully.
+            return Ok(Bytes::from(vec![0u8; length as usize]));
         }
 
         if length == 0 {
             return Ok(Bytes::new());
         }
 
-        self.metrics.record_guest_read(length as u64);
+        // Clamp reads that partially extend past the device boundary:
+        // return real data for the on-device portion, zeros for the rest.
+        let clamped_len = std::cmp::min(
+            length as u64,
+            self.device_size() - offset,
+        ) as u32;
+
+        self.metrics.record_guest_read(clamped_len as u64);
 
         let data = self
             .cache
             .read(
                 offset,
-                length as usize,
+                clamped_len as usize,
                 self.clean_cache.as_ref(),
                 &self.pack_index_cache,
                 &self.volume_manifest,
@@ -416,7 +416,16 @@ impl BlockHandler {
         self.trigger_readahead(offset);
 
         self.metrics.record_read_latency(start.elapsed());
-        Ok(data)
+
+        // Zero-pad if we clamped the read at the device boundary.
+        if clamped_len < length {
+            let mut padded = BytesMut::with_capacity(length as usize);
+            padded.extend_from_slice(&data);
+            padded.resize(length as usize, 0);
+            Ok(padded.freeze())
+        } else {
+            Ok(data)
+        }
     }
 
     /// Read data directly into a caller-provided buffer.
@@ -924,11 +933,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_beyond_device_size() {
+    async fn test_read_beyond_device_size_returns_zeros() {
         let (handler, _temp) = test_handler().await;
 
-        let result = handler.read(1024 * 1024, 4096).await;
-        assert!(matches!(result, Err(CommandError::InvalidArgument)));
+        // Reads beyond device boundary return zeros (not an error).
+        // The kernel NBD driver sends partition-probe reads past the
+        // device size, so we must handle this gracefully.
+        let data = handler.read(1024 * 1024, 4096).await.unwrap();
+        assert_eq!(data.len(), 4096);
+        assert!(data.iter().all(|&b| b == 0));
     }
 
     #[tokio::test]
