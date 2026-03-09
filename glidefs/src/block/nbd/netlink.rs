@@ -39,10 +39,10 @@ const NLMSG_ERROR: u16 = 2;
 
 const NBD_GENL_FAMILY_NAME: &[u8] = b"nbd\0";
 
-// NBD commands
-const NBD_CMD_CONNECT: u8 = 0;
-const NBD_CMD_DISCONNECT: u8 = 1;
-const NBD_CMD_RECONFIGURE: u8 = 2;
+// NBD commands (kernel enum starts at _UNSPEC = 0)
+const NBD_CMD_CONNECT: u8 = 1;
+const NBD_CMD_DISCONNECT: u8 = 2;
+const NBD_CMD_RECONFIGURE: u8 = 3;
 
 // NBD attributes
 const NBD_ATTR_INDEX: u16 = 1;
@@ -53,8 +53,8 @@ const NBD_ATTR_SERVER_FLAGS: u16 = 5;
 const NBD_ATTR_SOCKETS: u16 = 7;
 const NBD_ATTR_DEAD_CONN_TIMEOUT: u16 = 8;
 
-// NBD socket attributes (nested)
-const NBD_SOCK_FD: u16 = 0;
+// NBD socket attributes (nested, kernel enum starts at _UNSPEC = 0)
+const NBD_SOCK_FD: u16 = 1;
 
 // Nested attribute flag
 const NLA_F_NESTED: u16 = 1 << 15;

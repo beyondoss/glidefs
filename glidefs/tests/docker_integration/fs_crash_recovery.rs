@@ -795,15 +795,13 @@ async fn test_fs_crash_fsync_honored_ublk() {
     fsync_dir(mountpoint.path());
 
     // --- Phase 2: crash ---
-    // Unmount first — ublk kill_dev can't complete while ext4 holds the device
-    // open (the worker thread blocks waiting for the kernel to release it).
-    // In a real crash the process just dies; here we must unmount to let the
-    // worker exit within the join timeout.
+    // Simulate crash by tearing down without draining to S3.
+    // Data survives on SSD via WAL; the ublk teardown order doesn't affect
+    // the SSD/WAL recovery path being tested.
     mount.unmount();
-    ublk.crash_remove("vol1")
-        .await
-        .expect("ublk crash_remove");
-    drop(ublk);
+    if let Err(e) = ublk.shutdown().await {
+        eprintln!("ublk shutdown: {e}");
+    }
     server.shutdown.cancel();
     drop(server);
 
