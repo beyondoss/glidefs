@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU64;
 use tracing::{error, info, instrument, warn};
 
 use crate::block::block_map::{
-    SequenceNumber, SparseBlockState, SparseStateMap, zero_block_hash,
+    SequenceNumber, SparseBlockState, SparseCrcMap, SparseStateMap, zero_block_hash,
 };
 use crate::block::state::{Active, Initializing, Recovering};
 use crate::block::wal::Wal;
@@ -135,7 +135,7 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(recovery_warning_count),
-            crc_map: DashMap::new(),
+            crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
             partial_blocks,
         });
@@ -187,7 +187,7 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(0),
-            crc_map: DashMap::new(),
+            crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
             partial_blocks: DashMap::new(),
         });

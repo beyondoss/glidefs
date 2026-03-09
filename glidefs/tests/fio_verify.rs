@@ -302,6 +302,22 @@ mod fio_verify {
         eprintln!("[fio-verify] draining to S3...");
         server.router.drain_export("verify").await.unwrap();
 
+        // Diagnostic: verify manifest and handler reads before shutdown
+        {
+            let handler = server.router.get_handler("verify").await
+                .expect("handler should exist after drain");
+            // Spot-check blocks at boundaries: first, middle, last
+            for block in [0u64, 512, 960, 1023] {
+                let offset = block * 128 * 1024;
+                let data = handler.read(offset, 4096).await
+                    .unwrap_or_else(|e| panic!("[diag] handler read at block {block} (offset {offset}) failed: {e}"));
+                let nonzero = data.iter().any(|&b| b != 0);
+                eprintln!("[diag] block {block} (offset {offset}): len={}, nonzero={nonzero}, first4=[{:#04x},{:#04x},{:#04x},{:#04x}]",
+                    data.len(), data[0], data[1], data[2], data[3]);
+                assert!(nonzero, "[diag] block {block} is all zeros BEFORE shutdown — drain may have lost data");
+            }
+        }
+
         // Shutdown (drops local SSD cache)
         server.shutdown().await;
 
@@ -356,6 +372,36 @@ mod fio_verify {
             .expect("failed to register ublk device");
 
         eprintln!("[fio-verify] cold device ready: {}", dev_path2.display());
+
+        // Diagnostic: verify handler reads BEFORE fio (bypasses ublk, tests cold read path)
+        {
+            let handler2 = router2.get_handler("verify").await
+                .expect("handler should exist on cold router");
+            let mut cold_failures = Vec::new();
+            for block in [0u64, 512, 960, 1000, 1023] {
+                let offset = block * 128 * 1024;
+                match handler2.read(offset, 4096).await {
+                    Ok(data) => {
+                        let nonzero = data.iter().any(|&b| b != 0);
+                        eprintln!("[diag-cold] block {block} (offset {offset}): nonzero={nonzero}, first4=[{:#04x},{:#04x},{:#04x},{:#04x}]",
+                            data[0], data[1], data[2], data[3]);
+                        if !nonzero {
+                            cold_failures.push(block);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[diag-cold] block {block} read ERROR: {e}");
+                        cold_failures.push(block);
+                    }
+                }
+            }
+            if !cold_failures.is_empty() {
+                eprintln!("[diag-cold] CORRUPTION DETECTED via handler reads (no ublk): blocks {:?}", cold_failures);
+                eprintln!("[diag-cold] This means the bug is in the write/drain/manifest path, NOT ublk reads");
+            } else {
+                eprintln!("[diag-cold] All sampled blocks non-zero via handler — cold read path OK");
+            }
+        }
 
         // Phase 3: verify reads from cold device
         fio_verify_read("cold-verify", "read", &dev_path2, &["--size=128m"]);

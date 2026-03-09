@@ -53,7 +53,9 @@ const NBD_ATTR_SERVER_FLAGS: u16 = 5;
 const NBD_ATTR_SOCKETS: u16 = 7;
 const NBD_ATTR_DEAD_CONN_TIMEOUT: u16 = 8;
 
-// NBD socket attributes (nested, kernel enum starts at _UNSPEC = 0)
+// NBD socket item (outer container for each socket in the list)
+const NBD_SOCK_ITEM: u16 = 1;
+// NBD socket attributes (inside each socket item)
 const NBD_SOCK_FD: u16 = 1;
 
 // Nested attribute flag
@@ -308,14 +310,13 @@ pub fn connect(
 
     let family_id = resolve_nbd_family(fd)?;
 
-    // Build socket list (nested attribute)
+    // Build socket list: NBD_ATTR_SOCKETS → [ NBD_SOCK_ITEM → NBD_SOCK_FD ]
     let mut sock_attrs = Vec::new();
-    // Each socket entry is itself nested
     let mut sock_entry = Vec::new();
     put_nla_u32(&mut sock_entry, NBD_SOCK_FD, socket_fd as u32);
-    put_nla(&mut sock_attrs, NLA_F_NESTED, &sock_entry);
+    put_nla(&mut sock_attrs, NBD_SOCK_ITEM | NLA_F_NESTED, &sock_entry);
 
-    // Build connect attributes
+    // Build connect attributes (matches nbd-client's netlink_configure)
     let mut attrs = Vec::new();
     // Include NBD_ATTR_INDEX only when reclaiming a specific device path.
     // Omitting it tells the kernel to auto-assign the lowest free index.
@@ -325,11 +326,10 @@ pub fn connect(
     put_nla_u64(&mut attrs, NBD_ATTR_SIZE_BYTES, size_bytes);
     put_nla_u64(&mut attrs, NBD_ATTR_BLOCK_SIZE_BYTES, block_size as u64);
     put_nla_u64(&mut attrs, NBD_ATTR_SERVER_FLAGS, server_flags);
-    put_nla(&mut attrs, NBD_ATTR_SOCKETS | NLA_F_NESTED, &sock_attrs);
     if dead_conn_timeout > 0 {
         put_nla_u64(&mut attrs, NBD_ATTR_DEAD_CONN_TIMEOUT, dead_conn_timeout as u64);
     }
-    put_nla_u64(&mut attrs, NBD_ATTR_TIMEOUT, 0); // no I/O timeout
+    put_nla(&mut attrs, NBD_ATTR_SOCKETS | NLA_F_NESTED, &sock_attrs);
 
     let msg = build_genl_msg(family_id, NBD_CMD_CONNECT, 2, &attrs);
     nl_send(fd, &msg)?;
