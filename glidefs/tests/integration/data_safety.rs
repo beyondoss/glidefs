@@ -2179,140 +2179,152 @@ async fn test_full_chunk_cold_wake() {
     );
 }
 
-/// Same as above but via ExportRouter + BlockHandler (matching fio_verify path).
+/// Stress test: concurrent 4K sub-block writes with flush scheduler racing,
+/// drain, cold wake, verify. Runs 20 iterations to reproduce intermittent
+/// corruption seen in fio_verify_after_cold_wake (blocks 960-1023 returning
+/// zeros after cold wake).
 ///
-/// Uses a 1GB device but only writes 128MB (1024 blocks × 128KB) via the handler,
-/// drains via router.drain_export(), cold-wakes a second router, and verifies.
-#[tokio::test]
-async fn test_full_chunk_cold_wake_via_router() {
+/// The flush scheduler runs concurrently with writes (via ExportRouter),
+/// creating a race between scheduler claiming DIRTY blocks and the writer
+/// still filling 128KB blocks with 4K sub-block writes. Multiple concurrent
+/// writer tasks (like fio's iodepth=32) maximize the race window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_cold_wake_stress_concurrent_writes() {
     use glidefs::block::cache::SimpleBlockCache;
     use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
     use glidefs::block::router::{ExportRouter, RouterConfig};
     use glidefs::config::ExportConfig;
 
     const DEVICE_SIZE_GB: f64 = 1.0;
-    const NUM_BLOCKS: usize = 1024; // 128MB at 128KB blocks
-
-    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let cache_dir1 = TempDir::new().unwrap();
-
-    let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> =
-        Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-
-    let router1 = Arc::new(
-        ExportRouter::new(RouterConfig {
-            object_store: Arc::clone(&s3),
-            db_path: "cold-wake-router".to_string(),
-            cache_dir: cache_dir1.path().to_path_buf(),
-            block_size: BLOCK_SIZE,
-            clean_cache: Arc::clone(&clean_cache),
-            wal_sync: false,
-            max_s3_uploads: 128,
-            max_s3_downloads: 512,
-            default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
-            ublk_nr_queues: 4,
-            nbd_dead_conn_timeout: 0,
-        })
-        .await
-        .expect("router1"),
-    );
-
-    let config = ExportConfig {
-        name: "vol1".to_string(),
-        size_gb: DEVICE_SIZE_GB,
-        s3_prefix: None,
-        block_size: None,
-        blocks_per_pack: None,
-        flush_mode: None,
-        transport: None,
-    };
-    router1
-        .create_export(config, false, None, None)
-        .await
-        .unwrap();
-
-    let handler = router1.get_handler("vol1").await.unwrap();
-
-    // Write 1024 blocks (128MB) with 4K sub-block writes
+    const NUM_BLOCKS: usize = 1024;
     const SUB_BLOCK: usize = 4096;
     const SUBS_PER_BLOCK: usize = BLOCK_SIZE / SUB_BLOCK;
-    for block in 0..NUM_BLOCKS {
-        let fill = ((block + 1) % 256) as u8;
-        let sub_data = vec![fill; SUB_BLOCK];
-        for sub in 0..SUBS_PER_BLOCK {
-            let offset = block as u64 * BLOCK_SIZE as u64 + sub as u64 * SUB_BLOCK as u64;
-            handler.write(offset, &sub_data, false).await.unwrap();
-        }
-    }
+    const ITERATIONS: usize = 20;
 
-    // Drain to S3
-    router1.drain_export("vol1").await.unwrap();
+    for iteration in 0..ITERATIONS {
+        let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
-    // Shutdown
-    router1.shutdown().await.unwrap();
-    drop(cache_dir1);
+        // === Write phase: concurrent 4K sub-block writes with flush scheduler ===
+        let cache_dir1 = TempDir::new().unwrap();
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> =
+            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
-    // === Cold wake: new router, fresh cache ===
-    let cache_dir2 = TempDir::new().unwrap();
-    let clean_cache2: Arc<dyn glidefs::block::cache::BlockCache> =
-        Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-
-    let router2 = Arc::new(
-        ExportRouter::new(RouterConfig {
-            object_store: Arc::clone(&s3),
-            db_path: "cold-wake-router".to_string(),
-            cache_dir: cache_dir2.path().to_path_buf(),
-            block_size: BLOCK_SIZE,
-            clean_cache: clean_cache2,
-            wal_sync: false,
-            max_s3_uploads: 128,
-            max_s3_downloads: 512,
-            default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
-            ublk_nr_queues: 4,
-            nbd_dead_conn_timeout: 0,
-        })
-        .await
-        .expect("router2"),
-    );
-
-    let config2 = ExportConfig {
-        name: "vol1".to_string(),
-        size_gb: DEVICE_SIZE_GB,
-        s3_prefix: None,
-        block_size: None,
-        blocks_per_pack: None,
-        flush_mode: None,
-        transport: None,
-    };
-    router2
-        .create_export(config2, false, Some("vol1"), None)
-        .await
-        .unwrap();
-
-    let handler2 = router2.get_handler("vol1").await.unwrap();
-
-    // Verify all 1024 blocks
-    let mut failures = Vec::new();
-    for block in 0..NUM_BLOCKS {
-        let expected_fill = ((block + 1) % 256) as u8;
-        let offset = block as u64 * BLOCK_SIZE as u64;
-        let data = handler2
-            .read(offset, BLOCK_SIZE as u32)
+        let router1 = Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store: Arc::clone(&s3),
+                db_path: "stress".to_string(),
+                cache_dir: cache_dir1.path().to_path_buf(),
+                block_size: BLOCK_SIZE,
+                clean_cache,
+                wal_sync: false,
+                max_s3_uploads: 128,
+                max_s3_downloads: 512,
+                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                ublk_nr_queues: 4,
+                nbd_dead_conn_timeout: 0,
+            })
             .await
-            .unwrap();
+            .unwrap(),
+        );
 
-        if data[0] != expected_fill || data[BLOCK_SIZE - 1] != expected_fill {
-            failures.push((block, expected_fill, data[0]));
+        let config = ExportConfig {
+            name: "vol1".to_string(),
+            size_gb: DEVICE_SIZE_GB,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router1.create_export(config, false, None, None).await.unwrap();
+
+        let handler = router1.get_handler("vol1").await.unwrap();
+
+        // Concurrent writers: 8 tasks each writing a stripe of blocks with 4K I/Os.
+        // This mimics fio's iodepth=32 sequential write pattern.
+        let blocks_per_writer = NUM_BLOCKS / 8;
+        let mut write_handles = Vec::new();
+        for writer_id in 0..8u64 {
+            let h = Arc::clone(&handler);
+            let start_block = writer_id as usize * blocks_per_writer;
+            let end_block = start_block + blocks_per_writer;
+            write_handles.push(tokio::spawn(async move {
+                for block in start_block..end_block {
+                    let fill = ((block + 1) % 256) as u8;
+                    let sub_data = vec![fill; SUB_BLOCK];
+                    for sub in 0..SUBS_PER_BLOCK {
+                        let offset = block as u64 * BLOCK_SIZE as u64
+                            + sub as u64 * SUB_BLOCK as u64;
+                        h.write(offset, &sub_data, false).await.unwrap();
+                    }
+                }
+            }));
         }
+        for h in write_handles {
+            h.await.unwrap();
+        }
+
+        // Drain to S3
+        router1.drain_export("vol1").await.unwrap();
+        router1.shutdown().await.unwrap();
+        drop(cache_dir1);
+
+        // === Cold wake: new router, fresh cache ===
+        let cache_dir2 = TempDir::new().unwrap();
+        let clean_cache2: Arc<dyn glidefs::block::cache::BlockCache> =
+            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+        let router2 = Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store: Arc::clone(&s3),
+                db_path: "stress".to_string(),
+                cache_dir: cache_dir2.path().to_path_buf(),
+                block_size: BLOCK_SIZE,
+                clean_cache: clean_cache2,
+                wal_sync: false,
+                max_s3_uploads: 128,
+                max_s3_downloads: 512,
+                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                ublk_nr_queues: 4,
+                nbd_dead_conn_timeout: 0,
+            })
+            .await
+            .unwrap(),
+        );
+
+        let config2 = ExportConfig {
+            name: "vol1".to_string(),
+            size_gb: DEVICE_SIZE_GB,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router2.create_export(config2, false, Some("vol1"), None).await.unwrap();
+
+        let handler2 = router2.get_handler("vol1").await.unwrap();
+
+        // Verify all 1024 blocks
+        let mut failures = Vec::new();
+        for block in 0..NUM_BLOCKS {
+            let expected_fill = ((block + 1) % 256) as u8;
+            let offset = block as u64 * BLOCK_SIZE as u64;
+            let data = handler2.read(offset, BLOCK_SIZE as u32).await.unwrap();
+
+            if data[0] != expected_fill || data[BLOCK_SIZE - 1] != expected_fill {
+                failures.push((block, expected_fill, data[0]));
+            }
+        }
+
+        router2.shutdown().await.unwrap();
+
+        assert!(
+            failures.is_empty(),
+            "iteration {iteration}: cold wake corruption — {} blocks wrong.\n\
+             First 10: {:?}",
+            failures.len(),
+            &failures[..std::cmp::min(10, failures.len())],
+        );
     }
-
-    router2.shutdown().await.unwrap();
-
-    assert!(
-        failures.is_empty(),
-        "cold wake via router: {} blocks returned wrong data.\n\
-         First 10 failures: {:?}",
-        failures.len(),
-        &failures[..std::cmp::min(10, failures.len())],
-    );
 }

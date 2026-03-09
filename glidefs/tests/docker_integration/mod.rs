@@ -84,7 +84,7 @@ macro_rules! transport_test {
 
         #[cfg(target_os = "linux")]
         paste::paste! {
-            #[tokio::test]
+            #[tokio::test(flavor = "multi_thread")]
             async fn [< $name _nbd_kernel >]() {
                 if !$crate::nbd_kernel_available() {
                     eprintln!("nbd-kernel: skipping (nbd module not loaded or insufficient privileges)");

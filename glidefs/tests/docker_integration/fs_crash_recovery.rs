@@ -191,7 +191,7 @@ impl NbdKernelDevice {
 
 // Mount ext4, write file, fsync, crash glidefs, restart, e2fsck, verify file.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_fs_crash_fsync_honored_nbd_kernel() {
     if !crate::nbd_kernel_available() || !is_root() {
         eprintln!("skipping: requires nbd module + root");
@@ -284,7 +284,7 @@ async fn test_fs_crash_fsync_honored_nbd_kernel() {
 // Write file A (fsync), write file B (no fsync), crash, verify e2fsck clean.
 // File A must exist. File B may or may not exist, but no corruption.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_fs_crash_unsynced_write_lost_cleanly_nbd_kernel() {
     if !crate::nbd_kernel_available() || !is_root() {
         eprintln!("skipping: requires nbd module + root");
@@ -386,7 +386,7 @@ async fn test_fs_crash_unsynced_write_lost_cleanly_nbd_kernel() {
 
 // Mount with data=journal, write many files, crash mid-write, e2fsck clean.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_fs_crash_journal_replay_nbd_kernel() {
     if !crate::nbd_kernel_available() || !is_root() {
         eprintln!("skipping: requires nbd module + root");
@@ -485,7 +485,7 @@ async fn test_fs_crash_journal_replay_nbd_kernel() {
 
 // Mount, write, crash, recover — 5 cycles. No cumulative corruption.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_fs_repeated_crash_recovery_nbd_kernel() {
     if !crate::nbd_kernel_available() || !is_root() {
         eprintln!("skipping: requires nbd module + root");
@@ -638,7 +638,7 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
 // Write files, trigger drain, crash mid-drain, restart, filesystem intact,
 // re-drain pushes everything to S3.
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_fs_crash_during_flush_to_s3_nbd_kernel() {
     if !crate::nbd_kernel_available() || !is_root() {
         eprintln!("skipping: requires nbd module + root");

@@ -22,7 +22,7 @@ const BLOCK_SIZE: usize = 128 * 1024;
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_nbd_kernel_device_stable_after_crash() {
     use crate::nbd_kernel_client::NbdKernelClient;
 
