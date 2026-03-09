@@ -2035,3 +2035,146 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
         );
     }
 }
+
+// =============================================================================
+// Full chunk cold wake — reproduces fio_verify_after_cold_wake corruption
+// =============================================================================
+
+/// Write every block in a full chunk (1024 blocks at 128KB = 128MB), drain to S3,
+/// cold-restart from manifest, and verify all blocks read back correctly.
+///
+/// This test was added to reproduce a data corruption bug found by
+/// `fio_verify_after_cold_wake`: blocks 960-1023 returned zeros after cold wake.
+/// The test exercises the same path without ublk/fio to isolate whether the bug
+/// is in the core write→flush→manifest→cold-read path.
+#[tokio::test]
+async fn test_full_chunk_cold_wake() {
+    use super::{create_cold_reader, BLOCK_SIZE};
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::content_store::ContentStore;
+    use glidefs::block::metrics::ExportMetrics;
+    use glidefs::block::pack_index_cache::PackIndexCache;
+    use glidefs::block::volume_manifest::VolumeManifest;
+    use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
+
+    // 128MB device = exactly 1 chunk = 1024 blocks at 128KB
+    const FULL_CHUNK_DEVICE_SIZE: u64 = 128 * 1024 * 1024;
+    const NUM_BLOCKS: usize = (FULL_CHUNK_DEVICE_SIZE / BLOCK_SIZE as u64) as usize;
+    assert_eq!(NUM_BLOCKS, 1024);
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    // === Phase 1: Write all 1024 blocks ===
+    let writer_dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: writer_dir.path().to_path_buf(),
+        device_name: "full-chunk".to_string(),
+        device_size: FULL_CHUNK_DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: false,
+    };
+
+    let content_store = ContentStore::new(Arc::clone(&s3), "test");
+    let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(
+        VolumeManifest::new(FULL_CHUNK_DEVICE_SIZE, BLOCK_SIZE as u32),
+    ));
+    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let metrics = Arc::new(ExportMetrics::new());
+
+    let cache = WriteCache::open(config).expect("open cache");
+    let cache = Arc::new(cache.skip_recovery_for_test());
+
+    // Write each block with a unique pattern using 4K sub-block writes (like fio).
+    // Block N gets filled with (N+1) as u8, written in 32 × 4K chunks.
+    const SUB_BLOCK: usize = 4096;
+    const SUBS_PER_BLOCK: usize = BLOCK_SIZE / SUB_BLOCK; // 32
+    for block in 0..NUM_BLOCKS {
+        let fill = ((block + 1) % 256) as u8;
+        let sub_data = vec![fill; SUB_BLOCK];
+        for sub in 0..SUBS_PER_BLOCK {
+            let offset = block as u64 * BLOCK_SIZE as u64 + sub as u64 * SUB_BLOCK as u64;
+            cache
+                .write(offset, &sub_data, clean_cache.as_ref())
+                .unwrap();
+        }
+    }
+
+    // Drain: flush all dirty blocks to S3 + upload manifest
+    loop {
+        let stats = cache
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .await
+            .unwrap();
+        if stats.blocks_claimed == 0 {
+            break;
+        }
+    }
+
+    // Drop writer — only S3 has the data
+    drop(cache);
+    drop(writer_dir);
+
+    // === Phase 2: Cold wake from S3 manifest ===
+    let reader_dir = TempDir::new().unwrap();
+
+    // Fetch manifest from S3
+    let reader_cs = ContentStore::new(Arc::clone(&s3), "test");
+    let manifest_data = reader_cs
+        .get_manifest("full-chunk")
+        .await
+        .expect("get_manifest failed")
+        .expect("manifest not found in S3");
+    let reader_vm = Arc::new(parking_lot::RwLock::new(
+        VolumeManifest::deserialize(&manifest_data).expect("deserialize manifest"),
+    ));
+
+    let reader_config = WriteCacheConfig {
+        cache_dir: reader_dir.path().to_path_buf(),
+        device_name: "full-chunk-reader".to_string(),
+        device_size: FULL_CHUNK_DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: false,
+    };
+
+    let reader_cache = Arc::new(
+        WriteCache::open_fresh_active(reader_config).expect("open fresh cache"),
+    );
+
+    // Fresh pack index cache for the reader (simulates cold start)
+    let reader_pic = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+    let reader_cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let reader_m = Arc::new(ExportMetrics::new());
+
+    // === Phase 3: Verify ALL 1024 blocks ===
+    let mut failures = Vec::new();
+    for block in 0..NUM_BLOCKS {
+        let expected_fill = ((block + 1) % 256) as u8;
+        let offset = block as u64 * BLOCK_SIZE as u64;
+        let data = reader_cache
+            .read(
+                offset,
+                BLOCK_SIZE,
+                reader_cc.as_ref(),
+                &reader_pic,
+                &reader_vm,
+                &reader_cs,
+                &reader_m,
+            )
+            .await
+            .unwrap();
+
+        // Check first and last byte (fast) before doing full comparison
+        if data[0] != expected_fill || data[BLOCK_SIZE - 1] != expected_fill {
+            failures.push((block, expected_fill, data[0]));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "cold wake data corruption: {} blocks returned wrong data.\n\
+         First 10 failures: {:?}",
+        failures.len(),
+        &failures[..std::cmp::min(10, failures.len())],
+    );
+}
