@@ -215,13 +215,43 @@ impl BlockHandler {
                 continue;
             }
 
-            // Check if the block has S3 data that needs preserving.
-            // Fresh blocks (never flushed to S3) have no manifest entry — skip them.
+            // Check if THIS SPECIFIC BLOCK has S3 data that needs preserving.
+            //
+            // Must check per-block, not per-chunk: after the flush scheduler runs,
+            // the chunk has pack_ids for previously-flushed blocks, but THIS block
+            // (which is getting its first write) was never in any pack. A chunk-level
+            // check falsely marks such blocks as partial, causing compute_flush_batch
+            // to skip them (partial blocks are skipped to avoid flushing incomplete
+            // backfill data). Under the right timing, this leads to data loss.
             let has_s3_data = {
-                let vm = self.volume_manifest.read();
-                let chunk_idx = vm.chunk_idx_for_block(block_idx);
-                vm.chunk_pack_ids(chunk_idx)
-                    .map_or(false, |ids| !ids.is_empty())
+                let (_, chunk_offset, pack_ids) = {
+                    let vm = self.volume_manifest.read();
+                    let ci = vm.chunk_idx_for_block(block_idx);
+                    let co = vm.block_offset_in_chunk(block_idx);
+                    let pids = vm
+                        .chunk_pack_ids(ci)
+                        .map(|ids| ids.to_vec())
+                        .unwrap_or_default();
+                    (ci, co, pids)
+                };
+                if pack_ids.is_empty() {
+                    false
+                } else {
+                    // Search packs newest-first for this block's chunk_offset.
+                    let mut found = false;
+                    for &pid in pack_ids.iter().rev() {
+                        if self
+                            .pack_index_cache
+                            .lookup_block(pid, chunk_offset)
+                            .await
+                            .is_some()
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
             };
             if !has_s3_data {
                 continue;
