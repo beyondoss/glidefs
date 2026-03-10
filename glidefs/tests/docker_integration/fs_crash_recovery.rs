@@ -152,13 +152,15 @@ struct NbdKernelDevice {
 #[cfg(target_os = "linux")]
 impl NbdKernelDevice {
     async fn register(
-        cache_dir: &Path,
+        _cache_dir: &Path,
         export_name: &str,
         router: &Arc<glidefs::block::router::ExportRouter>,
         device_size: u64,
     ) -> Self {
-        let mut manager = glidefs::block::nbd::NbdDeviceManager::new()
-            .with_cache_dir(cache_dir.to_path_buf());
+        // Don't use with_cache_dir() here — persisted device indices cause
+        // collisions when multiple crash-recovery tests run in parallel.
+        // Each test auto-assigns a fresh /dev/nbdN index via the kernel.
+        let mut manager = glidefs::block::nbd::NbdDeviceManager::new();
         let dev_path = manager
             .add_device(export_name, Arc::clone(router), device_size)
             .await

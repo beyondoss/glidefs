@@ -487,6 +487,15 @@ impl WriteCache<Active> {
         );
     }
 
+    /// Remove a block from partial tracking (simulates backfill completing).
+    ///
+    /// TEST ONLY — used to reproduce the complete_partial race deterministically.
+    #[cfg(feature = "test-utils")]
+    #[allow(dead_code)]
+    pub fn complete_partial_for_test(&self, block_idx: usize) {
+        self.inner.complete_partial(block_idx);
+    }
+
     /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by
     /// chunk (128 MiB), per-chunk dedup/compress/upload as GLPK v3 packs,
     /// append pack_id to VolumeManifest, CAS SYNCING→CLEAN.
