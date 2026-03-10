@@ -863,7 +863,7 @@ async fn test_fork_during_compaction_sees_consistent_data() {
 
     let fork_handle = tokio::spawn(async move {
         // Simulate fork: load manifest from S3 (may be pre- or post-compaction)
-        let data = cs2
+        let (data, _etag) = cs2
             .get_manifest("vm1")
             .await
             .unwrap()
@@ -2078,7 +2078,7 @@ async fn test_snapshot_manifest_growth() {
     }
 
     // Current manifest size for reference
-    let current = cs
+    let (current, _etag) = cs
         .get_manifest("vm1")
         .await
         .unwrap()

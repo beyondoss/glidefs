@@ -377,7 +377,7 @@ async fn reconcile_prefix(
 
     for name in &manifest_names {
         match content_store.get_manifest(name).await {
-            Ok(Some(data)) => match VolumeManifest::deserialize(&data) {
+            Ok(Some((data, _))) => match VolumeManifest::deserialize(&data) {
                 Ok(vm) => {
                     live_packs.extend(vm.all_pack_ids());
                     stats.manifests_scanned += 1;

@@ -597,7 +597,7 @@ async fn test_s3_download_semaphore_exhaustion() {
             .with_download_semaphore(Arc::new(tokio::sync::Semaphore::new(2))),
     );
 
-    let manifest_bytes = cs
+    let (manifest_bytes, _etag) = cs
         .get_manifest("sem-exhaust")
         .await
         .unwrap()

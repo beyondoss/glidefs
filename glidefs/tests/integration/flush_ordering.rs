@@ -289,7 +289,7 @@ async fn test_flush_concurrent_with_pressure_flush() {
 
     // Verify via cold reader — router stores at "test/exports/vm1"
     let cs = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
-    let manifest_data = cs
+    let (manifest_data, _etag) = cs
         .get_manifest("vm1")
         .await
         .expect("should succeed")

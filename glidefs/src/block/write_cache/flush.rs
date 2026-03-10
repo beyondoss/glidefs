@@ -748,6 +748,10 @@ impl WriteCache<Active> {
     }
 
     /// Upload the VolumeManifest (binary GLVM) to S3.
+    ///
+    /// Uses conditional PUT (`If-Match`) when we have a known ETag, preventing
+    /// a concurrent writer (e.g., another host after failover) from having its
+    /// manifest silently overwritten.
     #[must_use = "manifest sync errors must be handled to avoid orphaned packs"]
     pub async fn sync_manifest(
         &self,
@@ -755,9 +759,15 @@ impl WriteCache<Active> {
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<(), CacheError> {
         let manifest_bytes = volume_manifest.read().serialize();
-        content_store
-            .put_manifest(&self.inner.export_name, manifest_bytes, None)
+        let expected_etag = self.inner.manifest_etag.lock().clone();
+        let new_etag = content_store
+            .put_manifest(
+                &self.inner.export_name,
+                manifest_bytes,
+                expected_etag.as_deref(),
+            )
             .await?;
+        *self.inner.manifest_etag.lock() = new_etag;
         self.checkpoint().await?;
         Ok(())
     }
@@ -781,13 +791,19 @@ impl WriteCache<Active> {
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
             .await?;
         let manifest_bytes = volume_manifest.read().serialize();
+        let expected_etag = self.inner.manifest_etag.lock().clone();
         let mut last_err = None;
         for attempt in 0..3u32 {
             match content_store
-                .put_manifest(&self.inner.export_name, manifest_bytes.clone(), None)
+                .put_manifest(
+                    &self.inner.export_name,
+                    manifest_bytes.clone(),
+                    expected_etag.as_deref(),
+                )
                 .await
             {
-                Ok(_) => {
+                Ok(new_etag) => {
+                    *self.inner.manifest_etag.lock() = new_etag;
                     last_err = None;
                     break;
                 }
@@ -828,9 +844,15 @@ impl WriteCache<Active> {
             .await?;
 
         let manifest_bytes = volume_manifest.read().serialize();
+        let expected_etag = self.inner.manifest_etag.lock().clone();
         let manifest_etag = content_store
-            .put_manifest(&self.inner.export_name, manifest_bytes.clone(), None)
+            .put_manifest(
+                &self.inner.export_name,
+                manifest_bytes.clone(),
+                expected_etag.as_deref(),
+            )
             .await?;
+        *self.inner.manifest_etag.lock() = manifest_etag.clone();
 
         let snapshot_persisted = {
             let mut persisted = false;

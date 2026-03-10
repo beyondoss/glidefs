@@ -158,12 +158,12 @@ impl ContentStore {
         }
     }
 
-    /// Download a manifest from S3. Returns None if not found.
+    /// Download a manifest from S3. Returns `(data, etag)` or None if not found.
     #[instrument(skip(self), fields(name = %name))]
     pub async fn get_manifest(
         &self,
         name: &str,
-    ) -> Result<Option<Vec<u8>>, ContentStoreError> {
+    ) -> Result<Option<(Vec<u8>, Option<String>)>, ContentStoreError> {
         self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, manifest_s3_key(name));
         let path = ObjectPath::from(key);
@@ -171,8 +171,9 @@ impl ContentStore {
         self.record_s3_result(&result);
         match result {
             Ok(response) => {
+                let etag = response.meta.e_tag.clone();
                 let bytes = response.bytes().await?;
-                Ok(Some(bytes.to_vec()))
+                Ok(Some((bytes.to_vec(), etag)))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
@@ -701,7 +702,7 @@ mod tests {
             .await
             .expect("put_manifest should succeed");
 
-        let got = store
+        let (got, _etag) = store
             .get_manifest(name)
             .await
             .expect("get_manifest should succeed")
@@ -889,7 +890,7 @@ mod tests {
             .await
             .expect("put_manifest should succeed");
 
-        let got = store
+        let (got, _etag) = store
             .get_manifest("test-vm")
             .await
             .expect("get_manifest should succeed")

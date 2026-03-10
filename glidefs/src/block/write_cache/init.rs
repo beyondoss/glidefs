@@ -138,6 +138,7 @@ impl WriteCache<Initializing> {
             crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
             partial_blocks,
+            manifest_etag: parking_lot::Mutex::new(None),
         });
 
         info!(
@@ -190,6 +191,7 @@ impl WriteCache<Initializing> {
             crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
             partial_blocks: DashMap::new(),
+            manifest_etag: parking_lot::Mutex::new(None),
         });
 
         info!("cache opened fresh for fork, directly Active");

@@ -130,7 +130,7 @@ pub async fn create_cold_reader(
 
     // Fetch VolumeManifest from S3
     let volume_manifest = match content_store.get_manifest(name).await {
-        Ok(Some(data)) => Arc::new(parking_lot::RwLock::new(
+        Ok(Some((data, _etag))) => Arc::new(parking_lot::RwLock::new(
             VolumeManifest::deserialize(&data).expect("failed to deserialize volume manifest"),
         )),
         Ok(None) => panic!("volume manifest should exist in S3 for cold reader"),

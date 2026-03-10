@@ -241,7 +241,7 @@ async fn create_reader_from_manifest(
     let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
 
     // Fetch VolumeManifest from S3
-    let manifest_bytes = content_store
+    let (manifest_bytes, _etag) = content_store
         .get_manifest(name)
         .await
         .expect("volume manifest fetch failed")

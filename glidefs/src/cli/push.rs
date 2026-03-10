@@ -126,7 +126,7 @@ async fn load_readonly_handler(
     manifest_name: &str,
     label: &str,
 ) -> Result<Arc<BlockHandler>> {
-    let manifest_data = content_store
+    let (manifest_data, _) = content_store
         .get_manifest(manifest_name)
         .await
         .context("failed to fetch manifest from S3")?

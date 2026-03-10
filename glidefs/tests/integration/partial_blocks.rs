@@ -456,7 +456,7 @@ async fn test_partial_block_concurrent_write_same_subregion() {
     cache.write(0, &[0xCC; SUB_BLOCK], cc.as_ref()).unwrap();
 
     // Fetch parent manifest for on-demand read
-    let manifest_data = cs
+    let (manifest_data, _etag) = cs
         .get_manifest("parent2")
         .await
         .unwrap()

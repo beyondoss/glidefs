@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(stats.unique_blocks, 8);
 
         // Load VolumeManifest and verify
-        let manifest_data = cs
+        let (manifest_data, _) = cs
             .get_manifest("bases/test-image")
             .await
             .unwrap()
@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(stats.packs_uploaded, 1);
 
         // Verify VolumeManifest only has 1 chunk entry (chunk 0 with 1 pack)
-        let manifest_data = cs
+        let (manifest_data, _) = cs
             .get_manifest("bases/sparse")
             .await
             .unwrap()
@@ -809,7 +809,7 @@ mod tests {
 
         // The pack should contain only 3 entries (blocks 0 and 2 share a hash,
         // so only the first occurrence is stored)
-        let manifest_data = cs
+        let (manifest_data, _) = cs
             .get_manifest("bases/dedup-test")
             .await
             .unwrap()
@@ -854,7 +854,7 @@ mod tests {
 
         // Verify each base is independently readable
         for (name, image) in [("image-a", &image_a), ("image-b", &image_b)] {
-            let manifest_data = cs
+            let (manifest_data, _) = cs
                 .get_manifest(&format!("bases/{}", name))
                 .await
                 .unwrap()
@@ -907,7 +907,7 @@ mod tests {
 
         bless_bytes(&cs, "lookup-test", &image).await.unwrap();
 
-        let manifest_data = cs
+        let (manifest_data, _) = cs
             .get_manifest("bases/lookup-test")
             .await
             .unwrap()

@@ -76,6 +76,7 @@ async fn flush_and_sync(
                     {
                         Ok(()) => {
                             manifest_synced = true;
+                            metrics.record_manifest_synced();
                             break;
                         }
                         Err(e) => {
@@ -208,6 +209,7 @@ pub async fn flush_scheduler(
                         if result.packs_uploaded > 0 {
                             if result.manifest_synced {
                                 manifest_pending = false;
+                                metrics.set_manifest_pending(false);
                             } else {
                                 // Do NOT checkpoint here. local_checkpoint persists
                                 // block states as CLEAN and truncates the WAL. If the
@@ -217,6 +219,7 @@ pub async fn flush_scheduler(
                                 // checkpoint ticker retries manifest sync and will
                                 // checkpoint after it succeeds.
                                 manifest_pending = true;
+                                metrics.set_manifest_pending(true);
                             }
                         } else {
                             // No packs uploaded — still checkpoint to persist
@@ -260,6 +263,7 @@ pub async fn flush_scheduler(
                             // so the compacted state is persisted to S3.
                             if !compaction_results.is_empty() {
                                 manifest_pending = true;
+                                metrics.set_manifest_pending(true);
                             }
                         }
                         Err(e) => {
@@ -279,6 +283,7 @@ pub async fn flush_scheduler(
                         Ok(()) => {
                             info!("deferred manifest sync succeeded");
                             manifest_pending = false;
+                            metrics.record_manifest_synced();
                         }
                         Err(e) => {
                             metrics.record_manifest_sync_error();
@@ -302,6 +307,7 @@ pub async fn flush_scheduler(
                         ).await
                             && result.packs_uploaded > 0 {
                             manifest_pending = !result.manifest_synced;
+                            metrics.set_manifest_pending(manifest_pending);
                         }
                     }
 

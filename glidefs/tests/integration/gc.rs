@@ -283,7 +283,7 @@ async fn test_gc_fork_then_delete_source() {
         .unwrap();
 
     // Get parent volume manifest bytes
-    let manifest_bytes = cs.get_manifest("parent").await.unwrap().unwrap();
+    let (manifest_bytes, _etag) = cs.get_manifest("parent").await.unwrap().unwrap();
 
     // Copy parent manifest as child manifest (child references same chunks/packs)
     cs.put_manifest("child", manifest_bytes.clone(), None)
