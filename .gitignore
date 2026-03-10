@@ -5,3 +5,5 @@ bench/bench_workspace
 glidefs.toml
 TODO.md
 .claude/settings.local.json
+glidefs/fuzz/corpus
+glidefs/fuzz/artifacts
