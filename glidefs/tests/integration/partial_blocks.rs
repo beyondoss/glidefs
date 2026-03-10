@@ -124,7 +124,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
         cache.write(0, &vec![0xAA; BLOCK_SIZE], cc2.as_ref()).unwrap();
         cache.flush_to_s3(&cs2, &pic2, &vm).await.unwrap();
         let manifest_bytes = vm.read().serialize();
-        cs.put_manifest("parent", manifest_bytes).await.unwrap();
+        cs.put_manifest("parent", manifest_bytes, None).await.unwrap();
         vm
     };
     let parent_manifest = parent_vm.read().clone();
@@ -432,7 +432,7 @@ async fn test_partial_block_concurrent_write_same_subregion() {
             .unwrap();
         cache.flush_to_s3(&cs2, &pic2, &vm).await.unwrap();
         let manifest_bytes = vm.read().serialize();
-        cs.put_manifest("parent2", manifest_bytes).await.unwrap();
+        cs.put_manifest("parent2", manifest_bytes, None).await.unwrap();
     }
 
     // --- Fork child: two writes to same sub-region ---
@@ -456,7 +456,7 @@ async fn test_partial_block_concurrent_write_same_subregion() {
     cache.write(0, &[0xCC; SUB_BLOCK], cc.as_ref()).unwrap();
 
     // Fetch parent manifest for on-demand read
-    let manifest_data = cs
+    let (manifest_data, _etag) = cs
         .get_manifest("parent2")
         .await
         .unwrap()

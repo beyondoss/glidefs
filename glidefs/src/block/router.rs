@@ -719,7 +719,7 @@ impl ExportRouter {
             } else {
                 // Fork from current manifest
                 match content_store.get_manifest(manifest_name).await {
-                    Ok(Some(data)) => VolumeManifest::deserialize(&data)
+                    Ok(Some((data, _etag))) => VolumeManifest::deserialize(&data)
                         .map_err(|e| RouterError::Manifest(format!("failed to deserialize volume manifest: {}", e)))?,
                     Ok(None) => {
                         return Err(RouterError::Manifest(format!(
@@ -787,8 +787,9 @@ impl ExportRouter {
             ));
 
             // Try to load existing volume manifest from S3
-            if let Ok(Some(data)) = content_store.get_manifest(&name).await && let Ok(vm) = VolumeManifest::deserialize(&data) {
+            if let Ok(Some((data, etag))) = content_store.get_manifest(&name).await && let Ok(vm) = VolumeManifest::deserialize(&data) {
                 *volume_manifest.write() = vm;
+                *cache.inner.manifest_etag.lock() = etag;
                 info!("Loaded existing volume manifest for '{}'", name);
             }
 
@@ -966,7 +967,7 @@ impl ExportRouter {
         if let Some(tag) = tag {
             let manifest_bytes = volume_manifest.read().serialize();
             content_store
-                .put_manifest(tag, manifest_bytes)
+                .put_manifest(tag, manifest_bytes, None)
                 .await
                 .map_err(RouterError::ContentStore)?;
             info!("Tagged snapshot of '{}' as '{}'", name, tag);
@@ -995,7 +996,7 @@ impl ExportRouter {
         let manifest_bytes = state.volume_manifest.read().serialize();
         state
             .content_store
-            .put_manifest(tag, manifest_bytes)
+            .put_manifest(tag, manifest_bytes, None)
             .await
             .map_err(RouterError::ContentStore)?;
         info!("Tagged export '{}' as '{}'", name, tag);

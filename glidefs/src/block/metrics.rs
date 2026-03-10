@@ -70,6 +70,12 @@ pub struct ExportMetrics {
     /// Failed manifest syncs after successful pack flush
     pub manifest_sync_errors: AtomicU64,
 
+    /// Whether a manifest sync is pending (packs uploaded but manifest not yet synced)
+    pub manifest_pending: AtomicU64,
+
+    /// Epoch seconds of the last successful manifest sync (0 = never synced)
+    pub manifest_last_sync_epoch: AtomicU64,
+
     /// Recovery issues (WAL replay failure, block map load failure)
     pub recovery_warnings: AtomicU64,
 
@@ -263,6 +269,8 @@ impl Default for ExportMetrics {
             flush_blocks_cas_failed: AtomicU64::new(0),
             flush_blocks_corrupted: AtomicU64::new(0),
             manifest_sync_errors: AtomicU64::new(0),
+            manifest_pending: AtomicU64::new(0),
+            manifest_last_sync_epoch: AtomicU64::new(0),
             recovery_warnings: AtomicU64::new(0),
             read_latencies: SampledHistogram::new(),
             write_latencies: SampledHistogram::new(),
@@ -404,6 +412,25 @@ impl ExportMetrics {
         self.manifest_sync_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Mark manifest sync as pending (packs uploaded, manifest not yet synced).
+    #[inline]
+    pub fn set_manifest_pending(&self, pending: bool) {
+        self.manifest_pending
+            .store(u64::from(pending), Ordering::Relaxed);
+    }
+
+    /// Record a successful manifest sync.
+    #[inline]
+    pub fn record_manifest_synced(&self) {
+        self.manifest_pending.store(0, Ordering::Relaxed);
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.manifest_last_sync_epoch
+            .store(epoch, Ordering::Relaxed);
+    }
+
     /// Record a recovery warning (WAL replay failure, block map load failure).
     #[inline]
     pub fn record_recovery_warning(&self) {
@@ -472,6 +499,8 @@ impl ExportMetrics {
             flush_blocks_cas_failed: self.flush_blocks_cas_failed.load(Ordering::Relaxed),
             flush_blocks_corrupted: self.flush_blocks_corrupted.load(Ordering::Relaxed),
             manifest_sync_errors: self.manifest_sync_errors.load(Ordering::Relaxed),
+            manifest_pending: self.manifest_pending.load(Ordering::Relaxed) != 0,
+            manifest_last_sync_epoch: self.manifest_last_sync_epoch.load(Ordering::Relaxed),
             recovery_warnings: self.recovery_warnings.load(Ordering::Relaxed),
             dirty_blocks: None,
             syncing_blocks: None,
@@ -509,6 +538,10 @@ pub struct MetricsSnapshot {
     pub flush_blocks_cas_failed: u64,
     pub flush_blocks_corrupted: u64,
     pub manifest_sync_errors: u64,
+    /// Whether a manifest sync is pending (packs on S3 but manifest not yet updated)
+    pub manifest_pending: bool,
+    /// Epoch seconds of the last successful manifest sync (0 = never synced)
+    pub manifest_last_sync_epoch: u64,
     pub recovery_warnings: u64,
 
     // Cache state (populated by router)
@@ -593,6 +626,8 @@ impl MetricsSnapshot {
         let _ = writeln!(out, "glidefs_flush_blocks_cas_failed_total{{{label}}} {}", self.flush_blocks_cas_failed);
         let _ = writeln!(out, "glidefs_flush_blocks_corrupted_total{{{label}}} {}", self.flush_blocks_corrupted);
         let _ = writeln!(out, "glidefs_manifest_sync_errors_total{{{label}}} {}", self.manifest_sync_errors);
+        let _ = writeln!(out, "glidefs_manifest_pending{{{label}}} {}", u64::from(self.manifest_pending));
+        let _ = writeln!(out, "glidefs_manifest_last_sync_epoch{{{label}}} {}", self.manifest_last_sync_epoch);
         let _ = writeln!(out, "glidefs_recovery_warnings_total{{{label}}} {}", self.recovery_warnings);
 
         // Cache state (gauges)
@@ -715,6 +750,10 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_flush_blocks_corrupted_total counter
 # HELP glidefs_manifest_sync_errors_total Failed manifest syncs after successful pack flush
 # TYPE glidefs_manifest_sync_errors_total counter
+# HELP glidefs_manifest_pending Whether packs exist on S3 not yet referenced by manifest
+# TYPE glidefs_manifest_pending gauge
+# HELP glidefs_manifest_last_sync_epoch Unix timestamp of last successful manifest sync
+# TYPE glidefs_manifest_last_sync_epoch gauge
 # HELP glidefs_recovery_warnings_total Recovery issues (WAL replay failure, block map load failure)
 # TYPE glidefs_recovery_warnings_total counter
 # HELP glidefs_read_latency_seconds NBD read operation latency

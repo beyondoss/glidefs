@@ -154,7 +154,7 @@ pub async fn run_bless(
     // --- Upload manifest ---
     let manifest_key = format!("bases/{}", name);
     content_store
-        .put_manifest(&manifest_key, volume_manifest.serialize())
+        .put_manifest(&manifest_key, volume_manifest.serialize(), None)
         .await
         .context("Failed to upload manifest")?;
 
@@ -391,7 +391,7 @@ pub async fn run_bless_oci(
     let manifest_key = format!("bases/{}", name);
     let manifest_data = volume_manifest.read().serialize();
     content_store
-        .put_manifest(&manifest_key, manifest_data)
+        .put_manifest(&manifest_key, manifest_data, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
 
@@ -601,7 +601,7 @@ mod tests {
         join_upload(&mut volume_manifest, &mut stats, in_flight).await?;
 
         content_store
-            .put_manifest(&format!("bases/{}", name), volume_manifest.serialize())
+            .put_manifest(&format!("bases/{}", name), volume_manifest.serialize(), None)
             .await?;
 
         let hot_set_data = serialize_hot_set(&hot_set_indices);
@@ -664,7 +664,7 @@ mod tests {
         assert_eq!(stats.unique_blocks, 8);
 
         // Load VolumeManifest and verify
-        let manifest_data = cs
+        let (manifest_data, _) = cs
             .get_manifest("bases/test-image")
             .await
             .unwrap()
@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(stats.packs_uploaded, 1);
 
         // Verify VolumeManifest only has 1 chunk entry (chunk 0 with 1 pack)
-        let manifest_data = cs
+        let (manifest_data, _) = cs
             .get_manifest("bases/sparse")
             .await
             .unwrap()
@@ -809,7 +809,7 @@ mod tests {
 
         // The pack should contain only 3 entries (blocks 0 and 2 share a hash,
         // so only the first occurrence is stored)
-        let manifest_data = cs
+        let (manifest_data, _) = cs
             .get_manifest("bases/dedup-test")
             .await
             .unwrap()
@@ -854,7 +854,7 @@ mod tests {
 
         // Verify each base is independently readable
         for (name, image) in [("image-a", &image_a), ("image-b", &image_b)] {
-            let manifest_data = cs
+            let (manifest_data, _) = cs
                 .get_manifest(&format!("bases/{}", name))
                 .await
                 .unwrap()
@@ -907,7 +907,7 @@ mod tests {
 
         bless_bytes(&cs, "lookup-test", &image).await.unwrap();
 
-        let manifest_data = cs
+        let (manifest_data, _) = cs
             .get_manifest("bases/lookup-test")
             .await
             .unwrap()

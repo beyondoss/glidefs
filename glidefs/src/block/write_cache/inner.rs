@@ -310,6 +310,14 @@ pub(crate) struct CacheInner {
     /// last-writer-wins on S3 can overwrite a correct manifest with a stale one.
     pub(crate) flush_lock: tokio::sync::Mutex<()>,
 
+    /// Last known S3 ETag of the manifest for this export.
+    ///
+    /// Used for conditional PUT (`If-Match`) to prevent overwriting a manifest
+    /// that was modified concurrently (e.g., by another host after failover).
+    /// Seeded on manifest load, updated after every successful `put_manifest`.
+    /// `None` means first upload (unconditional PUT).
+    pub(crate) manifest_etag: Mutex<Option<String>>,
+
     /// Partial block tracking for async sub-block backfill.
     ///
     /// Maps block_index → partial block state (bitmap + write lock). A set bit

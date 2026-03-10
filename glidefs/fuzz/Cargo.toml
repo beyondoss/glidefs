@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 deku = "0.20"
+tempfile = "3"
 
 [dependencies.glidefs]
 path = ".."
@@ -44,6 +45,41 @@ bench = false
 [[bin]]
 name = "fuzz_protocol_sequence"
 path = "fuzz_targets/fuzz_protocol_sequence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pack_index"
+path = "fuzz_targets/fuzz_pack_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wal"
+path = "fuzz_targets/fuzz_wal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_volume_manifest"
+path = "fuzz_targets/fuzz_volume_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_hot_set"
+path = "fuzz_targets/fuzz_hot_set.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_lz4_decompress"
+path = "fuzz_targets/fuzz_lz4_decompress.rs"
 test = false
 doc = false
 bench = false

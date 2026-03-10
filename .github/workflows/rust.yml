@@ -148,3 +148,36 @@ jobs:
       - name: Kernel logs (on failure)
         if: failure()
         run: sudo dmesg --color=never | tail -200
+
+  fuzz:
+    name: Fuzz Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: glidefs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "glidefs -> target"
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz WAL replay
+        run: cargo fuzz run fuzz_wal -- -max_total_time=30
+      - name: Fuzz pack index
+        run: cargo fuzz run fuzz_pack_index -- -max_total_time=30
+      - name: Fuzz NBD request parsing
+        run: cargo fuzz run fuzz_nbd_request -- -max_total_time=30
+      - name: Fuzz NBD protocol sequence
+        run: cargo fuzz run fuzz_protocol_sequence -- -max_total_time=30
+      - name: Fuzz NBD client flags
+        run: cargo fuzz run fuzz_nbd_client_flags -- -max_total_time=30
+      - name: Fuzz NBD option header
+        run: cargo fuzz run fuzz_nbd_option_header -- -max_total_time=30
+      - name: Fuzz volume manifest
+        run: cargo fuzz run fuzz_volume_manifest -- -max_total_time=30
+      - name: Fuzz hot set
+        run: cargo fuzz run fuzz_hot_set -- -max_total_time=30
+      - name: Fuzz LZ4 decompress
+        run: cargo fuzz run fuzz_lz4_decompress -- -max_total_time=30

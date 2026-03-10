@@ -283,10 +283,10 @@ async fn test_gc_fork_then_delete_source() {
         .unwrap();
 
     // Get parent volume manifest bytes
-    let manifest_bytes = cs.get_manifest("parent").await.unwrap().unwrap();
+    let (manifest_bytes, _etag) = cs.get_manifest("parent").await.unwrap().unwrap();
 
     // Copy parent manifest as child manifest (child references same chunks/packs)
-    cs.put_manifest("child", manifest_bytes.clone())
+    cs.put_manifest("child", manifest_bytes.clone(), None)
         .await
         .unwrap();
 
@@ -326,7 +326,7 @@ async fn test_gc_manifest_parse_error() {
         .unwrap();
 
     // Write a corrupt manifest for another "VM"
-    cs.put_manifest("vm-corrupt", b"not a valid manifest".to_vec())
+    cs.put_manifest("vm-corrupt", b"not a valid manifest".to_vec(), None)
         .await
         .unwrap();
 

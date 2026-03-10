@@ -885,7 +885,11 @@ impl WriteCache<Active> {
                 .push((idx, hash, offset, comp_len));
         }
 
-        // Fetch each group (potentially in parallel)
+        // Fetch each group (potentially in parallel).
+        //
+        // Within each group, blocks are coalesced into a single range request
+        // when they are densely packed. Sparse groups (gap > data) are fetched
+        // individually to avoid wasting bandwidth.
         let mut group_futures = Vec::new();
         for ((chunk_idx, pack_id), mut blocks) in groups {
             let cs = content_store;
@@ -894,9 +898,53 @@ impl WriteCache<Active> {
                 // Sort by pack_offset for contiguous range
                 blocks.sort_by_key(|&(_, _, offset, _)| offset);
 
+                // Determine fetch strategy based on block density.
                 let range_start = blocks.first().unwrap().2;
                 let last = blocks.last().unwrap();
                 let range_end = last.2 + last.3;
+                let span = (range_end - range_start) as u64;
+                let total_data: u64 = blocks.iter().map(|&(_, _, _, cl)| cl as u64).sum();
+                let gap = span - total_data;
+
+                // Sparse or single block — fetch each block individually.
+                if blocks.len() == 1 || gap > total_data {
+                    let mut results: Vec<(usize, Bytes)> =
+                        Vec::with_capacity(blocks.len());
+                    for (idx, expected_hash, offset, comp_len) in blocks {
+                        let fetch_start = std::time::Instant::now();
+                        let compressed = match cs
+                            .get_chunk_block(chunk_idx, pack_id, offset, comp_len)
+                            .await
+                        {
+                            Ok(data) => data,
+                            Err(e) => {
+                                if let Some(m) = metrics {
+                                    m.record_s3_get_error();
+                                }
+                                return Err(CacheError::from(e));
+                            }
+                        };
+                        if let Some(m) = metrics {
+                            m.record_s3_read(compressed.len() as u64);
+                            m.record_s3_fetch_latency(fetch_start.elapsed());
+                        }
+                        let decompressed = lz4_decompress(&compressed)
+                            .map_err(|e| CacheError::DecompressFailed(e.to_string()))?;
+                        let actual_hash = blake3_128(&decompressed);
+                        if actual_hash != expected_hash {
+                            return Err(CacheError::HashMismatch {
+                                expected: format!("{:?}", expected_hash),
+                                actual: format!("{:?}", actual_hash),
+                            });
+                        }
+                        let data = Bytes::from(decompressed);
+                        cc.insert(expected_hash, data.clone());
+                        results.push((idx, data));
+                    }
+                    return Ok(results);
+                }
+
+                // Dense — coalesce into a single range request.
                 let range_len = range_end - range_start;
 
                 let fetch_start = std::time::Instant::now();

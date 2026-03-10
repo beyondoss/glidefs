@@ -709,7 +709,7 @@ async fn test_pack_index_corruption_returns_error() {
     let reader_cs = ContentStore::new(Arc::clone(&s3) as _, "test");
 
     // Fetch the manifest to get the VolumeManifest
-    let manifest_data = reader_cs
+    let (manifest_data, _etag) = reader_cs
         .get_manifest("idx-corrupt")
         .await
         .unwrap()
@@ -1071,7 +1071,7 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     // Upload manifest so GC can read it
     {
         let manifest_bytes = vm.read().serialize();
-        cs.put_manifest("orphan-gc", manifest_bytes).await.unwrap();
+        cs.put_manifest("orphan-gc", manifest_bytes, None).await.unwrap();
     }
 
     // Second compaction with SAME stale pack_ids — CAS fails because
@@ -2120,7 +2120,7 @@ async fn test_full_chunk_cold_wake() {
 
     // Fetch manifest from S3
     let reader_cs = ContentStore::new(Arc::clone(&s3), "test");
-    let manifest_data = reader_cs
+    let (manifest_data, _etag) = reader_cs
         .get_manifest("full-chunk")
         .await
         .expect("get_manifest failed")

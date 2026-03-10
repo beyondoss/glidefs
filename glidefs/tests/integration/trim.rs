@@ -87,7 +87,7 @@ async fn test_trim_then_flush_to_s3() {
 
         // Save manifest
         let manifest_bytes = vm.read().serialize();
-        cs.put_manifest("trim-flush", manifest_bytes).await.unwrap();
+        cs.put_manifest("trim-flush", manifest_bytes, None).await.unwrap();
     }
 
     // Cold reader: must see zeros (tombstone overrides the earlier 0xBB pack)
@@ -129,7 +129,7 @@ async fn test_trim_fork_semantics() {
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
         let manifest_bytes = vm.read().serialize();
-        cs.put_manifest("trim-fork-parent", manifest_bytes)
+        cs.put_manifest("trim-fork-parent", manifest_bytes, None)
             .await
             .unwrap();
         vm.read().clone()
@@ -167,7 +167,7 @@ async fn test_trim_fork_semantics() {
         // Flush child to S3 with tombstone
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
         let manifest_bytes = vm.read().serialize();
-        cs.put_manifest("trim-fork-child", manifest_bytes)
+        cs.put_manifest("trim-fork-child", manifest_bytes, None)
             .await
             .unwrap();
     }

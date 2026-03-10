@@ -191,7 +191,7 @@ async fn test_pressure_flush_syncs_manifest() {
     // Verify manifest exists in S3 with chunk references.
     // Router's ContentStore base path is "{db_path}/exports/{export_name}".
     let cs = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
-    let manifest_data = cs
+    let (manifest_data, _etag) = cs
         .get_manifest("vm1")
         .await
         .expect("should succeed")
@@ -251,7 +251,7 @@ async fn test_pressure_flush_concurrent_with_drain() {
     // Router's ContentStore base path is "{db_path}/exports/{export_name}".
     let reader_dir = TempDir::new().unwrap();
     let cs = ContentStore::new(Arc::clone(&s3), "test/exports/vm1");
-    let manifest_data = cs
+    let (manifest_data, _etag) = cs
         .get_manifest("vm1")
         .await
         .expect("should succeed")
@@ -423,7 +423,7 @@ async fn test_drain_all_returns_errors_on_s3_failure() {
     // Verify data integrity from a cold reader for both exports
     for name in &["vm1", "vm2"] {
         let cs = ContentStore::new(Arc::clone(&s3) as _, &format!("test/exports/{name}"));
-        let manifest_data = cs
+        let (manifest_data, _etag) = cs
             .get_manifest(name)
             .await
             .expect("should succeed")

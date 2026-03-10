@@ -88,7 +88,7 @@ loom = "0.7"
 
 [lints.rust]
 # Allow loom and ublk cfg flags
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(tokio_unstable)'] }
 
 [lints.clippy]
 # Real bugs — deny in CI

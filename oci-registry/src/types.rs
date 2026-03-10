@@ -1,6 +1,6 @@
 pub use oci_client::manifest::{OciDescriptor, OciImageIndex, OciImageManifest};
 pub use oci_client::Reference;
-pub use oci_spec::image::{Arch, Os};
+pub use oci_client::config::{Architecture as Arch, Os};
 
 /// Credentials for registry authentication.
 #[derive(Clone, Debug)]
