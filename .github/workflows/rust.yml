@@ -175,3 +175,9 @@ jobs:
         run: cargo fuzz run fuzz_nbd_client_flags -- -max_total_time=30
       - name: Fuzz NBD option header
         run: cargo fuzz run fuzz_nbd_option_header -- -max_total_time=30
+      - name: Fuzz volume manifest
+        run: cargo fuzz run fuzz_volume_manifest -- -max_total_time=30
+      - name: Fuzz hot set
+        run: cargo fuzz run fuzz_hot_set -- -max_total_time=30
+      - name: Fuzz LZ4 decompress
+        run: cargo fuzz run fuzz_lz4_decompress -- -max_total_time=30

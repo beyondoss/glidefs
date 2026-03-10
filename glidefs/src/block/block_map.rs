@@ -742,10 +742,28 @@ pub fn lz4_compress(data: &[u8]) -> Vec<u8> {
 }
 
 /// Decompress LZ4 data (expects size-prepended format from `lz4_compress`).
+///
+/// Validates that the claimed uncompressed size does not exceed `MAX_DECOMPRESSED_SIZE`
+/// (2 MB) before allocating — a corrupted or adversarial size prefix cannot OOM the process.
 #[inline]
 pub fn lz4_decompress(
     compressed: &[u8],
 ) -> Result<Vec<u8>, lz4_flex::block::DecompressError> {
+    // The first 4 bytes are the little-endian uncompressed size.
+    // Max legitimate block is 1 MB; allow 2× headroom.
+    const MAX_DECOMPRESSED_SIZE: u32 = 2 * 1024 * 1024;
+
+    if compressed.len() < 4 {
+        return Err(lz4_flex::block::DecompressError::ExpectedAnotherByte);
+    }
+    let claimed_size =
+        u32::from_le_bytes(compressed[..4].try_into().unwrap());
+    if claimed_size > MAX_DECOMPRESSED_SIZE {
+        return Err(lz4_flex::block::DecompressError::OutputTooSmall {
+            expected: claimed_size as usize,
+            actual: MAX_DECOMPRESSED_SIZE as usize,
+        });
+    }
     lz4_flex::decompress_size_prepended(compressed)
 }
 
