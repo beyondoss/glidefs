@@ -526,7 +526,7 @@ async fn test_manifest_consistency_after_partial_drain() {
         // Save manifest
         let vm = volume_manifest.read().clone();
         content_store
-            .put_manifest("partial_drain", vm.serialize())
+            .put_manifest("partial_drain", vm.serialize(), None)
             .await
             .unwrap();
     }

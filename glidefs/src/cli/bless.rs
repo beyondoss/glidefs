@@ -154,7 +154,7 @@ pub async fn run_bless(
     // --- Upload manifest ---
     let manifest_key = format!("bases/{}", name);
     content_store
-        .put_manifest(&manifest_key, volume_manifest.serialize())
+        .put_manifest(&manifest_key, volume_manifest.serialize(), None)
         .await
         .context("Failed to upload manifest")?;
 
@@ -391,7 +391,7 @@ pub async fn run_bless_oci(
     let manifest_key = format!("bases/{}", name);
     let manifest_data = volume_manifest.read().serialize();
     content_store
-        .put_manifest(&manifest_key, manifest_data)
+        .put_manifest(&manifest_key, manifest_data, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
 
@@ -601,7 +601,7 @@ mod tests {
         join_upload(&mut volume_manifest, &mut stats, in_flight).await?;
 
         content_store
-            .put_manifest(&format!("bases/{}", name), volume_manifest.serialize())
+            .put_manifest(&format!("bases/{}", name), volume_manifest.serialize(), None)
             .await?;
 
         let hot_set_data = serialize_hot_set(&hot_set_indices);

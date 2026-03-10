@@ -966,7 +966,7 @@ impl ExportRouter {
         if let Some(tag) = tag {
             let manifest_bytes = volume_manifest.read().serialize();
             content_store
-                .put_manifest(tag, manifest_bytes)
+                .put_manifest(tag, manifest_bytes, None)
                 .await
                 .map_err(RouterError::ContentStore)?;
             info!("Tagged snapshot of '{}' as '{}'", name, tag);
@@ -995,7 +995,7 @@ impl ExportRouter {
         let manifest_bytes = state.volume_manifest.read().serialize();
         state
             .content_store
-            .put_manifest(tag, manifest_bytes)
+            .put_manifest(tag, manifest_bytes, None)
             .await
             .map_err(RouterError::ContentStore)?;
         info!("Tagged export '{}' as '{}'", name, tag);

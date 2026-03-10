@@ -756,7 +756,7 @@ impl WriteCache<Active> {
     ) -> Result<(), CacheError> {
         let manifest_bytes = volume_manifest.read().serialize();
         content_store
-            .put_manifest(&self.inner.export_name, manifest_bytes)
+            .put_manifest(&self.inner.export_name, manifest_bytes, None)
             .await?;
         self.checkpoint().await?;
         Ok(())
@@ -784,7 +784,7 @@ impl WriteCache<Active> {
         let mut last_err = None;
         for attempt in 0..3u32 {
             match content_store
-                .put_manifest(&self.inner.export_name, manifest_bytes.clone())
+                .put_manifest(&self.inner.export_name, manifest_bytes.clone(), None)
                 .await
             {
                 Ok(_) => {
@@ -829,7 +829,7 @@ impl WriteCache<Active> {
 
         let manifest_bytes = volume_manifest.read().serialize();
         let manifest_etag = content_store
-            .put_manifest(&self.inner.export_name, manifest_bytes.clone())
+            .put_manifest(&self.inner.export_name, manifest_bytes.clone(), None)
             .await?;
 
         let snapshot_persisted = {

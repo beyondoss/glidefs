@@ -6,7 +6,7 @@
 use crate::circuit_breaker::CircuitBreaker;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{GetOptions, GetRange, ObjectStore, PutMultipartOptions, PutPayload, WriteMultipart};
+use object_store::{GetOptions, GetRange, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, UpdateVersion, WriteMultipart};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -114,17 +114,29 @@ impl ContentStore {
     }
 
     /// Upload a manifest to S3. Returns the S3 ETag if the backend provides one.
+    ///
+    /// When `expected_etag` is `Some`, uses a conditional PUT (`If-Match`) to
+    /// prevent overwriting a manifest that was modified concurrently. Returns
+    /// [`ContentStoreError::PreconditionFailed`] on ETag mismatch.
     #[instrument(skip(self, data), fields(name = %name, size = data.len()))]
     pub async fn put_manifest(
         &self,
         name: &str,
         data: Vec<u8>,
+        expected_etag: Option<&str>,
     ) -> Result<Option<String>, ContentStoreError> {
         self.check_circuit()?;
         let key = format!("{}/{}", self.base_path, manifest_s3_key(name));
         let path = ObjectPath::from(key);
         let payload = PutPayload::from(data);
-        let result = self.object_store.put(&path, payload).await;
+        let opts = match expected_etag {
+            Some(etag) => PutOptions::from(PutMode::Update(UpdateVersion {
+                e_tag: Some(etag.to_string()),
+                version: None,
+            })),
+            None => PutOptions::default(),
+        };
+        let result = self.object_store.put_opts(&path, payload, opts).await;
         self.record_s3_result(&result);
         let put_result = result?;
         debug!("uploaded manifest");
@@ -549,11 +561,15 @@ impl ContentStore {
         self.get_range_from_key(&key, offset, comp_length).await
     }
 
-    /// Fetch the GLPK v3 pack index from S3 via suffix read.
+    /// Fetch the GLPK v3 pack index from S3 via adaptive suffix read.
     ///
-    /// Reads the last `MAX_INDEX_SIZE + TRAILER_SIZE` bytes from the pack,
-    /// then `parse_pack_index` locates the GLIX trailer and parses the
-    /// preceding index entries.
+    /// Uses a two-phase strategy to minimize bandwidth:
+    /// 1. Small suffix read (16 KB) — covers typical packs (≤500 blocks).
+    /// 2. If the pack has more blocks than the initial suffix can hold, a
+    ///    precise second read fetches exactly the remaining index bytes.
+    ///
+    /// For the common case (≤500 blocks, ~14 KB index), this transfers ~16 KB
+    /// instead of the previous fixed 896 KB — a ~56× reduction.
     ///
     /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
     #[instrument(skip(self), fields(chunk_idx, pack_id))]
@@ -564,21 +580,61 @@ impl ContentStore {
     ) -> Result<Vec<super::pack::PackIndexEntry>, ContentStoreError> {
         use super::pack::{PACK_INDEX_ENTRY_SIZE, TRAILER_SIZE, parse_pack_index};
 
-        // Maximum blocks per chunk: chunk_size / min_block_size = 128 MiB / 4 KB = 32768.
-        // block_size is configurable (4KB–1MB) so we must size the suffix read for the
-        // worst case, not just the default (128KB → 1024 blocks). With 32768 entries at
-        // 28 bytes each + 8 byte trailer, the suffix read is ~896 KB — negligible for S3.
-        const MIN_BLOCK_SIZE: usize = 4096;
-        const MAX_BLOCKS: usize =
-            super::volume_manifest::DEFAULT_CHUNK_SIZE as usize / MIN_BLOCK_SIZE;
-        const MAX_SUFFIX: u64 = (MAX_BLOCKS * PACK_INDEX_ENTRY_SIZE + TRAILER_SIZE) as u64;
-
         let key = format!(
             "{}/chunks/{:04}/{:016x}.pack",
             self.base_path, chunk_idx, pack_id
         );
 
-        let data = self.get_suffix_from_key(&key, MAX_SUFFIX).await?;
+        // Phase 1: small suffix read sized for typical packs (≤500 blocks).
+        // 500 × 28 + 8 = 14,008 bytes. Round up to 16 KB for alignment.
+        const INITIAL_SUFFIX: u64 = 16 * 1024;
+
+        let data = self.get_suffix_from_key(&key, INITIAL_SUFFIX).await?;
+
+        match parse_pack_index(&data) {
+            Ok(index) => return Ok(index.entries),
+            Err(e) => {
+                // Check if this is a "suffix too small" error (pack has more
+                // blocks than our initial read covered). Any other parse error
+                // is a real failure.
+                let msg = e.to_string();
+                if !msg.contains("suffix too small") {
+                    return Err(ContentStoreError::ObjectStore(
+                        object_store::Error::Generic {
+                            store: "pack-index",
+                            source: Box::new(e),
+                        },
+                    ));
+                }
+            }
+        }
+
+        // Phase 2: we know the trailer is in `data`, so extract block_count
+        // from the last 8 bytes and do a precise suffix read.
+        if data.len() < TRAILER_SIZE {
+            return Err(ContentStoreError::ObjectStore(
+                object_store::Error::Generic {
+                    store: "pack-index",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "suffix too small for trailer",
+                    )),
+                },
+            ));
+        }
+        let trailer_start = data.len() - TRAILER_SIZE;
+        let block_count =
+            u16::from_le_bytes([data[trailer_start], data[trailer_start + 1]]) as u64;
+        let precise_suffix =
+            block_count * PACK_INDEX_ENTRY_SIZE as u64 + TRAILER_SIZE as u64;
+
+        debug!(
+            block_count,
+            precise_suffix,
+            "pack index exceeded initial suffix, fetching precise size"
+        );
+
+        let data = self.get_suffix_from_key(&key, precise_suffix).await?;
 
         let index = parse_pack_index(&data).map_err(|e| {
             ContentStoreError::ObjectStore(object_store::Error::Generic {
@@ -641,7 +697,7 @@ mod tests {
         let data = b"serialized manifest bytes".to_vec();
 
         store
-            .put_manifest(name, data.clone())
+            .put_manifest(name, data.clone(), None)
             .await
             .expect("put_manifest should succeed");
 
@@ -690,7 +746,7 @@ mod tests {
         let err = store.get_manifest("test").await.unwrap_err();
         assert!(matches!(err, ContentStoreError::CircuitOpen), "get_manifest should fail: {err}");
 
-        let err = store.put_manifest("test", vec![1]).await.unwrap_err();
+        let err = store.put_manifest("test", vec![1], None).await.unwrap_err();
         assert!(matches!(err, ContentStoreError::CircuitOpen), "put_manifest should fail: {err}");
 
         let err = store.get_chunk_block(0, 1234u64, 0, 10).await.unwrap_err();
@@ -712,7 +768,7 @@ mod tests {
         let store = ContentStore::new(object_store, "test-bucket").with_circuit_breaker(Arc::clone(&cb));
 
         // Successful operation should record success
-        store.put_manifest("test", vec![1, 2, 3]).await.unwrap();
+        store.put_manifest("test", vec![1, 2, 3], None).await.unwrap();
         let _ = store.get_manifest("test").await.unwrap();
 
         // CB should still be closed
@@ -829,7 +885,7 @@ mod tests {
         let data = b"binary manifest data".to_vec();
 
         store
-            .put_manifest("test-vm", data.clone())
+            .put_manifest("test-vm", data.clone(), None)
             .await
             .expect("put_manifest should succeed");
 
