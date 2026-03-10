@@ -2763,7 +2763,6 @@ dependencies = [
  "bytes",
  "futures",
  "oci-client",
- "oci-spec",
  "openssl",
  "thiserror 2.0.18",
  "tokio",
