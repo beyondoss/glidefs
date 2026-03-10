@@ -311,6 +311,12 @@ impl NbdDeviceManager {
         let _ = std_stream.into_raw_fd();
 
         let dev_path = PathBuf::from(format!("/dev/nbd{dev_index}"));
+
+        // After a crash, a lazy-unmounted filesystem may still be tearing
+        // down (aborting journal, writing superblock) on this device. Wait
+        // for the previous mount to fully release before returning —
+        // otherwise callers like e2fsck will see "device in use".
+        wait_for_device_exclusive(&dev_path).await;
         info!(
             export = %export_name,
             path = %dev_path.display(),
@@ -444,6 +450,48 @@ impl NbdDeviceManager {
 fn is_nbd_device_alive(index: i32) -> bool {
     let pid_path = format!("/sys/block/nbd{index}/pid");
     std::path::Path::new(&pid_path).exists()
+}
+
+/// Wait until no filesystem or other subsystem holds the block device exclusively.
+///
+/// After a crash, the kernel may still be tearing down a lazy-unmounted
+/// filesystem (aborting journal, writing superblock) on this block device.
+/// Tools like `e2fsck` and `mount` open the device with `O_EXCL` and fail
+/// with "device in use" if the old teardown hasn't finished.
+///
+/// Lazy unmount (`umount -l`) removes the mountpoint from the namespace
+/// immediately but the filesystem keeps an exclusive claim on the block
+/// device until teardown completes. `/proc/mounts` won't show it, so we
+/// probe with `O_EXCL` directly — the same check callers will perform.
+async fn wait_for_device_exclusive(dev_path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let start = std::time::Instant::now();
+    loop {
+        // O_EXCL on a block device claims exclusive access via the kernel's
+        // bd_claim path. If another subsystem (ext4 teardown) still holds
+        // it, open fails with EBUSY.
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EXCL)
+            .open(dev_path)
+        {
+            Ok(_) => return, // got exclusive access — device is free
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(_) => return, // unexpected error — skip wait
+        }
+        if start.elapsed() >= MAX_WAIT {
+            warn!(
+                dev = %dev_path.display(),
+                "timed out waiting for previous filesystem teardown to finish"
+            );
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Client-side NBD handshake over a connected stream.
