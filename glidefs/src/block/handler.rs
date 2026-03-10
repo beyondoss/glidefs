@@ -224,7 +224,7 @@ impl BlockHandler {
             // to skip them (partial blocks are skipped to avoid flushing incomplete
             // backfill data). Under the right timing, this leads to data loss.
             let has_s3_data = {
-                let (_, chunk_offset, pack_ids) = {
+                let (chunk_idx, chunk_offset, pack_ids) = {
                     let vm = self.volume_manifest.read();
                     let ci = vm.chunk_idx_for_block(block_idx);
                     let co = vm.block_offset_in_chunk(block_idx);
@@ -237,6 +237,25 @@ impl BlockHandler {
                 if pack_ids.is_empty() {
                     false
                 } else {
+                    // Ensure pack indices are loaded into cache (they may not be
+                    // if this is a forked export and no reads have happened yet).
+                    for &pid in &pack_ids {
+                        if self.pack_index_cache.get_entries(pid).await.is_none() {
+                            match self.content_store.get_pack_index(chunk_idx, pid).await {
+                                Ok(entries) => {
+                                    self.pack_index_cache.insert_entries(pid, &entries);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        pack_id = pid,
+                                        error = %e,
+                                        "failed to fetch pack index for has_s3_data check"
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     // Search packs newest-first for this block's chunk_offset.
                     let mut found = false;
                     for &pid in pack_ids.iter().rev() {

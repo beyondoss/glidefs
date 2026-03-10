@@ -56,11 +56,16 @@ impl WriteCache<Active> {
         // For partial blocks: mark sub-regions BEFORE pwrite (same invariant).
         // This ensures background backfill sees the bit set and skips sub-regions
         // the guest is about to write.
+        //
+        // Snapshot which blocks are partial NOW — we must re-pwrite for these
+        // even if complete_partial removes the entry before we reach re-pwrite.
+        let mut partial_blocks: Vec<u64> = Vec::new();
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
                 if self.inner.is_partial(idx) {
+                    partial_blocks.push(block);
                     let block_start_byte = block * block_size;
                     let write_start = offset.max(block_start_byte);
                     let write_end = (offset + data.len() as u64).min(block_start_byte + block_size);
@@ -76,27 +81,33 @@ impl WriteCache<Active> {
         // Now write to local file (after claiming blocks via set_present)
         self.inner.data_file.write_all_at(data, offset)?;
 
-        // Re-pwrite under per-block write_lock for any partial blocks.
+        // Re-pwrite for blocks that were partial at the start of this write.
+        //
         // This guarantees guest data wins over a concurrent backfill write
         // that may have overwritten our pwrite above using stale S3 data.
-        // Only touches partial blocks (transient state, ~ms lifetime).
-        for block in start_block..=end_block {
+        //
+        // If the DashMap entry still exists, acquire write_lock to serialize
+        // with the backfill task's sub-region writes.
+        //
+        // If complete_partial already removed the entry (backfill finished),
+        // re-pwrite unconditionally WITHOUT the lock — no concurrent backfill
+        // can race, and the backfill may have overwritten our first pwrite
+        // with stale S3 data before calling complete_partial.
+        for &block in &partial_blocks {
             let idx = block as usize;
-            if idx < self.inner.num_blocks {
-                if let Some(state) = self.inner.partial_blocks.get(&idx) {
-                    let _guard = state.value().write_lock.lock();
-                    let block_start_byte = block * block_size;
-                    let write_start = offset.max(block_start_byte);
-                    let write_end =
-                        (offset + data.len() as u64).min(block_start_byte + block_size);
-                    let data_offset = (write_start - offset) as usize;
-                    let write_len = (write_end - write_start) as usize;
-                    self.inner.data_file.write_all_at(
-                        &data[data_offset..data_offset + write_len],
-                        write_start,
-                    )?;
-                }
-            }
+            let block_start_byte = block * block_size;
+            let write_start = offset.max(block_start_byte);
+            let write_end =
+                (offset + data.len() as u64).min(block_start_byte + block_size);
+            let data_offset = (write_start - offset) as usize;
+            let write_len = (write_end - write_start) as usize;
+
+            let entry = self.inner.partial_blocks.get(&idx);
+            let _guard = entry.as_ref().map(|e| e.value().write_lock.lock());
+            self.inner.data_file.write_all_at(
+                &data[data_offset..data_offset + write_len],
+                write_start,
+            )?;
         }
 
         // Mark affected blocks as dirty, invalidate stale CRC32 checksums,
@@ -162,14 +173,17 @@ impl WriteCache<Active> {
         // Same invariant as write() — prevents prefetch race where prefetch
         // could overwrite our zeros with stale S3 data.
         // For partial blocks: mark sub-regions before zeroing.
+        // Snapshot partial blocks for unconditional re-zero (same race fix as write()).
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (offset + len - 1) / block_size;
+        let mut partial_blocks: Vec<u64> = Vec::new();
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
                 if self.inner.is_partial(idx) {
+                    partial_blocks.push(block);
                     let block_start_byte = block * block_size;
                     let write_start = offset.max(block_start_byte);
                     let write_end = (offset + len).min(block_start_byte + block_size);
@@ -218,22 +232,19 @@ impl WriteCache<Active> {
             self.zero_range_fallback(offset, len)?;
         }
 
-        // Re-zero under per-block write_lock for any partial blocks (same
-        // rationale as the re-pwrite in write()).
-        for block in start_block..=end_block {
+        // Re-zero for blocks that were partial at the start (same fix as write()).
+        for &block in &partial_blocks {
             let idx = block as usize;
-            if idx < self.inner.num_blocks {
-                if let Some(state) = self.inner.partial_blocks.get(&idx) {
-                    let _guard = state.value().write_lock.lock();
-                    let block_start_byte = block * block_size;
-                    let write_start = offset.max(block_start_byte);
-                    let write_end = (offset + len).min(block_start_byte + block_size);
-                    let zero_len = (write_end - write_start) as usize;
-                    self.inner
-                        .data_file
-                        .write_all_at(&self.inner.zero_block_bytes[..zero_len], write_start)?;
-                }
-            }
+            let block_start_byte = block * block_size;
+            let write_start = offset.max(block_start_byte);
+            let write_end = (offset + len).min(block_start_byte + block_size);
+            let zero_len = (write_end - write_start) as usize;
+
+            let entry = self.inner.partial_blocks.get(&idx);
+            let _guard = entry.as_ref().map(|e| e.value().write_lock.lock());
+            self.inner
+                .data_file
+                .write_all_at(&self.inner.zero_block_bytes[..zero_len], write_start)?;
         }
 
         // Mark affected blocks as dirty, invalidate stale CRCs, and batch
