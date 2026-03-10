@@ -54,6 +54,7 @@ pub async fn load_readonly_handler(
         .context("failed to fetch manifest from S3")?
         .ok_or_else(|| anyhow::anyhow!("manifest '{}' not found in S3", manifest_name))?;
 
+    let (manifest_data, _etag) = manifest_data;
     let volume_manifest = VolumeManifest::deserialize(&manifest_data)
         .map_err(|e| anyhow::anyhow!("failed to deserialize volume manifest: {e}"))?;
 
