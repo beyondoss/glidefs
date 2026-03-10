@@ -84,6 +84,11 @@ pub struct BlockHandler {
 
     /// Optional write trace recorder. Zero cost when None.
     write_tracer: Option<Arc<WriteTracer>>,
+
+    /// Shared zero buffer for error responses and beyond-device reads.
+    /// `Bytes::slice()` is zero-copy (refcount bump), avoiding a fresh
+    /// 32MB allocation on every read error or out-of-bounds probe.
+    zero_buf: Bytes,
 }
 
 impl BlockHandler {
@@ -123,7 +128,14 @@ impl BlockHandler {
             flush_notify,
             blocks_per_pack,
             write_tracer,
+            zero_buf: Bytes::from(vec![0u8; 32 * 1024 * 1024]),
         }
+    }
+
+    /// Return a zero-filled `Bytes` of the given length (zero-copy slice).
+    #[inline]
+    pub fn zero_bytes(&self, len: usize) -> Bytes {
+        self.zero_buf.slice(..len)
     }
 
     /// Check if this handler is readonly.
@@ -433,7 +445,7 @@ impl BlockHandler {
             // Entirely beyond the device — return zeros. The kernel NBD
             // driver doesn't clamp requests to the device size for partition
             // table probing, so we must handle this gracefully.
-            return Ok(Bytes::from(vec![0u8; length as usize]));
+            return Ok(self.zero_bytes(length as usize));
         }
 
         if length == 0 {
@@ -468,9 +480,10 @@ impl BlockHandler {
 
         // Zero-pad if we clamped the read at the device boundary.
         if clamped_len < length {
+            let pad_len = (length - clamped_len) as usize;
             let mut padded = BytesMut::with_capacity(length as usize);
             padded.extend_from_slice(&data);
-            padded.resize(length as usize, 0);
+            padded.extend_from_slice(&self.zero_buf[..pad_len]);
             Ok(padded.freeze())
         } else {
             Ok(data)
