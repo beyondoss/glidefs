@@ -297,6 +297,7 @@ pub async fn compact_if_needed(
 ) -> Result<Vec<CompactionResult>, CacheError> {
     // Pass 1: collect chunks exceeding pack-count threshold (existing behavior)
     // Pass 2: collect chunks with 2+ packs for dead-ratio evaluation
+    #[allow(clippy::type_complexity)]
     let (mut chunks_to_compact, ratio_candidates): (
         Vec<(u32, Vec<PackId>)>,
         Vec<(u32, Vec<PackId>)>,

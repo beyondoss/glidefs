@@ -9,7 +9,7 @@
 ///   2. Extent-based entries (collapse contiguous chunk_offset runs)
 ///   3. Implicit offsets (drop offset field, derive from cumulative comp_length → 24B)
 ///   4. Pack-level compression (drop offset + comp_length → 20B, fixed stride)
-///   Combos: 3+1 (implicit+zstd), 2+1 (extents+zstd), 3+2+1 (hybrid extents+zstd)
+///      Combos: 3+1 (implicit+zstd), 2+1 (extents+zstd), 3+2+1 (hybrid extents+zstd)
 ///
 /// Functional round-trip verified for every scheme: lookup_block, get_entries,
 /// known_hashes, extract_block all work correctly.
@@ -22,7 +22,6 @@
 ///   cargo run --release --bin index_encoding_measure -- /tmp/glidefs-dedup-test/forked/*.raw
 ///   cargo run --release --bin index_encoding_measure -- --block-size 65536 /tmp/glidefs-dedup-test/forked/*.raw
 ///   cargo run --release --bin index_encoding_measure -- --block-size 16384 --blocks-per-pack 2000 /tmp/glidefs-dedup-test/forked/*.raw
-
 use std::fs::File;
 use std::io::{BufReader, Read as _};
 use std::path::PathBuf;
@@ -323,9 +322,9 @@ fn encode_extents(entries: &[PackIndexEntry]) -> Vec<u8> {
             buf.extend_from_slice(&entries[i].chunk_offset.to_le_bytes());
             buf.extend_from_slice(&(run_len as u16).to_le_bytes());
             buf.extend_from_slice(&entries[i].offset.to_le_bytes());
-            for j in i..run_end {
-                buf.extend_from_slice(entries[j].hash.as_bytes());
-                buf.extend_from_slice(&entries[j].comp_length.to_le_bytes());
+            for entry in &entries[i..run_end] {
+                buf.extend_from_slice(entry.hash.as_bytes());
+                buf.extend_from_slice(&entry.comp_length.to_le_bytes());
             }
         } else {
             // Single
@@ -511,9 +510,9 @@ fn encode_hybrid(entries: &[PackIndexEntry]) -> Vec<u8> {
             buf.push(0x01);
             buf.extend_from_slice(&entries[i].chunk_offset.to_le_bytes());
             buf.extend_from_slice(&(run_len as u16).to_le_bytes());
-            for j in i..run_end {
-                buf.extend_from_slice(entries[j].hash.as_bytes());
-                buf.extend_from_slice(&entries[j].comp_length.to_le_bytes());
+            for entry in &entries[i..run_end] {
+                buf.extend_from_slice(entry.hash.as_bytes());
+                buf.extend_from_slice(&entry.comp_length.to_le_bytes());
             }
         } else {
             buf.push(0x00);
@@ -654,6 +653,7 @@ fn measure_encoding(
     let header_size: u32 = 16;
 
     // Helper macro to measure an encoding scheme
+    #[allow(clippy::type_complexity)]
     struct SchemeSpec {
         name: &'static str,
         encode_fn: Box<dyn Fn(&[PackIndexEntry]) -> Vec<u8>>,
@@ -664,42 +664,42 @@ fn measure_encoding(
     let schemes: Vec<SchemeSpec> = vec![
         SchemeSpec {
             name: "current (28B)",
-            encode_fn: Box::new(|e| encode_current(e)),
-            decode_fn: Box::new(|d| decode_current(d)),
+            encode_fn: Box::new(encode_current),
+            decode_fn: Box::new(decode_current),
         },
         SchemeSpec {
             name: "1: zstd footer",
-            encode_fn: Box::new(|e| encode_zstd_footer(e)),
-            decode_fn: Box::new(|d| decode_zstd_footer(d)),
+            encode_fn: Box::new(encode_zstd_footer),
+            decode_fn: Box::new(decode_zstd_footer),
         },
         SchemeSpec {
             name: "2: extents",
-            encode_fn: Box::new(|e| encode_extents(e)),
-            decode_fn: Box::new(|d| decode_extents(d)),
+            encode_fn: Box::new(encode_extents),
+            decode_fn: Box::new(decode_extents),
         },
         SchemeSpec {
             name: "3: implicit offset (24B)",
-            encode_fn: Box::new(|e| encode_implicit_offset(e)),
+            encode_fn: Box::new(encode_implicit_offset),
             decode_fn: Box::new(move |d| decode_implicit_offset(d, header_size)),
         },
         SchemeSpec {
             name: "4: pack-level (20B)",
-            encode_fn: Box::new(|e| encode_pack_level(e)),
+            encode_fn: Box::new(encode_pack_level),
             decode_fn: Box::new(move |d| decode_pack_level(d, header_size, bs)),
         },
         SchemeSpec {
             name: "3+1: implicit+zstd",
-            encode_fn: Box::new(|e| encode_implicit_zstd(e)),
+            encode_fn: Box::new(encode_implicit_zstd),
             decode_fn: Box::new(move |d| decode_implicit_zstd(d, header_size)),
         },
         SchemeSpec {
             name: "2+1: extents+zstd",
-            encode_fn: Box::new(|e| encode_extents_zstd(e)),
-            decode_fn: Box::new(|d| decode_extents_zstd(d)),
+            encode_fn: Box::new(encode_extents_zstd),
+            decode_fn: Box::new(decode_extents_zstd),
         },
         SchemeSpec {
             name: "3+2+1: hybrid+zstd",
-            encode_fn: Box::new(|e| encode_hybrid_zstd(e)),
+            encode_fn: Box::new(encode_hybrid_zstd),
             decode_fn: Box::new(move |d| decode_hybrid_zstd(d, header_size)),
         },
     ];

@@ -43,6 +43,7 @@ struct FlushResult {
 /// exponential backoff, records error metric.
 ///
 /// Returns `Some(result)` on flush success, `None` on flush failure.
+#[allow(clippy::too_many_arguments)]
 async fn flush_and_sync(
     cache: &WriteCache<Active>,
     content_store: &ContentStore,

@@ -475,6 +475,7 @@ impl Wake for TaskWaker {
 /// - Waker clone: one atomic increment (`Arc::clone`)
 /// - Duplicate wakeups collapse (OR is idempotent → one poll per tick)
 /// - `all_done()`: O(1) counter check
+#[allow(clippy::type_complexity)]
 struct QueueExecutor<'a> {
     /// Task futures. `UnsafeCell` for interior mutability (single-threaded).
     tasks: Vec<UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + 'a>>>>>,

@@ -200,6 +200,7 @@ fn bench_sequential_reads(c: &mut Criterion) {
                                 &harness.content_store,
                                 &harness.pack_index_cache,
                                 &harness.volume_manifest,
+                                &harness.clean_cache,
                             )
                             .await
                             .unwrap();
@@ -386,6 +387,7 @@ fn bench_mixed_iops_during_flush(c: &mut Criterion) {
                                     &flush_harness.content_store,
                                     &flush_harness.pack_index_cache,
                                     &flush_harness.volume_manifest,
+                                    &flush_harness.clean_cache,
                                 )
                                 .await;
                         }
@@ -463,6 +465,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
                             &harness.content_store,
                             &harness.pack_index_cache,
                             &harness.volume_manifest,
+                            &harness.clean_cache,
                         )
                         .await
                         .unwrap();
@@ -505,6 +508,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
                             &harness.content_store,
                             &harness.pack_index_cache,
                             &harness.volume_manifest,
+                            &harness.clean_cache,
                         )
                         .await
                         .unwrap();
@@ -560,6 +564,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                                 &harness.content_store,
                                 &harness.pack_index_cache,
                                 &harness.volume_manifest,
+                                &harness.clean_cache,
                             )
                             .await
                             .unwrap();
@@ -598,6 +603,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                                 &harness.content_store,
                                 &harness.pack_index_cache,
                                 &harness.volume_manifest,
+                                &harness.clean_cache,
                             )
                             .await
                             .unwrap();
@@ -653,6 +659,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                                 &harness.content_store,
                                 &harness.pack_index_cache,
                                 &harness.volume_manifest,
+                                &harness.clean_cache,
                             )
                             .await
                             .unwrap();
@@ -718,6 +725,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                                 &harness.content_store,
                                 &harness.pack_index_cache,
                                 &harness.volume_manifest,
+                                &harness.clean_cache,
                             )
                             .await
                             .unwrap();
@@ -781,6 +789,7 @@ fn bench_flush_to_s3_latency(c: &mut Criterion) {
                                     &harness.content_store,
                                     &harness.pack_index_cache,
                                     &harness.volume_manifest,
+                                    &harness.clean_cache,
                                 )
                                 .await
                                 .unwrap();

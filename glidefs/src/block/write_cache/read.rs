@@ -173,6 +173,7 @@ impl WriteCache<Active> {
     /// The cold path (S3 fetch) is boxed to keep the hot-path future small.
     /// This matters because 128 per-tag io_task_zc futures share L1 cache.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn resolve_read_plan(
         &self,
         offset: u64,

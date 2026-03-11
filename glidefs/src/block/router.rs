@@ -3234,7 +3234,6 @@ mod tests {
         temp_dir: &TempDir,
         parent_fill: u8,
     ) -> (ExportRouter, Arc<dyn object_store::ObjectStore>) {
-        use object_store::ObjectStore as _;
         let s3: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
         let router = ExportRouter::new(RouterConfig {

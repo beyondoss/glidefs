@@ -117,6 +117,7 @@ fn bench_v2_flush_latency(c: &mut Criterion) {
                                     &h.content_store,
                                     &pic,
                                     &h.volume_manifest,
+                                    &h.clean_cache,
                                 )
                                 .await
                                 .unwrap();
@@ -173,7 +174,7 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
 
                         let start = std::time::Instant::now();
                         h.cache
-                            .flush_to_s3(&h.content_store, &pic, &h.volume_manifest)
+                            .flush_to_s3(&h.content_store, &pic, &h.volume_manifest, &h.clean_cache)
                             .await
                             .unwrap();
                         total += start.elapsed();
@@ -209,7 +210,7 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                                 .unwrap();
                         }
                         h.cache
-                            .flush_to_s3(&h.content_store, &pic, &h.volume_manifest)
+                            .flush_to_s3(&h.content_store, &pic, &h.volume_manifest, &h.clean_cache)
                             .await
                             .unwrap();
 
@@ -227,7 +228,7 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
 
                         let start = std::time::Instant::now();
                         h.cache
-                            .flush_to_s3(&h.content_store, &pic, &h.volume_manifest)
+                            .flush_to_s3(&h.content_store, &pic, &h.volume_manifest, &h.clean_cache)
                             .await
                             .unwrap();
                         total += start.elapsed();
