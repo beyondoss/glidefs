@@ -141,6 +141,11 @@ impl PackIndexCache {
             })
     }
 
+    /// Close the cache, releasing file descriptors and flushing SSD state.
+    pub async fn close(&self) -> anyhow::Result<()> {
+        self.inner.close().await.map_err(Into::into)
+    }
+
     /// Collect all block hashes across multiple packs (for flush dedup).
     pub async fn known_hashes(&self, pack_ids: &[PackId]) -> HashSet<Blake3Hash> {
         let mut hashes = HashSet::new();

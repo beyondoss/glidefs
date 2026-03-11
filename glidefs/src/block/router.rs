@@ -1576,6 +1576,11 @@ impl ExportRouter {
             });
         }
 
+        // Close the pack index cache to release file descriptors.
+        if let Err(e) = self.pack_index_cache.close().await {
+            warn!("Failed to close pack index cache: {}", e);
+        }
+
         info!("All exports shut down");
         Ok(())
     }
