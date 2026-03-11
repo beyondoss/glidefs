@@ -845,16 +845,44 @@ impl WriteCache<Active> {
         };
 
         let fetch_start = std::time::Instant::now();
-        let raw = match content_store
-            .get_chunk_block(chunk_idx, pack_id, pack_offset, fetch_length)
-            .await
-        {
-            Ok(data) => data,
-            Err(e) => {
-                if let Some(m) = metrics {
-                    m.record_s3_get_error();
+
+        // Try extended range first; fall back to target-only on failure.
+        // The extended range is best-effort — if it fails (e.g. range past
+        // object boundary, transient S3 error), we still need the target block.
+        let (raw, prefetch) = if fetch_length > comp_length {
+            match content_store
+                .get_chunk_block(chunk_idx, pack_id, pack_offset, fetch_length)
+                .await
+            {
+                Ok(data) => (data, prefetch),
+                Err(_) => {
+                    // Extended range failed — retry with just the target block
+                    match content_store
+                        .get_chunk_block(chunk_idx, pack_id, pack_offset, comp_length)
+                        .await
+                    {
+                        Ok(data) => (data, Vec::new()),
+                        Err(e) => {
+                            if let Some(m) = metrics {
+                                m.record_s3_get_error();
+                            }
+                            return Err(e.into());
+                        }
+                    }
                 }
-                return Err(e.into());
+            }
+        } else {
+            match content_store
+                .get_chunk_block(chunk_idx, pack_id, pack_offset, comp_length)
+                .await
+            {
+                Ok(data) => (data, prefetch),
+                Err(e) => {
+                    if let Some(m) = metrics {
+                        m.record_s3_get_error();
+                    }
+                    return Err(e.into());
+                }
             }
         };
 
