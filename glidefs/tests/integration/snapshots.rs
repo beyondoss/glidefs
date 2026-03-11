@@ -717,6 +717,7 @@ async fn test_compaction_old_packs_gc_respects_snapshots() {
     // Compact: merge [A, B] → C, live manifest now has [C]
     let old_packs = packs_after_flush2.clone();
     let blocks_per_chunk = volume_manifest.read().blocks_per_chunk();
+    let compact_cc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(glidefs::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
     compact::compact_chunk(
         0,
         &old_packs,
@@ -724,6 +725,7 @@ async fn test_compaction_old_packs_gc_respects_snapshots() {
         &cs,
         &pack_index_cache,
         &volume_manifest,
+        &compact_cc,
     )
     .await
     .unwrap();
@@ -853,7 +855,8 @@ async fn test_fork_during_compaction_sees_consistent_data() {
         let vm = Arc::clone(&volume_manifest);
         let cs_clone = ContentStore::new(Arc::clone(&s3), "test");
         tokio::spawn(async move {
-            compact::compact_chunk(0, &packs, blocks_per_chunk, &cs_clone, &pic, &vm)
+            let compact_cc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(glidefs::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+            compact::compact_chunk(0, &packs, blocks_per_chunk, &cs_clone, &pic, &vm, &compact_cc)
                 .await
                 .unwrap();
             // Sync the compacted manifest to S3
@@ -1236,6 +1239,7 @@ async fn test_compaction_cas_failure_orphan_cleaned_by_gc() {
 
     // Compaction #1: [A, B] → [C] (succeeds)
     let blocks_per_chunk = volume_manifest.read().blocks_per_chunk();
+    let compact_cc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(glidefs::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
     compact::compact_chunk(
         0,
         &stale_packs,
@@ -1243,6 +1247,7 @@ async fn test_compaction_cas_failure_orphan_cleaned_by_gc() {
         &cs,
         &pack_index_cache,
         &volume_manifest,
+        &compact_cc,
     )
     .await
     .unwrap();
@@ -1266,6 +1271,7 @@ async fn test_compaction_cas_failure_orphan_cleaned_by_gc() {
         &cs,
         &pack_index_cache,
         &volume_manifest,
+        &compact_cc,
     )
     .await;
     assert!(

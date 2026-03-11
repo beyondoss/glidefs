@@ -867,12 +867,14 @@ impl ExportRouter {
         let export_name = name.clone();
         let flush_metrics = Arc::clone(&metrics);
         let flush_sem = self.flush_semaphore.clone();
+        let flush_cc = Arc::clone(&clean_cache);
         let flush_handle = spawn_named(&format!("flush-{}", name), async move {
             flush_scheduler(
                 flush_cache,
                 flush_cs,
                 flush_cmc,
                 flush_vm,
+                flush_cc,
                 flush_notify,
                 flush_shutdown_rx,
                 flush_metrics,
