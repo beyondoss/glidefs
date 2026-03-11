@@ -706,6 +706,16 @@ impl BlockHandler {
         self.cache.inner().data_file_fd()
     }
 
+    /// Get a clone of the inner cache Arc (for eviction lock acquisition).
+    ///
+    /// The caller can use `eviction_stripes_for_range` and `eviction_read_locks`
+    /// on the returned Arc to hold shared eviction locks across the ublk
+    /// pre_write → io_uring → post_write sequence.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn cache_inner(&self) -> std::sync::Arc<super::write_cache::inner::CacheInner> {
+        self.cache.inner()
+    }
+
     /// Phase 1 of ublk zero-copy write: prepare metadata before io_uring write.
     ///
     /// Validates the request (readonly, SSD-full, bounds), then marks blocks

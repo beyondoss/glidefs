@@ -283,7 +283,7 @@ fn is_zero_block_u64(data: &[u8]) -> bool {
 /// Each stripe covers `num_blocks / 256` blocks. Write path takes shared
 /// (read) lock; eviction takes exclusive (write) lock — so concurrent
 /// writes to different stripes never contend.
-pub(super) const EVICTION_STRIPES: usize = 256;
+pub(crate) const EVICTION_STRIPES: usize = 256;
 
 /// Internal state shared across all cache states.
 ///
@@ -405,6 +405,39 @@ impl CacheInner {
     #[inline]
     pub(crate) fn data_file_fd(&self) -> std::os::unix::io::RawFd {
         self.data_file.as_raw_fd()
+    }
+
+    /// Compute which eviction stripes are touched by a byte range.
+    ///
+    /// Returns sorted, deduped stripe indices. Used by the ublk two-phase write
+    /// path to acquire shared eviction locks across pre_write → io_uring → post_write.
+    pub(crate) fn eviction_stripes_for_range(&self, offset: u64, len: u64) -> Vec<usize> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let block_size = self.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + len - 1) / block_size;
+        let mut stripes: Vec<usize> = (start_block..=end_block)
+            .map(|b| b as usize % EVICTION_STRIPES)
+            .collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        stripes
+    }
+
+    /// Acquire shared eviction read locks on the given stripes.
+    ///
+    /// The returned guards prevent `punch_holes` from running on these stripes.
+    /// The caller must keep them alive until the write is fully committed.
+    pub(crate) fn eviction_read_locks(
+        &self,
+        stripes: &[usize],
+    ) -> Vec<parking_lot::RwLockReadGuard<'_, ()>> {
+        stripes
+            .iter()
+            .map(|&s| self.eviction_locks[s].read())
+            .collect()
     }
 
     /// Check if block is present (lock-free read).

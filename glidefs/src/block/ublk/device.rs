@@ -1016,11 +1016,18 @@ async fn io_task_zc(
 /// Zero-copy WRITE: bio pages → io_uring Write → data file.
 ///
 /// Three-phase protocol:
-/// 1. `pre_write`: mark blocks present, clear CRC32 (metadata prep)
-/// 2. io_uring Write SQE: transfer data from bio pages to data file
-/// 3. `post_write`: mark blocks dirty, append WAL entries
+/// 1. Acquire shared eviction locks (prevent PUNCH_HOLE during write)
+/// 2. `pre_write`: mark blocks present, clear CRC32 (metadata prep)
+/// 3. io_uring Write SQE: transfer data from bio pages to data file
+/// 4. `post_write`: mark blocks dirty, append WAL entries
+/// 5. Release eviction locks (implicit drop)
 ///
-/// If the io_uring write fails, only phase 1 has run — blocks are marked
+/// The eviction locks are critical: without them, `punch_holes` can zero a
+/// block's SSD region between pre_write and post_write, wiping data that
+/// io_uring just wrote. The single-phase `write()` path holds these locks
+/// internally, but the two-phase ublk path needs them across the async gap.
+///
+/// If the io_uring write fails, only phases 1-2 have run — blocks are marked
 /// present (not dirty) with cleared CRCs. Recovery handles this safely.
 async fn handle_write_zc(
     q: &UblkQueue<'_>,
@@ -1033,6 +1040,13 @@ async fn handle_write_zc(
     if length == 0 {
         return 0;
     }
+
+    // Phase 0: acquire shared eviction locks for the affected stripes.
+    // Held until post_write completes to prevent PUNCH_HOLE from racing
+    // with our io_uring write. The inner Arc keeps the locks alive.
+    let inner = handler.cache_inner();
+    let stripes = inner.eviction_stripes_for_range(offset, length as u64);
+    let _eviction_guards = inner.eviction_read_locks(&stripes);
 
     // Phase 1: prepare metadata before data lands on disk.
     // Box::pin: pre_write chains into backfill_missing_blocks (deep async tree).
@@ -1066,6 +1080,7 @@ async fn handle_write_zc(
         return -e.to_linux_errno();
     }
 
+    // _eviction_guards dropped here — PUNCH_HOLE can now proceed.
     length as i32
 }
 
