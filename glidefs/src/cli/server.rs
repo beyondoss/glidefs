@@ -422,15 +422,16 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 fn auto_size_ssd_cache(foyer_dir: &std::path::Path) -> usize {
     use std::ffi::CString;
 
-    const MIN_BYTES: usize = 10 * 1024 * 1024 * 1024; // 10GB
-    const RESERVE_BYTES: usize = 10 * 1024 * 1024 * 1024; // 10GB
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MIN_BYTES: u64 = 10 * GB;
+    const RESERVE_BYTES: u64 = 10 * GB;
 
     // Ensure the directory exists so statvfs has something to stat
     let _ = std::fs::create_dir_all(foyer_dir);
 
     let path_cstr = match CString::new(foyer_dir.to_string_lossy().as_bytes().to_vec()) {
         Ok(c) => c,
-        Err(_) => return MIN_BYTES,
+        Err(_) => return MIN_BYTES as usize,
     };
 
     // SAFETY: statvfs is a standard POSIX FFI call with a valid path and zeroed struct.
@@ -444,21 +445,21 @@ fn auto_size_ssd_cache(foyer_dir: &std::path::Path) -> usize {
         warn!(
             "statvfs failed for {}, defaulting to {}GB SSD cache",
             foyer_dir.display(),
-            MIN_BYTES / (1024 * 1024 * 1024),
+            MIN_BYTES / GB,
         );
-        return MIN_BYTES;
+        return MIN_BYTES as usize;
     }
 
-    let total_bytes = stat.f_blocks as usize * stat.f_frsize as usize;
-    let sized = ((total_bytes as f64 * 0.80) as usize)
+    let total_bytes = stat.f_blocks as u64 * stat.f_frsize as u64;
+    let sized = ((total_bytes as f64 * 0.80) as u64)
         .saturating_sub(RESERVE_BYTES)
         .max(MIN_BYTES);
 
     info!(
-        total_disk_gb = total_bytes / (1024 * 1024 * 1024),
-        auto_sized_gb = sized / (1024 * 1024 * 1024),
+        total_disk_gb = total_bytes / GB,
+        auto_sized_gb = sized / GB,
         "auto-sized foyer SSD cache",
     );
 
-    sized
+    sized as usize
 }

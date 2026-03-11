@@ -12,6 +12,8 @@ Guest VM
     ▼
 Transport ──► ExportRouter ──► BlockHandler ──► WriteCache<Active>
                                                         │
+                                              acquire striped read lock (eviction_locks)
+                                                        │
                                             ┌───────────┼───────────┐
                                             ▼           ▼           ▼
                                        set_present   pwrite()   transition_to_dirty
@@ -19,12 +21,19 @@ Transport ──► ExportRouter ──► BlockHandler ──► WriteCache<Act
                                                         │
                                                    WAL append(block_index, seq)
                                                         │
+                                              drop striped read lock
+                                                        │
                                                     return OK     ◄── ~5µs
 ```
 
 Hash computation is **deferred to flush time**. The write path does zero hash or CRC work —
 it only claims the blocks (set_present), writes data, marks them dirty, and appends to the WAL.
 BLAKE3 is computed at flush time when the block is read from SSD anyway.
+
+The **striped eviction lock** (shared/read) prevents a concurrent eviction's PUNCH_HOLE from
+discarding data between pwrite and transition_to_dirty. 256 stripes, ~2ns uncontended read
+acquisition. Multiple writes proceed concurrently; only eviction takes the exclusive (write) lock.
+(`write_cache/write.rs`, `write_cache/inner.rs:eviction_locks`)
 
 ### Read Path (tiered, ~100ns to ~300ms)
 
@@ -34,7 +43,7 @@ Guest VM
     ▼
 WriteCache ──► is_present(block_idx)?
                       │
-              ┌── YES ──► SSD pread    ~5µs  (hot path: dirty or clean-SSD)
+              ┌── YES ──► SSD pread    ~5µs  (hot path: dirty or syncing blocks)
               │
               └── NO (not yet written / fork from S3)
                       │
@@ -82,7 +91,7 @@ For each chunk (one pack per chunk per flush cycle):
     │   ├── pread block from SSD
     │   ├── CRC32 verify from SparseCrcMap (if available)
     │   ├── Skip zero blocks (well-known hash sentinel)
-    │   ├── BLAKE3-128 hash → LZ4 compress
+    │   ├── BLAKE3-128 hash → insert raw block into foyer (CleanCache) → LZ4 compress
     │   └── Collect into Vec<(hash, chunk_offset, compressed)>
     ├── ContentStore::stream_chunk_pack():
     │   ├── WriteMultipart::new(put_multipart_opts(...))   ← streaming S3 upload
@@ -97,6 +106,13 @@ For each chunk (one pack per chunk per flush cycle):
     │
     ▼
 Phase 3 — Release: CAS SYNCING→CLEAN for each uploaded block
+    │
+    ▼
+Phase 4 — Evict: for each flushed block (sorted, contiguous ranges coalesced):
+    ├── acquire striped write lock (eviction_locks[idx % 256])
+    ├── CAS CLEAN→NOT_PRESENT (skip if re-dirtied)
+    └── PUNCH_HOLE on data file (fallocate, coalesced ranges)
+        └── Data file becomes dirty-only; clean blocks live in foyer
     │
     ▼
 Inline compaction: if chunk.packs.len() > threshold (default 16):
@@ -133,7 +149,7 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 | Compaction | Inline merge of N delta packs → 1 base pack after flush. Old pack_ids removed from manifest; GC deletes the S3 objects. | NOT inline pack deletion — compaction only updates the manifest. GC handles the S3 DELETE |
 | Block State Map | Per-block state (NotPresent / Clean / Dirty / Syncing). Lock-free sparse page table with 2-bit packed `AtomicU8`. | Not the data itself — no hashes stored per-block |
 | Drain | Flush all dirty blocks to S3 so the export can be stopped or migrated | Not a delete — S3 data is preserved |
-| Clean Cache | Read-through Foyer HybridCache (memory + SSD tiers) for blocks fetched from S3 | Not the write cache (dirty blocks on local SSD) |
+| Clean Cache | Foyer HybridCache (memory + SSD tiers) for clean blocks. Populated two ways: (1) S3 reads insert on fetch, (2) flush inserts during compute phase before evicting from data file. Auto-sized to 80% of filesystem minus 10GB reserve when not configured explicitly. | Not the write cache (dirty blocks on local SSD) |
 | Circuit Breaker | Lock-free S3 failure detector that fast-fails requests during outages | Not a retry mechanism — it prevents retries |
 | Hot Set | List of non-zero block indices for a base image, used to prefetch blocks on fork boot | Not a cache — it's a prefetch hint |
 | Bless | CLI command that converts a raw disk image into a content-addressed base image in S3 | Not a runtime operation — offline image preparation |
@@ -169,11 +185,17 @@ Chunk directories use 4-digit zero-padded indices (`chunks/0000/`, `chunks/0001/
 
 ## Core Mechanism: Write-Behind Cache
 
-GlideFS decouples write latency from S3 round-trip time. Writes land on local SSD immediately; a background scheduler uploads dirty blocks to S3 as content-addressed packs.
+GlideFS decouples write latency from S3 round-trip time. Writes land on local SSD immediately; a background scheduler uploads dirty blocks to S3 as content-addressed packs. After upload, blocks are inserted into foyer (shared SSD cache) and evicted from the per-export data file via PUNCH_HOLE:
 
-### Lock-Free Hot Path
+```
+data file (dirty only) ──► foyer (shared SSD, S3-FIFO eviction) ──► S3
+```
 
-The write path avoids all locks. Three techniques make this possible:
+This waterfall means the data file is a **dirty-only buffer** — its SSD usage is proportional to the write rate, not the working set. Foyer's S3-FIFO eviction naturally allocates shared SSD proportional to access patterns: active VMs keep blocks warm, idle VMs' blocks get evicted to S3.
+
+### Near-Lock-Free Hot Path
+
+The write path uses only a single shared (read) lock — the striped eviction lock (~2ns uncontended). All other coordination is lock-free:
 
 1. **Positional I/O** (`pread`/`pwrite`): The `SyncFile` wrapper uses POSIX positional I/O, which is atomic per-syscall and doesn't use the file position pointer. No locking needed for concurrent block reads and writes. (`write_cache/inner.rs:SyncFile`)
 
@@ -241,13 +263,18 @@ Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N 
 Stored in `SparseStateMap` — a sparse page table with 2-bit packed `AtomicU8` values (4 entries per byte), fully lock-free. Encoding: `NotPresent=0, Clean=1, Dirty=2, Syncing=3`. NotPresent=0 means unallocated pages (and zero bytes within allocated pages) are implicitly "never written" with no memory cost.
 
 ```
-NotPresent ──[write]──► Dirty ──[flush claim]──► Syncing ──[upload OK + no concurrent write]──► Clean
-                           ▲                         │                                              │
-                           └──────[write]────────────┘ (CAS SYNCING→DIRTY)                          │
-                           └──────────────────────────────────[write]───────────────────────────────┘
+                                                                               ┌──[evict]──► NotPresent
+                                                                               │
+NotPresent ──[write]──► Dirty ──[flush claim]──► Syncing ──[upload OK]──► Clean ┘
+     ▲                     ▲                         │                       │
+     │                     └──────[write]────────────┘ (CAS SYNCING→DIRTY)   │
+     │                     └─────────────────────────────[write]─────────────┘
+     └─────────────────────────────[write]──────────────────────────────────────┘
 ```
 
 The flush path uses **SYNCING-based CAS**: a dirty block is atomically claimed (`CAS DIRTY→SYNCING`) before CPU work begins. After upload, `CAS SYNCING→CLEAN` releases it. If a guest write lands during the flush, `transition_to_dirty()` CAS-loops `SYNCING→DIRTY` — the flush's final `CAS SYNCING→CLEAN` then fails, and the block stays Dirty for the next cycle.
+
+After SYNCING→CLEAN, **eviction** CAS-transitions CLEAN→NOT_PRESENT and PUNCH_HOLEs the data file range. The block data was already inserted into foyer (CleanCache) during the flush compute phase, so reads resolve from foyer instead of the data file. This makes the data file a **dirty-only buffer** — clean blocks live in foyer's shared SSD cache with S3-FIFO eviction.
 
 | From | Event | To | Encoding | Notes |
 |------|-------|----|----------|-------|
@@ -257,6 +284,8 @@ The flush path uses **SYNCING-based CAS**: a dirty block is atomically claimed (
 | Syncing | Concurrent guest write | Dirty | 3 → 2 | `transition_to_dirty()` CAS loop; flush's SYNCING→CLEAN will fail |
 | Syncing | Upload success, no concurrent write | Clean | 3 → 1 | `transition_syncing_to_clean()` — CAS fails if write re-dirtied |
 | Syncing | Upload success, concurrent write | Dirty | — | Final CAS fails; block stays dirty (re-flushed next cycle) |
+| Clean | Eviction | NotPresent | 1 → 0 | `transition_clean_to_not_present()` + PUNCH_HOLE. Block data in foyer. |
+| NotPresent | Guest write (re-dirty) | Dirty | 0 → 2 | `transition_to_dirty()` handles NOT_PRESENT directly |
 | Any | Crash recovery load | Dirty | — | `load_metadata()` converts Syncing→Dirty on startup |
 
 Presence is derived: `is_present = state != 0`. This eliminates a separate `present_chunks` bitmap. (`block_map.rs:SparseStateMap`)
@@ -645,7 +674,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/write_cache/mod.rs` | `WriteCache<S>` typestate; `FlushStats`, `SnapshotResult` |
 | `block/write_cache/write.rs` | Write path: `set_present` + `pwrite` + `transition_to_dirty` + WAL append |
 | `block/write_cache/init.rs` | Cache initialization: `open()` (Initializing→Recovering), `open_fresh_active()` (forks) |
-| `block/write_cache/inner.rs` | `CacheInner`: shared state (data file, state map, WAL, sequence, CRC map) |
+| `block/write_cache/inner.rs` | `CacheInner`: shared state (data file, state map, WAL, sequence, CRC map, eviction locks). `SyncFile` with `punch_hole`. |
 | `block/write_cache/recovery.rs` | Crash recovery: Syncing→Dirty on startup |
 | `block/block_map.rs` | `SparseStateMap`, `SparseCrcMap`, `Blake3Hash`, `blake3_128`, `lz4_compress`, `lz4_decompress` |
 | `block/cache.rs` | `BlockCache` trait (CleanCache) + Foyer implementation |
