@@ -439,11 +439,16 @@ async fn test_s3_slow_downloads_bounded_latency() {
                 data.iter().all(|&b| b == (i as u8) + 1),
                 "block {i} data mismatch with slow GET"
             );
-            // Each read should take at least 400ms (delay) but less than 10s
-            assert!(
-                elapsed >= Duration::from_millis(400),
-                "block {i} read too fast ({elapsed:?}), delay not applied?"
-            );
+            // First read must hit S3 (≥400ms delay). Subsequent reads may
+            // be served from the clean cache via extent-aware prefetching
+            // (fetch_single_block extends the S3 range to cover neighboring
+            // blocks in the same extent).
+            if i == 0 {
+                assert!(
+                    elapsed >= Duration::from_millis(400),
+                    "block 0 read too fast ({elapsed:?}), delay not applied?"
+                );
+            }
             assert!(
                 elapsed < Duration::from_secs(10),
                 "block {i} read too slow ({elapsed:?}), potential hang"

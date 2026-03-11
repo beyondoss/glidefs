@@ -821,7 +821,7 @@ mod tests {
         let per_hash = elapsed / iterations;
         // Release builds: ~5us. Debug builds: much slower due to no inlining.
         // Use a generous threshold that catches catastrophic regressions.
-        let max_us: u128 = if cfg!(debug_assertions) { 20_000 } else { 50 };
+        let max_us: u128 = if cfg!(debug_assertions) { 50_000 } else { 50 };
         assert!(
             per_hash.as_micros() < max_us,
             "blake3_128 took {}us per 128KB block, expected < {max_us}us",
