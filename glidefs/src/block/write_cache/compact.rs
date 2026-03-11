@@ -28,6 +28,10 @@ type FetchResult = Result<(Blake3Hash, u32, Vec<u8>), CacheError>;
 /// Default compaction threshold: compact when a chunk has more than this many packs.
 pub const DEFAULT_COMPACTION_THRESHOLD: usize = 16;
 
+/// Default dead-block ratio threshold: compact when >50% of entries across
+/// a chunk's packs are superseded by newer entries.
+pub const DEFAULT_DEAD_RATIO_THRESHOLD: f32 = 0.5;
+
 /// Result of compacting a single chunk.
 pub struct CompactionResult {
     /// Chunk index that was compacted.
@@ -40,6 +44,51 @@ pub struct CompactionResult {
     pub live_blocks: usize,
     /// Size of the new base pack in bytes.
     pub new_pack_size: u64,
+}
+
+/// Calculate the ratio of dead (superseded) blocks across all packs for a chunk.
+///
+/// A block is "dead" if a newer pack contains an entry for the same chunk_offset.
+/// Returns the ratio (0.0 = no dead blocks, 1.0 = all dead).
+async fn dead_block_ratio(
+    pack_ids: &[PackId],
+    pack_index_cache: &Arc<PackIndexCache>,
+    content_store: &ContentStore,
+    chunk_idx: u32,
+) -> Result<f32, CacheError> {
+    if pack_ids.len() < 2 {
+        return Ok(0.0);
+    }
+
+    // Collect entries from each pack (oldest→newest order).
+    let mut total_entries = 0usize;
+    let mut owner: HashMap<u32, usize> = HashMap::new();
+
+    for (pack_idx, &pack_id) in pack_ids.iter().enumerate() {
+        let entries = match pack_index_cache.get_entries(pack_id).await {
+            Some(entries) => entries,
+            None => {
+                // Cache miss — fetch from S3 (cold path, acceptable)
+                let fetched = content_store.get_pack_index(chunk_idx, pack_id).await?;
+                pack_index_cache.insert_entries(pack_id, &fetched);
+                fetched
+            }
+        };
+        total_entries += entries.len();
+        for entry in &entries {
+            // Last writer (highest pack_idx) wins
+            owner.insert(entry.chunk_offset, pack_idx);
+        }
+    }
+
+    if total_entries == 0 {
+        return Ok(0.0);
+    }
+
+    // Dead entries = total - unique offsets (each unique offset has one live owner)
+    let live = owner.len();
+    let dead = total_entries - live;
+    Ok(dead as f32 / total_entries as f32)
 }
 
 /// Compact a single chunk: merge N delta packs into 1 base pack.
@@ -206,6 +255,13 @@ pub async fn compact_chunk(
                 "compaction aborted: concurrent manifest modification",
             )));
         }
+        // Rebuild bitmap: only live (non-tombstone) blocks remain after compaction.
+        let live_offsets: Vec<u32> = index_entries
+            .iter()
+            .filter(|e| e.comp_length > 0)
+            .map(|e| e.chunk_offset)
+            .collect();
+        vm.rebuild_bitmap(chunk_idx, &live_offsets);
     }
 
     // 6. Update PackIndexCache
@@ -234,19 +290,53 @@ pub async fn compact_chunk(
 /// (the caller is responsible for deleting them, respecting snapshot references).
 pub async fn compact_if_needed(
     threshold: usize,
+    dead_ratio_threshold: f32,
     content_store: &ContentStore,
     pack_index_cache: &Arc<PackIndexCache>,
     volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
 ) -> Result<Vec<CompactionResult>, CacheError> {
-    // Collect chunks that need compaction (snapshot under read lock)
-    let chunks_to_compact: Vec<(u32, Vec<PackId>)> = {
+    // Pass 1: collect chunks exceeding pack-count threshold (existing behavior)
+    // Pass 2: collect chunks with 2+ packs for dead-ratio evaluation
+    let (mut chunks_to_compact, ratio_candidates): (
+        Vec<(u32, Vec<PackId>)>,
+        Vec<(u32, Vec<PackId>)>,
+    ) = {
         let vm = volume_manifest.read();
-        vm.chunks
-            .iter()
-            .filter(|(_, entry)| entry.packs.len() > threshold)
-            .map(|(&idx, entry)| (idx, entry.packs.clone()))
-            .collect()
+        let mut compact = Vec::new();
+        let mut candidates = Vec::new();
+        for (&idx, entry) in &vm.chunks {
+            if entry.packs.len() > threshold {
+                compact.push((idx, entry.packs.clone()));
+            } else if entry.packs.len() >= 2 {
+                candidates.push((idx, entry.packs.clone()));
+            }
+        }
+        (compact, candidates)
     };
+
+    // Evaluate dead-block ratio for candidates not already above pack-count threshold
+    for (chunk_idx, pack_ids) in ratio_candidates {
+        match dead_block_ratio(&pack_ids, pack_index_cache, content_store, chunk_idx).await {
+            Ok(ratio) if ratio > dead_ratio_threshold => {
+                debug!(
+                    chunk_idx,
+                    packs = pack_ids.len(),
+                    dead_ratio = format!("{:.1}%", ratio * 100.0),
+                    "dead-block ratio exceeds threshold"
+                );
+                chunks_to_compact.push((chunk_idx, pack_ids));
+            }
+            Ok(_) => {} // below threshold, skip
+            Err(e) => {
+                // Non-fatal: skip this candidate, will retry next cycle
+                warn!(
+                    chunk_idx,
+                    error = %e,
+                    "failed to compute dead-block ratio, skipping"
+                );
+            }
+        }
+    }
 
     if chunks_to_compact.is_empty() {
         return Ok(Vec::new());

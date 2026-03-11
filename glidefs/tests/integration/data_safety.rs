@@ -800,7 +800,7 @@ async fn test_concurrent_compaction_and_flush() {
     let vm_clone = Arc::clone(&vm);
     let cc_clone = Arc::clone(&cc);
     let (compact_result, flush_result) = tokio::join!(
-        compact_if_needed(16, &cs, &pic, &vm),
+        compact_if_needed(16, 0.5, &cs, &pic, &vm),
         async {
             // Small yield to let compaction start first
             tokio::task::yield_now().await;
@@ -1680,7 +1680,7 @@ async fn test_compaction_during_active_writes() {
     });
 
     // Run compaction concurrently
-    let compact_result = compact_if_needed(16, &cs, &pic, &vm).await;
+    let compact_result = compact_if_needed(16, 0.5, &cs, &pic, &vm).await;
 
     write_handle.await.unwrap();
 
@@ -1851,7 +1851,7 @@ async fn test_compaction_dedup_correctness() {
     );
 
     // Compact
-    let results = compact_if_needed(1, &cs, &pic, &vm).await.unwrap();
+    let results = compact_if_needed(1, 0.5, &cs, &pic, &vm).await.unwrap();
     assert!(
         !results.is_empty(),
         "compaction should have run (threshold=1, have {} packs)",
@@ -1954,7 +1954,7 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
     let cc_clone = Arc::clone(&cc);
 
     let (compact_result, flush_result) = tokio::join!(
-        compact_if_needed(16, &cs, &pic, &vm),
+        compact_if_needed(16, 0.5, &cs, &pic, &vm),
         async {
             tokio::task::yield_now().await;
             cache_clone.flush_to_s3(&cs_clone, &pic_clone, &vm_clone, &cc_clone).await

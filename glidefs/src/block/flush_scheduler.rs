@@ -245,6 +245,7 @@ pub async fn flush_scheduler(
                 if packs_uploaded > 0 {
                     match crate::block::write_cache::compact::compact_if_needed(
                         crate::block::write_cache::compact::DEFAULT_COMPACTION_THRESHOLD,
+                        crate::block::write_cache::compact::DEFAULT_DEAD_RATIO_THRESHOLD,
                         &content_store,
                         &pack_index_cache,
                         &volume_manifest,

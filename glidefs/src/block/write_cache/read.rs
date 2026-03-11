@@ -561,30 +561,23 @@ impl WriteCache<Active> {
                 .chunk_pack_ids(ci)
                 .map(|ids| ids.to_vec())
                 .unwrap_or_default();
+            // Bitmap fast path: if this offset was never written to S3, return zeros
+            // without any pack index resolution.
+            if pids.is_empty() || !vm.has_block_in_s3(ci, bo) {
+                return Ok(BlockLocation::Zero);
+            }
             (ci, bo, pids)
         };
 
-        if pack_ids.is_empty() {
-            return Ok(BlockLocation::Zero);
-        }
-
         // Iterate packs newest-first (last element = newest).
-        // Critical: once we encounter an uncached pack we must NOT resolve from
-        // older cached packs — the uncached pack might contain a newer version of
-        // the block. We stop the first-pass search and fall through to the fetch
-        // path which will load all uncached packs and re-resolve in order.
+        // On cache miss, fetch that pack's index from S3 immediately and check it
+        // before moving to older packs. This avoids fetching ALL pack indices when
+        // the target block is typically in the newest pack ("newest wins").
         let mut resolved = None;
-        let mut uncached_packs: Vec<PackId> = Vec::new();
+        let mut last_fetch_error = None;
 
         for &pack_id in pack_ids.iter().rev() {
-            if !uncached_packs.is_empty() {
-                // Already have uncached newer packs — collect remaining uncached
-                // but don't resolve from older cached entries.
-                if pack_index_cache.get_entries(pack_id).await.is_none() {
-                    uncached_packs.push(pack_id);
-                }
-                continue;
-            }
+            // Check cache: lookup_block does get_entries + binary search internally
             match pack_index_cache.lookup_block(pack_id, block_offset).await {
                 Some((hash, pack_offset, comp_length)) => {
                     resolved = Some((pack_id, hash, pack_offset, comp_length));
@@ -592,64 +585,39 @@ impl WriteCache<Active> {
                 }
                 None => {
                     if pack_index_cache.get_entries(pack_id).await.is_some() {
+                        // Pack is cached but doesn't contain this block — try older
                         continue;
                     }
-                    uncached_packs.push(pack_id);
+                }
+            }
+
+            // Cache miss — fetch this single pack's index from S3
+            match content_store.get_pack_index(chunk_idx, pack_id).await {
+                Ok(entries) => {
+                    pack_index_cache.insert_entries(pack_id, &entries);
+                    if let Some(e) = entries
+                        .iter()
+                        .find(|e| e.chunk_offset == block_offset)
+                    {
+                        resolved =
+                            Some((pack_id, e.hash, e.offset, e.comp_length));
+                        break;
+                    }
+                    // Fetched but block not in this pack — continue to older
+                }
+                Err(e) => {
+                    warn!(
+                        chunk_idx, pack_id,
+                        error = %e,
+                        "failed to fetch pack index from S3"
+                    );
+                    last_fetch_error = Some(e);
                 }
             }
         }
 
-        // On cache miss: parallel prefetch ALL uncached pack indices for this chunk
-        if !uncached_packs.is_empty() {
-            for &pack_id in &pack_ids {
-                if !uncached_packs.contains(&pack_id)
-                    && pack_index_cache.get_entries(pack_id).await.is_none()
-                {
-                    uncached_packs.push(pack_id);
-                }
-            }
-
-            let mut fetch_futures = Vec::new();
-            for &pack_id in &uncached_packs {
-                let cs = content_store;
-                let ci = chunk_idx;
-                let pid = pack_id;
-                fetch_futures.push(async move {
-                    let result = cs.get_pack_index(ci, pid).await;
-                    (pid, result)
-                });
-            }
-
-            let results = futures::future::join_all(fetch_futures).await;
-            let mut last_fetch_error = None;
-            for (pid, result) in results {
-                match result {
-                    Ok(entries) => {
-                        pack_index_cache.insert_entries(pid, &entries);
-                    }
-                    Err(e) => {
-                        warn!(
-                            chunk_idx, pack_id = pid,
-                            error = %e,
-                            "failed to fetch pack index from S3"
-                        );
-                        last_fetch_error = Some(e);
-                    }
-                }
-            }
-
-            for &pack_id in pack_ids.iter().rev() {
-                if let Some((hash, pack_offset, comp_length)) =
-                    pack_index_cache.lookup_block(pack_id, block_offset).await
-                {
-                    resolved = Some((pack_id, hash, pack_offset, comp_length));
-                    break;
-                }
-            }
-
-            if resolved.is_none() && let Some(e) = last_fetch_error {
-                return Err(e.into());
-            }
+        if resolved.is_none() && let Some(e) = last_fetch_error {
+            return Err(e.into());
         }
 
         let Some((pack_id, expected_hash, pack_offset, comp_length)) = resolved else {
