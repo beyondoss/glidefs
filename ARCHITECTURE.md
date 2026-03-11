@@ -99,13 +99,13 @@ For each chunk (one pack per chunk per flush cycle):
 Phase 3 — Release: CAS SYNCING→CLEAN for each uploaded block
     │
     ▼
-Inline compaction: if chunk.packs.len() > threshold (default 16):
+Inline compaction: if chunk.packs.len() > threshold (default 16)
+                    OR dead-block ratio > 50% (superseded entries across packs):
     └── compact_chunk(): merge N delta packs → 1 base pack
         ├── Load all pack indices from PackIndexCache (or S3 on miss)
         ├── Build merged block map: newest entry wins per chunk_offset
-        ├── Parallel S3 range-reads for live blocks (bounded concurrency)
+        ├── Fetch live blocks: clean cache (foyer) first, then S3 range-reads on miss
         ├── ContentStore::stream_chunk_pack() → stream new base pack to S3
-        └── (old pack_ids removed from manifest → GC collects them)
         ├── VolumeManifest::replace_packs(chunk_idx, [new_pack_id])
         └── Old pack_ids removed from manifest → GC collects them eventually
     │
@@ -128,9 +128,9 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 | PackId | 8-byte random `u64` identifying one pack within its chunk. Hex string in S3 key. | Not a UUID. Collision-safe: birthday bound ~4.3 billion per chunk, and chunks see hundreds of IDs over their lifetime |
 | VolumeManifest (GLVM) | Binary file mapping `chunk_idx → [pack_id, ...]`. Sparse: only written chunks appear. The root of an export's metadata. CRC32-protected. | Not the full block index — pack IDs point to self-describing packs that contain the block-level index |
 | ChunkEntry | `Vec<PackId>` for one chunk, ordered oldest-to-newest. After compaction: single entry. | Not block-level index — that lives in each pack's embedded index |
-| PackIndexCache | Two-tier Foyer HybridCache (64 MB memory + 512 MB SSD) keyed by `PackId → Vec<PackIndexEntry>`. Enables block-level resolution without S3 round-trips. | Not the block data itself — only the index entries. Not per-export — shared cache keyed by PackId |
+| PackIndexCache | Two-tier Foyer HybridCache (64 MB memory + 2 GB SSD) keyed by `PackId → Vec<PackIndexEntry>`. SSD tier stores entries extent-encoded + zstd-compressed (~17 bytes/entry vs 28 raw). 2 GB holds ~117M entries = index coverage for ~7.5 TB of block data. Enables block-level resolution without S3 round-trips. | Not the block data itself — only the index entries. Not per-export — shared cache keyed by PackId |
 | Pack Accumulation | Each flush `append_pack`s a new pack_id to the chunk's list. Overwriting the same block creates a new pack; the old pack still exists in S3 until compaction removes it from the manifest and GC deletes it. | Not immediate deletion of old data — compaction + GC handles that |
-| Compaction | Inline merge of N delta packs → 1 base pack after flush. Old pack_ids removed from manifest; GC deletes the S3 objects. | NOT inline pack deletion — compaction only updates the manifest. GC handles the S3 DELETE |
+| Compaction | Inline merge of N delta packs → 1 base pack after flush. Triggered by pack count > 16 or dead-block ratio > 50%. Old pack_ids removed from manifest; GC deletes the S3 objects. | NOT inline pack deletion — compaction only updates the manifest. GC handles the S3 DELETE |
 | Block State Map | Per-block state (NotPresent / Clean / Dirty / Syncing). Lock-free sparse page table with 2-bit packed `AtomicU8`. | Not the data itself — no hashes stored per-block |
 | Drain | Flush all dirty blocks to S3 so the export can be stopped or migrated | Not a delete — S3 data is preserved |
 | Clean Cache | Read-through Foyer HybridCache (memory + SSD tiers) for blocks fetched from S3 | Not the write cache (dirty blocks on local SSD) |
@@ -197,11 +197,15 @@ The well-known hash of a 128 KB zero block (`zero_block_hash()`) lets the flush 
 
 Each flush cycle produces one delta pack per dirty chunk and appends its ID to the manifest. Overwriting the same block does NOT remove the old pack — both the old and new packs exist in S3. Only compaction removes stale packs from the manifest.
 
-**Why accumulate instead of in-place update?** S3 objects are immutable. "Updating" a pack requires creating a new pack, uploading it, and atomically swapping the manifest. Accumulating packs amortizes this cost: compaction runs infrequently (only when pack count > threshold) rather than on every flush.
+**Why accumulate instead of in-place update?** S3 objects are immutable. "Updating" a pack requires creating a new pack, uploading it, and atomically swapping the manifest. Accumulating packs amortizes this cost: compaction runs infrequently rather than on every flush.
 
-**Compaction**: When a chunk's pack list exceeds `DEFAULT_COMPACTION_THRESHOLD` (16), `compact_chunk()` runs inline after flush:
+**Compaction triggers** (two-pass evaluation after each flush):
+1. **Pack count**: chunk has more than `DEFAULT_COMPACTION_THRESHOLD` (16) packs
+2. **Dead-block ratio**: >50% of entries across a chunk's packs are superseded by newer entries (catches heavy overwrites on few-pack chunks)
+
+**Compaction algorithm** (`compact_chunk()`):
 1. Merge all pack indices — newest entry wins per `chunk_offset`
-2. S3 range-reads for each live block (bounded concurrency)
+2. Fetch live blocks: try clean cache (foyer) first, fall back to S3 range-reads on miss
 3. Stream to a single GLPK base pack via `stream_chunk_pack()`
 4. Upload completes — index and trailer appended by the streaming writer
 5. `replace_packs_cas(chunk_idx, old_pack_ids, [new_pack_id])` — CAS-replaces old pack_ids in manifest, detecting concurrent appends
