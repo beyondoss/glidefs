@@ -76,7 +76,7 @@ impl ReadBenchHarness {
 
         // Flush to S3 so the chunk meta cache and content store are populated.
         cache
-            .snapshot(&content_store, pic, &volume_manifest)
+            .snapshot(&content_store, pic, &volume_manifest, &setup_cache)
             .await
             .unwrap();
 
