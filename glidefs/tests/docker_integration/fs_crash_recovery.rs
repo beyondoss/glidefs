@@ -692,7 +692,7 @@ async fn test_fs_crash_during_flush_to_s3_nbd_kernel() {
     mount.unmount();
 
     // Start drain but crash before it completes (drop server)
-    let _drain = tokio::spawn({
+    let drain = tokio::spawn({
         let router = Arc::clone(&server.router);
         async move {
             let _ = router.drain_all().await;
@@ -703,6 +703,12 @@ async fn test_fs_crash_during_flush_to_s3_nbd_kernel() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     dev.crash().await;
+    // Abort the drain task BEFORE dropping the server. In production, a crash
+    // kills the process and all tasks stop. In tests, tokio::spawn'd tasks
+    // survive drop(server) because they hold Arc<Router>. If the drain task
+    // continues running (writing metadata, PUNCH_HOLE), it races with the
+    // recovery server opening the same cache directory.
+    drain.abort();
     server.shutdown.cancel();
     drop(server);
 
