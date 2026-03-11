@@ -1877,3 +1877,159 @@ async fn test_write_survives_complete_partial_removal() {
         "sub-region 0 must have latest guest data (0xCC)"
     );
 }
+
+// ---- Eviction tests ----
+
+#[tokio::test]
+async fn test_eviction_transitions_to_not_present() {
+    let h = V2Harness::new().await;
+
+    // Write a block
+    h.cache
+        .write(0, &vec![0xAA; 4096], &h.clean_cache)
+        .unwrap();
+    assert!(h.cache.is_block_present(0));
+
+    // Flush — this triggers DIRTY→SYNCING→CLEAN→NOT_PRESENT
+    h.flush().await;
+
+    // Block should be evicted from data file
+    assert!(
+        !h.cache.is_block_present(0),
+        "block should be NOT_PRESENT after eviction"
+    );
+    assert_eq!(h.cache.dirty_block_count(), 0);
+}
+
+#[tokio::test]
+async fn test_eviction_inserts_into_foyer() {
+    let h = V2Harness::new().await;
+
+    let data = vec![0xBB; 4096];
+    h.cache.write(0, &data, &h.clean_cache).unwrap();
+
+    h.flush().await;
+
+    // Block is NOT_PRESENT on SSD but readable via foyer
+    assert!(!h.cache.is_block_present(0));
+
+    // Full read path should resolve through foyer (or S3 pack)
+    let readback = h.read(0, 4096).await;
+    assert_eq!(
+        &readback[..],
+        &data[..],
+        "data must be readable after eviction"
+    );
+}
+
+#[tokio::test]
+async fn test_eviction_then_rewrite() {
+    let h = V2Harness::new().await;
+
+    // Write, flush (evicts), write new data, flush again
+    h.cache
+        .write(0, &vec![0x11; 4096], &h.clean_cache)
+        .unwrap();
+    h.flush().await;
+    assert!(!h.cache.is_block_present(0));
+
+    // Write new data to same block (NOT_PRESENT→DIRTY)
+    h.cache
+        .write(0, &vec![0x22; 4096], &h.clean_cache)
+        .unwrap();
+    assert!(h.cache.is_block_present(0));
+    assert_eq!(h.cache.dirty_block_count(), 1);
+
+    // Flush again
+    h.flush().await;
+    assert!(!h.cache.is_block_present(0));
+
+    // Verify latest data wins
+    let readback = h.read(0, 4096).await;
+    assert!(
+        readback.iter().all(|&b| b == 0x22),
+        "latest write must win after re-eviction"
+    );
+}
+
+#[tokio::test]
+async fn test_transition_to_dirty_from_not_present() {
+    let h = V2Harness::new().await;
+
+    // Write + flush to get block to NOT_PRESENT
+    h.cache
+        .write(0, &vec![0xAA; 4096], &h.clean_cache)
+        .unwrap();
+    h.flush().await;
+    assert!(!h.cache.is_block_present(0));
+
+    // Write to evicted block — should go NOT_PRESENT→DIRTY
+    h.cache
+        .write(0, &vec![0xBB; 4096], &h.clean_cache)
+        .unwrap();
+
+    assert!(h.cache.is_block_present(0));
+    assert_eq!(h.cache.dirty_block_count(), 1);
+
+    let data = h.cache.read_local_only(0, 4096).unwrap();
+    assert!(
+        data.iter().all(|&b| b == 0xBB),
+        "write to evicted block must land correctly"
+    );
+}
+
+#[tokio::test]
+async fn test_zero_blocks_not_inserted_into_foyer() {
+    use crate::block::block_map::zero_block_hash;
+
+    let h = V2Harness::new().await;
+    let block_size = h.cache.block_size();
+
+    // Write zeros
+    h.cache
+        .write(0, &vec![0u8; block_size], &h.clean_cache)
+        .unwrap();
+    h.flush().await;
+
+    // Zero block should NOT be in foyer (free to reconstruct)
+    use crate::block::cache::BlockCache;
+    let zero_hash = zero_block_hash(block_size);
+    let entry = BlockCache::get(&h.clean_cache, &zero_hash).await;
+    assert!(
+        entry.is_none(),
+        "zero blocks should not be cached in foyer"
+    );
+}
+
+#[tokio::test]
+async fn test_multiple_blocks_evicted() {
+    let h = V2Harness::new().await;
+
+    // Write 10 blocks
+    for i in 0u8..10 {
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .unwrap();
+    }
+    assert_eq!(h.cache.dirty_block_count(), 10);
+
+    h.flush().await;
+
+    // All blocks should be evicted
+    for i in 0..10 {
+        assert!(
+            !h.cache.is_block_present(i),
+            "block {i} should be NOT_PRESENT after eviction"
+        );
+    }
+    assert_eq!(h.cache.dirty_block_count(), 0);
+
+    // All data readable through foyer/S3
+    for i in 0u8..10 {
+        let data = h.read(i as u64 * 4096, 4096).await;
+        assert!(
+            data.iter().all(|&b| b == i + 1),
+            "block {i} data mismatch after eviction"
+        );
+    }
+}

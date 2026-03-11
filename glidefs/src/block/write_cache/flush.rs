@@ -5,10 +5,11 @@ use std::sync::atomic::Ordering;
 use tracing::{debug, info, instrument, warn};
 
 use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
+use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
 use crate::block::state::{Active, Draining};
 
-use super::inner::{CRC_SENTINEL, CacheInner, is_zero_block};
+use super::inner::{CRC_SENTINEL, CacheInner, EVICTION_STRIPES, is_zero_block};
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
 
 /// Result of CPU-heavy flush computation (pread + crc32 + blake3 + lz4).
@@ -59,6 +60,7 @@ fn compute_flush_batch(
     inner: &CacheInner,
     snapshot: &[usize],
     zero_hash: Blake3Hash,
+    clean_cache: &dyn BlockCache,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
 
@@ -141,6 +143,11 @@ fn compute_flush_batch(
             }
 
             let hash = blake3_128(&chunk_buf);
+
+            // Insert raw block into foyer for post-eviction read path.
+            // Zero blocks are free to reconstruct — already skipped above.
+            // Cost: 128KB memcpy (~10μs) + sync foyer insert (~1μs).
+            clean_cache.insert(hash, bytes::Bytes::from(chunk_buf.clone()));
 
             let compressed = Some(lz4_compress(&chunk_buf[..]));
 
@@ -506,6 +513,7 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        clean_cache: &Arc<dyn BlockCache>,
     ) -> Result<(FlushStats, u64), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
 
@@ -525,7 +533,7 @@ impl WriteCache<Active> {
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
 
         let result = self
-            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest)
+            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache)
             .await;
 
         if result.is_err() {
@@ -549,6 +557,7 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        clean_cache: &Arc<dyn BlockCache>,
     ) -> Result<FlushStats, CacheError> {
         use crate::block::pack::new_pack_id;
 
@@ -618,8 +627,9 @@ impl WriteCache<Active> {
             // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
             let zero_hash = self.inner.zero_block_hash;
             let inner = Arc::clone(&self.inner);
+            let cc = Arc::clone(clean_cache);
             let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
-                compute_flush_batch(&inner, &chunk_blocks, zero_hash)
+                compute_flush_batch(&inner, &chunk_blocks, zero_hash, cc.as_ref())
             })
             .await
             .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
@@ -728,6 +738,73 @@ impl WriteCache<Active> {
             }
         }
 
+        // Evict flushed blocks: CAS CLEAN→NOT_PRESENT + PUNCH_HOLE.
+        // Block data is already in foyer (inserted during compute phase).
+        // Coalesce contiguous ranges for batch PUNCH_HOLE.
+        let block_size = self.inner.config.block_size as u64;
+        let mut evicted = 0u64;
+        let mut sorted_flushed = flushed_blocks.clone();
+        sorted_flushed.sort_unstable();
+
+        let mut range_start: Option<usize> = None;
+        let mut range_end: usize = 0;
+
+        for &idx in &sorted_flushed {
+            // Acquire exclusive (write) lock on this block's stripe.
+            // This prevents a concurrent write's pwrite from racing with
+            // our CAS + PUNCH_HOLE sequence. The write path holds a shared
+            // (read) lock on the same stripe across set_present → pwrite →
+            // transition_to_dirty.
+            let stripe = idx % EVICTION_STRIPES;
+            let _eviction_guard = self.inner.eviction_locks[stripe].write();
+
+            if !self.inner.transition_clean_to_not_present(idx) {
+                // Block was re-dirtied between SYNCING→CLEAN and now.
+                // Flush the pending range before skipping.
+                if let Some(start) = range_start.take() {
+                    let offset = start as u64 * block_size;
+                    let len = (range_end - start + 1) as u64 * block_size;
+                    let _ = self.inner.data_file.punch_hole(offset, len);
+                }
+                continue;
+            }
+
+            evicted += 1;
+
+            // Coalesce contiguous ranges.
+            // PUNCH_HOLE is deferred until we hit a non-contiguous block or
+            // a different stripe, so the write lock covers the CAS but not
+            // necessarily the PUNCH_HOLE for every block in the range.
+            // This is safe: once CAS CLEAN→NOT_PRESENT succeeds, the write
+            // path's set_present would make it CLEAN again, and transition_to_dirty
+            // would make it DIRTY — the data file hole is harmless because the
+            // write path will pwrite fresh data.
+            match range_start {
+                Some(_start) if idx == range_end + 1 => {
+                    range_end = idx;
+                }
+                Some(start) => {
+                    // Punch the previous range, start a new one
+                    let offset = start as u64 * block_size;
+                    let len = (range_end - start + 1) as u64 * block_size;
+                    let _ = self.inner.data_file.punch_hole(offset, len);
+                    range_start = Some(idx);
+                    range_end = idx;
+                }
+                None => {
+                    range_start = Some(idx);
+                    range_end = idx;
+                }
+            }
+        }
+
+        // Punch trailing range
+        if let Some(start) = range_start {
+            let offset = start as u64 * block_size;
+            let len = (range_end - start + 1) as u64 * block_size;
+            let _ = self.inner.data_file.punch_hole(offset, len);
+        }
+
         info!(
             blocks_claimed = total_stats.blocks_claimed,
             blocks_deduped = total_stats.blocks_deduped,
@@ -735,6 +812,7 @@ impl WriteCache<Active> {
             blocks_corrupted = total_stats.blocks_corrupted,
             packs_uploaded = total_stats.packs_uploaded,
             bytes_uploaded = total_stats.bytes_uploaded,
+            blocks_evicted = evicted,
             "flush complete"
         );
 
@@ -751,9 +829,9 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
-        _clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
+        clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<(FlushStats, u64), CacheError> {
-        self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+        self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await
     }
 
@@ -789,17 +867,17 @@ impl WriteCache<Active> {
     /// failures when blocks are already clean but a transient S3 error
     /// prevents the manifest upload.
     #[must_use = "flush errors must be handled to avoid silent data loss"]
-    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest, _clean_cache))]
+    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest, clean_cache))]
     pub async fn flush_to_s3(
         &self,
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
-        _clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
+        clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, _seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await?;
         let manifest_bytes = volume_manifest.read().serialize();
         let expected_etag = self.inner.manifest_etag.lock().clone();
@@ -842,17 +920,17 @@ impl WriteCache<Active> {
 
     /// Take a point-in-time snapshot.
     #[must_use = "snapshot errors must be handled"]
-    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest, _clean_cache))]
+    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest, clean_cache))]
     pub async fn snapshot(
         &self,
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
-        _clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
+        clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await?;
 
         let manifest_bytes = volume_manifest.read().serialize();

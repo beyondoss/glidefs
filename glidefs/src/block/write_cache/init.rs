@@ -137,6 +137,7 @@ impl WriteCache<Initializing> {
             recovery_warnings: AtomicU64::new(recovery_warning_count),
             crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
+            eviction_locks: std::array::from_fn(|_| parking_lot::RwLock::new(())),
             partial_blocks,
             manifest_etag: parking_lot::Mutex::new(None),
         });
@@ -190,6 +191,7 @@ impl WriteCache<Initializing> {
             recovery_warnings: AtomicU64::new(0),
             crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
+            eviction_locks: std::array::from_fn(|_| parking_lot::RwLock::new(())),
             partial_blocks: DashMap::new(),
             manifest_etag: parking_lot::Mutex::new(None),
         });

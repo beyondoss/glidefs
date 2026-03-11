@@ -4,6 +4,7 @@ use crate::block::cache::BlockCache;
 use crate::block::state::Active;
 use crate::block::wal::{serialize_entry, serialize_partial_entry};
 
+use super::inner::EVICTION_STRIPES;
 use super::{CacheError, WriteCache};
 
 impl WriteCache<Active> {
@@ -42,6 +43,20 @@ impl WriteCache<Active> {
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (offset + data.len() as u64 - 1) / block_size;
+
+        // Acquire striped read locks (shared — multiple writes proceed concurrently).
+        // Held through set_present → pwrite → transition_to_dirty → WAL append.
+        // Eviction takes the write (exclusive) lock on the same stripes, so
+        // PUNCH_HOLE cannot race with our pwrite.
+        let mut stripes: Vec<usize> = (start_block..=end_block)
+            .map(|b| b as usize % EVICTION_STRIPES)
+            .collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        let _eviction_guards: Vec<_> = stripes
+            .iter()
+            .map(|&s| self.inner.eviction_locks[s].read())
+            .collect();
 
         // CRITICAL: Mark blocks as present BEFORE writing to file.
         // This prevents a race with prefetch where:
@@ -169,14 +184,26 @@ impl WriteCache<Active> {
             ));
         }
 
+        let block_size = self.inner.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + len - 1) / block_size;
+
+        // Striped read locks — same as write(). See comment there.
+        let mut stripes: Vec<usize> = (start_block..=end_block)
+            .map(|b| b as usize % EVICTION_STRIPES)
+            .collect();
+        stripes.sort_unstable();
+        stripes.dedup();
+        let _eviction_guards: Vec<_> = stripes
+            .iter()
+            .map(|&s| self.inner.eviction_locks[s].read())
+            .collect();
+
         // CRITICAL: Mark blocks as present BEFORE writing zeros to file.
         // Same invariant as write() — prevents prefetch race where prefetch
         // could overwrite our zeros with stale S3 data.
         // For partial blocks: mark sub-regions before zeroing.
         // Snapshot partial blocks for unconditional re-zero (same race fix as write()).
-        let block_size = self.inner.config.block_size as u64;
-        let start_block = offset / block_size;
-        let end_block = (offset + len - 1) / block_size;
         let mut partial_blocks: Vec<u64> = Vec::new();
         for block in start_block..=end_block {
             let idx = block as usize;

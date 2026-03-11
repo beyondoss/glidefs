@@ -102,6 +102,41 @@ mod sync_file {
             use std::os::unix::io::AsRawFd;
             self.file.as_raw_fd()
         }
+
+        /// Punch a hole in the data file, releasing SSD space for the given range.
+        ///
+        /// On Linux: uses `fallocate(PUNCH_HOLE | KEEP_SIZE)` — the range reads
+        /// as zeros afterward but the file size doesn't change.
+        /// On other platforms: no-op (eviction still transitions state, just
+        /// doesn't reclaim physical SSD space).
+        #[allow(unused_variables)]
+        pub fn punch_hole(&self, offset: u64, len: u64) -> std::io::Result<()> {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::io::AsRawFd;
+                const FALLOC_FL_PUNCH_HOLE: libc::c_int = 0x02;
+                const FALLOC_FL_KEEP_SIZE: libc::c_int = 0x01;
+                let ret = unsafe {
+                    libc::fallocate(
+                        self.file.as_raw_fd(),
+                        FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                        offset as libc::off_t,
+                        len as libc::off_t,
+                    )
+                };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    // EOPNOTSUPP on filesystems that don't support hole punching — not fatal.
+                    if err.raw_os_error() == Some(libc::EOPNOTSUPP)
+                        || err.raw_os_error() == Some(libc::ENOTSUP)
+                    {
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -244,6 +279,12 @@ fn is_zero_block_u64(data: &[u8]) -> bool {
     suffix.iter().all(|&b| b == 0)
 }
 
+/// Number of eviction lock stripes. 256 stripes ≈ 1KB total overhead.
+/// Each stripe covers `num_blocks / 256` blocks. Write path takes shared
+/// (read) lock; eviction takes exclusive (write) lock — so concurrent
+/// writes to different stripes never contend.
+pub(super) const EVICTION_STRIPES: usize = 256;
+
 /// Internal state shared across all cache states.
 ///
 /// Uses lock-free atomics for block states and presence to avoid contention
@@ -318,6 +359,19 @@ pub(crate) struct CacheInner {
     /// `None` means first upload (unconditional PUT).
     pub(crate) manifest_etag: Mutex<Option<String>>,
 
+    /// Striped eviction locks to prevent PUNCH_HOLE from racing with pwrite.
+    ///
+    /// The race without locks:
+    /// 1. Eviction: CAS CLEAN→NOT_PRESENT
+    /// 2. Write: set_present (NOT_PRESENT→CLEAN) — before pwrite
+    /// 3. Eviction: PUNCH_HOLE — blows away the write's data!
+    ///
+    /// With locks: write path holds shared (read) lock across set_present →
+    /// pwrite → transition_to_dirty. Eviction holds exclusive (write) lock
+    /// across CAS + PUNCH_HOLE. Multiple writes proceed concurrently;
+    /// eviction excludes writes on the same stripe.
+    pub(super) eviction_locks: [parking_lot::RwLock<()>; EVICTION_STRIPES],
+
     /// Partial block tracking for async sub-block backfill.
     ///
     /// Maps block_index → partial block state (bitmap + write lock). A set bit
@@ -387,12 +441,6 @@ impl CacheInner {
         loop {
             let current = self.state_map.get(idx);
 
-            debug_assert_ne!(
-                current,
-                SparseBlockState::NOT_PRESENT,
-                "transition_to_dirty called on NOT_PRESENT block {idx}"
-            );
-
             if current == SparseBlockState::DIRTY {
                 return false;
             }
@@ -413,6 +461,17 @@ impl CacheInner {
                     .is_ok()
                 {
                     self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
+            } else if current == SparseBlockState::NOT_PRESENT {
+                // Block was evicted (CLEAN→NOT_PRESENT) and is being re-dirtied
+                // by a new guest write. Transition directly to DIRTY.
+                if self
+                    .state_map
+                    .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
+                    .is_ok()
+                {
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                     return true;
                 }
@@ -458,6 +517,18 @@ impl CacheInner {
         } else {
             false
         }
+    }
+
+    /// Atomically evict a clean block: CAS CLEAN→NOT_PRESENT.
+    ///
+    /// Returns true if the CAS succeeded (block evicted).
+    /// Returns false if a concurrent write transitioned CLEAN→DIRTY,
+    /// meaning the block was re-dirtied and must not be evicted.
+    #[inline]
+    pub(super) fn transition_clean_to_not_present(&self, idx: usize) -> bool {
+        self.state_map
+            .cas(idx, SparseBlockState::CLEAN, SparseBlockState::NOT_PRESENT)
+            .is_ok()
     }
 
     /// Count present blocks (for metrics/logging).
