@@ -163,6 +163,7 @@ fn bench_flush_vs_s3(c: &mut Criterion) {
                                 &h.content_store,
                                 &h.pack_index_cache,
                                 &h.volume_manifest,
+                                &h.clean_cache,
                             )
                             .await
                             .unwrap();
