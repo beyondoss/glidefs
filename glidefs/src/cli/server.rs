@@ -74,11 +74,9 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     // Shared clean block cache — foyer HybridCache with memory + SSD tiers
     let memory_bytes =
         (settings.cache.memory_size_gb.unwrap_or(1.0) * 1024.0 * 1024.0 * 1024.0) as usize;
+    let ssd_bytes =
+        (settings.cache.ssd_cache_size_gb.unwrap_or(10.0) * 1024.0 * 1024.0 * 1024.0) as usize;
     let foyer_dir = cache_dir.join("foyer");
-    let ssd_bytes = match settings.cache.ssd_cache_size_gb {
-        Some(gb) => (gb * 1024.0 * 1024.0 * 1024.0) as usize,
-        None => auto_size_ssd_cache(&foyer_dir),
-    };
     info!(
         "Opening clean cache: {}MB memory, {}GB SSD at {}",
         memory_bytes / (1024 * 1024),
@@ -415,51 +413,4 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     info!("Shutdown complete");
     shutdown_result
-}
-
-/// Auto-size foyer SSD cache: 80% of filesystem capacity minus 10GB reserve.
-/// Falls back to 10GB if statvfs fails. Minimum 10GB.
-fn auto_size_ssd_cache(foyer_dir: &std::path::Path) -> usize {
-    use std::ffi::CString;
-
-    const GB: u64 = 1024 * 1024 * 1024;
-    const MIN_BYTES: u64 = 10 * GB;
-    const RESERVE_BYTES: u64 = 10 * GB;
-
-    // Ensure the directory exists so statvfs has something to stat
-    let _ = std::fs::create_dir_all(foyer_dir);
-
-    let path_cstr = match CString::new(foyer_dir.to_string_lossy().as_bytes().to_vec()) {
-        Ok(c) => c,
-        Err(_) => return MIN_BYTES as usize,
-    };
-
-    // SAFETY: statvfs is a standard POSIX FFI call with a valid path and zeroed struct.
-    #[allow(unsafe_code)]
-    let (stat, ret) = {
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::statvfs(path_cstr.as_ptr(), &mut stat) };
-        (stat, ret)
-    };
-    if ret != 0 {
-        warn!(
-            "statvfs failed for {}, defaulting to {}GB SSD cache",
-            foyer_dir.display(),
-            MIN_BYTES / GB,
-        );
-        return MIN_BYTES as usize;
-    }
-
-    let total_bytes = stat.f_blocks as u64 * stat.f_frsize as u64;
-    let sized = ((total_bytes as f64 * 0.80) as u64)
-        .saturating_sub(RESERVE_BYTES)
-        .max(MIN_BYTES);
-
-    info!(
-        total_disk_gb = total_bytes / GB,
-        auto_sized_gb = sized / GB,
-        "auto-sized foyer SSD cache",
-    );
-
-    sized as usize
 }
