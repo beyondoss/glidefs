@@ -21,8 +21,14 @@ use super::pack::{PackId, PackIndexEntry, PACK_HEADER_SIZE};
 /// Default memory tier: 64MB.
 const DEFAULT_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Default SSD tier: 2GB.
+/// Default SSD tier: 2GB in production, 128MB in test builds.
+/// 2GB holds ~117M entries = 7.5TB at 64KB blocks.
+/// Tests use tiny volumes; 128MB avoids FD exhaustion in stress tests
+/// that create/destroy many cache instances.
+#[cfg(not(feature = "test-utils"))]
 const DEFAULT_SSD_BYTES: usize = 2 * 1024 * 1024 * 1024;
+#[cfg(feature = "test-utils")]
+const DEFAULT_SSD_BYTES: usize = 128 * 1024 * 1024;
 
 /// Cached pack index — wraps sorted entries for a single pack.
 ///
