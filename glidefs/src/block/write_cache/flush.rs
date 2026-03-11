@@ -741,22 +741,6 @@ impl WriteCache<Active> {
             }
         }
 
-        // Evict flushed blocks: CAS CLEAN→NOT_PRESENT.
-        // Block data is already in foyer (inserted during compute phase).
-        //
-        // PUNCH_HOLE is deferred until after checkpoint persists the NOT_PRESENT
-        // state to disk. This prevents a crash window where metadata says
-        // CLEAN/DIRTY but the data file has holes (PUNCH_HOLE'd). Without this
-        // ordering, crash recovery would re-flush zeros over correct S3 data.
-        let mut evicted_blocks: Vec<usize> = Vec::new();
-        for &idx in &flushed_blocks {
-            if self.inner.transition_clean_to_not_present(idx) {
-                evicted_blocks.push(idx);
-            }
-        }
-
-        let evicted = evicted_blocks.len() as u64;
-
         info!(
             blocks_claimed = total_stats.blocks_claimed,
             blocks_deduped = total_stats.blocks_deduped,
@@ -764,22 +748,55 @@ impl WriteCache<Active> {
             blocks_corrupted = total_stats.blocks_corrupted,
             packs_uploaded = total_stats.packs_uploaded,
             bytes_uploaded = total_stats.bytes_uploaded,
-            blocks_evicted = evicted,
             "flush complete"
         );
 
-        Ok((total_stats, evicted_blocks))
+        // Return flushed_blocks (CLEAN after SYNCING→CLEAN CAS above).
+        // Caller decides when to evict (CAS CLEAN→NOT_PRESENT) — MUST only
+        // happen after manifest is confirmed synced to S3. Otherwise, crash
+        // recovery without a manifest would lose evicted blocks.
+        Ok((total_stats, flushed_blocks))
     }
 
-    /// PUNCH_HOLE evicted blocks after checkpoint has persisted NOT_PRESENT state.
+    /// Evict flushed blocks: CAS CLEAN→NOT_PRESENT, checkpoint, then PUNCH_HOLE.
     ///
-    /// MUST only be called after checkpoint() — otherwise a crash between
-    /// PUNCH_HOLE and checkpoint would leave metadata thinking blocks are
-    /// present while the data file has holes.
+    /// MUST only be called after manifest is confirmed synced to S3.
+    /// Otherwise, crash recovery without a manifest would lose evicted blocks.
+    ///
+    /// Sequence: CAS → checkpoint (persists NOT_PRESENT) → PUNCH_HOLE.
+    /// This ensures metadata and data file are always consistent.
+    pub async fn evict_flushed_blocks(&self, flushed_blocks: &[usize]) {
+        if flushed_blocks.is_empty() {
+            return;
+        }
+
+        // Phase 1: CAS CLEAN→NOT_PRESENT
+        let mut evicted: Vec<usize> = Vec::new();
+        for &idx in flushed_blocks {
+            if self.inner.transition_clean_to_not_present(idx) {
+                evicted.push(idx);
+            }
+        }
+
+        if evicted.is_empty() {
+            return;
+        }
+
+        // Phase 2: Checkpoint persists NOT_PRESENT state to disk
+        if let Err(e) = self.checkpoint().await {
+            tracing::warn!(error = %e, "checkpoint after eviction CAS failed, skipping PUNCH_HOLE");
+            return;
+        }
+
+        // Phase 3: PUNCH_HOLE (safe now — metadata says NOT_PRESENT)
+        self.punch_holes(&evicted);
+    }
+
+    /// PUNCH_HOLE blocks that are already NOT_PRESENT in persisted metadata.
     ///
     /// Uses striped write locks to prevent concurrent pwrite from racing
     /// with PUNCH_HOLE. Coalesces contiguous ranges for fewer syscalls.
-    pub fn punch_evicted(&self, evicted_blocks: &[usize]) {
+    fn punch_holes(&self, evicted_blocks: &[usize]) {
         if evicted_blocks.is_empty() {
             return;
         }
@@ -836,9 +853,8 @@ impl WriteCache<Active> {
 
     /// Flush dirty blocks to S3 as chunk-scoped GLPK v3 packs (no manifest upload).
     ///
-    /// Returns (stats, seq_cutpoint, evicted_blocks). Caller MUST call
-    /// checkpoint (via sync_manifest) then punch_evicted(&evicted_blocks)
-    /// to complete the eviction safely.
+    /// Returns (stats, seq_cutpoint, flushed_blocks). Caller MUST sync manifest
+    /// to S3 before calling `evict_flushed_blocks(&flushed_blocks)` to reclaim SSD.
     #[must_use = "flush errors must be handled to avoid silent data loss"]
     pub async fn flush_packs(
         &self,
@@ -892,7 +908,7 @@ impl WriteCache<Active> {
         clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
-        let (stats, _seq_cutpoint, evicted) = self
+        let (stats, _seq_cutpoint, flushed) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await?;
         let manifest_bytes = volume_manifest.read().serialize();
@@ -930,9 +946,8 @@ impl WriteCache<Active> {
         if let Some(e) = last_err {
             return Err(e.into());
         }
-        // Checkpoint persists NOT_PRESENT state — MUST happen before PUNCH_HOLE.
-        self.checkpoint().await?;
-        self.punch_evicted(&evicted);
+        // Manifest synced — safe to evict. CAS + checkpoint + PUNCH_HOLE.
+        self.evict_flushed_blocks(&flushed).await;
         Ok(stats)
     }
 
@@ -947,7 +962,7 @@ impl WriteCache<Active> {
         clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
-        let (stats, seq_cutpoint, evicted) = self
+        let (stats, seq_cutpoint, flushed) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await?;
 
@@ -990,8 +1005,8 @@ impl WriteCache<Active> {
             persisted
         };
 
-        self.checkpoint().await?;
-        self.punch_evicted(&evicted);
+        // Manifest synced — safe to evict.
+        self.evict_flushed_blocks(&flushed).await;
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,

@@ -832,59 +832,22 @@ impl WriteCache<Active> {
     ) -> Result<Bytes, CacheError> {
         use crate::block::block_map::{blake3_128, lz4_decompress};
 
-        // Find extent neighbors for prefetching (best-effort, ~100ns memory-tier hit)
-        let prefetch = Self::prefetch_window(
-            pack_index_cache, pack_id, pack_offset,
-        ).await;
-
-        // Extend range to cover prefetch blocks
-        let fetch_length = if let Some(last) = prefetch.last() {
-            (last.offset - pack_offset) + last.comp_length
-        } else {
-            comp_length
-        };
-
         let fetch_start = std::time::Instant::now();
-
-        // Try extended range first; fall back to target-only on failure.
-        // The extended range is best-effort — if it fails (e.g. range past
-        // object boundary, transient S3 error), we still need the target block.
-        let (raw, prefetch) = if fetch_length > comp_length {
-            match content_store
-                .get_chunk_block(chunk_idx, pack_id, pack_offset, fetch_length)
-                .await
-            {
-                Ok(data) => (data, prefetch),
-                Err(_) => {
-                    // Extended range failed — retry with just the target block
-                    match content_store
-                        .get_chunk_block(chunk_idx, pack_id, pack_offset, comp_length)
-                        .await
-                    {
-                        Ok(data) => (data, Vec::new()),
-                        Err(e) => {
-                            if let Some(m) = metrics {
-                                m.record_s3_get_error();
-                            }
-                            return Err(e.into());
-                        }
-                    }
+        let raw = match content_store
+            .get_chunk_block(chunk_idx, pack_id, pack_offset, comp_length)
+            .await
+        {
+            Ok(data) => data,
+            Err(e) => {
+                if let Some(m) = metrics {
+                    m.record_s3_get_error();
                 }
-            }
-        } else {
-            match content_store
-                .get_chunk_block(chunk_idx, pack_id, pack_offset, comp_length)
-                .await
-            {
-                Ok(data) => (data, prefetch),
-                Err(e) => {
-                    if let Some(m) = metrics {
-                        m.record_s3_get_error();
-                    }
-                    return Err(e.into());
-                }
+                return Err(e.into());
             }
         };
+
+        // Prefetch disabled pending investigation of CI hangs.
+        let _ = pack_index_cache;
 
         if let Some(m) = metrics {
             m.record_s3_read(raw.len() as u64);
@@ -906,29 +869,6 @@ impl WriteCache<Active> {
 
         let target_data = Bytes::from(decompressed);
         clean_cache.insert(expected_hash, target_data.clone());
-
-        // Process prefetched blocks (best-effort: stop on any error)
-        for entry in &prefetch {
-            let local_start = (entry.offset - pack_offset) as usize;
-            let local_end = local_start + entry.comp_length as usize;
-            if local_end > raw.len() {
-                break;
-            }
-
-            let compressed = raw.slice(local_start..local_end);
-            let Ok(decompressed) = lz4_decompress(&compressed) else {
-                break;
-            };
-            let hash = blake3_128(&decompressed);
-            if hash != entry.hash {
-                warn!(
-                    chunk_idx, pack_id, chunk_offset = entry.chunk_offset,
-                    "prefetch block hash mismatch, stopping prefetch"
-                );
-                break;
-            }
-            clean_cache.insert(entry.hash, Bytes::from(decompressed));
-        }
 
         Ok(target_data)
     }
