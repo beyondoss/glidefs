@@ -324,13 +324,19 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) -> usize {
 }
 
 impl WriteCache<Active> {
-    /// Flush the local cache file.
+    /// Flush the local cache file and WAL to durable storage.
     ///
-    /// This performs an fsync on the local SSD, which is fast (<10ms).
-    /// It does NOT wait for S3 sync - that happens in the background.
+    /// Syncs both the data file and the WAL so that all dirty block metadata
+    /// survives a crash. Without the WAL sync, blocks written since the last
+    /// checkpoint would have data on SSD but no state entry — recovery would
+    /// see them as NOT_PRESENT and lose data.
+    ///
+    /// This is fast (<10ms). It does NOT wait for S3 sync — that happens in
+    /// the background.
     #[instrument(skip(self))]
     pub fn flush(&self) -> Result<(), CacheError> {
         self.inner.data_file.sync_all()?;
+        self.inner.wal.sync()?;
         debug!("local flush complete");
         Ok(())
     }
