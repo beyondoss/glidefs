@@ -111,7 +111,7 @@ async fn test_sync_manifest_does_not_create_snapshots() {
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
 
     // flush_packs + sync_manifest (the background flush path)
-    let (_stats, _seq) = cache.flush_packs(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
+    let (_stats, _seq, _evicted) = cache.flush_packs(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
     cache.sync_manifest(&cs, &volume_manifest).await.unwrap();
 
     // No snapshot should be created by sync_manifest

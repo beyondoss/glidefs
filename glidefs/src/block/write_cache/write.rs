@@ -339,27 +339,6 @@ impl WriteCache<Active> {
         Ok(())
     }
 
-    /// Check if any block in the given range is not yet present on SSD.
-    ///
-    /// Used by the write rejection path: when SSD is near-full, writes to
-    /// already-present blocks are allowed (overwrites don't grow the data file),
-    /// but writes to new blocks are rejected with ENOSPC.
-    pub fn has_new_blocks(&self, offset: u64, len: usize) -> bool {
-        let block_size = self.inner.config.block_size as u64;
-        let start_block = offset / block_size;
-        let end_block = (offset + len as u64 - 1) / block_size;
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx >= self.inner.num_blocks {
-                return true;
-            }
-            if !self.inner.is_present(idx) {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Phase 1 of a two-phase write: prepare blocks before data lands on disk.
     ///
     /// Marks blocks as present. This MUST be called before the data write

@@ -1118,7 +1118,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     inner.data_file.write_all_at(&corrupted_data, 0).unwrap();
 
     // Flush should detect CRC32 mismatch and skip the block.
-    let (stats, _seq) = h
+    let (stats, _seq, _) = h
         .cache
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
@@ -1144,7 +1144,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // Next flush succeeds — CRC32 now matches the (corrupted) SSD data.
     // This is the inherent limitation of deferred checksumming: if corruption
     // is persistent, the next checkpoint captures the corrupted state.
-    let (stats2, _seq) = h
+    let (stats2, _seq, _) = h
         .cache
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
@@ -1178,7 +1178,7 @@ async fn test_crc32_cleared_on_write() {
     );
 
     // Flush without a checkpoint in between — no CRC32, verification skipped.
-    let (stats, _) = h
+    let (stats, _, _) = h
         .cache
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
@@ -1223,7 +1223,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
         .unwrap();
 
     // Flush: should upload 3 good blocks, skip 2 corrupted.
-    let (stats, _) = h
+    let (stats, _, _) = h
         .cache
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
@@ -1249,7 +1249,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     assert!(inner.crc_map.load(3).is_some(), "checkpoint recomputed CRC for block 3");
 
     // Second flush succeeds for the remaining 2 blocks.
-    let (stats2, _) = h
+    let (stats2, _, _) = h
         .cache
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
@@ -1289,7 +1289,7 @@ async fn test_crc32_happy_path_multi_cycle() {
         );
     }
 
-    let (stats1, _) = h
+    let (stats1, _, _) = h
         .cache
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
@@ -1326,7 +1326,7 @@ async fn test_crc32_happy_path_multi_cycle() {
         );
     }
 
-    let (stats2, _) = h
+    let (stats2, _, _) = h
         .cache
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
@@ -1397,7 +1397,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         tasks.spawn(async move {
             for _ in 0..10 {
                 cache.local_checkpoint().await.unwrap();
-                let (stats, _) = cache.flush_packs(&cs, &cmc, &vm, &cc).await.unwrap();
+                let (stats, _, _) = cache.flush_packs(&cs, &cmc, &vm, &cc).await.unwrap();
                 corrupted.fetch_add(
                     stats.blocks_corrupted as u64,
                     std::sync::atomic::Ordering::Relaxed,

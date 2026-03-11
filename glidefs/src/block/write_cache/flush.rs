@@ -508,13 +508,16 @@ impl WriteCache<Active> {
     /// append pack_id to VolumeManifest, CAS SYNCING→CLEAN.
     ///
     /// Returns (stats, seq_cutpoint) on success.
+    /// Returns (stats, seq_cutpoint, evicted_blocks) on success.
+    /// evicted_blocks have been CAS'd CLEAN→NOT_PRESENT but NOT yet PUNCH_HOLE'd.
+    /// Caller MUST checkpoint (persist NOT_PRESENT state) before calling punch_evicted.
     async fn flush_dirty_inner(
         &self,
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: &Arc<dyn BlockCache>,
-    ) -> Result<(FlushStats, u64), CacheError> {
+    ) -> Result<(FlushStats, u64, Vec<usize>), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
 
         // Claim dirty blocks: CAS DIRTY→SYNCING.
@@ -527,7 +530,7 @@ impl WriteCache<Active> {
 
         if snapshot.is_empty() {
             debug!("flush: no dirty blocks to flush");
-            return Ok((FlushStats::default(), seq_cutpoint));
+            return Ok((FlushStats::default(), seq_cutpoint, Vec::new()));
         }
 
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
@@ -542,7 +545,7 @@ impl WriteCache<Active> {
             }
         }
 
-        result.map(|stats| (stats, seq_cutpoint))
+        result.map(|(stats, evicted)| (stats, seq_cutpoint, evicted))
     }
 
     /// Inner body of flush_dirty_inner, factored out for error recovery.
@@ -558,7 +561,7 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: &Arc<dyn BlockCache>,
-    ) -> Result<FlushStats, CacheError> {
+    ) -> Result<(FlushStats, Vec<usize>), CacheError> {
         use crate::block::pack::new_pack_id;
 
         // Partition dirty blocks by chunk
@@ -738,29 +741,66 @@ impl WriteCache<Active> {
             }
         }
 
-        // Evict flushed blocks: CAS CLEAN→NOT_PRESENT + PUNCH_HOLE.
+        // Evict flushed blocks: CAS CLEAN→NOT_PRESENT.
         // Block data is already in foyer (inserted during compute phase).
-        // Coalesce contiguous ranges for batch PUNCH_HOLE.
+        //
+        // PUNCH_HOLE is deferred until after checkpoint persists the NOT_PRESENT
+        // state to disk. This prevents a crash window where metadata says
+        // CLEAN/DIRTY but the data file has holes (PUNCH_HOLE'd). Without this
+        // ordering, crash recovery would re-flush zeros over correct S3 data.
+        let mut evicted_blocks: Vec<usize> = Vec::new();
+        for &idx in &flushed_blocks {
+            if self.inner.transition_clean_to_not_present(idx) {
+                evicted_blocks.push(idx);
+            }
+        }
+
+        let evicted = evicted_blocks.len() as u64;
+
+        info!(
+            blocks_claimed = total_stats.blocks_claimed,
+            blocks_deduped = total_stats.blocks_deduped,
+            blocks_cas_failed = total_stats.blocks_cas_failed,
+            blocks_corrupted = total_stats.blocks_corrupted,
+            packs_uploaded = total_stats.packs_uploaded,
+            bytes_uploaded = total_stats.bytes_uploaded,
+            blocks_evicted = evicted,
+            "flush complete"
+        );
+
+        Ok((total_stats, evicted_blocks))
+    }
+
+    /// PUNCH_HOLE evicted blocks after checkpoint has persisted NOT_PRESENT state.
+    ///
+    /// MUST only be called after checkpoint() — otherwise a crash between
+    /// PUNCH_HOLE and checkpoint would leave metadata thinking blocks are
+    /// present while the data file has holes.
+    ///
+    /// Uses striped write locks to prevent concurrent pwrite from racing
+    /// with PUNCH_HOLE. Coalesces contiguous ranges for fewer syscalls.
+    pub fn punch_evicted(&self, evicted_blocks: &[usize]) {
+        if evicted_blocks.is_empty() {
+            return;
+        }
+
         let block_size = self.inner.config.block_size as u64;
-        let mut evicted = 0u64;
-        let mut sorted_flushed = flushed_blocks.clone();
-        sorted_flushed.sort_unstable();
+        let mut sorted = evicted_blocks.to_vec();
+        sorted.sort_unstable();
 
         let mut range_start: Option<usize> = None;
         let mut range_end: usize = 0;
 
-        for &idx in &sorted_flushed {
-            // Acquire exclusive (write) lock on this block's stripe.
-            // This prevents a concurrent write's pwrite from racing with
-            // our CAS + PUNCH_HOLE sequence. The write path holds a shared
-            // (read) lock on the same stripe across set_present → pwrite →
-            // transition_to_dirty.
+        for &idx in &sorted {
+            // Acquire exclusive lock — prevents concurrent write's pwrite
+            // from racing with our PUNCH_HOLE.
             let stripe = idx % EVICTION_STRIPES;
-            let _eviction_guard = self.inner.eviction_locks[stripe].write();
+            let _guard = self.inner.eviction_locks[stripe].write();
 
-            if !self.inner.transition_clean_to_not_present(idx) {
-                // Block was re-dirtied between SYNCING→CLEAN and now.
-                // Flush the pending range before skipping.
+            // Re-check state: a write may have re-dirtied this block between
+            // the CAS (in flush_dirty_body) and now.
+            if self.inner.state_map.get(idx) != SparseBlockState::NOT_PRESENT {
+                // Block was reclaimed — flush pending range and skip.
                 if let Some(start) = range_start.take() {
                     let offset = start as u64 * block_size;
                     let len = (range_end - start + 1) as u64 * block_size;
@@ -769,22 +809,11 @@ impl WriteCache<Active> {
                 continue;
             }
 
-            evicted += 1;
-
-            // Coalesce contiguous ranges.
-            // PUNCH_HOLE is deferred until we hit a non-contiguous block or
-            // a different stripe, so the write lock covers the CAS but not
-            // necessarily the PUNCH_HOLE for every block in the range.
-            // This is safe: once CAS CLEAN→NOT_PRESENT succeeds, the write
-            // path's set_present would make it CLEAN again, and transition_to_dirty
-            // would make it DIRTY — the data file hole is harmless because the
-            // write path will pwrite fresh data.
             match range_start {
-                Some(_start) if idx == range_end + 1 => {
+                Some(_) if idx == range_end + 1 => {
                     range_end = idx;
                 }
                 Some(start) => {
-                    // Punch the previous range, start a new one
                     let offset = start as u64 * block_size;
                     let len = (range_end - start + 1) as u64 * block_size;
                     let _ = self.inner.data_file.punch_hole(offset, len);
@@ -798,31 +827,18 @@ impl WriteCache<Active> {
             }
         }
 
-        // Punch trailing range
         if let Some(start) = range_start {
             let offset = start as u64 * block_size;
             let len = (range_end - start + 1) as u64 * block_size;
             let _ = self.inner.data_file.punch_hole(offset, len);
         }
-
-        info!(
-            blocks_claimed = total_stats.blocks_claimed,
-            blocks_deduped = total_stats.blocks_deduped,
-            blocks_cas_failed = total_stats.blocks_cas_failed,
-            blocks_corrupted = total_stats.blocks_corrupted,
-            packs_uploaded = total_stats.packs_uploaded,
-            bytes_uploaded = total_stats.bytes_uploaded,
-            blocks_evicted = evicted,
-            "flush complete"
-        );
-
-        Ok(total_stats)
     }
 
     /// Flush dirty blocks to S3 as chunk-scoped GLPK v3 packs (no manifest upload).
     ///
-    /// Returns (stats, seq_cutpoint). Compaction is the caller's responsibility
-    /// and should run outside the flush lock to avoid blocking concurrent flushes.
+    /// Returns (stats, seq_cutpoint, evicted_blocks). Caller MUST call
+    /// checkpoint (via sync_manifest) then punch_evicted(&evicted_blocks)
+    /// to complete the eviction safely.
     #[must_use = "flush errors must be handled to avoid silent data loss"]
     pub async fn flush_packs(
         &self,
@@ -830,7 +846,7 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
-    ) -> Result<(FlushStats, u64), CacheError> {
+    ) -> Result<(FlushStats, u64, Vec<usize>), CacheError> {
         self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await
     }
@@ -876,7 +892,7 @@ impl WriteCache<Active> {
         clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
-        let (stats, _seq_cutpoint) = self
+        let (stats, _seq_cutpoint, evicted) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await?;
         let manifest_bytes = volume_manifest.read().serialize();
@@ -914,7 +930,9 @@ impl WriteCache<Active> {
         if let Some(e) = last_err {
             return Err(e.into());
         }
+        // Checkpoint persists NOT_PRESENT state — MUST happen before PUNCH_HOLE.
         self.checkpoint().await?;
+        self.punch_evicted(&evicted);
         Ok(stats)
     }
 
@@ -929,7 +947,7 @@ impl WriteCache<Active> {
         clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
-        let (stats, seq_cutpoint) = self
+        let (stats, seq_cutpoint, evicted) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await?;
 
@@ -973,6 +991,7 @@ impl WriteCache<Active> {
         };
 
         self.checkpoint().await?;
+        self.punch_evicted(&evicted);
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,

@@ -58,7 +58,7 @@ async fn flush_and_sync(
         .flush_packs(content_store, pack_index_cache, volume_manifest, clean_cache)
         .await
     {
-        Ok((stats, _seq_cutpoint)) => {
+        Ok((stats, _seq_cutpoint, evicted)) => {
             *flush_backoff = Duration::ZERO;
             *last_flush_failure = None;
             metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
@@ -97,6 +97,13 @@ async fn flush_and_sync(
                         }
                     }
                 }
+            }
+
+            // PUNCH_HOLE after checkpoint (inside sync_manifest) persisted
+            // NOT_PRESENT state. Safe even if manifest_synced is false —
+            // sync_manifest's checkpoint runs before the manifest upload.
+            if manifest_synced {
+                cache.punch_evicted(&evicted);
             }
 
             Some(FlushResult {

@@ -522,9 +522,12 @@ impl ExportRouter {
                 continue;
             };
             match cache.flush_packs(cs, cmc, vm, cc).await {
-                Ok((stats, _)) if stats.packs_uploaded > 0 => {
+                Ok((stats, _, evicted)) if stats.packs_uploaded > 0 => {
                     if let Err(e) = cache.sync_manifest(cs, vm).await {
                         warn!(export = %name, error = %e, "pressure flush manifest sync failed");
+                    } else {
+                        // PUNCH_HOLE after checkpoint persists NOT_PRESENT state
+                        cache.punch_evicted(&evicted);
                     }
                     info!(export = %name, packs = stats.packs_uploaded, "pressure flush");
                 }
