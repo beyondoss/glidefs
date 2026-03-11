@@ -724,6 +724,7 @@ async fn test_compaction_old_packs_gc_respects_snapshots() {
         &cs,
         &pack_index_cache,
         &volume_manifest,
+        &cc,
     )
     .await
     .unwrap();
@@ -851,9 +852,10 @@ async fn test_fork_during_compaction_sees_consistent_data() {
         let packs = packs_before.clone();
         let pic = Arc::clone(&pack_index_cache);
         let vm = Arc::clone(&volume_manifest);
+        let cc2 = Arc::clone(&cc);
         let cs_clone = ContentStore::new(Arc::clone(&s3), "test");
         tokio::spawn(async move {
-            compact::compact_chunk(0, &packs, blocks_per_chunk, &cs_clone, &pic, &vm)
+            compact::compact_chunk(0, &packs, blocks_per_chunk, &cs_clone, &pic, &vm, &cc2)
                 .await
                 .unwrap();
             // Sync the compacted manifest to S3
@@ -1245,6 +1247,7 @@ async fn test_compaction_cas_failure_orphan_cleaned_by_gc() {
         &cs,
         &pack_index_cache,
         &volume_manifest,
+        &cc,
     )
     .await
     .unwrap();
@@ -1268,6 +1271,7 @@ async fn test_compaction_cas_failure_orphan_cleaned_by_gc() {
         &cs,
         &pack_index_cache,
         &volume_manifest,
+        &cc,
     )
     .await;
     assert!(

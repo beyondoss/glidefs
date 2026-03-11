@@ -800,7 +800,7 @@ async fn test_concurrent_compaction_and_flush() {
     let vm_clone = Arc::clone(&vm);
     let cc_clone = Arc::clone(&cc);
     let (compact_result, flush_result) = tokio::join!(
-        compact_if_needed(16, 0.5, &cs, &pic, &vm),
+        compact_if_needed(16, 0.5, &cs, &pic, &vm, &cc),
         async {
             // Small yield to let compaction start first
             tokio::task::yield_now().await;
@@ -1064,7 +1064,7 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     };
 
     // First compaction succeeds — replaces [A,B,C,D] with [base_1]
-    let result1 = compact_chunk(0, &pack_ids, blocks_per_chunk, &cs, &pic, &vm).await;
+    let result1 = compact_chunk(0, &pack_ids, blocks_per_chunk, &cs, &pic, &vm, &cc).await;
     assert!(
         result1.is_ok(),
         "first compaction should succeed: {:?}",
@@ -1081,7 +1081,7 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     // the manifest now has [base_1], not [A,B,C,D].
     // compact_chunk uploads a new pack to S3 BEFORE the CAS check,
     // so the uploaded pack becomes an orphan when CAS fails.
-    let result2 = compact_chunk(0, &pack_ids, blocks_per_chunk, &cs, &pic, &vm).await;
+    let result2 = compact_chunk(0, &pack_ids, blocks_per_chunk, &cs, &pic, &vm, &cc).await;
     assert!(
         result2.is_err(),
         "second compaction should fail: pack list prefix diverged"
@@ -1680,7 +1680,7 @@ async fn test_compaction_during_active_writes() {
     });
 
     // Run compaction concurrently
-    let compact_result = compact_if_needed(16, 0.5, &cs, &pic, &vm).await;
+    let compact_result = compact_if_needed(16, 0.5, &cs, &pic, &vm, &cc).await;
 
     write_handle.await.unwrap();
 
@@ -1756,7 +1756,7 @@ async fn test_compaction_crash_midway() {
 
     // Run compaction — this uploads a new base pack and updates the manifest
     let blocks_per_chunk = vm.read().blocks_per_chunk();
-    let result = compact_chunk(0, &packs_before, blocks_per_chunk, &cs, &pic, &vm)
+    let result = compact_chunk(0, &packs_before, blocks_per_chunk, &cs, &pic, &vm, &cc)
         .await
         .unwrap();
 
@@ -1851,7 +1851,7 @@ async fn test_compaction_dedup_correctness() {
     );
 
     // Compact
-    let results = compact_if_needed(1, 0.5, &cs, &pic, &vm).await.unwrap();
+    let results = compact_if_needed(1, 0.5, &cs, &pic, &vm, &cc).await.unwrap();
     assert!(
         !results.is_empty(),
         "compaction should have run (threshold=1, have {} packs)",
@@ -1954,7 +1954,7 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
     let cc_clone = Arc::clone(&cc);
 
     let (compact_result, flush_result) = tokio::join!(
-        compact_if_needed(16, 0.5, &cs, &pic, &vm),
+        compact_if_needed(16, 0.5, &cs, &pic, &vm, &cc),
         async {
             tokio::task::yield_now().await;
             cache_clone.flush_to_s3(&cs_clone, &pic_clone, &vm_clone, &cc_clone).await

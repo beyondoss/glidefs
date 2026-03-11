@@ -13,13 +13,14 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
+use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
 use crate::block::pack::{
     PackId, PackIndexEntry, new_pack_id,
 };
 use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::volume_manifest::VolumeManifest;
-use crate::block::block_map::Blake3Hash;
+use crate::block::block_map::{Blake3Hash, lz4_compress};
 
 use super::CacheError;
 
@@ -109,6 +110,7 @@ pub async fn compact_chunk(
     content_store: &ContentStore,
     pack_index_cache: &Arc<PackIndexCache>,
     volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+    clean_cache: &Arc<dyn BlockCache>,
 ) -> Result<CompactionResult, CacheError> {
     info!(
         chunk_idx,
@@ -205,8 +207,34 @@ pub async fn compact_chunk(
 
     let live_block_count = blocks_to_fetch.len() + zero_tombstones.len();
 
+    // Local-first fetch: try the clean cache (Foyer) before S3.
+    // Foyer stores uncompressed blocks keyed by BLAKE3 hash, so hits
+    // require LZ4 recompression (~40µs/block). Misses fall back to S3
+    // range-reads which return already-compressed data (zero-copy).
+    let mut cache_hits = 0u64;
+    let mut from_cache: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
+    let mut need_s3: Vec<(u32, PackId, Blake3Hash, u32, u32)> = Vec::new();
+
+    for (chunk_offset, pid, hash, pack_offset, comp_length) in blocks_to_fetch {
+        if let Some(raw) = clean_cache.get(&hash).await {
+            from_cache.push((hash, chunk_offset, lz4_compress(&raw)));
+            cache_hits += 1;
+        } else {
+            need_s3.push((chunk_offset, pid, hash, pack_offset, comp_length));
+        }
+    }
+
+    if cache_hits > 0 {
+        debug!(
+            chunk_idx,
+            cache_hits,
+            s3_fetches = need_s3.len(),
+            "compaction: served blocks from clean cache"
+        );
+    }
+
     let fetched_blocks: Vec<FetchResult> =
-        stream::iter(blocks_to_fetch)
+        stream::iter(need_s3)
             .map(|(chunk_offset, pid, hash, pack_offset, comp_length)| {
                 let cs = content_store;
                 async move {
@@ -224,6 +252,7 @@ pub async fn compact_chunk(
     let mut blocks_for_pack: Vec<(Blake3Hash, u32, Vec<u8>)> =
         Vec::with_capacity(live_block_count);
     blocks_for_pack.extend(zero_tombstones);
+    blocks_for_pack.extend(from_cache);
     for result in fetched_blocks {
         blocks_for_pack.push(result?);
     }
@@ -287,6 +316,7 @@ pub async fn compact_if_needed(
     content_store: &ContentStore,
     pack_index_cache: &Arc<PackIndexCache>,
     volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+    clean_cache: &Arc<dyn BlockCache>,
 ) -> Result<Vec<CompactionResult>, CacheError> {
     // Pass 1: collect chunks exceeding pack-count threshold (existing behavior)
     // Pass 2: collect chunks with 2+ packs for dead-ratio evaluation
@@ -356,6 +386,7 @@ pub async fn compact_if_needed(
             content_store,
             pack_index_cache,
             volume_manifest,
+            clean_cache,
         )
         .await
         {

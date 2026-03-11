@@ -37,7 +37,6 @@ pub struct BlockDevice {
 /// Reads use read-through caching: if a block isn't present locally,
 /// it's fetched from S3 on demand.
 ///
-
 /// Transport-agnostic: used by both NBD and ublk frontends.
 pub struct BlockHandler {
     /// The write-behind cache (must be in Active state)

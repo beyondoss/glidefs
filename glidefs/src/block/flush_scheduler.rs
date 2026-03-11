@@ -257,6 +257,7 @@ pub async fn flush_scheduler(
                         &content_store,
                         &pack_index_cache,
                         &volume_manifest,
+                        &clean_cache,
                     )
                     .await
                     {
