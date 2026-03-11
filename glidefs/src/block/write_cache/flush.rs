@@ -611,7 +611,7 @@ impl WriteCache<Active> {
 
         let mut total_stats = FlushStats::default();
         let mut flushed_blocks: Vec<usize> = Vec::new();
-        let mut staged_appends: Vec<(u32, crate::block::pack::PackId, Vec<u32>)> = Vec::new();
+        let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
 
         // Per-chunk flush
         for (chunk_idx, chunk_blocks) in per_chunk {
@@ -707,9 +707,7 @@ impl WriteCache<Active> {
 
             // Stage manifest append (applied after all chunk uploads succeed).
             // This avoids orphaned manifest entries if a later chunk's S3 upload fails.
-            let chunk_offsets: Vec<u32> =
-                index_entries.iter().map(|e| e.chunk_offset).collect();
-            staged_appends.push((chunk_idx, pack_id, chunk_offsets));
+            staged_appends.push((chunk_idx, pack_id));
 
             flushed_blocks.extend(packed_indices);
         }
@@ -718,9 +716,8 @@ impl WriteCache<Active> {
         // Only reached if every chunk upload succeeded.
         if !staged_appends.is_empty() {
             let mut vm = volume_manifest.write();
-            for (chunk_idx, pack_id, ref chunk_offsets) in staged_appends {
+            for (chunk_idx, pack_id) in staged_appends {
                 vm.append_pack(chunk_idx, pack_id);
-                vm.set_block_bits(chunk_idx, chunk_offsets);
             }
         }
 

@@ -1,12 +1,8 @@
-//! Volume manifest v6: binary GLVM format with pack ID lists + block bitmap per chunk.
+//! Volume manifest v5: binary GLVM format with pack ID lists per chunk.
 //!
 //! The volume manifest maps chunk indices to ordered lists of pack IDs.
 //! Stored as binary GLVM at `manifests/{export_name}` in S3.
 //! Sparse: only chunks with written data appear. Absent = all-zero / unwritten.
-//!
-//! v6 changes from v5: per-chunk 1024-bit bitmap tracking which block offsets
-//! have been written to S3. Enables fast zero-return for unwritten offsets
-//! without any pack index resolution.
 //!
 //! v5 changes from v4: pack_count widened from u8 to u16 to avoid silent
 //! truncation when a chunk accumulates 256+ packs (possible if compaction
@@ -19,11 +15,8 @@ use super::pack::PackId;
 /// GLVM magic bytes.
 pub const GLVM_MAGIC: &[u8; 4] = b"GLVM";
 
-/// Volume manifest version 6 (v6: per-chunk block bitmap).
-pub const VOLUME_MANIFEST_VERSION: u16 = 6;
-
-/// Size of the per-chunk block bitmap in bytes (1024 bits = 128 bytes).
-const CHUNK_BITMAP_SIZE: usize = 128;
+/// Volume manifest version 5 (v5: pack_count widened from u8 to u16).
+pub const VOLUME_MANIFEST_VERSION: u16 = 5;
 
 /// Default chunk size for v4: 128 MiB (= 1 ext4 block group).
 pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024 * 1024;
@@ -31,16 +24,12 @@ pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024 * 1024;
 /// GLVM header size in bytes.
 const GLVM_HEADER_SIZE: usize = 32;
 
-/// One chunk's pack list + block bitmap in the manifest.
+/// One chunk's pack list in the v4 manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkEntry {
     /// Ordered pack list: oldest first, newest last (last = highest priority).
     /// After compaction: single entry covering all written blocks.
     pub packs: Vec<PackId>,
-    /// 1024-bit bitmap: bit N set = block offset N has been written to S3.
-    /// Used to short-circuit reads to unwritten offsets (return zeros without
-    /// any pack index resolution).
-    pub bitmap: [u8; CHUNK_BITMAP_SIZE],
 }
 
 /// Volume manifest v4: binary format mapping chunk indices to pack ID lists.
@@ -113,47 +102,6 @@ impl VolumeManifest {
         self.chunks.get(&chunk_idx).map(|e| e.packs.as_slice())
     }
 
-    /// Check if a block offset has been written to S3 (bitmap check).
-    /// Returns false for absent chunks or unset bits.
-    pub fn has_block_in_s3(&self, chunk_idx: u32, block_offset: u32) -> bool {
-        let Some(entry) = self.chunks.get(&chunk_idx) else {
-            return false;
-        };
-        let byte_idx = (block_offset / 8) as usize;
-        let bit_idx = block_offset % 8;
-        byte_idx < CHUNK_BITMAP_SIZE && (entry.bitmap[byte_idx] & (1 << bit_idx)) != 0
-    }
-
-    /// Set bitmap bits for the given block offsets in a chunk.
-    pub fn set_block_bits(&mut self, chunk_idx: u32, offsets: &[u32]) {
-        let Some(entry) = self.chunks.get_mut(&chunk_idx) else {
-            return;
-        };
-        for &offset in offsets {
-            let byte_idx = (offset / 8) as usize;
-            let bit_idx = offset % 8;
-            if byte_idx < CHUNK_BITMAP_SIZE {
-                entry.bitmap[byte_idx] |= 1 << bit_idx;
-            }
-        }
-    }
-
-    /// Rebuild bitmap from scratch: zero all bits, then set the given offsets.
-    /// Used after compaction to reflect only live blocks.
-    pub fn rebuild_bitmap(&mut self, chunk_idx: u32, offsets: &[u32]) {
-        let Some(entry) = self.chunks.get_mut(&chunk_idx) else {
-            return;
-        };
-        entry.bitmap = [0u8; CHUNK_BITMAP_SIZE];
-        for &offset in offsets {
-            let byte_idx = (offset / 8) as usize;
-            let bit_idx = offset % 8;
-            if byte_idx < CHUNK_BITMAP_SIZE {
-                entry.bitmap[byte_idx] |= 1 << bit_idx;
-            }
-        }
-    }
-
     /// Collect all (chunk_idx, pack_id) pairs across the manifest.
     ///
     /// Pairs are structurally unique: each pack_id appears exactly once per chunk.
@@ -175,7 +123,6 @@ impl VolumeManifest {
             .entry(chunk_idx)
             .or_insert_with(|| ChunkEntry {
                 packs: Vec::new(),
-                bitmap: [0u8; CHUNK_BITMAP_SIZE],
             })
             .packs
             .push(pack_id);
@@ -190,10 +137,7 @@ impl VolumeManifest {
         if packs.is_empty() {
             self.chunks.remove(&chunk_idx);
         } else {
-            self.chunks.insert(chunk_idx, ChunkEntry {
-                packs,
-                bitmap: [0u8; CHUNK_BITMAP_SIZE],
-            });
+            self.chunks.insert(chunk_idx, ChunkEntry { packs });
         }
     }
 
@@ -252,7 +196,6 @@ impl VolumeManifest {
     /// Chunk entries (sorted by chunk_idx):
     ///   chunk_idx:    u32 LE
     ///   pack_count:   u16 LE
-    ///   bitmap:       [u8; 128]          (v6+)
     ///   packs:        [u64 LE; pack_count]
     ///
     /// CRC32 trailer: 4 bytes
@@ -262,7 +205,7 @@ impl VolumeManifest {
         let entries_size: usize = self
             .chunks
             .values()
-            .map(|e| 4 + 2 + CHUNK_BITMAP_SIZE + e.packs.len() * 8)
+            .map(|e| 4 + 2 + e.packs.len() * 8) // chunk_idx + pack_count(u16) + packs
             .sum();
         let total = GLVM_HEADER_SIZE + entries_size + 4; // +4 for CRC32
         let mut buf = Vec::with_capacity(total);
@@ -286,7 +229,6 @@ impl VolumeManifest {
             );
             buf.extend_from_slice(&chunk_idx.to_le_bytes());
             buf.extend_from_slice(&(entry.packs.len() as u16).to_le_bytes());
-            buf.extend_from_slice(&entry.bitmap);
             for &pack_id in &entry.packs {
                 buf.extend_from_slice(&pack_id.to_le_bytes());
             }
@@ -322,10 +264,9 @@ impl VolumeManifest {
             return Err(VolumeManifestError::BadMagic);
         }
         let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
-        if version != 5 && version != VOLUME_MANIFEST_VERSION {
+        if version != VOLUME_MANIFEST_VERSION {
             return Err(VolumeManifestError::UnsupportedVersion(version as u32));
         }
-        let has_bitmap = version >= 6;
         let chunk_count = u32::from_le_bytes(data[6..10].try_into().unwrap()) as usize;
         let chunk_size = u32::from_le_bytes(data[10..14].try_into().unwrap()) as u64;
         let block_size = u32::from_le_bytes(data[14..18].try_into().unwrap());
@@ -348,19 +289,6 @@ impl VolumeManifest {
                 u16::from_le_bytes(data[pos + 4..pos + 6].try_into().unwrap()) as usize;
             pos += 6;
 
-            let bitmap = if has_bitmap {
-                if pos + CHUNK_BITMAP_SIZE > crc_offset {
-                    return Err(VolumeManifestError::TooShort);
-                }
-                let mut bm = [0u8; CHUNK_BITMAP_SIZE];
-                bm.copy_from_slice(&data[pos..pos + CHUNK_BITMAP_SIZE]);
-                pos += CHUNK_BITMAP_SIZE;
-                bm
-            } else {
-                // v5 backward compat: assume all blocks written (no false negatives)
-                [0xFF; CHUNK_BITMAP_SIZE]
-            };
-
             if pos + pack_count * 8 > crc_offset {
                 return Err(VolumeManifestError::TooShort);
             }
@@ -371,7 +299,7 @@ impl VolumeManifest {
                 pos += 8;
             }
 
-            chunks.insert(chunk_idx, ChunkEntry { packs, bitmap });
+            chunks.insert(chunk_idx, ChunkEntry { packs });
         }
 
         Ok(VolumeManifest {
@@ -441,17 +369,16 @@ mod tests {
     }
 
     #[test]
-    fn test_v6_manifest_size_matches_predictions() {
-        // 1 TB, 50% written, compacted (1 pack/chunk).
+    fn test_v4_manifest_size_matches_predictions() {
+        // 1 TB, 50% written, compacted (1 pack/chunk) = ~53 KB per plan.
         let mut m = VolumeManifest::new(1024 * 1024 * 1024 * 1024, 131072);
         for i in 0..4096 {
             // 50% of 8192 chunks
             m.append_pack(i * 2, 0x1234567890ABCDEF);
         }
         let bytes = m.serialize();
-        // 32 (header) + 4096 * (4 + 2 + 128 + 8) (entries) + 4 (crc)
-        // = 32 + 4096 * 142 + 4 = 32 + 581632 + 4 = 581668
-        assert_eq!(bytes.len(), 581668);
+        // 32 (header) + 4096 * (4 + 2 + 8) (entries) + 4 (crc) = 32 + 57344 + 4 = 57380
+        assert_eq!(bytes.len(), 57380);
 
         // Verify round-trip.
         let m2 = VolumeManifest::deserialize(&bytes).unwrap();
@@ -611,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v6_deserialize_truncated_entry() {
+    fn test_v4_deserialize_truncated_entry() {
         // Serialize a valid manifest, then chop it so the chunk entry data
         // is incomplete. We re-compute the CRC over the truncated payload
         // so that the CRC check passes but entry parsing hits TooShort.
@@ -620,99 +547,14 @@ mod tests {
         m.append_pack(0, 43);
 
         let full = m.serialize();
-        // Keep header + partial entry (chunk_idx + pack_count + partial bitmap).
-        // 6 bytes of chunk_idx+pack_count, but truncate in the bitmap.
-        let body = &full[..GLVM_HEADER_SIZE + 6 + 64]; // only 64 of 128 bitmap bytes
+        // Keep header + partial entry (first 6 bytes = chunk_idx + pack_count,
+        // but not the pack data). Then append a valid CRC for this truncated body.
+        let body = &full[..GLVM_HEADER_SIZE + 6];
         let mut truncated = body.to_vec();
         let crc = crc32fast::hash(&truncated);
         truncated.extend_from_slice(&crc.to_le_bytes());
 
         let err = VolumeManifest::deserialize(&truncated).unwrap_err();
         assert!(matches!(err, VolumeManifestError::TooShort));
-    }
-
-    #[test]
-    fn test_v6_bitmap_set_and_check() {
-        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        m.append_pack(0, 100);
-
-        // Initially all bits are zero.
-        assert!(!m.has_block_in_s3(0, 0));
-        assert!(!m.has_block_in_s3(0, 500));
-        assert!(!m.has_block_in_s3(0, 1023));
-
-        // Absent chunk returns false.
-        assert!(!m.has_block_in_s3(1, 0));
-
-        // Set some bits.
-        m.set_block_bits(0, &[0, 500, 1023]);
-        assert!(m.has_block_in_s3(0, 0));
-        assert!(m.has_block_in_s3(0, 500));
-        assert!(m.has_block_in_s3(0, 1023));
-        assert!(!m.has_block_in_s3(0, 1));
-        assert!(!m.has_block_in_s3(0, 501));
-    }
-
-    #[test]
-    fn test_v6_bitmap_rebuild() {
-        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        m.append_pack(0, 100);
-        m.set_block_bits(0, &[0, 1, 2, 3, 100, 200, 300]);
-
-        // Rebuild with subset — old bits should be cleared.
-        m.rebuild_bitmap(0, &[100, 200]);
-        assert!(!m.has_block_in_s3(0, 0));
-        assert!(!m.has_block_in_s3(0, 1));
-        assert!(!m.has_block_in_s3(0, 300));
-        assert!(m.has_block_in_s3(0, 100));
-        assert!(m.has_block_in_s3(0, 200));
-    }
-
-    #[test]
-    fn test_v6_bitmap_round_trip() {
-        let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        m.append_pack(0, 100);
-        m.set_block_bits(0, &[0, 7, 8, 15, 16, 255, 512, 1023]);
-        m.append_pack(5, 200);
-        m.set_block_bits(5, &[42]);
-
-        let bytes = m.serialize();
-        let m2 = VolumeManifest::deserialize(&bytes).unwrap();
-        assert_eq!(m, m2);
-
-        // Verify bitmap survived round-trip.
-        assert!(m2.has_block_in_s3(0, 0));
-        assert!(m2.has_block_in_s3(0, 7));
-        assert!(m2.has_block_in_s3(0, 1023));
-        assert!(!m2.has_block_in_s3(0, 1));
-        assert!(m2.has_block_in_s3(5, 42));
-        assert!(!m2.has_block_in_s3(5, 43));
-    }
-
-    #[test]
-    fn test_v5_backward_compat_all_ones_bitmap() {
-        // Manually build a v5-format manifest (no bitmap).
-        let mut buf = Vec::new();
-        buf.extend_from_slice(GLVM_MAGIC);
-        buf.extend_from_slice(&5u16.to_le_bytes()); // v5
-        buf.extend_from_slice(&1u32.to_le_bytes()); // 1 chunk
-        buf.extend_from_slice(&(DEFAULT_CHUNK_SIZE as u32).to_le_bytes());
-        buf.extend_from_slice(&131072u32.to_le_bytes());
-        buf.extend_from_slice(&(1024u64 * 1024 * 1024).to_le_bytes());
-        buf.extend_from_slice(&[0u8; 6]); // reserved
-        // Chunk entry: chunk_idx=0, pack_count=1, pack_id=42
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(&1u16.to_le_bytes());
-        buf.extend_from_slice(&42u64.to_le_bytes());
-        // CRC
-        let crc = crc32fast::hash(&buf);
-        buf.extend_from_slice(&crc.to_le_bytes());
-
-        let m = VolumeManifest::deserialize(&buf).unwrap();
-        assert_eq!(m.chunk_pack_ids(0), Some([42].as_slice()));
-        // v5 backward compat: all bits set (conservative).
-        assert!(m.has_block_in_s3(0, 0));
-        assert!(m.has_block_in_s3(0, 500));
-        assert!(m.has_block_in_s3(0, 1023));
     }
 }
