@@ -1056,14 +1056,15 @@ async fn test_concurrent_flush_write_s3_convergence() {
         "all blocks clean after final flush"
     );
 
-    // Verify reads through S3 return the correct final data.
-    // Use a fresh clean_cache to force resolution through S3 packs.
+    // Verify reads through S3/foyer return the correct final data.
+    // After eviction, blocks are NOT_PRESENT on SSD — read through the
+    // full tiered path (foyer → S3 packs) to verify correctness.
     let verify_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
     let metrics = crate::block::metrics::ExportMetrics::new();
-    for block_idx in 0u64..10 {
-        let final_ssd = cache.read_local(block_idx * 4096, 4096).unwrap();
+    for writer_id in 0..5u8 {
+        let block_idx = writer_id as u64 * 2;
+        let expected_fill = writer_id * 10 + 9; // last round
 
-        // Read through full S3 path
         let s3_data = cache
             .read(
                 block_idx * 4096,
@@ -1077,12 +1078,14 @@ async fn test_concurrent_flush_write_s3_convergence() {
             .await
             .unwrap();
 
-        assert_eq!(
-            &s3_data[..],
-            &final_ssd[..],
-            "block {} S3 read doesn't match SSD — flush may have committed \
-             a hash for stale data",
+        assert!(
+            s3_data.iter().all(|&b| b == expected_fill),
+            "block {} (writer {}) S3 read expected fill 0x{:02x}, got 0x{:02x} — \
+             flush may have committed a hash for stale data",
             block_idx,
+            writer_id,
+            expected_fill,
+            s3_data[0],
         );
     }
 }

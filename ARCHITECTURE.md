@@ -193,9 +193,9 @@ data file (dirty only) ──► foyer (shared SSD, S3-FIFO eviction) ──► 
 
 This waterfall means the data file is a **dirty-only buffer** — its SSD usage is proportional to the write rate, not the working set. Foyer's S3-FIFO eviction naturally allocates shared SSD proportional to access patterns: active VMs keep blocks warm, idle VMs' blocks get evicted to S3.
 
-### Near-Lock-Free Hot Path
+### Lock-Free Hot Path
 
-The write path uses only a single shared (read) lock — the striped eviction lock (~2ns uncontended). All other coordination is lock-free:
+The write path avoids all locks. Three techniques make this possible:
 
 1. **Positional I/O** (`pread`/`pwrite`): The `SyncFile` wrapper uses POSIX positional I/O, which is atomic per-syscall and doesn't use the file position pointer. No locking needed for concurrent block reads and writes. (`write_cache/inner.rs:SyncFile`)
 
