@@ -244,7 +244,7 @@ pub async fn compact_chunk(
         + (crate::block::pack::TRAILER_SIZE as u64);
 
     // 5. Update manifest: replace N packs with 1, preserving concurrent appends
-    {
+    let tail_packs = {
         let mut vm = volume_manifest.write();
         if !vm.replace_packs_cas(chunk_idx, pack_ids, vec![base_pack_id]) {
             warn!(
@@ -255,13 +255,39 @@ pub async fn compact_chunk(
                 "compaction aborted: concurrent manifest modification",
             )));
         }
-        // Rebuild bitmap: only live (non-tombstone) blocks remain after compaction.
+        // Rebuild bitmap from the compacted pack's live (non-tombstone) blocks.
         let live_offsets: Vec<u32> = index_entries
             .iter()
             .filter(|e| e.comp_length > 0)
             .map(|e| e.chunk_offset)
             .collect();
         vm.rebuild_bitmap(chunk_idx, &live_offsets);
+
+        // Collect tail pack IDs (concurrent appends preserved by replace_packs_cas)
+        // while still holding the write lock — then release before async lookups.
+        vm.chunk_pack_ids(chunk_idx)
+            .map(|packs| if packs.len() > 1 { packs[1..].to_vec() } else { vec![] })
+            .unwrap_or_default()
+    };
+
+    // Preserve bitmap bits for tail packs appended by concurrent flushes.
+    // replace_packs_cas preserves packs appended after our snapshot; their
+    // bitmap bits were set by set_block_bits during flush but rebuild_bitmap
+    // zeroed them. Re-set from the pack index cache.
+    if !tail_packs.is_empty() {
+        let mut tail_offsets = Vec::new();
+        for &pid in &tail_packs {
+            if let Some(entries) = pack_index_cache.get_entries(pid).await {
+                for e in entries.iter() {
+                    if e.comp_length > 0 {
+                        tail_offsets.push(e.chunk_offset);
+                    }
+                }
+            }
+        }
+        if !tail_offsets.is_empty() {
+            volume_manifest.write().set_block_bits(chunk_idx, &tail_offsets);
+        }
     }
 
     // 6. Update PackIndexCache
