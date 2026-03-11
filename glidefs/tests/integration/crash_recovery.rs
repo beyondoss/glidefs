@@ -746,19 +746,15 @@ async fn test_flush_truncates_wal_before_crash() {
             "block 2 data should survive WAL recovery"
         );
 
-        // Blocks 0,1 data should also be on SSD (pwrite'd) even though not dirty
-        let data_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
-        assert_eq!(
-            data_0.as_ref(),
-            &flushed_data_0[..],
-            "block 0 should still be readable from SSD"
+        // Blocks 0,1 were flushed and evicted (NOT_PRESENT after eviction).
+        // They should NOT be present on SSD but remain readable via S3/foyer.
+        assert!(
+            !cache.is_block_present(0),
+            "block 0 should be evicted (NOT_PRESENT) after flush"
         );
-
-        let data_1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
-        assert_eq!(
-            data_1.as_ref(),
-            &flushed_data_1[..],
-            "block 1 should still be readable from SSD"
+        assert!(
+            !cache.is_block_present(1),
+            "block 1 should be evicted (NOT_PRESENT) after flush"
         );
     }
 }
