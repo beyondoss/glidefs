@@ -128,7 +128,7 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 | PackId | 8-byte random `u64` identifying one pack within its chunk. Hex string in S3 key. | Not a UUID. Collision-safe: birthday bound ~4.3 billion per chunk, and chunks see hundreds of IDs over their lifetime |
 | VolumeManifest (GLVM) | Binary file mapping `chunk_idx → [pack_id, ...]`. Sparse: only written chunks appear. The root of an export's metadata. CRC32-protected. | Not the full block index — pack IDs point to self-describing packs that contain the block-level index |
 | ChunkEntry | `Vec<PackId>` for one chunk, ordered oldest-to-newest. After compaction: single entry. | Not block-level index — that lives in each pack's embedded index |
-| PackIndexCache | Two-tier Foyer HybridCache (64 MB memory + 512 MB SSD) keyed by `PackId → Vec<PackIndexEntry>`. Enables block-level resolution without S3 round-trips. | Not the block data itself — only the index entries. Not per-export — shared cache keyed by PackId |
+| PackIndexCache | Two-tier Foyer HybridCache (64 MB memory + 2 GB SSD) keyed by `PackId → CachedPackIndex`. Memory tier holds parsed `Vec<PackIndexEntry>` directly (~100ns). SSD tier stores extent-encoded + zstd-compressed entries (~17B/entry effective, ~39% smaller than raw 28B). Enables block-level resolution without S3 round-trips. | Not the block data itself — only the index entries. Not per-export — shared cache keyed by PackId |
 | Pack Accumulation | Each flush `append_pack`s a new pack_id to the chunk's list. Overwriting the same block creates a new pack; the old pack still exists in S3 until compaction removes it from the manifest and GC deletes it. | Not immediate deletion of old data — compaction + GC handles that |
 | Compaction | Inline merge of N delta packs → 1 base pack after flush. Old pack_ids removed from manifest; GC deletes the S3 objects. | NOT inline pack deletion — compaction only updates the manifest. GC handles the S3 DELETE |
 | Block State Map | Per-block state (NotPresent / Clean / Dirty / Syncing). Lock-free sparse page table with 2-bit packed `AtomicU8`. | Not the data itself — no hashes stored per-block |
@@ -637,7 +637,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 |------|---------|
 | `block/pack.rs` | GLPK format: `stream_pack_to_writer`, `assemble_pack` (tests/bench), `parse_pack_index` (suffix), `PackId = u64`, `PackIndexEntry` |
 | `block/volume_manifest.rs` | Binary GLVM: `VolumeManifest`, `ChunkEntry`, `append_pack`, `replace_packs`, `all_pack_ids`, CRC32 |
-| `block/pack_index_cache.rs` | `PackIndexCache`: Foyer HybridCache keyed by `PackId`; `lookup_block`, `insert_entries`, `known_hashes` |
+| `block/pack_index_cache.rs` | `PackIndexCache`: Foyer HybridCache keyed by `PackId`; extent-encoded + zstd on SSD tier, parsed structs in memory; `lookup_block`, `insert_entries`, `known_hashes` |
 | `block/content_store.rs` | S3 typed I/O: `stream_chunk_pack` (WriteMultipart), `get_chunk_block`, `get_pack_index` (suffix-read), manifests, snapshots |
 | `block/write_cache/flush.rs` | Flush orchestration: CAS claim, rayon compute, per-chunk GLPK streaming upload, manifest append, inline compaction trigger |
 | `block/write_cache/compact.rs` | Inline compaction: merge N delta packs → 1 base pack via `stream_chunk_pack`; `compact_chunk`, `compact_if_needed` |

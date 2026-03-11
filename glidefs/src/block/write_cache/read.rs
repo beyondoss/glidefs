@@ -5,10 +5,14 @@ use tracing::{debug, instrument, warn};
 
 use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
-use crate::block::pack::PackId;
+use crate::block::pack::{PackId, PackIndexEntry};
+use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::state::Active;
 
 use super::{CacheError, WriteCache};
+
+/// Max blocks to prefetch forward within an extent on a single-block S3 fetch.
+const PREFETCH_BLOCKS: usize = 32;
 
 /// Where a block lives after resolution (before S3 fetch).
 enum BlockLocation {
@@ -179,7 +183,7 @@ impl WriteCache<Active> {
         offset: u64,
         len: usize,
         clean_cache: &dyn BlockCache,
-        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        pack_index_cache: &PackIndexCache,
         volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
         content_store: &ContentStore,
         metrics: &super::super::metrics::ExportMetrics,
@@ -235,7 +239,7 @@ impl WriteCache<Active> {
         start_chunk: u64,
         end_chunk: u64,
         clean_cache: &dyn BlockCache,
-        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        pack_index_cache: &PackIndexCache,
         volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
         content_store: &ContentStore,
         metrics: &super::super::metrics::ExportMetrics,
@@ -367,7 +371,7 @@ impl WriteCache<Active> {
         offset: u64,
         len: usize,
         clean_cache: &dyn BlockCache,
-        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        pack_index_cache: &PackIndexCache,
         volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
         content_store: &ContentStore,
         metrics: &super::super::metrics::ExportMetrics,
@@ -536,7 +540,7 @@ impl WriteCache<Active> {
         &self,
         block_index: usize,
         clean_cache: &dyn BlockCache,
-        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        pack_index_cache: &PackIndexCache,
         volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
@@ -694,7 +698,7 @@ impl WriteCache<Active> {
         &self,
         block_index: usize,
         clean_cache: &dyn BlockCache,
-        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        pack_index_cache: &PackIndexCache,
         volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
@@ -743,6 +747,7 @@ impl WriteCache<Active> {
                     expected_hash,
                     pack_offset,
                     comp_length,
+                    pack_index_cache,
                 )
                 .await?;
                 if !is_partial {
@@ -809,6 +814,10 @@ impl WriteCache<Active> {
     }
 
     /// Fetch, decompress, verify, and cache a single block from S3.
+    ///
+    /// When the pack index is cached, extends the S3 range read to prefetch
+    /// up to `PREFETCH_BLOCKS` consecutive blocks within the same extent.
+    /// Prefetch is best-effort: failures don't propagate to the caller.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_single_block(
         content_store: &ContentStore,
@@ -819,12 +828,25 @@ impl WriteCache<Active> {
         expected_hash: crate::block::block_map::Blake3Hash,
         pack_offset: u32,
         comp_length: u32,
+        pack_index_cache: &PackIndexCache,
     ) -> Result<Bytes, CacheError> {
         use crate::block::block_map::{blake3_128, lz4_decompress};
 
+        // Find extent neighbors for prefetching (best-effort, ~100ns memory-tier hit)
+        let prefetch = Self::prefetch_window(
+            pack_index_cache, pack_id, pack_offset,
+        ).await;
+
+        // Extend range to cover prefetch blocks
+        let fetch_length = if let Some(last) = prefetch.last() {
+            (last.offset - pack_offset) + last.comp_length
+        } else {
+            comp_length
+        };
+
         let fetch_start = std::time::Instant::now();
-        let compressed = match content_store
-            .get_chunk_block(chunk_idx, pack_id, pack_offset, comp_length)
+        let raw = match content_store
+            .get_chunk_block(chunk_idx, pack_id, pack_offset, fetch_length)
             .await
         {
             Ok(data) => data,
@@ -836,7 +858,14 @@ impl WriteCache<Active> {
             }
         };
 
-        let decompressed = lz4_decompress(&compressed)
+        if let Some(m) = metrics {
+            m.record_s3_read(raw.len() as u64);
+            m.record_s3_fetch_latency(fetch_start.elapsed());
+        }
+
+        // Decompress + verify target block (hard error on failure)
+        let target_compressed = raw.slice(0..comp_length as usize);
+        let decompressed = lz4_decompress(&target_compressed)
             .map_err(|e| CacheError::DecompressFailed(e.to_string()))?;
 
         let actual_hash = blake3_128(&decompressed);
@@ -847,14 +876,66 @@ impl WriteCache<Active> {
             });
         }
 
-        if let Some(m) = metrics {
-            m.record_s3_read(compressed.len() as u64);
-            m.record_s3_fetch_latency(fetch_start.elapsed());
+        let target_data = Bytes::from(decompressed);
+        clean_cache.insert(expected_hash, target_data.clone());
+
+        // Process prefetched blocks (best-effort: stop on any error)
+        for entry in &prefetch {
+            let local_start = (entry.offset - pack_offset) as usize;
+            let local_end = local_start + entry.comp_length as usize;
+            if local_end > raw.len() {
+                break;
+            }
+
+            let compressed = raw.slice(local_start..local_end);
+            let Ok(decompressed) = lz4_decompress(&compressed) else {
+                break;
+            };
+            let hash = blake3_128(&decompressed);
+            if hash != entry.hash {
+                warn!(
+                    chunk_idx, pack_id, chunk_offset = entry.chunk_offset,
+                    "prefetch block hash mismatch, stopping prefetch"
+                );
+                break;
+            }
+            clean_cache.insert(entry.hash, Bytes::from(decompressed));
         }
 
-        let data = Bytes::from(decompressed);
-        clean_cache.insert(expected_hash, data.clone());
-        Ok(data)
+        Ok(target_data)
+    }
+
+    /// Find blocks to prefetch: consecutive chunk_offsets after the target block
+    /// within the same extent, up to `PREFETCH_BLOCKS`.
+    async fn prefetch_window(
+        pack_index_cache: &PackIndexCache,
+        pack_id: PackId,
+        target_pack_offset: u32,
+    ) -> Vec<PackIndexEntry> {
+        let entries = match pack_index_cache.get_entries(pack_id).await {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+
+        // Find target by pack offset (unique within a pack)
+        let target_pos = match entries.iter().position(|e| e.offset == target_pack_offset) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        // Scan forward: consecutive chunk_offsets = same extent
+        let mut result = Vec::with_capacity(PREFETCH_BLOCKS.min(entries.len() - target_pos));
+        for i in (target_pos + 1)..entries.len() {
+            if entries[i].chunk_offset != entries[i - 1].chunk_offset + 1 {
+                break; // extent boundary
+            }
+            result.push(entries[i].clone());
+            if result.len() >= PREFETCH_BLOCKS {
+                break;
+            }
+        }
+
+        result
     }
 
     /// Fetch multiple blocks from S3 with coalesced range requests.
@@ -1011,7 +1092,7 @@ impl WriteCache<Active> {
     pub async fn prefetch_chunk(
         &self,
         chunk_idx: u32,
-        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        pack_index_cache: &PackIndexCache,
         volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
         content_store: &ContentStore,
     ) -> Result<(), CacheError> {
@@ -1047,7 +1128,7 @@ impl WriteCache<Active> {
     pub async fn prefetch_chunks(
         &self,
         chunk_indices: &[u64],
-        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        pack_index_cache: &PackIndexCache,
         volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
         content_store: &ContentStore,
     ) {
