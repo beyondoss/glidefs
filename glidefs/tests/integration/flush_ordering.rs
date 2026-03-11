@@ -469,6 +469,7 @@ async fn test_manifest_consistency_after_partial_drain() {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache_arc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         for i in 0..block_count {
             let data = vec![(i % 256) as u8; BLOCK_SIZE];
@@ -489,7 +490,7 @@ async fn test_manifest_consistency_after_partial_drain() {
         )));
 
         let result = cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache_arc)
             .await;
         assert!(result.is_err(), "flush should fail after crash");
 
@@ -502,6 +503,7 @@ async fn test_manifest_consistency_after_partial_drain() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
+        let clean_cache_arc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         assert!(
             cache.dirty_block_count() > 0,
@@ -517,7 +519,7 @@ async fn test_manifest_consistency_after_partial_drain() {
         )));
 
         let stats = cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache_arc)
             .await
             .unwrap();
         assert!(stats.packs_uploaded > 0, "should upload recovered blocks");

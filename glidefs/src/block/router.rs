@@ -127,6 +127,7 @@ pub struct ExportState {
     pub content_store: Arc<ContentStore>,
     pub pack_index_cache: Arc<PackIndexCache>,
     pub volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
+    pub clean_cache: Arc<dyn BlockCache>,
     pub readonly: bool,
     pub metrics: Arc<ExportMetrics>,
     /// Original s3_prefix from ExportConfig (None = use export name).
@@ -153,7 +154,7 @@ impl ExportState {
         for _ in 0..MAX_DRAIN_ITERATIONS {
             let stats = self
                 .cache
-                .flush_to_s3(&self.content_store, &self.pack_index_cache, &self.volume_manifest)
+                .flush_to_s3(&self.content_store, &self.pack_index_cache, &self.volume_manifest, &self.clean_cache)
                 .await
                 .map_err(RouterError::Cache)?;
             if stats.blocks_claimed == 0 {
@@ -509,17 +510,18 @@ impl ExportRouter {
                         Arc::clone(&s.content_store),
                         Arc::clone(&s.pack_index_cache),
                         Arc::clone(&s.volume_manifest),
+                        Arc::clone(&s.clean_cache),
                     )
                 })
                 .collect()
         };
         targets.sort_by(|a, b| b.1.cmp(&a.1));
-        for (name, _, cache, cs, cmc, vm) in targets.iter().take(8) {
+        for (name, _, cache, cs, cmc, vm, cc) in targets.iter().take(8) {
             // Skip exports already being flushed (drain, snapshot, scheduler).
             let Ok(_flush_guard) = cache.flush_lock().try_lock() else {
                 continue;
             };
-            match cache.flush_packs(cs, cmc, vm).await {
+            match cache.flush_packs(cs, cmc, vm, cc).await {
                 Ok((stats, _)) if stats.packs_uploaded > 0 => {
                     if let Err(e) = cache.sync_manifest(cs, vm).await {
                         warn!(export = %name, error = %e, "pressure flush manifest sync failed");
@@ -867,12 +869,14 @@ impl ExportRouter {
         let export_name = name.clone();
         let flush_metrics = Arc::clone(&metrics);
         let flush_sem = self.flush_semaphore.clone();
+        let flush_clean_cache = Arc::clone(&clean_cache);
         let flush_handle = spawn_named(&format!("flush-{}", name), async move {
             flush_scheduler(
                 flush_cache,
                 flush_cs,
                 flush_cmc,
                 flush_vm,
+                flush_clean_cache,
                 flush_notify,
                 flush_shutdown_rx,
                 flush_metrics,
@@ -890,6 +894,7 @@ impl ExportRouter {
             content_store,
             pack_index_cache,
             volume_manifest,
+            clean_cache,
             readonly,
             metrics,
             s3_prefix: orig_s3_prefix,
@@ -939,7 +944,7 @@ impl ExportRouter {
 
         // Clone Arc'd components under read lock, then release it so we don't
         // block export lifecycle operations (create/remove/shutdown) during flush.
-        let (cache, content_store, pack_index_cache, volume_manifest) = {
+        let (cache, content_store, pack_index_cache, volume_manifest, clean_cache) = {
             let exports = self.exports.read().await;
             let state = exports
                 .get(name)
@@ -949,12 +954,13 @@ impl ExportRouter {
                 Arc::clone(&state.content_store),
                 Arc::clone(&state.pack_index_cache),
                 Arc::clone(&state.volume_manifest),
+                Arc::clone(&state.clean_cache),
             )
         };
 
         info!("Taking snapshot of export '{}'...", name);
         let result: SnapshotResult = cache
-            .snapshot(&content_store, &pack_index_cache, &volume_manifest)
+            .snapshot(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await
             .map_err(RouterError::Cache)?;
 
@@ -1585,6 +1591,7 @@ impl ExportRouter {
             content_store,
             pack_index_cache,
             volume_manifest,
+            clean_cache,
             metrics,
             flush_shutdown_tx,
             flush_handle,
@@ -1607,7 +1614,7 @@ impl ExportRouter {
         let mut drain_done = false;
         let mut backoff = Duration::from_millis(100);
         for _ in 0..MAX_DRAIN_ITERATIONS {
-            match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
+            match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache).await {
                 Ok(stats) if stats.blocks_claimed == 0 => {
                     drain_done = true;
                     break;

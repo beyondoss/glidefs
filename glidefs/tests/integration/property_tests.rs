@@ -48,7 +48,7 @@ proptest! {
             prop_assert_eq!(read_data.as_ref(), &data[..], "Local read mismatch");
 
             // Flush to S3
-            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
+            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache).await.unwrap();
 
             // Read from fresh cache (S3 fetch)
             drop(cache);
@@ -95,7 +95,7 @@ proptest! {
             prop_assert_eq!(read_data.as_ref(), &expected[..], "Last write should win");
 
             // Also verify after S3 roundtrip
-            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
+            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache).await.unwrap();
 
             drop(cache);
             let temp_dir2 = TempDir::new().unwrap();
@@ -148,7 +148,7 @@ proptest! {
             }
 
             // Verify after S3 roundtrip
-            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
+            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache).await.unwrap();
 
             drop(cache);
             let temp_dir2 = TempDir::new().unwrap();
@@ -205,7 +205,7 @@ proptest! {
             cache.write(offset, &data, clean_cache.as_ref()).unwrap();
 
             // Flush and verify
-            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
+            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache).await.unwrap();
 
             drop(cache);
             let temp_dir2 = TempDir::new().unwrap();
@@ -311,7 +311,7 @@ proptest! {
             cache.write(offset, &zeros, clean_cache.as_ref()).unwrap();
 
             // Flush (zero-block optimization may skip S3 write)
-            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
+            cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache).await.unwrap();
 
             // Read from fresh cache
             drop(cache);
@@ -366,7 +366,7 @@ async fn test_multi_batch_writes() {
     }
 
     // Flush all
-    cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
+    cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache).await.unwrap();
 
     // Verify from fresh cache
     drop(cache);
@@ -414,7 +414,7 @@ async fn test_alternating_read_write() {
     }
 
     // Final verification
-    cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
+    cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache).await.unwrap();
     assert_eq!(cache.dirty_block_count(), 0);
 }
 
@@ -434,7 +434,7 @@ async fn test_device_boundary() {
     cache.write(offset, &data, clean_cache.as_ref()).unwrap();
 
     // Flush and verify
-    cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
+    cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache).await.unwrap();
 
     drop(cache);
     let temp_dir2 = TempDir::new().unwrap();

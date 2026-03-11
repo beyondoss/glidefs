@@ -214,7 +214,7 @@ async fn test_ssd_full_flush_frees_dirty_count() {
     );
 
     // Flush to S3
-    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    let stats = cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     assert_eq!(stats.blocks_claimed, 10, "all 10 blocks should be claimed");
 
     // Dirty count should be zero after flush

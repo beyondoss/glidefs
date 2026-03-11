@@ -751,6 +751,7 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        _clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<(FlushStats, u64), CacheError> {
         self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
             .await
@@ -788,12 +789,13 @@ impl WriteCache<Active> {
     /// failures when blocks are already clean but a transient S3 error
     /// prevents the manifest upload.
     #[must_use = "flush errors must be handled to avoid silent data loss"]
-    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
+    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest, _clean_cache))]
     pub async fn flush_to_s3(
         &self,
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        _clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, _seq_cutpoint) = self
@@ -840,12 +842,13 @@ impl WriteCache<Active> {
 
     /// Take a point-in-time snapshot.
     #[must_use = "snapshot errors must be handled"]
-    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
+    #[instrument(skip(self, content_store, pack_index_cache, volume_manifest, _clean_cache))]
     pub async fn snapshot(
         &self,
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        _clean_cache: &Arc<dyn crate::block::cache::BlockCache>,
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, seq_cutpoint) = self

@@ -62,7 +62,7 @@ async fn test_snapshot_persists_versioned_key() {
         create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
-    let result = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
+    let result = cache.snapshot(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
 
     // Snapshot sequence should be listed
     let snapshots = cs.list_snapshots("vm1").await.unwrap();
@@ -88,13 +88,13 @@ async fn test_multiple_snapshots_accumulate() {
         create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
     write_blocks(&cache, 0, 2, 1, cc.as_ref());
-    let r1 = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
+    let r1 = cache.snapshot(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
 
     write_blocks(&cache, 2, 2, 2, cc.as_ref());
-    let r2 = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
+    let r2 = cache.snapshot(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
 
     write_blocks(&cache, 4, 2, 3, cc.as_ref());
-    let r3 = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
+    let r3 = cache.snapshot(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
 
     let snapshots = cs.list_snapshots("vm1").await.unwrap();
     assert_eq!(snapshots, vec![r1.sequence, r2.sequence, r3.sequence]);
@@ -111,7 +111,7 @@ async fn test_sync_manifest_does_not_create_snapshots() {
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
 
     // flush_packs + sync_manifest (the background flush path)
-    let (_stats, _seq) = cache.flush_packs(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
+    let (_stats, _seq) = cache.flush_packs(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
     cache.sync_manifest(&cs, &volume_manifest).await.unwrap();
 
     // No snapshot should be created by sync_manifest
@@ -200,11 +200,11 @@ async fn test_gc_respects_snapshot_packs() {
 
     // Write blocks and snapshot (creates snapshot manifest referencing pack_A)
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
-    let snap = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
+    let snap = cache.snapshot(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
 
     // Overwrite same blocks with different data and flush (creates pack_B)
     write_blocks(&cache, 0, 3, 2, cc.as_ref());
-    cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
+    cache.snapshot(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
 
     // pack_A is no longer referenced by manifests/{name} but IS referenced by the first snapshot.
     // GC should NOT delete pack_A.
@@ -256,7 +256,7 @@ async fn test_delete_snapshot_frees_packs_for_gc() {
     // Write blocks and flush to create live packs
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -451,11 +451,11 @@ async fn test_api_list_and_delete_snapshots() {
 async fn test_snapshot_empty_export() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pack_index_cache, volume_manifest, _cc, _m) =
+    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
         create_test_cache(&dir, "vm1", Arc::clone(&s3) as _).await;
 
     // Snapshot immediately — no writes. Sequence may be 0 (no flushes yet).
-    let result = cache.snapshot(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
+    let result = cache.snapshot(&cs, &pack_index_cache, &volume_manifest, &cc).await.unwrap();
 
     let snapshots = cs.list_snapshots("vm1").await.unwrap();
     assert_eq!(snapshots, vec![result.sequence]);
@@ -683,7 +683,7 @@ async fn test_compaction_old_packs_gc_respects_snapshots() {
     // Flush 1: write blocks → pack A
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -697,7 +697,7 @@ async fn test_compaction_old_packs_gc_respects_snapshots() {
     // Flush 2: overwrite same blocks → pack B
     write_blocks(&cache, 0, 3, 2, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -710,7 +710,7 @@ async fn test_compaction_old_packs_gc_respects_snapshots() {
 
     // Take snapshot — snapshot manifest references both pack A and pack B
     let snap = cache
-        .snapshot(&cs, &pack_index_cache, &volume_manifest)
+        .snapshot(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -771,13 +771,13 @@ async fn test_snapshot_idempotent_when_no_writes() {
     // Write some data and take the first snapshot.
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
     let r1 = cache
-        .snapshot(&cs, &pack_index_cache, &volume_manifest)
+        .snapshot(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
     // Take a second snapshot with no writes in between.
     let r2 = cache
-        .snapshot(&cs, &pack_index_cache, &volume_manifest)
+        .snapshot(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -822,14 +822,14 @@ async fn test_fork_during_compaction_sees_consistent_data() {
     // Flush 1: write blocks → pack A
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
     // Flush 2: overwrite same blocks with seed=2 → pack B (manifest: [A, B])
     write_blocks(&cache, 0, 3, 2, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -931,7 +931,7 @@ async fn test_snapshot_concurrent_with_flush_and_compaction() {
     for round in 0u8..17 {
         write_blocks(&cache, 0, 3, round + 1, cc.as_ref());
         cache
-            .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
             .await
             .unwrap();
     }
@@ -955,10 +955,11 @@ async fn test_snapshot_concurrent_with_flush_and_compaction() {
     let cs2 = ContentStore::new(Arc::clone(&s3), "test");
     let pic2 = Arc::clone(&pack_index_cache);
     let vm2 = Arc::clone(&volume_manifest);
+    let cc2 = Arc::clone(&cc);
 
     let flush_handle = tokio::spawn(async move {
         cache2
-            .flush_to_s3(&cs2, &pic2, &vm2)
+            .flush_to_s3(&cs2, &pic2, &vm2, &cc2)
             .await
     });
 
@@ -967,8 +968,9 @@ async fn test_snapshot_concurrent_with_flush_and_compaction() {
         let cs3 = ContentStore::new(Arc::clone(&s3), "test");
         let pic3 = Arc::clone(&pack_index_cache);
         let vm3 = Arc::clone(&volume_manifest);
+        let cc3 = Arc::clone(&cc);
         tokio::spawn(async move {
-            cache3.snapshot(&cs3, &pic3, &vm3).await
+            cache3.snapshot(&cs3, &pic3, &vm3, &cc3).await
         })
     };
 
@@ -1022,7 +1024,7 @@ async fn test_zero_overwrite_cold_reader_sees_zeros() {
     // Write non-zero data to blocks 0-2
     write_blocks(&cache, 0, 3, 0xAA, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -1034,7 +1036,7 @@ async fn test_zero_overwrite_cold_reader_sees_zeros() {
             .unwrap();
     }
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -1216,14 +1218,14 @@ async fn test_compaction_cas_failure_orphan_cleaned_by_gc() {
     // Flush 1: write blocks → pack A
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
     // Flush 2: overwrite same blocks → pack B (manifest: [A, B])
     write_blocks(&cache, 0, 3, 2, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -1954,20 +1956,20 @@ async fn test_snapshot_gc_race() {
     // Write blocks and flush to create packs
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
     // Take snapshot (pins the packs)
     let snap = cache
-        .snapshot(&cs, &pack_index_cache, &volume_manifest)
+        .snapshot(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
     // Overwrite with new data, flush (creates new packs, old packs only live via snapshot)
     write_blocks(&cache, 0, 3, 2, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -2052,7 +2054,7 @@ async fn test_snapshot_manifest_growth() {
         cache.write(offset as u64, &data, cc.as_ref()).unwrap();
 
         let snap = cache
-            .snapshot(&cs, &pack_index_cache, &volume_manifest)
+            .snapshot(&cs, &pack_index_cache, &volume_manifest, &cc)
             .await
             .unwrap();
         sequences.push(snap.sequence);

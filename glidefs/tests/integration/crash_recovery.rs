@@ -50,18 +50,18 @@ async fn test_metadata_atomicity() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        cache.write(0, &test_data, clean_cache.as_ref()).unwrap();
         cache.save_metadata().unwrap();
 
         cache
-            .write(BLOCK_SIZE as u64, &test_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &test_data, clean_cache.as_ref())
             .unwrap();
         cache.save_metadata().unwrap();
 
         cache
-            .write(2 * BLOCK_SIZE as u64, &test_data, &clean_cache)
+            .write(2 * BLOCK_SIZE as u64, &test_data, clean_cache.as_ref())
             .unwrap();
         cache.save_metadata().unwrap();
     }
@@ -112,8 +112,8 @@ async fn test_leftover_temp_file_ignored() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        cache.write(0, &test_data, clean_cache.as_ref()).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -151,8 +151,8 @@ async fn test_torn_write_temp_file() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        cache.write(0, &test_data, clean_cache.as_ref()).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -218,9 +218,9 @@ async fn test_corrupted_magic_bytes() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         cache
-            .write(0, &vec![0xCC; BLOCK_SIZE], &clean_cache)
+            .write(0, &vec![0xCC; BLOCK_SIZE], clean_cache.as_ref())
             .unwrap();
         cache.save_metadata().unwrap();
     }
@@ -288,8 +288,8 @@ async fn test_repeated_metadata_crash_cycles() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        cache.write(0, &test_data, clean_cache.as_ref()).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -379,9 +379,9 @@ async fn test_write_after_recovery_overwrites() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
-        cache.write(0, &old_data, &clean_cache).unwrap();
+        cache.write(0, &old_data, clean_cache.as_ref()).unwrap();
         cache.save_metadata().unwrap();
         // Crash without flushing to S3
     }
@@ -390,10 +390,10 @@ async fn test_write_after_recovery_overwrites() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Now write new data to the same block (overwrites recovered data)
-        cache.write(0, &new_data, &clean_cache).unwrap();
+        cache.write(0, &new_data, clean_cache.as_ref()).unwrap();
 
         // Flush to S3 via pack path
         let content_store =
@@ -403,7 +403,7 @@ async fn test_write_after_recovery_overwrites() {
             VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
         ));
         cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await
             .unwrap();
     }
@@ -459,11 +459,11 @@ async fn test_wal_recovery_without_metadata_save() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
-        cache.write(0, &block_0_data, &clean_cache).unwrap();
+        cache.write(0, &block_0_data, clean_cache.as_ref()).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &block_1_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &block_1_data, clean_cache.as_ref())
             .unwrap();
 
         assert_eq!(cache.dirty_block_count(), 2);
@@ -476,6 +476,7 @@ async fn test_wal_recovery_without_metadata_save() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Data should be readable from local SSD (pwrite'd before WAL append)
         let data_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
@@ -501,7 +502,7 @@ async fn test_wal_recovery_without_metadata_save() {
             VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
         ));
         let stats = cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await
             .unwrap();
         assert!(stats.packs_uploaded > 0, "should upload recovered blocks");
@@ -577,8 +578,8 @@ async fn test_wal_recovery_multiple_crash_cycles() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
-        cache.write(0, &data_session_1, &clean_cache).unwrap();
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        cache.write(0, &data_session_1, clean_cache.as_ref()).unwrap();
         cache.save_metadata().unwrap();
         // Crash — .meta has block 0 dirty, WAL has block 0 entry
     }
@@ -587,7 +588,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Block 0 should be recovered from metadata (.meta says dirty)
         assert!(
@@ -597,7 +598,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
 
         // Write block 1 (new data) — appends to WAL
         cache
-            .write(BLOCK_SIZE as u64, &data_session_2, &clean_cache)
+            .write(BLOCK_SIZE as u64, &data_session_2, clean_cache.as_ref())
             .unwrap();
 
         // Crash without saving metadata — .meta still has only block 0 dirty
@@ -607,6 +608,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // SSD data should be intact for both blocks
         let read_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
@@ -632,7 +634,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
             VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
         ));
         let stats = cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await
             .unwrap();
         assert_eq!(stats.blocks_claimed, 2, "both blocks should flush to S3");
@@ -691,7 +693,7 @@ async fn test_flush_truncates_wal_before_crash() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         let content_store =
             glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
@@ -701,22 +703,22 @@ async fn test_flush_truncates_wal_before_crash() {
         ));
 
         // Write blocks 0 and 1
-        cache.write(0, &flushed_data_0, &clean_cache).unwrap();
+        cache.write(0, &flushed_data_0, clean_cache.as_ref()).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &flushed_data_1, &clean_cache)
+            .write(BLOCK_SIZE as u64, &flushed_data_1, clean_cache.as_ref())
             .unwrap();
         assert_eq!(cache.dirty_block_count(), 2);
 
         // Flush to S3 — this calls checkpoint() which truncates the WAL
         cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await
             .unwrap();
         assert_eq!(cache.dirty_block_count(), 0, "blocks should be clean after flush");
 
         // Write block 2 — new WAL entry appended after truncation
         cache
-            .write(2 * BLOCK_SIZE as u64, &unflushed_data_2, &clean_cache)
+            .write(2 * BLOCK_SIZE as u64, &unflushed_data_2, clean_cache.as_ref())
             .unwrap();
         assert_eq!(cache.dirty_block_count(), 1);
 
@@ -795,11 +797,11 @@ async fn test_wal_lost_blocks_since_last_checkpoint_are_lost() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        cache.write(0, &test_data, clean_cache.as_ref()).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &test_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &test_data, clean_cache.as_ref())
             .unwrap();
 
         assert_eq!(cache.dirty_block_count(), 2);
@@ -854,12 +856,12 @@ async fn test_wal_lost_preserves_checkpointed_blocks() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Write blocks 0 and 1
-        cache.write(0, &old_data, &clean_cache).unwrap();
+        cache.write(0, &old_data, clean_cache.as_ref()).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &old_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &old_data, clean_cache.as_ref())
             .unwrap();
 
         // Save metadata — blocks 0,1 are now persisted in .meta
@@ -867,7 +869,7 @@ async fn test_wal_lost_preserves_checkpointed_blocks() {
 
         // Write block 2 — WAL entry appended, but no metadata save
         cache
-            .write(2 * BLOCK_SIZE as u64, &new_data, &clean_cache)
+            .write(2 * BLOCK_SIZE as u64, &new_data, clean_cache.as_ref())
             .unwrap();
         assert_eq!(cache.dirty_block_count(), 3);
     }
@@ -880,6 +882,7 @@ async fn test_wal_lost_preserves_checkpointed_blocks() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Blocks 0,1 should survive (from metadata)
         assert_eq!(
@@ -904,7 +907,7 @@ async fn test_wal_lost_preserves_checkpointed_blocks() {
             VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
         ));
         let stats = cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await
             .unwrap();
         assert_eq!(
@@ -937,12 +940,12 @@ async fn test_syncing_blocks_at_crash_become_dirty() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Write 3 blocks — all become DIRTY
         for i in 0..3 {
             cache
-                .write(i as u64 * BLOCK_SIZE as u64, &test_data, &clean_cache)
+                .write(i as u64 * BLOCK_SIZE as u64, &test_data, clean_cache.as_ref())
                 .unwrap();
         }
         assert_eq!(cache.dirty_block_count(), 3);

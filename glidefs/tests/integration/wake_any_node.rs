@@ -39,7 +39,7 @@ async fn test_wake_from_different_node() {
 
     // Flush to S3 (simulates graceful shutdown)
     cache_a
-        .flush_to_s3(&content_store_a, &pack_index_cache_a, &volume_manifest_a)
+        .flush_to_s3(&content_store_a, &pack_index_cache_a, &volume_manifest_a, &clean_cache_a)
         .await
         .unwrap();
 
@@ -147,7 +147,7 @@ async fn test_cache_hit_on_second_read() {
     let data: Vec<u8> = (0..128 * 1024).map(|i| (i % 256) as u8).collect();
     cache.write(0, &data, clean_cache.as_ref()).unwrap();
     cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
 
@@ -211,7 +211,7 @@ async fn test_batch_prefetch_optimization() {
         writer_cache.write(i * 128 * 1024, &data, writer_clean_cache.as_ref()).unwrap();
     }
     writer_cache
-        .flush_to_s3(&writer_content_store, &writer_pack_index_cache, &writer_volume_manifest)
+        .flush_to_s3(&writer_content_store, &writer_pack_index_cache, &writer_volume_manifest, &writer_clean_cache)
         .await
         .unwrap();
     drop(writer_cache);
@@ -280,7 +280,7 @@ async fn test_recovery_after_pack_flush_without_drain() {
     // Critically, we do NOT call flush_to_s3 or drain — this is what happens
     // when the host dies after the scheduler fires but before drain.
     let (stats, _seq_cutpoint) = cache_a
-        .flush_packs(&content_store_a, &pack_index_cache_a, &volume_manifest_a)
+        .flush_packs(&content_store_a, &pack_index_cache_a, &volume_manifest_a, &clean_cache_a)
         .await
         .unwrap();
     assert!(stats.packs_uploaded > 0, "should have uploaded packs");

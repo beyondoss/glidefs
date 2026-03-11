@@ -199,7 +199,7 @@ async fn test_crash_mid_flush_concurrent_writers_no_data_loss() {
         let s3 = Arc::new(CrashingObjectStore::new(0));
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = Arc::new(cache.skip_recovery_for_test());
-        let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         let num_writers = 8u8;
         let blocks_per_writer = 50u32;
@@ -231,9 +231,10 @@ async fn test_crash_mid_flush_concurrent_writers_no_data_loss() {
         )));
 
         let flush_cache = Arc::clone(&cache);
+        let flush_clean_cache = Arc::clone(&clean_cache);
         let flush_handle = tokio::spawn(async move {
             let _ = flush_cache
-                .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+                .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &flush_clean_cache)
                 .await;
         });
 
@@ -350,13 +351,14 @@ async fn test_crash_recover_then_flush_to_s3() {
         let crash_s3 = Arc::new(CrashingObjectStore::new(0));
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache_inner = SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
         // Write 20 blocks
         for i in 0..20u32 {
             let data = make_block_data(0, i, 0);
             cache
-                .write(i as u64 * BLOCK_SIZE as u64, &data, &clean_cache)
+                .write(i as u64 * BLOCK_SIZE as u64, &data, &clean_cache_inner)
                 .unwrap();
             expected_blocks.insert(i, data);
         }
@@ -370,7 +372,7 @@ async fn test_crash_recover_then_flush_to_s3() {
             BLOCK_SIZE as u32,
         )));
         let result = cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await;
         assert!(result.is_err(), "flush should fail");
 
@@ -395,8 +397,9 @@ async fn test_crash_recover_then_flush_to_s3() {
             DEVICE_SIZE,
             BLOCK_SIZE as u32,
         )));
+        let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         let stats = cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await
             .unwrap();
         assert!(stats.packs_uploaded > 0, "should upload recovered blocks");

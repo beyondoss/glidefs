@@ -341,7 +341,7 @@ pub async fn run_bless_oci(
 
     for i in 0..100 {
         let stats = cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await
             .map_err(|e| anyhow::anyhow!("flush failed: {e}"))?;
         if stats.blocks_claimed == 0 {

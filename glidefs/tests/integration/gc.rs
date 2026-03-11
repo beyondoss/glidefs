@@ -74,7 +74,7 @@ async fn test_gc_finds_no_orphans() {
 
     write_blocks(&cache, 0, 5, 0, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -100,7 +100,7 @@ async fn test_gc_deletes_orphaned_packs() {
     // Create live packs via flush
     write_blocks(&cache, 0, 5, 0, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -134,7 +134,7 @@ async fn test_gc_respects_grace_period() {
     // Create live packs
     write_blocks(&cache, 0, 3, 0, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -199,7 +199,7 @@ async fn test_gc_respects_max_deletes() {
     // Create live packs
     write_blocks(&cache, 0, 5, 0, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -242,7 +242,7 @@ async fn test_gc_dry_run() {
     // Create live packs
     write_blocks(&cache, 0, 5, 0, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -278,7 +278,7 @@ async fn test_gc_fork_then_delete_source() {
     // Write and flush parent
     write_blocks(&cache, 0, 5, 0, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -321,7 +321,7 @@ async fn test_gc_manifest_parse_error() {
     // Create a valid VM with packs
     write_blocks(&cache, 0, 3, 0, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -362,7 +362,7 @@ async fn test_gc_concurrent_with_flush() {
     // Create initial packs via flush
     write_blocks(&cache, 0, 5, 1, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -395,7 +395,7 @@ async fn test_gc_concurrent_with_flush() {
 
     let flush_handle = tokio::spawn(async move {
         cache2
-            .flush_to_s3(&cs_flush, &pic2, &vm2)
+            .flush_to_s3(&cs_flush, &pic2, &vm2, &cc)
             .await
             .unwrap()
     });
@@ -459,7 +459,7 @@ async fn test_gc_with_in_flight_multipart_upload() {
     // Create live packs via flush
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
     cache
-        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&cs, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 

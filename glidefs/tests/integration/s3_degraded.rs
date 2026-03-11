@@ -257,7 +257,7 @@ async fn create_cache_with_store(
     ContentStore,
     Arc<glidefs::block::pack_index_cache::PackIndexCache>,
     Arc<parking_lot::RwLock<VolumeManifest>>,
-    Arc<SimpleBlockCache>,
+    Arc<dyn glidefs::block::cache::BlockCache>,
     Arc<ExportMetrics>,
 ) {
     let config = WriteCacheConfig {
@@ -275,7 +275,7 @@ async fn create_cache_with_store(
         DEVICE_SIZE,
         BLOCK_SIZE as u32,
     )));
-    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("open cache");
     let cache = cache.skip_recovery_for_test();
@@ -325,7 +325,7 @@ async fn test_s3_slow_uploads_dont_block_writes() {
 
     // Flush to S3 — will be slow but should succeed
     let flush_start = Instant::now();
-    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    let stats = cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     let flush_duration = flush_start.elapsed();
 
     assert_eq!(stats.blocks_claimed, 10);
@@ -399,7 +399,7 @@ async fn test_s3_slow_downloads_bounded_latency() {
                 )
                 .unwrap();
         }
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
         let manifest_bytes = vm.read().serialize();
         cs.put_manifest("slow-download", manifest_bytes, None)
             .await
@@ -487,7 +487,7 @@ async fn test_s3_intermittent_failures_eventual_success() {
 
     // First flush attempt may partially succeed or fail entirely
     for attempt in 0..10 {
-        match cache.flush_to_s3(&cs, &pic, &vm).await {
+        match cache.flush_to_s3(&cs, &pic, &vm, &cc).await {
             Ok(_stats) => {
                 if cache.dirty_block_count() == 0 {
                     break;
@@ -575,7 +575,7 @@ async fn test_s3_download_semaphore_exhaustion() {
                 .unwrap();
         }
 
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
         let manifest_bytes = vm.read().serialize();
         cs.put_manifest("sem-exhaust", manifest_bytes, None)
             .await
@@ -673,7 +673,7 @@ async fn test_s3_upload_semaphore_exhaustion() {
         DEVICE_SIZE,
         BLOCK_SIZE as u32,
     )));
-    let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let cc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
     let _metrics = Arc::new(ExportMetrics::new());
 
     let cache = WriteCache::open(config).unwrap();
@@ -691,7 +691,7 @@ async fn test_s3_upload_semaphore_exhaustion() {
     }
 
     // Flush — semaphore allows only 1 concurrent upload, but all packs should succeed
-    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    let stats = cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     assert_eq!(stats.blocks_claimed, 50, "all 50 blocks should be claimed");
     assert_eq!(cache.dirty_block_count(), 0, "no dirty blocks after flush");
 
@@ -752,7 +752,7 @@ async fn test_s3_manifest_put_fails_after_pack_upload() {
     }
 
     // Flush packs to S3 (should succeed — failures disabled)
-    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    let stats = cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     assert_eq!(stats.blocks_claimed, 10);
 
     // Now fail the manifest PUT

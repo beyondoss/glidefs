@@ -28,7 +28,7 @@ use std::sync::{Arc, LazyLock};
 use object_store::ObjectStore;
 use tempfile::TempDir;
 
-use glidefs::block::cache::SimpleBlockCache;
+use glidefs::block::cache::{BlockCache, SimpleBlockCache};
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::metrics::ExportMetrics;
 use glidefs::block::pack_index_cache::PackIndexCache;
@@ -77,7 +77,7 @@ pub async fn create_test_cache(
     ContentStore,
     Arc<PackIndexCache>,
     Arc<parking_lot::RwLock<VolumeManifest>>,
-    Arc<SimpleBlockCache>,
+    Arc<dyn BlockCache>,
     Arc<ExportMetrics>,
 ) {
     let config = WriteCacheConfig {
@@ -94,7 +94,7 @@ pub async fn create_test_cache(
     let volume_manifest = Arc::new(parking_lot::RwLock::new(
         VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
     ));
-    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
     let cache = cache.skip_recovery_for_test();
@@ -123,7 +123,7 @@ pub async fn create_cold_reader(
     ContentStore,
     Arc<PackIndexCache>,
     Arc<parking_lot::RwLock<VolumeManifest>>,
-    Arc<SimpleBlockCache>,
+    Arc<dyn BlockCache>,
     Arc<ExportMetrics>,
 ) {
     let content_store = ContentStore::new(Arc::clone(&s3), "test");
@@ -148,7 +148,7 @@ pub async fn create_cold_reader(
     };
 
     let metrics = Arc::new(ExportMetrics::new());
-    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open_fresh_active(config)
         .expect("Failed to open fresh cache for cold reader");

@@ -279,7 +279,7 @@ async fn create_cache_with_store(
     ContentStore,
     Arc<PackIndexCache>,
     Arc<parking_lot::RwLock<VolumeManifest>>,
-    Arc<SimpleBlockCache>,
+    Arc<dyn glidefs::block::cache::BlockCache>,
     Arc<ExportMetrics>,
 ) {
     super::create_test_cache(temp_dir, name, s3).await
@@ -295,7 +295,7 @@ async fn create_reader(
     ContentStore,
     Arc<PackIndexCache>,
     Arc<parking_lot::RwLock<VolumeManifest>>,
-    Arc<SimpleBlockCache>,
+    Arc<dyn glidefs::block::cache::BlockCache>,
     Arc<ExportMetrics>,
 ) {
     super::create_cold_reader(temp_dir, name, s3).await
@@ -487,7 +487,7 @@ async fn test_s3_data_corruption_detected_by_blake3() {
     // Write distinct data
     let data = vec![0x42; BLOCK_SIZE];
     cache.write(0, &data, cc.as_ref()).unwrap();
-    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     drop(cache);
 
     // Enable corruption on GET responses for chunk pack data
@@ -570,6 +570,7 @@ async fn test_ssd_corruption_detected_during_flush() {
     let cache = cache.skip_recovery_for_test();
 
     let clean = Arc::new(SimpleBlockCache::new(1024));
+    let cc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::clone(&clean) as _;
     let cs = ContentStore::new(Arc::clone(&s3), "test");
     let pic = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
@@ -608,7 +609,7 @@ async fn test_ssd_corruption_detected_during_flush() {
     // Flush — block 1 should be detected as corrupted via CRC32 mismatch.
     // The flush should still succeed for blocks 0 and 2.
     let cache = Arc::new(cache);
-    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    let stats = cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
 
     assert!(
         stats.blocks_corrupted > 0,
@@ -637,7 +638,7 @@ async fn test_ssd_corruption_detected_during_flush() {
     cache.local_checkpoint().await.unwrap();
 
     // Retry flush — should now succeed for the previously-corrupted block
-    let stats2 = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    let stats2 = cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     assert_eq!(
         stats2.blocks_corrupted, 0,
         "no corruption on retry after fix"
@@ -668,7 +669,7 @@ async fn test_pack_index_corruption_returns_error() {
 
     let data = vec![0x42; BLOCK_SIZE];
     cache.write(0, &data, cc.as_ref()).unwrap();
-    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
 
     // Find the pack file in S3 and corrupt the GLIX trailer
     let pack_ids: Vec<u64> = {
@@ -772,7 +773,7 @@ async fn test_concurrent_compaction_and_flush() {
     for i in 0..17u8 {
         let data = vec![i; BLOCK_SIZE];
         cache.write(0, &data, cc.as_ref()).unwrap();
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     }
 
     // Verify chunk 0 has >16 packs
@@ -797,12 +798,13 @@ async fn test_concurrent_compaction_and_flush() {
     let cs_clone = ContentStore::new(Arc::clone(&s3), "test");
     let pic_clone = Arc::clone(&pic);
     let vm_clone = Arc::clone(&vm);
+    let cc_clone = Arc::clone(&cc);
     let (compact_result, flush_result) = tokio::join!(
         compact_if_needed(16, &cs, &pic, &vm),
         async {
             // Small yield to let compaction start first
             tokio::task::yield_now().await;
-            cache_clone.flush_to_s3(&cs_clone, &pic_clone, &vm_clone).await
+            cache_clone.flush_to_s3(&cs_clone, &pic_clone, &vm_clone, &cc_clone).await
         }
     );
 
@@ -934,6 +936,7 @@ async fn test_multipart_finish_failure_preserves_dirty() {
     let cache = cache.skip_recovery_for_test();
 
     let clean = Arc::new(SimpleBlockCache::new(1024));
+    let cc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::clone(&clean) as _;
     let cs = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
     let pic = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
@@ -956,7 +959,7 @@ async fn test_multipart_finish_failure_preserves_dirty() {
     let cache = Arc::new(cache);
 
     // Flush should fail
-    let result = cache.flush_to_s3(&cs, &pic, &vm).await;
+    let result = cache.flush_to_s3(&cs, &pic, &vm, &cc).await;
     assert!(
         result.is_err(),
         "flush should fail when multipart finish fails"
@@ -972,7 +975,7 @@ async fn test_multipart_finish_failure_preserves_dirty() {
     // Disable failure and retry
     s3.set_fail_finish(false);
 
-    let result = cache.flush_to_s3(&cs, &pic, &vm).await;
+    let result = cache.flush_to_s3(&cs, &pic, &vm, &cc).await;
     assert!(
         result.is_ok(),
         "flush should succeed after failure resolved: {:?}",
@@ -1039,7 +1042,7 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     for i in 0..4u8 {
         let data = vec![i; BLOCK_SIZE];
         cache.write(0, &data, cc.as_ref()).unwrap();
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     }
 
     // Snapshot pack list — both "compactions" start from this same stale view
@@ -1235,6 +1238,7 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
     let config = test_config_wal_sync(dir.path(), "manifest-drain-fail");
 
     let clean = Arc::new(SimpleBlockCache::new(1024));
+    let cc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::clone(&clean) as _;
     let cs = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
     let pic = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
@@ -1262,7 +1266,7 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
         // Enable manifest failure — packs will upload fine, manifest save will fail
         s3.set_fail_manifest(true);
 
-        let result = cache.flush_to_s3(&cs, &pic, &vm).await;
+        let result = cache.flush_to_s3(&cs, &pic, &vm, &cc).await;
         assert!(
             result.is_err(),
             "flush_to_s3 should fail when manifest save fails"
@@ -1313,7 +1317,7 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
             DEVICE_SIZE,
             BLOCK_SIZE as u32,
         )));
-        let result = cache.flush_to_s3(&cs, &pic, &vm2).await;
+        let result = cache.flush_to_s3(&cs, &pic, &vm2, &cc).await;
         assert!(
             result.is_ok(),
             "flush_to_s3 should succeed on retry: {:?}",
@@ -1434,8 +1438,9 @@ async fn test_wal_replay_same_block_last_write_wins() {
             DEVICE_SIZE,
             BLOCK_SIZE as u32,
         )));
+        let cc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(1024));
 
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
         drop(cache);
 
         // Cold reader should see data_c
@@ -1499,7 +1504,7 @@ async fn test_concurrent_same_block_no_torn_write() {
     }
 
     // Flush and verify from cold reader
-    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     assert_eq!(cache.dirty_block_count(), 0);
 
     drop(cache);
@@ -1551,7 +1556,7 @@ async fn test_within_batch_dedup_all_offsets_readable() {
     assert_eq!(cache.dirty_block_count(), 4);
 
     // Flush — 4 blocks claimed, 3 deduped (only the first unique hash uploads)
-    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    let stats = cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     assert_eq!(stats.blocks_claimed, 4, "should claim all 4 dirty blocks");
     assert_eq!(stats.blocks_deduped, 3, "3 of 4 identical blocks should be deduped");
     assert_eq!(stats.packs_uploaded, 1, "all 4 blocks should fit in 1 pack");
@@ -1604,7 +1609,7 @@ async fn test_within_batch_dedup_mixed_unique_and_duplicate() {
 
     assert_eq!(cache.dirty_block_count(), 5);
 
-    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    let stats = cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     assert_eq!(stats.blocks_claimed, 5);
     assert_eq!(stats.blocks_deduped, 2, "2 of 3 identical blocks deduped");
 
@@ -1655,7 +1660,7 @@ async fn test_compaction_during_active_writes() {
     for i in 0..17u8 {
         let data = vec![i; BLOCK_SIZE];
         cache.write(0, &data, cc.as_ref()).unwrap();
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     }
 
     // Spawn continuous writes to multiple blocks while compaction runs
@@ -1690,7 +1695,7 @@ async fn test_compaction_during_active_writes() {
     }
 
     // Flush remaining dirty blocks
-    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     assert_eq!(cache.dirty_block_count(), 0, "all blocks should be clean after flush");
 
     // Cold read: verify all blocks have the last written data (0xF0 + 19 = 0x03 wrapping)
@@ -1741,7 +1746,7 @@ async fn test_compaction_crash_midway() {
     for i in 0..3u8 {
         let data = vec![i + 1; BLOCK_SIZE];
         cache.write(0, &data, cc.as_ref()).unwrap();
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     }
     cache.sync_manifest(&cs, &vm).await.unwrap();
 
@@ -1826,7 +1831,7 @@ async fn test_compaction_dedup_correctness() {
 
     // Flush in two batches to create multiple packs
     // (flush_to_s3 creates packs based on blocks_per_pack)
-    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
 
     let _packs_before_compact = vm.read().chunk_pack_ids(0).unwrap().len();
 
@@ -1836,7 +1841,7 @@ async fn test_compaction_dedup_correctness() {
             .write(i * BLOCK_SIZE as u64, &dedup_data, cc.as_ref())
             .unwrap();
     }
-    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
 
     let packs_after_second_flush = vm.read().chunk_pack_ids(0).unwrap().len();
     assert!(
@@ -1920,7 +1925,7 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
                 .write(block_idx * BLOCK_SIZE as u64, &data, cc.as_ref())
                 .unwrap();
         }
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     }
 
     // Verify we have >16 packs before starting
@@ -1946,12 +1951,13 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
     let cs_clone = ContentStore::new(Arc::clone(&s3), "test");
     let pic_clone = Arc::clone(&pic);
     let vm_clone = Arc::clone(&vm);
+    let cc_clone = Arc::clone(&cc);
 
     let (compact_result, flush_result) = tokio::join!(
         compact_if_needed(16, &cs, &pic, &vm),
         async {
             tokio::task::yield_now().await;
-            cache_clone.flush_to_s3(&cs_clone, &pic_clone, &vm_clone).await
+            cache_clone.flush_to_s3(&cs_clone, &pic_clone, &vm_clone, &cc_clone).await
         }
     );
 
@@ -2079,7 +2085,7 @@ async fn test_full_chunk_cold_wake() {
     let volume_manifest = Arc::new(parking_lot::RwLock::new(
         VolumeManifest::new(FULL_CHUNK_DEVICE_SIZE, BLOCK_SIZE as u32),
     ));
-    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
     let metrics = Arc::new(ExportMetrics::new());
 
     let cache = WriteCache::open(config).expect("open cache");
@@ -2103,7 +2109,7 @@ async fn test_full_chunk_cold_wake() {
     // Drain: flush all dirty blocks to S3 + upload manifest
     loop {
         let stats = cache
-            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
             .await
             .unwrap();
         if stats.blocks_claimed == 0 {

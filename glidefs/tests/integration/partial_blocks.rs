@@ -114,7 +114,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
     let cs = ContentStore::new(Arc::clone(&s3), "test");
     let pic = Arc::clone(&*SHARED_PACK_INDEX_CACHE);
     let metrics = Arc::new(ExportMetrics::new());
-    let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let cc: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     // --- Parent: write block 0 of 0xAA, flush to S3 ---
     let parent_dir = TempDir::new().unwrap();
@@ -122,7 +122,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
         let (cache, cs2, pic2, vm, cc2, _m) =
             super::create_test_cache(&parent_dir, "parent", Arc::clone(&s3)).await;
         cache.write(0, &vec![0xAA; BLOCK_SIZE], cc2.as_ref()).unwrap();
-        cache.flush_to_s3(&cs2, &pic2, &vm).await.unwrap();
+        cache.flush_to_s3(&cs2, &pic2, &vm, &cc).await.unwrap();
         let manifest_bytes = vm.read().serialize();
         cs.put_manifest("parent", manifest_bytes, None).await.unwrap();
         vm
@@ -157,7 +157,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
     );
 
     // Flush — block 0 is partial, so it must be skipped (counted as cas_failed)
-    cache.flush_to_s3(&cs, &pic, &child_vm).await.unwrap();
+    cache.flush_to_s3(&cs, &pic, &child_vm, &cc).await.unwrap();
     assert!(
         cache.dirty_block_count() > 0,
         "partial block should remain dirty after flush — was incorrectly uploaded"
@@ -193,7 +193,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
     );
 
     // Now flush should succeed and block should become clean
-    cache.flush_to_s3(&cs, &pic, &child_vm).await.unwrap();
+    cache.flush_to_s3(&cs, &pic, &child_vm, &cc).await.unwrap();
     assert_eq!(
         cache.dirty_block_count(),
         0,
@@ -332,7 +332,7 @@ async fn test_partial_block_crash_after_checkpoint_recovery() {
 /// crash and the block is dirty after recovery.
 #[tokio::test]
 async fn test_partial_block_crash_during_backfill() {
-    let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let cc: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     // --- Fork child: write sub-block, checkpoint, then crash ---
     // This simulates: sub-block write triggers backfill, but crash happens
@@ -420,7 +420,7 @@ async fn test_partial_block_concurrent_write_same_subregion() {
     let cs = ContentStore::new(Arc::clone(&s3), "test");
     let pic = Arc::clone(&*SHARED_PACK_INDEX_CACHE);
     let metrics = Arc::new(ExportMetrics::new());
-    let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let cc: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     // --- Parent: write block 0 with 0xAA, flush to S3 ---
     let parent_dir = TempDir::new().unwrap();
@@ -430,7 +430,7 @@ async fn test_partial_block_concurrent_write_same_subregion() {
         cache
             .write(0, &vec![0xAA; BLOCK_SIZE], cc2.as_ref())
             .unwrap();
-        cache.flush_to_s3(&cs2, &pic2, &vm).await.unwrap();
+        cache.flush_to_s3(&cs2, &pic2, &vm, &cc).await.unwrap();
         let manifest_bytes = vm.read().serialize();
         cs.put_manifest("parent2", manifest_bytes, None).await.unwrap();
     }
@@ -697,7 +697,7 @@ async fn test_partial_block_cap_overflow() {
                 .write(i * BLOCK_SIZE as u64, &vec![fill; BLOCK_SIZE], cc.as_ref())
                 .unwrap();
         }
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
         vm.read().clone()
     };
 

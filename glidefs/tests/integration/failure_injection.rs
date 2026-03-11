@@ -187,7 +187,7 @@ async fn create_test_cache(
     ContentStore,
     Arc<PackIndexCache>,
     Arc<parking_lot::RwLock<VolumeManifest>>,
-    Arc<SimpleBlockCache>,
+    Arc<dyn glidefs::block::cache::BlockCache>,
     Arc<ExportMetrics>,
 ) {
     let config = WriteCacheConfig {
@@ -205,7 +205,7 @@ async fn create_test_cache(
         DEVICE_SIZE,
         BLOCK_SIZE as u32,
     )));
-    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     let cache = WriteCache::open(config).expect("Failed to open cache");
     let cache = cache.skip_recovery_for_test();
@@ -235,7 +235,7 @@ async fn create_reader_from_manifest(
     ContentStore,
     Arc<PackIndexCache>,
     Arc<parking_lot::RwLock<VolumeManifest>>,
-    Arc<SimpleBlockCache>,
+    Arc<dyn glidefs::block::cache::BlockCache>,
     Arc<ExportMetrics>,
 ) {
     let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
@@ -260,7 +260,7 @@ async fn create_reader_from_manifest(
     let metrics = Arc::new(ExportMetrics::new());
     let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let volume_manifest = Arc::new(parking_lot::RwLock::new(volume_manifest));
-    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let clean_cache: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     // open_fresh_active creates a WriteCache with an empty local block map.
     // read resolves remote data via VolumeManifest + PackIndexCache.
@@ -309,7 +309,7 @@ async fn test_s3_failure_during_sync_marks_blocks_dirty() {
     // Attempt to flush - will fail because pack upload fails.
     // flush_dirty_inner returns Err before CAS-clearing dirty flags.
     let result = cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await;
     assert!(result.is_err(), "Flush should fail when S3 is unavailable");
 
@@ -325,7 +325,7 @@ async fn test_s3_failure_during_sync_marks_blocks_dirty() {
 
     // Now flush should succeed
     let stats = cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
     assert_eq!(
@@ -357,7 +357,7 @@ async fn test_s3_failure_during_read_returns_error() {
         .write(0, &data, writer_clean_cache.as_ref())
         .unwrap();
     writer_cache
-        .flush_to_s3(&writer_content_store, &writer_pack_index_cache, &writer_volume_manifest)
+        .flush_to_s3(&writer_content_store, &writer_pack_index_cache, &writer_volume_manifest, &writer_clean_cache)
         .await
         .unwrap();
     drop(writer_cache);
@@ -421,7 +421,7 @@ async fn test_write_during_sync_preserves_new_data() {
     let data_v1 = vec![0x11; BLOCK_SIZE];
     cache.write(0, &data_v1, clean_cache.as_ref()).unwrap();
     cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
 
@@ -438,7 +438,7 @@ async fn test_write_during_sync_preserves_new_data() {
 
     // Flush the new data
     cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
 
@@ -557,7 +557,7 @@ async fn test_zero_blocks_produce_tombstones() {
 
     // Flush to S3
     let stats = cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
 
@@ -598,7 +598,7 @@ async fn test_mixed_zero_nonzero_batch() {
 
     // Flush
     cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
 
@@ -656,7 +656,7 @@ async fn test_data_integrity_after_failure_recovery() {
     // Enable S3 failures and attempt flush
     s3.set_fail_puts(true);
     let result = cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await;
     assert!(result.is_err(), "First flush should fail");
 
@@ -669,7 +669,7 @@ async fn test_data_integrity_after_failure_recovery() {
     // Disable failures and flush successfully
     s3.set_fail_puts(false);
     cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
 
@@ -732,9 +732,10 @@ async fn test_concurrent_drain_safety() {
         let content_store = Arc::clone(&content_store);
         let pack_index_cache = Arc::clone(&pack_index_cache);
         let volume_manifest = Arc::clone(&volume_manifest);
+        let clean_cache = Arc::clone(&clean_cache);
         handles.push(tokio::spawn(async move {
             let _ = cache
-                .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+                .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
                 .await;
         }));
     }
@@ -815,7 +816,7 @@ async fn test_partial_pack_upload_preserves_dirty() {
 
     // Flush should fail — some packs uploaded, but not all
     let result = cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await;
     assert!(result.is_err(), "flush should fail on partial pack upload");
 
@@ -832,7 +833,7 @@ async fn test_partial_pack_upload_preserves_dirty() {
     s3.set_fail_puts(false);
 
     let stats = cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
 
@@ -898,7 +899,7 @@ async fn test_delete_all_snapshots_returns_ok_on_partial_failure() {
     let data = vec![0xAA; BLOCK_SIZE];
     cache.write(0, &data, clean_cache.as_ref()).unwrap();
     cache
-        .snapshot(&content_store, &pack_index_cache, &volume_manifest)
+        .snapshot(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
 
@@ -907,7 +908,7 @@ async fn test_delete_all_snapshots_returns_ok_on_partial_failure() {
         .write(BLOCK_SIZE as u64, &data, clean_cache.as_ref())
         .unwrap();
     cache
-        .snapshot(&content_store, &pack_index_cache, &volume_manifest)
+        .snapshot(&content_store, &pack_index_cache, &volume_manifest, &clean_cache)
         .await
         .unwrap();
 

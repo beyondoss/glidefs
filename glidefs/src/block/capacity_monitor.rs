@@ -10,8 +10,8 @@
 //! | ≥ 90%       | Escalate — pressure-flush dirtiest exports to S3             |
 //! | < 80%       | Normal — pressure resolved                                   |
 //!
-//! Hole-punching clean blocks was considered and rejected: `fallocate(PUNCH_HOLE)`
-//! races with `pwrite` at the kernel level, risking silent data corruption.
+//! Hole-punching clean blocks is now protected by striped eviction locks
+//! (`eviction_locks` on CacheInner) that prevent `PUNCH_HOLE` / `pwrite` races.
 
 use std::path::Path;
 use std::sync::Arc;

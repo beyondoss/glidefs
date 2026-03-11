@@ -146,6 +146,7 @@ struct V2Harness {
     pack_index_cache: Arc<PackIndexCache>,
     volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
     clean_cache: crate::block::cache::SimpleBlockCache,
+    clean_cache_arc: Arc<dyn crate::block::cache::BlockCache>,
     #[allow(dead_code)]
     dir: TempDir,
 }
@@ -175,6 +176,8 @@ impl V2Harness {
             block_size as u32,
         )));
         let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+        let clean_cache_arc: Arc<dyn crate::block::cache::BlockCache> =
+            Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
         let cache = WriteCache::<Initializing>::open(config).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
         Self {
@@ -183,6 +186,7 @@ impl V2Harness {
             pack_index_cache,
             volume_manifest,
             clean_cache,
+            clean_cache_arc,
             dir,
         }
     }
@@ -195,6 +199,7 @@ impl V2Harness {
                 &self.content_store,
                 &self.pack_index_cache,
                 &self.volume_manifest,
+                &self.clean_cache_arc,
             )
             .await;
         result.unwrap()
@@ -645,6 +650,7 @@ async fn test_snapshot_returns_sequence_and_stats() {
             &h.content_store,
             &h.pack_index_cache,
             &h.volume_manifest,
+            &h.clean_cache_arc,
         )
         .await
         .unwrap();
@@ -675,6 +681,7 @@ async fn test_snapshot_clears_dirty_state() {
             &h.content_store,
             &h.pack_index_cache,
             &h.volume_manifest,
+            &h.clean_cache_arc,
         )
         .await
         .unwrap();
@@ -687,6 +694,7 @@ async fn test_snapshot_clears_dirty_state() {
             &h.content_store,
             &h.pack_index_cache,
             &h.volume_manifest,
+            &h.clean_cache_arc,
         )
         .await
         .unwrap();
@@ -712,6 +720,7 @@ async fn test_snapshot_captures_concurrent_writes() {
             &h.content_store,
             &h.pack_index_cache,
             &h.volume_manifest,
+            &h.clean_cache_arc,
         )
         .await
         .unwrap();
@@ -729,6 +738,7 @@ async fn test_snapshot_captures_concurrent_writes() {
             &h.content_store,
             &h.pack_index_cache,
             &h.volume_manifest,
+            &h.clean_cache_arc,
         )
         .await
         .unwrap();
@@ -837,9 +847,10 @@ async fn test_concurrent_flush_and_writes() {
         let cs = Arc::clone(&content_store);
         let cmc = Arc::clone(&pack_index_cache);
         let vm = Arc::clone(&volume_manifest);
+        let cc = Arc::clone(&clean_cache) as Arc<dyn crate::block::cache::BlockCache>;
         tasks.spawn(async move {
             for _ in 0..5 {
-                let _ = cache.flush_to_s3(&cs, &cmc, &vm).await;
+                let _ = cache.flush_to_s3(&cs, &cmc, &vm, &cc).await;
                 tokio::task::yield_now().await;
             }
         });
@@ -866,8 +877,9 @@ async fn test_concurrent_flush_and_writes() {
     }
 
     // Final flush to capture any remaining dirty blocks
+    let cc: Arc<dyn crate::block::cache::BlockCache> = clean_cache;
     let _stats = cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
 
@@ -1002,9 +1014,10 @@ async fn test_concurrent_flush_write_s3_convergence() {
         let cs = Arc::clone(&content_store);
         let cmc = Arc::clone(&pack_index_cache);
         let vm = Arc::clone(&volume_manifest);
+        let cc = Arc::clone(&clean_cache) as Arc<dyn crate::block::cache::BlockCache>;
         tasks.spawn(async move {
             for _ in 0..5 {
-                let _ = cache.flush_to_s3(&cs, &cmc, &vm).await;
+                let _ = cache.flush_to_s3(&cs, &cmc, &vm, &cc).await;
                 tokio::task::yield_now().await;
             }
         });
@@ -1032,8 +1045,9 @@ async fn test_concurrent_flush_write_s3_convergence() {
     }
 
     // Quiesced final flush — no concurrent writes
+    let cc: Arc<dyn crate::block::cache::BlockCache> = clean_cache;
     let _stats = cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
     assert_eq!(
@@ -1103,7 +1117,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // Flush should detect CRC32 mismatch and skip the block.
     let (stats, _seq) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 1, "should detect 1 corrupted block");
@@ -1129,7 +1143,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // is persistent, the next checkpoint captures the corrupted state.
     let (stats2, _seq) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "no mismatch on second flush");
@@ -1163,7 +1177,7 @@ async fn test_crc32_cleared_on_write() {
     // Flush without a checkpoint in between — no CRC32, verification skipped.
     let (stats, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);
@@ -1208,7 +1222,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Flush: should upload 3 good blocks, skip 2 corrupted.
     let (stats, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 2, "blocks 1 and 3 corrupted");
@@ -1234,7 +1248,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Second flush succeeds for the remaining 2 blocks.
     let (stats2, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0);
@@ -1274,7 +1288,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     let (stats1, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
         .unwrap();
     assert_eq!(stats1.blocks_corrupted, 0, "cycle 1: no corruption");
@@ -1311,7 +1325,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     let (stats2, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, &h.clean_cache_arc)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "cycle 2: no corruption");
@@ -1375,11 +1389,12 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         let cs = Arc::clone(&content_store);
         let cmc = Arc::clone(&pack_index_cache);
         let vm = Arc::clone(&volume_manifest);
+        let cc = Arc::clone(&clean_cache) as Arc<dyn crate::block::cache::BlockCache>;
         let corrupted = Arc::clone(&total_corrupted);
         tasks.spawn(async move {
             for _ in 0..10 {
                 cache.local_checkpoint().await.unwrap();
-                let (stats, _) = cache.flush_packs(&cs, &cmc, &vm).await.unwrap();
+                let (stats, _) = cache.flush_packs(&cs, &cmc, &vm, &cc).await.unwrap();
                 corrupted.fetch_add(
                     stats.blocks_corrupted as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -1417,8 +1432,9 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
 
     // Final quiesced flush to verify convergence.
     cache.local_checkpoint().await.unwrap();
+    let cc: Arc<dyn crate::block::cache::BlockCache> = clean_cache;
     let stats = cache
-        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest, &cc)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);

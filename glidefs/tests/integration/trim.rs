@@ -77,13 +77,13 @@ async fn test_trim_then_flush_to_s3() {
             super::create_test_cache(&writer_dir, "trim-flush", Arc::clone(&s3)).await;
 
         cache.write(0, &vec![0xBB; BLOCK_SIZE], cc.as_ref()).unwrap();
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
 
         // TRIM block 0
         cache.zero_range(0, BLOCK_SIZE as u64).unwrap();
 
         // Flush again — this should create a tombstone (zero block with comp_length=0)
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
 
         // Save manifest
         let manifest_bytes = vm.read().serialize();
@@ -126,7 +126,7 @@ async fn test_trim_fork_semantics() {
         cache
             .write(0, &vec![0xCC; BLOCK_SIZE], cc.as_ref())
             .unwrap();
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
 
         let manifest_bytes = vm.read().serialize();
         cs.put_manifest("trim-fork-parent", manifest_bytes, None)
@@ -148,7 +148,7 @@ async fn test_trim_fork_semantics() {
         let cache = WriteCache::open_fresh_active(config).unwrap();
         let cs = ContentStore::new(Arc::clone(&s3), "test");
         let vm = Arc::new(parking_lot::RwLock::new(parent_manifest));
-        let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let cc: Arc<dyn glidefs::block::cache::BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         let metrics = Arc::new(ExportMetrics::new());
 
         // TRIM block 0 on child
@@ -165,7 +165,7 @@ async fn test_trim_fork_semantics() {
         );
 
         // Flush child to S3 with tombstone
-        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
         let manifest_bytes = vm.read().serialize();
         cs.put_manifest("trim-fork-child", manifest_bytes, None)
             .await
@@ -302,7 +302,7 @@ async fn test_trim_large_range() {
     }
 
     // Flush to S3 — all should create tombstones (zero blocks)
-    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    let stats = cache.flush_to_s3(&cs, &pic, &vm, &cc).await.unwrap();
     // All 800 blocks should be claimed as dirty
     assert_eq!(
         stats.blocks_claimed, num_blocks,
