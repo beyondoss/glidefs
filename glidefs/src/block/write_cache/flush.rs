@@ -493,6 +493,13 @@ impl WriteCache<Active> {
         let active_path = self.inner.config.data_path();
         let flushing_path = self.inner.config.flushing_path();
 
+        // Signal that a flush is active BEFORE rename so the ublk zero-copy path
+        // (resolve_read_plan) stops emitting LocalSsd entries. The io_uring
+        // registered fd points to the pre-rotation file; after rename it still
+        // refers to the flushing file. New DIRTY blocks (in the new active file)
+        // have a different fd, so LocalSsd would read stale data.
+        self.inner.flushing_active.store(true, Ordering::Release);
+
         // Rename active -> flushing (crash recovery boundary)
         std::fs::rename(&active_path, &flushing_path)?;
 
@@ -580,6 +587,7 @@ impl WriteCache<Active> {
             debug!("flush: no dirty blocks to flush");
             // Bottomless: clean up the empty flushing file if we rotated but had no dirty blocks
             if self.inner.bottomless {
+                self.inner.flushing_active.store(false, Ordering::Release);
                 drop(self.inner.flushing_file.lock().take());
                 let flushing_path = self.inner.config.flushing_path();
                 if flushing_path.exists() {
@@ -618,6 +626,7 @@ impl WriteCache<Active> {
                         }
                     }
                 }
+                self.inner.flushing_active.store(false, Ordering::Release);
                 drop(self.inner.flushing_file.lock().take());
                 let flushing_path = self.inner.config.flushing_path();
                 if flushing_path.exists() {
@@ -862,7 +871,10 @@ impl WriteCache<Active> {
                 }
             }
 
-            // Drop flushing file handle and delete the file
+            // Drop flushing file handle and delete the file.
+            // Clear flushing_active BEFORE dropping the file so resolve_read_plan
+            // re-enables LocalSsd only after the cleanup is complete.
+            self.inner.flushing_active.store(false, Ordering::Release);
             drop(self.inner.flushing_file.lock().take());
             let flushing_path = self.inner.config.flushing_path();
             if flushing_path.exists()

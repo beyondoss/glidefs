@@ -382,7 +382,7 @@ impl TestServer {
                 cache_dir: cache_dir.path().to_path_buf(),
                 block_size: 128 * 1024,
                 clean_cache,
-                wal_sync: false, bottomless: false,
+                wal_sync: false, bottomless: true,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
                 default_blocks_per_pack: glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK,
@@ -473,7 +473,7 @@ impl TestServer {
                 cache_dir: cache_dir.clone(),
                 block_size: 128 * 1024,
                 clean_cache,
-                wal_sync: false, bottomless: false,
+                wal_sync: false, bottomless: true,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
                 default_blocks_per_pack: glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK,
@@ -919,6 +919,7 @@ impl TestServer {
 // Test modules (declared after macro so transport_test! is in scope)
 // ---------------------------------------------------------------------------
 
+mod bottomless;
 mod cold_wake;
 mod concurrent;
 mod data_integrity;

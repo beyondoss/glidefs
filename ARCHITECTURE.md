@@ -35,6 +35,7 @@ Guest VM
 WriteCache ──► is_present(block_idx)?
                       │
               ┌── YES ──► SSD pread    ~5µs  (hot path: dirty or clean-SSD)
+              │           (bottomless: SYNCING blocks → flushing file during flush)
               │
               └── NO (not yet written / fork from S3)
                       │
@@ -96,7 +97,12 @@ For each chunk (one pack per chunk per flush cycle):
     │   (manifest now has [old_packs..., new_pack_id])
     │
     ▼
-Phase 3 — Release: CAS SYNCING→CLEAN for each uploaded block
+Phase 3 — Release:
+    ├── Normal mode: CAS SYNCING→CLEAN (blocks stay on SSD)
+    └── Bottomless mode: CAS SYNCING→NOT_PRESENT (evict from SSD)
+            ├── Insert decompressed blocks into CleanCache (S3-FIFO probationary queue)
+            ├── Copy failed/skipped blocks from flushing file to active file
+            └── unlink("{name}.flushing")
     │
     ▼
 Inline compaction: if chunk.packs.len() > threshold (default 16)
@@ -141,6 +147,7 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 | Fork | A new export whose VolumeManifest is copied from a parent's. The fork starts with an empty local SparseStateMap; unwritten blocks resolve through VolumeManifest → PackIndexCache → S3. | Not a full copy — parent pack files are never duplicated |
 | Snapshot Sequence | A monotonic counter (`u64`) that increments on every flush. | Not a timestamp — purely an ordering counter |
 | Manifest Tag | A named alias for a VolumeManifest, stored at `manifests/{tag}`. Forkable by name. | Not a snapshot sequence — not versioned; overwriting updates the pointer |
+| Bottomless | Storage mode where local SSD is a bounded write-back buffer. After flush, blocks are evicted (SYNCING→NOT_PRESENT) and the flushing file is deleted. Reads for evicted blocks go through CleanCache → S3. Enabled by default; disable with `bottomless: false`. | Disabling keeps CLEAN blocks on SSD indefinitely |
 
 ## S3 Object Layout
 
@@ -240,18 +247,69 @@ A lock-free circuit breaker protects against S3 outages. All mutable state is pa
 
 Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N failures within a time window). Only connectivity errors count — business logic errors (404, etc.) don't trip the breaker. (`circuit_breaker.rs`)
 
+## Bottomless Storage
+
+Bottomless mode treats local SSD as a bounded write-back buffer rather than a persistent cache. After each flush to S3, blocks are evicted (SYNCING→NOT_PRESENT) and the flushing file is deleted. SSD footprint per export: `(dirty + syncing) × block_size` — only blocks modified since the last flush consume local space.
+
+### File Rotation
+
+Two files, deterministic naming. Writes accumulate in the active file. At flush time, the active file becomes the flushing file (atomic rename), a new sparse active file is created, and the flush reads from the flushing file. Direct `block_idx × block_size` addressing preserved throughout.
+
+```
+Normal:        {name}.cache          ← active, receives all writes
+During flush:  {name}.cache          ← new active (sparse, receives new writes)
+               {name}.flushing       ← old active (immutable, being uploaded)
+After flush:   {name}.cache          ← active
+               (flushing deleted)
+```
+
+**Rotation sequence** (inside `flush_dirty_inner`, under `flush_lock`):
+
+1. `flushing_active.store(true)` — signals ublk to stop using io_uring registered fd
+2. `rename("{name}.cache", "{name}.flushing")` — crash recovery boundary
+3. Create new sparse `SyncFile` at `"{name}.cache"` (set_len to device_size)
+4. Swap `data_file` RwLock (write-locked briefly, ~2ns read-lock for all I/O)
+5. Store old handle in `flushing_file: Mutex<Option<SyncFile>>`
+6. CAS DIRTY→SYNCING for all dirty blocks
+7. `compute_flush_batch` reads from `flushing_file`
+8. Upload to S3
+9. Finalize: CAS SYNCING→NOT_PRESENT (evict), copy skipped blocks flushing→active
+10. `unlink("{name}.flushing")`, `flushing_active.store(false)`
+
+**SSD footprint**: With 128KB blocks, 500 blocks_per_pack, 5s flush interval: ~64MB active + ~64MB flushing = ~128MB per export during flush. Outside flush: just dirty blocks since last flush.
+
+### Read Path After Eviction
+
+Evicted blocks (NOT_PRESENT) resolve through the standard cold path: VolumeManifest → PackIndexCache → CleanCache → S3. The flush path warms CleanCache with decompressed block data during upload, so the first read after eviction typically hits the S3-FIFO probationary queue (~100ns) rather than making an S3 round-trip.
+
+### Crash Recovery
+
+If a crash occurs mid-flush, the flushing file persists on disk. On startup:
+
+1. `load_metadata()` converts SYNCING→DIRTY (conservative)
+2. If `{name}.flushing` exists: copy all DIRTY block data from flushing file to active file
+3. Delete flushing file
+
+**Invariant**: after recovery, no flushing file exists. All blocks are DIRTY (in active) or NOT_PRESENT (in S3).
+
+### ublk Interaction
+
+The io_uring registered fd (captured at device startup) becomes stale after rotation. `flushing_active: AtomicBool` causes `resolve_read_plan` to skip the `LocalSsd` fast path during flush, falling back to pread via `data_file.read()` (correct fd). Outside flush, zero overhead.
+
 ## Block State Machine
 
 Stored in `SparseStateMap` — a sparse page table with 2-bit packed `AtomicU8` values (4 entries per byte), fully lock-free. Encoding: `NotPresent=0, Clean=1, Dirty=2, Syncing=3`. NotPresent=0 means unallocated pages (and zero bytes within allocated pages) are implicitly "never written" with no memory cost.
 
 ```
 NotPresent ──[write]──► Dirty ──[flush claim]──► Syncing ──[upload OK + no concurrent write]──► Clean
-                           ▲                         │                                              │
-                           └──────[write]────────────┘ (CAS SYNCING→DIRTY)                          │
-                           └──────────────────────────────────[write]───────────────────────────────┘
+     ▲                     ▲                         │                                              │
+     │                     └──────[write]────────────┘ (CAS SYNCING→DIRTY)                          │
+     │                     └──────────────────────────────────[write]───────────────────────────────┘
+     │
+     └──[bottomless: upload OK]── Syncing   (CAS SYNCING→NOT_PRESENT, evict from SSD)
 ```
 
-The flush path uses **SYNCING-based CAS**: a dirty block is atomically claimed (`CAS DIRTY→SYNCING`) before CPU work begins. After upload, `CAS SYNCING→CLEAN` releases it. If a guest write lands during the flush, `transition_to_dirty()` CAS-loops `SYNCING→DIRTY` — the flush's final `CAS SYNCING→CLEAN` then fails, and the block stays Dirty for the next cycle.
+The flush path uses **SYNCING-based CAS**: a dirty block is atomically claimed (`CAS DIRTY→SYNCING`) before CPU work begins. After upload: in normal mode, `CAS SYNCING→CLEAN` releases it; in bottomless mode, `CAS SYNCING→NOT_PRESENT` evicts it. If a guest write lands during the flush, `transition_to_dirty()` CAS-loops `SYNCING→DIRTY` — the flush's final CAS then fails, and the block stays Dirty for the next cycle.
 
 | From | Event | To | Encoding | Notes |
 |------|-------|----|----------|-------|
@@ -259,7 +317,8 @@ The flush path uses **SYNCING-based CAS**: a dirty block is atomically claimed (
 | Clean | Guest write | Dirty | 1 → 2 | Block already on SSD, re-dirtied |
 | Dirty | Flush claim | Syncing | 2 → 3 | `transition_dirty_to_syncing()` — atomic snapshot of dirty block |
 | Syncing | Concurrent guest write | Dirty | 3 → 2 | `transition_to_dirty()` CAS loop; flush's SYNCING→CLEAN will fail |
-| Syncing | Upload success, no concurrent write | Clean | 3 → 1 | `transition_syncing_to_clean()` — CAS fails if write re-dirtied |
+| Syncing | Upload success, no concurrent write | Clean | 3 → 1 | Normal mode: `transition_syncing_to_clean()` — CAS fails if write re-dirtied |
+| Syncing | Upload success, no concurrent write (bottomless) | NotPresent | 3 → 0 | Bottomless: `transition_syncing_to_not_present()` — evict from SSD |
 | Syncing | Upload success, concurrent write | Dirty | — | Final CAS fails; block stays dirty (re-flushed next cycle) |
 | Any | Crash recovery load | Dirty | — | `load_metadata()` converts Syncing→Dirty on startup |
 

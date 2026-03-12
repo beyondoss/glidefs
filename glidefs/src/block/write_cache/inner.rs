@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::block::block_map::{
@@ -263,6 +263,13 @@ pub(crate) struct CacheInner {
     /// Only set during an active flush in bottomless mode. Immutable once set
     /// (no writes, only reads by compute_flush_batch).
     pub(super) flushing_file: parking_lot::Mutex<Option<SyncFile>>,
+
+    /// True while a bottomless flush rotation is in progress (between
+    /// rotate_data_file() and flushing file deletion). Used by resolve_read_plan
+    /// to avoid emitting LocalSsd entries while the io_uring-registered fd
+    /// points to the old file. Relaxed ordering: only needs to be eventually
+    /// visible; the ublk path tolerates a single false-positive pread.
+    pub(super) flushing_active: AtomicBool,
 
     /// Bottomless storage mode: evict blocks after flush, delete flushing file.
     pub(super) bottomless: bool,

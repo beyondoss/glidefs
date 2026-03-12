@@ -2,7 +2,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use tracing::{error, info, instrument, warn};
 
 use crate::block::block_map::{
@@ -145,8 +145,15 @@ impl WriteCache<Initializing> {
         let bottomless = config.bottomless;
 
         // Bottomless crash recovery: if a flushing file exists, we crashed mid-flush.
-        // All SYNCING blocks have data in the flushing file — copy them to the active
-        // file and mark DIRTY so they'll be re-flushed.
+        //
+        // The flushing file is the old active file, renamed atomically as the crash
+        // recovery boundary. All blocks that were DIRTY before rotation have their
+        // data in the flushing file. The new active file is empty (sparse).
+        //
+        // Recovery must copy flushing data back to the active file for all dirty
+        // blocks. Note: `load_metadata` converts SYNCING→DIRTY, so by this point
+        // all blocks appear as DIRTY (not SYNCING) in the state map — we handle
+        // both to be safe regardless of load order.
         let flushing_path = config.flushing_path();
         if flushing_path.exists() {
             info!("found flushing file — recovering from interrupted flush");
@@ -154,7 +161,9 @@ impl WriteCache<Initializing> {
             let block_size = config.block_size;
             let mut recovered = 0usize;
             for (idx, state) in state_map.iter_present() {
-                if state == SparseBlockState::SYNCING {
+                let is_dirty = state == SparseBlockState::DIRTY
+                    || state == SparseBlockState::SYNCING;
+                if is_dirty {
                     let offset = idx as u64 * block_size as u64;
                     let valid_bytes = std::cmp::min(
                         block_size as u64,
@@ -165,8 +174,11 @@ impl WriteCache<Initializing> {
                         flushing_file.read_exact_at(&mut buf, offset)?;
                         data_file.write_all_at(&buf, offset)?;
                     }
+                    // Ensure state is DIRTY (SYNCING was already converted by load_metadata)
                     let _ = state_map.cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY);
-                    dirty_count += 1;
+                    if state == SparseBlockState::SYNCING {
+                        dirty_count += 1;
+                    }
                     recovered += 1;
                 }
             }
@@ -205,6 +217,7 @@ impl WriteCache<Initializing> {
             flush_lock: tokio::sync::Mutex::new(()),
             partial_blocks,
             manifest_etag: parking_lot::Mutex::new(None),
+            flushing_active: AtomicBool::new(false),
         });
 
         info!(
@@ -262,6 +275,7 @@ impl WriteCache<Initializing> {
             flush_lock: tokio::sync::Mutex::new(()),
             partial_blocks: DashMap::new(),
             manifest_etag: parking_lot::Mutex::new(None),
+            flushing_active: AtomicBool::new(false),
         });
 
         info!(bottomless, "cache opened fresh for fork, directly Active");

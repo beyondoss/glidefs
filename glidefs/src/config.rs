@@ -332,9 +332,10 @@ impl NbdConfig {
         self.nbd_dead_conn_timeout.unwrap_or(30)
     }
 
-    /// Whether bottomless storage mode is enabled (default: false).
+    /// Whether bottomless storage mode is enabled (default: true).
+    /// Evicts blocks from local SSD after flush to S3, bounding SSD usage.
     pub fn bottomless(&self) -> bool {
-        self.bottomless.unwrap_or(false)
+        self.bottomless.unwrap_or(true)
     }
 
     /// Get the list of exports, handling legacy single-device config.
