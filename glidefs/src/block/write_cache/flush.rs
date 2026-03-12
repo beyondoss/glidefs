@@ -500,33 +500,11 @@ impl WriteCache<Active> {
         let active_path = self.inner.config.data_path();
         let flushing_path = self.inner.config.flushing_path();
 
-        // Signal that a flush is active BEFORE rename so the ublk zero-copy path
-        // (resolve_read_plan) stops emitting LocalSsd entries and the write path
-        // falls back to pwrite. The io_uring registered fd points to the
-        // pre-rotation file; after rename it refers to the flushing file.
-        //
-        // SeqCst ordering: paired with begin_uring_write() to prevent io_uring
-        // writes from targeting the stale registered fd after rotation.
-        self.inner.flushing_active.store(true, Ordering::SeqCst);
-
-        // Wait for any in-flight io_uring writes to complete before renaming.
-        // begin_uring_write() increments the counter (SeqCst) BEFORE checking
-        // flushing_active. Since we set flushing_active BEFORE this loop, any
-        // write that incremented after our store will see flushing_active=true
-        // and decrement + fall back to pwrite. Writes that incremented before
-        // our store are in-flight on the current (still-correct) fd.
-        #[cfg(all(target_os = "linux", feature = "ublk"))]
-        {
-            let mut spins = 0u32;
-            while self.inner.inflight_uring_writes.load(Ordering::SeqCst) > 0 {
-                spins += 1;
-                if spins < 100 {
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-        }
+        // Signal that a flush rotation is in progress. The ublk read path
+        // checks this to avoid reading SYNCING blocks from the active file
+        // (their data lives in the flushing file). The ublk write path always
+        // uses pwrite via the RwLock'd data_file, so it's unaffected.
+        self.inner.flushing_active.store(true, Ordering::Release);
 
         // Rename active -> flushing (crash recovery boundary)
         std::fs::rename(&active_path, &flushing_path)?;

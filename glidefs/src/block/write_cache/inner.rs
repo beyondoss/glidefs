@@ -267,19 +267,10 @@ pub(crate) struct CacheInner {
     pub(super) flushing_file: parking_lot::Mutex<Option<Arc<SyncFile>>>,
 
     /// True while a flush rotation is in progress (between rotate_data_file()
-    /// and flushing file deletion). Used by resolve_read_plan to avoid emitting
-    /// LocalSsd entries, and by the ublk write path to fall back to pwrite,
-    /// while the io_uring-registered fd points to the old file.
+    /// and flushing file deletion). Used by the read path to avoid reading
+    /// SYNCING blocks from the active file (their data lives in the flushing
+    /// file during flush).
     pub(super) flushing_active: AtomicBool,
-
-    /// Number of in-flight io_uring writes using the registered fd.
-    ///
-    /// The ublk zero-copy write path increments this (SeqCst) before checking
-    /// `flushing_active`. `rotate_data_file` sets `flushing_active = true`
-    /// (SeqCst) then waits for this counter to drain before renaming the file.
-    /// This ensures no io_uring write can target a stale fd after rotation.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
-    pub(crate) inflight_uring_writes: AtomicU64,
 
     /// Sparse block state map - LOCK-FREE
     /// Combines block state and presence into a single sparse page table.
@@ -377,36 +368,10 @@ impl CacheInner {
         self.data_file.read().as_raw_fd()
     }
 
-    /// Try to begin an io_uring write using the registered fd.
-    ///
-    /// Increments `inflight_uring_writes` (SeqCst) then checks `flushing_active`.
-    /// If flushing is active, decrements the counter and returns `false` — the
-    /// caller must fall back to pwrite via the RwLock'd `data_file`.
-    ///
-    /// If this returns `true`, the caller MUST call `end_uring_write()` after
-    /// the io_uring write completes.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
-    #[inline]
-    pub(crate) fn begin_uring_write(&self) -> bool {
-        self.inflight_uring_writes.fetch_add(1, Ordering::SeqCst);
-        if self.flushing_active.load(Ordering::SeqCst) {
-            self.inflight_uring_writes.fetch_sub(1, Ordering::SeqCst);
-            false
-        } else {
-            true
-        }
-    }
-
-    /// Signal that an io_uring write using the registered fd has completed.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
-    #[inline]
-    pub(crate) fn end_uring_write(&self) {
-        self.inflight_uring_writes.fetch_sub(1, Ordering::SeqCst);
-    }
-
     /// Write data to the data file via the RwLock'd handle (always correct fd).
     ///
-    /// Used as fallback when the io_uring registered fd is stale during flush.
+    /// Used by the ublk write path — pwrite via the RwLock ensures writes
+    /// always target the current active file, even after file rotation.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     #[inline]
     pub(crate) fn pwrite_data_file(&self, data: &[u8], offset: u64) -> std::io::Result<()> {

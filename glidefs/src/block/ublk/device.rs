@@ -1045,40 +1045,18 @@ async fn handle_write_zc(
         return -e.to_linux_errno();
     }
 
-    // Phase 2: write data to the data file.
+    // Phase 2: write data to the data file via pwrite.
     //
-    // Try the io_uring registered fd (zero-copy fast path). If a flush
-    // rotation is in progress, the registered fd is stale — fall back to
-    // pwrite via the RwLock'd data_file which always has the correct fd.
-    if handler.begin_uring_write() {
-        // Fast path: io_uring Write from bio pages to data file.
-        // types::Fixed(1) = data file fd (registered in tgt_init at fds[1]).
-        let sqe = io_uring::opcode::Write::new(
-            io_uring::types::Fixed(DATA_FILE_FD_INDEX),
-            addr as *const u8,
-            length,
-        )
-        .offset(offset)
-        .build()
-        .flags(io_uring::squeue::Flags::FIXED_FILE);
-
-        let cqe_result = q.ublk_submit_sqe(sqe).await;
-        handler.end_uring_write();
-
-        if cqe_result < 0 {
-            return cqe_result;
-        }
-        if cqe_result as u32 != length {
-            return -libc::EIO;
-        }
-    } else {
-        // Slow path: pwrite via RwLock'd data_file (correct fd during flush).
-        // SAFETY: addr points to kernel-mapped bio pages, valid for the
-        // duration of this I/O request (between get_iod and commit).
-        let data = unsafe { std::slice::from_raw_parts(addr as *const u8, length as usize) };
-        if let Err(e) = handler.pwrite_to_data_file(offset, data) {
-            return -e.to_linux_errno();
-        }
+    // File rotation (bottomless flush) renames the active data file and opens
+    // a new one. The io_uring-registered fd (Fixed) would permanently point to
+    // the old inode after rotation. pwrite via the RwLock'd data_file always
+    // uses the current fd.
+    //
+    // SAFETY: addr points to kernel-mapped bio pages, valid for the
+    // duration of this I/O request (between get_iod and commit).
+    let data = unsafe { std::slice::from_raw_parts(addr as *const u8, length as usize) };
+    if let Err(e) = handler.pwrite_to_data_file(offset, data) {
+        return -e.to_linux_errno();
     }
 
     // Phase 3: commit metadata after data is on disk.
@@ -1127,26 +1105,6 @@ async fn handle_read_zc(
                 // the duration of this I/O request (between get_iod and commit).
                 unsafe {
                     std::ptr::write_bytes(dst_ptr, 0, entry.slice_len);
-                }
-            }
-            ChunkSource::LocalSsd { file_offset } => {
-                // io_uring Read from data file directly into bio pages.
-                let read_offset = file_offset + entry.slice_start as u64;
-                let sqe = io_uring::opcode::Read::new(
-                    io_uring::types::Fixed(DATA_FILE_FD_INDEX),
-                    dst_ptr,
-                    entry.slice_len as u32,
-                )
-                .offset(read_offset)
-                .build()
-                .flags(io_uring::squeue::Flags::FIXED_FILE);
-
-                let cqe_result = q.ublk_submit_sqe(sqe).await;
-                if cqe_result < 0 {
-                    return cqe_result;
-                }
-                if cqe_result as u32 != entry.slice_len as u32 {
-                    return -libc::EIO;
                 }
             }
             ChunkSource::InMemory(data) => {

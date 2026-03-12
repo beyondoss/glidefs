@@ -36,9 +36,7 @@ enum BlockLocation {
 pub enum ChunkSource {
     /// Block is all zeros — memset the destination.
     Zero,
-    /// Block is on local SSD at this file offset — io_uring Read from data file.
-    LocalSsd { file_offset: u64 },
-    /// Block data already in memory (clean cache or S3 fetch) — memcpy to destination.
+    /// Block data already in memory (local pread, clean cache, or S3 fetch) — memcpy to destination.
     InMemory(Bytes),
 }
 
@@ -224,37 +222,14 @@ impl WriteCache<Active> {
         let start_chunk = offset / chunk_size;
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
 
-        // Fast path: all chunks present on local SSD and not partial →
-        // single LocalSsd entry. Collapses N per-chunk SQEs into one io_uring Read.
+        // All reads go through the cold path which uses pread via the RwLock'd
+        // data_file (always correct fd). File rotation (bottomless flush)
+        // renames the active file and opens a new one — the io_uring-registered
+        // fd permanently points to the old inode after the first rotation,
+        // making LocalSsd (Fixed fd) unsafe for all subsequent I/O.
         //
-        // Exclusions during flush:
-        // - SYNCING blocks: data lives in the flushing file, not the active file.
-        // - flushing_active: the io_uring-registered fd points to the old file.
-        //   New DIRTY blocks are in the new active file (different fd). Fall
-        //   through to cold path which preads via RwLock (correct fd).
-        let flush_active =
-            self.inner.flushing_active.load(std::sync::atomic::Ordering::Relaxed);
-        if !flush_active
-            && (start_chunk..=end_chunk).all(|i| {
-                let idx = i as usize;
-                self.inner.is_present(idx)
-                    && !self.inner.is_partial(idx)
-                    && self.inner.state_map.get(idx)
-                        != crate::block::block_map::SparseBlockState::SYNCING
-            })
-        {
-            return Ok(ReadPlan {
-                entries: vec![ChunkPlanEntry {
-                    source: ChunkSource::LocalSsd { file_offset: offset },
-                    slice_start: 0,
-                    slice_len: len,
-                }],
-            });
-        }
-
-        // Cold path: some blocks need S3 fetch. Box to keep the parent future
-        // (io_task_zc) small — locate_block/fetch_coalesced have deep async
-        // call trees that inflate the state machine.
+        // Box to keep the parent future (io_task_zc) small — locate_block/
+        // fetch_coalesced have deep async call trees that inflate the state machine.
         Box::pin(self.resolve_read_plan_cold(
             offset, len, start_chunk, end_chunk, clean_cache,
             pack_index_cache, volume_manifest, content_store, metrics,
@@ -280,22 +255,11 @@ impl WriteCache<Active> {
         let num_chunks = (end_chunk - start_chunk + 1) as usize;
 
         // Locate all blocks concurrently, then coalesce S3 fetches.
-        // During flush rotation, the io_uring fd is stale (points to old file).
-        // Skip LocalSsd for ALL present blocks until flush completes.
-        let flush_active =
-            self.inner.flushing_active.load(std::sync::atomic::Ordering::Relaxed);
+        // All local reads go through pread (via locate_block → sync_read_local_block)
+        // which uses the RwLock'd data_file — always the correct fd after rotation.
         let locate_futures: Vec<_> = (start_chunk..=end_chunk)
             .map(|block_idx| {
-                let is_local = !flush_active
-                    && self.inner.is_present(block_idx as usize)
-                    && self.inner.state_map.get(block_idx as usize)
-                        != crate::block::block_map::SparseBlockState::SYNCING;
-                let file_offset = block_idx * chunk_size;
                 async move {
-                    if is_local {
-                        // Return LocalSsd directly — no data read needed.
-                        return Ok((block_idx, None, Some(file_offset)));
-                    }
                     let loc = self.locate_block(
                         block_idx as usize,
                         clean_cache,
@@ -304,7 +268,7 @@ impl WriteCache<Active> {
                         content_store,
                         Some(metrics),
                     ).await?;
-                    Ok::<_, CacheError>((block_idx, Some(loc), None))
+                    Ok::<_, CacheError>((block_idx, loc))
                 }
             })
             .collect();
@@ -314,12 +278,8 @@ impl WriteCache<Active> {
         let mut sources: HashMap<usize, ChunkSource> = HashMap::new();
         let mut fetch_entries = Vec::new();
 
-        for (i, (_block_idx, location, local_offset)) in located.into_iter().enumerate() {
-            if let Some(file_offset) = local_offset {
-                sources.insert(i, ChunkSource::LocalSsd { file_offset });
-                continue;
-            }
-            match location.unwrap() {
+        for (i, (_block_idx, location)) in located.into_iter().enumerate() {
+            match location {
                 BlockLocation::Local(data) => {
                     if data.iter().all(|&b| b == 0) {
                         sources.insert(i, ChunkSource::Zero);
