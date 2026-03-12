@@ -1,6 +1,6 @@
 # GlideFS Architecture
 
-High-performance block storage server that turns S3 into fast block storage for microVMs, using local SSD as a write-behind cache. Transport-agnostic: NBD (default, cross-platform) and ublk (Linux 6.0+, io_uring-based, opt-in via `--features ublk`).
+Takes block I/O commands (read/write/flush/trim) from a Linux kernel block device (`/dev/nbdN` or `/dev/ublkbN`), serves reads from a tiered cache (local SSD → in-memory Foyer → SSD Foyer → S3), buffers writes to local SSD (~5µs), and asynchronously uploads dirty blocks to S3 as LZ4-compressed, content-addressed packs. Transport-agnostic: NBD (default, cross-platform) and ublk (Linux 6.0+, io_uring-based, opt-in via `--features ublk`).
 
 ## Data Flow
 
@@ -10,16 +10,24 @@ High-performance block storage server that turns S3 into fast block storage for 
 Guest VM
     │ WRITE (NBD or ublk)
     ▼
-Transport ──► ExportRouter ──► BlockHandler ──► WriteCache<Active>
-                                                        │
-                                            ┌───────────┼───────────┐
-                                            ▼           ▼           ▼
-                                       set_present   pwrite()   transition_to_dirty
-                                      (SparseStateMap)(local SSD) (CAS on SparseStateMap)
-                                                        │
-                                                   WAL append(block_index, seq)
-                                                        │
-                                                    return OK     ◄── ~5µs
+Transport ──► ExportRouter ──► BlockHandler
+                                    │
+                              ┌─────┤ pre-checks
+                              │     ├── readonly?              → EPERM
+                              │     ├── SSD >95% + new blocks? → ENOSPC
+                              │     └── offset > device_size?  → EINVAL
+                              │
+                              ▼ OK
+                         WriteCache<Active>
+                              │
+                  ┌───────────┼───────────┐
+                  ▼           ▼           ▼
+             set_present   pwrite()   transition_to_dirty
+            (SparseStateMap)(local SSD) (CAS on SparseStateMap)
+                              │
+                         WAL append(block_index, seq)
+                              │
+                          return OK     ◄── ~5µs
 ```
 
 Hash computation is **deferred to flush time**. The write path does zero hash or CRC work —
@@ -55,8 +63,11 @@ WriteCache ──► is_present(block_idx)?
                       │           └─ miss ▼
                       │
                       └── Tier 3: S3 range GET                        50-300ms
-                                  ContentStore::get_chunk_block(chunk_idx, pack_id, offset, comp_length)
-                                  → LZ4 decompress → verify BLAKE3 → insert CleanCache → return
+                                  ├── circuit breaker OPEN? → EIO immediately (no S3 call)
+                                  └── ContentStore::get_chunk_block(chunk_idx, pack_id, offset, comp_length)
+                                      ├── S3 error → EIO to guest (block stays NOT_PRESENT; next read retries)
+                                      ├── BLAKE3 mismatch → HashMismatch error → EIO to guest
+                                      └── OK → LZ4 decompress → verify BLAKE3 → insert CleanCache → return
 ```
 
 Multi-block reads fan out with `futures::future::try_join_all()`. Sequential access (3+ consecutive chunk accesses) triggers prefetch of the next pack boundary to hide S3 latency. (`readahead.rs`)
@@ -689,7 +700,114 @@ Per-export Prometheus metrics exposed at `/metrics`. Latency histograms are samp
 
 Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 
+## Configuration
+
+| Setting | Default | What It Controls at Runtime |
+|---------|---------|----------------------------|
+| `blocks_per_pack` | 500 | Dirty block count that triggers a flush cycle. 0 = manual mode (only drain/snapshot flush). Higher values reduce S3 PUTs but increase dirty data at risk. |
+| `block_size` | 128 KB | Fixed block size (4 KB–1 MB, power of 2). Matches ZFS recordsize. Smaller blocks reduce write amplification for random I/O. |
+| `max_s3_uploads` | 128 | Global semaphore cap on concurrent S3 PUT operations across all exports. 0 = unlimited. |
+| `max_s3_downloads` | 512 | Global semaphore cap on concurrent S3 GET operations across all exports. 0 = unlimited. |
+| `wal_sync` | false | When false: WAL appends use OS buffer flush (~20µs). When true: fsync per batch (~10ms). Set true on SSDs without power-loss protection. |
+| `scrubber_blocks_per_second` | 0 (disabled) | Rate limit for background CleanCache hash verification. Set to 1000+ for continuous integrity checking. |
+| `nbd_dead_conn_timeout` | 30 s | Seconds the kernel NBD driver queues I/O when the socket disconnects. Enables hot reload without client timeouts. 0 disables. |
+| `shutdown_timeout_secs` | 30 s | Graceful shutdown window: all exports are drained to S3 within this period. Exports exceeding it log a warning and exit with dirty blocks. |
+| `connect_timeout_secs` | 10 s | S3 TCP connection timeout. |
+| `request_timeout_secs` | 300 s | S3 request timeout. Set high to accommodate large pack uploads (~60 MB). |
+| `clean_cache_size_gb` | 10 GB | Foyer HybridCache SSD tier size for decompressed blocks fetched from S3. |
+| `api_address` | `127.0.0.1:8080` | HTTP management API bind address. No authentication — restrict via bind address or firewall. |
+
+**Capacity monitor thresholds** (not user-configurable):
+
+| Threshold | Value | What Happens |
+|-----------|-------|-------------|
+| SSD warn | 80% | Warning logged + metric emitted |
+| SSD escalate | 90% | Pressure-flush: dirtiest exports flushed to S3 every 5s until utilization drops below 80% |
+| SSD reject | 95% | Writes to **new** blocks rejected with ENOSPC. Overwrites to existing blocks still allowed. |
+
+**Compaction thresholds** (not user-configurable):
+
+| Trigger | Value | Effect |
+|---------|-------|--------|
+| Pack count | >16 packs per chunk | Merge all delta packs into one base pack |
+| Dead-block ratio | >50% superseded entries | Same merge, even if pack count is low |
+
+(`config.rs`, `capacity_monitor.rs`, `write_cache/compact.rs`)
+
+## Trust Boundaries
+
+**What the system verifies (rejects if invalid):**
+
+- Block data integrity: BLAKE3-128 verified on every S3 fetch + LZ4 decompress
+- Manifest integrity: CRC32 trailer verified on every deserialization
+- WAL integrity: CRC32 per entry, replay stops at first corrupt entry
+- Dirty block integrity: CRC32 verified at flush time before uploading to S3
+- Export name format: 1–128 chars, alphanumeric/hyphen/underscore/dot only
+- Device bounds: writes beyond device_size rejected
+- SSD capacity: writes to new blocks rejected above 95% utilization
+
+**What passes through unchecked:**
+
+- Management API authentication: **none**. Any caller that can reach the API socket can create/delete exports, trigger snapshots, drain data, and resize devices. The default bind address (`127.0.0.1:8080`) limits exposure to localhost.
+- Management API authorization: no per-export access control. A single API token controls all exports.
+- S3 credentials: trusted from config. No credential rotation or expiry handling.
+- Block data on the write path: guest writes are stored verbatim — no validation of content.
+- Inter-export isolation: exports share global S3 semaphores and SSD capacity. One export's heavy writes can pressure-flush another's dirty blocks.
+
+**Why these boundaries are where they are:**
+
+- The management API is designed for trusted orchestrators (e.g., a VM control plane) on the same host or private network. Authentication is the orchestrator's responsibility — GlideFS is a storage backend, not a user-facing service.
+- Block data validation on writes would add latency to the hot path (~5µs) for no safety benefit — the guest is the authority on its own data. Integrity verification happens at flush time (BLAKE3) and read time (BLAKE3 + CRC32).
+
+(`api.rs`, `handler.rs`, `content_store.rs`)
+
+## Failure Modes
+
+| Failure | What Actually Happens | Recovery |
+|---------|----------------------|---------|
+| S3 PUT fails during flush | Blocks stay SYNCING in flushing file. Exponential backoff (1s → 30s max). Manifest sync skipped. Checkpoint still runs (prevents WAL growth). | Retry on next checkpoint tick (5s) or next flush trigger. Blocks are not lost — WAL + SSD preserve them. |
+| S3 GET fails during read | Guest receives EIO. Block stays NOT_PRESENT. No retry in read path. | Next read attempt retries S3. Circuit breaker opens after 5 consecutive failures → fast-fail for 30s. |
+| Manifest PUT fails after pack upload | Packs are orphaned in S3 (uploaded but not referenced). `manifest_pending` flag set. | Retry on next 5s checkpoint tick. On drain/snapshot: 3 retries with exponential backoff. GC grace period (24h) prevents premature deletion of orphaned packs. |
+| SSD full (>95%) | New-block writes rejected with ENOSPC. Overwrites succeed. At 90%: pressure-flush dirtiest exports every 5s. | Automatic: pressure-flush frees SSD space. Normal mode resumes when utilization drops below 80%. |
+| WAL append fails | Write returns error to guest. Block state changes are not committed. | Guest retries the write. If SSD is the issue, capacity monitor will pressure-flush. |
+| Crash mid-flush (flushing file exists) | On restart: `load_metadata()` converts SYNCING→DIRTY. Dirty block data copied from flushing file to active file. Flushing file deleted. | Automatic. All blocks re-flushed on next cycle. Packs uploaded before crash may be orphaned — GC cleans them after grace period. |
+| Circuit breaker opens (5 consecutive S3 failures) | All S3 operations fail immediately (no network call). Writes continue to local SSD. Reads for non-local blocks fail with EIO. | Half-open after 30s: 3 probe requests allowed. If any succeed, circuit closes. If all fail, re-open for another 30s. |
+| Export discovery fails on startup (S3 unreachable) | Warning logged. Server starts with config-defined exports only. Dynamically-created exports from prior sessions are not restored. | Config-defined exports work locally. Discovery retried on next restart. |
+| NBD module not loaded | Netlink family resolution fails with descriptive error. | `modprobe nbd` then retry. |
+| Process killed without shutdown | NBD: `nbd_devices.json` persists; kernel devices remain alive for `dead_conn_timeout` (30s). ublk: kernel transitions devices to QUIESCED. | Next process hot-reloads NBD devices via `NBD_CMD_RECONFIGURE`. ublk devices recovered via `recover_quiesced_devices()`. |
+
+(`flush_scheduler.rs`, `write_cache/read.rs`, `capacity_monitor.rs`, `handler.rs`, `circuit_breaker.rs`)
+
 ## Package Structure
+
+### Transport Layer
+
+| File | Purpose |
+|------|---------|
+| `block/server.rs` | NBD session handler: concurrent request dispatch (sequential socket read → per-request tasks → mpsc writer), `MAX_INFLIGHT_REQUESTS = 256` backpressure |
+| `block/protocol.rs` | NBD wire constants and deku structs: magic values, command types, option negotiation, request/reply encoding |
+| `block/nbd/` | `NbdDeviceManager`: kernel device lifecycle, socketpair wiring, hot reload via `nbd_devices.json`. See [nbd/ARCHITECTURE.md](block/nbd/ARCHITECTURE.md). |
+| `block/ublk/` | `UblkServer` + `QueueExecutor`: io_uring-based block device, custom async executor, zero-copy path. See [ublk/ARCHITECTURE.md](block/ublk/ARCHITECTURE.md). |
+
+### Block Storage Core
+
+| File | Purpose |
+|------|---------|
+| `block/router.rs` | `ExportRouter`: export lifecycle (create/fork/snapshot/drain/remove), SSD capacity enforcement, S3 semaphores |
+| `block/handler.rs` | `BlockHandler`: transport-agnostic read/write/flush/trim/write_zeroes |
+| `block/write_cache/mod.rs` | `WriteCache<S>` typestate; `FlushStats`, `SnapshotResult` |
+| `block/write_cache/write.rs` | Write path: `set_present` + `pwrite` + `transition_to_dirty` + WAL append |
+| `block/write_cache/read.rs` | Read path: `resolve_block` (SSD → PackIndexCache → parallel prefetch → S3); `prefetch_chunk` |
+| `block/write_cache/flush.rs` | Flush orchestration: CAS claim, rayon compute, per-chunk GLPK streaming upload, manifest append, inline compaction trigger |
+| `block/write_cache/compact.rs` | Inline compaction: merge N delta packs → 1 base pack via `stream_chunk_pack`; `compact_chunk`, `compact_if_needed` |
+| `block/write_cache/init.rs` | Cache initialization: `open()` (Initializing→Recovering), `open_fresh_active()` (forks) |
+| `block/write_cache/inner.rs` | `CacheInner`: shared state (data file, state map, WAL, sequence, CRC map) |
+| `block/write_cache/recovery.rs` | Crash recovery: Syncing→Dirty on startup |
+| `block/state.rs` | Typestate marker structs: `Initializing`, `Recovering`, `Active`, `Draining` (compile-time I/O gating) |
+| `block/flush_scheduler.rs` | Per-export flush scheduling: event-driven (dirty count threshold), periodic checkpoint (5s) |
+| `block/wal.rs` | Append-only WAL with CRC32 per entry; O_APPEND for lock-free concurrent appends; RwLock for truncation |
+
+### Storage Formats
 
 | File | Purpose |
 |------|---------|
@@ -697,28 +815,32 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/volume_manifest.rs` | Binary GLVM: `VolumeManifest`, `ChunkEntry`, `append_pack`, `replace_packs`, `all_pack_ids`, CRC32 |
 | `block/pack_index_cache.rs` | `PackIndexCache`: Foyer HybridCache keyed by `PackId`; `lookup_block`, `insert_entries`, `known_hashes` |
 | `block/content_store.rs` | S3 typed I/O: `stream_chunk_pack` (WriteMultipart), `get_chunk_block`, `get_pack_index` (suffix-read), manifests, snapshots |
-| `block/write_cache/flush.rs` | Flush orchestration: CAS claim, rayon compute, per-chunk GLPK streaming upload, manifest append, inline compaction trigger |
-| `block/write_cache/compact.rs` | Inline compaction: merge N delta packs → 1 base pack via `stream_chunk_pack`; `compact_chunk`, `compact_if_needed` |
-| `block/write_cache/read.rs` | Read path: `resolve_block` (SSD → PackIndexCache → parallel prefetch → S3); `prefetch_chunk` |
-| `block/write_cache/mod.rs` | `WriteCache<S>` typestate; `FlushStats`, `SnapshotResult` |
-| `block/write_cache/write.rs` | Write path: `set_present` + `pwrite` + `transition_to_dirty` + WAL append |
-| `block/write_cache/init.rs` | Cache initialization: `open()` (Initializing→Recovering), `open_fresh_active()` (forks) |
-| `block/write_cache/inner.rs` | `CacheInner`: shared state (data file, state map, WAL, sequence, CRC map) |
-| `block/write_cache/recovery.rs` | Crash recovery: Syncing→Dirty on startup |
+| `block/manifest.rs` | S3 key helpers: `manifest_s3_key`, `snapshot_s3_key` |
 | `block/block_map.rs` | `SparseStateMap`, `SparseCrcMap`, `Blake3Hash`, `blake3_128`, `lz4_compress`, `lz4_decompress` |
 | `block/cache.rs` | `BlockCache` trait (CleanCache) + Foyer implementation |
-| `block/flush_scheduler.rs` | Per-export flush scheduling: event-driven (dirty count threshold), periodic checkpoint |
-| `block/handler.rs` | `BlockHandler`: transport-agnostic read/write/flush/trim/write_zeroes |
-| `block/manifest.rs` | S3 key helpers: `manifest_s3_key`, `snapshot_s3_key` |
+
+### Background & Observability
+
+| File | Purpose |
+|------|---------|
+| `block/scrubber.rs` | Background hash verification for CleanCache entries; evicts mismatches for re-fetch from S3 |
+| `block/readahead.rs` | Sequential read detection (ring buffer) and pack index prefetch |
+| `block/capacity_monitor.rs` | `statvfs` polling every 5s; warns ≥80%, pressure-flushes dirtiest exports ≥90% |
+| `block/write_trace.rs` | Optional binary trace recorder (GLIDETRC format): every write/trim/zero with µs timestamps; zero cost when disabled |
+| `block/metrics.rs` | Per-export Prometheus metrics (counters, gauges, histograms) |
+| `block/api.rs` | HTTP REST API handlers |
+| `block/error.rs` | `NBDError` and `Result` type aliases |
+| `block/sync.rs` | Conditional re-exports of `AtomicU8`/`AtomicU64` — loom-instrumented under `--cfg loom`, std otherwise |
+
+### CLI & Top-Level
+
+| File | Purpose |
+|------|---------|
 | `cli/gc.rs` | GC: two-pass algorithm (live manifests → stream S3 → stream snapshots), grace period, max-delete cap |
 | `cli/bless.rs` | Base image preparation: raw disk → GLPK packs + GLVM manifest + hot set |
-| `router.rs` | `ExportRouter`: export lifecycle, fork, snapshot, drain |
 | `circuit_breaker.rs` | Lock-free S3 circuit breaker (`AtomicU64` packed state) |
-| `api.rs` | HTTP REST API handlers |
-| `metrics.rs` | Per-export Prometheus metrics |
-| `scrubber.rs` | Background hash verification for CleanCache entries |
-| `readahead.rs` | Sequential read detection and pack index prefetch |
-| `wal.rs` | Append-only WAL with CRC32 per entry |
+| `config.rs` | `Settings`, `ExportConfig`, `CacheConfig`, `StorageConfig` |
+| `parse_object_store.rs` | S3/GCS/Azure/MinIO backend construction from URL |
 
 ## Design Decisions
 
@@ -733,6 +855,8 @@ With a footer index, blocks stream to S3 as they're produced via `WriteMultipart
 NBD is cross-platform and battle-tested — it works on macOS (dev), Linux (prod), and anywhere with a TCP stack. ublk eliminates socket overhead on Linux 6.0+: io_uring shared memory, fixed mmap'd descriptors, native multi-queue. Benchmarks show 2-3x IOPS improvement for random 4K reads.
 
 The storage layer (`BlockHandler`, `WriteCache`, `ContentStore`) is transport-agnostic — both frontends call the same 6 methods. NBD remains the default; ublk is opt-in for production Linux deployments where per-I/O overhead matters.
+
+See [block/nbd/ARCHITECTURE.md](glidefs/src/block/nbd/ARCHITECTURE.md) and [block/ublk/ARCHITECTURE.md](glidefs/src/block/ublk/ARCHITECTURE.md) for transport-specific internals: socketpair wiring, hot reload, netlink protocol, io_uring executor, zero-copy path, and failure modes.
 
 ### Why 128 MiB chunks?
 

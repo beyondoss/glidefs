@@ -707,26 +707,10 @@ impl BlockHandler {
         self.cache.inner().data_file_fd()
     }
 
-    /// Write data to the data file via the RwLock'd handle (always correct fd).
-    ///
-    /// Used by the ublk write path — pwrite via the RwLock ensures writes
-    /// always target the current active file, even after file rotation.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
-    #[inline]
-    pub fn pwrite_to_data_file(&self, offset: u64, data: &[u8]) -> CommandResult<()> {
-        self.cache
-            .inner()
-            .pwrite_data_file(data, offset)
-            .map_err(|e| {
-                tracing::warn!(error = %e, "pwrite fallback failed");
-                CommandError::IoError
-            })
-    }
-
-    /// Phase 1 of ublk zero-copy write: prepare metadata before io_uring write.
+    /// Phase 1 of ublk zero-copy write: prepare metadata before data write.
     ///
     /// Validates the request (readonly, SSD-full, bounds), then marks blocks
-    /// present and clears CRC32. Call BEFORE the io_uring write SQE.
+    /// present and clears CRC32. Call BEFORE the data write.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     pub async fn pre_write(&self, offset: u64, length: u64) -> CommandResult<()> {
         if self.is_readonly() {
@@ -758,12 +742,20 @@ impl BlockHandler {
         Ok(())
     }
 
-    /// Phase 2 of ublk zero-copy write: commit metadata after io_uring write.
+    /// Phase 2 of ublk zero-copy write: pwrite data + commit metadata atomically.
     ///
-    /// Records metrics, marks blocks dirty, appends WAL entries.
-    /// Call ONLY after the io_uring write SQE has completed successfully.
+    /// Holds the data_file read lock across both pwrite and dirty marking to
+    /// prevent rotate_and_snapshot() from interleaving. Without this, rotation
+    /// can snapshot dirty blocks between pwrite and transition_to_dirty, leaving
+    /// the block's data stranded in the flushing file (deleted after flush).
     #[cfg(all(target_os = "linux", feature = "ublk"))]
-    pub fn post_write(&self, offset: u64, length: u64, fua: bool) -> CommandResult<()> {
+    pub fn pwrite_and_commit(
+        &self,
+        offset: u64,
+        data: &[u8],
+        fua: bool,
+    ) -> CommandResult<()> {
+        let length = data.len() as u64;
         if length == 0 {
             return Ok(());
         }
@@ -771,7 +763,12 @@ impl BlockHandler {
         let start = Instant::now();
 
         self.metrics.record_guest_write(length);
-        self.cache.post_write(offset, length)?;
+        self.cache
+            .pwrite_and_commit(offset, data)
+            .map_err(|e| {
+                tracing::warn!(error = %e, "pwrite_and_commit failed");
+                CommandError::IoError
+            })?;
 
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(offset, length, super::write_trace::TraceOp::Write);

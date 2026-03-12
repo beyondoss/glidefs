@@ -1012,19 +1012,15 @@ async fn io_task_zc(
     }
 }
 
-/// Zero-copy WRITE: bio pages → io_uring Write → data file.
+/// Zero-copy WRITE: bio pages → pwrite → data file.
 ///
-/// Three-phase protocol:
+/// Two-phase protocol:
 /// 1. `pre_write`: mark blocks present, clear CRC32 (metadata prep)
-/// 2. io_uring Write SQE: transfer data from bio pages to data file
-/// 3. `post_write`: mark blocks dirty, append WAL entries
+/// 2. `pwrite_and_commit`: pwrite data + mark dirty under one data_file
+///    read lock (prevents rotate_and_snapshot from interleaving)
 ///
-/// If the io_uring write fails, only phase 1 has run — blocks are marked
+/// If the pwrite fails, only phase 1 has run — blocks are marked
 /// present (not dirty) with cleared CRCs. Recovery handles this safely.
-///
-/// During flush rotation, the io_uring registered fd is stale (points to the
-/// flushing file, not the active file). `begin_uring_write` detects this and
-/// falls back to pwrite via the RwLock'd data_file (always correct fd).
 async fn handle_write_zc(
     q: &UblkQueue<'_>,
     offset: u64,
@@ -1045,22 +1041,15 @@ async fn handle_write_zc(
         return -e.to_linux_errno();
     }
 
-    // Phase 2: write data to the data file via pwrite.
+    // Phase 2+3: write data and commit metadata under one data_file read lock.
     //
-    // File rotation (bottomless flush) renames the active data file and opens
-    // a new one. The io_uring-registered fd (Fixed) would permanently point to
-    // the old inode after rotation. pwrite via the RwLock'd data_file always
-    // uses the current fd.
+    // Holding the lock across both pwrite and dirty-marking prevents
+    // rotate_and_snapshot() from interleaving — see pwrite_and_commit docs.
     //
     // SAFETY: addr points to kernel-mapped bio pages, valid for the
     // duration of this I/O request (between get_iod and commit).
     let data = unsafe { std::slice::from_raw_parts(addr as *const u8, length as usize) };
-    if let Err(e) = handler.pwrite_to_data_file(offset, data) {
-        return -e.to_linux_errno();
-    }
-
-    // Phase 3: commit metadata after data is on disk.
-    if let Err(e) = handler.post_write(offset, length as u64, fua) {
+    if let Err(e) = handler.pwrite_and_commit(offset, data, fua) {
         return -e.to_linux_errno();
     }
 

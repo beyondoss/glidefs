@@ -284,26 +284,6 @@ Before finishing, verify:
 - [ ] If there's a trust model, does it honestly state what passes through unchecked?
 - [ ] Are failure modes documented as "what actually happens," not "what should happen"?
 
-## Reference Examples
-
-Before writing, study these exemplary architecture docs in this codebase:
-
-| File                                | Rating | Why It's Excellent                                                                                                                                                     |
-| ----------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `boxes/box-manager/ARCHITECTURE.md` | 10/10  | Comprehensive coverage: typestates, state machines, storage classes, networking, crash recovery, NATS messaging, distributed tracing. Every design decision explained. |
-| `edge/ARCHITECTURE.md`              | 10/10  | Exhaustive reverse proxy docs: RFC 9111 compliance tables, S3-FIFO eviction rationale, WAF prefilter SIMD details, store abstraction layer.                            |
-| `tunnel/ARCHITECTURE.md`            | 10/10  | SSH/TLS proxy with explicit trust model (what we verify AND what we don't). Circuit breakers, rate limiting, connection draining.                                      |
-| `api/app/billing/ARCHITECTURE.md`   | 9/10   | Trust-based tiering, fraud scoring with signal weights, state machines. Excellent "Design Decisions" section.                                                          |
-| `api/app/authz/ARCHITECTURE.md`     | 9/10   | Zanzibar-style ReBAC with "Why ReBAC over RBAC/ABAC?" section. Check algorithm, caching strategy, performance characteristics.                                         |
-
-**Read these files** to understand the quality bar. Note how they:
-
-- Lead with diagrams, not prose
-- Define terms with "NOT" columns
-- Explain "why" for every non-obvious choice
-- Include state machine diagrams AND transition tables
-- Document trust models explicitly
-
 ## Output Format
 
 When creating an architecture doc, output a complete ARCHITECTURE.md file with all applicable sections. Use the exact markdown formatting shown above.
