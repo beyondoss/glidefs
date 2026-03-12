@@ -68,7 +68,6 @@ pub async fn load_readonly_handler(
         device_size,
         block_size: BLOCK_SIZE as usize,
         wal_sync: false,
-        bottomless: false,
     };
 
     let cache = Arc::new(WriteCache::open_fresh_active(cache_config)?);

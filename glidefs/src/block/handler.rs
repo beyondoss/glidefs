@@ -181,6 +181,7 @@ impl BlockHandler {
     /// - Block is already fully present and not partial
     /// - Write fully covers the block (no preservation needed)
     /// - Block has no S3 data (fresh block, zeros are fine)
+    ///
     /// Prepare partial-block tracking for sub-block writes.
     ///
     /// Returns the list of block indices that need background backfill.

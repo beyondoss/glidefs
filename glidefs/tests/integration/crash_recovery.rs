@@ -744,19 +744,57 @@ async fn test_flush_truncates_wal_before_crash() {
             "block 2 data should survive WAL recovery"
         );
 
-        // Blocks 0,1 data should also be on SSD (pwrite'd) even though not dirty
-        let data_0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+        // Blocks 0,1 were flushed to S3 and evicted (NOT_PRESENT) — verify
+        // they are readable through the full read path (S3 resolution).
+        let content_store =
+            glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
+        let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(
+            VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
+        ));
+        // Load the manifest saved by session 1's successful flush
+        let manifest_data = content_store.get_manifest("wal_trunc").await;
+        if let Ok(Some((data, _etag))) = manifest_data {
+            *volume_manifest.write() =
+                VolumeManifest::deserialize(&data).expect("deserialize manifest");
+        }
+        let clean_cache = glidefs::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+        let metrics = Arc::new(glidefs::block::metrics::ExportMetrics::new());
+
+        let data_0 = cache
+            .read(
+                0,
+                BLOCK_SIZE,
+                &clean_cache,
+                &pack_index_cache,
+                &volume_manifest,
+                &content_store,
+                &metrics,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             data_0.as_ref(),
             &flushed_data_0[..],
-            "block 0 should still be readable from SSD"
+            "block 0 should be readable from S3 after eviction"
         );
 
-        let data_1 = cache.read_local(BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        let data_1 = cache
+            .read(
+                BLOCK_SIZE as u64,
+                BLOCK_SIZE,
+                &clean_cache,
+                &pack_index_cache,
+                &volume_manifest,
+                &content_store,
+                &metrics,
+            )
+            .await
+            .unwrap();
         assert_eq!(
             data_1.as_ref(),
             &flushed_data_1[..],
-            "block 1 should still be readable from SSD"
+            "block 1 should be readable from S3 after eviction"
         );
     }
 }
