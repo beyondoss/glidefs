@@ -124,7 +124,7 @@ mod tests {
             device_name: "block-adapter-test".to_string(),
             device_size: 1024 * 1024,
             block_size: 4096,
-            wal_sync: false, bottomless: false,
+            wal_sync: false,
         };
 
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());

@@ -45,7 +45,7 @@ fn create_cache(dir: &std::path::Path, name: &str, device_size: u64) -> Arc<Writ
         device_name: name.to_string(),
         device_size,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
     let cache = WriteCache::open(config).expect("open failed");
     Arc::new(cache.skip_recovery_for_test())

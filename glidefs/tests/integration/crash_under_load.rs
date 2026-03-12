@@ -144,7 +144,7 @@ fn test_config(dir: &TempDir, name: &str) -> WriteCacheConfig {
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
         wal_sync: true, // production-grade: every write is durable on SSD
-        bottomless: false,
+       
     }
 }
 

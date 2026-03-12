@@ -11,7 +11,7 @@ use crate::block::block_map::{
 use crate::block::state::{Active, Initializing, Recovering};
 use crate::block::wal::Wal;
 
-use super::inner::{CacheInner, SyncFile};
+use super::inner::{CacheInner, SyncFile, is_zero_block};
 use super::{CacheError, WriteCache, WriteCacheConfig};
 
 impl WriteCache<Initializing> {
@@ -142,24 +142,24 @@ impl WriteCache<Initializing> {
         let zbb = Bytes::from(vec![0u8; block_size]);
 
         let partial_count = partial_blocks.len();
-        let bottomless = config.bottomless;
 
-        // Bottomless crash recovery: if a flushing file exists, we crashed mid-flush.
+        // Crash recovery: if a flushing file exists, we crashed mid-flush.
         //
-        // The flushing file is the old active file, renamed atomically as the crash
-        // recovery boundary. All blocks that were DIRTY before rotation have their
-        // data in the flushing file. The new active file is empty (sparse).
+        // The flushing file is the old active file, renamed by rotate_data_file().
+        // After rotation, new writes go to the fresh (sparse) active file. So:
+        //   - Pre-rotation dirty blocks: data in flushing file, active is sparse
+        //   - Post-rotation writes: data in active file
         //
-        // Recovery must copy flushing data back to the active file for all dirty
-        // blocks. Note: `load_metadata` converts SYNCING→DIRTY, so by this point
-        // all blocks appear as DIRTY (not SYNCING) in the state map — we handle
-        // both to be safe regardless of load order.
+        // We MERGE by only copying from flushing when the active block is empty
+        // (all zeros / sparse). This preserves post-rotation writes while
+        // recovering pre-rotation data that would otherwise be lost.
         let flushing_path = config.flushing_path();
         if flushing_path.exists() {
             info!("found flushing file — recovering from interrupted flush");
             let flushing_file = SyncFile::open(&flushing_path, false, config.device_size)?;
             let block_size = config.block_size;
             let mut recovered = 0usize;
+            let mut skipped = 0usize;
             for (idx, state) in state_map.iter_present() {
                 let is_dirty = state == SparseBlockState::DIRTY
                     || state == SparseBlockState::SYNCING;
@@ -170,31 +170,39 @@ impl WriteCache<Initializing> {
                         config.device_size.saturating_sub(offset),
                     ) as usize;
                     if valid_bytes > 0 {
-                        let mut buf = vec![0u8; valid_bytes];
-                        flushing_file.read_exact_at(&mut buf, offset)?;
-                        data_file.write_all_at(&buf, offset)?;
+                        // Read from active file first — if it has data, a
+                        // post-rotation write landed here and takes precedence.
+                        let mut active_buf = vec![0u8; valid_bytes];
+                        data_file.read_exact_at(&mut active_buf, offset)?;
+                        if is_zero_block(&active_buf) {
+                            // Active is empty (sparse) — recover from flushing
+                            let mut flush_buf = vec![0u8; valid_bytes];
+                            flushing_file.read_exact_at(&mut flush_buf, offset)?;
+                            data_file.write_all_at(&flush_buf, offset)?;
+                            recovered += 1;
+                        } else {
+                            skipped += 1;
+                        }
                     }
                     // Ensure state is DIRTY (SYNCING was already converted by load_metadata)
                     let _ = state_map.cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY);
-                    if state == SparseBlockState::SYNCING {
-                        dirty_count += 1;
-                    }
-                    recovered += 1;
                 }
             }
             drop(flushing_file);
             std::fs::remove_file(&flushing_path)?;
-            info!(recovered_blocks = recovered, "flush recovery complete");
+            info!(
+                recovered_blocks = recovered,
+                skipped_blocks = skipped,
+                "flush recovery complete"
+            );
         }
 
-        // Bottomless migration: transition any CLEAN blocks to NOT_PRESENT.
-        // Their data is in S3 by definition of CLEAN. Without this, reads of
-        // CLEAN blocks would try the active file which may be empty (sparse).
-        if bottomless {
-            for (idx, state) in state_map.iter_present().collect::<Vec<_>>() {
-                if state == SparseBlockState::CLEAN {
-                    let _ = state_map.cas(idx, SparseBlockState::CLEAN, SparseBlockState::NOT_PRESENT);
-                }
+        // Transition any CLEAN blocks to NOT_PRESENT. Their data is in S3
+        // by definition of CLEAN. Without this, reads of CLEAN blocks would
+        // try the active file which may be empty (sparse).
+        for (idx, state) in state_map.iter_present().collect::<Vec<_>>() {
+            if state == SparseBlockState::CLEAN {
+                let _ = state_map.cas(idx, SparseBlockState::CLEAN, SparseBlockState::NOT_PRESENT);
             }
         }
 
@@ -202,7 +210,6 @@ impl WriteCache<Initializing> {
             config,
             data_file: parking_lot::RwLock::new(data_file),
             flushing_file: parking_lot::Mutex::new(None),
-            bottomless,
             state_map,
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
@@ -225,7 +232,6 @@ impl WriteCache<Initializing> {
             present_blocks = present_count,
             partial_blocks = partial_count,
             recovery_warnings = recovery_warning_count,
-            bottomless,
             "cache opened, transitioning to Recovering"
         );
 
@@ -255,12 +261,10 @@ impl WriteCache<Initializing> {
         let zbh = zero_block_hash(block_size);
         let zbb = Bytes::from(vec![0u8; block_size]);
 
-        let bottomless = config.bottomless;
         let inner = Arc::new(CacheInner {
             config,
             data_file: parking_lot::RwLock::new(data_file),
             flushing_file: parking_lot::Mutex::new(None),
-            bottomless,
             state_map,
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
@@ -278,7 +282,7 @@ impl WriteCache<Initializing> {
             flushing_active: AtomicBool::new(false),
         });
 
-        info!(bottomless, "cache opened fresh for fork, directly Active");
+        info!("cache opened fresh for fork, directly Active");
 
         Ok(WriteCache {
             inner,

@@ -55,7 +55,7 @@ mod tests {
             device_name: "export-test".to_string(),
             device_size,
             block_size: 4096,
-            wal_sync: false, bottomless: false,
+            wal_sync: false,
         };
 
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());

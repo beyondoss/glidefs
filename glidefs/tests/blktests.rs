@@ -179,7 +179,7 @@ mod blktests {
                     cache_dir: cache_dir.path().to_path_buf(),
                     block_size: 128 * 1024,
                     clean_cache,
-                    wal_sync: false, bottomless: false,
+                    wal_sync: false,
                     max_s3_uploads: 128,
                     max_s3_downloads: 512,
                     default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,

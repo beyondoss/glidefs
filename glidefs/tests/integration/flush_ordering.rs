@@ -33,7 +33,7 @@ fn test_config(dir: &TempDir, name: &str) -> WriteCacheConfig {
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
         wal_sync: true, // production-grade: every write durable on SSD before ack
-        bottomless: false,
+       
     }
 }
 
@@ -44,7 +44,7 @@ fn create_router_config(s3: Arc<dyn ObjectStore>, dir: &TempDir) -> RouterConfig
         cache_dir: dir.path().to_path_buf(),
         block_size: BLOCK_SIZE,
         clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
-        wal_sync: true, bottomless: false,
+        wal_sync: true,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
         default_blocks_per_pack: 500,
@@ -308,7 +308,7 @@ async fn test_flush_concurrent_with_pressure_flush() {
         device_name: "vm1".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
     let reader_cache = WriteCache::open_fresh_active(reader_config).unwrap();
     let reader_pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);

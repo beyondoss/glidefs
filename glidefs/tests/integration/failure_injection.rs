@@ -195,7 +195,7 @@ async fn create_test_cache(
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
 
     let metrics = Arc::new(ExportMetrics::new());
@@ -254,7 +254,7 @@ async fn create_reader_from_manifest(
         device_name: name.to_string(),
         device_size: volume_manifest.size,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
 
     let metrics = Arc::new(ExportMetrics::new());

@@ -861,7 +861,7 @@ mod tests {
             device_name: "test".to_string(),
             device_size: 1024 * 1024, // 1MB
             block_size: 4096,
-            wal_sync: false, bottomless: false,
+            wal_sync: false,
         };
 
         // Create in-memory S3 store for tests
@@ -1155,7 +1155,7 @@ mod tests {
             device_name: "flush-test".to_string(),
             device_size: 1024 * 1024,
             block_size: 4096,
-            wal_sync: false, bottomless: false,
+            wal_sync: false,
         };
 
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -1268,7 +1268,7 @@ mod tests {
             device_name: "enospc-test".to_string(),
             device_size: 1024 * 1024,
             block_size: 4096,
-            wal_sync: false, bottomless: false,
+            wal_sync: false,
         };
 
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());

@@ -22,12 +22,6 @@ pub struct WriteCacheConfig {
     /// Adds ~10ms latency per write but guarantees durability on SSDs without
     /// power-loss protection.
     pub wal_sync: bool,
-
-    /// Bottomless storage mode. When enabled, the local SSD is a bounded
-    /// write-back buffer: after flush, blocks are evicted (SYNCING→NOT_PRESENT)
-    /// and the flushing file is deleted via `unlink()`. Reads for evicted blocks
-    /// go through CleanCache → S3.
-    pub bottomless: bool,
 }
 
 impl WriteCacheConfig {

@@ -575,12 +575,10 @@ impl WriteCache<Active> {
     ) -> Result<(FlushStats, u64), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
 
-        // Bottomless mode: rotate data file before claiming dirty blocks.
-        // After rotation, all DIRTY data is in the flushing file. New writes
-        // go to the fresh active file.
-        if self.inner.bottomless {
-            self.rotate_data_file()?;
-        }
+        // Rotate data file before claiming dirty blocks. After rotation,
+        // all DIRTY data is in the flushing file. New writes go to the
+        // fresh active file.
+        self.rotate_data_file()?;
 
         // Claim dirty blocks: CAS DIRTY→SYNCING.
         let snapshot: Vec<usize> = self
@@ -592,14 +590,12 @@ impl WriteCache<Active> {
 
         if snapshot.is_empty() {
             debug!("flush: no dirty blocks to flush");
-            // Bottomless: clean up the empty flushing file if we rotated but had no dirty blocks
-            if self.inner.bottomless {
-                self.inner.flushing_active.store(false, Ordering::Release);
-                drop(self.inner.flushing_file.lock().take());
-                let flushing_path = self.inner.config.flushing_path();
-                if flushing_path.exists() {
-                    let _ = std::fs::remove_file(&flushing_path);
-                }
+            // Clean up the empty flushing file (rotated but no dirty blocks)
+            self.inner.flushing_active.store(false, Ordering::Release);
+            drop(self.inner.flushing_file.lock().take());
+            let flushing_path = self.inner.config.flushing_path();
+            if flushing_path.exists() {
+                let _ = std::fs::remove_file(&flushing_path);
             }
             return Ok((FlushStats::default(), seq_cutpoint));
         }
@@ -611,38 +607,36 @@ impl WriteCache<Active> {
             .await;
 
         if result.is_err() {
-            // Bottomless: copy block data from flushing to active BEFORE
-            // transitioning state. If we transition SYNCING→DIRTY first,
-            // a concurrent read sees DIRTY, reads the new active file
-            // (which is empty for these blocks), and serves zeros.
-            if self.inner.bottomless {
-                let block_size = self.inner.config.block_size;
-                if let Some(ref ff) = *self.inner.flushing_file.lock() {
-                    for &idx in &snapshot {
-                        // Only copy blocks still SYNCING (not re-dirtied by a
-                        // concurrent write — those already have data in active).
-                        if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
-                            continue;
-                        }
-                        let offset = idx as u64 * block_size as u64;
-                        let valid_bytes = std::cmp::min(
-                            block_size as u64,
-                            self.inner.config.device_size.saturating_sub(offset),
-                        ) as usize;
-                        if valid_bytes > 0 {
-                            let mut buf = vec![0u8; valid_bytes];
-                            if ff.read_exact_at(&mut buf, offset).is_ok() {
-                                let _ = self.inner.data_file.read().write_all_at(&buf, offset);
-                            }
+            // Copy block data from flushing to active BEFORE transitioning
+            // state. If we transition SYNCING→DIRTY first, a concurrent read
+            // sees DIRTY, reads the new active file (which is empty for these
+            // blocks), and serves zeros.
+            let block_size = self.inner.config.block_size;
+            if let Some(ref ff) = *self.inner.flushing_file.lock() {
+                for &idx in &snapshot {
+                    // Only copy blocks still SYNCING (not re-dirtied by a
+                    // concurrent write — those already have data in active).
+                    if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
+                        continue;
+                    }
+                    let offset = idx as u64 * block_size as u64;
+                    let valid_bytes = std::cmp::min(
+                        block_size as u64,
+                        self.inner.config.device_size.saturating_sub(offset),
+                    ) as usize;
+                    if valid_bytes > 0 {
+                        let mut buf = vec![0u8; valid_bytes];
+                        if ff.read_exact_at(&mut buf, offset).is_ok() {
+                            let _ = self.inner.data_file.read().write_all_at(&buf, offset);
                         }
                     }
                 }
-                self.inner.flushing_active.store(false, Ordering::Release);
-                drop(self.inner.flushing_file.lock().take());
-                let flushing_path = self.inner.config.flushing_path();
-                if flushing_path.exists() {
-                    let _ = std::fs::remove_file(&flushing_path);
-                }
+            }
+            self.inner.flushing_active.store(false, Ordering::Release);
+            drop(self.inner.flushing_file.lock().take());
+            let flushing_path = self.inner.config.flushing_path();
+            if flushing_path.exists() {
+                let _ = std::fs::remove_file(&flushing_path);
             }
             // Now transition all snapshot blocks to DIRTY (after data is in active file).
             for &idx in &snapshot {
@@ -736,11 +730,7 @@ impl WriteCache<Active> {
             // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
             let zero_hash = self.inner.zero_block_hash;
             let inner = Arc::clone(&self.inner);
-            let clean_cache_clone = if self.inner.bottomless {
-                clean_cache.map(Arc::clone)
-            } else {
-                None
-            };
+            let clean_cache_clone = clean_cache.map(Arc::clone);
             let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
                 compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone)
             })
@@ -756,9 +746,7 @@ impl WriteCache<Active> {
             for &idx in &batch.skipped {
                 self.inner.transition_to_dirty(idx);
             }
-            if self.inner.bottomless {
-                all_skipped.extend_from_slice(&batch.skipped);
-            }
+            all_skipped.extend_from_slice(&batch.skipped);
 
             // Build hash → compressed data map from the unique-hash upload set.
             // Within-batch dedup (seen_hashes in compute_flush_batch) ensures one
@@ -847,27 +835,22 @@ impl WriteCache<Active> {
             }
         }
 
-        // Finalize flushed blocks
+        // Finalize flushed blocks: evict SYNCING→NOT_PRESENT.
+        // Block data lives in S3 (and clean_cache) — local SSD copy not needed.
         for &chunk_index in &flushed_blocks {
-            if self.inner.bottomless {
-                // Bottomless: evict SYNCING→NOT_PRESENT (skip CLEAN)
-                if !self.inner.transition_syncing_to_not_present(chunk_index) {
-                    // Block was re-dirtied during flush — already in active file
-                    total_stats.blocks_cas_failed += 1;
-                }
-            } else if !self.inner.transition_syncing_to_clean(chunk_index) {
+            if !self.inner.transition_syncing_to_not_present(chunk_index) {
+                // Block was re-dirtied during flush — already in active file
                 total_stats.blocks_cas_failed += 1;
             }
         }
 
-        // Bottomless: copy skipped blocks from flushing to active, then clean up
-        if self.inner.bottomless {
+        // Copy skipped blocks from flushing file to active file.
+        // These blocks were transitioned back SYNCING→DIRTY but their data
+        // is only in the flushing file (new active is empty for those blocks).
+        // Re-dirtied blocks (concurrent write during flush) already have data
+        // in the active file from the write that re-dirtied them.
+        {
             let block_size = self.inner.config.block_size;
-            // Copy skipped blocks from flushing file to active file.
-            // These blocks were transitioned back SYNCING→DIRTY but their data
-            // is only in the flushing file (new active is empty for those blocks).
-            // Re-dirtied blocks (concurrent write during flush) already have data
-            // in the active file from the write that re-dirtied them.
             if !all_skipped.is_empty()
                 && let Some(ref ff) = *self.inner.flushing_file.lock()
             {
@@ -885,18 +868,18 @@ impl WriteCache<Active> {
                     }
                 }
             }
+        }
 
-            // Drop flushing file handle and delete the file.
-            // Clear flushing_active BEFORE dropping the file so resolve_read_plan
-            // re-enables LocalSsd only after the cleanup is complete.
-            self.inner.flushing_active.store(false, Ordering::Release);
-            drop(self.inner.flushing_file.lock().take());
-            let flushing_path = self.inner.config.flushing_path();
-            if flushing_path.exists()
-                && let Err(e) = std::fs::remove_file(&flushing_path)
-            {
-                warn!(error = %e, "failed to remove flushing file");
-            }
+        // Drop flushing file handle and delete the file.
+        // Clear flushing_active BEFORE dropping the file so resolve_read_plan
+        // re-enables LocalSsd only after the cleanup is complete.
+        self.inner.flushing_active.store(false, Ordering::Release);
+        drop(self.inner.flushing_file.lock().take());
+        let flushing_path = self.inner.config.flushing_path();
+        if flushing_path.exists()
+            && let Err(e) = std::fs::remove_file(&flushing_path)
+        {
+            warn!(error = %e, "failed to remove flushing file");
         }
 
         info!(

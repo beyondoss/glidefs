@@ -144,7 +144,7 @@ async fn load_readonly_handler(
         device_name: format!("push-{}", manifest_name.replace('/', "-")),
         device_size,
         block_size: BLOCK_SIZE as usize,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
 
     let cache = Arc::new(WriteCache::open_fresh_active(cache_config)?);

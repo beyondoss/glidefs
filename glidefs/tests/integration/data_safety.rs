@@ -254,7 +254,7 @@ fn test_config(dir: &std::path::Path, name: &str) -> WriteCacheConfig {
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     }
 }
 
@@ -264,7 +264,7 @@ fn test_config_wal_sync(dir: &std::path::Path, name: &str) -> WriteCacheConfig {
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: true, bottomless: false,
+        wal_sync: true,
     }
 }
 
@@ -723,7 +723,7 @@ async fn test_pack_index_corruption_returns_error() {
         device_name: "idx-corrupt".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
     let reader_cache = WriteCache::open_fresh_active(reader_config).unwrap();
     let reader_cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
@@ -2077,7 +2077,7 @@ async fn test_full_chunk_cold_wake() {
         device_name: "full-chunk".to_string(),
         device_size: FULL_CHUNK_DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
 
     let content_store = ContentStore::new(Arc::clone(&s3), "test");
@@ -2140,7 +2140,7 @@ async fn test_full_chunk_cold_wake() {
         device_name: "full-chunk-reader".to_string(),
         device_size: FULL_CHUNK_DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
 
     let reader_cache = Arc::new(
@@ -2222,7 +2222,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
                 cache_dir: cache_dir1.path().to_path_buf(),
                 block_size: BLOCK_SIZE,
                 clean_cache,
-                wal_sync: false, bottomless: false,
+                wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
                 default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
@@ -2287,7 +2287,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
                 cache_dir: cache_dir2.path().to_path_buf(),
                 block_size: BLOCK_SIZE,
                 clean_cache: clean_cache2,
-                wal_sync: false, bottomless: false,
+                wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
                 default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,

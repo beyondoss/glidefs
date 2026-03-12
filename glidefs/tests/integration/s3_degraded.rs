@@ -265,7 +265,7 @@ async fn create_cache_with_store(
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
 
     let metrics = Arc::new(ExportMetrics::new());
@@ -589,7 +589,7 @@ async fn test_s3_download_semaphore_exhaustion() {
         device_name: "sem-exhaust".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
 
     let cs = Arc::new(
@@ -661,7 +661,7 @@ async fn test_s3_upload_semaphore_exhaustion() {
         device_name: "sem-upload".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
 
     // ContentStore with tiny upload semaphore (1 concurrent upload)

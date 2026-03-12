@@ -488,7 +488,7 @@ mod tests {
             device_name: "sched-test".to_string(),
             device_size: device_size(),
             block_size: 128 * 1024,
-            wal_sync: false, bottomless: false,
+            wal_sync: false,
         };
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -543,7 +543,7 @@ mod tests {
             device_name: "sched-backoff".to_string(),
             device_size: device_size(),
             block_size: 128 * 1024,
-            wal_sync: false, bottomless: false,
+            wal_sync: false,
         };
 
         let content_store = Arc::new(ContentStore::new(s3, "test"));
@@ -989,7 +989,7 @@ mod tests {
             device_name: "sched-backoff".to_string(),
             device_size: device_size(),
             block_size: 128 * 1024,
-            wal_sync: false, bottomless: false,
+            wal_sync: false,
         };
         let recovered = WriteCache::<Initializing>::open(config).unwrap();
         let recovered = recovered.skip_recovery_for_test();

@@ -189,13 +189,6 @@ pub struct NbdConfig {
     /// (e.g., during a binary upgrade). Set to 0 to disable.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub nbd_dead_conn_timeout: Option<u32>,
-
-    /// Bottomless storage mode (default: false). When enabled, local SSD is a
-    /// bounded write-back buffer: after each flush, blocks are evicted and the
-    /// flushing file is deleted via unlink(). SSD footprint per export drops to
-    /// ~(dirty + syncing) × block_size. Applies to all exports on this node.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub bottomless: Option<bool>,
 }
 
 /// Configuration for a single NBD export (virtual block device).
@@ -330,12 +323,6 @@ impl NbdConfig {
     /// NBD kernel device dead connection timeout in seconds (default: 30).
     pub fn nbd_dead_conn_timeout(&self) -> u32 {
         self.nbd_dead_conn_timeout.unwrap_or(30)
-    }
-
-    /// Whether bottomless storage mode is enabled (default: true).
-    /// Evicts blocks from local SSD after flush to S3, bounding SSD usage.
-    pub fn bottomless(&self) -> bool {
-        self.bottomless.unwrap_or(true)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -662,7 +649,6 @@ impl Settings {
                     api_address: Some(default_api_address()),
                     block_size: None,
                     blocks_per_batch: None,
-                    bottomless: None,
                     exports: vec![ExportConfig {
                         name: "default".to_string(),
                         size_gb: 100.0,

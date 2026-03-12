@@ -268,7 +268,7 @@ pub async fn run_bless_oci(
         device_name: format!("bless-oci-{}", name),
         device_size,
         block_size: BLOCK_SIZE as usize,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
 
     let cache = Arc::new(WriteCache::open_fresh_active(cache_config)?);

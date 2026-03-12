@@ -273,9 +273,6 @@ pub(crate) struct CacheInner {
     /// visible; the ublk path tolerates a single false-positive pread.
     pub(super) flushing_active: AtomicBool,
 
-    /// Bottomless storage mode: evict blocks after flush, delete flushing file.
-    pub(super) bottomless: bool,
-
     /// Sparse block state map - LOCK-FREE
     /// Combines block state and presence into a single sparse page table.
     /// State encoding: 0=NotPresent, 1=Clean, 2=Dirty, 3=Syncing
@@ -462,7 +459,8 @@ impl CacheInner {
 
     /// Atomically evict a flushed block: CAS SYNCING→NOT_PRESENT.
     ///
-    /// Used by bottomless mode to free SSD space after successful upload.
+    /// After a successful S3 upload, the block data lives in S3 (and optionally
+    /// in the clean cache). The local SSD copy is no longer needed.
     /// Returns true if the CAS succeeded (block evicted).
     /// Returns false if a concurrent write transitioned SYNCING→DIRTY.
     #[inline]
@@ -470,25 +468,6 @@ impl CacheInner {
         if self
             .state_map
             .cas(idx, SparseBlockState::SYNCING, SparseBlockState::NOT_PRESENT)
-            .is_ok()
-        {
-            self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Atomically finalize a flushed block: CAS SYNCING→CLEAN.
-    ///
-    /// Returns true if the CAS succeeded (block is now clean).
-    /// Returns false if a concurrent write transitioned SYNCING→DIRTY,
-    /// meaning the block must be re-flushed in the next cycle.
-    #[inline]
-    pub(super) fn transition_syncing_to_clean(&self, idx: usize) -> bool {
-        if self
-            .state_map
-            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::CLEAN)
             .is_ok()
         {
             self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);

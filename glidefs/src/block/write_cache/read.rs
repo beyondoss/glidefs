@@ -83,14 +83,12 @@ impl WriteCache<Active> {
         }) {
             return None;
         }
-        // Bottomless: during flush, SYNCING blocks are in the flushing file.
+        // During flush, SYNCING blocks are in the flushing file.
         // Bail to the full read path which handles state-aware dispatch.
-        if self.inner.bottomless
-            && (start_block..=end_block).any(|i| {
-                self.inner.state_map.get(i as usize)
-                    == crate::block::block_map::SparseBlockState::SYNCING
-            })
-        {
+        if (start_block..=end_block).any(|i| {
+            self.inner.state_map.get(i as usize)
+                == crate::block::block_map::SparseBlockState::SYNCING
+        }) {
             return None;
         }
         Some(match self.inner.data_file.read().read_exact_at(&mut buf[..len], offset) {
@@ -161,11 +159,10 @@ impl WriteCache<Active> {
 
         let mut buf = vec![0u8; block_size];
 
-        // Bottomless: SYNCING blocks live in the flushing file during flush.
+        // SYNCING blocks live in the flushing file during flush.
         // The active file is empty for those blocks after rotation.
-        let use_flushing = self.inner.bottomless
-            && self.inner.state_map.get(block_num as usize)
-                == crate::block::block_map::SparseBlockState::SYNCING;
+        let use_flushing = self.inner.state_map.get(block_num as usize)
+            == crate::block::block_map::SparseBlockState::SYNCING;
 
         if use_flushing {
             let guard = self.inner.flushing_file.lock();
@@ -230,21 +227,20 @@ impl WriteCache<Active> {
         // Fast path: all chunks present on local SSD and not partial →
         // single LocalSsd entry. Collapses N per-chunk SQEs into one io_uring Read.
         //
-        // Bottomless exclusions:
+        // Exclusions during flush:
         // - SYNCING blocks: data lives in the flushing file, not the active file.
         // - flushing_active: the io_uring-registered fd points to the old file.
         //   New DIRTY blocks are in the new active file (different fd). Fall
-        //   through to cold path which prreads via RwLock (correct fd).
-        let bottomless_flush_active = self.inner.bottomless
-            && self.inner.flushing_active.load(std::sync::atomic::Ordering::Relaxed);
-        if !bottomless_flush_active
+        //   through to cold path which preads via RwLock (correct fd).
+        let flush_active =
+            self.inner.flushing_active.load(std::sync::atomic::Ordering::Relaxed);
+        if !flush_active
             && (start_chunk..=end_chunk).all(|i| {
                 let idx = i as usize;
                 self.inner.is_present(idx)
                     && !self.inner.is_partial(idx)
-                    && !(self.inner.bottomless
-                        && self.inner.state_map.get(idx)
-                            == crate::block::block_map::SparseBlockState::SYNCING)
+                    && self.inner.state_map.get(idx)
+                        != crate::block::block_map::SparseBlockState::SYNCING
             })
         {
             return Ok(ReadPlan {
@@ -284,17 +280,16 @@ impl WriteCache<Active> {
         let num_chunks = (end_chunk - start_chunk + 1) as usize;
 
         // Locate all blocks concurrently, then coalesce S3 fetches.
-        // During a bottomless flush rotation, the io_uring fd is stale (points
-        // to old file). Skip LocalSsd for ALL present blocks until flush completes.
-        let bottomless_flush_active = self.inner.bottomless
-            && self.inner.flushing_active.load(std::sync::atomic::Ordering::Relaxed);
+        // During flush rotation, the io_uring fd is stale (points to old file).
+        // Skip LocalSsd for ALL present blocks until flush completes.
+        let flush_active =
+            self.inner.flushing_active.load(std::sync::atomic::Ordering::Relaxed);
         let locate_futures: Vec<_> = (start_chunk..=end_chunk)
             .map(|block_idx| {
-                let is_local = !bottomless_flush_active
+                let is_local = !flush_active
                     && self.inner.is_present(block_idx as usize)
-                    && !(self.inner.bottomless
-                        && self.inner.state_map.get(block_idx as usize)
-                            == crate::block::block_map::SparseBlockState::SYNCING);
+                    && self.inner.state_map.get(block_idx as usize)
+                        != crate::block::block_map::SparseBlockState::SYNCING;
                 let file_offset = block_idx * chunk_size;
                 async move {
                     if is_local {
@@ -438,14 +433,13 @@ impl WriteCache<Active> {
 
         // Fast path: all blocks present on local SSD and not partial →
         // single pread of exact bytes. Bypasses per-block resolution.
-        // Bottomless: SYNCING blocks are in the flushing file, bail to per-block path.
+        // SYNCING blocks are in the flushing file, bail to per-block path.
         if (start_block..=end_block).all(|i| {
             let idx = i as usize;
             self.inner.is_present(idx)
                 && !self.inner.is_partial(idx)
-                && !(self.inner.bottomless
-                    && self.inner.state_map.get(idx)
-                        == crate::block::block_map::SparseBlockState::SYNCING)
+                && self.inner.state_map.get(idx)
+                    != crate::block::block_map::SparseBlockState::SYNCING
         }) {
             let mut buf = vec![0u8; len];
             self.inner.data_file.read().read_exact_at(&mut buf, offset)?;

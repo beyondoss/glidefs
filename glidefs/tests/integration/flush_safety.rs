@@ -127,7 +127,7 @@ fn create_router_config(s3: Arc<dyn ObjectStore>, dir: &TempDir) -> RouterConfig
         cache_dir: dir.path().to_path_buf(),
         block_size: BLOCK_SIZE,
         clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
         default_blocks_per_pack: 500,
@@ -268,7 +268,7 @@ async fn test_pressure_flush_concurrent_with_drain() {
         device_name: "vm1".to_string(),
         device_size: 256 * 1024 * 1024,
         block_size: BLOCK_SIZE,
-        wal_sync: false, bottomless: false,
+        wal_sync: false,
     };
     let reader_cache = glidefs::block::write_cache::WriteCache::open_fresh_active(reader_config)
         .unwrap();
