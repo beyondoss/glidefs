@@ -399,33 +399,32 @@ impl CacheInner {
 
     /// CAS loop to transition a block to Dirty state (lock-free).
     ///
-    /// Handles three source states (sparse encoding):
+    /// Handles four source states (sparse encoding):
     /// - **Clean(1) -> Dirty(2)**: increments dirty_block_count.
     /// - **Syncing(3) -> Dirty(2)**: decrements syncing_block_count, increments dirty_block_count.
     /// - **Dirty(2) -> Dirty(2)**: no-op.
+    /// - **NotPresent(0) -> Dirty(2)**: increments dirty_block_count. This
+    ///   handles a race where promote_syncing_blocks copied data and the guest
+    ///   wrote, but the flush thread evicted the block (SYNCING→NOT_PRESENT)
+    ///   before this call. The data is already in the active file.
     ///
-    /// Returns `true` if the state actually changed (CLEAN→DIRTY or
-    /// SYNCING→DIRTY), `false` if the block was already DIRTY. Used by the
-    /// write path to skip redundant WAL entries.
+    /// Returns `true` if the state actually changed, `false` if already DIRTY.
+    /// Used by the write path to skip redundant WAL entries.
     #[inline]
     pub(super) fn transition_to_dirty(&self, idx: usize) -> bool {
         loop {
             let current = self.state_map.get(idx);
 
-            debug_assert_ne!(
-                current,
-                SparseBlockState::NOT_PRESENT,
-                "transition_to_dirty called on NOT_PRESENT block {idx}"
-            );
-
             if current == SparseBlockState::DIRTY {
                 return false;
             }
 
-            if current == SparseBlockState::CLEAN {
+            if current == SparseBlockState::CLEAN
+                || current == SparseBlockState::NOT_PRESENT
+            {
                 if self
                     .state_map
-                    .cas(idx, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
+                    .cas(idx, current, SparseBlockState::DIRTY)
                     .is_ok()
                 {
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
@@ -549,7 +548,9 @@ impl CacheInner {
     ///
     /// Promote copies the full block from flushing → active BEFORE the guest
     /// pwrite, so the active file always has complete data for every DIRTY block.
-    /// The guest pwrite then overlays its sub-block on top.
+    /// After the copy, CAS SYNCING→DIRTY so the flush thread's eviction CAS
+    /// will fail — preventing a race where eviction clears the block between
+    /// promote and the caller's transition_to_dirty.
     ///
     /// Idempotent: multiple concurrent promotions of the same block copy the
     /// same data. The flushing file is immutable after rotation.
@@ -589,6 +590,20 @@ impl CacheInner {
                 let mut buf = vec![0u8; valid];
                 if ff.read_exact_at(&mut buf, offset).is_ok() {
                     let _ = df.write_all_at(&buf, offset);
+                    // CAS SYNCING→DIRTY immediately after copying data.
+                    // This prevents the flush thread from evicting the block
+                    // (SYNCING→NOT_PRESENT) between here and the caller's
+                    // transition_to_dirty. If the CAS fails, either another
+                    // writer promoted it first (fine) or flush already evicted
+                    // it (the data we just copied is still valid in active).
+                    if self
+                        .state_map
+                        .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                        .is_ok()
+                    {
+                        self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
