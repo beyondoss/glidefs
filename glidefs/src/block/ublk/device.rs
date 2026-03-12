@@ -1021,6 +1021,10 @@ async fn io_task_zc(
 ///
 /// If the io_uring write fails, only phase 1 has run — blocks are marked
 /// present (not dirty) with cleared CRCs. Recovery handles this safely.
+///
+/// During flush rotation, the io_uring registered fd is stale (points to the
+/// flushing file, not the active file). `begin_uring_write` detects this and
+/// falls back to pwrite via the RwLock'd data_file (always correct fd).
 async fn handle_write_zc(
     q: &UblkQueue<'_>,
     offset: u64,
@@ -1041,23 +1045,40 @@ async fn handle_write_zc(
         return -e.to_linux_errno();
     }
 
-    // Phase 2: io_uring Write from bio pages to data file.
-    // types::Fixed(1) = data file fd (registered in tgt_init at fds[1]).
-    let sqe = io_uring::opcode::Write::new(
-        io_uring::types::Fixed(DATA_FILE_FD_INDEX),
-        addr as *const u8,
-        length,
-    )
-    .offset(offset)
-    .build()
-    .flags(io_uring::squeue::Flags::FIXED_FILE);
+    // Phase 2: write data to the data file.
+    //
+    // Try the io_uring registered fd (zero-copy fast path). If a flush
+    // rotation is in progress, the registered fd is stale — fall back to
+    // pwrite via the RwLock'd data_file which always has the correct fd.
+    if handler.begin_uring_write() {
+        // Fast path: io_uring Write from bio pages to data file.
+        // types::Fixed(1) = data file fd (registered in tgt_init at fds[1]).
+        let sqe = io_uring::opcode::Write::new(
+            io_uring::types::Fixed(DATA_FILE_FD_INDEX),
+            addr as *const u8,
+            length,
+        )
+        .offset(offset)
+        .build()
+        .flags(io_uring::squeue::Flags::FIXED_FILE);
 
-    let cqe_result = q.ublk_submit_sqe(sqe).await;
-    if cqe_result < 0 {
-        return cqe_result;
-    }
-    if cqe_result as u32 != length {
-        return -libc::EIO;
+        let cqe_result = q.ublk_submit_sqe(sqe).await;
+        handler.end_uring_write();
+
+        if cqe_result < 0 {
+            return cqe_result;
+        }
+        if cqe_result as u32 != length {
+            return -libc::EIO;
+        }
+    } else {
+        // Slow path: pwrite via RwLock'd data_file (correct fd during flush).
+        // SAFETY: addr points to kernel-mapped bio pages, valid for the
+        // duration of this I/O request (between get_iod and commit).
+        let data = unsafe { std::slice::from_raw_parts(addr as *const u8, length as usize) };
+        if let Err(e) = handler.pwrite_to_data_file(offset, data) {
+            return -e.to_linux_errno();
+        }
     }
 
     // Phase 3: commit metadata after data is on disk.

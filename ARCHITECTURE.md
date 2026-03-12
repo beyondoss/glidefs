@@ -35,7 +35,7 @@ Guest VM
 WriteCache ──► is_present(block_idx)?
                       │
               ┌── YES ──► SSD pread    ~5µs  (hot path: dirty or clean-SSD)
-              │           (bottomless: SYNCING blocks → flushing file during flush)
+              │           (SYNCING blocks → flushing file during flush)
               │
               └── NO (not yet written / fork from S3)
                       │
@@ -98,11 +98,10 @@ For each chunk (one pack per chunk per flush cycle):
     │
     ▼
 Phase 3 — Release:
-    ├── Normal mode: CAS SYNCING→CLEAN (blocks stay on SSD)
-    └── Bottomless mode: CAS SYNCING→NOT_PRESENT (evict from SSD)
-            ├── Insert decompressed blocks into CleanCache (S3-FIFO probationary queue)
-            ├── Copy failed/skipped blocks from flushing file to active file
-            └── unlink("{name}.flushing")
+    CAS SYNCING→NOT_PRESENT (evict from SSD)
+        ├── Insert decompressed blocks into CleanCache (S3-FIFO probationary queue)
+        ├── Copy failed/skipped blocks from flushing file to active file
+        └── unlink("{name}.flushing")
     │
     ▼
 Inline compaction: if chunk.packs.len() > threshold (default 16)
@@ -147,7 +146,7 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 | Fork | A new export whose VolumeManifest is copied from a parent's. The fork starts with an empty local SparseStateMap; unwritten blocks resolve through VolumeManifest → PackIndexCache → S3. | Not a full copy — parent pack files are never duplicated |
 | Snapshot Sequence | A monotonic counter (`u64`) that increments on every flush. | Not a timestamp — purely an ordering counter |
 | Manifest Tag | A named alias for a VolumeManifest, stored at `manifests/{tag}`. Forkable by name. | Not a snapshot sequence — not versioned; overwriting updates the pointer |
-| Bottomless | Storage mode where local SSD is a bounded write-back buffer. After flush, blocks are evicted (SYNCING→NOT_PRESENT) and the flushing file is deleted. Reads for evicted blocks go through CleanCache → S3. Enabled by default; disable with `bottomless: false`. | Disabling keeps CLEAN blocks on SSD indefinitely |
+| File Rotation | After flush, blocks are evicted (SYNCING→NOT_PRESENT) and the flushing file is deleted. Local SSD is a bounded write-back buffer. Reads for evicted blocks go through CleanCache → S3. | Not optional — this is the only storage mode. CLEAN state exists only transiently during migration from older metadata |
 
 ## S3 Object Layout
 
@@ -184,7 +183,7 @@ The write path avoids all locks. Three techniques make this possible:
 
 1. **Positional I/O** (`pread`/`pwrite`): The `SyncFile` wrapper uses POSIX positional I/O, which is atomic per-syscall and doesn't use the file position pointer. No locking needed for concurrent block reads and writes. (`write_cache/inner.rs:SyncFile`)
 
-2. **Sparse state map** (CAS + sparse page table): `SparseStateMap` stores per-block state in a two-level page table with 2-bit packing — 4 entries per `AtomicU8`, 16,384 entries per 4KB page. Pages are allocated on first write via CAS — empty exports use ~4KB for the directory. State transitions (`set_present`, `transition_to_dirty`, `transition_dirty_to_syncing`, `transition_syncing_to_clean`) are CAS-on-byte loops with no global lock. (`block_map.rs:SparseStateMap`)
+2. **Sparse state map** (CAS + sparse page table): `SparseStateMap` stores per-block state in a two-level page table with 2-bit packing — 4 entries per `AtomicU8`, 16,384 entries per 4KB page. Pages are allocated on first write via CAS — empty exports use ~4KB for the directory. State transitions (`set_present`, `transition_to_dirty`, `transition_dirty_to_syncing`, `transition_syncing_to_not_present`) are CAS-on-byte loops with no global lock. (`block_map.rs:SparseStateMap`)
 
 3. **Sparse CRC map** (AtomicU32 page table): `SparseCrcMap` tracks CRC32 checksums for dirty blocks using the same two-level page table pattern as `SparseStateMap` — 1,024 `AtomicU32` entries per 4KB page, lazily allocated. Checkpoint computes CRC32s; flush verifies them to detect SSD corruption. Lock-free: stores, loads, and CAS operations on `AtomicU32` with no shard locks. (`block_map.rs:SparseCrcMap`)
 
@@ -247,9 +246,9 @@ A lock-free circuit breaker protects against S3 outages. All mutable state is pa
 
 Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N failures within a time window). Only connectivity errors count — business logic errors (404, etc.) don't trip the breaker. (`circuit_breaker.rs`)
 
-## Bottomless Storage
+## File Rotation & Eviction
 
-Bottomless mode treats local SSD as a bounded write-back buffer rather than a persistent cache. After each flush to S3, blocks are evicted (SYNCING→NOT_PRESENT) and the flushing file is deleted. SSD footprint per export: `(dirty + syncing) × block_size` — only blocks modified since the last flush consume local space.
+Local SSD is a bounded write-back buffer, not a persistent cache. After each flush to S3, blocks are evicted (SYNCING→NOT_PRESENT) and the flushing file is deleted. SSD footprint per export: `(dirty + syncing) × block_size` — only blocks modified since the last flush consume local space.
 
 ### File Rotation
 
@@ -301,24 +300,20 @@ The io_uring registered fd (captured at device startup) becomes stale after rota
 Stored in `SparseStateMap` — a sparse page table with 2-bit packed `AtomicU8` values (4 entries per byte), fully lock-free. Encoding: `NotPresent=0, Clean=1, Dirty=2, Syncing=3`. NotPresent=0 means unallocated pages (and zero bytes within allocated pages) are implicitly "never written" with no memory cost.
 
 ```
-NotPresent ──[write]──► Dirty ──[flush claim]──► Syncing ──[upload OK + no concurrent write]──► Clean
-     ▲                     ▲                         │                                              │
-     │                     └──────[write]────────────┘ (CAS SYNCING→DIRTY)                          │
-     │                     └──────────────────────────────────[write]───────────────────────────────┘
-     │
-     └──[bottomless: upload OK]── Syncing   (CAS SYNCING→NOT_PRESENT, evict from SSD)
+NotPresent ──[write]──► Dirty ──[flush claim]──► Syncing ──[upload OK]──► NotPresent
+     ▲                     ▲                         │                    (evict from SSD)
+     │                     └──────[write]────────────┘ (CAS SYNCING→DIRTY)
 ```
 
-The flush path uses **SYNCING-based CAS**: a dirty block is atomically claimed (`CAS DIRTY→SYNCING`) before CPU work begins. After upload: in normal mode, `CAS SYNCING→CLEAN` releases it; in bottomless mode, `CAS SYNCING→NOT_PRESENT` evicts it. If a guest write lands during the flush, `transition_to_dirty()` CAS-loops `SYNCING→DIRTY` — the flush's final CAS then fails, and the block stays Dirty for the next cycle.
+The flush path uses **SYNCING-based CAS**: a dirty block is atomically claimed (`CAS DIRTY→SYNCING`) before CPU work begins. After upload, `CAS SYNCING→NOT_PRESENT` evicts it from local SSD. If a guest write lands during the flush, `transition_to_dirty()` CAS-loops `SYNCING→DIRTY` — the flush's final CAS then fails, and the block stays Dirty for the next cycle.
 
 | From | Event | To | Encoding | Notes |
 |------|-------|----|----------|-------|
 | NotPresent | Guest write | Dirty | 0 → 1 → 2 | `set_present` (CAS 0→1) + SSD pwrite + `transition_to_dirty` (CAS 1→2) + WAL append |
-| Clean | Guest write | Dirty | 1 → 2 | Block already on SSD, re-dirtied |
+| Clean | Guest write | Dirty | 1 → 2 | Legacy: CLEAN blocks migrated to NOT_PRESENT on startup; this transition only during migration window |
 | Dirty | Flush claim | Syncing | 2 → 3 | `transition_dirty_to_syncing()` — atomic snapshot of dirty block |
-| Syncing | Concurrent guest write | Dirty | 3 → 2 | `transition_to_dirty()` CAS loop; flush's SYNCING→CLEAN will fail |
-| Syncing | Upload success, no concurrent write | Clean | 3 → 1 | Normal mode: `transition_syncing_to_clean()` — CAS fails if write re-dirtied |
-| Syncing | Upload success, no concurrent write (bottomless) | NotPresent | 3 → 0 | Bottomless: `transition_syncing_to_not_present()` — evict from SSD |
+| Syncing | Concurrent guest write | Dirty | 3 → 2 | `transition_to_dirty()` CAS loop; flush's SYNCING→NOT_PRESENT will fail |
+| Syncing | Upload success, no concurrent write | NotPresent | 3 → 0 | `transition_syncing_to_not_present()` — evict from SSD |
 | Syncing | Upload success, concurrent write | Dirty | — | Final CAS fails; block stays dirty (re-flushed next cycle) |
 | Any | Crash recovery load | Dirty | — | `load_metadata()` converts Syncing→Dirty on startup |
 
@@ -621,7 +616,7 @@ CRC32 is stored in `crc_map: SparseCrcMap` on `CacheInner` — a lock-free two-l
 | Gap | Why Acceptable |
 |-----|---------------|
 | Dirty block reads (guest reads dirty data from SSD) | Read path returns raw pread data — no checksum. Checkpoint runs every ~5s; the window is small. |
-| SSD data file between flush cycles | Once a block is flushed (Clean), reads prefer CleanCache or S3. SSD bit rot on clean blocks is caught by the scrubber or on next S3 re-fetch. |
+| SSD data file between flush cycles | Once a block is flushed, it's evicted from SSD (NOT_PRESENT). Reads go through CleanCache or S3. Only dirty blocks (not yet flushed) are on SSD. |
 | PackIndexCache SSD files | Derived data — rebuildable from S3 pack objects. Foyer corruption falls back to S3 on cache miss. |
 
 ## CLI Commands

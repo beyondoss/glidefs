@@ -707,6 +707,42 @@ impl BlockHandler {
         self.cache.inner().data_file_fd()
     }
 
+    /// Try to begin an io_uring write using the registered fd.
+    ///
+    /// Returns `true` if the registered fd is valid (no flush rotation in
+    /// progress). Returns `false` if flushing is active — the caller must
+    /// use `pwrite_to_data_file` instead of the io_uring registered fd.
+    ///
+    /// If this returns `true`, the caller MUST call `end_uring_write()` after
+    /// the io_uring write completes.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[inline]
+    pub fn begin_uring_write(&self) -> bool {
+        self.cache.inner().begin_uring_write()
+    }
+
+    /// Signal that an io_uring write using the registered fd has completed.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[inline]
+    pub fn end_uring_write(&self) {
+        self.cache.inner().end_uring_write();
+    }
+
+    /// Write data to the data file via the RwLock'd handle (always correct fd).
+    ///
+    /// Used as fallback when the io_uring registered fd is stale during flush.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[inline]
+    pub fn pwrite_to_data_file(&self, offset: u64, data: &[u8]) -> CommandResult<()> {
+        self.cache
+            .inner()
+            .pwrite_data_file(data, offset)
+            .map_err(|e| {
+                tracing::warn!(error = %e, "pwrite fallback failed");
+                CommandError::IoError
+            })
+    }
+
     /// Phase 1 of ublk zero-copy write: prepare metadata before io_uring write.
     ///
     /// Validates the request (readonly, SSD-full, bounds), then marks blocks

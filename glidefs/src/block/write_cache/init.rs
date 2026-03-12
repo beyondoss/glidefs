@@ -225,6 +225,8 @@ impl WriteCache<Initializing> {
             partial_blocks,
             manifest_etag: parking_lot::Mutex::new(None),
             flushing_active: AtomicBool::new(false),
+            #[cfg(all(target_os = "linux", feature = "ublk"))]
+            inflight_uring_writes: AtomicU64::new(0),
         });
 
         info!(
@@ -280,6 +282,8 @@ impl WriteCache<Initializing> {
             partial_blocks: DashMap::new(),
             manifest_etag: parking_lot::Mutex::new(None),
             flushing_active: AtomicBool::new(false),
+            #[cfg(all(target_os = "linux", feature = "ublk"))]
+            inflight_uring_writes: AtomicU64::new(0),
         });
 
         info!("cache opened fresh for fork, directly Active");
