@@ -1672,6 +1672,7 @@ dependencies = [
  "tracing-subscriber",
  "ublk-core",
  "url",
+ "zstd",
 ]
 
 [[package]]

@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 pub struct UblkClient {
@@ -18,12 +19,24 @@ pub struct UblkClient {
 
 impl UblkClient {
     /// Open a ublk block device for read-write I/O.
+    ///
+    /// Drops the kernel page cache for this device on open. Kernel probes
+    /// (udev, bcache) that fire during device registration can leave stale
+    /// zero pages in the cache; without invalidation, reads may serve those
+    /// stale pages instead of hitting the ublk handler.
     pub fn open(dev_path: &Path, export_size: u64) -> Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(dev_path)
             .with_context(|| format!("failed to open ublk device {}", dev_path.display()))?;
+
+        // Drop any stale page cache entries for this device.
+        // SAFETY: posix_fadvise is safe with a valid fd.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+
         Ok(Self {
             file,
             export_size,

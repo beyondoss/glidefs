@@ -68,6 +68,7 @@ tar = "0.4"
 ext4 = { path = "../ext4" }
 oci-registry = { path = "../oci-registry" }
 flate2 = "1"
+zstd = "0.13"
 sha2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -107,7 +107,27 @@ impl WriteCache<Initializing> {
         let initial_seq = persisted_max_seq.max(max_wal_seq);
         let sequence = SequenceNumber::new(initial_seq);
 
-        // Open WAL for new appends
+        // Rewrite the WAL with only valid entries to remove any torn tail.
+        //
+        // A crash can leave a partial/corrupt entry at the end of the WAL.
+        // replay() stops at the first corruption, but Wal::open() appends
+        // after the corruption. On the NEXT recovery, replay stops at the
+        // old corruption and misses all entries written in the previous
+        // session. Rewriting ensures a clean WAL for future appends.
+        {
+            use crate::block::wal::{serialize_entry, serialize_partial_entry};
+            let mut buf = Vec::new();
+            for entry in &wal_entries {
+                if let Some(bitmap) = entry.partial_bitmap {
+                    serialize_partial_entry(&mut buf, entry.block_index, entry.sequence, bitmap);
+                } else {
+                    serialize_entry(&mut buf, entry.block_index, entry.sequence);
+                }
+            }
+            std::fs::write(&wal_path, &buf)?;
+        }
+
+        // Open WAL for new appends (clean file, no torn tail)
         let wal = match Wal::open(&wal_path) {
             Ok(w) => w,
             Err(e) => {

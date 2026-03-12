@@ -17,6 +17,7 @@ use rand::Rng;
 use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
+use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
 use crate::block::metrics::ExportMetrics;
 use crate::block::pack_index_cache::PackIndexCache;
@@ -130,6 +131,7 @@ pub async fn flush_scheduler(
     content_store: Arc<ContentStore>,
     pack_index_cache: Arc<PackIndexCache>,
     volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
+    clean_cache: Arc<dyn BlockCache>,
     flush_notify: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<ExportMetrics>,
@@ -242,9 +244,11 @@ pub async fn flush_scheduler(
                 if packs_uploaded > 0 {
                     match crate::block::write_cache::compact::compact_if_needed(
                         crate::block::write_cache::compact::DEFAULT_COMPACTION_THRESHOLD,
+                        crate::block::write_cache::compact::DEFAULT_DEAD_RATIO_THRESHOLD,
                         &content_store,
                         &pack_index_cache,
                         &volume_manifest,
+                        &clean_cache,
                     )
                     .await
                     {
@@ -571,7 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_shutdown() {
-        let (cache, content_store, pack_index_cache, volume_manifest, flush_notify, shutdown_rx, shutdown_tx, metrics, ..) =
+        let (cache, content_store, pack_index_cache, volume_manifest, flush_notify, shutdown_rx, shutdown_tx, metrics, clean_cache, _temp) =
             test_scheduler_components().await;
 
         let handle = tokio::spawn(async move {
@@ -580,6 +584,7 @@ mod tests {
                 content_store,
                 pack_index_cache,
                 volume_manifest,
+                clean_cache,
                 flush_notify,
                 shutdown_rx,
                 metrics,
@@ -634,6 +639,7 @@ mod tests {
                 content_store,
                 pack_index_cache,
                 volume_manifest,
+                clean_cache,
                 flush_notify,
                 shutdown_rx,
                 metrics,
@@ -699,6 +705,7 @@ mod tests {
                 content_store,
                 pack_index_cache,
                 volume_manifest,
+                clean_cache,
                 flush_notify,
                 shutdown_rx,
                 metrics,
@@ -770,6 +777,7 @@ mod tests {
         let metrics_check = Arc::clone(&metrics);
         let cache_check = Arc::clone(&cache);
         let flush_notify_clone = Arc::clone(&flush_notify);
+        let clean_cache_check = Arc::clone(&clean_cache);
 
         // Write dirty blocks
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
@@ -785,6 +793,7 @@ mod tests {
                 content_store,
                 pack_index_cache,
                 volume_manifest,
+                clean_cache,
                 flush_notify,
                 shutdown_rx,
                 metrics,
@@ -816,7 +825,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache_check
-                .write(offset, &[0xDD; 128 * 1024], clean_cache.as_ref())
+                .write(offset, &[0xDD; 128 * 1024], clean_cache_check.as_ref())
                 .unwrap();
         }
 
@@ -868,6 +877,7 @@ mod tests {
                 content_store,
                 pack_index_cache,
                 volume_manifest,
+                clean_cache,
                 flush_notify,
                 shutdown_rx,
                 metrics,
@@ -939,6 +949,7 @@ mod tests {
                 content_store,
                 pack_index_cache,
                 volume_manifest,
+                clean_cache,
                 flush_notify,
                 shutdown_rx,
                 metrics,
