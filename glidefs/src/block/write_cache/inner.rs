@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
@@ -262,7 +263,8 @@ pub(crate) struct CacheInner {
     /// Flushing file: the previous active file being uploaded to S3.
     /// Only set during an active flush in bottomless mode. Immutable once set
     /// (no writes, only reads by compute_flush_batch).
-    pub(super) flushing_file: parking_lot::Mutex<Option<SyncFile>>,
+    /// Arc-wrapped so rayon workers can share the reference without holding the Mutex.
+    pub(super) flushing_file: parking_lot::Mutex<Option<Arc<SyncFile>>>,
 
     /// True while a bottomless flush rotation is in progress (between
     /// rotate_data_file() and flushing file deletion). Used by resolve_read_plan
@@ -607,12 +609,17 @@ impl CacheInner {
         write_hashed!(&(self.num_blocks as u64).to_le_bytes());
 
         // v4/v5 sparse format: entry_count(u64) + entries of (index u32, state u8).
-        let entry_count = self.state_map.count_present() as u64;
+        // Collect into a Vec first so entry_count is consistent with the
+        // entries written. Without this, a concurrent set_present() between
+        // count_present() and iter_present() could yield more entries than
+        // the header claims, failing CRC on reload.
+        let entries: Vec<(usize, u8)> = self.state_map.iter_present().collect();
+        let entry_count = entries.len() as u64;
         write_hashed!(&entry_count.to_le_bytes());
 
-        for (idx, state) in self.state_map.iter_present() {
-            write_hashed!(&(idx as u32).to_le_bytes());
-            write_hashed!(&[state]);
+        for (idx, state) in &entries {
+            write_hashed!(&(*idx as u32).to_le_bytes());
+            write_hashed!(&[*state]);
         }
 
         // v5: append max_sequence as trailing u64 LE

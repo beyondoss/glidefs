@@ -1932,13 +1932,15 @@ impl BottomlessHarness {
     }
 
     async fn flush(&self) -> FlushStats {
+        let cc: Arc<dyn crate::block::cache::BlockCache> =
+            Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
         let (stats, _seq) = self
             .cache
             .flush_packs(
                 &self.content_store,
                 &self.pack_index_cache,
                 &self.volume_manifest,
-                None,
+                Some(&cc),
             )
             .await
             .unwrap();
@@ -1968,34 +1970,21 @@ async fn test_bottomless_rotate_data_file() {
     cache.write(4096, &data1, &clean_cache).unwrap();
 
     // Before rotation: no flushing file, flushing_active is false
-    assert!(
-        cache.inner.flushing_file.lock().is_none(),
-        "flushing_file should be None before rotation"
-    );
-    assert!(
-        !cache.inner.flushing_active.load(Ordering::Acquire),
-        "flushing_active should be false before rotation"
-    );
+    assert!(cache.inner.flushing_file.lock().is_none());
+    assert!(!cache.inner.flushing_active.load(Ordering::Acquire));
 
-    // Simulate rotate_data_file: rename active -> flushing, create new active
-    let active_path = config.data_path();
-    let flushing_path = config.flushing_path();
-    cache.inner.flushing_active.store(true, Ordering::Release);
-    std::fs::rename(&active_path, &flushing_path).unwrap();
-    let new_file = super::inner::SyncFile::open(&active_path, true, config.device_size).unwrap();
-    let old_file = std::mem::replace(&mut *cache.inner.data_file.write(), new_file);
-    *cache.inner.flushing_file.lock() = Some(old_file);
+    // Call the real rotate_data_file method
+    cache.rotate_data_file().unwrap();
 
     // After rotation: flushing_file is Some, flushing_active is true
-    assert!(
-        cache.inner.flushing_active.load(Ordering::Acquire),
-        "flushing_active should be true after rotation"
-    );
+    assert!(cache.inner.flushing_active.load(Ordering::Acquire));
+    assert!(cache.inner.flushing_file.lock().is_some());
+    assert!(config.flushing_path().exists(), "flushing file should exist on disk");
 
     // Data should be readable from the flushing file
     {
         let ff_guard = cache.inner.flushing_file.lock();
-        let ff = ff_guard.as_ref().expect("flushing_file should be Some after rotation");
+        let ff = ff_guard.as_ref().unwrap();
         let mut buf = vec![0u8; 4096];
         ff.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf[..], &data0[..], "flushing file should have block 0 data");
@@ -2003,18 +1992,12 @@ async fn test_bottomless_rotate_data_file() {
         assert_eq!(&buf[..], &data1[..], "flushing file should have block 1 data");
     }
 
-    // New active file should be empty (zeros) for those blocks
+    // New active file should be zeros for those blocks
     let mut buf = vec![0u8; 4096];
     cache.inner.data_file.read().read_exact_at(&mut buf, 0).unwrap();
-    assert!(
-        buf.iter().all(|&b| b == 0),
-        "new active file block 0 should be zeros"
-    );
+    assert!(buf.iter().all(|&b| b == 0), "new active file block 0 should be zeros");
     cache.inner.data_file.read().read_exact_at(&mut buf, 4096).unwrap();
-    assert!(
-        buf.iter().all(|&b| b == 0),
-        "new active file block 1 should be zeros"
-    );
+    assert!(buf.iter().all(|&b| b == 0), "new active file block 1 should be zeros");
 }
 
 /// Test 2: Eviction lifecycle.
@@ -2085,16 +2068,8 @@ async fn test_bottomless_re_dirty_during_flush() {
     cache.write(0, &initial_data, &clean_cache).unwrap();
     assert_eq!(cache.dirty_block_count(), 1);
 
-    // Manually rotate the data file (simulates start of flush)
-    {
-        let active_path = config.data_path();
-        let flushing_path = config.flushing_path();
-        cache.inner.flushing_active.store(true, Ordering::Release);
-        std::fs::rename(&active_path, &flushing_path).unwrap();
-        let new_file = super::inner::SyncFile::open(&active_path, true, config.device_size).unwrap();
-        let old_file = std::mem::replace(&mut *cache.inner.data_file.write(), new_file);
-        *cache.inner.flushing_file.lock() = Some(old_file);
-    }
+    // Rotate the data file (start of flush)
+    cache.rotate_data_file().unwrap();
 
     // CAS DIRTY -> SYNCING (what flush does to claim blocks)
     assert!(
@@ -2473,4 +2448,290 @@ async fn test_bottomless_flush_and_s3_readback() {
             data[0]
         );
     }
+}
+
+/// Test: Concurrent writes during bottomless flush.
+///
+/// Spawn a flush on one task while writing to the same blocks concurrently.
+/// Re-dirtied blocks must survive with the latest data. Evicted blocks must
+/// be readable from S3.
+#[tokio::test]
+async fn test_bottomless_concurrent_write_during_flush() {
+    let h = Arc::new(BottomlessHarness::new().await);
+    let metrics = crate::block::metrics::ExportMetrics::new();
+
+    // Write 10 blocks
+    for i in 0u8..10 {
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 0x10; 4096], &h.clean_cache)
+            .unwrap();
+    }
+
+    // Spawn flush in background
+    let h2 = Arc::clone(&h);
+    let flush_handle = tokio::spawn(async move {
+        h2.flush().await
+    });
+
+    // Concurrently overwrite blocks 0-4 with new data
+    // The write path CAS SYNCING→DIRTY races with the flush claiming DIRTY→SYNCING
+    for i in 0u8..5 {
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 0xA0; 4096], &h.clean_cache)
+            .unwrap();
+    }
+
+    let stats = flush_handle.await.unwrap();
+    assert!(stats.blocks_claimed > 0, "some blocks should have been claimed");
+
+    // After flush, verify all blocks are readable with correct data.
+    // Blocks 0-4: either re-dirtied (latest write = 0xA0+i) or evicted then overwritten.
+    // Blocks 5-9: either evicted (0x10+i readable from S3) or still dirty.
+    for i in 0u8..5 {
+        // Re-dirtied blocks: the last write was 0xA0+i. If they were evicted first,
+        // the overwrite re-dirtied them, so data is in the active file.
+        let state = h.cache.inner.state_map.get(i as usize);
+        assert!(
+            state == SparseBlockState::DIRTY || state == SparseBlockState::NOT_PRESENT,
+            "block {} unexpected state: {}", i, state,
+        );
+        let data = h
+            .cache
+            .read(
+                i as u64 * 4096,
+                4096,
+                &h.clean_cache,
+                &h.pack_index_cache,
+                &h.volume_manifest,
+                &h.content_store,
+                &metrics,
+            )
+            .await
+            .unwrap();
+        if state == SparseBlockState::DIRTY {
+            assert!(
+                data.iter().all(|&b| b == i + 0xA0),
+                "re-dirtied block {} should have 0x{:02x}, got 0x{:02x}",
+                i, i + 0xA0, data[0],
+            );
+        }
+        // If NOT_PRESENT: the flush uploaded 0x10+i, then write happened after eviction,
+        // re-dirtied it. Either way the block is in a valid state.
+    }
+
+    for i in 5u8..10 {
+        let data = h
+            .cache
+            .read(
+                i as u64 * 4096,
+                4096,
+                &h.clean_cache,
+                &h.pack_index_cache,
+                &h.volume_manifest,
+                &h.content_store,
+                &metrics,
+            )
+            .await
+            .unwrap();
+        // Blocks 5-9 were not overwritten concurrently, so they should have
+        // the original data (either from SSD if still dirty, or from S3 if evicted).
+        assert!(
+            data.iter().all(|&b| b == i + 0x10),
+            "block {} should have 0x{:02x}, got 0x{:02x}",
+            i, i + 0x10, data[0],
+        );
+    }
+}
+
+/// Test: Clean cache warming during bottomless flush.
+///
+/// After flush evicts blocks, the clean_cache should have been warmed
+/// so reads resolve from cache (not S3).
+#[tokio::test]
+async fn test_bottomless_clean_cache_warming() {
+    let dir = TempDir::new().unwrap();
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "test".to_string(),
+        device_size: 1024 * 1024,
+        block_size: 4096,
+        wal_sync: false,
+        bottomless: true,
+    };
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let content_store =
+        crate::block::content_store::ContentStore::new(object_store, "test-bucket");
+    let pack_index_cache = Arc::new(PackIndexCache::open(dir.path()).await.unwrap());
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        1024 * 1024,
+        4096,
+    )));
+
+    // Use a shared clean_cache that we can inspect after flush
+    let clean_cache: Arc<dyn crate::block::cache::BlockCache> =
+        Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+    let cache = WriteCache::<Initializing>::open(config).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+
+    // Write 3 non-zero blocks
+    for i in 0u8..3 {
+        cache
+            .write(
+                i as u64 * 4096,
+                &vec![i + 0x60; 4096],
+                clean_cache.as_ref(),
+            )
+            .unwrap();
+    }
+
+    // Flush with the shared clean_cache — this should warm the cache
+    let (stats, _seq) = cache
+        .flush_packs(
+            &content_store,
+            &pack_index_cache,
+            &volume_manifest,
+            Some(&clean_cache),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats.blocks_claimed, 3);
+
+    // All blocks should be NOT_PRESENT (evicted)
+    for i in 0usize..3 {
+        assert_eq!(cache.inner.state_map.get(i), SparseBlockState::NOT_PRESENT);
+    }
+
+    // Now read them back. If clean_cache was warmed, this doesn't hit S3.
+    // (We can't directly test "didn't hit S3" without metrics, but we can
+    // verify the data is correct and the read succeeds.)
+    let metrics = crate::block::metrics::ExportMetrics::new();
+    for i in 0u8..3 {
+        let data = cache
+            .read(
+                i as u64 * 4096,
+                4096,
+                clean_cache.as_ref(),
+                &pack_index_cache,
+                &volume_manifest,
+                &content_store,
+                &metrics,
+            )
+            .await
+            .unwrap();
+        assert!(
+            data.iter().all(|&b| b == i + 0x60),
+            "block {} should be 0x{:02x} from warmed cache, got 0x{:02x}",
+            i, i + 0x60, data[0],
+        );
+    }
+}
+
+/// Test: S3 upload failure during bottomless flush copies blocks back.
+///
+/// After flush failure, all SYNCING blocks should be copied from flushing→active
+/// and marked DIRTY. The flushing file should be cleaned up.
+#[tokio::test]
+async fn test_bottomless_flush_failure_recovery() {
+    // Use FailingObjectStore inline — the flush_scheduler's version is private.
+    use async_trait::async_trait;
+    use object_store::{
+        GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ObjStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+        Result as ObjectStoreResult,
+    };
+
+    #[derive(Debug)]
+    struct AlwaysFailStore;
+    impl std::fmt::Display for AlwaysFailStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "AlwaysFailStore")
+        }
+    }
+    #[async_trait]
+    impl ObjStore for AlwaysFailStore {
+        async fn put_opts(&self, _: &object_store::path::Path, _: PutPayload, _: PutOptions) -> ObjectStoreResult<PutResult> {
+            Err(object_store::Error::Generic { store: "AlwaysFailStore", source: "fail".into() })
+        }
+        async fn put_multipart_opts(&self, _: &object_store::path::Path, _: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            Err(object_store::Error::Generic { store: "AlwaysFailStore", source: "fail".into() })
+        }
+        async fn get_opts(&self, _: &object_store::path::Path, _: GetOptions) -> ObjectStoreResult<GetResult> {
+            Err(object_store::Error::Generic { store: "AlwaysFailStore", source: "fail".into() })
+        }
+        async fn delete(&self, _: &object_store::path::Path) -> ObjectStoreResult<()> {
+            Err(object_store::Error::Generic { store: "AlwaysFailStore", source: "fail".into() })
+        }
+        fn list(&self, _: Option<&object_store::path::Path>) -> futures::stream::BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            futures::stream::empty().boxed()
+        }
+        async fn list_with_delimiter(&self, _: Option<&object_store::path::Path>) -> ObjectStoreResult<ListResult> {
+            Ok(ListResult { common_prefixes: vec![], objects: vec![] })
+        }
+        async fn copy(&self, _: &object_store::path::Path, _: &object_store::path::Path) -> ObjectStoreResult<()> {
+            Err(object_store::Error::Generic { store: "AlwaysFailStore", source: "fail".into() })
+        }
+        async fn copy_if_not_exists(&self, _: &object_store::path::Path, _: &object_store::path::Path) -> ObjectStoreResult<()> {
+            Err(object_store::Error::Generic { store: "AlwaysFailStore", source: "fail".into() })
+        }
+    }
+
+    use futures::StreamExt;
+
+    let dir = TempDir::new().unwrap();
+    let config = bottomless_config(dir.path());
+    let failing_store: Arc<dyn object_store::ObjectStore> = Arc::new(AlwaysFailStore);
+    let content_store =
+        crate::block::content_store::ContentStore::new(failing_store, "test-bucket");
+    let pack_index_cache = Arc::new(PackIndexCache::open(dir.path()).await.unwrap());
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        1024 * 1024,
+        4096,
+    )));
+
+    let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+
+    // Write 3 blocks
+    for i in 0u8..3 {
+        cache
+            .write(i as u64 * 4096, &vec![i + 0x70; 4096], &clean_cache)
+            .unwrap();
+    }
+
+    // Flush should fail (S3 upload rejected)
+    let result = cache
+        .flush_packs(&content_store, &pack_index_cache, &volume_manifest, None)
+        .await;
+    assert!(result.is_err(), "flush should fail with AlwaysFailStore");
+
+    // After failure recovery: all blocks should be DIRTY (copied back from flushing)
+    for i in 0usize..3 {
+        assert_eq!(
+            cache.inner.state_map.get(i),
+            SparseBlockState::DIRTY,
+            "block {i} should be DIRTY after flush failure recovery"
+        );
+    }
+
+    // Data should be intact in the active file
+    for i in 0u8..3 {
+        let mut buf = vec![0u8; 4096];
+        cache
+            .inner
+            .data_file
+            .read()
+            .read_exact_at(&mut buf, i as u64 * 4096)
+            .unwrap();
+        assert!(
+            buf.iter().all(|&b| b == i + 0x70),
+            "block {} should have 0x{:02x} after failure recovery, got 0x{:02x}",
+            i, i + 0x70, buf[0],
+        );
+    }
+
+    // Flushing file should be cleaned up
+    assert!(cache.inner.flushing_file.lock().is_none());
+    assert!(!cache.inner.flushing_active.load(Ordering::Acquire));
+    assert!(!config.flushing_path().exists());
 }

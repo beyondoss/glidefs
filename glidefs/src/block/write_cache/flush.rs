@@ -69,6 +69,12 @@ fn compute_flush_batch(
     let block_size = inner.config.block_size;
     let device_size = inner.config.device_size;
 
+    // Snap the flushing file Arc before entering rayon so workers share it
+    // lock-free. Without this, every rayon thread serializes on the Mutex
+    // for each pread, defeating parallelism in bottomless mode.
+    let flushing_snap: Option<Arc<super::inner::SyncFile>> =
+        inner.flushing_file.lock().as_ref().map(Arc::clone);
+
     // Phase 1: parallel per-block compute (pread + crc32 + blake3 + dedup + lz4).
     // Each rayon task allocates its own read buffer; peak memory = num_threads × block_size.
     let per_block: Vec<Result<BlockResult, CacheError>> = snapshot
@@ -90,7 +96,7 @@ fn compute_flush_batch(
             let valid_bytes =
                 std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
             if valid_bytes > 0 {
-                if let Some(ref ff) = *inner.flushing_file.lock() {
+                if let Some(ref ff) = flushing_snap {
                     ff.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
                 } else {
                     inner
@@ -489,7 +495,8 @@ impl WriteCache<Active> {
     /// 2. Create new sparse active file
     /// 3. Swap data_file RwLock (write-locked briefly)
     /// 4. Store old handle in flushing_file Mutex
-    fn rotate_data_file(&self) -> Result<(), CacheError> {
+    #[cfg_attr(feature = "test-utils", allow(dead_code))]
+    pub(crate) fn rotate_data_file(&self) -> Result<(), CacheError> {
         let active_path = self.inner.config.data_path();
         let flushing_path = self.inner.config.flushing_path();
 
@@ -512,7 +519,7 @@ impl WriteCache<Active> {
 
         // Swap: write-lock data_file, replace with new file, store old as flushing
         let old_file = std::mem::replace(&mut *self.inner.data_file.write(), new_file);
-        *self.inner.flushing_file.lock() = Some(old_file);
+        *self.inner.flushing_file.lock() = Some(Arc::new(old_file));
 
         info!("rotated data file for bottomless flush");
         Ok(())
@@ -604,15 +611,19 @@ impl WriteCache<Active> {
             .await;
 
         if result.is_err() {
-            // On error, transition all blocks back to DIRTY
-            for &idx in &snapshot {
-                self.inner.transition_to_dirty(idx);
-            }
-            // Bottomless: copy SYNCING blocks from flushing to active before cleanup
+            // Bottomless: copy block data from flushing to active BEFORE
+            // transitioning state. If we transition SYNCING→DIRTY first,
+            // a concurrent read sees DIRTY, reads the new active file
+            // (which is empty for these blocks), and serves zeros.
             if self.inner.bottomless {
                 let block_size = self.inner.config.block_size;
                 if let Some(ref ff) = *self.inner.flushing_file.lock() {
                     for &idx in &snapshot {
+                        // Only copy blocks still SYNCING (not re-dirtied by a
+                        // concurrent write — those already have data in active).
+                        if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
+                            continue;
+                        }
                         let offset = idx as u64 * block_size as u64;
                         let valid_bytes = std::cmp::min(
                             block_size as u64,
@@ -632,6 +643,10 @@ impl WriteCache<Active> {
                 if flushing_path.exists() {
                     let _ = std::fs::remove_file(&flushing_path);
                 }
+            }
+            // Now transition all snapshot blocks to DIRTY (after data is in active file).
+            for &idx in &snapshot {
+                self.inner.transition_to_dirty(idx);
             }
         }
 
