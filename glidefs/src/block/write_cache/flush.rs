@@ -766,7 +766,6 @@ impl WriteCache<Active> {
         let mut total_stats = FlushStats::default();
         let mut flushed_blocks: Vec<usize> = Vec::new();
         let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
-        let mut all_skipped: Vec<usize> = Vec::new();
 
         // Per-chunk flush
         for (chunk_idx, chunk_blocks) in per_chunk {
@@ -785,11 +784,36 @@ impl WriteCache<Active> {
             total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
             total_stats.blocks_corrupted += batch.stats.blocks_corrupted;
 
-            // Transition skipped blocks back SYNCING→DIRTY
-            for &idx in &batch.skipped {
-                self.inner.transition_to_dirty(idx);
+            // Transition skipped blocks back to DIRTY.
+            //
+            // Blocks still SYNCING (corrupted, partial-not-re-dirtied) need
+            // data promoted from flushing → active before transition, since
+            // no guest write triggered promote-on-write for them.
+            // Blocks already DIRTY (re-dirtied by guest write) were promoted
+            // by the write path — don't overwrite active with stale data.
+            {
+                let flushing_guard = self.inner.flushing_file.lock();
+                let df = self.inner.data_file.read();
+                let block_size = self.inner.config.block_size;
+                for &idx in &batch.skipped {
+                    if self.inner.state_map.get(idx) == SparseBlockState::SYNCING {
+                        if let Some(ref ff) = *flushing_guard {
+                            let offset = idx as u64 * block_size as u64;
+                            let valid = std::cmp::min(
+                                block_size as u64,
+                                self.inner.config.device_size.saturating_sub(offset),
+                            ) as usize;
+                            if valid > 0 {
+                                let mut buf = vec![0u8; valid];
+                                if ff.read_exact_at(&mut buf, offset).is_ok() {
+                                    let _ = df.write_all_at(&buf, offset);
+                                }
+                            }
+                        }
+                    }
+                    self.inner.transition_to_dirty(idx);
+                }
             }
-            all_skipped.extend_from_slice(&batch.skipped);
 
             // Build hash → compressed data map from the unique-hash upload set.
             // Within-batch dedup (seen_hashes in compute_flush_batch) ensures one
@@ -880,88 +904,14 @@ impl WriteCache<Active> {
 
         // Finalize flushed blocks: evict SYNCING→NOT_PRESENT.
         // Block data lives in S3 (and clean_cache) — local SSD copy not needed.
-        let mut cas_failed_blocks: Vec<usize> = Vec::new();
+        //
+        // CAS failure means a guest write re-dirtied the block during flush.
+        // Promote-on-write already copied the full block from flushing → active
+        // before the guest pwrite, so the active file has complete data.
+        // No post-hoc merge needed.
         for &chunk_index in &flushed_blocks {
             if !self.inner.transition_syncing_to_not_present(chunk_index) {
-                // Block was re-dirtied during flush — needs merge below.
-                cas_failed_blocks.push(chunk_index);
                 total_stats.blocks_cas_failed += 1;
-            }
-        }
-
-        // Merge flushing→active for blocks that need recovery:
-        //
-        // 1. Skipped blocks: transitioned back SYNCING→DIRTY. Their data is
-        //    ONLY in the flushing file (new active is empty/sparse).
-        //
-        // 2. CAS-failed blocks (re-dirtied during flush): a concurrent write
-        //    landed SOME sub-blocks in the new active file, but the PRE-rotation
-        //    sub-blocks are ONLY in the flushing file. Without merging, the next
-        //    flush reads the new active file and uploads incomplete data — the
-        //    pre-rotation sub-blocks are permanently lost.
-        //
-        //    Merge strategy: for each 4K sub-block, if the active file has zeros
-        //    (sparse / unwritten), copy from flushing. If the active has data
-        //    (post-rotation write), keep it. This preserves both pre-rotation
-        //    data (from flushing) and post-rotation data (from active).
-        {
-            let block_size = self.inner.config.block_size;
-            let needs_recovery: Vec<usize> = all_skipped
-                .iter()
-                .chain(cas_failed_blocks.iter())
-                .copied()
-                .collect();
-
-            if !needs_recovery.is_empty()
-                && let Some(ref ff) = *self.inner.flushing_file.lock()
-            {
-                let df = self.inner.data_file.read();
-                for &idx in &needs_recovery {
-                    let offset = idx as u64 * block_size as u64;
-                    let valid_bytes = std::cmp::min(
-                        block_size as u64,
-                        self.inner.config.device_size.saturating_sub(offset),
-                    ) as usize;
-                    if valid_bytes == 0 {
-                        continue;
-                    }
-
-                    let mut flush_buf = vec![0u8; valid_bytes];
-                    if ff.read_exact_at(&mut flush_buf, offset).is_err() {
-                        continue;
-                    }
-
-                    // For skipped blocks, active is guaranteed empty — bulk copy.
-                    // For CAS-failed blocks, merge at 4K sub-block granularity.
-                    if cas_failed_blocks.contains(&idx) {
-                        let mut active_buf = vec![0u8; valid_bytes];
-                        if df.read_exact_at(&mut active_buf, offset).is_err() {
-                            // Can't read active — fall back to full copy from flushing
-                            let _ = df.write_all_at(&flush_buf, offset);
-                            continue;
-                        }
-
-                        // Merge: for each 4K sub-block, keep active if non-zero,
-                        // else take flushing's version.
-                        const SUB_BLOCK: usize = 4096;
-                        let mut merged = false;
-                        for sub_off in (0..valid_bytes).step_by(SUB_BLOCK) {
-                            let end = (sub_off + SUB_BLOCK).min(valid_bytes);
-                            if active_buf[sub_off..end].iter().all(|&b| b == 0) {
-                                // Active sub-block is empty — copy from flushing
-                                active_buf[sub_off..end]
-                                    .copy_from_slice(&flush_buf[sub_off..end]);
-                                merged = true;
-                            }
-                        }
-                        if merged {
-                            let _ = df.write_all_at(&active_buf, offset);
-                        }
-                    } else {
-                        // Skipped block: active is empty, bulk copy from flushing
-                        let _ = df.write_all_at(&flush_buf, offset);
-                    }
-                }
             }
         }
 

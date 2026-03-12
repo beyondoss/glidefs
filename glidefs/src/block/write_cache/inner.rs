@@ -540,6 +540,60 @@ impl CacheInner {
         self.data_file.read().write_all_at(data, offset)
     }
 
+    /// Promote SYNCING blocks from flushing → active file before a guest write.
+    ///
+    /// When a guest writes to a block being flushed (SYNCING), its pre-rotation
+    /// data lives only in the flushing file. Without promotion, the guest's
+    /// sub-block write lands in the active file but the rest of the block is
+    /// zeros — the block is split across two files.
+    ///
+    /// Promote copies the full block from flushing → active BEFORE the guest
+    /// pwrite, so the active file always has complete data for every DIRTY block.
+    /// The guest pwrite then overlays its sub-block on top.
+    ///
+    /// Idempotent: multiple concurrent promotions of the same block copy the
+    /// same data. The flushing file is immutable after rotation.
+    ///
+    /// Called under the data_file read lock (passed as `df`).
+    pub(super) fn promote_syncing_blocks(
+        &self,
+        df: &SyncFile,
+        start_block: u64,
+        end_block: u64,
+    ) {
+        use crate::block::block_map::SparseBlockState;
+
+        if !self.flushing_active.load(Ordering::Acquire) {
+            return;
+        }
+
+        let block_size = self.config.block_size as u64;
+        let flushing_guard = self.flushing_file.lock();
+        if let Some(ref ff) = *flushing_guard {
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx >= self.num_blocks {
+                    continue;
+                }
+                if self.state_map.get(idx) != SparseBlockState::SYNCING {
+                    continue;
+                }
+                let offset = block * block_size;
+                let valid = std::cmp::min(
+                    block_size,
+                    self.config.device_size.saturating_sub(offset),
+                ) as usize;
+                if valid == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; valid];
+                if ff.read_exact_at(&mut buf, offset).is_ok() {
+                    let _ = df.write_all_at(&buf, offset);
+                }
+            }
+        }
+    }
+
     // -- CRC32 SparseCrcMap methods (for dirty-block corruption detection) -----
 
     /// Store a CRC32 checksum for a dirty block (checkpoint path).

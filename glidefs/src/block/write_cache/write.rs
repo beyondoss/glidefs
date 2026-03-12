@@ -94,6 +94,12 @@ impl WriteCache<Active> {
         // interleaving. The read lock is shared, so concurrent writers are
         // not blocked — only rotation waits until all writers release.
         let df = self.inner.data_file.read();
+
+        // Promote SYNCING blocks from flushing → active before pwrite.
+        // This ensures the active file has the complete block so the guest's
+        // sub-block write doesn't leave the rest as zeros.
+        self.inner.promote_syncing_blocks(&df, start_block, end_block);
+
         df.write_all_at(data, offset)?;
 
         // Re-pwrite for blocks that were partial at the start of this write.
@@ -216,6 +222,9 @@ impl WriteCache<Active> {
         // Hold the data_file read lock across zero + dirty marking (same
         // rotation race as write() — see comment there).
         let df = self.inner.data_file.read();
+
+        // Promote SYNCING blocks from flushing → active before zeroing.
+        self.inner.promote_syncing_blocks(&df, start_block, end_block);
 
         // Zero the file range (after claiming blocks via set_present)
         #[cfg(target_os = "linux")]
@@ -430,6 +439,10 @@ impl WriteCache<Active> {
         // Hold the data_file read lock across pwrite + dirty marking.
         // See cache.write() for the full explanation of the race.
         let df = self.inner.data_file.read();
+
+        // Promote SYNCING blocks from flushing → active before pwrite.
+        self.inner.promote_syncing_blocks(&df, start_block, end_block);
+
         df.write_all_at(data, offset)?;
 
         // Mark affected blocks as dirty, invalidate stale CRCs, and batch
