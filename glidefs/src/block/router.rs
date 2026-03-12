@@ -187,6 +187,8 @@ pub struct RouterConfig {
     pub clean_cache: Arc<dyn BlockCache>,
     /// Whether to fsync the WAL after each write batch
     pub wal_sync: bool,
+    /// Bottomless storage mode: evict blocks after flush, free SSD space.
+    pub bottomless: bool,
     /// Max concurrent S3 pack uploads across all exports (0 = unlimited).
     pub max_s3_uploads: usize,
     /// Max concurrent S3 pack downloads across all exports (0 = unlimited).
@@ -229,6 +231,9 @@ pub struct ExportRouter {
 
     /// Whether to fsync the WAL after each write batch
     wal_sync: bool,
+
+    /// Bottomless storage mode: evict blocks after flush, free SSD space.
+    bottomless: bool,
 
     /// Default blocks per pack for new exports (from global config).
     default_blocks_per_pack: usize,
@@ -346,6 +351,7 @@ impl ExportRouter {
             pack_index_cache,
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
+            bottomless: config.bottomless,
             default_blocks_per_pack: config.default_blocks_per_pack,
             scrubber_metrics: Arc::new(crate::block::scrubber::ScrubberMetrics::new()),
             s3_circuit_breaker,
@@ -519,7 +525,7 @@ impl ExportRouter {
             let Ok(_flush_guard) = cache.flush_lock().try_lock() else {
                 continue;
             };
-            match cache.flush_packs(cs, cmc, vm).await {
+            match cache.flush_packs(cs, cmc, vm, None).await {
                 Ok((stats, _)) if stats.packs_uploaded > 0 => {
                     if let Err(e) = cache.sync_manifest(cs, vm).await {
                         warn!(export = %name, error = %e, "pressure flush manifest sync failed");
@@ -760,6 +766,7 @@ impl ExportRouter {
                 device_size,
                 block_size,
                 wal_sync: self.wal_sync,
+                bottomless: self.bottomless,
             };
 
             // Open a fresh cache (local SSD starts empty, reads go through VolumeManifest → ChunkMetaCache → S3)
@@ -775,6 +782,7 @@ impl ExportRouter {
                 device_size,
                 block_size,
                 wal_sync: self.wal_sync,
+                bottomless: self.bottomless,
             };
             let cache = WriteCache::open(cache_config)?;
             info!("Recovering write cache for export '{}'...", name);
@@ -1678,7 +1686,7 @@ impl ExportRouter {
             cache_dir: temp_dir,
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
@@ -1721,7 +1729,7 @@ mod tests {
             cache_dir: temp_dir.path().to_path_buf(),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
@@ -3154,7 +3162,7 @@ mod tests {
             cache_dir: temp_dir.path().to_path_buf(),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
@@ -3190,7 +3198,7 @@ mod tests {
             cache_dir: temp_dir2.path().to_path_buf(),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
@@ -3238,7 +3246,7 @@ mod tests {
             cache_dir: temp_dir.path().join("parent"),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
@@ -3267,7 +3275,7 @@ mod tests {
             cache_dir: temp_dir.path().join("child"),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
@@ -3372,7 +3380,7 @@ mod tests {
             cache_dir: reader_dir.path().to_path_buf(),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
             default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,

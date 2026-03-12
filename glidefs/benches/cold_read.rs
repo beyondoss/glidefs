@@ -49,7 +49,7 @@ impl ReadBenchHarness {
             device_name: "bench".to_string(),
             device_size: device_size_bytes,
             block_size: BLOCK_SIZE,
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
         };
 
         let content_store = ContentStore::new(Arc::clone(&s3_backend), "bench");

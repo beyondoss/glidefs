@@ -100,7 +100,7 @@ async fn test_handler() -> (Arc<BlockHandler>, TempDir) {
         device_name: "oci-push-test".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
 
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());

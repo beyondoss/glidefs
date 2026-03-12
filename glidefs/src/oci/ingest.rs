@@ -66,7 +66,7 @@ mod tests {
             device_name: "ingest-test".to_string(),
             device_size,
             block_size: 4096,
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
         };
 
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());

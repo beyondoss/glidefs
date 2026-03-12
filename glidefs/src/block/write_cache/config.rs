@@ -22,6 +22,12 @@ pub struct WriteCacheConfig {
     /// Adds ~10ms latency per write but guarantees durability on SSDs without
     /// power-loss protection.
     pub wal_sync: bool,
+
+    /// Bottomless storage mode. When enabled, the local SSD is a bounded
+    /// write-back buffer: after flush, blocks are evicted (SYNCING→NOT_PRESENT)
+    /// and the flushing file is deleted via `unlink()`. Reads for evicted blocks
+    /// go through CleanCache → S3.
+    pub bottomless: bool,
 }
 
 impl WriteCacheConfig {
@@ -43,6 +49,11 @@ impl WriteCacheConfig {
     /// Path to the v2 WAL file.
     pub fn wal_path(&self) -> PathBuf {
         self.cache_dir.join(format!("{}.wal", self.device_name))
+    }
+
+    /// Path to the flushing data file (exists only during active flush in bottomless mode).
+    pub fn flushing_path(&self) -> PathBuf {
+        self.cache_dir.join(format!("{}.flushing", self.device_name))
     }
 
     /// Validate configuration. Guards against zero block_size which would

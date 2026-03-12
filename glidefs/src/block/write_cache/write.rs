@@ -79,7 +79,7 @@ impl WriteCache<Active> {
         }
 
         // Now write to local file (after claiming blocks via set_present)
-        self.inner.data_file.write_all_at(data, offset)?;
+        self.inner.data_file.read().write_all_at(data, offset)?;
 
         // Re-pwrite for blocks that were partial at the start of this write.
         //
@@ -104,7 +104,7 @@ impl WriteCache<Active> {
 
             let entry = self.inner.partial_blocks.get(&idx);
             let _guard = entry.as_ref().map(|e| e.value().write_lock.lock());
-            self.inner.data_file.write_all_at(
+            self.inner.data_file.read().write_all_at(
                 &data[data_offset..data_offset + write_len],
                 write_start,
             )?;
@@ -199,7 +199,7 @@ impl WriteCache<Active> {
         // Zero the file range (after claiming blocks via set_present)
         #[cfg(target_os = "linux")]
         {
-            let fd = self.inner.data_file.as_raw_fd();
+            let fd = self.inner.data_file.read().as_raw_fd();
 
             // FALLOC_FL_ZERO_RANGE = 0x10
             // This zeros the range without deallocating - keeps the file contiguous
@@ -244,6 +244,7 @@ impl WriteCache<Active> {
             let _guard = entry.as_ref().map(|e| e.value().write_lock.lock());
             self.inner
                 .data_file
+                .read()
                 .write_all_at(&self.inner.zero_block_bytes[..zero_len], write_start)?;
         }
 
@@ -304,6 +305,7 @@ impl WriteCache<Active> {
             let chunk_size = (remaining as usize).min(ZERO_CHUNK_SIZE);
             self.inner
                 .data_file
+                .read()
                 .write_all_at(&ZERO_CHUNK[..chunk_size], current_offset)?;
             remaining -= chunk_size as u64;
             current_offset += chunk_size as u64;

@@ -280,7 +280,7 @@ async fn test_recovery_after_pack_flush_without_drain() {
     // Critically, we do NOT call flush_to_s3 or drain — this is what happens
     // when the host dies after the scheduler fires but before drain.
     let (stats, _seq_cutpoint) = cache_a
-        .flush_packs(&content_store_a, &pack_index_cache_a, &volume_manifest_a)
+        .flush_packs(&content_store_a, &pack_index_cache_a, &volume_manifest_a, None)
         .await
         .unwrap();
     assert!(stats.packs_uploaded > 0, "should have uploaded packs");

@@ -11,7 +11,7 @@ use crate::block::block_map::{
 use crate::block::state::{Active, Initializing, Recovering};
 use crate::block::wal::Wal;
 
-use super::inner::CacheInner;
+use super::inner::{CacheInner, SyncFile};
 use super::{CacheError, WriteCache, WriteCacheConfig};
 
 impl WriteCache<Initializing> {
@@ -142,9 +142,55 @@ impl WriteCache<Initializing> {
         let zbb = Bytes::from(vec![0u8; block_size]);
 
         let partial_count = partial_blocks.len();
+        let bottomless = config.bottomless;
+
+        // Bottomless crash recovery: if a flushing file exists, we crashed mid-flush.
+        // All SYNCING blocks have data in the flushing file — copy them to the active
+        // file and mark DIRTY so they'll be re-flushed.
+        let flushing_path = config.flushing_path();
+        if flushing_path.exists() {
+            info!("found flushing file — recovering from interrupted flush");
+            let flushing_file = SyncFile::open(&flushing_path, false, config.device_size)?;
+            let block_size = config.block_size;
+            let mut recovered = 0usize;
+            for (idx, state) in state_map.iter_present() {
+                if state == SparseBlockState::SYNCING {
+                    let offset = idx as u64 * block_size as u64;
+                    let valid_bytes = std::cmp::min(
+                        block_size as u64,
+                        config.device_size.saturating_sub(offset),
+                    ) as usize;
+                    if valid_bytes > 0 {
+                        let mut buf = vec![0u8; valid_bytes];
+                        flushing_file.read_exact_at(&mut buf, offset)?;
+                        data_file.write_all_at(&buf, offset)?;
+                    }
+                    let _ = state_map.cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY);
+                    dirty_count += 1;
+                    recovered += 1;
+                }
+            }
+            drop(flushing_file);
+            std::fs::remove_file(&flushing_path)?;
+            info!(recovered_blocks = recovered, "flush recovery complete");
+        }
+
+        // Bottomless migration: transition any CLEAN blocks to NOT_PRESENT.
+        // Their data is in S3 by definition of CLEAN. Without this, reads of
+        // CLEAN blocks would try the active file which may be empty (sparse).
+        if bottomless {
+            for (idx, state) in state_map.iter_present().collect::<Vec<_>>() {
+                if state == SparseBlockState::CLEAN {
+                    let _ = state_map.cas(idx, SparseBlockState::CLEAN, SparseBlockState::NOT_PRESENT);
+                }
+            }
+        }
+
         let inner = Arc::new(CacheInner {
             config,
-            data_file,
+            data_file: parking_lot::RwLock::new(data_file),
+            flushing_file: parking_lot::Mutex::new(None),
+            bottomless,
             state_map,
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
@@ -166,6 +212,7 @@ impl WriteCache<Initializing> {
             present_blocks = present_count,
             partial_blocks = partial_count,
             recovery_warnings = recovery_warning_count,
+            bottomless,
             "cache opened, transitioning to Recovering"
         );
 
@@ -195,9 +242,12 @@ impl WriteCache<Initializing> {
         let zbh = zero_block_hash(block_size);
         let zbb = Bytes::from(vec![0u8; block_size]);
 
+        let bottomless = config.bottomless;
         let inner = Arc::new(CacheInner {
             config,
-            data_file,
+            data_file: parking_lot::RwLock::new(data_file),
+            flushing_file: parking_lot::Mutex::new(None),
+            bottomless,
             state_map,
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
@@ -214,7 +264,7 @@ impl WriteCache<Initializing> {
             manifest_etag: parking_lot::Mutex::new(None),
         });
 
-        info!("cache opened fresh for fork, directly Active");
+        info!(bottomless, "cache opened fresh for fork, directly Active");
 
         Ok(WriteCache {
             inner,

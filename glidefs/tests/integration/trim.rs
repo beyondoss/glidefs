@@ -143,7 +143,7 @@ async fn test_trim_fork_semantics() {
             device_name: "trim-fork-child".to_string(),
             device_size: DEVICE_SIZE,
             block_size: BLOCK_SIZE,
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
         };
         let cache = WriteCache::open_fresh_active(config).unwrap();
         let cs = ContentStore::new(Arc::clone(&s3), "test");
@@ -216,7 +216,7 @@ async fn test_trim_crash_recovery() {
         device_name: "trim-crash".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: true,
+        wal_sync: true, bottomless: false,
     };
 
     // Session 1: write block, then TRIM, then crash (drop without save)

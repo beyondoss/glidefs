@@ -101,6 +101,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             block_size: nbd_config.block_size(),
             clean_cache,
             wal_sync: nbd_config.wal_sync(),
+            bottomless: nbd_config.bottomless(),
             max_s3_uploads: nbd_config.max_s3_uploads(),
             max_s3_downloads: nbd_config.max_s3_downloads(),
             default_blocks_per_pack: nbd_config.blocks_per_pack(),

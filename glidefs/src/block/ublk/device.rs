@@ -1258,7 +1258,7 @@ mod tests {
             device_name: "ublk-test".to_string(),
             device_size: DEVICE_SIZE,
             block_size: BLOCK_SIZE,
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
         };
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), "test"));

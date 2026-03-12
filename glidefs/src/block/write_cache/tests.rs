@@ -15,7 +15,7 @@ fn test_config(dir: &Path) -> WriteCacheConfig {
         device_name: "test".to_string(),
         device_size: 1024 * 1024, // 1MB
         block_size: 4096,         // 4KB for testing
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     }
 }
 
@@ -164,7 +164,7 @@ impl V2Harness {
             device_name: "test".to_string(),
             device_size,
             block_size,
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
         };
         let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         let content_store =
@@ -753,7 +753,7 @@ async fn test_recovery_verifies_dirty_blocks_readable() {
         device_name: "test-recovery".to_string(),
         device_size: 1024 * 1024,
         block_size,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
 
     let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
@@ -805,7 +805,7 @@ async fn test_concurrent_flush_and_writes() {
         device_name: "conc-flush".to_string(),
         device_size: 1024 * 1024,
         block_size: 4096,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let content_store = Arc::new(crate::block::content_store::ContentStore::new(
@@ -907,7 +907,7 @@ async fn test_draining_state_transition() {
         device_name: "drain-test".to_string(),
         device_size: 1024 * 1024,
         block_size: 4096,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
 
     let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
@@ -970,7 +970,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
         device_name: "s3-converge".to_string(),
         device_size: 1024 * 1024,
         block_size: 4096,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let content_store = Arc::new(crate::block::content_store::ContentStore::new(
@@ -1098,12 +1098,12 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
 
     // Corrupt the block on SSD (simulate bit rot after checkpoint).
     let corrupted_data = vec![0xFFu8; 4096];
-    inner.data_file.write_all_at(&corrupted_data, 0).unwrap();
+    inner.data_file.read().write_all_at(&corrupted_data, 0).unwrap();
 
     // Flush should detect CRC32 mismatch and skip the block.
     let (stats, _seq) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 1, "should detect 1 corrupted block");
@@ -1129,7 +1129,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
     // is persistent, the next checkpoint captures the corrupted state.
     let (stats2, _seq) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "no mismatch on second flush");
@@ -1163,7 +1163,7 @@ async fn test_crc32_cleared_on_write() {
     // Flush without a checkpoint in between — no CRC32, verification skipped.
     let (stats, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);
@@ -1198,17 +1198,19 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Corrupt blocks 1 and 3 on SSD (leave 0, 2, 4 intact).
     inner
         .data_file
+        .read()
         .write_all_at(&vec![0xFFu8; 4096], 4096)
         .unwrap();
     inner
         .data_file
+        .read()
         .write_all_at(&vec![0xFEu8; 4096], 3 * 4096)
         .unwrap();
 
     // Flush: should upload 3 good blocks, skip 2 corrupted.
     let (stats, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 2, "blocks 1 and 3 corrupted");
@@ -1234,7 +1236,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Second flush succeeds for the remaining 2 blocks.
     let (stats2, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0);
@@ -1274,7 +1276,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     let (stats1, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
     assert_eq!(stats1.blocks_corrupted, 0, "cycle 1: no corruption");
@@ -1311,7 +1313,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     let (stats2, _) = h
         .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
     assert_eq!(stats2.blocks_corrupted, 0, "cycle 2: no corruption");
@@ -1341,7 +1343,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         device_name: "crc32-conc".to_string(),
         device_size: 1024 * 1024,
         block_size: 4096,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let content_store = Arc::new(crate::block::content_store::ContentStore::new(
@@ -1379,7 +1381,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         tasks.spawn(async move {
             for _ in 0..10 {
                 cache.local_checkpoint().await.unwrap();
-                let (stats, _) = cache.flush_packs(&cs, &cmc, &vm).await.unwrap();
+                let (stats, _) = cache.flush_packs(&cs, &cmc, &vm, None).await.unwrap();
                 corrupted.fetch_add(
                     stats.blocks_corrupted as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -1457,7 +1459,7 @@ async fn test_partial_blocks_insert_overwrites_bitmap_causing_data_loss() {
         device_name: "partial-test".to_string(),
         device_size: 128 * 1024, // 1 block at 128KB
         block_size: 128 * 1024,  // 128KB blocks → 32 sub-regions of 4KB
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.skip_recovery_for_test();
@@ -1551,7 +1553,7 @@ async fn test_merge_partial_block_stale_bitmap_misses_concurrent_write() {
         device_name: "merge-test".to_string(),
         device_size: block_size as u64,
         block_size,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.skip_recovery_for_test();
@@ -1620,7 +1622,7 @@ async fn test_backfill_write_sub_region_overwrites_guest_data() {
         device_name: "backfill-race".to_string(),
         device_size: block_size as u64,
         block_size,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.skip_recovery_for_test();
@@ -1652,7 +1654,7 @@ async fn test_backfill_write_sub_region_overwrites_guest_data() {
         // Guest marks bit and does main pwrite (outside the lock — these are
         // atomic/positional-IO and don't need the lock).
         inner.mark_sub_regions(block_idx, 0, SUB_BLOCK_SIZE);
-        inner.data_file.write_all_at(&guest_data, 0).unwrap();
+        inner.data_file.read().write_all_at(&guest_data, 0).unwrap();
 
         // Backfill writes S3 data (under lock, using stale bitmap).
         // This overwrites the guest's main pwrite — but the guest will
@@ -1666,12 +1668,12 @@ async fn test_backfill_write_sub_region_overwrites_guest_data() {
     {
         let state = inner.partial_blocks.get(&block_idx).unwrap();
         let _guard = state.value().write_lock.lock();
-        inner.data_file.write_all_at(&guest_data, 0).unwrap();
+        inner.data_file.read().write_all_at(&guest_data, 0).unwrap();
     }
 
     // --- VERIFY: guest data survives ---
     let mut readback = vec![0u8; SUB_BLOCK_SIZE];
-    inner.data_file.read_exact_at(&mut readback, 0).unwrap();
+    inner.data_file.read().read_exact_at(&mut readback, 0).unwrap();
 
     assert_eq!(
         readback[0], 0xBB,
@@ -1704,7 +1706,7 @@ async fn test_complete_partial_before_repwrite_race() {
         device_name: "complete-partial-race".to_string(),
         device_size: block_size as u64,
         block_size,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.skip_recovery_for_test();
@@ -1724,7 +1726,7 @@ async fn test_complete_partial_before_repwrite_race() {
     // Fill the entire block with S3 data (0xAA) — simulates backfill writing
     // stale data to the SSD.
     let s3_data = vec![0xAAu8; block_size];
-    cache.inner().data_file.write_all_at(&s3_data, 0).unwrap();
+    cache.inner().data_file.read().write_all_at(&s3_data, 0).unwrap();
 
     // Backfill completes: removes the partial block entry.
     // This is the critical step — it happens BEFORE the guest write.
@@ -1762,6 +1764,7 @@ async fn test_complete_partial_before_repwrite_race() {
     cache
         .inner()
         .data_file
+        .read()
         .read_exact_at(&mut readback, 0)
         .unwrap();
 
@@ -1776,6 +1779,7 @@ async fn test_complete_partial_before_repwrite_race() {
     cache
         .inner()
         .data_file
+        .read()
         .read_exact_at(&mut rest, SUB_BLOCK_SIZE as u64)
         .unwrap();
     assert!(
@@ -1805,7 +1809,7 @@ async fn test_write_survives_complete_partial_removal() {
         device_name: "repwrite-removal".to_string(),
         device_size: block_size as u64,
         block_size,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.skip_recovery_for_test();
@@ -1828,6 +1832,7 @@ async fn test_write_survives_complete_partial_removal() {
     cache
         .inner()
         .data_file
+        .read()
         .write_all_at(&[0xAAu8; SUB_BLOCK_SIZE], 0)
         .unwrap();
     cache.inner().complete_partial(block_idx);
@@ -1853,6 +1858,7 @@ async fn test_write_survives_complete_partial_removal() {
     cache
         .inner()
         .data_file
+        .read()
         .read_exact_at(&mut readback, 0)
         .unwrap();
 

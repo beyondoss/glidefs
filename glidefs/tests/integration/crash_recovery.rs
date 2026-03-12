@@ -27,7 +27,7 @@ fn test_config(dir: &TempDir, name: &str) -> WriteCacheConfig {
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     }
 }
 
@@ -258,7 +258,7 @@ async fn test_device_size_shrink_rejected() {
         device_name: config.device_name.clone(),
         device_size: config.device_size / 2, // Halve the size
         block_size: config.block_size,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
 
     // Resize data file to match new config
@@ -680,7 +680,7 @@ async fn test_flush_truncates_wal_before_crash() {
         device_name: "wal_trunc".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: true,
+        wal_sync: true, bottomless: false,
     };
 
     let flushed_data_0: Vec<u8> = vec![0x11; BLOCK_SIZE];
@@ -786,7 +786,7 @@ async fn test_wal_lost_blocks_since_last_checkpoint_are_lost() {
         device_name: "wal_lost".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: true,
+        wal_sync: true, bottomless: false,
     };
 
     let test_data: Vec<u8> = vec![0xEE; BLOCK_SIZE];
@@ -843,7 +843,7 @@ async fn test_wal_lost_preserves_checkpointed_blocks() {
         device_name: "wal_partial_loss".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: true,
+        wal_sync: true, bottomless: false,
     };
 
     let old_data: Vec<u8> = vec![0x11; BLOCK_SIZE];

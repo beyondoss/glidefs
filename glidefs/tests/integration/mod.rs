@@ -85,7 +85,7 @@ pub async fn create_test_cache(
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
 
     let metrics = Arc::new(ExportMetrics::new());
@@ -144,7 +144,7 @@ pub async fn create_cold_reader(
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
 
     let metrics = Arc::new(ExportMetrics::new());

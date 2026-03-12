@@ -83,7 +83,17 @@ impl WriteCache<Active> {
         }) {
             return None;
         }
-        Some(match self.inner.data_file.read_exact_at(&mut buf[..len], offset) {
+        // Bottomless: during flush, SYNCING blocks are in the flushing file.
+        // Bail to the full read path which handles state-aware dispatch.
+        if self.inner.bottomless
+            && (start_block..=end_block).any(|i| {
+                self.inner.state_map.get(i as usize)
+                    == crate::block::block_map::SparseBlockState::SYNCING
+            })
+        {
+            return None;
+        }
+        Some(match self.inner.data_file.read().read_exact_at(&mut buf[..len], offset) {
             Ok(()) => Ok(len),
             Err(e) => Err(CacheError::from(e)),
         })
@@ -106,7 +116,7 @@ impl WriteCache<Active> {
         }
 
         let mut buf = vec![0u8; len];
-        self.inner.data_file.read_exact_at(&mut buf, offset)?;
+        self.inner.data_file.read().read_exact_at(&mut buf, offset)?;
 
         Ok(Bytes::from(buf))
     }
@@ -150,13 +160,30 @@ impl WriteCache<Active> {
         };
 
         let mut buf = vec![0u8; block_size];
+
+        // Bottomless: SYNCING blocks live in the flushing file during flush.
+        // The active file is empty for those blocks after rotation.
+        let use_flushing = self.inner.bottomless
+            && self.inner.state_map.get(block_num as usize)
+                == crate::block::block_map::SparseBlockState::SYNCING;
+
+        if use_flushing {
+            let guard = self.inner.flushing_file.lock();
+            if let Some(ref ff) = *guard {
+                ff.read_exact_at(&mut buf[..valid_bytes], offset)?;
+                return Ok(Bytes::from(buf));
+            }
+            // Flushing file gone — block should have been transitioned, fall through
+        }
+
         if valid_bytes == block_size {
             // Full block - read normally
-            self.inner.data_file.read_exact_at(&mut buf, offset)?;
+            self.inner.data_file.read().read_exact_at(&mut buf, offset)?;
         } else {
             // Partial block (last block) - read only valid bytes, rest stays zero
             self.inner
                 .data_file
+                .read()
                 .read_exact_at(&mut buf[..valid_bytes], offset)?;
         }
         Ok(Bytes::from(buf))
@@ -202,9 +229,14 @@ impl WriteCache<Active> {
 
         // Fast path: all chunks present on local SSD and not partial →
         // single LocalSsd entry. Collapses N per-chunk SQEs into one io_uring Read.
+        // Also check not SYNCING in bottomless mode (data in flushing file).
         if (start_chunk..=end_chunk).all(|i| {
             let idx = i as usize;
-            self.inner.is_present(idx) && !self.inner.is_partial(idx)
+            self.inner.is_present(idx)
+                && !self.inner.is_partial(idx)
+                && !(self.inner.bottomless
+                    && self.inner.state_map.get(idx)
+                        == crate::block::block_map::SparseBlockState::SYNCING)
         }) {
             return Ok(ReadPlan {
                 entries: vec![ChunkPlanEntry {
@@ -245,7 +277,10 @@ impl WriteCache<Active> {
         // Locate all blocks concurrently, then coalesce S3 fetches.
         let locate_futures: Vec<_> = (start_chunk..=end_chunk)
             .map(|block_idx| {
-                let is_local = self.inner.is_present(block_idx as usize);
+                let is_local = self.inner.is_present(block_idx as usize)
+                    && !(self.inner.bottomless
+                        && self.inner.state_map.get(block_idx as usize)
+                            == crate::block::block_map::SparseBlockState::SYNCING);
                 let file_offset = block_idx * chunk_size;
                 async move {
                     if is_local {
@@ -389,12 +424,17 @@ impl WriteCache<Active> {
 
         // Fast path: all blocks present on local SSD and not partial →
         // single pread of exact bytes. Bypasses per-block resolution.
+        // Bottomless: SYNCING blocks are in the flushing file, bail to per-block path.
         if (start_block..=end_block).all(|i| {
             let idx = i as usize;
-            self.inner.is_present(idx) && !self.inner.is_partial(idx)
+            self.inner.is_present(idx)
+                && !self.inner.is_partial(idx)
+                && !(self.inner.bottomless
+                    && self.inner.state_map.get(idx)
+                        == crate::block::block_map::SparseBlockState::SYNCING)
         }) {
             let mut buf = vec![0u8; len];
-            self.inner.data_file.read_exact_at(&mut buf, offset)?;
+            self.inner.data_file.read().read_exact_at(&mut buf, offset)?;
             return Ok(Bytes::from(buf));
         }
 

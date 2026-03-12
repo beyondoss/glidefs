@@ -43,17 +43,19 @@ struct FlushResult {
 /// exponential backoff, records error metric.
 ///
 /// Returns `Some(result)` on flush success, `None` on flush failure.
+#[allow(clippy::too_many_arguments)]
 async fn flush_and_sync(
     cache: &WriteCache<Active>,
     content_store: &ContentStore,
     pack_index_cache: &Arc<PackIndexCache>,
     volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+    clean_cache: &Arc<dyn BlockCache>,
     metrics: &ExportMetrics,
     flush_backoff: &mut Duration,
     last_flush_failure: &mut Option<tokio::time::Instant>,
 ) -> Option<FlushResult> {
     match cache
-        .flush_packs(content_store, pack_index_cache, volume_manifest)
+        .flush_packs(content_store, pack_index_cache, volume_manifest, Some(clean_cache))
         .await
     {
         Ok((stats, _seq_cutpoint)) => {
@@ -204,7 +206,7 @@ pub async fn flush_scheduler(
                     let _flush_guard = cache.flush_lock().lock().await;
                     if let Some(result) = flush_and_sync(
                         &cache, &content_store, &pack_index_cache, &volume_manifest,
-                        &metrics, &mut flush_backoff, &mut last_flush_failure,
+                        &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
                     ).await {
                         metrics.record_s3_put_latency(start.elapsed());
                         packs_uploaded = result.packs_uploaded;
@@ -307,7 +309,7 @@ pub async fn flush_scheduler(
                         let _flush_guard = cache.flush_lock().lock().await;
                         if let Some(result) = flush_and_sync(
                             &cache, &content_store, &pack_index_cache, &volume_manifest,
-                            &metrics, &mut flush_backoff, &mut last_flush_failure,
+                            &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
                         ).await
                             && result.packs_uploaded > 0 {
                             manifest_pending = !result.manifest_synced;
@@ -486,7 +488,7 @@ mod tests {
             device_name: "sched-test".to_string(),
             device_size: device_size(),
             block_size: 128 * 1024,
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
         };
 
         let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
@@ -541,7 +543,7 @@ mod tests {
             device_name: "sched-backoff".to_string(),
             device_size: device_size(),
             block_size: 128 * 1024,
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
         };
 
         let content_store = Arc::new(ContentStore::new(s3, "test"));
@@ -987,7 +989,7 @@ mod tests {
             device_name: "sched-backoff".to_string(),
             device_size: device_size(),
             block_size: 128 * 1024,
-            wal_sync: false,
+            wal_sync: false, bottomless: false,
         };
         let recovered = WriteCache::<Initializing>::open(config).unwrap();
         let recovered = recovered.skip_recovery_for_test();

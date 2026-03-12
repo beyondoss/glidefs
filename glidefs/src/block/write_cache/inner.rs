@@ -253,9 +253,19 @@ pub(crate) struct CacheInner {
     /// Configuration
     pub(super) config: WriteCacheConfig,
 
-    /// Local cache file (data) - encrypted at rest
-    /// Uses positional I/O (pread/pwrite) which is lock-free and thread-safe
-    pub(super) data_file: SyncFile,
+    /// Local cache file (data).
+    /// Uses positional I/O (pread/pwrite) which is thread-safe. RwLock is
+    /// read-locked for all I/O (~2ns overhead); write-locked only during
+    /// bottomless file rotation (once per flush cycle).
+    pub(super) data_file: parking_lot::RwLock<SyncFile>,
+
+    /// Flushing file: the previous active file being uploaded to S3.
+    /// Only set during an active flush in bottomless mode. Immutable once set
+    /// (no writes, only reads by compute_flush_batch).
+    pub(super) flushing_file: parking_lot::Mutex<Option<SyncFile>>,
+
+    /// Bottomless storage mode: evict blocks after flush, delete flushing file.
+    pub(super) bottomless: bool,
 
     /// Sparse block state map - LOCK-FREE
     /// Combines block state and presence into a single sparse page table.
@@ -350,7 +360,7 @@ impl CacheInner {
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     #[inline]
     pub(crate) fn data_file_fd(&self) -> std::os::unix::io::RawFd {
-        self.data_file.as_raw_fd()
+        self.data_file.read().as_raw_fd()
     }
 
     /// Check if block is present (lock-free read).
@@ -441,6 +451,25 @@ impl CacheInner {
         }
     }
 
+    /// Atomically evict a flushed block: CAS SYNCING→NOT_PRESENT.
+    ///
+    /// Used by bottomless mode to free SSD space after successful upload.
+    /// Returns true if the CAS succeeded (block evicted).
+    /// Returns false if a concurrent write transitioned SYNCING→DIRTY.
+    #[inline]
+    pub(super) fn transition_syncing_to_not_present(&self, idx: usize) -> bool {
+        if self
+            .state_map
+            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::NOT_PRESENT)
+            .is_ok()
+        {
+            self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Atomically finalize a flushed block: CAS SYNCING→CLEAN.
     ///
     /// Returns true if the CAS succeeded (block is now clean).
@@ -511,7 +540,7 @@ impl CacheInner {
     /// Write a sub-region to the data file (for background backfill).
     #[inline]
     pub(crate) fn write_sub_region(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-        self.data_file.write_all_at(data, offset)
+        self.data_file.read().write_all_at(data, offset)
     }
 
     // -- CRC32 SparseCrcMap methods (for dirty-block corruption detection) -----

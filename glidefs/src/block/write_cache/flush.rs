@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+use bytes::Bytes;
 use tracing::{debug, info, instrument, warn};
 
 use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
+use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
 use crate::block::state::{Active, Draining};
 
@@ -59,6 +62,7 @@ fn compute_flush_batch(
     inner: &CacheInner,
     snapshot: &[usize],
     zero_hash: Blake3Hash,
+    clean_cache: Option<Arc<dyn BlockCache>>,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
 
@@ -86,9 +90,14 @@ fn compute_flush_batch(
             let valid_bytes =
                 std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
             if valid_bytes > 0 {
-                inner
-                    .data_file
-                    .read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
+                if let Some(ref ff) = *inner.flushing_file.lock() {
+                    ff.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
+                } else {
+                    inner
+                        .data_file
+                        .read()
+                        .read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
+                }
             }
             if valid_bytes < block_size {
                 chunk_buf[valid_bytes..].fill(0);
@@ -141,6 +150,13 @@ fn compute_flush_batch(
             }
 
             let hash = blake3_128(&chunk_buf);
+
+            // Warm clean_cache for bottomless mode: decompressed block data
+            // goes into the Foyer S3-FIFO cache so reads after eviction hit
+            // cache instead of S3. S3-FIFO handles scan resistance.
+            if let Some(ref cache) = clean_cache {
+                cache.insert(hash, Bytes::from(chunk_buf.clone()));
+            }
 
             let compressed = Some(lz4_compress(&chunk_buf[..]));
 
@@ -289,6 +305,7 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) -> usize {
         let mut buf = vec![0u8; block_size];
         if let Err(e) = inner
             .data_file
+            .read()
             .read_exact_at(&mut buf[..valid_bytes], offset)
         {
             warn!(
@@ -328,7 +345,7 @@ impl WriteCache<Active> {
     /// the background.
     #[instrument(skip(self))]
     pub fn flush(&self) -> Result<(), CacheError> {
-        self.inner.data_file.sync_all()?;
+        self.inner.data_file.read().sync_all()?;
         self.inner.wal.sync()?;
         debug!("local flush complete");
         Ok(())
@@ -378,7 +395,7 @@ impl WriteCache<Active> {
             "backfill_block requires exactly block_size bytes"
         );
         let offset = block_idx as u64 * self.inner.config.block_size as u64;
-        self.inner.data_file.write_all_at(data, offset)?;
+        self.inner.data_file.read().write_all_at(data, offset)?;
         self.inner.set_present(block_idx);
         Ok(())
     }
@@ -466,6 +483,34 @@ impl WriteCache<Active> {
         Arc::clone(&self.inner)
     }
 
+    /// Rotate the data file for bottomless mode.
+    ///
+    /// 1. Rename active file -> flushing file
+    /// 2. Create new sparse active file
+    /// 3. Swap data_file RwLock (write-locked briefly)
+    /// 4. Store old handle in flushing_file Mutex
+    fn rotate_data_file(&self) -> Result<(), CacheError> {
+        let active_path = self.inner.config.data_path();
+        let flushing_path = self.inner.config.flushing_path();
+
+        // Rename active -> flushing (crash recovery boundary)
+        std::fs::rename(&active_path, &flushing_path)?;
+
+        // Create new sparse active file
+        let new_file = super::inner::SyncFile::open(
+            &active_path,
+            true,
+            self.inner.config.device_size,
+        )?;
+
+        // Swap: write-lock data_file, replace with new file, store old as flushing
+        let old_file = std::mem::replace(&mut *self.inner.data_file.write(), new_file);
+        *self.inner.flushing_file.lock() = Some(old_file);
+
+        info!("rotated data file for bottomless flush");
+        Ok(())
+    }
+
     /// Check whether a block is in the partial_blocks map (has unfilled sub-regions).
     ///
     /// TEST ONLY — exposed via `test-utils` feature for integration test assertions.
@@ -512,8 +557,16 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        clean_cache: Option<&Arc<dyn BlockCache>>,
     ) -> Result<(FlushStats, u64), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
+
+        // Bottomless mode: rotate data file before claiming dirty blocks.
+        // After rotation, all DIRTY data is in the flushing file. New writes
+        // go to the fresh active file.
+        if self.inner.bottomless {
+            self.rotate_data_file()?;
+        }
 
         // Claim dirty blocks: CAS DIRTY→SYNCING.
         let snapshot: Vec<usize> = self
@@ -525,18 +578,51 @@ impl WriteCache<Active> {
 
         if snapshot.is_empty() {
             debug!("flush: no dirty blocks to flush");
+            // Bottomless: clean up the empty flushing file if we rotated but had no dirty blocks
+            if self.inner.bottomless {
+                drop(self.inner.flushing_file.lock().take());
+                let flushing_path = self.inner.config.flushing_path();
+                if flushing_path.exists() {
+                    let _ = std::fs::remove_file(&flushing_path);
+                }
+            }
             return Ok((FlushStats::default(), seq_cutpoint));
         }
 
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
 
         let result = self
-            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest)
+            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache)
             .await;
 
         if result.is_err() {
+            // On error, transition all blocks back to DIRTY
             for &idx in &snapshot {
                 self.inner.transition_to_dirty(idx);
+            }
+            // Bottomless: copy SYNCING blocks from flushing to active before cleanup
+            if self.inner.bottomless {
+                let block_size = self.inner.config.block_size;
+                if let Some(ref ff) = *self.inner.flushing_file.lock() {
+                    for &idx in &snapshot {
+                        let offset = idx as u64 * block_size as u64;
+                        let valid_bytes = std::cmp::min(
+                            block_size as u64,
+                            self.inner.config.device_size.saturating_sub(offset),
+                        ) as usize;
+                        if valid_bytes > 0 {
+                            let mut buf = vec![0u8; valid_bytes];
+                            if ff.read_exact_at(&mut buf, offset).is_ok() {
+                                let _ = self.inner.data_file.read().write_all_at(&buf, offset);
+                            }
+                        }
+                    }
+                }
+                drop(self.inner.flushing_file.lock().take());
+                let flushing_path = self.inner.config.flushing_path();
+                if flushing_path.exists() {
+                    let _ = std::fs::remove_file(&flushing_path);
+                }
             }
         }
 
@@ -555,6 +641,7 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        clean_cache: Option<&Arc<dyn BlockCache>>,
     ) -> Result<FlushStats, CacheError> {
         use crate::block::pack::new_pack_id;
 
@@ -618,14 +705,20 @@ impl WriteCache<Active> {
         let mut total_stats = FlushStats::default();
         let mut flushed_blocks: Vec<usize> = Vec::new();
         let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
+        let mut all_skipped: Vec<usize> = Vec::new();
 
         // Per-chunk flush
         for (chunk_idx, chunk_blocks) in per_chunk {
             // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
             let zero_hash = self.inner.zero_block_hash;
             let inner = Arc::clone(&self.inner);
+            let clean_cache_clone = if self.inner.bottomless {
+                clean_cache.map(Arc::clone)
+            } else {
+                None
+            };
             let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
-                compute_flush_batch(&inner, &chunk_blocks, zero_hash)
+                compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone)
             })
             .await
             .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
@@ -638,6 +731,9 @@ impl WriteCache<Active> {
             // Transition skipped blocks back SYNCING→DIRTY
             for &idx in &batch.skipped {
                 self.inner.transition_to_dirty(idx);
+            }
+            if self.inner.bottomless {
+                all_skipped.extend_from_slice(&batch.skipped);
             }
 
             // Build hash → compressed data map from the unique-hash upload set.
@@ -727,10 +823,52 @@ impl WriteCache<Active> {
             }
         }
 
-        // CAS SYNCING→CLEAN for successfully flushed blocks
+        // Finalize flushed blocks
         for &chunk_index in &flushed_blocks {
-            if !self.inner.transition_syncing_to_clean(chunk_index) {
+            if self.inner.bottomless {
+                // Bottomless: evict SYNCING→NOT_PRESENT (skip CLEAN)
+                if !self.inner.transition_syncing_to_not_present(chunk_index) {
+                    // Block was re-dirtied during flush — already in active file
+                    total_stats.blocks_cas_failed += 1;
+                }
+            } else if !self.inner.transition_syncing_to_clean(chunk_index) {
                 total_stats.blocks_cas_failed += 1;
+            }
+        }
+
+        // Bottomless: copy skipped blocks from flushing to active, then clean up
+        if self.inner.bottomless {
+            let block_size = self.inner.config.block_size;
+            // Copy skipped blocks from flushing file to active file.
+            // These blocks were transitioned back SYNCING→DIRTY but their data
+            // is only in the flushing file (new active is empty for those blocks).
+            // Re-dirtied blocks (concurrent write during flush) already have data
+            // in the active file from the write that re-dirtied them.
+            if !all_skipped.is_empty()
+                && let Some(ref ff) = *self.inner.flushing_file.lock()
+            {
+                for &idx in &all_skipped {
+                    let offset = idx as u64 * block_size as u64;
+                    let valid_bytes = std::cmp::min(
+                        block_size as u64,
+                        self.inner.config.device_size.saturating_sub(offset),
+                    ) as usize;
+                    if valid_bytes > 0 {
+                        let mut buf = vec![0u8; valid_bytes];
+                        if let Ok(()) = ff.read_exact_at(&mut buf, offset) {
+                            let _ = self.inner.data_file.read().write_all_at(&buf, offset);
+                        }
+                    }
+                }
+            }
+
+            // Drop flushing file handle and delete the file
+            drop(self.inner.flushing_file.lock().take());
+            let flushing_path = self.inner.config.flushing_path();
+            if flushing_path.exists()
+                && let Err(e) = std::fs::remove_file(&flushing_path)
+            {
+                warn!(error = %e, "failed to remove flushing file");
             }
         }
 
@@ -757,8 +895,9 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        clean_cache: Option<&Arc<dyn BlockCache>>,
     ) -> Result<(FlushStats, u64), CacheError> {
-        self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+        self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await
     }
 
@@ -803,7 +942,7 @@ impl WriteCache<Active> {
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, _seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
         let manifest_bytes = volume_manifest.read().serialize();
         let expected_etag = self.inner.manifest_etag.lock().clone();
@@ -855,7 +994,7 @@ impl WriteCache<Active> {
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
 
         let manifest_bytes = volume_manifest.read().serialize();

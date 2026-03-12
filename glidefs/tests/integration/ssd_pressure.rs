@@ -36,7 +36,7 @@ async fn handler_with_ssd_util() -> (BlockHandler, Arc<AtomicU64>, TempDir) {
         device_name: "ssd-pressure".to_string(),
         device_size: DEVICE_SIZE,
         block_size: HANDLER_BLOCK_SIZE,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
 
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());

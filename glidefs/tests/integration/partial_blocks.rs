@@ -45,7 +45,7 @@ fn test_config(dir: &std::path::Path, name: &str) -> WriteCacheConfig {
         device_name: name.to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: true,
+        wal_sync: true, bottomless: false,
     }
 }
 
@@ -136,7 +136,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
         device_name: "child".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let cache = WriteCache::open_fresh_active(config).unwrap();
     let child_vm = Arc::new(parking_lot::RwLock::new(parent_manifest.clone()));
@@ -218,7 +218,7 @@ async fn test_partial_block_crash_before_checkpoint_recovery() {
         device_name: "crash-before-ckpt".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: true,
+        wal_sync: true, bottomless: false,
     };
 
     // Session 1: write 4KB to partial block, crash without checkpoint
@@ -266,7 +266,7 @@ async fn test_partial_block_crash_after_checkpoint_recovery() {
         device_name: "crash-after-ckpt".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: true,
+        wal_sync: true, bottomless: false,
     };
 
     // Session 1: write sub-block 0, local_checkpoint (saves metadata + re-appends partial WAL),
@@ -344,7 +344,7 @@ async fn test_partial_block_crash_during_backfill() {
             device_name: "child-crash".to_string(),
             device_size: DEVICE_SIZE,
             block_size: BLOCK_SIZE,
-            wal_sync: true,
+            wal_sync: true, bottomless: false,
         };
         let cache = WriteCache::open_fresh_active(config.clone()).unwrap();
 
@@ -371,7 +371,7 @@ async fn test_partial_block_crash_during_backfill() {
             device_name: "child-crash".to_string(),
             device_size: DEVICE_SIZE,
             block_size: BLOCK_SIZE,
-            wal_sync: true,
+            wal_sync: true, bottomless: false,
         };
 
         let cache = WriteCache::<Initializing>::open(child_config).unwrap();
@@ -442,7 +442,7 @@ async fn test_partial_block_concurrent_write_same_subregion() {
         device_name: "child-overwrite".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let cache = WriteCache::open_fresh_active(config).unwrap();
 
@@ -713,7 +713,7 @@ async fn test_partial_block_cap_overflow() {
         device_name: "child-cap".to_string(),
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
-        wal_sync: false,
+        wal_sync: false, bottomless: false,
     };
     let cache = Arc::new(WriteCache::open_fresh_active(config).unwrap());
 
