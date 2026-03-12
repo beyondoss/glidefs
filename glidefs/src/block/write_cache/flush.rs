@@ -497,6 +497,25 @@ impl WriteCache<Active> {
     /// 4. Store old handle in flushing_file Mutex
     #[cfg_attr(feature = "test-utils", allow(dead_code))]
     pub(crate) fn rotate_data_file(&self) -> Result<(), CacheError> {
+        let (_, ()) = self.rotate_data_file_inner(false)?;
+        Ok(())
+    }
+
+    /// Snapshot dirty block indices AND rotate the data file atomically.
+    ///
+    /// Holds the data_file write lock across both operations so no concurrent
+    /// writes can land between the snapshot and the file swap. This prevents
+    /// a race where a block becomes dirty (with data in the new active file)
+    /// after rotation but is picked up by the CAS scan — compute_flush_batch
+    /// would read zeros from the flushing file for that block.
+    fn rotate_and_snapshot(&self) -> Result<Vec<usize>, CacheError> {
+        let (pre_dirty, ()) = self.rotate_data_file_inner(true)?;
+        Ok(pre_dirty)
+    }
+
+    /// Core rotation logic. If `snapshot` is true, captures dirty block
+    /// indices under the write lock before swapping files.
+    fn rotate_data_file_inner(&self, snapshot: bool) -> Result<(Vec<usize>, ()), CacheError> {
         let active_path = self.inner.config.data_path();
         let flushing_path = self.inner.config.flushing_path();
 
@@ -506,22 +525,40 @@ impl WriteCache<Active> {
         // uses pwrite via the RwLock'd data_file, so it's unaffected.
         self.inner.flushing_active.store(true, Ordering::Release);
 
-        // Rename active -> flushing (crash recovery boundary)
+        // Rename active -> flushing (crash recovery boundary).
+        // Done BEFORE acquiring the write lock so the filesystem metadata
+        // op doesn't hold up concurrent I/O. The RwLock still points to
+        // the old file handle (now at flushing_path), so pwrites in flight
+        // complete to the correct inode.
         std::fs::rename(&active_path, &flushing_path)?;
 
-        // Create new sparse active file
+        // Create new sparse active file (also outside write lock).
         let new_file = super::inner::SyncFile::open(
             &active_path,
             true,
             self.inner.config.device_size,
         )?;
 
-        // Swap: write-lock data_file, replace with new file, store old as flushing
-        let old_file = std::mem::replace(&mut *self.inner.data_file.write(), new_file);
+        // Write-lock data_file: blocks all concurrent pwrite/pread.
+        // Under the lock: snapshot dirty blocks, then swap files.
+        let mut data_file_guard = self.inner.data_file.write();
+
+        let pre_dirty = if snapshot {
+            self.inner
+                .state_map
+                .iter_with_state(SparseBlockState::DIRTY)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let old_file = std::mem::replace(&mut *data_file_guard, new_file);
+        drop(data_file_guard);
+
         *self.inner.flushing_file.lock() = Some(Arc::new(old_file));
 
         info!("rotated data file for bottomless flush");
-        Ok(())
+        Ok((pre_dirty, ()))
     }
 
     /// Check whether a block is in the partial_blocks map (has unfilled sub-regions).
@@ -574,16 +611,23 @@ impl WriteCache<Active> {
     ) -> Result<(FlushStats, u64), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
 
-        // Rotate data file before claiming dirty blocks. After rotation,
-        // all DIRTY data is in the flushing file. New writes go to the
-        // fresh active file.
-        self.rotate_data_file()?;
+        // Snapshot dirty blocks AND rotate under the data_file write lock.
+        //
+        // The write lock blocks concurrent pwrite/pread, giving us a clean
+        // cut: every block in `pre_dirty` has its data in the current active
+        // file (about to become the flushing file). Blocks that become dirty
+        // AFTER we release the lock write to the new active file and are NOT
+        // in our snapshot — they stay DIRTY for the next flush cycle.
+        //
+        // Without this barrier, a block could become dirty between rotation
+        // and the CAS scan below, landing its data in the new active file.
+        // compute_flush_batch would then read zeros from the flushing file
+        // for that block, uploading corrupted data to S3.
+        let pre_dirty = self.rotate_and_snapshot()?;
 
-        // Claim dirty blocks: CAS DIRTY→SYNCING.
-        let snapshot: Vec<usize> = self
-            .inner
-            .state_map
-            .iter_with_state(SparseBlockState::DIRTY)
+        // Claim dirty blocks: CAS DIRTY→SYNCING (only pre-rotation blocks).
+        let snapshot: Vec<usize> = pre_dirty
+            .into_iter()
             .filter(|&idx| self.inner.transition_dirty_to_syncing(idx))
             .collect();
 

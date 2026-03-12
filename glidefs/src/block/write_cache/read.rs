@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use tracing::{debug, instrument, warn};
@@ -75,21 +76,28 @@ impl WriteCache<Active> {
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (offset + len as u64 - 1) / block_size;
+
+        // Hold the read lock across both the state check and the pread.
+        // This prevents rotate_data_file from swapping the file handle
+        // between our check and our read (the swap needs the write lock).
+        let df = self.inner.data_file.read();
+
+        // Bail if a flush rotation is in progress — data for some blocks
+        // may be in the flushing file, not the active file.
+        if self.inner.flushing_active.load(Ordering::Acquire) {
+            return None;
+        }
+
         if !(start_block..=end_block).all(|i| {
             let idx = i as usize;
-            self.inner.is_present(idx) && !self.inner.is_partial(idx)
+            self.inner.is_present(idx)
+                && !self.inner.is_partial(idx)
+                && self.inner.state_map.get(idx)
+                    != crate::block::block_map::SparseBlockState::SYNCING
         }) {
             return None;
         }
-        // During flush, SYNCING blocks are in the flushing file.
-        // Bail to the full read path which handles state-aware dispatch.
-        if (start_block..=end_block).any(|i| {
-            self.inner.state_map.get(i as usize)
-                == crate::block::block_map::SparseBlockState::SYNCING
-        }) {
-            return None;
-        }
-        Some(match self.inner.data_file.read().read_exact_at(&mut buf[..len], offset) {
+        Some(match df.read_exact_at(&mut buf[..len], offset) {
             Ok(()) => Ok(len),
             Err(e) => Err(CacheError::from(e)),
         })
@@ -132,6 +140,7 @@ impl WriteCache<Active> {
     #[allow(dead_code)] // Used by tests
     pub fn read_local_block(&self, block_num: u64) -> Result<Bytes, CacheError> {
         self.sync_read_local_block(block_num)
+            .map(|opt| opt.unwrap_or_else(|| Bytes::from(vec![0u8; self.inner.config.block_size])))
     }
 
     /// Read a single block for sync worker.
@@ -140,7 +149,10 @@ impl WriteCache<Active> {
     /// For the last block of a device, if device_size is not a multiple of block_size,
     /// this reads only the valid bytes and pads the rest with zeros. This is necessary
     /// because the cache file is sized to device_size, not num_blocks * block_size.
-    pub fn sync_read_local_block(&self, block_num: u64) -> Result<Bytes, CacheError> {
+    /// Returns `None` if the block was evicted (SYNCING→NOT_PRESENT) between
+    /// the caller's `is_present()` check and this read. The caller should
+    /// fall through to the cold (S3) resolution path.
+    pub fn sync_read_local_block(&self, block_num: u64) -> Result<Option<Bytes>, CacheError> {
         let block_size = self.inner.config.block_size;
         let device_size = self.inner.config.device_size;
         let offset = block_num * block_size as u64;
@@ -150,25 +162,35 @@ impl WriteCache<Active> {
         // it may be less (device_size - offset)
         let valid_bytes = if offset >= device_size {
             // Block is entirely beyond device - shouldn't happen but handle gracefully
-            return Ok(Bytes::from(vec![0u8; block_size]));
+            return Ok(Some(Bytes::from(vec![0u8; block_size])));
         } else {
             std::cmp::min(block_size as u64, device_size - offset) as usize
         };
 
         let mut buf = vec![0u8; block_size];
 
-        // SYNCING blocks live in the flushing file during flush.
-        // The active file is empty for those blocks after rotation.
-        let use_flushing = self.inner.state_map.get(block_num as usize)
-            == crate::block::block_map::SparseBlockState::SYNCING;
+        // Re-check state: the block may have been evicted (SYNCING→NOT_PRESENT)
+        // between the caller's is_present() check and now.
+        let state = self.inner.state_map.get(block_num as usize);
+        if state == crate::block::block_map::SparseBlockState::NOT_PRESENT {
+            return Ok(None);
+        }
 
-        if use_flushing {
+        // SYNCING blocks live in the flushing file during flush.
+        // The active file is empty (sparse) for those blocks after rotation.
+        if state == crate::block::block_map::SparseBlockState::SYNCING {
             let guard = self.inner.flushing_file.lock();
             if let Some(ref ff) = *guard {
                 ff.read_exact_at(&mut buf[..valid_bytes], offset)?;
-                return Ok(Bytes::from(buf));
+                return Ok(Some(Bytes::from(buf)));
             }
-            // Flushing file gone — block should have been transitioned, fall through
+            // Flushing file gone — flush completed between state check and
+            // lock acquisition. Block is now NOT_PRESENT (or re-dirtied).
+            let state2 = self.inner.state_map.get(block_num as usize);
+            if state2 == crate::block::block_map::SparseBlockState::NOT_PRESENT {
+                return Ok(None);
+            }
+            // Block was re-dirtied by a concurrent write — data is in active file.
         }
 
         if valid_bytes == block_size {
@@ -181,7 +203,7 @@ impl WriteCache<Active> {
                 .read()
                 .read_exact_at(&mut buf[..valid_bytes], offset)?;
         }
-        Ok(Bytes::from(buf))
+        Ok(Some(Bytes::from(buf)))
     }
 
     /// Build a read plan for the ublk zero-copy path.
@@ -393,17 +415,24 @@ impl WriteCache<Active> {
 
         // Fast path: all blocks present on local SSD and not partial →
         // single pread of exact bytes. Bypasses per-block resolution.
-        // SYNCING blocks are in the flushing file, bail to per-block path.
-        if (start_block..=end_block).all(|i| {
-            let idx = i as usize;
-            self.inner.is_present(idx)
-                && !self.inner.is_partial(idx)
-                && self.inner.state_map.get(idx)
-                    != crate::block::block_map::SparseBlockState::SYNCING
-        }) {
-            let mut buf = vec![0u8; len];
-            self.inner.data_file.read().read_exact_at(&mut buf, offset)?;
-            return Ok(Bytes::from(buf));
+        //
+        // Hold the read lock across check + pread so rotate_data_file
+        // can't swap the file handle between them (swap needs write lock).
+        {
+            let df = self.inner.data_file.read();
+            if !self.inner.flushing_active.load(Ordering::Acquire)
+                && (start_block..=end_block).all(|i| {
+                    let idx = i as usize;
+                    self.inner.is_present(idx)
+                        && !self.inner.is_partial(idx)
+                        && self.inner.state_map.get(idx)
+                            != crate::block::block_map::SparseBlockState::SYNCING
+                })
+            {
+                let mut buf = vec![0u8; len];
+                df.read_exact_at(&mut buf, offset)?;
+                return Ok(Bytes::from(buf));
+            }
         }
 
         // Single block fast path
@@ -548,10 +577,14 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<BlockLocation, CacheError> {
-        // Hot path: block is present on local SSD and fully backfilled
+        // Hot path: block is present on local SSD and fully backfilled.
+        // sync_read_local_block returns None if the block was evicted
+        // (SYNCING→NOT_PRESENT) between our is_present() check and the
+        // actual read — in that case, fall through to the cold path.
         if self.inner.is_present(block_index) && !self.inner.is_partial(block_index) {
-            let data = self.sync_read_local_block(block_index as u64)?;
-            return Ok(BlockLocation::Local(data));
+            if let Some(data) = self.sync_read_local_block(block_index as u64)? {
+                return Ok(BlockLocation::Local(data));
+            }
         }
 
         // Partial block: need S3 data for unwritten sub-regions.
@@ -776,8 +809,11 @@ impl WriteCache<Active> {
 
         let block_size = self.inner.config.block_size;
 
-        // Read current SSD data (has guest writes in marked sub-regions)
-        let local_data = self.sync_read_local_block(block_index as u64)?;
+        // Read current SSD data (has guest writes in marked sub-regions).
+        // If the block was evicted (shouldn't happen for partial blocks, but
+        // handle defensively), use the S3 data directly.
+        let local_data = self.sync_read_local_block(block_index as u64)?
+            .unwrap_or_else(|| Bytes::from(s3_data.to_vec()));
         let mut merged = local_data.to_vec();
         let block_start = block_index as u64 * block_size as u64;
 
