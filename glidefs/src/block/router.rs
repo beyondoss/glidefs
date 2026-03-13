@@ -150,14 +150,30 @@ impl ExportState {
     pub async fn drain(&self, name: &str) -> Result<(), RouterError> {
         // Loop until no more dirty blocks remain (concurrent writes may
         // produce new dirty data between flushes).
-        for _ in 0..MAX_DRAIN_ITERATIONS {
+        //
+        // Check dirty_block_count() in addition to blocks_claimed: partial
+        // blocks (with incomplete backfill) are excluded from the flush
+        // snapshot to avoid uploading incomplete data. blocks_claimed can
+        // be 0 while dirty partial blocks remain. A short sleep gives
+        // backfill tasks time to complete.
+        for i in 0..MAX_DRAIN_ITERATIONS {
             let stats = self
                 .cache
                 .flush_to_s3(&self.content_store, &self.pack_index_cache, &self.volume_manifest)
                 .await
                 .map_err(RouterError::Cache)?;
-            if stats.blocks_claimed == 0 {
+            if stats.blocks_claimed == 0 && self.cache.dirty_block_count() == 0 {
                 return Ok(());
+            }
+            // Partial blocks excluded from snapshot: yield to let backfill
+            // tasks complete before retrying.
+            if stats.blocks_claimed == 0 {
+                tracing::debug!(
+                    dirty = self.cache.dirty_block_count(),
+                    iteration = i,
+                    "drain: dirty blocks remain (likely partial), waiting for backfill"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
         let remaining = self.cache.dirty_block_count();
