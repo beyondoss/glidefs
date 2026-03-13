@@ -390,11 +390,15 @@ impl CacheInner {
 
     /// Mark block as present (lock-free CAS NOT_PRESENT -> CLEAN).
     #[inline]
-    pub(super) fn set_present(&self, block_num: usize) {
+    /// Mark a block as present (CAS NOT_PRESENT→CLEAN).
+    ///
+    /// Returns `true` if the block transitioned from NOT_PRESENT→CLEAN,
+    /// meaning its data was evicted and may need recovery (promote or backfill).
+    pub(super) fn set_present(&self, block_num: usize) -> bool {
         if block_num >= self.num_blocks {
-            return;
+            return false;
         }
-        self.state_map.set_present(block_num);
+        self.state_map.set_present(block_num)
     }
 
     /// CAS loop to transition a block to Dirty state (lock-free).

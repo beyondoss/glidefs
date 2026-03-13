@@ -723,7 +723,9 @@ impl BlockHandler {
     /// Validates the request (readonly, SSD-full, bounds), then marks blocks
     /// present and clears CRC32. Call BEFORE the data write.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
-    pub async fn pre_write(&self, offset: u64, length: u64) -> CommandResult<()> {
+    /// Returns block indices that were NOT_PRESENT (evicted) at set_present
+    /// time. The caller must pass these to `pwrite_and_commit()`.
+    pub async fn pre_write(&self, offset: u64, length: u64) -> CommandResult<Vec<u64>> {
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
         }
@@ -733,7 +735,7 @@ impl BlockHandler {
         }
 
         if length == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let util = f64::from_bits(self.ssd_utilization.load(Ordering::Relaxed));
@@ -743,14 +745,14 @@ impl BlockHandler {
 
         let backfill_blocks = self.backfill_missing_blocks(offset, length).await?;
 
-        self.cache.pre_write(offset, length)?;
+        let was_evicted = self.cache.pre_write(offset, length)?;
 
         // Spawn after pre_write — bitmap bits are set, safe for backfill
         for block_idx in backfill_blocks {
             self.spawn_background_backfill(block_idx);
         }
 
-        Ok(())
+        Ok(was_evicted)
     }
 
     /// Phase 2 of ublk zero-copy write: pwrite data + commit metadata atomically.
@@ -765,6 +767,7 @@ impl BlockHandler {
         offset: u64,
         data: &[u8],
         fua: bool,
+        was_evicted: &[u64],
     ) -> CommandResult<()> {
         let length = data.len() as u64;
         if length == 0 {
@@ -776,13 +779,12 @@ impl BlockHandler {
         self.metrics.record_guest_write(length);
         let evicted_blocks = self
             .cache
-            .pwrite_and_commit(offset, data)
+            .pwrite_and_commit(offset, data, was_evicted)
             .map_err(|e| {
                 tracing::warn!(error = %e, "pwrite_and_commit failed");
                 CommandError::IoError
             })?;
-        // Backfill blocks evicted between pre_write and pwrite_and_commit
-        // (the SYNCING→NOT_PRESENT eviction race — see pwrite_and_commit).
+        // Backfill blocks that need S3 data recovery.
         for block_idx in evicted_blocks {
             self.spawn_background_backfill(block_idx);
         }

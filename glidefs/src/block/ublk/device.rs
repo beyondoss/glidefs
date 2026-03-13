@@ -1037,9 +1037,10 @@ async fn handle_write_zc(
     // Box::pin: pre_write chains into backfill_missing_blocks (deep async tree).
     // Without boxing, its state machine inflates the io_task_zc future and
     // hurts L1 cache locality on the hot read path.
-    if let Err(e) = Box::pin(handler.pre_write(offset, length as u64)).await {
-        return -e.to_linux_errno();
-    }
+    let was_evicted = match Box::pin(handler.pre_write(offset, length as u64)).await {
+        Ok(evicted) => evicted,
+        Err(e) => return -e.to_linux_errno(),
+    };
 
     // Phase 2+3: write data and commit metadata under one data_file read lock.
     //
@@ -1049,7 +1050,7 @@ async fn handle_write_zc(
     // SAFETY: addr points to kernel-mapped bio pages, valid for the
     // duration of this I/O request (between get_iod and commit).
     let data = unsafe { std::slice::from_raw_parts(addr as *const u8, length as usize) };
-    if let Err(e) = handler.pwrite_and_commit(offset, data, fua) {
+    if let Err(e) = handler.pwrite_and_commit(offset, data, fua, &was_evicted) {
         return -e.to_linux_errno();
     }
 

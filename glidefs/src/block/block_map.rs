@@ -293,21 +293,26 @@ impl SparseStateMap {
     /// Idempotent: no-op if the block is already present.
     /// Allocates the page if needed.
     #[inline]
-    pub fn set_present(&self, idx: usize) {
+    /// Mark a block as present (CAS NOT_PRESENT→CLEAN).
+    ///
+    /// Returns `true` if the block was NOT_PRESENT and is now CLEAN.
+    /// Returns `false` if the block was already in a present state
+    /// (CLEAN, DIRTY, or SYNCING).
+    pub fn set_present(&self, idx: usize) -> bool {
         let (page_idx, byte_idx, shift) = Self::split_index(idx);
         let page = self.ensure_page(page_idx);
         let mask = 0x3u8 << shift;
         loop {
             let old = page.data[byte_idx].load(Ordering::Acquire);
             if (old >> shift) & 0x3 != SparseBlockState::NOT_PRESENT {
-                break; // already present
+                return false; // already present
             }
             let new = (old & !mask) | (SparseBlockState::CLEAN << shift);
             if page.data[byte_idx]
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                break;
+                return true; // transitioned from NOT_PRESENT
             }
         }
     }
