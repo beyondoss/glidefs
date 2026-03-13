@@ -564,11 +564,12 @@ impl CacheInner {
     ) {
         use crate::block::block_map::SparseBlockState;
 
-        if !self.flushing_active.load(Ordering::Acquire) {
-            return;
-        }
-
         let block_size = self.config.block_size as u64;
+        // Always try the flushing file — don't gate on flushing_active.
+        // There's a window where blocks are evicted (SYNCING→NOT_PRESENT)
+        // but flushing_active is still true and flushing_file still exists.
+        // By skipping the flushing_active check, we also catch blocks that
+        // were evicted between flushing_active=false and flushing_file=None.
         let flushing_guard = self.flushing_file.lock();
         if let Some(ref ff) = *flushing_guard {
             for block in start_block..=end_block {
@@ -576,7 +577,10 @@ impl CacheInner {
                 if idx >= self.num_blocks {
                     continue;
                 }
-                if self.state_map.get(idx) != SparseBlockState::SYNCING {
+                let state = self.state_map.get(idx);
+                if state != SparseBlockState::SYNCING
+                    && state != SparseBlockState::NOT_PRESENT
+                {
                     continue;
                 }
                 let offset = block * block_size;
@@ -590,19 +594,32 @@ impl CacheInner {
                 let mut buf = vec![0u8; valid];
                 if ff.read_exact_at(&mut buf, offset).is_ok() {
                     let _ = df.write_all_at(&buf, offset);
-                    // CAS SYNCING→DIRTY immediately after copying data.
-                    // This prevents the flush thread from evicting the block
-                    // (SYNCING→NOT_PRESENT) between here and the caller's
-                    // transition_to_dirty. If the CAS fails, either another
-                    // writer promoted it first (fine) or flush already evicted
-                    // it (the data we just copied is still valid in active).
-                    if self
-                        .state_map
-                        .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
-                        .is_ok()
-                    {
-                        self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    if state == SparseBlockState::SYNCING {
+                        // CAS SYNCING→DIRTY immediately after copying data.
+                        // This prevents the flush thread from evicting the block
+                        // (SYNCING→NOT_PRESENT) between here and the caller's
+                        // transition_to_dirty. If the CAS fails, either another
+                        // writer promoted it first (fine) or flush already evicted
+                        // it (the data we just copied is still valid in active).
+                        if self
+                            .state_map
+                            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                            .is_ok()
+                        {
+                            self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+                            self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        // NOT_PRESENT: block was evicted between pre_write (which
+                        // saw SYNCING and skipped backfill) and now. The flushing
+                        // file still has the data. CAS NOT_PRESENT→DIRTY.
+                        if self
+                            .state_map
+                            .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
+                            .is_ok()
+                        {
+                            self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }

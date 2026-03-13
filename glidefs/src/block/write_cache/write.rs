@@ -20,13 +20,15 @@ impl WriteCache<Active> {
     /// - Dirty → Dirty: no-op (WAL entry skipped — already recorded)
     /// Hash computation is deferred to flush-to-S3 time. The write path only
     /// does: set_present → pwrite → mark dirty → invalidate CRC → WAL append.
+    /// Returns block indices that need background backfill from S3 (see
+    /// `pwrite_and_commit` for the full explanation of the eviction race).
     #[instrument(skip(self, data, _clean_cache), fields(offset = offset, len = data.len()))]
     pub fn write(
         &self,
         offset: u64,
         data: &[u8],
         _clean_cache: &dyn BlockCache,
-    ) -> Result<(), CacheError> {
+    ) -> Result<Vec<u64>, CacheError> {
         if offset + data.len() as u64 > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
                 offset + data.len() as u64,
@@ -35,7 +37,7 @@ impl WriteCache<Active> {
         }
 
         if data.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Calculate affected blocks
@@ -98,7 +100,56 @@ impl WriteCache<Active> {
         // Promote SYNCING blocks from flushing → active before pwrite.
         // This ensures the active file has the complete block so the guest's
         // sub-block write doesn't leave the rest as zeros.
+        // Also recovers NOT_PRESENT blocks if flushing file is still available.
         self.inner.promote_syncing_blocks(&df, start_block, end_block);
+
+        // Detect blocks evicted between backfill_missing_blocks and now:
+        // block was SYNCING when backfill ran (present → skipped), but now
+        // NOT_PRESENT and promote couldn't recover it (flushing file gone).
+        // Create a partial entry so flush skips this block until backfill.
+        let mut needs_backfill: Vec<u64> = Vec::new();
+        {
+            use super::inner::PartialBlockState;
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx >= self.inner.num_blocks {
+                    continue;
+                }
+                if self.inner.state_map.get(idx)
+                    != crate::block::block_map::SparseBlockState::NOT_PRESENT
+                {
+                    continue;
+                }
+                if self.inner.is_partial(idx) {
+                    continue;
+                }
+                self.inner
+                    .partial_blocks
+                    .entry(idx)
+                    .or_insert_with(|| PartialBlockState {
+                        bitmap: std::sync::atomic::AtomicU32::new(0),
+                        write_lock: parking_lot::Mutex::new(()),
+                    });
+                let block_start_byte = block * block_size;
+                let write_start = offset.max(block_start_byte);
+                let write_end =
+                    (offset + data.len() as u64).min(block_start_byte + block_size);
+                self.inner.mark_sub_regions(
+                    idx,
+                    (write_start - block_start_byte) as usize,
+                    (write_end - write_start) as usize,
+                );
+                if !partial_blocks.contains(&block) {
+                    partial_blocks.push(block);
+                }
+                needs_backfill.push(block);
+                tracing::warn!(
+                    block = block,
+                    "eviction race: block was SYNCING during backfill check but \
+                     evicted before write — created partial entry for backfill"
+                );
+            }
+        }
 
         df.write_all_at(data, offset)?;
 
@@ -170,7 +221,7 @@ impl WriteCache<Active> {
             end_block = end_block,
             "marked blocks dirty and present"
         );
-        Ok(())
+        Ok(needs_backfill)
     }
 
     /// Write zeros to a range efficiently.
@@ -180,9 +231,11 @@ impl WriteCache<Active> {
     /// This is much faster for large ranges.
     ///
     /// On other platforms, falls back to writing a static zero buffer.
-    pub fn zero_range(&self, offset: u64, len: u64) -> Result<(), CacheError> {
+    /// Returns block indices that need background backfill from S3 (see
+    /// `pwrite_and_commit` for the full explanation of the eviction race).
+    pub fn zero_range(&self, offset: u64, len: u64) -> Result<Vec<u64>, CacheError> {
         if len == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         if offset + len > self.inner.config.device_size {
@@ -224,7 +277,51 @@ impl WriteCache<Active> {
         let df = self.inner.data_file.read();
 
         // Promote SYNCING blocks from flushing → active before zeroing.
+        // Also recovers NOT_PRESENT blocks if flushing file is still available.
         self.inner.promote_syncing_blocks(&df, start_block, end_block);
+
+        // Detect eviction race (same as write() — see there for full explanation).
+        let mut needs_backfill: Vec<u64> = Vec::new();
+        {
+            use super::inner::PartialBlockState;
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx >= self.inner.num_blocks {
+                    continue;
+                }
+                if self.inner.state_map.get(idx)
+                    != crate::block::block_map::SparseBlockState::NOT_PRESENT
+                {
+                    continue;
+                }
+                if self.inner.is_partial(idx) {
+                    continue;
+                }
+                self.inner
+                    .partial_blocks
+                    .entry(idx)
+                    .or_insert_with(|| PartialBlockState {
+                        bitmap: std::sync::atomic::AtomicU32::new(0),
+                        write_lock: parking_lot::Mutex::new(()),
+                    });
+                let block_start_byte = block * block_size;
+                let write_start = offset.max(block_start_byte);
+                let write_end = (offset + len).min(block_start_byte + block_size);
+                self.inner.mark_sub_regions(
+                    idx,
+                    (write_start - block_start_byte) as usize,
+                    (write_end - write_start) as usize,
+                );
+                if !partial_blocks.contains(&block) {
+                    partial_blocks.push(block);
+                }
+                needs_backfill.push(block);
+                tracing::warn!(
+                    block = block,
+                    "eviction race in zero_range: created partial entry for backfill"
+                );
+            }
+        }
 
         // Zero the file range (after claiming blocks via set_present)
         #[cfg(target_os = "linux")]
@@ -314,7 +411,7 @@ impl WriteCache<Active> {
 
         drop(df);
 
-        Ok(())
+        Ok(needs_backfill)
     }
 
     /// Fallback zero writing using a static buffer and a pre-acquired file guard.
@@ -421,15 +518,23 @@ impl WriteCache<Active> {
     ///
     /// The read lock is shared — concurrent writers are not blocked. Only
     /// rotation (which takes the write lock) waits for all writers.
+    ///
+    /// Returns block indices that need background backfill from S3. These
+    /// are blocks that were SYNCING during pre_write (so backfill was skipped)
+    /// but got evicted to NOT_PRESENT before we could recover them from the
+    /// flushing file. A partial entry has been created so flush won't pick
+    /// them up until backfill completes.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     pub fn pwrite_and_commit(
         &self,
         offset: u64,
         data: &[u8],
-    ) -> Result<(), CacheError> {
+    ) -> Result<Vec<u64>, CacheError> {
+        use super::inner::PartialBlockState;
+
         let len = data.len() as u64;
         if len == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let block_size = self.inner.config.block_size as u64;
@@ -451,7 +556,56 @@ impl WriteCache<Active> {
         let df = self.inner.data_file.read();
 
         // Promote SYNCING blocks from flushing → active before pwrite.
+        // Also recovers NOT_PRESENT blocks if flushing file is still available.
         self.inner.promote_syncing_blocks(&df, start_block, end_block);
+
+        // Detect blocks evicted between pre_write and now: block was SYNCING
+        // when pre_write ran (present → backfill skipped), but now NOT_PRESENT
+        // and promote couldn't recover it (flushing file already gone). Create
+        // a partial entry so flush skips this block until backfill fills it.
+        let mut needs_backfill: Vec<u64> = Vec::new();
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx >= self.inner.num_blocks {
+                continue;
+            }
+            if self.inner.state_map.get(idx)
+                != crate::block::block_map::SparseBlockState::NOT_PRESENT
+            {
+                continue;
+            }
+            if self.inner.is_partial(idx) {
+                continue;
+            }
+            // Block was evicted and flushing file is gone. The block's data
+            // is in S3 (the flush that evicted it uploaded it). Create a
+            // partial entry with this write's sub-region bits so flush won't
+            // pick up the block (it would flush zeros for unwritten regions).
+            self.inner
+                .partial_blocks
+                .entry(idx)
+                .or_insert_with(|| PartialBlockState {
+                    bitmap: std::sync::atomic::AtomicU32::new(0),
+                    write_lock: parking_lot::Mutex::new(()),
+                });
+            let block_start_byte = block * block_size;
+            let write_start = offset.max(block_start_byte);
+            let write_end = (offset + len).min(block_start_byte + block_size);
+            self.inner.mark_sub_regions(
+                idx,
+                (write_start - block_start_byte) as usize,
+                (write_end - write_start) as usize,
+            );
+            if !partial_blocks.contains(&block) {
+                partial_blocks.push(block);
+            }
+            needs_backfill.push(block);
+            tracing::warn!(
+                block = block,
+                "eviction race: block was SYNCING during pre_write but evicted \
+                 before pwrite_and_commit — created partial entry for backfill"
+            );
+        }
 
         df.write_all_at(data, offset)?;
 
@@ -518,7 +672,7 @@ impl WriteCache<Active> {
         drop(df);
 
         tracing::debug!(start_block, end_block, "pwrite_and_commit: wrote + marked dirty");
-        Ok(())
+        Ok(needs_backfill)
     }
 
 }

@@ -565,12 +565,17 @@ impl BlockHandler {
             .await?;
 
         self.metrics.record_guest_write(data.len() as u64);
-        self.cache.write(offset, data, self.clean_cache.as_ref())?;
+        let evicted_blocks = self.cache.write(offset, data, self.clean_cache.as_ref())?;
 
         // Spawn background backfill AFTER write completes — the bitmap bits are
         // now set and the pwrite is done, so the backfill task won't race with
         // guest-written data.
         for block_idx in backfill_blocks {
+            self.spawn_background_backfill(block_idx);
+        }
+        // Also backfill blocks that were evicted between backfill check and write
+        // (the SYNCING→NOT_PRESENT eviction race — see write() for details).
+        for block_idx in evicted_blocks {
             self.spawn_background_backfill(block_idx);
         }
 
@@ -613,10 +618,13 @@ impl BlockHandler {
             .backfill_missing_blocks(offset, length as u64)
             .await?;
 
-        self.cache.zero_range(offset, length as u64)?;
+        let evicted_blocks = self.cache.zero_range(offset, length as u64)?;
 
         // Spawn background backfill AFTER zero_range completes
         for block_idx in backfill_blocks {
+            self.spawn_background_backfill(block_idx);
+        }
+        for block_idx in evicted_blocks {
             self.spawn_background_backfill(block_idx);
         }
 
@@ -656,9 +664,12 @@ impl BlockHandler {
             .backfill_missing_blocks(offset, length as u64)
             .await?;
 
-        self.cache.zero_range(offset, length as u64)?;
+        let evicted_blocks = self.cache.zero_range(offset, length as u64)?;
 
         for block_idx in backfill_blocks {
+            self.spawn_background_backfill(block_idx);
+        }
+        for block_idx in evicted_blocks {
             self.spawn_background_backfill(block_idx);
         }
 
@@ -763,12 +774,18 @@ impl BlockHandler {
         let start = Instant::now();
 
         self.metrics.record_guest_write(length);
-        self.cache
+        let evicted_blocks = self
+            .cache
             .pwrite_and_commit(offset, data)
             .map_err(|e| {
                 tracing::warn!(error = %e, "pwrite_and_commit failed");
                 CommandError::IoError
             })?;
+        // Backfill blocks evicted between pre_write and pwrite_and_commit
+        // (the SYNCING→NOT_PRESENT eviction race — see pwrite_and_commit).
+        for block_idx in evicted_blocks {
+            self.spawn_background_backfill(block_idx);
+        }
 
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(offset, length, super::write_trace::TraceOp::Write);
