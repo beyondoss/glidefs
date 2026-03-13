@@ -2188,10 +2188,9 @@ async fn test_full_chunk_cold_wake() {
 /// Stress test: concurrent 4K sub-block writes, drain, cold wake, verify.
 /// Runs 20 iterations to reproduce intermittent corruption.
 ///
-/// Uses manual flush mode to ensure all sub-block writes complete before
-/// any flush occurs. With eviction-always semantics, auto-flush during
-/// writes would evict partially-written blocks, and the cold wake would
-/// read incomplete data from S3 instead of the full block from local SSD.
+/// Uses auto-flush (default mode) with concurrent sub-block writes.
+/// Auto-flush now uses SYNCING→CLEAN (not NOT_PRESENT), so blocks stay
+/// on local SSD during writes. Only drain evicts after all writes complete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cold_wake_stress_concurrent_writes() {
     use glidefs::block::cache::SimpleBlockCache;
@@ -2237,7 +2236,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
             s3_prefix: None,
             block_size: None,
             blocks_per_pack: None,
-            flush_mode: Some("manual".to_string()),
+            flush_mode: None,
             transport: None,
         };
         router1.create_export(config, false, None, None).await.unwrap();

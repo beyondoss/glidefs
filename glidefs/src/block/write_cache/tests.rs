@@ -1952,6 +1952,18 @@ impl BottomlessHarness {
             .unwrap();
         stats
     }
+
+    /// Drain: flush + evict (SYNCING→NOT_PRESENT). Use when testing eviction.
+    async fn drain(&self) -> FlushStats {
+        self.cache
+            .flush_to_s3(
+                &self.content_store,
+                &self.pack_index_cache,
+                &self.volume_manifest,
+            )
+            .await
+            .unwrap()
+    }
 }
 
 /// Test 1: Rotation mechanics.
@@ -2022,18 +2034,18 @@ async fn test_bottomless_eviction_lifecycle() {
     }
     assert_eq!(h.cache.dirty_block_count(), 5);
 
-    // Flush to S3
-    let stats = h.flush().await;
+    // Drain to S3 (drain evicts, unlike auto-flush which keeps blocks CLEAN)
+    let stats = h.drain().await;
     assert_eq!(stats.blocks_claimed, 5);
     assert!(stats.packs_uploaded > 0);
 
-    // After flush in bottomless mode, blocks should be NOT_PRESENT (evicted)
+    // After drain in bottomless mode, blocks should be NOT_PRESENT (evicted)
     for i in 0usize..5 {
         let state = h.cache.inner.state_map.get(i);
         assert_eq!(
             state,
             SparseBlockState::NOT_PRESENT,
-            "block {i} should be NOT_PRESENT after bottomless flush, got {state}"
+            "block {i} should be NOT_PRESENT after drain, got {state}"
         );
     }
 
@@ -2151,11 +2163,11 @@ async fn test_bottomless_skipped_block_recovery() {
         "partial block should stay DIRTY"
     );
 
-    // Block 1 should be NOT_PRESENT (evicted in bottomless mode)
+    // Block 1 should be CLEAN (auto-flush keeps blocks on SSD)
     assert_eq!(
         h.cache.inner.state_map.get(1),
-        SparseBlockState::NOT_PRESENT,
-        "flushed block should be NOT_PRESENT"
+        SparseBlockState::CLEAN,
+        "flushed block should be CLEAN after auto-flush"
     );
 
     // Block 0's data should have been copied during rotation (old → new active)
@@ -2383,9 +2395,9 @@ async fn test_bottomless_flushing_active_no_dirty_blocks() {
     );
 }
 
-/// Test: Bottomless flush end-to-end with S3 read-back.
+/// Test: Bottomless drain end-to-end with S3 read-back.
 ///
-/// Write blocks, flush (evict to NOT_PRESENT), then read through the full
+/// Write blocks, drain (evict to NOT_PRESENT), then read through the full
 /// tiered path (local miss -> S3 pack). Verifies the full bottomless lifecycle.
 #[tokio::test]
 async fn test_bottomless_flush_and_s3_readback() {
@@ -2399,11 +2411,11 @@ async fn test_bottomless_flush_and_s3_readback() {
             .unwrap();
     }
 
-    // Flush to S3 (blocks become NOT_PRESENT)
-    let stats = h.flush().await;
+    // Drain to S3 (blocks become NOT_PRESENT)
+    let stats = h.drain().await;
     assert_eq!(stats.blocks_claimed, 3);
 
-    // All blocks should be NOT_PRESENT locally
+    // All blocks should be NOT_PRESENT locally (drain evicts)
     for i in 0usize..3 {
         assert_eq!(h.cache.inner.state_map.get(i), SparseBlockState::NOT_PRESENT);
     }
@@ -2433,11 +2445,11 @@ async fn test_bottomless_flush_and_s3_readback() {
     }
 }
 
-/// Test: Concurrent writes during bottomless flush.
+/// Test: Concurrent writes during bottomless auto-flush.
 ///
-/// Spawn a flush on one task while writing to the same blocks concurrently.
-/// Re-dirtied blocks must survive with the latest data. Evicted blocks must
-/// be readable from S3.
+/// Spawn an auto-flush on one task while writing to the same blocks concurrently.
+/// Re-dirtied blocks must survive with the latest data. Flushed blocks stay
+/// CLEAN on local SSD (auto-flush doesn't evict).
 #[tokio::test]
 async fn test_bottomless_concurrent_write_during_flush() {
     let h = Arc::new(BottomlessHarness::new().await);
@@ -2467,15 +2479,13 @@ async fn test_bottomless_concurrent_write_during_flush() {
     let stats = flush_handle.await.unwrap();
     assert!(stats.blocks_claimed > 0, "some blocks should have been claimed");
 
-    // After flush, verify all blocks are readable with correct data.
-    // Blocks 0-4: either re-dirtied (latest write = 0xA0+i) or evicted then overwritten.
-    // Blocks 5-9: either evicted (0x10+i readable from S3) or still dirty.
+    // After auto-flush, verify all blocks are readable with correct data.
+    // Blocks 0-4: either re-dirtied (latest write = 0xA0+i) or CLEAN on SSD.
+    // Blocks 5-9: CLEAN on SSD (0x10+i) or still dirty.
     for i in 0u8..5 {
-        // Re-dirtied blocks: the last write was 0xA0+i. If they were evicted first,
-        // the overwrite re-dirtied them, so data is in the active file.
         let state = h.cache.inner.state_map.get(i as usize);
         assert!(
-            state == SparseBlockState::DIRTY || state == SparseBlockState::NOT_PRESENT,
+            state == SparseBlockState::DIRTY || state == SparseBlockState::CLEAN,
             "block {} unexpected state: {}", i, state,
         );
         let data = h
@@ -2498,8 +2508,8 @@ async fn test_bottomless_concurrent_write_during_flush() {
                 i, i + 0xA0, data[0],
             );
         }
-        // If NOT_PRESENT: the flush uploaded 0x10+i, then write happened after eviction,
-        // re-dirtied it. Either way the block is in a valid state.
+        // If CLEAN: the flush uploaded and kept 0x10+i on SSD, then the concurrent
+        // write may not have won the race. Either way the block is in a valid state.
     }
 
     for i in 5u8..10 {
@@ -2526,10 +2536,10 @@ async fn test_bottomless_concurrent_write_during_flush() {
     }
 }
 
-/// Test: Clean cache warming during bottomless flush.
+/// Test: Clean cache warming during bottomless auto-flush.
 ///
-/// After flush evicts blocks, the clean_cache should have been warmed
-/// so reads resolve from cache (not S3).
+/// After auto-flush, blocks stay CLEAN on local SSD and the clean_cache
+/// should have been warmed. Reads resolve from either local SSD or cache.
 #[tokio::test]
 async fn test_bottomless_clean_cache_warming() {
     let dir = TempDir::new().unwrap();
@@ -2578,14 +2588,12 @@ async fn test_bottomless_clean_cache_warming() {
         .unwrap();
     assert_eq!(stats.blocks_claimed, 3);
 
-    // All blocks should be NOT_PRESENT (evicted)
+    // All blocks should be CLEAN (auto-flush keeps blocks on SSD)
     for i in 0usize..3 {
-        assert_eq!(cache.inner.state_map.get(i), SparseBlockState::NOT_PRESENT);
+        assert_eq!(cache.inner.state_map.get(i), SparseBlockState::CLEAN);
     }
 
-    // Now read them back. If clean_cache was warmed, this doesn't hit S3.
-    // (We can't directly test "didn't hit S3" without metrics, but we can
-    // verify the data is correct and the read succeeds.)
+    // Read them back — data resolves from local SSD (CLEAN) or warmed cache.
     let metrics = crate::block::metrics::ExportMetrics::new();
     for i in 0u8..3 {
         let data = cache
@@ -2602,7 +2610,7 @@ async fn test_bottomless_clean_cache_warming() {
             .unwrap();
         assert!(
             data.iter().all(|&b| b == i + 0x60),
-            "block {} should be 0x{:02x} from warmed cache, got 0x{:02x}",
+            "block {} should be 0x{:02x}, got 0x{:02x}",
             i, i + 0x60, data[0],
         );
     }

@@ -491,6 +491,24 @@ impl CacheInner {
         }
     }
 
+    /// CAS SYNCING→CLEAN. Used by auto-flush in bottomless mode to keep the
+    /// block on local SSD after upload. The block is in S3 but stays readable
+    /// from local SSD — no backfill needed on re-write. Only drain evicts
+    /// (SYNCING→NOT_PRESENT) to free SSD space, ensuring the local copy is
+    /// always the most recent when the guest is actively writing.
+    pub(super) fn transition_syncing_to_clean(&self, idx: usize) -> bool {
+        if self
+            .state_map
+            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::CLEAN)
+            .is_ok()
+        {
+            self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Count present blocks (for metrics/logging).
     #[allow(dead_code)]
     pub(super) fn count_present(&self) -> usize {

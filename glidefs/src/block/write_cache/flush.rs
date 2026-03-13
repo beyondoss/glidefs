@@ -666,6 +666,7 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: Option<&Arc<dyn BlockCache>>,
+        evict: bool,
     ) -> Result<(FlushStats, u64), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
 
@@ -704,7 +705,7 @@ impl WriteCache<Active> {
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
 
         let result = self
-            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache)
+            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache, evict)
             .await;
 
         if result.is_err() {
@@ -761,6 +762,7 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: Option<&Arc<dyn BlockCache>>,
+        evict: bool,
     ) -> Result<FlushStats, CacheError> {
         use crate::block::pack::new_pack_id;
 
@@ -960,15 +962,57 @@ impl WriteCache<Active> {
             }
         }
 
-        // Finalize flushed blocks: evict SYNCING→NOT_PRESENT.
-        // Block data lives in S3 (and clean_cache) — local SSD copy not needed.
+        // Finalize flushed blocks.
+        //
+        // evict=true (drain): SYNCING→NOT_PRESENT — free local SSD space.
+        //   Block data lives in S3 (and clean_cache). This is safe because
+        //   drain runs after all guest writes are complete.
+        //
+        // evict=false (auto-flush): SYNCING→CLEAN — keep on local SSD.
+        //   The block is now in S3 for durability, but we keep the local copy
+        //   because the guest may be in the middle of writing 4KB sub-blocks
+        //   to this 128KB block. Evicting would force subsequent writes to
+        //   backfill from S3, which may have zeros for not-yet-written
+        //   sub-blocks. Keeping the block CLEAN avoids this data corruption.
+        //   We must copy data from flushing → active for blocks still SYNCING
+        //   (not re-dirtied) because the active file is empty for them.
         //
         // CAS failure means a guest write re-dirtied the block during flush.
         // Promote-on-write already copied the full block from flushing → active
         // before the guest pwrite, so the active file has complete data.
-        // No post-hoc merge needed.
+        if !evict {
+            // Copy flushed block data from flushing → active so reads after
+            // SYNCING→CLEAN find valid data in the active file.
+            let block_size = self.inner.config.block_size;
+            let flushing_guard = self.inner.flushing_file.lock();
+            if let Some(ref ff) = *flushing_guard {
+                let df = self.inner.data_file.read();
+                for &idx in &flushed_blocks {
+                    if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
+                        continue; // re-dirtied: promote already copied data
+                    }
+                    let offset = idx as u64 * block_size as u64;
+                    let valid = std::cmp::min(
+                        block_size as u64,
+                        self.inner.config.device_size.saturating_sub(offset),
+                    ) as usize;
+                    if valid > 0 {
+                        let mut buf = vec![0u8; valid];
+                        if ff.read_exact_at(&mut buf, offset).is_ok() {
+                            let _ = df.write_all_at(&buf, offset);
+                        }
+                    }
+                }
+            }
+            drop(flushing_guard);
+        }
         for &chunk_index in &flushed_blocks {
-            if !self.inner.transition_syncing_to_not_present(chunk_index) {
+            let ok = if evict {
+                self.inner.transition_syncing_to_not_present(chunk_index)
+            } else {
+                self.inner.transition_syncing_to_clean(chunk_index)
+            };
+            if !ok {
                 total_stats.blocks_cas_failed += 1;
             }
         }
@@ -1010,7 +1054,10 @@ impl WriteCache<Active> {
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: Option<&Arc<dyn BlockCache>>,
     ) -> Result<(FlushStats, u64), CacheError> {
-        self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
+        // Auto-flush: don't evict. Keep blocks CLEAN on local SSD so the
+        // guest's in-progress sub-block writes see complete data. Only drain
+        // evicts (after all guest writes are done).
+        self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache, false)
             .await
     }
 
@@ -1054,8 +1101,10 @@ impl WriteCache<Active> {
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
+        // Drain: evict blocks to free SSD space. Safe because drain runs
+        // after all guest writes are complete.
         let (stats, _seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None, true)
             .await?;
         let manifest_bytes = volume_manifest.read().serialize();
         let expected_etag = self.inner.manifest_etag.lock().clone();
@@ -1106,8 +1155,11 @@ impl WriteCache<Active> {
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
+        // Snapshots evict: the snapshot is a durable point-in-time copy in S3.
+        // Blocks transition to NOT_PRESENT so the local cache is clean for
+        // subsequent writes (snapshot semantics: fork-friendly).
         let (stats, seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None, true)
             .await?;
 
         let manifest_bytes = volume_manifest.read().serialize();
