@@ -583,11 +583,13 @@ impl WriteCache<Active> {
         // Swap file handle: new active file goes into the RwLock.
         let old_file = std::mem::replace(&mut *data_file_guard, new_file);
 
-        // Copy partial block data from old active → new active.
-        // Safe under write lock: no write_sub_region can execute.
+        // Copy block data from old active → new active for blocks that
+        // must survive rotation. Safe under write lock: no concurrent I/O.
         {
             let block_size = self.inner.config.block_size as u64;
             let device_size = self.inner.config.device_size;
+
+            // Partial blocks: have guest writes in some sub-regions.
             for &idx in &partial_to_copy {
                 let offset = idx as u64 * block_size;
                 let valid = std::cmp::min(block_size, device_size.saturating_sub(offset)) as usize;
@@ -597,6 +599,29 @@ impl WriteCache<Active> {
                 let mut buf = vec![0u8; valid];
                 if old_file.read_exact_at(&mut buf, offset).is_ok() {
                     let _ = data_file_guard.write_all_at(&buf, offset);
+                }
+            }
+
+            // CLEAN blocks from a previous auto-flush (evict=false).
+            // After SYNCING→CLEAN, data was copied back to the active file.
+            // Without this copy, the new empty active file would return zeros
+            // for reads of CLEAN blocks, since they're not in the flushed batch
+            // and won't be copied during post-flush copy-back.
+            if snapshot {
+                for idx in self.inner.state_map.iter_with_state(SparseBlockState::CLEAN) {
+                    if partial_to_copy.contains(&idx) {
+                        continue; // already copied above
+                    }
+                    let offset = idx as u64 * block_size;
+                    let valid =
+                        std::cmp::min(block_size, device_size.saturating_sub(offset)) as usize;
+                    if valid == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u8; valid];
+                    if old_file.read_exact_at(&mut buf, offset).is_ok() {
+                        let _ = data_file_guard.write_all_at(&buf, offset);
+                    }
                 }
             }
         }
@@ -710,12 +735,13 @@ impl WriteCache<Active> {
             // interleaving with the copy. Without this, a write could:
             // 1. CAS SYNCING→DIRTY, promote, pwrite new data
             // 2. Then our copy overwrites that new data with stale flushing data
+            // Lock ordering: data_file.write() THEN flushing_file.lock().
+            // Must match sync_read_local_block (data_file.read() → flushing_file)
+            // to avoid deadlock.
             let block_size = self.inner.config.block_size;
+            let df = self.inner.data_file.write();
             if let Some(ref ff) = *self.inner.flushing_file.lock() {
-                let df = self.inner.data_file.write();
                 for &idx in &snapshot {
-                    // Only copy blocks still SYNCING (not re-dirtied by a
-                    // concurrent write — those already have data in active).
                     if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
                         continue;
                     }
@@ -731,8 +757,8 @@ impl WriteCache<Active> {
                         }
                     }
                 }
-                drop(df);
             }
+            drop(df);
             self.inner.flushing_active.store(false, Ordering::Release);
             drop(self.inner.flushing_file.lock().take());
             let flushing_path = self.inner.config.flushing_path();
@@ -851,10 +877,10 @@ impl WriteCache<Active> {
             // Blocks already DIRTY (re-dirtied by guest write) were promoted
             // by the write path — don't overwrite active with stale data.
             {
-                let flushing_guard = self.inner.flushing_file.lock();
-                // Write-lock prevents concurrent writes from interleaving
-                // with the copy (same TOCTOU race as the post-flush copy-back).
+                // Lock ordering: data_file.write() THEN flushing_file.lock()
+                // (same order as sync_read_local_block to avoid deadlock).
                 let df = self.inner.data_file.write();
+                let flushing_guard = self.inner.flushing_file.lock();
                 let block_size = self.inner.config.block_size;
                 for &idx in &batch.skipped {
                     if self.inner.state_map.get(idx) == SparseBlockState::SYNCING
@@ -992,9 +1018,9 @@ impl WriteCache<Active> {
             //    that new data with stale flushing data
             // The write lock serializes the copy with all pwrite/pread.
             let block_size = self.inner.config.block_size;
+            let df = self.inner.data_file.write();
             let flushing_guard = self.inner.flushing_file.lock();
             if let Some(ref ff) = *flushing_guard {
-                let df = self.inner.data_file.write();
                 for &idx in &flushed_blocks {
                     if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
                         continue; // re-dirtied: promote already copied data
@@ -1013,6 +1039,7 @@ impl WriteCache<Active> {
                 }
             }
             drop(flushing_guard);
+            drop(df);
         }
         for &chunk_index in &flushed_blocks {
             let ok = if evict {

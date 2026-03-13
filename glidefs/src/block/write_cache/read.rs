@@ -169,6 +169,15 @@ impl WriteCache<Active> {
 
         let mut buf = vec![0u8; block_size];
 
+        // Hold the data_file read lock across the state check AND the pread.
+        // Without this, rotation can interleave:
+        //   1. state check → DIRTY (no lock)
+        //   2. rotation: write lock, DIRTY→SYNCING, swap files (new empty active)
+        //   3. pread from new active → zeros
+        // The read lock prevents rotation (which needs write lock) from
+        // swapping files between our state check and pread.
+        let df = self.inner.data_file.read();
+
         // Re-check state: the block may have been evicted (SYNCING→NOT_PRESENT)
         // between the caller's is_present() check and now.
         let state = self.inner.state_map.get(block_num as usize);
@@ -195,13 +204,10 @@ impl WriteCache<Active> {
 
         if valid_bytes == block_size {
             // Full block - read normally
-            self.inner.data_file.read().read_exact_at(&mut buf, offset)?;
+            df.read_exact_at(&mut buf, offset)?;
         } else {
             // Partial block (last block) - read only valid bytes, rest stays zero
-            self.inner
-                .data_file
-                .read()
-                .read_exact_at(&mut buf[..valid_bytes], offset)?;
+            df.read_exact_at(&mut buf[..valid_bytes], offset)?;
         }
         Ok(Some(Bytes::from(buf)))
     }
