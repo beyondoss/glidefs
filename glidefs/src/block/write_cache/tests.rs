@@ -2865,3 +2865,113 @@ async fn test_no_syncing_blocks_no_eviction_detection() {
         "empty syncing_blocks should not trigger eviction detection"
     );
 }
+
+/// End-to-end proof of the eviction race data corruption.
+///
+/// Demonstrates that WITHOUT syncing_blocks, a sub-block write after
+/// bottomless eviction produces a block with mostly zeros that gets
+/// flushed to S3 — causing data loss on cold read.
+///
+/// The sequence:
+/// 1. Write full block with 0xAA, flush to S3 (block is SYNCING)
+/// 2. Evict (SYNCING→NOT_PRESENT) — simulates bottomless mode
+/// 3. Sub-block write (512 bytes of 0xBB) with empty syncing_blocks
+///    (old buggy path: set_present masks NOT_PRESENT→CLEAN, no partial)
+/// 4. Block is now DIRTY with 512B of 0xBB + rest zeros — no partial
+///    entry, so flush picks it up
+/// 5. Flush to S3 — uploads corrupted block
+/// 6. Cold read from S3 — get the corrupted block
+#[tokio::test]
+async fn test_eviction_race_end_to_end_data_corruption() {
+    let h = V2Harness::new().await;
+    let block_size = 4096usize;
+
+    // Step 1: Write full block with 0xAA.
+    let original = vec![0xAAu8; block_size];
+    h.cache.write(0, &original, &[]).unwrap();
+
+    // Step 2: Flush to S3 — block becomes SYNCING, then we manually evict.
+    let stats = h.flush().await;
+    assert_eq!(stats.blocks_claimed, 1);
+
+    // After flush_to_s3, the block should be evicted (NOT_PRESENT)
+    // because flush_dirty_body calls transition_syncing_to_not_present.
+    assert_eq!(
+        h.cache.inner.state_map.get(0),
+        SparseBlockState::NOT_PRESENT,
+        "block should be NOT_PRESENT after flush (bottomless eviction)"
+    );
+
+    // Step 3: Sub-block write WITHOUT syncing_blocks — the bug.
+    // set_present: NOT_PRESENT→CLEAN, promote sees CLEAN → skips.
+    // No partial entry created. The 512-byte write lands on zeros.
+    let sub_data = vec![0xBBu8; 512];
+    let _needs_backfill = h.cache.write(0, &sub_data, &[]).unwrap();
+
+    // Verify: block is DIRTY with NO partial entry — flush will pick it up.
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::DIRTY);
+    assert!(
+        !h.cache.inner.is_partial(0),
+        "BUG: no partial entry without syncing_blocks — flush will upload corrupted data"
+    );
+
+    // Step 4: Flush again — uploads the block with 512B of 0xBB + rest zeros.
+    let stats2 = h.flush().await;
+    assert_eq!(stats2.blocks_claimed, 1);
+
+    // Step 5: Cold read from S3 — should get the corrupted block.
+    // Read through the full tiered path (S3 → clean_cache → local).
+    let read_data = h.read(0, block_size).await;
+
+    // PROOF OF CORRUPTION: first 512 bytes are 0xBB (the sub-block write),
+    // but the rest of the block is zeros instead of the original 0xAA.
+    assert_eq!(
+        &read_data[..512],
+        &vec![0xBBu8; 512][..],
+        "first 512 bytes should be the sub-block write"
+    );
+    assert!(
+        read_data[512..].iter().all(|&b| b == 0),
+        "BUG PROVEN: rest of block is zeros (was 0xAA) — data corruption!\n\
+         first non-zero after 512: {:?}",
+        read_data[512..].iter().position(|&b| b != 0),
+    );
+}
+
+/// Same scenario but WITH the fix: syncing_blocks prevents corruption.
+///
+/// When syncing_blocks=[0] is passed, write() detects the eviction and
+/// creates a partial entry. This blocks the second flush from uploading
+/// the block (flush skips partial blocks). The backfill task (not run
+/// in this unit test) would fill in the missing sub-regions from S3.
+#[tokio::test]
+async fn test_eviction_race_fix_prevents_corruption() {
+    let h = V2Harness::new().await;
+    let block_size = 4096usize;
+
+    // Same setup: write, flush, evict.
+    h.cache.write(0, &vec![0xAAu8; block_size], &[]).unwrap();
+    h.flush().await;
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::NOT_PRESENT);
+
+    // Sub-block write WITH syncing_blocks=[0] — the fix.
+    let sub_data = vec![0xBBu8; 512];
+    let needs_backfill = h.cache.write(0, &sub_data, &[0]).unwrap();
+
+    // The fix: partial entry created, backfill requested.
+    assert!(
+        needs_backfill.contains(&0),
+        "fix should detect eviction and request backfill"
+    );
+    assert!(
+        h.cache.inner.is_partial(0),
+        "fix should create partial entry to block flush"
+    );
+
+    // Flush should skip block 0 because it's partial (incomplete backfill).
+    let stats2 = h.flush().await;
+    assert_eq!(
+        stats2.blocks_claimed, 0,
+        "flush should skip partial blocks — no data uploaded"
+    );
+}
