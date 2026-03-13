@@ -42,6 +42,7 @@ struct TestHarness {
     content_store: ContentStore,
     pack_index_cache: Arc<PackIndexCache>,
     volume_manifest: Arc<RwLock<VolumeManifest>>,
+    #[allow(dead_code)]
     clean_cache: Arc<dyn BlockCache>,
     metrics: Arc<ExportMetrics>,
     #[allow(dead_code)]
@@ -154,7 +155,7 @@ fn bench_random_writes(c: &mut Criterion) {
                     let aligned = (offset / 4096) * 4096;
                     harness
                         .cache
-                        .write(aligned, &data, harness.clean_cache.as_ref())
+                        .write(aligned, &data, &[])
                         .unwrap();
                 });
             },
@@ -190,7 +191,7 @@ fn bench_sequential_reads(c: &mut Criterion) {
                                 .write(
                                     i as u64 * BLOCK_SIZE as u64,
                                     &data,
-                                    harness.clean_cache.as_ref(),
+                                    &[],
                                 )
                                 .unwrap();
                         }
@@ -244,7 +245,7 @@ fn bench_sequential_reads(c: &mut Criterion) {
                 .write(
                     i as u64 * BLOCK_SIZE as u64,
                     &data,
-                    harness.clean_cache.as_ref(),
+                    &[],
                 )
                 .unwrap();
         }
@@ -279,7 +280,7 @@ fn bench_mixed_iops_baseline(c: &mut Criterion) {
                 .write(
                     i as u64 * BLOCK_SIZE as u64,
                     &data,
-                    harness.clean_cache.as_ref(),
+                    &[],
                 )
                 .unwrap();
         }
@@ -296,7 +297,7 @@ fn bench_mixed_iops_baseline(c: &mut Criterion) {
             } else {
                 harness
                     .cache
-                    .write(offset, &data, harness.clean_cache.as_ref())
+                    .write(offset, &data, &[])
                     .unwrap();
             }
         });
@@ -314,7 +315,7 @@ fn bench_mixed_iops_baseline(c: &mut Criterion) {
                 .write(
                     i as u64 * BLOCK_SIZE as u64,
                     &data,
-                    harness.clean_cache.as_ref(),
+                    &[],
                 )
                 .unwrap();
         }
@@ -331,7 +332,7 @@ fn bench_mixed_iops_baseline(c: &mut Criterion) {
             } else {
                 harness
                     .cache
-                    .write(offset, &data, harness.clean_cache.as_ref())
+                    .write(offset, &data, &[])
                     .unwrap();
             }
         });
@@ -367,7 +368,7 @@ fn bench_mixed_iops_during_flush(c: &mut Criterion) {
                         let data = vec![i as u8; BLOCK_SIZE];
                         harness
                             .cache
-                            .write(i * BLOCK_SIZE as u64, &data, harness.clean_cache.as_ref())
+                            .write(i * BLOCK_SIZE as u64, &data, &[])
                             .unwrap();
                     }
 
@@ -407,7 +408,7 @@ fn bench_mixed_iops_during_flush(c: &mut Criterion) {
                             } else {
                                 io_harness
                                     .cache
-                                    .write(offset, &data, io_harness.clean_cache.as_ref())
+                                    .write(offset, &data, &[])
                                     .unwrap();
                             }
                         }
@@ -452,7 +453,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
                     for _ in 0..1000 {
                         harness
                             .cache
-                            .write(0, &data, harness.clean_cache.as_ref())
+                            .write(0, &data, &[])
                             .unwrap();
                         harness.metrics.record_guest_write(BLOCK_SIZE as u64);
                     }
@@ -494,7 +495,7 @@ fn bench_write_coalescing(c: &mut Criterion) {
                             .write(
                                 i as u64 * BLOCK_SIZE as u64,
                                 &data,
-                                harness.clean_cache.as_ref(),
+                                &[],
                             )
                             .unwrap();
                         harness.metrics.record_guest_write(BLOCK_SIZE as u64);
@@ -550,7 +551,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                                 .write(
                                     i as u64 * BLOCK_SIZE as u64,
                                     &data,
-                                    harness.clean_cache.as_ref(),
+                                    &[],
                                 )
                                 .unwrap();
                         }
@@ -584,7 +585,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                                     .write(
                                         block * BLOCK_SIZE as u64,
                                         &data,
-                                        harness.clean_cache.as_ref(),
+                                        &[],
                                     )
                                     .unwrap();
                                 harness.metrics.record_guest_write(4096);
@@ -635,7 +636,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                                 .write(
                                     block * BLOCK_SIZE as u64,
                                     &data,
-                                    harness.clean_cache.as_ref(),
+                                    &[],
                                 )
                                 .unwrap();
                             harness.metrics.record_guest_write(data.len() as u64);
@@ -689,7 +690,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                                 % (harness.device_blocks() * BLOCK_SIZE as u64);
                             harness
                                 .cache
-                                .write(offset, &data, harness.clean_cache.as_ref())
+                                .write(offset, &data, &[])
                                 .unwrap();
                             harness.metrics.record_guest_write(size as u64);
                         }
@@ -706,7 +707,7 @@ fn bench_real_world_workloads(c: &mut Criterion) {
                         let binary = vec![0xEEu8; 512 * 1024]; // 512KB binary
                         harness
                             .cache
-                            .write(0, &binary, harness.clean_cache.as_ref())
+                            .write(0, &binary, &[])
                             .unwrap();
                         harness.metrics.record_guest_write(binary.len() as u64);
                         harness.cache.flush().unwrap();
@@ -768,7 +769,7 @@ fn bench_flush_to_s3_latency(c: &mut Criterion) {
                                     .write(
                                         i * BLOCK_SIZE as u64,
                                         &data,
-                                        harness.clean_cache.as_ref(),
+                                        &[],
                                     )
                                     .unwrap();
                                 harness.metrics.record_guest_write(BLOCK_SIZE as u64);
@@ -844,7 +845,7 @@ fn bench_concurrent_access(c: &mut Criterion) {
                                         .write(
                                             block * BLOCK_SIZE as u64,
                                             &data,
-                                            h.clean_cache.as_ref(),
+                                            &[],
                                         )
                                         .unwrap();
                                 }
@@ -875,7 +876,7 @@ fn bench_concurrent_access(c: &mut Criterion) {
                     .write(
                         i as u64 * BLOCK_SIZE as u64,
                         &data,
-                        harness.clean_cache.as_ref(),
+                        &[],
                     )
                     .unwrap();
             }
@@ -897,7 +898,7 @@ fn bench_concurrent_access(c: &mut Criterion) {
 
                             if is_writer {
                                 h.cache
-                                    .write(offset, &data, h.clean_cache.as_ref())
+                                    .write(offset, &data, &[])
                                     .unwrap();
                             } else {
                                 let _ = h.cache.read_local(offset, BLOCK_SIZE);
@@ -938,7 +939,7 @@ fn bench_sequential_writes(c: &mut Criterion) {
                     .write(
                         i as u64 * BLOCK_SIZE as u64,
                         &data,
-                        harness.clean_cache.as_ref(),
+                        &[],
                     )
                     .unwrap();
             }
@@ -959,7 +960,7 @@ fn bench_sequential_writes(c: &mut Criterion) {
                     .write(
                         i as u64 * BLOCK_SIZE as u64,
                         &data,
-                        harness.clean_cache.as_ref(),
+                        &[],
                     )
                     .unwrap();
             }

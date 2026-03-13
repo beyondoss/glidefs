@@ -35,7 +35,7 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+            let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
                 super::create_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let offset = block_idx * BLOCK_SIZE as u64;
@@ -79,7 +79,7 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+            let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
                 super::create_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let offset = block_idx * BLOCK_SIZE as u64;
@@ -126,7 +126,7 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+            let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
                 super::create_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             // Write all blocks
@@ -190,7 +190,7 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+            let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
                 super::create_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let block_idx = batch_idx * BLOCKS_PER_BATCH + position;
@@ -238,7 +238,7 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let s3 = Arc::new(object_store::memory::InMemory::new());
         let temp_dir = TempDir::new().unwrap();
-        let (cache, _content_store, _pack_index_cache, _volume_manifest, clean_cache, _metrics) =
+        let (cache, _content_store, _pack_index_cache, _volume_manifest, _clean_cache, _metrics) =
             rt.block_on(super::create_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>));
 
         let data = vec![0xAB; BLOCK_SIZE];
@@ -301,7 +301,7 @@ proptest! {
         rt.block_on(async {
             let s3 = Arc::new(object_store::memory::InMemory::new());
             let temp_dir = TempDir::new().unwrap();
-            let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+            let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
                 super::create_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
             let offset = block_idx * BLOCK_SIZE as u64;
@@ -343,7 +343,7 @@ proptest! {
 async fn test_multi_batch_writes() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         super::create_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
     // Write blocks across 3 batches
@@ -423,7 +423,7 @@ async fn test_alternating_read_write() {
 async fn test_device_boundary() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         super::create_test_cache(&temp_dir, "proptest", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
     let last_block = (DEVICE_SIZE / BLOCK_SIZE as u64) - 1;

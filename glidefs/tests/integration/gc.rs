@@ -32,7 +32,7 @@ fn write_blocks(
     start: usize,
     count: usize,
     seed: u8,
-    clean_cache: &dyn glidefs::block::cache::BlockCache,
+    _clean_cache: &dyn glidefs::block::cache::BlockCache,
 ) {
     for i in 0..count {
         let offset = (start + i) * BLOCK_SIZE;

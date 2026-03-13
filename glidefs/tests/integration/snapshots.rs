@@ -34,7 +34,7 @@ fn write_blocks(
     start: usize,
     count: usize,
     seed: u8,
-    clean_cache: &dyn glidefs::block::cache::BlockCache,
+    _clean_cache: &dyn glidefs::block::cache::BlockCache,
 ) {
     for i in 0..count {
         let offset = (start + i) * BLOCK_SIZE;
@@ -2043,7 +2043,7 @@ async fn test_snapshot_gc_race() {
 async fn test_snapshot_manifest_growth() {
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+    let (cache, cs, pack_index_cache, volume_manifest, _cc, _m) =
         create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
 
     let mut sequences = Vec::new();

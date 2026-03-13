@@ -38,7 +38,7 @@ async fn test_write_read() {
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
-    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Write some data
     cache.write(0, b"hello world", &[]).unwrap();
@@ -58,7 +58,7 @@ async fn test_flush() {
 
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
-    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     cache.write(0, b"data", &[]).unwrap();
     cache.flush().unwrap();
@@ -72,7 +72,7 @@ async fn test_flush() {
 async fn test_metadata_persistence() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path());
-    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Create cache and write data
     {
@@ -757,7 +757,7 @@ async fn test_recovery_verifies_dirty_blocks_readable() {
         wal_sync: false,
     };
 
-    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
     let original_data = vec![0xAAu8; block_size];
 
     // Session 1: write data and persist metadata
@@ -849,7 +849,7 @@ async fn test_concurrent_flush_and_writes() {
     // Spawn concurrent writers that overwrite blocks during flush
     for writer_id in 0..5u8 {
         let cache = Arc::clone(&cache);
-        let clean_cache = Arc::clone(&clean_cache);
+        let _clean_cache = Arc::clone(&clean_cache);
         tasks.spawn(async move {
             for round in 0..20u8 {
                 let block_idx = (writer_id as u64 * 2) % 10;
@@ -911,7 +911,7 @@ async fn test_draining_state_transition() {
         wal_sync: false,
     };
 
-    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
     let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
 
@@ -1015,7 +1015,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
     // Final value is deterministic: writer_id * 10 + 9 (last round).
     for writer_id in 0..5u8 {
         let cache = Arc::clone(&cache);
-        let clean_cache = Arc::clone(&clean_cache);
+        let _clean_cache = Arc::clone(&clean_cache);
         tasks.spawn(async move {
             let block_idx = writer_id as u64 * 2; // blocks 0,2,4,6,8
             for round in 0..10u8 {
@@ -1403,7 +1403,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     // Concurrent writers hammering the same blocks during flush.
     for writer_id in 0..5u8 {
         let cache = Arc::clone(&cache);
-        let clean_cache = Arc::clone(&clean_cache);
+        let _clean_cache = Arc::clone(&clean_cache);
         tasks.spawn(async move {
             for round in 0..30u8 {
                 let block_idx = (writer_id as u64 * 2) % 10;
@@ -1757,7 +1757,7 @@ async fn test_complete_partial_before_repwrite_race() {
     // write() will: mark bitmap → first pwrite → re-pwrite.
     // The re-pwrite MUST happen even though backfill already called
     // complete_partial in the real scenario.
-    let clean = crate::block::cache::SimpleBlockCache::new(1024);
+    let _clean = crate::block::cache::SimpleBlockCache::new(1024);
     cache
         .write(0, &[0xBBu8; SUB_BLOCK_SIZE], &[])
         .unwrap();
@@ -1822,7 +1822,7 @@ async fn test_write_survives_complete_partial_removal() {
     };
     let cache = WriteCache::<Initializing>::open(config).unwrap();
     let cache = cache.skip_recovery_for_test();
-    let clean = crate::block::cache::SimpleBlockCache::new(1024);
+    let _clean = crate::block::cache::SimpleBlockCache::new(1024);
 
     let block_idx = 0usize;
 
@@ -1967,7 +1967,7 @@ async fn test_bottomless_rotate_data_file() {
     let config = bottomless_config(dir.path());
     let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
-    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Write data to blocks 0 and 1
     let data0 = vec![0xAAu8; 4096];
@@ -2067,7 +2067,7 @@ async fn test_bottomless_re_dirty_during_flush() {
     let config = bottomless_config(dir.path());
     let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
-    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Write block 0 with initial data
     let initial_data = vec![0xAAu8; 4096];
@@ -2250,7 +2250,7 @@ async fn test_bottomless_crash_recovery_with_flushing_file() {
         let config = bottomless_config(dir.path());
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Write 3 blocks
         for i in 0u8..3 {
@@ -2672,7 +2672,7 @@ async fn test_bottomless_flush_failure_recovery() {
 
     let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
     let cache = cache.finish_recovery().await.unwrap();
-    let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
+    let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Write 3 blocks
     for i in 0u8..3 {

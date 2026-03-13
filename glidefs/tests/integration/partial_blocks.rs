@@ -59,7 +59,7 @@ fn test_config(dir: &std::path::Path, name: &str) -> WriteCacheConfig {
 async fn test_partial_wal_entry_survives_crash() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path(), "partial-wal");
-    let clean = SimpleBlockCache::new(1024);
+    let _clean = SimpleBlockCache::new(1024);
 
     // Session 1: write a full block (to establish present/dirty), then manually
     // write a partial WAL entry to simulate a partial-block write.
@@ -119,7 +119,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
     // --- Parent: write block 0 of 0xAA, flush to S3 ---
     let parent_dir = TempDir::new().unwrap();
     let parent_vm = {
-        let (cache, cs2, pic2, vm, cc2, _m) =
+        let (cache, cs2, pic2, vm, _cc2, _m) =
             super::create_test_cache(&parent_dir, "parent", Arc::clone(&s3)).await;
         cache.write(0, &vec![0xAA; BLOCK_SIZE], &[]).unwrap();
         cache.flush_to_s3(&cs2, &pic2, &vm).await.unwrap();
@@ -211,7 +211,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
 /// On recovery, WAL replay marks the block dirty and the data is on SSD.
 #[tokio::test]
 async fn test_partial_block_crash_before_checkpoint_recovery() {
-    let cc = SimpleBlockCache::new(1024);
+    let _cc = SimpleBlockCache::new(1024);
     let dir = TempDir::new().unwrap();
     let config = WriteCacheConfig {
         cache_dir: dir.path().to_path_buf(),
@@ -259,7 +259,7 @@ async fn test_partial_block_crash_before_checkpoint_recovery() {
 /// should reconstruct the full bitmap: persisted bits OR WAL bits.
 #[tokio::test]
 async fn test_partial_block_crash_after_checkpoint_recovery() {
-    let cc = SimpleBlockCache::new(1024);
+    let _cc = SimpleBlockCache::new(1024);
     let dir = TempDir::new().unwrap();
     let config = WriteCacheConfig {
         cache_dir: dir.path().to_path_buf(),
@@ -332,7 +332,7 @@ async fn test_partial_block_crash_after_checkpoint_recovery() {
 /// crash and the block is dirty after recovery.
 #[tokio::test]
 async fn test_partial_block_crash_during_backfill() {
-    let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let _cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
 
     // --- Fork child: write sub-block, checkpoint, then crash ---
     // This simulates: sub-block write triggers backfill, but crash happens
@@ -425,7 +425,7 @@ async fn test_partial_block_concurrent_write_same_subregion() {
     // --- Parent: write block 0 with 0xAA, flush to S3 ---
     let parent_dir = TempDir::new().unwrap();
     {
-        let (cache, cs2, pic2, vm, cc2, _m) =
+        let (cache, cs2, pic2, vm, _cc2, _m) =
             super::create_test_cache(&parent_dir, "parent2", Arc::clone(&s3)).await;
         cache
             .write(0, &vec![0xAA; BLOCK_SIZE], &[])
@@ -688,7 +688,7 @@ async fn test_partial_block_cap_overflow() {
     // --- Parent: write 1025 blocks with unique data, flush to S3 ---
     let parent_dir = TempDir::new().unwrap();
     let parent_manifest = {
-        let (cache, cs, pic, vm, cc, _m) =
+        let (cache, cs, pic, vm, _cc, _m) =
             super::create_test_cache(&parent_dir, "parent-cap", Arc::clone(&s3)).await;
 
         for i in 0..1025u64 {

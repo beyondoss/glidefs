@@ -290,7 +290,7 @@ async fn create_reader_from_manifest(
 async fn test_s3_failure_during_sync_marks_blocks_dirty() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write some blocks
@@ -349,7 +349,7 @@ async fn test_s3_failure_during_read_returns_error() {
 
     // First, write data to S3 successfully
     let writer_dir = TempDir::new().unwrap();
-    let (writer_cache, writer_content_store, writer_pack_index_cache, writer_volume_manifest, writer_clean_cache, _) =
+    let (writer_cache, writer_content_store, writer_pack_index_cache, writer_volume_manifest, _writer_clean_cache, _) =
         create_test_cache(&writer_dir, "vol1", Arc::clone(&s3)).await;
 
     let data = vec![0xAB; BLOCK_SIZE];
@@ -414,7 +414,7 @@ async fn test_s3_failure_during_read_returns_error() {
 async fn test_write_during_sync_preserves_new_data() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write initial data and flush to S3
@@ -491,7 +491,7 @@ async fn test_concurrent_writes_no_torn_reads() {
     for writer_id in 0..10u8 {
         let cache = Arc::clone(&cache);
         let write_count = Arc::clone(&write_count);
-        let clean_cache = Arc::clone(&clean_cache);
+        let _clean_cache = Arc::clone(&clean_cache);
 
         tasks.spawn(async move {
             for _ in 0..100 {
@@ -544,7 +544,7 @@ async fn test_concurrent_writes_no_torn_reads() {
 async fn test_zero_blocks_produce_tombstones() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write zero blocks
@@ -581,7 +581,7 @@ async fn test_zero_blocks_produce_tombstones() {
 async fn test_mixed_zero_nonzero_batch() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write alternating zero and non-zero blocks
@@ -640,7 +640,7 @@ async fn test_mixed_zero_nonzero_batch() {
 async fn test_data_integrity_after_failure_recovery() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write known pattern
@@ -710,7 +710,7 @@ async fn test_data_integrity_after_failure_recovery() {
 async fn test_concurrent_drain_safety() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write data
@@ -785,7 +785,7 @@ async fn test_concurrent_drain_safety() {
 async fn test_partial_pack_upload_preserves_dirty() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write enough blocks for 3 packs (500 blocks per pack, so 1250 = 3 packs).
@@ -891,7 +891,7 @@ async fn test_partial_pack_upload_preserves_dirty() {
 async fn test_delete_all_snapshots_returns_ok_on_partial_failure() {
     let s3 = Arc::new(FailingObjectStore::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write data and create two snapshots

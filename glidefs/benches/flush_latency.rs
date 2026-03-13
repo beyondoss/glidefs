@@ -28,6 +28,7 @@ struct BenchHarness {
     content_store: ContentStore,
     pack_index_cache: Arc<PackIndexCache>,
     volume_manifest: Arc<RwLock<VolumeManifest>>,
+    #[allow(dead_code)]
     clean_cache: Arc<dyn BlockCache>,
     #[allow(dead_code)]
     temp_dir: TempDir,
@@ -93,7 +94,7 @@ fn bench_flush_is_local_only(c: &mut Criterion) {
                 let data = vec![42u8; BLOCK_SIZE];
                 for i in 0..blocks {
                     h.cache
-                        .write(i * BLOCK_SIZE as u64, &data, h.clean_cache.as_ref())
+                        .write(i * BLOCK_SIZE as u64, &data, &[])
                         .unwrap();
                 }
 
@@ -129,7 +130,7 @@ fn bench_flush_vs_s3(c: &mut Criterion) {
         let data = vec![42u8; BLOCK_SIZE];
         for i in 0..dirty_blocks {
             h.cache
-                .write(i * BLOCK_SIZE as u64, &data, h.clean_cache.as_ref())
+                .write(i * BLOCK_SIZE as u64, &data, &[])
                 .unwrap();
         }
 
@@ -153,7 +154,7 @@ fn bench_flush_vs_s3(c: &mut Criterion) {
                         let data = vec![42u8; BLOCK_SIZE];
                         for i in 0..dirty_blocks {
                             h.cache
-                                .write(i * BLOCK_SIZE as u64, &data, h.clean_cache.as_ref())
+                                .write(i * BLOCK_SIZE as u64, &data, &[])
                                 .unwrap();
                         }
 
@@ -198,7 +199,7 @@ fn bench_write_throughput(c: &mut Criterion) {
 
         b.iter(|| {
             h.cache
-                .write(offset, &data, h.clean_cache.as_ref())
+                .write(offset, &data, &[])
                 .unwrap();
             offset = (offset + block_size as u64) % (100 * 1024 * 1024);
         });

@@ -50,7 +50,7 @@ async fn test_metadata_atomicity() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         cache.write(0, &test_data, &[]).unwrap();
         cache.save_metadata().unwrap();
@@ -112,7 +112,7 @@ async fn test_leftover_temp_file_ignored() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
         cache.write(0, &test_data, &[]).unwrap();
         cache.save_metadata().unwrap();
     }
@@ -151,7 +151,7 @@ async fn test_torn_write_temp_file() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
         cache.write(0, &test_data, &[]).unwrap();
         cache.save_metadata().unwrap();
     }
@@ -218,7 +218,7 @@ async fn test_corrupted_magic_bytes() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
         cache
             .write(0, &vec![0xCC; BLOCK_SIZE], &[])
             .unwrap();
@@ -288,7 +288,7 @@ async fn test_repeated_metadata_crash_cycles() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
         cache.write(0, &test_data, &[]).unwrap();
         cache.save_metadata().unwrap();
     }
@@ -379,7 +379,7 @@ async fn test_write_after_recovery_overwrites() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         cache.write(0, &old_data, &[]).unwrap();
         cache.save_metadata().unwrap();
@@ -390,7 +390,7 @@ async fn test_write_after_recovery_overwrites() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Now write new data to the same block (overwrites recovered data)
         cache.write(0, &new_data, &[]).unwrap();
@@ -459,7 +459,7 @@ async fn test_wal_recovery_without_metadata_save() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         cache.write(0, &block_0_data, &[]).unwrap();
         cache
@@ -577,7 +577,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
         cache.write(0, &data_session_1, &[]).unwrap();
         cache.save_metadata().unwrap();
         // Crash — .meta has block 0 dirty, WAL has block 0 entry
@@ -587,7 +587,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Block 0 should be recovered from metadata (.meta says dirty)
         assert!(
@@ -691,7 +691,7 @@ async fn test_flush_truncates_wal_before_crash() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         let content_store =
             glidefs::block::content_store::ContentStore::new(Arc::clone(&s3_backend), "test");
@@ -833,7 +833,7 @@ async fn test_wal_lost_blocks_since_last_checkpoint_are_lost() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         cache.write(0, &test_data, &[]).unwrap();
         cache
@@ -892,7 +892,7 @@ async fn test_wal_lost_preserves_checkpointed_blocks() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Write blocks 0 and 1
         cache.write(0, &old_data, &[]).unwrap();
@@ -975,7 +975,7 @@ async fn test_syncing_blocks_at_crash_become_dirty() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Write 3 blocks — all become DIRTY
         for i in 0..3 {

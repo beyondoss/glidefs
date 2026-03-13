@@ -26,6 +26,7 @@ struct V2BenchHarness {
     cache: WriteCache<Active>,
     content_store: ContentStore,
     volume_manifest: Arc<RwLock<VolumeManifest>>,
+    #[allow(dead_code)]
     clean_cache: Arc<dyn BlockCache>,
     #[allow(dead_code)]
     temp_dir: TempDir,
@@ -105,7 +106,7 @@ fn bench_v2_flush_latency(c: &mut Criterion) {
                                     .write(
                                         i * BLOCK_SIZE as u64,
                                         &data,
-                                        h.clean_cache.as_ref(),
+                                        &[],
                                     )
                                     .unwrap();
                             }
@@ -166,7 +167,7 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                                 .write(
                                     i * BLOCK_SIZE as u64,
                                     &data,
-                                    h.clean_cache.as_ref(),
+                                    &[],
                                 )
                                 .unwrap();
                         }
@@ -204,7 +205,7 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                                 .write(
                                     i * BLOCK_SIZE as u64,
                                     &data,
-                                    h.clean_cache.as_ref(),
+                                    &[],
                                 )
                                 .unwrap();
                         }
@@ -220,7 +221,7 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                                 .write(
                                     (i + dirty_blocks) * BLOCK_SIZE as u64,
                                     &data,
-                                    h.clean_cache.as_ref(),
+                                    &[],
                                 )
                                 .unwrap();
                         }

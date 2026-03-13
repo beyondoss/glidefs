@@ -25,7 +25,7 @@ async fn test_wake_from_different_node() {
 
     // === NODE A: Write data and flush to S3 ===
     let node_a_dir = TempDir::new().unwrap();
-    let (cache_a, content_store_a, pack_index_cache_a, volume_manifest_a, clean_cache_a, _metrics_a) =
+    let (cache_a, content_store_a, pack_index_cache_a, volume_manifest_a, _clean_cache_a, _metrics_a) =
         create_test_cache(&node_a_dir, "vol1", Arc::clone(&s3) as _).await;
 
     // Write test pattern: blocks 0, 1, 5 with distinct data
@@ -140,7 +140,7 @@ async fn test_unwritten_blocks_return_zeros() {
 async fn test_cache_hit_on_second_read() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3) as _).await;
 
     // Write some data
@@ -203,7 +203,7 @@ async fn test_batch_prefetch_optimization() {
 
     // Write blocks 0-9 (all in same batch)
     let writer_dir = TempDir::new().unwrap();
-    let (writer_cache, writer_content_store, writer_pack_index_cache, writer_volume_manifest, writer_clean_cache, _) =
+    let (writer_cache, writer_content_store, writer_pack_index_cache, writer_volume_manifest, _writer_clean_cache, _) =
         create_test_cache(&writer_dir, "vol1", Arc::clone(&s3) as _).await;
 
     for i in 0..10u64 {
@@ -264,7 +264,7 @@ async fn test_recovery_after_pack_flush_without_drain() {
 
     // === NODE A: Write data, flush packs + sync manifest (no drain) ===
     let node_a_dir = TempDir::new().unwrap();
-    let (cache_a, content_store_a, pack_index_cache_a, volume_manifest_a, clean_cache_a, _metrics_a) =
+    let (cache_a, content_store_a, pack_index_cache_a, volume_manifest_a, _clean_cache_a, _metrics_a) =
         create_test_cache(&node_a_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write 3 blocks with distinct patterns

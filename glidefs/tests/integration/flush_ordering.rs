@@ -88,7 +88,7 @@ async fn test_flush_ordering_guarantee() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Write block A at offset 0
         cache.write(0, &block_a_data, &[]).unwrap();
@@ -157,7 +157,7 @@ async fn test_flush_ordering_guarantee_wal_sync_false() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         cache.write(0, &block_a_data, &[]).unwrap();
         cache.flush().unwrap();
@@ -215,7 +215,7 @@ async fn test_fua_write_durable_before_response() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Write with FUA — this should sync SSD before returning
         cache.write(0, &fua_data, &[]).unwrap();
@@ -469,7 +469,7 @@ async fn test_manifest_consistency_after_partial_drain() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         for i in 0..block_count {
             let data = vec![(i % 256) as u8; BLOCK_SIZE];

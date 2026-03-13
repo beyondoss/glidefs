@@ -325,7 +325,7 @@ async fn test_wal_recovery_after_crash_without_metadata_save() {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
 
-        let clean = SimpleBlockCache::new(1024);
+        let _clean = SimpleBlockCache::new(1024);
 
         // Write block 0 and checkpoint (saves metadata + truncates WAL)
         cache.write(0, &original_data, &[]).unwrap();
@@ -379,7 +379,7 @@ async fn test_wal_recovery_after_crash_without_metadata_save() {
 async fn test_multi_crash_wal_recovery() {
     let dir = TempDir::new().unwrap();
     let config = test_config_wal_sync(dir.path(), "multi-crash");
-    let clean = SimpleBlockCache::new(1024);
+    let _clean = SimpleBlockCache::new(1024);
 
     let data_a = vec![0xAA; BLOCK_SIZE];
     let data_b = vec![0xBB; BLOCK_SIZE];
@@ -481,7 +481,7 @@ async fn test_multi_crash_wal_recovery() {
 async fn test_s3_data_corruption_detected_by_blake3() {
     let s3 = Arc::new(CorruptingObjectStore::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pic, vm, cc, _m) =
+    let (cache, cs, pic, vm, _cc, _m) =
         create_cache_with_store(&dir, "corrupt-test", Arc::clone(&s3) as _).await;
 
     // Write distinct data
@@ -569,7 +569,7 @@ async fn test_ssd_corruption_detected_during_flush() {
     let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
     let cache = cache.skip_recovery_for_test();
 
-    let clean = Arc::new(SimpleBlockCache::new(1024));
+    let _clean = Arc::new(SimpleBlockCache::new(1024));
     let cs = ContentStore::new(Arc::clone(&s3), "test");
     let pic = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
@@ -662,7 +662,7 @@ async fn test_ssd_corruption_detected_during_flush() {
 async fn test_pack_index_corruption_returns_error() {
     let s3 = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pic, vm, cc, _m) =
+    let (cache, cs, pic, vm, _cc, _m) =
         create_cache_with_store(&dir, "idx-corrupt", Arc::clone(&s3) as Arc<dyn ObjectStore>)
             .await;
 
@@ -867,7 +867,7 @@ async fn test_concurrent_compaction_and_flush() {
 async fn test_metadata_crc32_detects_corruption() {
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path(), "meta-corrupt");
-    let clean = SimpleBlockCache::new(1024);
+    let _clean = SimpleBlockCache::new(1024);
 
     // Session 1: write some blocks and save metadata
     {
@@ -934,7 +934,7 @@ async fn test_multipart_finish_failure_preserves_dirty() {
     let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
     let cache = cache.skip_recovery_for_test();
 
-    let clean = Arc::new(SimpleBlockCache::new(1024));
+    let _clean = Arc::new(SimpleBlockCache::new(1024));
     let cs = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
     let pic = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
@@ -1241,7 +1241,7 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
 
     let config = test_config_wal_sync(dir.path(), "manifest-drain-fail");
 
-    let clean = Arc::new(SimpleBlockCache::new(1024));
+    let _clean = Arc::new(SimpleBlockCache::new(1024));
     let cs = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
     let pic = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
     let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
@@ -1365,7 +1365,7 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
 async fn test_wal_replay_same_block_last_write_wins() {
     let dir = TempDir::new().unwrap();
     let config = test_config_wal_sync(dir.path(), "wal-dup");
-    let clean = SimpleBlockCache::new(1024);
+    let _clean = SimpleBlockCache::new(1024);
 
     let data_a = vec![0xAA; BLOCK_SIZE];
     let data_b = vec![0xBB; BLOCK_SIZE];
@@ -1480,7 +1480,7 @@ async fn test_concurrent_same_block_no_torn_write() {
     // Run many rounds to exercise the race
     for _ in 0..50 {
         let cache_ref = &cache;
-        let cc_ref = cc.as_ref();
+        let _cc_ref = cc.as_ref();
         let pa = &pattern_a;
         let pb = &pattern_b;
 
@@ -1540,7 +1540,7 @@ async fn test_concurrent_same_block_no_torn_write() {
 async fn test_within_batch_dedup_all_offsets_readable() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pic, vm, cc, _m) =
+    let (cache, cs, pic, vm, _cc, _m) =
         super::create_test_cache(&dir, "dedup-integrity", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
     let identical_data = vec![0xDD; BLOCK_SIZE];
@@ -1590,7 +1590,7 @@ async fn test_within_batch_dedup_all_offsets_readable() {
 async fn test_within_batch_dedup_mixed_unique_and_duplicate() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pic, vm, cc, _m) =
+    let (cache, cs, pic, vm, _cc, _m) =
         super::create_test_cache(&dir, "dedup-mixed", Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>).await;
 
     // 3 blocks with identical data (will dedup to 1 upload)
@@ -1663,7 +1663,7 @@ async fn test_compaction_during_active_writes() {
 
     // Spawn continuous writes to multiple blocks while compaction runs
     let cache2 = Arc::clone(&cache);
-    let cc2 = Arc::clone(&cc);
+    let _cc2 = Arc::clone(&cc);
     let write_handle = tokio::spawn(async move {
         for round in 0..20u8 {
             // Write to blocks 0-4 with unique data per round
@@ -2056,11 +2056,10 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
 /// is in the core write→flush→manifest→cold-read path.
 #[tokio::test]
 async fn test_full_chunk_cold_wake() {
-    use super::{create_cold_reader, BLOCK_SIZE};
+    use super::BLOCK_SIZE;
     use glidefs::block::cache::SimpleBlockCache;
     use glidefs::block::content_store::ContentStore;
     use glidefs::block::metrics::ExportMetrics;
-    use glidefs::block::pack_index_cache::PackIndexCache;
     use glidefs::block::volume_manifest::VolumeManifest;
     use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
 
@@ -2086,8 +2085,8 @@ async fn test_full_chunk_cold_wake() {
     let volume_manifest = Arc::new(parking_lot::RwLock::new(
         VolumeManifest::new(FULL_CHUNK_DEVICE_SIZE, BLOCK_SIZE as u32),
     ));
-    let clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-    let metrics = Arc::new(ExportMetrics::new());
+    let _clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let _metrics = Arc::new(ExportMetrics::new());
 
     let cache = WriteCache::open(config).expect("open cache");
     let cache = Arc::new(cache.skip_recovery_for_test());
