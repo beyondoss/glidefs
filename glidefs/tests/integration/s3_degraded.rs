@@ -312,7 +312,7 @@ async fn test_s3_slow_uploads_dont_block_writes() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
+                &[],
             )
             .unwrap();
     }
@@ -395,7 +395,7 @@ async fn test_s3_slow_downloads_bounded_latency() {
                 .write(
                     (i * BLOCK_SIZE) as u64,
                     &vec![(i as u8) + 1; BLOCK_SIZE],
-                    cc.as_ref(),
+                    &[],
                 )
                 .unwrap();
         }
@@ -480,7 +480,7 @@ async fn test_s3_intermittent_failures_eventual_success() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
+                &[],
             )
             .unwrap();
     }
@@ -570,7 +570,7 @@ async fn test_s3_download_semaphore_exhaustion() {
                 .write(
                     (i * BLOCK_SIZE) as u64,
                     &vec![(i as u8) + 1; BLOCK_SIZE],
-                    cc.as_ref(),
+                    &[],
                 )
                 .unwrap();
         }
@@ -685,7 +685,7 @@ async fn test_s3_upload_semaphore_exhaustion() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
+                &[],
             )
             .unwrap();
     }
@@ -746,7 +746,7 @@ async fn test_s3_manifest_put_fails_after_pack_upload() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
+                &[],
             )
             .unwrap();
     }

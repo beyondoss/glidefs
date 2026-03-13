@@ -188,19 +188,39 @@ impl BlockHandler {
     /// The caller MUST spawn background backfill AFTER the guest write completes,
     /// so the bitmap bits are set and the pwrite is done before the backfill
     /// task can race with the written data.
-    async fn backfill_missing_blocks(&self, offset: u64, length: u64) -> CommandResult<Vec<u64>> {
+    /// Returns `(needs_backfill, syncing_with_s3_data)`.
+    ///
+    /// - `needs_backfill`: blocks that are NOT_PRESENT, have S3 data, and need
+    ///   a partial entry + background backfill.
+    /// - `syncing_with_s3_data`: blocks that are SYNCING (present, in-flight flush)
+    ///   with S3 data. These could get evicted (SYNCING→NOT_PRESENT) before the
+    ///   write path runs, so the write path must watch for this race.
+    async fn backfill_missing_blocks(&self, offset: u64, length: u64) -> CommandResult<(Vec<u64>, Vec<u64>)> {
         use super::write_cache::inner::{MAX_PARTIAL_BLOCKS, PartialBlockState};
+        use crate::block::block_map::SparseBlockState;
 
         let block_size = self.cache.block_size() as u64;
         let start_block = offset / block_size;
         let end_block = (offset + length - 1) / block_size;
         let mut needs_backfill = Vec::new();
+        let mut syncing_with_s3_data = Vec::new();
 
         for block_idx in start_block..=end_block {
             let idx = block_idx as usize;
 
-            // Fast path: block is fully present on local SSD (not partial)
+            // Fast path: block is fully present on local SSD (not partial).
+            // Track SYNCING blocks separately — they could be evicted before
+            // the write path runs.
             if self.cache.is_block_present(idx) && !self.cache.inner().is_partial(idx) {
+                if self.cache.inner().block_state(idx) == SparseBlockState::SYNCING {
+                    // Check if the write fully covers this block — if so, no
+                    // prior data needs preserving even if evicted.
+                    let block_start = block_idx * block_size;
+                    let block_end = block_start + block_size;
+                    if !(offset <= block_start && offset + length >= block_end) {
+                        syncing_with_s3_data.push(block_idx);
+                    }
+                }
                 continue;
             }
 
@@ -314,7 +334,7 @@ impl BlockHandler {
             needs_backfill.push(block_idx);
         }
 
-        Ok(needs_backfill)
+        Ok((needs_backfill, syncing_with_s3_data))
     }
 
     /// Spawn a background task to backfill a partial block from S3.
@@ -560,12 +580,12 @@ impl BlockHandler {
             return Err(CommandError::NoSpace);
         }
 
-        let backfill_blocks = self
+        let (backfill_blocks, syncing_blocks) = self
             .backfill_missing_blocks(offset, data.len() as u64)
             .await?;
 
         self.metrics.record_guest_write(data.len() as u64);
-        let evicted_blocks = self.cache.write(offset, data, self.clean_cache.as_ref())?;
+        let evicted_blocks = self.cache.write(offset, data, &syncing_blocks)?;
 
         // Spawn background backfill AFTER write completes — the bitmap bits are
         // now set and the pwrite is done, so the backfill task won't race with
@@ -614,11 +634,11 @@ impl BlockHandler {
             return Ok(());
         }
 
-        let backfill_blocks = self
+        let (backfill_blocks, syncing_blocks) = self
             .backfill_missing_blocks(offset, length as u64)
             .await?;
 
-        let evicted_blocks = self.cache.zero_range(offset, length as u64)?;
+        let evicted_blocks = self.cache.zero_range(offset, length as u64, &syncing_blocks)?;
 
         // Spawn background backfill AFTER zero_range completes
         for block_idx in backfill_blocks {
@@ -660,11 +680,11 @@ impl BlockHandler {
             return Ok(());
         }
 
-        let backfill_blocks = self
+        let (backfill_blocks, syncing_blocks) = self
             .backfill_missing_blocks(offset, length as u64)
             .await?;
 
-        let evicted_blocks = self.cache.zero_range(offset, length as u64)?;
+        let evicted_blocks = self.cache.zero_range(offset, length as u64, &syncing_blocks)?;
 
         for block_idx in backfill_blocks {
             self.spawn_background_backfill(block_idx);
@@ -743,16 +763,16 @@ impl BlockHandler {
             return Err(CommandError::NoSpace);
         }
 
-        let backfill_blocks = self.backfill_missing_blocks(offset, length).await?;
+        let (backfill_blocks, syncing_blocks) = self.backfill_missing_blocks(offset, length).await?;
 
-        let was_evicted = self.cache.pre_write(offset, length)?;
+        self.cache.pre_write(offset, length)?;
 
         // Spawn after pre_write — bitmap bits are set, safe for backfill
         for block_idx in backfill_blocks {
             self.spawn_background_backfill(block_idx);
         }
 
-        Ok(was_evicted)
+        Ok(syncing_blocks)
     }
 
     /// Phase 2 of ublk zero-copy write: pwrite data + commit metadata atomically.
@@ -767,7 +787,7 @@ impl BlockHandler {
         offset: u64,
         data: &[u8],
         fua: bool,
-        was_evicted: &[u64],
+        syncing_blocks: &[u64],
     ) -> CommandResult<()> {
         let length = data.len() as u64;
         if length == 0 {
@@ -779,7 +799,7 @@ impl BlockHandler {
         self.metrics.record_guest_write(length);
         let evicted_blocks = self
             .cache
-            .pwrite_and_commit(offset, data, was_evicted)
+            .pwrite_and_commit(offset, data, syncing_blocks)
             .map_err(|e| {
                 tracing::warn!(error = %e, "pwrite_and_commit failed");
                 CommandError::IoError

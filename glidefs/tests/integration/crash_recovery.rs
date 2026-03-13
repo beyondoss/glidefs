@@ -52,16 +52,16 @@ async fn test_metadata_atomicity() {
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        cache.write(0, &test_data, &[]).unwrap();
         cache.save_metadata().unwrap();
 
         cache
-            .write(BLOCK_SIZE as u64, &test_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &test_data, &[])
             .unwrap();
         cache.save_metadata().unwrap();
 
         cache
-            .write(2 * BLOCK_SIZE as u64, &test_data, &clean_cache)
+            .write(2 * BLOCK_SIZE as u64, &test_data, &[])
             .unwrap();
         cache.save_metadata().unwrap();
     }
@@ -113,7 +113,7 @@ async fn test_leftover_temp_file_ignored() {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        cache.write(0, &test_data, &[]).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -152,7 +152,7 @@ async fn test_torn_write_temp_file() {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        cache.write(0, &test_data, &[]).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -220,7 +220,7 @@ async fn test_corrupted_magic_bytes() {
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
         cache
-            .write(0, &vec![0xCC; BLOCK_SIZE], &clean_cache)
+            .write(0, &vec![0xCC; BLOCK_SIZE], &[])
             .unwrap();
         cache.save_metadata().unwrap();
     }
@@ -289,7 +289,7 @@ async fn test_repeated_metadata_crash_cycles() {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        cache.write(0, &test_data, &[]).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -381,7 +381,7 @@ async fn test_write_after_recovery_overwrites() {
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
-        cache.write(0, &old_data, &clean_cache).unwrap();
+        cache.write(0, &old_data, &[]).unwrap();
         cache.save_metadata().unwrap();
         // Crash without flushing to S3
     }
@@ -393,7 +393,7 @@ async fn test_write_after_recovery_overwrites() {
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Now write new data to the same block (overwrites recovered data)
-        cache.write(0, &new_data, &clean_cache).unwrap();
+        cache.write(0, &new_data, &[]).unwrap();
 
         // Flush to S3 via pack path
         let content_store =
@@ -461,9 +461,9 @@ async fn test_wal_recovery_without_metadata_save() {
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
-        cache.write(0, &block_0_data, &clean_cache).unwrap();
+        cache.write(0, &block_0_data, &[]).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &block_1_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &block_1_data, &[])
             .unwrap();
 
         assert_eq!(cache.dirty_block_count(), 2);
@@ -578,7 +578,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
-        cache.write(0, &data_session_1, &clean_cache).unwrap();
+        cache.write(0, &data_session_1, &[]).unwrap();
         cache.save_metadata().unwrap();
         // Crash — .meta has block 0 dirty, WAL has block 0 entry
     }
@@ -597,7 +597,7 @@ async fn test_wal_recovery_multiple_crash_cycles() {
 
         // Write block 1 (new data) — appends to WAL
         cache
-            .write(BLOCK_SIZE as u64, &data_session_2, &clean_cache)
+            .write(BLOCK_SIZE as u64, &data_session_2, &[])
             .unwrap();
 
         // Crash without saving metadata — .meta still has only block 0 dirty
@@ -701,9 +701,9 @@ async fn test_flush_truncates_wal_before_crash() {
         ));
 
         // Write blocks 0 and 1
-        cache.write(0, &flushed_data_0, &clean_cache).unwrap();
+        cache.write(0, &flushed_data_0, &[]).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &flushed_data_1, &clean_cache)
+            .write(BLOCK_SIZE as u64, &flushed_data_1, &[])
             .unwrap();
         assert_eq!(cache.dirty_block_count(), 2);
 
@@ -716,7 +716,7 @@ async fn test_flush_truncates_wal_before_crash() {
 
         // Write block 2 — new WAL entry appended after truncation
         cache
-            .write(2 * BLOCK_SIZE as u64, &unflushed_data_2, &clean_cache)
+            .write(2 * BLOCK_SIZE as u64, &unflushed_data_2, &[])
             .unwrap();
         assert_eq!(cache.dirty_block_count(), 1);
 
@@ -835,9 +835,9 @@ async fn test_wal_lost_blocks_since_last_checkpoint_are_lost() {
         let cache = cache.skip_recovery_for_test();
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
-        cache.write(0, &test_data, &clean_cache).unwrap();
+        cache.write(0, &test_data, &[]).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &test_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &test_data, &[])
             .unwrap();
 
         assert_eq!(cache.dirty_block_count(), 2);
@@ -895,9 +895,9 @@ async fn test_wal_lost_preserves_checkpointed_blocks() {
         let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Write blocks 0 and 1
-        cache.write(0, &old_data, &clean_cache).unwrap();
+        cache.write(0, &old_data, &[]).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &old_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &old_data, &[])
             .unwrap();
 
         // Save metadata — blocks 0,1 are now persisted in .meta
@@ -905,7 +905,7 @@ async fn test_wal_lost_preserves_checkpointed_blocks() {
 
         // Write block 2 — WAL entry appended, but no metadata save
         cache
-            .write(2 * BLOCK_SIZE as u64, &new_data, &clean_cache)
+            .write(2 * BLOCK_SIZE as u64, &new_data, &[])
             .unwrap();
         assert_eq!(cache.dirty_block_count(), 3);
     }
@@ -980,7 +980,7 @@ async fn test_syncing_blocks_at_crash_become_dirty() {
         // Write 3 blocks — all become DIRTY
         for i in 0..3 {
             cache
-                .write(i as u64 * BLOCK_SIZE as u64, &test_data, &clean_cache)
+                .write(i as u64 * BLOCK_SIZE as u64, &test_data, &[])
                 .unwrap();
         }
         assert_eq!(cache.dirty_block_count(), 3);

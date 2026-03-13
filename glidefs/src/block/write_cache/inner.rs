@@ -388,17 +388,19 @@ impl CacheInner {
         self.state_map.is_present(block_num)
     }
 
+    /// Get the current state of a block as raw u8.
+    #[inline]
+    pub(crate) fn block_state(&self, idx: usize) -> u8 {
+        self.state_map.get(idx)
+    }
+
     /// Mark block as present (lock-free CAS NOT_PRESENT -> CLEAN).
     #[inline]
-    /// Mark a block as present (CAS NOT_PRESENT→CLEAN).
-    ///
-    /// Returns `true` if the block transitioned from NOT_PRESENT→CLEAN,
-    /// meaning its data was evicted and may need recovery (promote or backfill).
-    pub(super) fn set_present(&self, block_num: usize) -> bool {
+    pub(super) fn set_present(&self, block_num: usize) {
         if block_num >= self.num_blocks {
-            return false;
+            return;
         }
-        self.state_map.set_present(block_num)
+        self.state_map.set_present(block_num);
     }
 
     /// CAS loop to transition a block to Dirty state (lock-free).

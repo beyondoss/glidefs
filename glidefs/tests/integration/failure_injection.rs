@@ -297,7 +297,7 @@ async fn test_s3_failure_during_sync_marks_blocks_dirty() {
     for i in 0..5 {
         let data = vec![i as u8; BLOCK_SIZE];
         cache
-            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .write(i as u64 * BLOCK_SIZE as u64, &data, &[])
             .unwrap();
     }
 
@@ -354,7 +354,7 @@ async fn test_s3_failure_during_read_returns_error() {
 
     let data = vec![0xAB; BLOCK_SIZE];
     writer_cache
-        .write(0, &data, writer_clean_cache.as_ref())
+        .write(0, &data, &[])
         .unwrap();
     writer_cache
         .flush_to_s3(&writer_content_store, &writer_pack_index_cache, &writer_volume_manifest)
@@ -419,7 +419,7 @@ async fn test_write_during_sync_preserves_new_data() {
 
     // Write initial data and flush to S3
     let data_v1 = vec![0x11; BLOCK_SIZE];
-    cache.write(0, &data_v1, clean_cache.as_ref()).unwrap();
+    cache.write(0, &data_v1, &[]).unwrap();
     cache
         .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
@@ -427,7 +427,7 @@ async fn test_write_during_sync_preserves_new_data() {
 
     // Write new data to the same block
     let data_v2 = vec![0x22; BLOCK_SIZE];
-    cache.write(0, &data_v2, clean_cache.as_ref()).unwrap();
+    cache.write(0, &data_v2, &[]).unwrap();
 
     // Block should be dirty again with new data
     assert_eq!(cache.dirty_block_count(), 1);
@@ -497,7 +497,7 @@ async fn test_concurrent_writes_no_torn_reads() {
             for _ in 0..100 {
                 // Each writer writes its ID as the pattern
                 let data = vec![writer_id; BLOCK_SIZE];
-                cache.write(0, &data, clean_cache.as_ref()).unwrap();
+                cache.write(0, &data, &[]).unwrap();
                 write_count.fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -551,7 +551,7 @@ async fn test_zero_blocks_produce_tombstones() {
     let zeros = vec![0u8; BLOCK_SIZE];
     for i in 0..10 {
         cache
-            .write(i as u64 * BLOCK_SIZE as u64, &zeros, clean_cache.as_ref())
+            .write(i as u64 * BLOCK_SIZE as u64, &zeros, &[])
             .unwrap();
     }
 
@@ -592,7 +592,7 @@ async fn test_mixed_zero_nonzero_batch() {
             vec![0xAB; BLOCK_SIZE] // Non-zero block
         };
         cache
-            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .write(i as u64 * BLOCK_SIZE as u64, &data, &[])
             .unwrap();
     }
 
@@ -649,7 +649,7 @@ async fn test_data_integrity_after_failure_recovery() {
         let data: Vec<u8> = (0..BLOCK_SIZE).map(|j| i.wrapping_add(j as u8)).collect();
         expected_data.push(data.clone());
         cache
-            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .write(i as u64 * BLOCK_SIZE as u64, &data, &[])
             .unwrap();
     }
 
@@ -717,7 +717,7 @@ async fn test_concurrent_drain_safety() {
     for i in 0..10 {
         let data = vec![i as u8; BLOCK_SIZE];
         cache
-            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .write(i as u64 * BLOCK_SIZE as u64, &data, &[])
             .unwrap();
     }
 
@@ -800,7 +800,7 @@ async fn test_partial_pack_upload_preserves_dirty() {
             data[j] = ((i as usize + j) % 256) as u8;
         }
         cache
-            .write(i as u64 * BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+            .write(i as u64 * BLOCK_SIZE as u64, &data, &[])
             .unwrap();
     }
 
@@ -896,7 +896,7 @@ async fn test_delete_all_snapshots_returns_ok_on_partial_failure() {
 
     // Write data and create two snapshots
     let data = vec![0xAA; BLOCK_SIZE];
-    cache.write(0, &data, clean_cache.as_ref()).unwrap();
+    cache.write(0, &data, &[]).unwrap();
     cache
         .snapshot(&content_store, &pack_index_cache, &volume_manifest)
         .await
@@ -904,7 +904,7 @@ async fn test_delete_all_snapshots_returns_ok_on_partial_failure() {
 
     let data = vec![0xBB; BLOCK_SIZE];
     cache
-        .write(BLOCK_SIZE as u64, &data, clean_cache.as_ref())
+        .write(BLOCK_SIZE as u64, &data, &[])
         .unwrap();
     cache
         .snapshot(&content_store, &pack_index_cache, &volume_manifest)

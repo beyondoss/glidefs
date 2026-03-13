@@ -203,7 +203,7 @@ async fn test_ssd_full_flush_frees_dirty_count() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
+                &[],
             )
             .unwrap();
     }

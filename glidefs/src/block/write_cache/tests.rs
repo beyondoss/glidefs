@@ -41,7 +41,7 @@ async fn test_write_read() {
     let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Write some data
-    cache.write(0, b"hello world", &clean_cache).unwrap();
+    cache.write(0, b"hello world", &[]).unwrap();
 
     // Read it back
     let data = cache.read_local_only(0, 11).unwrap();
@@ -60,7 +60,7 @@ async fn test_flush() {
     let cache = cache.finish_recovery().await.unwrap();
     let clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
-    cache.write(0, b"data", &clean_cache).unwrap();
+    cache.write(0, b"data", &[]).unwrap();
     cache.flush().unwrap();
 
     // Data should still be readable
@@ -78,7 +78,7 @@ async fn test_metadata_persistence() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        cache.write(0, b"persistent", &clean_cache).unwrap();
+        cache.write(0, b"persistent", &[]).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -232,7 +232,7 @@ async fn test_flush_end_to_end() {
     // Write 10 distinct blocks (each 4KB = block_size)
     for i in 0u8..10 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -255,7 +255,7 @@ async fn test_flush_dedup_skips_existing() {
     // Write 5 blocks
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -270,7 +270,7 @@ async fn test_flush_dedup_skips_existing() {
     // Each new block offset gets its own pack entry regardless of content.
     for i in 0u8..5 {
         h.cache
-            .write((i as u64 + 5) * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write((i as u64 + 5) * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -288,7 +288,7 @@ async fn test_flush_partial_dedup() {
     // Write 10 blocks with unique data
     for i in 0u8..10 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -301,12 +301,12 @@ async fn test_flush_partial_dedup() {
     // is offset-based (not hash-based across flushes).
     for i in 0u8..5 {
         h.cache
-            .write((i as u64 + 10) * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write((i as u64 + 10) * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
     for i in 0u8..5 {
         h.cache
-            .write((i as u64 + 15) * 4096, &vec![i + 100; 4096], &h.clean_cache)
+            .write((i as u64 + 15) * 4096, &vec![i + 100; 4096], &[])
             .unwrap();
     }
 
@@ -323,11 +323,11 @@ async fn test_flush_zero_blocks_skipped() {
 
     // Write one real block
     h.cache
-        .write(0, &vec![42u8; 128 * 1024], &h.clean_cache)
+        .write(0, &vec![42u8; 128 * 1024], &[])
         .unwrap();
     // Write a block of zeros — this should get ZERO_BLOCK_HASH
     h.cache
-        .write(128 * 1024, &vec![0u8; 128 * 1024], &h.clean_cache)
+        .write(128 * 1024, &vec![0u8; 128 * 1024], &[])
         .unwrap();
 
     let stats = h.flush().await;
@@ -342,7 +342,7 @@ async fn test_flush_clears_dirty_state() {
 
     for i in 0u8..3 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -357,11 +357,11 @@ async fn test_flush_clears_dirty_state() {
 async fn test_flush_concurrent_write_stays_dirty() {
     let h = V2Harness::new().await;
 
-    h.cache.write(0, &vec![1u8; 4096], &h.clean_cache).unwrap();
+    h.cache.write(0, &vec![1u8; 4096], &[]).unwrap();
     h.flush().await;
 
     // Overwrite block 0 with different data
-    h.cache.write(0, &vec![2u8; 4096], &h.clean_cache).unwrap();
+    h.cache.write(0, &vec![2u8; 4096], &[]).unwrap();
 
     let stats = h.flush().await;
     assert_eq!(
@@ -381,7 +381,7 @@ async fn test_flush_manifest_self_contained() {
         let mut data = vec![0xAAu8; 4096];
         data[..2].copy_from_slice(&(i + 1).to_le_bytes());
         h.cache
-            .write(i as u64 * 4096, &data, &h.clean_cache)
+            .write(i as u64 * 4096, &data, &[])
             .unwrap();
     }
 
@@ -402,7 +402,7 @@ async fn test_flush_manifest_self_contained() {
 async fn test_v2_read_recently_written_block() {
     let h = V2Harness::new().await;
     let data = vec![0xAAu8; 4096];
-    h.cache.write(0, &data, &h.clean_cache).unwrap();
+    h.cache.write(0, &data, &[]).unwrap();
 
     let got = h.read(0, 4096).await;
     assert_eq!(got.as_ref(), &data[..]);
@@ -426,9 +426,9 @@ async fn test_v2_read_trimmed_block() {
 
     // Write a block, then zero it out.
     h.cache
-        .write(0, &vec![0xBBu8; 4096], &h.clean_cache)
+        .write(0, &vec![0xBBu8; 4096], &[])
         .unwrap();
-    h.cache.zero_range(0, 4096).unwrap();
+    h.cache.zero_range(0, 4096, &[]).unwrap();
 
     let got = h.read(0, 4096).await;
     assert!(
@@ -441,7 +441,7 @@ async fn test_v2_read_trimmed_block() {
 async fn test_v2_read_sub_chunk() {
     let h = V2Harness::new().await;
     let data = vec![0xCCu8; 4096];
-    h.cache.write(0, &data, &h.clean_cache).unwrap();
+    h.cache.write(0, &data, &[]).unwrap();
 
     // Read 100 bytes from offset 1000 within the chunk.
     let got = h.read(1000, 100).await;
@@ -455,10 +455,10 @@ async fn test_v2_read_spans_chunks() {
 
     // Write two distinct chunks.
     h.cache
-        .write(0, &vec![0x11u8; 4096], &h.clean_cache)
+        .write(0, &vec![0x11u8; 4096], &[])
         .unwrap();
     h.cache
-        .write(4096, &vec![0x22u8; 4096], &h.clean_cache)
+        .write(4096, &vec![0x22u8; 4096], &[])
         .unwrap();
 
     // Read across the chunk boundary: last 100 bytes of chunk 0 + first 100 of chunk 1.
@@ -483,7 +483,7 @@ async fn test_v2_read_from_s3_pack() {
     // Write blocks, flush to S3, clear clean_cache so reads go to S3.
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
     h.flush().await;
@@ -519,7 +519,7 @@ async fn test_v2_mixed_dirty_and_clean_reads() {
     // Write 5 blocks and flush to S3 (they'll become "clean" once evicted from cache).
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
     h.flush().await;
@@ -533,7 +533,7 @@ async fn test_v2_mixed_dirty_and_clean_reads() {
     // Write 5 more blocks (dirty, not flushed).
     for i in 5u8..10 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -567,7 +567,7 @@ async fn test_v2_read_mixed_cache_hit_and_s3_miss() {
     // Write 8 blocks with distinct data per block
     for i in 0u8..8 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
     h.flush().await;
@@ -636,7 +636,7 @@ async fn test_snapshot_returns_sequence_and_stats() {
     // Write 5 blocks
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -666,7 +666,7 @@ async fn test_snapshot_clears_dirty_state() {
     // Write blocks and snapshot
     for i in 0u8..3 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -702,9 +702,9 @@ async fn test_snapshot_captures_concurrent_writes() {
     let h = V2Harness::new().await;
 
     // Write blocks at different times
-    h.cache.write(0, &vec![0xAA; 4096], &h.clean_cache).unwrap();
+    h.cache.write(0, &vec![0xAA; 4096], &[]).unwrap();
     h.cache
-        .write(4096, &vec![0xBB; 4096], &h.clean_cache)
+        .write(4096, &vec![0xBB; 4096], &[])
         .unwrap();
 
     let result: SnapshotResult = h
@@ -720,7 +720,7 @@ async fn test_snapshot_captures_concurrent_writes() {
 
     // Write more after snapshot
     h.cache
-        .write(8192, &vec![0xCC; 4096], &h.clean_cache)
+        .write(8192, &vec![0xCC; 4096], &[])
         .unwrap();
 
     // Second snapshot picks up the new write
@@ -764,7 +764,7 @@ async fn test_recovery_verifies_dirty_blocks_readable() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        cache.write(0, &original_data, &clean_cache).unwrap();
+        cache.write(0, &original_data, &[]).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -826,7 +826,7 @@ async fn test_concurrent_flush_and_writes() {
     // Seed some initial dirty blocks
     for i in 0u8..10 {
         cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], clean_cache.as_ref())
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -855,7 +855,7 @@ async fn test_concurrent_flush_and_writes() {
                 let block_idx = (writer_id as u64 * 2) % 10;
                 let data = vec![writer_id.wrapping_add(round).wrapping_add(100); 4096];
                 cache
-                    .write(block_idx * 4096, &data, clean_cache.as_ref())
+                    .write(block_idx * 4096, &data, &[])
                     .unwrap();
                 tokio::task::yield_now().await;
             }
@@ -916,8 +916,8 @@ async fn test_draining_state_transition() {
     let cache = cache.finish_recovery().await.unwrap();
 
     // Write some data before draining
-    cache.write(0, &vec![0xAA; 4096], &clean_cache).unwrap();
-    cache.write(4096, &vec![0xBB; 4096], &clean_cache).unwrap();
+    cache.write(0, &vec![0xAA; 4096], &[]).unwrap();
+    cache.write(4096, &vec![0xBB; 4096], &[]).unwrap();
     assert_eq!(cache.dirty_block_count(), 2);
 
     // Save the dirty count before shutdown
@@ -991,7 +991,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
     // Seed blocks with initial data
     for i in 0u8..10 {
         cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], clean_cache.as_ref())
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
 
@@ -1021,7 +1021,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
             for round in 0..10u8 {
                 let fill = writer_id * 10 + round;
                 cache
-                    .write(block_idx * 4096, &vec![fill; 4096], clean_cache.as_ref())
+                    .write(block_idx * 4096, &vec![fill; 4096], &[])
                     .unwrap();
                 tokio::task::yield_now().await;
             }
@@ -1094,7 +1094,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
 
     // Write a block.
     let original_data = vec![0xABu8; 4096];
-    h.cache.write(0, &original_data, &h.clean_cache).unwrap();
+    h.cache.write(0, &original_data, &[]).unwrap();
     assert_eq!(h.cache.dirty_block_count(), 1);
 
     // Run local checkpoint — computes CRC32 for the dirty block.
@@ -1152,7 +1152,7 @@ async fn test_crc32_cleared_on_write() {
 
     // Write, checkpoint (compute CRC32).
     h.cache
-        .write(0, &vec![0xAAu8; 4096], &h.clean_cache)
+        .write(0, &vec![0xAAu8; 4096], &[])
         .unwrap();
     h.cache.local_checkpoint().await.unwrap();
 
@@ -1161,7 +1161,7 @@ async fn test_crc32_cleared_on_write() {
 
     // Write new data to the same block — CRC32 should be invalidated (sentinel).
     h.cache
-        .write(0, &vec![0xBBu8; 4096], &h.clean_cache)
+        .write(0, &vec![0xBBu8; 4096], &[])
         .unwrap();
     assert_eq!(
         inner.crc_map.load(0).expect("sentinel should exist"),
@@ -1188,7 +1188,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Write 5 distinct blocks.
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 10; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 10; 4096], &[])
             .unwrap();
     }
     assert_eq!(h.cache.dirty_block_count(), 5);
@@ -1270,7 +1270,7 @@ async fn test_crc32_happy_path_multi_cycle() {
     // Cycle 1: write 3 blocks, checkpoint (computes CRC32), flush.
     for i in 0u8..3 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 10; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 10; 4096], &[])
             .unwrap();
     }
     h.cache.local_checkpoint().await.unwrap();
@@ -1295,12 +1295,12 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     // Cycle 2: write 2 new blocks + overwrite 1 existing block.
     h.cache
-        .write(3 * 4096, &vec![0xDD; 4096], &h.clean_cache)
+        .write(3 * 4096, &vec![0xDD; 4096], &[])
         .unwrap();
     h.cache
-        .write(4 * 4096, &vec![0xEE; 4096], &h.clean_cache)
+        .write(4 * 4096, &vec![0xEE; 4096], &[])
         .unwrap();
-    h.cache.write(0, &vec![0xFF; 4096], &h.clean_cache).unwrap(); // overwrite block 0
+    h.cache.write(0, &vec![0xFF; 4096], &[]).unwrap(); // overwrite block 0
 
     assert_eq!(h.cache.dirty_block_count(), 3);
 
@@ -1372,7 +1372,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     // Seed blocks with initial data + checkpoint to arm CRC32.
     for i in 0u8..10 {
         cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], clean_cache.as_ref())
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
     cache.local_checkpoint().await.unwrap();
@@ -1409,7 +1409,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
                 let block_idx = (writer_id as u64 * 2) % 10;
                 let fill = writer_id.wrapping_add(round).wrapping_add(100);
                 cache
-                    .write(block_idx * 4096, &vec![fill; 4096], clean_cache.as_ref())
+                    .write(block_idx * 4096, &vec![fill; 4096], &[])
                     .unwrap();
                 tokio::task::yield_now().await;
             }
@@ -1759,7 +1759,7 @@ async fn test_complete_partial_before_repwrite_race() {
     // complete_partial in the real scenario.
     let clean = crate::block::cache::SimpleBlockCache::new(1024);
     cache
-        .write(0, &[0xBBu8; SUB_BLOCK_SIZE], &clean)
+        .write(0, &[0xBBu8; SUB_BLOCK_SIZE], &[])
         .unwrap();
 
     // Simulate what happens in the actual race: between the first pwrite
@@ -1834,7 +1834,7 @@ async fn test_write_survives_complete_partial_removal() {
             write_lock: parking_lot::Mutex::new(()),
         },
     );
-    cache.write(0, &[0xBBu8; SUB_BLOCK_SIZE], &clean).unwrap();
+    cache.write(0, &[0xBBu8; SUB_BLOCK_SIZE], &[]).unwrap();
 
     // Step 2: Simulate backfill completing — overwrite sub-region 0 with S3
     // data (0xAA) and remove partial entry.
@@ -1859,7 +1859,7 @@ async fn test_write_survives_complete_partial_removal() {
     // Write 4KB of 0xCC to sub-region 0. write() must re-pwrite even if
     // the entry gets removed during execution.
     cache
-        .write(0, &[0xCCu8; SUB_BLOCK_SIZE], &clean)
+        .write(0, &[0xCCu8; SUB_BLOCK_SIZE], &[])
         .unwrap();
 
     // Verify guest data (0xCC) is on SSD, not the stale overwrite (0xAA)
@@ -1972,8 +1972,8 @@ async fn test_bottomless_rotate_data_file() {
     // Write data to blocks 0 and 1
     let data0 = vec![0xAAu8; 4096];
     let data1 = vec![0xBBu8; 4096];
-    cache.write(0, &data0, &clean_cache).unwrap();
-    cache.write(4096, &data1, &clean_cache).unwrap();
+    cache.write(0, &data0, &[]).unwrap();
+    cache.write(4096, &data1, &[]).unwrap();
 
     // Before rotation: no flushing file, flushing_active is false
     assert!(cache.inner.flushing_file.lock().is_none());
@@ -2017,7 +2017,7 @@ async fn test_bottomless_eviction_lifecycle() {
     // Write 5 distinct blocks
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
             .unwrap();
     }
     assert_eq!(h.cache.dirty_block_count(), 5);
@@ -2071,7 +2071,7 @@ async fn test_bottomless_re_dirty_during_flush() {
 
     // Write block 0 with initial data
     let initial_data = vec![0xAAu8; 4096];
-    cache.write(0, &initial_data, &clean_cache).unwrap();
+    cache.write(0, &initial_data, &[]).unwrap();
     assert_eq!(cache.dirty_block_count(), 1);
 
     // Rotate the data file (start of flush)
@@ -2089,7 +2089,7 @@ async fn test_bottomless_re_dirty_during_flush() {
     // Write the same block again with new data (simulates concurrent write during flush)
     // This should CAS SYNCING -> DIRTY via transition_to_dirty
     let new_data = vec![0xBBu8; 4096];
-    cache.write(0, &new_data, &clean_cache).unwrap();
+    cache.write(0, &new_data, &[]).unwrap();
 
     // Block should be back to DIRTY
     assert_eq!(cache.inner.state_map.get(0), SparseBlockState::DIRTY);
@@ -2132,8 +2132,8 @@ async fn test_bottomless_skipped_block_recovery() {
     // Write blocks 0 and 1 with distinct data
     let data0 = vec![0xAAu8; 4096];
     let data1 = vec![0xBBu8; 4096];
-    h.cache.write(0, &data0, &h.clean_cache).unwrap();
-    h.cache.write(4096, &data1, &h.clean_cache).unwrap();
+    h.cache.write(0, &data0, &[]).unwrap();
+    h.cache.write(4096, &data1, &[]).unwrap();
 
     // Mark block 0 as partial — rotation will exclude it from snapshot
     // and copy its data from old active → new active.
@@ -2255,7 +2255,7 @@ async fn test_bottomless_crash_recovery_with_flushing_file() {
         // Write 3 blocks
         for i in 0u8..3 {
             cache
-                .write(i as u64 * block_size as u64, &vec![i + 0x10; block_size], &clean_cache)
+                .write(i as u64 * block_size as u64, &vec![i + 0x10; block_size], &[])
                 .unwrap();
         }
 
@@ -2345,7 +2345,7 @@ async fn test_bottomless_flushing_active_flag() {
     // Write a block and flush. The flush internally rotates, so flushing_active
     // should be true during flush and false after.
     h.cache
-        .write(0, &vec![0xDD; 4096], &h.clean_cache)
+        .write(0, &vec![0xDD; 4096], &[])
         .unwrap();
 
     let stats = h.flush().await;
@@ -2395,7 +2395,7 @@ async fn test_bottomless_flush_and_s3_readback() {
     // Write 3 distinct blocks
     for i in 0u8..3 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 0x50; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 0x50; 4096], &[])
             .unwrap();
     }
 
@@ -2446,7 +2446,7 @@ async fn test_bottomless_concurrent_write_during_flush() {
     // Write 10 blocks
     for i in 0u8..10 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 0x10; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 0x10; 4096], &[])
             .unwrap();
     }
 
@@ -2460,7 +2460,7 @@ async fn test_bottomless_concurrent_write_during_flush() {
     // The write path CAS SYNCING→DIRTY races with the flush claiming DIRTY→SYNCING
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 0xA0; 4096], &h.clean_cache)
+            .write(i as u64 * 4096, &vec![i + 0xA0; 4096], &[])
             .unwrap();
     }
 
@@ -2561,7 +2561,7 @@ async fn test_bottomless_clean_cache_warming() {
             .write(
                 i as u64 * 4096,
                 &vec![i + 0x60; 4096],
-                clean_cache.as_ref(),
+                &[],
             )
             .unwrap();
     }
@@ -2677,7 +2677,7 @@ async fn test_bottomless_flush_failure_recovery() {
     // Write 3 blocks
     for i in 0u8..3 {
         cache
-            .write(i as u64 * 4096, &vec![i + 0x70; 4096], &clean_cache)
+            .write(i as u64 * 4096, &vec![i + 0x70; 4096], &[])
             .unwrap();
     }
 

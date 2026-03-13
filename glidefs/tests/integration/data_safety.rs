@@ -328,11 +328,11 @@ async fn test_wal_recovery_after_crash_without_metadata_save() {
         let clean = SimpleBlockCache::new(1024);
 
         // Write block 0 and checkpoint (saves metadata + truncates WAL)
-        cache.write(0, &original_data, &clean).unwrap();
+        cache.write(0, &original_data, &[]).unwrap();
         cache.save_metadata().unwrap();
 
         // Write block 1 — WAL entry is fsynced (wal_sync: true) but metadata NOT saved
-        cache.write(BLOCK_SIZE as u64, &second_data, &clean).unwrap();
+        cache.write(BLOCK_SIZE as u64, &second_data, &[]).unwrap();
 
         // "Crash" — drop without saving metadata.
         // Block 0 is saved in metadata as Dirty (from the first save_metadata).
@@ -390,7 +390,7 @@ async fn test_multi_crash_wal_recovery() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        cache.write(0, &data_a, &clean).unwrap();
+        cache.write(0, &data_a, &[]).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -398,7 +398,7 @@ async fn test_multi_crash_wal_recovery() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        cache.write(BLOCK_SIZE as u64, &data_b, &clean).unwrap();
+        cache.write(BLOCK_SIZE as u64, &data_b, &[]).unwrap();
         // crash — no save_metadata()
     }
 
@@ -417,7 +417,7 @@ async fn test_multi_crash_wal_recovery() {
         );
 
         cache
-            .write(2 * BLOCK_SIZE as u64, &data_c, &clean)
+            .write(2 * BLOCK_SIZE as u64, &data_c, &[])
             .unwrap();
         cache.save_metadata().unwrap();
     }
@@ -427,7 +427,7 @@ async fn test_multi_crash_wal_recovery() {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
         cache
-            .write(3 * BLOCK_SIZE as u64, &data_d, &clean)
+            .write(3 * BLOCK_SIZE as u64, &data_d, &[])
             .unwrap();
         // crash
     }
@@ -486,7 +486,7 @@ async fn test_s3_data_corruption_detected_by_blake3() {
 
     // Write distinct data
     let data = vec![0x42; BLOCK_SIZE];
-    cache.write(0, &data, cc.as_ref()).unwrap();
+    cache.write(0, &data, &[]).unwrap();
     cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
     drop(cache);
 
@@ -581,12 +581,12 @@ async fn test_ssd_corruption_detected_during_flush() {
     let data0 = vec![0x11; BLOCK_SIZE];
     let data1 = vec![0x22; BLOCK_SIZE];
     let data2 = vec![0x33; BLOCK_SIZE];
-    cache.write(0, &data0, clean.as_ref()).unwrap();
+    cache.write(0, &data0, &[]).unwrap();
     cache
-        .write(BLOCK_SIZE as u64, &data1, clean.as_ref())
+        .write(BLOCK_SIZE as u64, &data1, &[])
         .unwrap();
     cache
-        .write(2 * BLOCK_SIZE as u64, &data2, clean.as_ref())
+        .write(2 * BLOCK_SIZE as u64, &data2, &[])
         .unwrap();
     assert_eq!(cache.dirty_block_count(), 3);
 
@@ -667,7 +667,7 @@ async fn test_pack_index_corruption_returns_error() {
             .await;
 
     let data = vec![0x42; BLOCK_SIZE];
-    cache.write(0, &data, cc.as_ref()).unwrap();
+    cache.write(0, &data, &[]).unwrap();
     cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
     // Find the pack file in S3 and corrupt the GLIX trailer
@@ -771,7 +771,7 @@ async fn test_concurrent_compaction_and_flush() {
     // We write to block 0 each time with different data to create 17 packs.
     for i in 0..17u8 {
         let data = vec![i; BLOCK_SIZE];
-        cache.write(0, &data, cc.as_ref()).unwrap();
+        cache.write(0, &data, &[]).unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
     }
 
@@ -790,7 +790,7 @@ async fn test_concurrent_compaction_and_flush() {
 
     // Now write fresh data to the same chunk (this creates a new dirty block)
     let concurrent_data = vec![0xFE; BLOCK_SIZE];
-    cache.write(0, &concurrent_data, cc.as_ref()).unwrap();
+    cache.write(0, &concurrent_data, &[]).unwrap();
 
     // Run compaction and flush concurrently
     let cache_clone = Arc::clone(&cache);
@@ -873,9 +873,9 @@ async fn test_metadata_crc32_detects_corruption() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        cache.write(0, &vec![0xAA; BLOCK_SIZE], &clean).unwrap();
+        cache.write(0, &vec![0xAA; BLOCK_SIZE], &[]).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE], &clean)
+            .write(BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE], &[])
             .unwrap();
         cache.save_metadata().unwrap();
     }
@@ -946,7 +946,7 @@ async fn test_multipart_finish_failure_preserves_dirty() {
     for i in 0..5 {
         let data = vec![i as u8; BLOCK_SIZE];
         cache
-            .write(i as u64 * BLOCK_SIZE as u64, &data, clean.as_ref())
+            .write(i as u64 * BLOCK_SIZE as u64, &data, &[])
             .unwrap();
     }
     assert_eq!(cache.dirty_block_count(), 5);
@@ -1039,7 +1039,7 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     // Write and flush multiple times to create packs in chunk 0
     for i in 0..4u8 {
         let data = vec![i; BLOCK_SIZE];
-        cache.write(0, &data, cc.as_ref()).unwrap();
+        cache.write(0, &data, &[]).unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
     }
 
@@ -1257,12 +1257,12 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
         let data0 = vec![0xAA; BLOCK_SIZE];
         let data1 = vec![0xBB; BLOCK_SIZE];
         let data2 = vec![0xCC; BLOCK_SIZE];
-        cache.write(0, &data0, clean.as_ref()).unwrap();
+        cache.write(0, &data0, &[]).unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &data1, clean.as_ref())
+            .write(BLOCK_SIZE as u64, &data1, &[])
             .unwrap();
         cache
-            .write(2 * BLOCK_SIZE as u64, &data2, clean.as_ref())
+            .write(2 * BLOCK_SIZE as u64, &data2, &[])
             .unwrap();
         assert_eq!(cache.dirty_block_count(), 3);
 
@@ -1375,8 +1375,8 @@ async fn test_wal_replay_same_block_last_write_wins() {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
 
-        cache.write(0, &data_a, &clean).unwrap();
-        cache.write(0, &data_b, &clean).unwrap();
+        cache.write(0, &data_a, &[]).unwrap();
+        cache.write(0, &data_b, &[]).unwrap();
 
         // Crash — drop without save_metadata()
     }
@@ -1412,9 +1412,9 @@ async fn test_wal_replay_same_block_last_write_wins() {
         let cache = cache.skip_recovery_for_test();
 
         // Three writes to same block
-        cache.write(0, &data_a, &clean).unwrap();
-        cache.write(0, &data_b, &clean).unwrap();
-        cache.write(0, &data_c, &clean).unwrap();
+        cache.write(0, &data_a, &[]).unwrap();
+        cache.write(0, &data_b, &[]).unwrap();
+        cache.write(0, &data_c, &[]).unwrap();
 
         // Crash
     }
@@ -1485,8 +1485,8 @@ async fn test_concurrent_same_block_no_torn_write() {
         let pb = &pattern_b;
 
         let (r1, r2) = tokio::join!(
-            async { cache_ref.write(0, pa, cc_ref) },
-            async { cache_ref.write(0, pb, cc_ref) },
+            async { cache_ref.write(0, pa, &[]) },
+            async { cache_ref.write(0, pb, &[]) },
         );
         r1.unwrap();
         r2.unwrap();
@@ -1549,7 +1549,7 @@ async fn test_within_batch_dedup_all_offsets_readable() {
     // All 4 will land in the same flush and trigger within-batch dedup.
     let offsets: Vec<u64> = (0..4).map(|i| i * BLOCK_SIZE as u64).collect();
     for &offset in &offsets {
-        cache.write(offset, &identical_data, cc.as_ref()).unwrap();
+        cache.write(offset, &identical_data, &[]).unwrap();
     }
     assert_eq!(cache.dirty_block_count(), 4);
 
@@ -1596,14 +1596,14 @@ async fn test_within_batch_dedup_mixed_unique_and_duplicate() {
     // 3 blocks with identical data (will dedup to 1 upload)
     let dup_data = vec![0xAA; BLOCK_SIZE];
     for i in 0..3u64 {
-        cache.write(i * BLOCK_SIZE as u64, &dup_data, cc.as_ref()).unwrap();
+        cache.write(i * BLOCK_SIZE as u64, &dup_data, &[]).unwrap();
     }
 
     // 2 blocks with unique data (each must upload separately)
     let unique_a: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 251) as u8).collect();
     let unique_b: Vec<u8> = (0..BLOCK_SIZE).map(|i| ((i + 127) % 253) as u8).collect();
-    cache.write(3 * BLOCK_SIZE as u64, &unique_a, cc.as_ref()).unwrap();
-    cache.write(4 * BLOCK_SIZE as u64, &unique_b, cc.as_ref()).unwrap();
+    cache.write(3 * BLOCK_SIZE as u64, &unique_a, &[]).unwrap();
+    cache.write(4 * BLOCK_SIZE as u64, &unique_b, &[]).unwrap();
 
     assert_eq!(cache.dirty_block_count(), 5);
 
@@ -1657,7 +1657,7 @@ async fn test_compaction_during_active_writes() {
     // Build up 17 packs to exceed compaction threshold of 16
     for i in 0..17u8 {
         let data = vec![i; BLOCK_SIZE];
-        cache.write(0, &data, cc.as_ref()).unwrap();
+        cache.write(0, &data, &[]).unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
     }
 
@@ -1670,7 +1670,7 @@ async fn test_compaction_during_active_writes() {
             for block in 0..5u64 {
                 let data = vec![round.wrapping_add(0x80); BLOCK_SIZE];
                 cache2
-                    .write(block * BLOCK_SIZE as u64, &data, cc2.as_ref())
+                    .write(block * BLOCK_SIZE as u64, &data, &[])
                     .unwrap();
             }
             tokio::task::yield_now().await;
@@ -1744,7 +1744,7 @@ async fn test_compaction_crash_midway() {
     // Build up 3 packs so we have something to compact
     for i in 0..3u8 {
         let data = vec![i + 1; BLOCK_SIZE];
-        cache.write(0, &data, cc.as_ref()).unwrap();
+        cache.write(0, &data, &[]).unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
     }
     cache.sync_manifest(&cs, &vm).await.unwrap();
@@ -1825,7 +1825,7 @@ async fn test_compaction_dedup_correctness() {
     let dedup_data = vec![0xDD; BLOCK_SIZE];
     for i in 0..100u64 {
         cache
-            .write(i * BLOCK_SIZE as u64, &dedup_data, cc.as_ref())
+            .write(i * BLOCK_SIZE as u64, &dedup_data, &[])
             .unwrap();
     }
 
@@ -1838,7 +1838,7 @@ async fn test_compaction_dedup_correctness() {
     // Write the same data again (to force a second pack) and flush
     for i in 0..100u64 {
         cache
-            .write(i * BLOCK_SIZE as u64, &dedup_data, cc.as_ref())
+            .write(i * BLOCK_SIZE as u64, &dedup_data, &[])
             .unwrap();
     }
     cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
@@ -1923,7 +1923,7 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
         for block_idx in 0..10u64 {
             let data = vec![flush_round.wrapping_add(block_idx as u8); BLOCK_SIZE];
             cache
-                .write(block_idx * BLOCK_SIZE as u64, &data, cc.as_ref())
+                .write(block_idx * BLOCK_SIZE as u64, &data, &[])
                 .unwrap();
         }
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
@@ -1943,7 +1943,7 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
     for block_idx in 0..10u64 {
         let data = vec![0xFF; BLOCK_SIZE];
         cache
-            .write(block_idx * BLOCK_SIZE as u64, &data, cc.as_ref())
+            .write(block_idx * BLOCK_SIZE as u64, &data, &[])
             .unwrap();
     }
 
@@ -2102,7 +2102,7 @@ async fn test_full_chunk_cold_wake() {
         for sub in 0..SUBS_PER_BLOCK {
             let offset = block as u64 * BLOCK_SIZE as u64 + sub as u64 * SUB_BLOCK as u64;
             cache
-                .write(offset, &sub_data, clean_cache.as_ref())
+                .write(offset, &sub_data, &[])
                 .unwrap();
         }
     }

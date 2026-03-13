@@ -68,11 +68,11 @@ async fn test_partial_wal_entry_survives_crash() {
         let cache = cache.skip_recovery_for_test();
 
         // Write full block 0 so it's marked present and dirty
-        cache.write(0, &vec![0xAA; BLOCK_SIZE], &clean).unwrap();
+        cache.write(0, &vec![0xAA; BLOCK_SIZE], &[]).unwrap();
 
         // Write sub-block to block 1: only the first two 4KB sub-regions (bitmap = 0b11 = 3)
         cache
-            .write(BLOCK_SIZE as u64, &[0xBB; SUB_BLOCK * 2], &clean)
+            .write(BLOCK_SIZE as u64, &[0xBB; SUB_BLOCK * 2], &[])
             .unwrap();
 
         // Drop without metadata save — WAL entries survive on disk
@@ -121,7 +121,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
     let parent_vm = {
         let (cache, cs2, pic2, vm, cc2, _m) =
             super::create_test_cache(&parent_dir, "parent", Arc::clone(&s3)).await;
-        cache.write(0, &vec![0xAA; BLOCK_SIZE], cc2.as_ref()).unwrap();
+        cache.write(0, &vec![0xAA; BLOCK_SIZE], &[]).unwrap();
         cache.flush_to_s3(&cs2, &pic2, &vm).await.unwrap();
         let manifest_bytes = vm.read().serialize();
         cs.put_manifest("parent", manifest_bytes, None).await.unwrap();
@@ -147,7 +147,7 @@ async fn test_flush_skips_partial_block_until_backfill() {
     cache.insert_partial_block_for_test(0);
 
     // Write first 4KB — this sets bit 0 in the bitmap
-    cache.write(0, &[0xBB; SUB_BLOCK], cc.as_ref()).unwrap();
+    cache.write(0, &[0xBB; SUB_BLOCK], &[]).unwrap();
 
     // Verify: block 0 is dirty AND partial → flush should skip it
     assert!(cache.dirty_block_count() > 0, "block should be dirty");
@@ -228,7 +228,7 @@ async fn test_partial_block_crash_before_checkpoint_recovery() {
 
         // Simulate partial block: mark block 0 as partial, write first 4KB
         cache.insert_partial_block_for_test(0);
-        cache.write(0, &[0xBB; SUB_BLOCK], &cc).unwrap();
+        cache.write(0, &[0xBB; SUB_BLOCK], &[]).unwrap();
 
         // Partial WAL entry with bit 0 set is fsynced to disk.
         // Crash (drop) without saving metadata.
@@ -278,14 +278,14 @@ async fn test_partial_block_crash_after_checkpoint_recovery() {
 
         // Mark block 0 as partial, write sub-block 0 (bit 0 set)
         cache.insert_partial_block_for_test(0);
-        cache.write(0, &[0xBB; SUB_BLOCK], &cc).unwrap();
+        cache.write(0, &[0xBB; SUB_BLOCK], &[]).unwrap();
 
         // local_checkpoint: saves metadata (bitmap with bit 0), truncates WAL,
         // re-appends the partial WAL entry
         cache.local_checkpoint().await.unwrap();
 
         // Write sub-block 4 (offset 16384, bit 4 set) — WAL captures this but metadata doesn't yet
-        cache.write(16384, &[0xCC; SUB_BLOCK], &cc).unwrap();
+        cache.write(16384, &[0xCC; SUB_BLOCK], &[]).unwrap();
 
         // Crash: metadata has bitmap = bit 0, WAL has partial entry for bit 0 (re-appended)
         // PLUS a new partial WAL entry for bit 4.
@@ -352,11 +352,11 @@ async fn test_partial_block_crash_during_backfill() {
         cache.insert_partial_block_for_test(0);
 
         // Write first 4KB with guest data
-        cache.write(0, &[0xBB; SUB_BLOCK], cc.as_ref()).unwrap();
+        cache.write(0, &[0xBB; SUB_BLOCK], &[]).unwrap();
 
         // Also write a non-partial block to verify both survive
         cache
-            .write(BLOCK_SIZE as u64, &vec![0xDD; BLOCK_SIZE], cc.as_ref())
+            .write(BLOCK_SIZE as u64, &vec![0xDD; BLOCK_SIZE], &[])
             .unwrap();
 
         // Save metadata (checkpoint), then crash without completing backfill
@@ -428,7 +428,7 @@ async fn test_partial_block_concurrent_write_same_subregion() {
         let (cache, cs2, pic2, vm, cc2, _m) =
             super::create_test_cache(&parent_dir, "parent2", Arc::clone(&s3)).await;
         cache
-            .write(0, &vec![0xAA; BLOCK_SIZE], cc2.as_ref())
+            .write(0, &vec![0xAA; BLOCK_SIZE], &[])
             .unwrap();
         cache.flush_to_s3(&cs2, &pic2, &vm).await.unwrap();
         let manifest_bytes = vm.read().serialize();
@@ -450,10 +450,10 @@ async fn test_partial_block_concurrent_write_same_subregion() {
     cache.insert_partial_block_for_test(0);
 
     // First write: 4KB at offset 0 with 0xBB
-    cache.write(0, &[0xBB; SUB_BLOCK], cc.as_ref()).unwrap();
+    cache.write(0, &[0xBB; SUB_BLOCK], &[]).unwrap();
 
     // Second write: 4KB at offset 0 with 0xCC — must overwrite
-    cache.write(0, &[0xCC; SUB_BLOCK], cc.as_ref()).unwrap();
+    cache.write(0, &[0xCC; SUB_BLOCK], &[]).unwrap();
 
     // Fetch parent manifest for on-demand read
     let (manifest_data, _etag) = cs
@@ -521,7 +521,7 @@ proptest! {
 
             // Write sub-block
             let write_data = vec![fill; len];
-            cache.write(offset_in_block as u64, &write_data, cc.as_ref()).unwrap();
+            cache.write(offset_in_block as u64, &write_data, &[]).unwrap();
 
             // Read full block via async path
             let block_data = cache
@@ -576,7 +576,7 @@ proptest! {
                     continue;
                 }
                 let data = vec![fill; len];
-                cache.write(offset as u64, &data, cc.as_ref()).unwrap();
+                cache.write(offset as u64, &data, &[]).unwrap();
                 reference[offset..offset + len].fill(fill);
             }
 
@@ -694,7 +694,7 @@ async fn test_partial_block_cap_overflow() {
         for i in 0..1025u64 {
             let fill = (i % 251) as u8 + 1; // non-zero, unique per block
             cache
-                .write(i * BLOCK_SIZE as u64, &vec![fill; BLOCK_SIZE], cc.as_ref())
+                .write(i * BLOCK_SIZE as u64, &vec![fill; BLOCK_SIZE], &[])
                 .unwrap();
         }
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
