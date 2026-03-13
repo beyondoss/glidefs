@@ -543,38 +543,50 @@ impl WriteCache<Active> {
         // Under the lock: snapshot dirty blocks, then swap files.
         let mut data_file_guard = self.inner.data_file.write();
 
-        let pre_dirty = if snapshot {
-            self.inner
-                .state_map
-                .iter_with_state(SparseBlockState::DIRTY)
-                // Exclude partial blocks: their data in the old file may be
-                // incomplete (backfill in progress). We copy their data to
-                // the new file below so they survive rotation.
-                .filter(|&idx| !self.inner.is_partial(idx))
-                .collect()
+        // Snapshot dirty blocks AND partial block indices atomically.
+        //
+        // We must capture partial indices at the SAME time as the snapshot
+        // exclusion decision. complete_partial (DashMap remove) can run
+        // concurrently — it doesn't need the data_file lock. If we iterated
+        // partial_blocks later for the copy step, a block could be excluded
+        // from pre_dirty (because is_partial=true) but then complete_partial
+        // removes it before the copy loop, causing the copy to be skipped
+        // and the block's data stranded in the old file.
+        let (pre_dirty, partial_to_copy) = if snapshot {
+            let mut dirty = Vec::new();
+            let mut partials = Vec::new();
+            for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
+                if self.inner.is_partial(idx) {
+                    partials.push(idx);
+                } else {
+                    dirty.push(idx);
+                }
+            }
+            // Also include non-DIRTY partial blocks (e.g. NOT_PRESENT+partial
+            // from eviction race) — they have guest data in the active file
+            // that must survive rotation.
+            for entry in self.inner.partial_blocks.iter() {
+                let idx = *entry.key();
+                if !partials.contains(&idx) {
+                    partials.push(idx);
+                }
+            }
+            (dirty, partials)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         let old_file = std::mem::replace(&mut *data_file_guard, new_file);
 
         // Copy partial block data from old active → new active.
         //
-        // Partial blocks have incomplete backfill data — some sub-regions may
-        // be in the old file (early backfill writes + guest writes) and the
-        // rest will arrive in future backfill writes to the new file.
-        // Without this copy, the old file's data is lost when it's deleted
-        // after flush, leaving the new file with only late backfill data.
-        //
-        // Safe under write lock: no write_sub_region can execute (needs read
-        // lock), so the old file's data is stable. complete_partial might run
-        // (doesn't need data_file lock) but that's harmless — we just copy a
-        // block that's no longer partial, which is idempotent.
+        // Uses the snapshot'd partial_to_copy list (captured atomically with
+        // the pre_dirty exclusion) so complete_partial can't cause a TOCTOU
+        // race. Safe under write lock: no write_sub_region can execute.
         {
             let block_size = self.inner.config.block_size as u64;
             let device_size = self.inner.config.device_size;
-            for entry in self.inner.partial_blocks.iter() {
-                let idx = *entry.key();
+            for &idx in &partial_to_copy {
                 let offset = idx as u64 * block_size;
                 let valid = std::cmp::min(block_size, device_size.saturating_sub(offset)) as usize;
                 if valid == 0 {

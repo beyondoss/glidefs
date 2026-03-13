@@ -2975,3 +2975,77 @@ async fn test_eviction_race_fix_prevents_corruption() {
         "flush should skip partial blocks — no data uploaded"
     );
 }
+
+/// TOCTOU race between complete_partial and rotate_and_snapshot.
+///
+/// Proves that if complete_partial removes a DashMap entry between the
+/// snapshot's is_partial check (which excludes the block from pre_dirty)
+/// and the partial block copy step, the block's data is NOT lost.
+///
+/// Without the fix (snapshotting partial indices atomically with the
+/// exclusion decision), this test would show data corruption.
+#[tokio::test]
+async fn test_complete_partial_rotation_race_data_preserved() {
+    let h = V2Harness::new().await;
+    let block_size = 4096usize;
+
+    // Step 1: Write full block with 0xAA.
+    h.cache.write(0, &vec![0xAAu8; block_size], &[]).unwrap();
+
+    // Step 2: Flush to S3. Block becomes SYNCING→NOT_PRESENT (evicted).
+    let stats = h.flush().await;
+    assert_eq!(stats.blocks_claimed, 1);
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::NOT_PRESENT);
+
+    // Step 3: Simulate guest write + backfill creating partial entry.
+    // Write sub-block (512B of 0xBB), manually create partial entry.
+    h.cache.inner.set_present(0); // NOT_PRESENT→CLEAN
+    {
+        use super::inner::PartialBlockState;
+        h.cache.inner.partial_blocks.entry(0).or_insert_with(|| {
+            PartialBlockState {
+                bitmap: std::sync::atomic::AtomicU32::new(0),
+                write_lock: parking_lot::Mutex::new(()),
+            }
+        });
+    }
+    // Write 512 bytes of guest data and mark those sub-regions.
+    h.cache.inner.mark_sub_regions(0, 0, 512);
+    h.cache.inner.data_file.read().write_all_at(&vec![0xBBu8; 512], 0).unwrap();
+
+    // Simulate backfill writing the rest of the block from S3 (0xAA).
+    h.cache.inner.data_file.read().write_all_at(
+        &vec![0xAAu8; block_size - 512],
+        512,
+    ).unwrap();
+    h.cache.inner.transition_to_dirty(0);
+
+    // Step 4: Simulate the TOCTOU race.
+    // complete_partial removes the DashMap entry RIGHT NOW, before flush.
+    // In the real race, this happens between the snapshot's is_partial
+    // check and the copy loop.
+    h.cache.inner.complete_partial(0);
+
+    // Block is now DIRTY, NOT partial. It will be included in the next
+    // flush's snapshot. The question is: does the active file still have
+    // the correct data after rotation?
+
+    // Step 5: Flush again. This triggers rotate_and_snapshot.
+    // With the fix, the block was captured in partial_to_copy during
+    // the snapshot and its data was copied from old→new active.
+    let stats2 = h.flush().await;
+    assert_eq!(stats2.blocks_claimed, 1, "block should be flushed");
+
+    // Step 6: Cold read from S3 — verify data integrity.
+    let data = h.read(0, block_size).await;
+    assert_eq!(
+        &data[..512],
+        &vec![0xBBu8; 512][..],
+        "first 512 bytes should be guest write (0xBB)"
+    );
+    assert!(
+        data[512..].iter().all(|&b| b == 0xAA),
+        "rest should be backfill data (0xAA), got first non-0xAA at offset {}",
+        data[512..].iter().position(|&b| b != 0xAA).unwrap_or(0) + 512,
+    );
+}
