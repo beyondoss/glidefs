@@ -2616,6 +2616,96 @@ async fn test_bottomless_clean_cache_warming() {
     }
 }
 
+/// Test: Rotation claims blocks atomically (CAS DIRTY→SYNCING under write lock).
+///
+/// Proves that after rotate_and_snapshot, claimed blocks are already SYNCING.
+/// This prevents a race where a concurrent write between lock-release and CAS
+/// puts data in the new active file, but the CAS still claims the block — the
+/// flushing file then has stale data and the copy overwrites the new data.
+///
+/// With atomic claiming, concurrent writes see SYNCING → re-dirty via
+/// promote_syncing_blocks + transition_to_dirty(SYNCING→DIRTY), preserving
+/// the latest write.
+#[tokio::test]
+async fn test_rotation_claims_atomically() {
+    let h = BottomlessHarness::new().await;
+
+    // Write 5 blocks
+    for i in 0u8..5 {
+        h.cache
+            .write(i as u64 * 4096, &vec![i + 0x30; 4096], &[])
+            .unwrap();
+    }
+
+    // All blocks should be DIRTY before rotation
+    for i in 0usize..5 {
+        assert_eq!(
+            h.cache.inner.state_map.get(i),
+            SparseBlockState::DIRTY,
+            "block {} should be DIRTY before rotation",
+            i
+        );
+    }
+
+    // rotate_and_snapshot does CAS DIRTY→SYNCING under the write lock
+    let claimed = h.cache.rotate_and_snapshot().unwrap();
+    assert_eq!(claimed.len(), 5, "all 5 dirty blocks should be claimed");
+
+    // After rotation, all claimed blocks must be SYNCING (not DIRTY).
+    // This is the key invariant: any concurrent write that acquires the
+    // read lock after rotation sees SYNCING and properly re-dirties.
+    for i in 0usize..5 {
+        assert_eq!(
+            h.cache.inner.state_map.get(i),
+            SparseBlockState::SYNCING,
+            "block {} must be SYNCING after atomic rotate+claim",
+            i
+        );
+    }
+
+    // Simulate what a concurrent write would do: write to block 2,
+    // which should re-dirty it (CAS SYNCING→DIRTY).
+    let new_data = vec![0xFFu8; 4096];
+    h.cache.write(2 * 4096, &new_data, &[]).unwrap();
+    assert_eq!(
+        h.cache.inner.state_map.get(2),
+        SparseBlockState::DIRTY,
+        "concurrent write must re-dirty the block (SYNCING→DIRTY)"
+    );
+
+    // The other blocks should still be SYNCING
+    for i in [0, 1, 3, 4] {
+        assert_eq!(
+            h.cache.inner.state_map.get(i),
+            SparseBlockState::SYNCING,
+            "block {} should still be SYNCING",
+            i
+        );
+    }
+
+    // Clean up: transition remaining SYNCING blocks back to DIRTY
+    // so they can be re-flushed (prevent orphaned SYNCING state).
+    for &idx in &claimed {
+        h.cache.inner.transition_to_dirty(idx);
+    }
+
+    // Verify block 2 has the NEW data (not stale flushing file data).
+    // promote_syncing_blocks should have copied the old data from flushing→active,
+    // then the pwrite overwrote with 0xFF.
+    let mut buf = vec![0u8; 4096];
+    h.cache
+        .inner
+        .data_file
+        .read()
+        .read_exact_at(&mut buf, 2 * 4096)
+        .unwrap();
+    assert!(
+        buf.iter().all(|&b| b == 0xFF),
+        "block 2 in active file should have new data 0xFF, got 0x{:02x}",
+        buf[0]
+    );
+}
+
 /// Test: S3 upload failure during bottomless flush copies blocks back.
 ///
 /// After flush failure, all SYNCING blocks should be copied from flushing→active

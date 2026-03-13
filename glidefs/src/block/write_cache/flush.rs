@@ -508,9 +508,10 @@ impl WriteCache<Active> {
     /// a race where a block becomes dirty (with data in the new active file)
     /// after rotation but is picked up by the CAS scan — compute_flush_batch
     /// would read zeros from the flushing file for that block.
-    fn rotate_and_snapshot(&self) -> Result<Vec<usize>, CacheError> {
-        let (pre_dirty, ()) = self.rotate_data_file_inner(true)?;
-        Ok(pre_dirty)
+    #[cfg_attr(feature = "test-utils", allow(dead_code))]
+    pub(crate) fn rotate_and_snapshot(&self) -> Result<Vec<usize>, CacheError> {
+        let (claimed, ()) = self.rotate_data_file_inner(true)?;
+        Ok(claimed)
     }
 
     /// Core rotation logic. If `snapshot` is true, captures dirty block
@@ -552,14 +553,28 @@ impl WriteCache<Active> {
         // from pre_dirty (because is_partial=true) but then complete_partial
         // removes it before the copy loop, causing the copy to be skipped
         // and the block's data stranded in the old file.
-        let (pre_dirty, partial_to_copy) = if snapshot {
-            let mut dirty = Vec::new();
+        let (claimed, partial_to_copy) = if snapshot {
+            let mut claimed = Vec::new();
             let mut partials = Vec::new();
             for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
                 if self.inner.is_partial(idx) {
                     partials.push(idx);
                 } else {
-                    dirty.push(idx);
+                    // CAS DIRTY→SYNCING under the write lock.
+                    //
+                    // This closes a race where a concurrent write between
+                    // lock-release and CAS lands data in the new active file
+                    // while the block is still DIRTY. Without this, the CAS
+                    // after lock-release claims the block, but the flushing
+                    // file has stale data (missing the concurrent write).
+                    //
+                    // By claiming under the lock, concurrent writes after
+                    // lock-release see SYNCING and CAS SYNCING→DIRTY in
+                    // transition_to_dirty, properly re-dirtying the block.
+                    // promote_syncing_blocks then copies from flushing→active.
+                    if self.inner.transition_dirty_to_syncing(idx) {
+                        claimed.push(idx);
+                    }
                 }
             }
             // Also include non-DIRTY partial blocks (e.g. NOT_PRESENT+partial
@@ -571,7 +586,7 @@ impl WriteCache<Active> {
                     partials.push(idx);
                 }
             }
-            (dirty, partials)
+            (claimed, partials)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -616,7 +631,7 @@ impl WriteCache<Active> {
         drop(data_file_guard);
 
         info!("rotated data file for bottomless flush");
-        Ok((pre_dirty, ()))
+        Ok((claimed, ()))
     }
 
     /// Check whether a block is in the partial_blocks map (has unfilled sub-regions).
@@ -670,25 +685,23 @@ impl WriteCache<Active> {
     ) -> Result<(FlushStats, u64), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
 
-        // Snapshot dirty blocks AND rotate under the data_file write lock.
+        // Snapshot dirty blocks, claim (CAS DIRTY→SYNCING), AND rotate —
+        // all under the data_file write lock.
         //
         // The write lock blocks concurrent pwrite/pread, giving us a clean
-        // cut: every block in `pre_dirty` has its data in the current active
-        // file (about to become the flushing file). Blocks that become dirty
-        // AFTER we release the lock write to the new active file and are NOT
-        // in our snapshot — they stay DIRTY for the next flush cycle.
+        // cut: every block in `snapshot` has its data in the current active
+        // file (now the flushing file) AND is already SYNCING.
         //
-        // Without this barrier, a block could become dirty between rotation
-        // and the CAS scan below, landing its data in the new active file.
-        // compute_flush_batch would then read zeros from the flushing file
-        // for that block, uploading corrupted data to S3.
-        let pre_dirty = self.rotate_and_snapshot()?;
-
-        // Claim dirty blocks: CAS DIRTY→SYNCING (only pre-rotation blocks).
-        let snapshot: Vec<usize> = pre_dirty
-            .into_iter()
-            .filter(|&idx| self.inner.transition_dirty_to_syncing(idx))
-            .collect();
+        // The CAS DIRTY→SYNCING must happen under the write lock to prevent
+        // a race where a concurrent write between lock-release and CAS lands
+        // data in the new active file while the block is still DIRTY. Without
+        // this, the CAS would claim the block, but the flushing file would
+        // have stale data (missing the concurrent write). By claiming under
+        // the lock, concurrent writes after lock-release see SYNCING and
+        // CAS SYNCING→DIRTY in transition_to_dirty, properly re-dirtying
+        // the block. promote_syncing_blocks then copies data from
+        // flushing→active so the new active file has complete block data.
+        let snapshot = self.rotate_and_snapshot()?;
 
         if snapshot.is_empty() {
             debug!("flush: no dirty blocks to flush");
