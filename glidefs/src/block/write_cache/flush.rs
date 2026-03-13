@@ -587,9 +587,21 @@ impl WriteCache<Active> {
             }
         }
 
-        drop(data_file_guard);
-
+        // Set flushing_file BEFORE releasing the write lock.
+        //
+        // promote_syncing_blocks checks flushing_active (true since above) then
+        // locks flushing_file to copy data. If we release the data_file write
+        // lock first, a writer can acquire the read lock (on the new sparse file),
+        // see flushing_active=true but flushing_file=None, skip the promote, and
+        // pwrite a 4k sub-block into the new file — leaving the rest of the 128KB
+        // block as zeros. The next drain iteration uploads this incomplete data.
+        //
+        // By setting flushing_file under the write lock, any writer that acquires
+        // the read lock after rotation will see a consistent state and promote
+        // correctly.
         *self.inner.flushing_file.lock() = Some(Arc::new(old_file));
+
+        drop(data_file_guard);
 
         info!("rotated data file for bottomless flush");
         Ok((pre_dirty, ()))
