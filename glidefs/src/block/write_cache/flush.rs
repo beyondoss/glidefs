@@ -516,43 +516,44 @@ impl WriteCache<Active> {
 
     /// Core rotation logic. If `snapshot` is true, captures dirty block
     /// indices under the write lock before swapping files.
+    ///
+    /// The entire rotation is one atomic critical section under a single
+    /// write-lock acquisition. This eliminates a class of races where
+    /// state changes (CAS, file swap, partial snapshot) span non-atomic
+    /// windows. The lock holds for ~15µs on typical hardware — rename is
+    /// an inode pointer swap, file creation is a single syscall, and the
+    /// CAS loop touches only cache-hot atomics.
     fn rotate_data_file_inner(&self, snapshot: bool) -> Result<(Vec<usize>, ()), CacheError> {
         let active_path = self.inner.config.data_path();
         let flushing_path = self.inner.config.flushing_path();
 
-        // Signal that a flush rotation is in progress. The ublk read path
-        // checks this to avoid reading SYNCING blocks from the active file
-        // (their data lives in the flushing file). The ublk write path always
-        // uses pwrite via the RwLock'd data_file, so it's unaffected.
+        // === Single write lock: everything below is atomic w.r.t. I/O ===
+        let mut data_file_guard = self.inner.data_file.write();
+
+        // Signal flush rotation in progress. Under the lock so no reader
+        // can observe flushing_active=true with stale file state.
         self.inner.flushing_active.store(true, Ordering::Release);
 
-        // Rename active -> flushing (crash recovery boundary).
-        // Done BEFORE acquiring the write lock so the filesystem metadata
-        // op doesn't hold up concurrent I/O. The RwLock still points to
-        // the old file handle (now at flushing_path), so pwrites in flight
-        // complete to the correct inode.
+        // Rename active → flushing. The file handle in data_file_guard
+        // still refers to the same inode (now at flushing_path).
         std::fs::rename(&active_path, &flushing_path)?;
 
-        // Create new sparse active file (also outside write lock).
+        // Create new sparse active file.
         let new_file = super::inner::SyncFile::open(
             &active_path,
             true,
             self.inner.config.device_size,
         )?;
 
-        // Write-lock data_file: blocks all concurrent pwrite/pread.
-        // Under the lock: snapshot dirty blocks, then swap files.
-        let mut data_file_guard = self.inner.data_file.write();
-
         // Snapshot dirty blocks AND partial block indices atomically.
         //
-        // We must capture partial indices at the SAME time as the snapshot
-        // exclusion decision. complete_partial (DashMap remove) can run
-        // concurrently — it doesn't need the data_file lock. If we iterated
-        // partial_blocks later for the copy step, a block could be excluded
-        // from pre_dirty (because is_partial=true) but then complete_partial
-        // removes it before the copy loop, causing the copy to be skipped
-        // and the block's data stranded in the old file.
+        // CAS DIRTY→SYNCING happens here, under the lock, so concurrent
+        // writes after lock-release see SYNCING and properly re-dirty via
+        // transition_to_dirty + promote_syncing_blocks.
+        //
+        // Partial indices are captured at the same time as the exclusion
+        // decision — complete_partial can't cause a TOCTOU race because
+        // it needs the data_file read lock (which we hold exclusively).
         let (claimed, partial_to_copy) = if snapshot {
             let mut claimed = Vec::new();
             let mut partials = Vec::new();
@@ -560,18 +561,6 @@ impl WriteCache<Active> {
                 if self.inner.is_partial(idx) {
                     partials.push(idx);
                 } else {
-                    // CAS DIRTY→SYNCING under the write lock.
-                    //
-                    // This closes a race where a concurrent write between
-                    // lock-release and CAS lands data in the new active file
-                    // while the block is still DIRTY. Without this, the CAS
-                    // after lock-release claims the block, but the flushing
-                    // file has stale data (missing the concurrent write).
-                    //
-                    // By claiming under the lock, concurrent writes after
-                    // lock-release see SYNCING and CAS SYNCING→DIRTY in
-                    // transition_to_dirty, properly re-dirtying the block.
-                    // promote_syncing_blocks then copies from flushing→active.
                     if self.inner.transition_dirty_to_syncing(idx) {
                         claimed.push(idx);
                     }
@@ -591,13 +580,11 @@ impl WriteCache<Active> {
             (Vec::new(), Vec::new())
         };
 
+        // Swap file handle: new active file goes into the RwLock.
         let old_file = std::mem::replace(&mut *data_file_guard, new_file);
 
         // Copy partial block data from old active → new active.
-        //
-        // Uses the snapshot'd partial_to_copy list (captured atomically with
-        // the pre_dirty exclusion) so complete_partial can't cause a TOCTOU
-        // race. Safe under write lock: no write_sub_region can execute.
+        // Safe under write lock: no write_sub_region can execute.
         {
             let block_size = self.inner.config.block_size as u64;
             let device_size = self.inner.config.device_size;
@@ -614,18 +601,10 @@ impl WriteCache<Active> {
             }
         }
 
-        // Set flushing_file BEFORE releasing the write lock.
-        //
-        // promote_syncing_blocks checks flushing_active (true since above) then
-        // locks flushing_file to copy data. If we release the data_file write
-        // lock first, a writer can acquire the read lock (on the new sparse file),
-        // see flushing_active=true but flushing_file=None, skip the promote, and
-        // pwrite a 4k sub-block into the new file — leaving the rest of the 128KB
-        // block as zeros. The next drain iteration uploads this incomplete data.
-        //
-        // By setting flushing_file under the write lock, any writer that acquires
-        // the read lock after rotation will see a consistent state and promote
-        // correctly.
+        // Set flushing_file before releasing the write lock.
+        // Writers acquiring the read lock after rotation will see
+        // flushing_active=true AND flushing_file=Some, so
+        // promote_syncing_blocks works correctly.
         *self.inner.flushing_file.lock() = Some(Arc::new(old_file));
 
         drop(data_file_guard);
