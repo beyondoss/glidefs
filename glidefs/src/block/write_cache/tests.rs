@@ -2117,14 +2117,14 @@ async fn test_bottomless_re_dirty_during_flush() {
     }
 }
 
-/// Test 4: Skipped block recovery in bottomless mode.
+/// Test 4: Partial blocks excluded from flush snapshot.
 ///
-/// Set up a flushing file with data. Have a SYNCING block that gets
-/// transitioned back to DIRTY (skipped). Verify the data gets copied
-/// from the flushing file to the active file during cleanup.
+/// Partial blocks are excluded from the dirty snapshot during rotation.
+/// Their data is copied from the old active → new active file under the
+/// write lock, so it survives flushing file deletion.
 ///
-/// This exercises the "copy skipped blocks from flushing to active" path
-/// in flush_dirty_body.
+/// This exercises the "copy partial blocks during rotation" path in
+/// rotate_data_file_inner.
 #[tokio::test]
 async fn test_bottomless_skipped_block_recovery() {
     let h = BottomlessHarness::new().await;
@@ -2135,20 +2135,20 @@ async fn test_bottomless_skipped_block_recovery() {
     h.cache.write(0, &data0, &h.clean_cache).unwrap();
     h.cache.write(4096, &data1, &h.clean_cache).unwrap();
 
-    // Mark block 0 as partial so it gets skipped during flush
-    // (compute_flush_batch skips partial blocks)
+    // Mark block 0 as partial — rotation will exclude it from snapshot
+    // and copy its data from old active → new active.
     h.cache.insert_partial_block_for_test(0);
 
-    // Flush: block 0 is partial -> skipped, block 1 flushes normally
+    // Flush: block 0 excluded (partial), block 1 flushes normally
     let stats = h.flush().await;
-    assert_eq!(stats.blocks_claimed, 2, "both blocks claimed");
-    assert_eq!(stats.blocks_cas_failed, 1, "block 0 should be skipped (partial)");
+    assert_eq!(stats.blocks_claimed, 1, "only non-partial block claimed");
+    assert_eq!(stats.blocks_cas_failed, 0, "no skips needed");
 
-    // Block 0 should be back to DIRTY (skipped -> transitioned back)
+    // Block 0 should still be DIRTY (never claimed, never transitioned)
     assert_eq!(
         h.cache.inner.state_map.get(0),
         SparseBlockState::DIRTY,
-        "skipped block should be DIRTY"
+        "partial block should stay DIRTY"
     );
 
     // Block 1 should be NOT_PRESENT (evicted in bottomless mode)
@@ -2158,12 +2158,12 @@ async fn test_bottomless_skipped_block_recovery() {
         "flushed block should be NOT_PRESENT"
     );
 
-    // Block 0's data should have been copied from flushing to active file
+    // Block 0's data should have been copied during rotation (old → new active)
     let mut buf = vec![0u8; 4096];
     h.cache.inner.data_file.read().read_exact_at(&mut buf, 0).unwrap();
     assert_eq!(
         &buf[..], &data0[..],
-        "skipped block data must be copied from flushing to active file"
+        "partial block data must be copied from old to new active during rotation"
     );
 
     // Flushing file should be cleaned up

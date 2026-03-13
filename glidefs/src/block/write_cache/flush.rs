@@ -547,12 +547,46 @@ impl WriteCache<Active> {
             self.inner
                 .state_map
                 .iter_with_state(SparseBlockState::DIRTY)
+                // Exclude partial blocks: their data in the old file may be
+                // incomplete (backfill in progress). We copy their data to
+                // the new file below so they survive rotation.
+                .filter(|&idx| !self.inner.is_partial(idx))
                 .collect()
         } else {
             Vec::new()
         };
 
         let old_file = std::mem::replace(&mut *data_file_guard, new_file);
+
+        // Copy partial block data from old active → new active.
+        //
+        // Partial blocks have incomplete backfill data — some sub-regions may
+        // be in the old file (early backfill writes + guest writes) and the
+        // rest will arrive in future backfill writes to the new file.
+        // Without this copy, the old file's data is lost when it's deleted
+        // after flush, leaving the new file with only late backfill data.
+        //
+        // Safe under write lock: no write_sub_region can execute (needs read
+        // lock), so the old file's data is stable. complete_partial might run
+        // (doesn't need data_file lock) but that's harmless — we just copy a
+        // block that's no longer partial, which is idempotent.
+        {
+            let block_size = self.inner.config.block_size as u64;
+            let device_size = self.inner.config.device_size;
+            for entry in self.inner.partial_blocks.iter() {
+                let idx = *entry.key();
+                let offset = idx as u64 * block_size;
+                let valid = std::cmp::min(block_size, device_size.saturating_sub(offset)) as usize;
+                if valid == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; valid];
+                if old_file.read_exact_at(&mut buf, offset).is_ok() {
+                    let _ = data_file_guard.write_all_at(&buf, offset);
+                }
+            }
+        }
+
         drop(data_file_guard);
 
         *self.inner.flushing_file.lock() = Some(Arc::new(old_file));
