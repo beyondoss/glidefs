@@ -660,11 +660,11 @@ mod tests {
 
         let entries = Wal::replay(&wal_path, 0).unwrap();
         assert_eq!(entries.len(), 6);
-        for i in 0..5 {
+        for (i, entry) in entries.iter().enumerate().take(5) {
             let seq = (i + 1) as u64;
-            assert_eq!(entries[i].block_index, seq * 10);
-            assert_eq!(entries[i].sequence, seq);
-            assert_eq!(entries[i].partial_bitmap, None);
+            assert_eq!(entry.block_index, seq * 10);
+            assert_eq!(entry.sequence, seq);
+            assert_eq!(entry.partial_bitmap, None);
         }
         assert_eq!(entries[5].block_index, 100);
         assert_eq!(entries[5].sequence, 6);

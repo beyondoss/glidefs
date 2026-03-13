@@ -349,6 +349,7 @@ impl NbdDeviceManager {
     /// Simulates a crash: the device dies but `nbd_devices.json` still has the
     /// old index. Used in tests to prove device path stability across restarts.
     #[cfg(feature = "test-utils")]
+    #[allow(dead_code)]
     pub async fn crash_disconnect(&mut self, export_name: &str) -> anyhow::Result<()> {
         let Some(device) = self.devices.remove(export_name) else {
             return Ok(());

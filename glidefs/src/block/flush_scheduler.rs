@@ -779,7 +779,7 @@ mod tests {
         let metrics_check = Arc::clone(&metrics);
         let cache_check = Arc::clone(&cache);
         let flush_notify_clone = Arc::clone(&flush_notify);
-        let clean_cache_check = Arc::clone(&clean_cache);
+        let _clean_cache_check = Arc::clone(&clean_cache);
 
         // Write dirty blocks
         for i in 0..DEFAULT_BLOCKS_PER_PACK {

@@ -581,10 +581,10 @@ impl WriteCache<Active> {
         // sync_read_local_block returns None if the block was evicted
         // (SYNCING→NOT_PRESENT) between our is_present() check and the
         // actual read — in that case, fall through to the cold path.
-        if self.inner.is_present(block_index) && !self.inner.is_partial(block_index) {
-            if let Some(data) = self.sync_read_local_block(block_index as u64)? {
-                return Ok(BlockLocation::Local(data));
-            }
+        if self.inner.is_present(block_index) && !self.inner.is_partial(block_index)
+            && let Some(data) = self.sync_read_local_block(block_index as u64)?
+        {
+            return Ok(BlockLocation::Local(data));
         }
 
         // Partial block: need S3 data for unwritten sub-regions.

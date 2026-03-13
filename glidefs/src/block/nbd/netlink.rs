@@ -48,6 +48,7 @@ const NBD_CMD_RECONFIGURE: u8 = 3;
 const NBD_ATTR_INDEX: u16 = 1;
 const NBD_ATTR_SIZE_BYTES: u16 = 2;
 const NBD_ATTR_BLOCK_SIZE_BYTES: u16 = 3;
+#[allow(dead_code)]
 const NBD_ATTR_TIMEOUT: u16 = 4;
 const NBD_ATTR_SERVER_FLAGS: u16 = 5;
 const NBD_ATTR_SOCKETS: u16 = 7;

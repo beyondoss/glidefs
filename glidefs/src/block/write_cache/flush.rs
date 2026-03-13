@@ -842,18 +842,18 @@ impl WriteCache<Active> {
                 let df = self.inner.data_file.read();
                 let block_size = self.inner.config.block_size;
                 for &idx in &batch.skipped {
-                    if self.inner.state_map.get(idx) == SparseBlockState::SYNCING {
-                        if let Some(ref ff) = *flushing_guard {
-                            let offset = idx as u64 * block_size as u64;
-                            let valid = std::cmp::min(
-                                block_size as u64,
-                                self.inner.config.device_size.saturating_sub(offset),
-                            ) as usize;
-                            if valid > 0 {
-                                let mut buf = vec![0u8; valid];
-                                if ff.read_exact_at(&mut buf, offset).is_ok() {
-                                    let _ = df.write_all_at(&buf, offset);
-                                }
+                    if self.inner.state_map.get(idx) == SparseBlockState::SYNCING
+                        && let Some(ref ff) = *flushing_guard
+                    {
+                        let offset = idx as u64 * block_size as u64;
+                        let valid = std::cmp::min(
+                            block_size as u64,
+                            self.inner.config.device_size.saturating_sub(offset),
+                        ) as usize;
+                        if valid > 0 {
+                            let mut buf = vec![0u8; valid];
+                            if ff.read_exact_at(&mut buf, offset).is_ok() {
+                                let _ = df.write_all_at(&buf, offset);
                             }
                         }
                     }

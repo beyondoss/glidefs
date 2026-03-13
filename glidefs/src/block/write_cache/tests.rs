@@ -2717,3 +2717,151 @@ async fn test_bottomless_flush_failure_recovery() {
     assert!(!cache.inner.flushing_active.load(Ordering::Acquire));
     assert!(!config.flushing_path().exists());
 }
+
+// ============================================================================
+// Eviction race tests (bottomless mode)
+// ============================================================================
+
+/// Simulate the eviction race: a block is SYNCING during backfill check,
+/// gets evicted (SYNCING→NOT_PRESENT) before the write, and the sub-block
+/// write must detect this via syncing_blocks and create a partial entry.
+#[tokio::test]
+async fn test_eviction_race_creates_partial_for_sub_block_write() {
+    let h = V2Harness::new().await;
+    let block_size = 4096u64;
+
+    // Step 1: Write a full block (block 0) with known data.
+    let original = vec![0xAAu8; block_size as usize];
+    h.cache.write(0, &original, &[]).unwrap();
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::DIRTY);
+
+    // Step 2: Transition to SYNCING (simulates flush claiming the block).
+    assert!(h.cache.inner.transition_dirty_to_syncing(0));
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::SYNCING);
+
+    // Step 3: Evict the block (simulates bottomless SYNCING→NOT_PRESENT).
+    assert!(h.cache.inner.transition_syncing_to_not_present(0));
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::NOT_PRESENT);
+
+    // Step 4: Sub-block write WITH syncing_blocks=[0].
+    // This simulates what happens when backfill_missing_blocks saw block 0
+    // as SYNCING, but by the time write() runs, it's been evicted.
+    let sub_data = vec![0xBBu8; 512];
+    let needs_backfill = h.cache.write(0, &sub_data, &[0]).unwrap();
+
+    // The write should have detected the eviction race and created a
+    // partial entry for block 0, returning it as needing backfill.
+    assert!(
+        needs_backfill.contains(&0),
+        "block 0 should need backfill after eviction race, got {:?}",
+        needs_backfill
+    );
+    assert!(
+        h.cache.inner.is_partial(0),
+        "block 0 should be partial after eviction race"
+    );
+}
+
+/// Same race but with a FULL-block write: no partial entry needed because
+/// the entire block is being overwritten (no prior data to preserve).
+#[tokio::test]
+async fn test_eviction_race_full_block_write_no_partial() {
+    let h = V2Harness::new().await;
+    let block_size = 4096u64;
+
+    // Write → SYNCING → evict
+    h.cache.write(0, &vec![0xAAu8; block_size as usize], &[]).unwrap();
+    assert!(h.cache.inner.transition_dirty_to_syncing(0));
+    assert!(h.cache.inner.transition_syncing_to_not_present(0));
+
+    // Full-block write with syncing_blocks=[0]
+    let full_data = vec![0xBBu8; block_size as usize];
+    let needs_backfill = h.cache.write(0, &full_data, &[0]).unwrap();
+
+    // No backfill needed — the write fully covers the block.
+    assert!(
+        needs_backfill.is_empty(),
+        "full-block write should not need backfill, got {:?}",
+        needs_backfill
+    );
+    assert!(
+        !h.cache.inner.is_partial(0),
+        "block 0 should NOT be partial after full-block write"
+    );
+}
+
+/// If the block is still SYNCING (not yet evicted) when write() runs,
+/// promote_syncing_blocks handles it — no partial entry needed.
+#[tokio::test]
+async fn test_syncing_block_not_evicted_no_partial() {
+    let h = V2Harness::new().await;
+    let block_size = 4096u64;
+
+    // Write → SYNCING (but do NOT evict)
+    h.cache.write(0, &vec![0xAAu8; block_size as usize], &[]).unwrap();
+    assert!(h.cache.inner.transition_dirty_to_syncing(0));
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::SYNCING);
+
+    // Sub-block write with syncing_blocks=[0], block still SYNCING
+    let sub_data = vec![0xBBu8; 512];
+    let needs_backfill = h.cache.write(0, &sub_data, &[0]).unwrap();
+
+    // promote_syncing_blocks should handle it — no backfill needed.
+    // (promote copies data from flushing→active file, but since there's
+    // no flushing file in this test, promote's CAS SYNCING→DIRTY handles it.)
+    assert!(
+        needs_backfill.is_empty(),
+        "still-SYNCING block should not need backfill, got {:?}",
+        needs_backfill
+    );
+}
+
+/// Eviction race with zero_range: sub-block zero should create partial.
+#[tokio::test]
+async fn test_eviction_race_zero_range_creates_partial() {
+    let h = V2Harness::new().await;
+    let block_size = 4096u64;
+
+    // Write → SYNCING → evict
+    h.cache.write(0, &vec![0xAAu8; block_size as usize], &[]).unwrap();
+    assert!(h.cache.inner.transition_dirty_to_syncing(0));
+    assert!(h.cache.inner.transition_syncing_to_not_present(0));
+
+    // Sub-block zero_range with syncing_blocks=[0]
+    let needs_backfill = h.cache.zero_range(0, 512, &[0]).unwrap();
+
+    assert!(
+        needs_backfill.contains(&0),
+        "block 0 should need backfill after eviction race in zero_range"
+    );
+    assert!(
+        h.cache.inner.is_partial(0),
+        "block 0 should be partial after eviction race in zero_range"
+    );
+}
+
+/// Without syncing_blocks, an evicted block gets NO partial entry — this
+/// is the old buggy behavior. We test that empty syncing_blocks means
+/// no eviction detection (the caller is responsible for populating it).
+#[tokio::test]
+async fn test_no_syncing_blocks_no_eviction_detection() {
+    let h = V2Harness::new().await;
+    let block_size = 4096u64;
+
+    // Write → SYNCING → evict
+    h.cache.write(0, &vec![0xAAu8; block_size as usize], &[]).unwrap();
+    assert!(h.cache.inner.transition_dirty_to_syncing(0));
+    assert!(h.cache.inner.transition_syncing_to_not_present(0));
+
+    // Sub-block write with EMPTY syncing_blocks (simulates the bug:
+    // backfill_missing_blocks didn't report block 0 as SYNCING).
+    let sub_data = vec![0xBBu8; 512];
+    let needs_backfill = h.cache.write(0, &sub_data, &[]).unwrap();
+
+    // No eviction detection — no partial entry created.
+    // This is the scenario that causes data loss without the fix.
+    assert!(
+        needs_backfill.is_empty(),
+        "empty syncing_blocks should not trigger eviction detection"
+    );
+}

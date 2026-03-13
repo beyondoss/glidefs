@@ -148,6 +148,7 @@ impl PackIndexCache {
     }
 
     /// Close the cache, releasing file descriptors and flushing SSD state.
+    #[allow(dead_code)]
     pub async fn close(&self) -> anyhow::Result<()> {
         self.inner.close().await.map_err(Into::into)
     }
