@@ -705,8 +705,14 @@ impl WriteCache<Active> {
             // state. If we transition SYNCING→DIRTY first, a concurrent read
             // sees DIRTY, reads the new active file (which is empty for these
             // blocks), and serves zeros.
+            //
+            // Write-lock data_file to prevent concurrent writes from
+            // interleaving with the copy. Without this, a write could:
+            // 1. CAS SYNCING→DIRTY, promote, pwrite new data
+            // 2. Then our copy overwrites that new data with stale flushing data
             let block_size = self.inner.config.block_size;
             if let Some(ref ff) = *self.inner.flushing_file.lock() {
+                let df = self.inner.data_file.write();
                 for &idx in &snapshot {
                     // Only copy blocks still SYNCING (not re-dirtied by a
                     // concurrent write — those already have data in active).
@@ -721,10 +727,11 @@ impl WriteCache<Active> {
                     if valid_bytes > 0 {
                         let mut buf = vec![0u8; valid_bytes];
                         if ff.read_exact_at(&mut buf, offset).is_ok() {
-                            let _ = self.inner.data_file.read().write_all_at(&buf, offset);
+                            let _ = df.write_all_at(&buf, offset);
                         }
                     }
                 }
+                drop(df);
             }
             self.inner.flushing_active.store(false, Ordering::Release);
             drop(self.inner.flushing_file.lock().take());
@@ -845,7 +852,9 @@ impl WriteCache<Active> {
             // by the write path — don't overwrite active with stale data.
             {
                 let flushing_guard = self.inner.flushing_file.lock();
-                let df = self.inner.data_file.read();
+                // Write-lock prevents concurrent writes from interleaving
+                // with the copy (same TOCTOU race as the post-flush copy-back).
+                let df = self.inner.data_file.write();
                 let block_size = self.inner.config.block_size;
                 for &idx in &batch.skipped {
                     if self.inner.state_map.get(idx) == SparseBlockState::SYNCING
@@ -975,10 +984,17 @@ impl WriteCache<Active> {
         if !evict {
             // Copy flushed block data from flushing → active so reads after
             // SYNCING→CLEAN find valid data in the active file.
+            //
+            // Write-lock data_file to prevent concurrent writes from
+            // interleaving with the copy. Without this, a write could:
+            // 1. See SYNCING, CAS SYNCING→DIRTY, promote, pwrite new data
+            // 2. Then our copy (which checked SYNCING before step 1) overwrites
+            //    that new data with stale flushing data
+            // The write lock serializes the copy with all pwrite/pread.
             let block_size = self.inner.config.block_size;
             let flushing_guard = self.inner.flushing_file.lock();
             if let Some(ref ff) = *flushing_guard {
-                let df = self.inner.data_file.read();
+                let df = self.inner.data_file.write();
                 for &idx in &flushed_blocks {
                     if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
                         continue; // re-dirtied: promote already copied data
