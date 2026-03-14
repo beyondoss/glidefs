@@ -479,7 +479,7 @@ impl CacheInner {
         df: &SyncFile,
         start_block: u64,
         end_block: u64,
-    ) {
+    ) -> std::io::Result<()> {
         use crate::block::block_map::SparseBlockState;
 
         let block_size = self.config.block_size as u64;
@@ -511,7 +511,11 @@ impl CacheInner {
                 }
                 let mut buf = vec![0u8; valid];
                 if ff.read_exact_at(&mut buf, offset).is_ok() {
-                    let _ = df.write_all_at(&buf, offset);
+                    // Propagate write errors: if the active file write fails,
+                    // we must NOT transition the block state. A silent failure
+                    // here would mark the block DIRTY with corrupt/zero data
+                    // in the active file, causing data corruption on next flush.
+                    df.write_all_at(&buf, offset)?;
                     if state == SparseBlockState::SYNCING {
                         // CAS SYNCING→DIRTY immediately after copying data.
                         // This prevents the flush thread from evicting the block
@@ -542,6 +546,7 @@ impl CacheInner {
                 }
             }
         }
+        Ok(())
     }
 
     // -- CRC32 SparseCrcMap methods (for dirty-block corruption detection) -----
