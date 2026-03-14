@@ -1044,8 +1044,9 @@ async fn test_syncing_blocks_at_crash_become_dirty() {
         write_hashed!(&2u32.to_le_bytes()); // block 2
         write_hashed!(&[2u8]); // DIRTY
 
-        // v5: max_sequence
+        // Trailing fields: max_sequence + rotation_seq
         write_hashed!(&100u64.to_le_bytes());
+        write_hashed!(&0u64.to_le_bytes()); // rotation_seq = 0 (no active rotation)
 
         // CRC32 trailer
         let crc = hasher.finalize();
