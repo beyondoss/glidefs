@@ -1628,6 +1628,28 @@ impl ExportRouter {
         Ok(())
     }
 
+    /// Stop all flush schedulers without draining. Leaves dirty blocks on
+    /// the local SSD for WAL-based recovery on next startup.
+    ///
+    /// Used by crash simulation in tests: a real process crash kills all
+    /// tasks instantly, but in an in-process test we need to explicitly
+    /// stop the schedulers so they release cache file handles before the
+    /// next server opens the same files.
+    #[cfg(feature = "test-utils")]
+    pub async fn stop_flush_schedulers(&self) {
+        let mut exports = self.exports.write().await;
+        let export_list: Vec<_> = exports.drain().collect();
+        drop(exports);
+
+        for (name, state) in export_list {
+            let _ = state.flush_shutdown_tx.send(true);
+            if let Err(e) = state.flush_handle.await {
+                tracing::warn!("Flush scheduler for '{}' panicked: {}", name, e);
+            }
+            // Deliberately NO drain — dirty blocks stay on SSD.
+        }
+    }
+
     /// Drain dirty blocks, stop flush scheduler, and transition cache through
     /// the Draining typestate. Shared by `remove_export` and `shutdown`.
     ///

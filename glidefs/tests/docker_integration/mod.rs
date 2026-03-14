@@ -894,11 +894,11 @@ impl TestServer {
     /// they detect the dropped shutdown channel. Data remains on the SSD
     /// for WAL recovery by the next server instance.
     pub async fn crash_shutdown(self) {
-        // Shut down the router first so flush schedulers release cache file
-        // handles. In a real crash the process dies and the OS closes
-        // everything; in a test we need to clean up explicitly or the old
-        // scheduler races with the new server opening the same files.
-        let _ = self.router.shutdown().await;
+        // Stop flush schedulers so they release cache file handles.
+        // Deliberately does NOT drain — dirty blocks stay on SSD for
+        // WAL-based recovery, matching what happens in a real crash
+        // (process dies, OS closes fds, nothing is flushed to S3).
+        self.router.stop_flush_schedulers().await;
         self.shutdown.cancel();
         self._server_handle.abort();
         let _ = self._server_handle.await;
