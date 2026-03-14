@@ -92,7 +92,9 @@ pub struct SparseBlockState;
 impl SparseBlockState {
     /// Block has never been written to the local SSD.
     pub const NOT_PRESENT: u8 = 0;
-    /// Block is present on SSD and synced to S3.
+    /// Block is claimed but not yet dirty. Transient state used by the write
+    /// path (set_present before pwrite) and as a CAS gate for backfill
+    /// synchronization.
     pub const CLEAN: u8 = 1;
     /// Block is present on SSD and needs to be flushed to S3.
     pub const DIRTY: u8 = 2;
@@ -137,7 +139,7 @@ impl StatePage {
 ///
 /// State encoding (2 bits per entry):
 /// - `0` = NotPresent (never written to SSD)
-/// - `1` = Clean (present on SSD, synced to S3)
+/// - `1` = Clean (claimed, not yet dirty — transient)
 /// - `2` = Dirty (present on SSD, needs flush)
 /// - `3` = Syncing (present on SSD, upload in progress)
 pub struct SparseStateMap {

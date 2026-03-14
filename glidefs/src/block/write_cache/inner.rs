@@ -247,11 +247,11 @@ pub(crate) struct CacheInner {
     /// Local cache file (data).
     /// Uses positional I/O (pread/pwrite) which is thread-safe. RwLock is
     /// read-locked for all I/O (~2ns overhead); write-locked only during
-    /// bottomless file rotation (once per flush cycle).
+    /// file rotation (once per flush cycle).
     pub(super) data_file: parking_lot::RwLock<SyncFile>,
 
     /// Flushing file: the previous active file being uploaded to S3.
-    /// Only set during an active flush in bottomless mode. Immutable once set
+    /// Only set during an active flush. Immutable once set
     /// (no writes, only reads by compute_flush_batch).
     /// Arc-wrapped so rayon workers can share the reference without holding the Mutex.
     pub(super) flushing_file: parking_lot::Mutex<Option<Arc<SyncFile>>>,
@@ -264,7 +264,7 @@ pub(crate) struct CacheInner {
 
     /// Sparse block state map - LOCK-FREE
     /// Combines block state and presence into a single sparse page table.
-    /// State encoding: 0=NotPresent, 1=Clean, 2=Dirty, 3=Syncing
+    /// State encoding: 0=NotPresent, 1=Clean (transient), 2=Dirty, 3=Syncing
     pub(super) state_map: SparseStateMap,
 
     /// Number of blocks (for bounds checking)

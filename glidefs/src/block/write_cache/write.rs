@@ -14,7 +14,7 @@ impl WriteCache<Active> {
     /// # Lock-Free State Updates
     ///
     /// Uses CAS operations for state transitions:
-    /// - Clean → Dirty: increment dirty_count
+    /// - Clean → Dirty: increment dirty_count (normal path after set_present)
     /// - Syncing → Dirty: decrement syncing_count, increment dirty_count
     /// - Dirty → Dirty: no-op (WAL entry skipped — already recorded)
     /// Hash computation is deferred to flush-to-S3 time. The write path only

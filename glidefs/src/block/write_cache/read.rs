@@ -251,7 +251,7 @@ impl WriteCache<Active> {
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
 
         // All reads go through the cold path which uses pread via the RwLock'd
-        // data_file (always correct fd). File rotation (bottomless flush)
+        // data_file (always correct fd). File rotation (flush)
         // renames the active file and opens a new one — the io_uring-registered
         // fd permanently points to the old inode after the first rotation,
         // making LocalSsd (Fixed fd) unsafe for all subsequent I/O.
