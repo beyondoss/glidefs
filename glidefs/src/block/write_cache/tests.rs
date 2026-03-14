@@ -219,6 +219,27 @@ impl V2Harness {
         result.unwrap()
     }
 
+    /// Flush packs and sync manifest (separate calls for stats inspection).
+    async fn flush_packs_and_sync(&self) -> super::FlushStats {
+        let (stats, _) = self
+            .cache
+            .flush_packs(
+                &self.content_store,
+                &self.pack_index_cache,
+                &self.volume_manifest,
+                None,
+            )
+            .await
+            .unwrap();
+        if stats.packs_uploaded > 0 {
+            self.cache
+                .sync_manifest(&self.content_store, &self.volume_manifest)
+                .await
+                .unwrap();
+        }
+        stats
+    }
+
     /// Get the volume manifest (in-memory copy).
     fn manifest(&self) -> VolumeManifest {
         self.volume_manifest.read().clone()
@@ -1194,11 +1215,9 @@ async fn test_crc32_happy_path_multi_cycle() {
             .unwrap();
     }
 
-    let (stats1, _) = h
-        .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
-        .await
-        .unwrap();
+    // flush_packs_and_sync: flush packs + sync manifest so the flushing
+    // file is cleaned up before the next cycle.
+    let stats1 = h.flush_packs_and_sync().await;
     assert_eq!(stats1.blocks_crc_mismatched, 0, "cycle 1: no corruption");
     assert_eq!(stats1.blocks_claimed, 3);
     assert_eq!(stats1.packs_uploaded, 1);
@@ -1211,11 +1230,7 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     assert_eq!(h.cache.dirty_block_count(), 3);
 
-    let (stats2, _) = h
-        .cache
-        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
-        .await
-        .unwrap();
+    let stats2 = h.flush_packs_and_sync().await;
     assert_eq!(stats2.blocks_crc_mismatched, 0, "cycle 2: no corruption");
     assert_eq!(stats2.blocks_claimed, 3);
     assert_eq!(h.cache.dirty_block_count(), 0, "cycle 2: all clean");
@@ -1263,7 +1278,9 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
 
     let mut tasks = JoinSet::new();
 
-    // Flusher: flush_packs (which does its own CRC pre-pass internally).
+    // Flusher: flush_packs + sync_manifest (which does its own CRC pre-pass
+    // internally). Must sync manifest between cycles so the flushing file is
+    // cleaned up before the next rotation.
     let total_corrupted = Arc::new(std::sync::atomic::AtomicU64::new(0));
     {
         let cache = Arc::clone(&cache);
@@ -1278,6 +1295,9 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
                     stats.blocks_crc_mismatched as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                if stats.packs_uploaded > 0 {
+                    let _ = cache.sync_manifest(&cs, &vm).await;
+                }
                 tokio::task::yield_now().await;
             }
         });
@@ -1391,6 +1411,12 @@ impl BottomlessHarness {
             )
             .await
             .unwrap();
+        if stats.packs_uploaded > 0 {
+            self.cache
+                .sync_manifest(&self.content_store, &self.volume_manifest)
+                .await
+                .unwrap();
+        }
         stats
     }
 
