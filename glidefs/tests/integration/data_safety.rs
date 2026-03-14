@@ -607,7 +607,7 @@ async fn test_ssd_corruption_detected_during_flush() {
     // Flush all 3 blocks — should succeed.
     let cache = Arc::new(cache);
     let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
-    assert_eq!(stats.blocks_corrupted, 0);
+    assert_eq!(stats.blocks_crc_mismatched, 0);
     assert_eq!(stats.blocks_claimed, 3);
     assert_eq!(cache.dirty_block_count(), 0, "all blocks flushed");
 
@@ -628,13 +628,13 @@ async fn test_ssd_corruption_detected_during_flush() {
 
     let stats2 = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
     // No CRC mismatch because both reads see the same "garbage" data.
-    assert_eq!(stats2.blocks_corrupted, 0);
+    assert_eq!(stats2.blocks_crc_mismatched, 0);
     assert_eq!(cache.dirty_block_count(), 0);
 
     // Fix: overwrite with correct data and flush again.
     cache.write(0, &data0).unwrap();
     let stats3 = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
-    assert_eq!(stats3.blocks_corrupted, 0);
+    assert_eq!(stats3.blocks_crc_mismatched, 0);
     assert_eq!(cache.dirty_block_count(), 0);
 }
 

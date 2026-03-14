@@ -64,8 +64,8 @@ pub struct ExportMetrics {
     /// Blocks left dirty per flush due to concurrent-write CAS failures
     pub flush_blocks_cas_failed: AtomicU64,
 
-    /// Blocks skipped due to SSD corruption (CRC mismatch while still SYNCING)
-    pub flush_blocks_corrupted: AtomicU64,
+    /// Blocks skipped due to CRC mismatch while SYNCING (write race or SSD corruption)
+    pub flush_blocks_crc_mismatched: AtomicU64,
 
     /// Failed manifest syncs after successful pack flush
     pub manifest_sync_errors: AtomicU64,
@@ -267,7 +267,7 @@ impl Default for ExportMetrics {
             s3_get_errors: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
             flush_blocks_cas_failed: AtomicU64::new(0),
-            flush_blocks_corrupted: AtomicU64::new(0),
+            flush_blocks_crc_mismatched: AtomicU64::new(0),
             manifest_sync_errors: AtomicU64::new(0),
             manifest_pending: AtomicU64::new(0),
             manifest_last_sync_epoch: AtomicU64::new(0),
@@ -397,11 +397,11 @@ impl ExportMetrics {
         }
     }
 
-    /// Record blocks skipped due to SSD corruption during flush.
+    /// Record blocks skipped due to CRC mismatch during flush (write race or SSD corruption).
     #[inline]
-    pub fn record_flush_blocks_corrupted(&self, count: usize) {
+    pub fn record_flush_blocks_crc_mismatched(&self, count: usize) {
         if count > 0 {
-            self.flush_blocks_corrupted
+            self.flush_blocks_crc_mismatched
                 .fetch_add(count as u64, Ordering::Relaxed);
         }
     }
@@ -497,7 +497,7 @@ impl ExportMetrics {
             s3_get_errors: self.s3_get_errors.load(Ordering::Relaxed),
             flush_errors: self.flush_errors.load(Ordering::Relaxed),
             flush_blocks_cas_failed: self.flush_blocks_cas_failed.load(Ordering::Relaxed),
-            flush_blocks_corrupted: self.flush_blocks_corrupted.load(Ordering::Relaxed),
+            flush_blocks_crc_mismatched: self.flush_blocks_crc_mismatched.load(Ordering::Relaxed),
             manifest_sync_errors: self.manifest_sync_errors.load(Ordering::Relaxed),
             manifest_pending: self.manifest_pending.load(Ordering::Relaxed) != 0,
             manifest_last_sync_epoch: self.manifest_last_sync_epoch.load(Ordering::Relaxed),
@@ -538,7 +538,7 @@ pub struct MetricsSnapshot {
     pub s3_get_errors: u64,
     pub flush_errors: u64,
     pub flush_blocks_cas_failed: u64,
-    pub flush_blocks_corrupted: u64,
+    pub flush_blocks_crc_mismatched: u64,
     pub manifest_sync_errors: u64,
     /// Whether a manifest sync is pending (packs on S3 but manifest not yet updated)
     pub manifest_pending: bool,
@@ -642,7 +642,7 @@ impl MetricsSnapshot {
         let _ = writeln!(out, "glidefs_s3_get_errors_total{{{label}}} {}", self.s3_get_errors);
         let _ = writeln!(out, "glidefs_flush_errors_total{{{label}}} {}", self.flush_errors);
         let _ = writeln!(out, "glidefs_flush_blocks_cas_failed_total{{{label}}} {}", self.flush_blocks_cas_failed);
-        let _ = writeln!(out, "glidefs_flush_blocks_corrupted_total{{{label}}} {}", self.flush_blocks_corrupted);
+        let _ = writeln!(out, "glidefs_flush_blocks_crc_mismatched_total{{{label}}} {}", self.flush_blocks_crc_mismatched);
         let _ = writeln!(out, "glidefs_manifest_sync_errors_total{{{label}}} {}", self.manifest_sync_errors);
         let _ = writeln!(out, "glidefs_manifest_pending{{{label}}} {}", u64::from(self.manifest_pending));
         let _ = writeln!(out, "glidefs_manifest_last_sync_epoch{{{label}}} {}", self.manifest_last_sync_epoch);
@@ -774,8 +774,8 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_flush_errors_total counter
 # HELP glidefs_flush_blocks_cas_failed_total Blocks left dirty per flush due to concurrent-write CAS failures
 # TYPE glidefs_flush_blocks_cas_failed_total counter
-# HELP glidefs_flush_blocks_corrupted_total Blocks skipped due to SSD corruption (CRC mismatch while SYNCING)
-# TYPE glidefs_flush_blocks_corrupted_total counter
+# HELP glidefs_flush_blocks_crc_mismatched_total Blocks skipped due to CRC mismatch while SYNCING (write race or SSD corruption)
+# TYPE glidefs_flush_blocks_crc_mismatched_total counter
 # HELP glidefs_manifest_sync_errors_total Failed manifest syncs after successful pack flush
 # TYPE glidefs_manifest_sync_errors_total counter
 # HELP glidefs_manifest_pending Whether packs exist on S3 not yet referenced by manifest

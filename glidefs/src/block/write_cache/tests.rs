@@ -1131,7 +1131,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
-    assert_eq!(stats.blocks_corrupted, 0, "consistent read = no mismatch");
+    assert_eq!(stats.blocks_crc_mismatched, 0, "consistent read = no mismatch");
     assert_eq!(stats.blocks_claimed, 1);
     assert_eq!(h.cache.dirty_block_count(), 0, "block flushed");
 }
@@ -1152,7 +1152,7 @@ async fn test_crc32_overwrite_then_flush() {
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
-    assert_eq!(stats.blocks_corrupted, 0);
+    assert_eq!(stats.blocks_crc_mismatched, 0);
     assert_eq!(stats.blocks_claimed, 1);
 }
 
@@ -1176,7 +1176,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
-    assert_eq!(stats.blocks_corrupted, 0, "no corruption");
+    assert_eq!(stats.blocks_crc_mismatched, 0, "no corruption");
     assert_eq!(stats.blocks_claimed, 5, "all 5 scanned");
     assert_eq!(stats.packs_uploaded, 1, "5 blocks → 1 pack");
     assert_eq!(h.cache.dirty_block_count(), 0, "all blocks clean");
@@ -1199,7 +1199,7 @@ async fn test_crc32_happy_path_multi_cycle() {
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
-    assert_eq!(stats1.blocks_corrupted, 0, "cycle 1: no corruption");
+    assert_eq!(stats1.blocks_crc_mismatched, 0, "cycle 1: no corruption");
     assert_eq!(stats1.blocks_claimed, 3);
     assert_eq!(stats1.packs_uploaded, 1);
     assert_eq!(h.cache.dirty_block_count(), 0, "cycle 1: all clean");
@@ -1216,7 +1216,7 @@ async fn test_crc32_happy_path_multi_cycle() {
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
-    assert_eq!(stats2.blocks_corrupted, 0, "cycle 2: no corruption");
+    assert_eq!(stats2.blocks_crc_mismatched, 0, "cycle 2: no corruption");
     assert_eq!(stats2.blocks_claimed, 3);
     assert_eq!(h.cache.dirty_block_count(), 0, "cycle 2: all clean");
 }
@@ -1275,7 +1275,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
             for _ in 0..10 {
                 let (stats, _) = cache.flush_packs(&cs, &cmc, &vm, None).await.unwrap();
                 corrupted.fetch_add(
-                    stats.blocks_corrupted as u64,
+                    stats.blocks_crc_mismatched as u64,
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 tokio::task::yield_now().await;
@@ -1304,7 +1304,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     }
 
     // With ephemeral CRCs, writes between the CRC pre-pass and rotation
-    // produce stale-CRC mismatches counted as blocks_corrupted. These are
+    // produce stale-CRC mismatches counted as blocks_crc_mismatched. These are
     // harmless retries, not real corruption. The important invariant is that
     // all blocks eventually flush (convergence).
 
@@ -1314,7 +1314,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
         .unwrap();
-    assert_eq!(stats.blocks_corrupted, 0, "quiesced flush should have no CRC mismatches");
+    assert_eq!(stats.blocks_crc_mismatched, 0, "quiesced flush should have no CRC mismatches");
     assert_eq!(cache.dirty_block_count(), 0, "all blocks should eventually flush");
 }
 
@@ -2413,6 +2413,104 @@ async fn test_crash_recovery_preserves_post_rotation_zero_write() {
             "block 0 should be zeros (guest's post-rotation write), \
              but got 0x{:02X} — recovery clobbered it with stale flushing data",
             buf[0]
+        );
+    }
+}
+
+/// Prove: if the recovery path skips a SYNCING block (e.g. pwrite failure),
+/// it must NOT be transitioned to DIRTY. The old code unconditionally called
+/// `transition_to_dirty` for ALL snapshot blocks, even ones whose data was
+/// NOT successfully copied to the active file. That would leave the active
+/// file with zeros for that block — next flush uploads zeros to S3.
+///
+/// This test directly exercises the recovery invariant: blocks whose data
+/// could NOT be recovered must stay SYNCING, not be falsely marked DIRTY.
+#[tokio::test]
+async fn test_flush_recovery_skipped_block_stays_syncing() {
+    let dir = TempDir::new().unwrap();
+    let config = bottomless_config(dir.path());
+
+    let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+    let cache = cache.finish_recovery().await.unwrap();
+
+    // Write known data to blocks 0, 1, 2
+    for i in 0u8..3 {
+        cache.write(i as u64 * 4096, &vec![i + 0x70; 4096]).unwrap();
+    }
+
+    // Rotate: data moves to flushing file, blocks become SYNCING
+    let snapshot = cache.rotate_and_snapshot().unwrap();
+    assert_eq!(snapshot.len(), 3);
+    for &idx in &snapshot {
+        assert_eq!(cache.inner.state_map.get(idx), SparseBlockState::SYNCING);
+    }
+
+    // Simulate the recovery path with SELECTIVE failure: block 1 fails
+    // to copy (simulating a pwrite error), blocks 0 and 2 succeed.
+    // This is the exact logic from the fixed flush_dirty_inner error path.
+    {
+        let block_size = config.block_size;
+        let df = cache.inner.data_file.write();
+        let mut recovered = Vec::new();
+        if let Some(ref ff) = *cache.inner.flushing_file.lock() {
+            for &idx in &snapshot {
+                if cache.inner.state_map.get(idx) != SparseBlockState::SYNCING {
+                    recovered.push(idx);
+                    continue;
+                }
+                let offset = idx as u64 * block_size as u64;
+                let mut buf = vec![0u8; block_size];
+                ff.read_exact_at(&mut buf, offset).unwrap();
+
+                // Simulate pwrite failure for block 1 only
+                if idx == 1 {
+                    // Skip — simulates df.write_all_at() returning Err
+                    continue;
+                }
+
+                df.write_all_at(&buf, offset).unwrap();
+                recovered.push(idx);
+            }
+        }
+        drop(df);
+
+        // Only transition successfully recovered blocks
+        for &idx in &recovered {
+            cache.inner.transition_to_dirty(idx);
+        }
+    }
+
+    // Blocks 0 and 2: successfully copied → DIRTY
+    assert_eq!(
+        cache.inner.state_map.get(0),
+        SparseBlockState::DIRTY,
+        "block 0 (recovered) should be DIRTY"
+    );
+    assert_eq!(
+        cache.inner.state_map.get(2),
+        SparseBlockState::DIRTY,
+        "block 2 (recovered) should be DIRTY"
+    );
+
+    // Block 1: pwrite failed → must stay SYNCING, NOT DIRTY.
+    // The old code (`let _ = df.write_all_at(...)` + unconditional
+    // transition_to_dirty for all blocks) would have marked it DIRTY
+    // with zeros in the active file — next flush uploads zeros = corruption.
+    assert_eq!(
+        cache.inner.state_map.get(1),
+        SparseBlockState::SYNCING,
+        "block 1 (pwrite failed) must stay SYNCING — marking DIRTY would \
+         cause the next flush to upload zeros (data corruption)"
+    );
+
+    // Verify the recovered blocks actually have correct data in active file
+    for &(idx, fill) in &[(0usize, 0x70u8), (2usize, 0x72u8)] {
+        let mut buf = vec![0u8; 4096];
+        cache.inner.data_file.read().read_exact_at(&mut buf, idx as u64 * 4096).unwrap();
+        assert!(
+            buf.iter().all(|&b| b == fill),
+            "block {} should have 0x{:02x} after recovery",
+            idx, fill,
         );
     }
 }

@@ -35,6 +35,9 @@ struct FlushResult {
     packs_uploaded: usize,
     /// Whether the manifest was successfully synced to S3.
     manifest_synced: bool,
+    /// Another host owns this export's manifest (ETag conflict).
+    /// When true, the scheduler should stop flushing entirely.
+    manifest_conflict: bool,
 }
 
 /// Execute flush_packs + sync_manifest (with retries).
@@ -63,9 +66,10 @@ async fn flush_and_sync(
             *flush_backoff = Duration::ZERO;
             *last_flush_failure = None;
             metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
-            metrics.record_flush_blocks_corrupted(stats.blocks_corrupted);
+            metrics.record_flush_blocks_crc_mismatched(stats.blocks_crc_mismatched);
 
             let mut manifest_synced = false;
+            let mut manifest_conflict = false;
             if stats.packs_uploaded > 0 {
                 info!(
                     packs = stats.packs_uploaded,
@@ -81,6 +85,15 @@ async fn flush_and_sync(
                         Ok(()) => {
                             manifest_synced = true;
                             metrics.record_manifest_synced();
+                            break;
+                        }
+                        Err(e) if e.is_manifest_conflict() => {
+                            tracing::error!(
+                                "manifest ETag conflict — another host owns this export, \
+                                 stopping flush scheduler"
+                            );
+                            metrics.record_manifest_sync_error();
+                            manifest_conflict = true;
                             break;
                         }
                         Err(e) => {
@@ -103,6 +116,7 @@ async fn flush_and_sync(
             Some(FlushResult {
                 packs_uploaded: stats.packs_uploaded,
                 manifest_synced,
+                manifest_conflict,
             })
         }
         Err(e) => {
@@ -266,12 +280,15 @@ pub async fn flush_scheduler(
                     ).await {
                         metrics.record_s3_put_latency(start.elapsed());
                         packs_uploaded = result.packs_uploaded;
+                        if result.manifest_conflict {
+                            return;
+                        }
                         if result.packs_uploaded > 0 {
                             if result.manifest_synced {
                                 manifest_pending = false;
                                 metrics.set_manifest_pending(false);
                             } else {
-                                // Do NOT checkpoint here. local_checkpoint persists
+                                // Do NOT checkpoint here. checkpoint persists
                                 // block states as CLEAN and truncates the WAL. If the
                                 // host crashes before manifest sync succeeds, those
                                 // blocks become irrecoverable (CLEAN on disk, but S3
@@ -284,14 +301,14 @@ pub async fn flush_scheduler(
                         } else {
                             // No packs uploaded — still checkpoint to persist
                             // clean block states.
-                            if let Err(e) = cache.local_checkpoint().await {
+                            if let Err(e) = cache.checkpoint().await {
                                 warn!(error = %e, "checkpoint after flush");
                             }
                         }
                     } else {
                         // Flush failed — still checkpoint to prevent WAL growth
                         // when S3 is down and flush_notify fires continuously.
-                        if let Err(e) = cache.local_checkpoint().await {
+                        if let Err(e) = cache.checkpoint().await {
                             warn!(error = %e, "checkpoint after flush error");
                         }
                     }
@@ -352,9 +369,17 @@ pub async fn flush_scheduler(
                             // flushed to S3 remain DIRTY in the .meta file and
                             // WAL entries are never truncated. On recovery,
                             // those blocks would be unnecessarily re-uploaded.
-                            if let Err(e) = cache.local_checkpoint().await {
+                            if let Err(e) = cache.checkpoint().await {
                                 warn!(error = %e, "checkpoint after deferred manifest sync");
                             }
+                        }
+                        Err(e) if e.is_manifest_conflict() => {
+                            tracing::error!(
+                                "manifest ETag conflict — another host owns this export, \
+                                 stopping flush scheduler"
+                            );
+                            metrics.record_manifest_sync_error();
+                            return;
                         }
                         Err(e) => {
                             metrics.record_manifest_sync_error();
@@ -375,15 +400,19 @@ pub async fn flush_scheduler(
                         if let Some(result) = flush_and_sync(
                             &cache, &content_store, &pack_index_cache, &volume_manifest,
                             &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
-                        ).await
-                            && result.packs_uploaded > 0 {
-                            manifest_pending = !result.manifest_synced;
-                            metrics.set_manifest_pending(manifest_pending);
+                        ).await {
+                            if result.manifest_conflict {
+                                return;
+                            }
+                            if result.packs_uploaded > 0 {
+                                manifest_pending = !result.manifest_synced;
+                                metrics.set_manifest_pending(manifest_pending);
+                            }
                         }
                     }
 
                     // Always checkpoint locally when dirty.
-                    if let Err(e) = cache.local_checkpoint().await {
+                    if let Err(e) = cache.checkpoint().await {
                         warn!(error = %e, "local checkpoint failed");
                     }
                 }
@@ -1073,7 +1102,7 @@ mod tests {
 
         // After recovery, blocks MUST still be dirty. The manifest never
         // synced, so these blocks exist as unreferenced packs on S3. If
-        // local_checkpoint() ran after the failed manifest sync, .meta
+        // checkpoint() ran after the failed manifest sync, .meta
         // would show CLEAN + WAL truncated = data loss on crash.
         assert!(
             recovered.dirty_block_count() > 0,

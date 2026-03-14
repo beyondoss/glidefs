@@ -55,4 +55,15 @@ impl CacheError {
     pub fn invalid_metadata() -> Self {
         CacheError::InvalidMetadata
     }
+
+    /// True when the error is an S3 precondition failure (ETag mismatch),
+    /// indicating another host has taken ownership of this export's manifest.
+    pub fn is_manifest_conflict(&self) -> bool {
+        matches!(
+            self,
+            CacheError::ContentStore(ContentStoreError::ObjectStore(
+                object_store::Error::Precondition { .. }
+            ))
+        )
+    }
 }

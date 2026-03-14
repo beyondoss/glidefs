@@ -8,7 +8,7 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
 use crate::block::cache::BlockCache;
-use crate::block::content_store::ContentStore;
+use crate::block::content_store::{ContentStore, ContentStoreError};
 use crate::block::state::{Active, Draining};
 
 use super::inner::{CacheInner, is_zero_block};
@@ -44,7 +44,7 @@ enum BlockResult {
     Skipped {
         chunk_index: usize,
         cas_failed: bool,
-        corrupted: bool,
+        crc_mismatched: bool,
     },
 }
 
@@ -118,7 +118,7 @@ fn compute_flush_batch(
                         return Ok(BlockResult::Skipped {
                             chunk_index,
                             cas_failed: true,
-                            corrupted: false,
+                            crc_mismatched: false,
                         });
                     }
                     debug!(
@@ -130,7 +130,7 @@ fn compute_flush_batch(
                     return Ok(BlockResult::Skipped {
                         chunk_index,
                         cas_failed: false,
-                        corrupted: true,
+                        crc_mismatched: true,
                     });
                 }
             }
@@ -177,15 +177,15 @@ fn compute_flush_batch(
             BlockResult::Skipped {
                 chunk_index,
                 cas_failed,
-                corrupted,
+                crc_mismatched,
             } => {
                 stats.blocks_claimed += 1;
                 skipped.push(chunk_index);
                 if cas_failed {
                     stats.blocks_cas_failed += 1;
                 }
-                if corrupted {
-                    stats.blocks_corrupted += 1;
+                if crc_mismatched {
+                    stats.blocks_crc_mismatched += 1;
                 }
             }
             BlockResult::Computed {
@@ -357,34 +357,17 @@ impl WriteCache<Active> {
     /// Persist block states and truncate WAL.
     ///
     /// Runs on a blocking thread via `spawn_blocking` to avoid blocking
-    /// the Tokio runtime with `sync_all()` + `rename()` syscalls in
-    /// `save_block_states`.
-    ///
-    async fn checkpoint(&self) -> Result<(), CacheError> {
-        let inner = Arc::clone(&self.inner);
-        crate::task::spawn_blocking_named("checkpoint", move || {
-            inner.save_block_states()?;
-            inner.wal.truncate()?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| CacheError::Io(std::io::Error::other(e)))?
-    }
-
-    /// Local checkpoint: persist block states and truncate WAL.
-    ///
-    /// Runs on a blocking thread via `spawn_blocking` to avoid blocking
     /// the Tokio runtime with `sync_all()` + `rename()` syscalls.
     ///
     /// Independent of S3 — keeps the WAL bounded in demand-driven mode
     /// where S3 flushes may be infrequent. Should run every ~5s when
     /// there are dirty blocks.
-    pub async fn local_checkpoint(&self) -> Result<(), CacheError> {
+    pub async fn checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
-        crate::task::spawn_blocking_named("local-checkpoint", move || {
+        crate::task::spawn_blocking_named("checkpoint", move || {
             inner.save_block_states()?;
             inner.wal.truncate()?;
-            debug!("local checkpoint complete");
+            debug!("checkpoint complete");
             Ok(())
         })
         .await
@@ -582,9 +565,13 @@ impl WriteCache<Active> {
             // to avoid deadlock.
             let block_size = self.inner.config.block_size;
             let df = self.inner.data_file.write();
+            let mut recovered = Vec::with_capacity(snapshot.len());
             if let Some(ref ff) = *self.inner.flushing_file.lock() {
                 for &idx in &snapshot {
                     if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
+                        // Already re-dirtied by a concurrent write — data is
+                        // in the active file. Safe to transition.
+                        recovered.push(idx);
                         continue;
                     }
                     let offset = idx as u64 * block_size as u64;
@@ -595,8 +582,28 @@ impl WriteCache<Active> {
                     if valid_bytes > 0 {
                         let mut buf = vec![0u8; valid_bytes];
                         if ff.read_exact_at(&mut buf, offset).is_ok() {
-                            let _ = df.write_all_at(&buf, offset);
+                            if let Err(e) = df.write_all_at(&buf, offset) {
+                                // Cannot copy block to active file. Leave it
+                                // SYNCING — crash recovery will handle it.
+                                // Do NOT mark dirty: the active file has zeros.
+                                warn!(
+                                    block = idx,
+                                    error = %e,
+                                    "pwrite to active file failed during flush \
+                                     recovery — block left SYNCING"
+                                );
+                                continue;
+                            }
                         }
+                    }
+                    recovered.push(idx);
+                }
+            } else {
+                // No flushing file — blocks not in SYNCING were already
+                // handled by concurrent writes. Only transition those.
+                for &idx in &snapshot {
+                    if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
+                        recovered.push(idx);
                     }
                 }
             }
@@ -608,8 +615,8 @@ impl WriteCache<Active> {
             if flushing_path.exists() {
                 let _ = std::fs::remove_file(&flushing_path);
             }
-            // Now transition all snapshot blocks to DIRTY (after data is in active file).
-            for &idx in &snapshot {
+            // Only transition blocks whose data was successfully recovered.
+            for &idx in &recovered {
                 self.inner.transition_to_dirty(idx);
             }
         }
@@ -711,13 +718,13 @@ impl WriteCache<Active> {
             total_stats.blocks_claimed += batch.stats.blocks_claimed;
             total_stats.blocks_deduped += batch.stats.blocks_deduped;
             total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
-            total_stats.blocks_corrupted += batch.stats.blocks_corrupted;
+            total_stats.blocks_crc_mismatched += batch.stats.blocks_crc_mismatched;
 
             // Transition skipped blocks back to DIRTY.
             //
-            // Blocks still SYNCING (corrupted, partial-not-re-dirtied) need
-            // data promoted from flushing → active before transition, since
-            // no guest write triggered promote-on-write for them.
+            // Blocks still SYNCING (CRC-mismatched, partial-not-re-dirtied)
+            // need data promoted from flushing → active before transition,
+            // since no guest write triggered promote-on-write for them.
             // Blocks already DIRTY (re-dirtied by guest write) were promoted
             // by the write path — don't overwrite active with stale data.
             {
@@ -738,7 +745,15 @@ impl WriteCache<Active> {
                         if valid > 0 {
                             let mut buf = vec![0u8; valid];
                             if ff.read_exact_at(&mut buf, offset).is_ok() {
-                                let _ = df.write_all_at(&buf, offset);
+                                if let Err(e) = df.write_all_at(&buf, offset) {
+                                    warn!(
+                                        block = idx,
+                                        error = %e,
+                                        "pwrite to active file failed during \
+                                         skipped-block recovery — block left SYNCING"
+                                    );
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -868,7 +883,7 @@ impl WriteCache<Active> {
             blocks_claimed = total_stats.blocks_claimed,
             blocks_deduped = total_stats.blocks_deduped,
             blocks_cas_failed = total_stats.blocks_cas_failed,
-            blocks_corrupted = total_stats.blocks_corrupted,
+            blocks_crc_mismatched = total_stats.blocks_crc_mismatched,
             packs_uploaded = total_stats.packs_uploaded,
             bytes_uploaded = total_stats.bytes_uploaded,
             "flush complete"
@@ -952,6 +967,11 @@ impl WriteCache<Active> {
                     *self.inner.manifest_etag.lock() = new_etag;
                     last_err = None;
                     break;
+                }
+                Err(e @ ContentStoreError::ObjectStore(object_store::Error::Precondition { .. })) => {
+                    // Another host owns this manifest. Don't retry — every
+                    // attempt will fail with the same stale ETag.
+                    return Err(e.into());
                 }
                 Err(e) => {
                     warn!(
