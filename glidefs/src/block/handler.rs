@@ -184,6 +184,35 @@ impl BlockHandler {
             if zero_end - zero_start >= block_size_u64 {
                 continue;
             }
+            // Check if this block has S3 data before doing the expensive resolve.
+            let has_s3_data = {
+                let (bo, pids) = {
+                    let vm = self.volume_manifest.read();
+                    let ci = vm.chunk_idx_for_block(block);
+                    let bo = vm.block_offset_in_chunk(block);
+                    let pids = vm.chunk_pack_ids(ci).map(|ids| ids.to_vec()).unwrap_or_default();
+                    (bo, pids)
+                };
+                if pids.is_empty() {
+                    false
+                } else {
+                    let mut found = false;
+                    for &pid in pids.iter().rev() {
+                        if self.pack_index_cache.lookup_block(pid, bo).await.is_some() {
+                            found = true;
+                            break;
+                        }
+                        if self.pack_index_cache.get_entries(pid).await.is_none() {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
+            };
+            if !has_s3_data {
+                continue;
+            }
             // Fetch prior data from S3 and write the full block.
             let block_data = match self.cache.resolve_block_for_backfill(
                 idx,
@@ -274,6 +303,42 @@ impl BlockHandler {
             }
 
             // Sub-block write to a NOT_PRESENT block.
+            // Check if this specific block has S3 data before doing the
+            // expensive resolve. Most first-writes to fresh blocks have no
+            // S3 data — the volume manifest has no pack_ids for them.
+            let (bo, pids) = {
+                let vm = self.volume_manifest.read();
+                let ci = vm.chunk_idx_for_block(block as u64);
+                let bo = vm.block_offset_in_chunk(block as u64);
+                let pids = vm.chunk_pack_ids(ci).map(|ids| ids.to_vec()).unwrap_or_default();
+                (bo, pids)
+            };
+            let has_s3_data = if pids.is_empty() {
+                false
+            } else {
+                // Check if any pack actually contains this block offset.
+                let mut found = false;
+                for &pid in pids.iter().rev() {
+                    if self.pack_index_cache.lookup_block(pid, bo).await.is_some() {
+                        found = true;
+                        break;
+                    }
+                    // If pack index isn't cached, conservatively assume it has data.
+                    if self.pack_index_cache.get_entries(pid).await.is_none() {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+
+            if !has_s3_data {
+                // No prior data in S3 — the data file has zeros from set_len.
+                // Just write the guest's sub-block directly.
+                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                continue;
+            }
+
             // Fetch prior data BEFORE claiming — resolve_block_for_backfill
             // checks is_present and reads from the data file if true, so the
             // block must still be NOT_PRESENT during the fetch.
