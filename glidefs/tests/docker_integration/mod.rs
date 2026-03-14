@@ -889,6 +889,22 @@ impl TestServer {
         }
     }
 
+    /// Simulate a process crash: abort the server task and drop the router
+    /// without draining dirty blocks. Background flush schedulers exit once
+    /// they detect the dropped shutdown channel. Data remains on the SSD
+    /// for WAL recovery by the next server instance.
+    pub async fn crash_shutdown(self) {
+        self.shutdown.cancel();
+        self._server_handle.abort();
+        let _ = self._server_handle.await;
+        // self is consumed here — router Arc drops, ExportState drops,
+        // flush_shutdown_tx channels close. Brief sleep to let flush
+        // schedulers on other threads observe the close and exit,
+        // releasing their data file handles.
+        drop(self.router);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
     /// Drain all exports and shut down gracefully.
     pub async fn shutdown(self) {
         // Shut down kernel devices first (they hold handler/router refs).
