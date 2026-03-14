@@ -64,9 +64,7 @@ impl CacheError {
     pub fn is_manifest_conflict(&self) -> bool {
         matches!(
             self,
-            CacheError::ContentStore(ContentStoreError::ObjectStore(
-                object_store::Error::Precondition { .. }
-            ))
+            CacheError::ContentStore(ContentStoreError::PreconditionFailed(_))
         )
     }
 }

@@ -81,17 +81,32 @@ fn zero_block_hash(block_size: usize) -> Blake3Hash {
 
 /// Returns zero-block bytes and hash for the given block size.
 ///
-/// Cached in a global `OnceLock` — block size is uniform across all exports.
+/// Memoized: computes once per unique block_size, returns cached result
+/// thereafter. Typical deployments use 1-2 block sizes so the linear
+/// scan is negligible.
 pub fn shared_zero_block(block_size: usize) -> (Bytes, Blake3Hash) {
-    use std::sync::OnceLock;
-    static ZERO_BLOCK: OnceLock<(Bytes, Blake3Hash)> = OnceLock::new();
-    ZERO_BLOCK
-        .get_or_init(|| {
-            let bytes = Bytes::from(vec![0u8; block_size]);
-            let hash = zero_block_hash(block_size);
-            (bytes, hash)
-        })
-        .clone()
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
+
+    static CACHE: LazyLock<Mutex<Vec<(usize, Bytes, Blake3Hash)>>> =
+        LazyLock::new(|| Mutex::new(Vec::with_capacity(2)));
+
+    let cache = CACHE.lock();
+    if let Some((_, bytes, hash)) = cache.iter().find(|(bs, _, _)| *bs == block_size) {
+        return (bytes.clone(), *hash);
+    }
+    drop(cache);
+
+    let bytes = Bytes::from(vec![0u8; block_size]);
+    let hash = zero_block_hash(block_size);
+
+    let mut cache = CACHE.lock();
+    // Double-check after re-acquiring (another thread may have inserted).
+    if let Some((_, bytes, hash)) = cache.iter().find(|(bs, _, _)| *bs == block_size) {
+        return (bytes.clone(), *hash);
+    }
+    cache.push((block_size, bytes.clone(), hash));
+    (bytes, hash)
 }
 
 // ============================================================================

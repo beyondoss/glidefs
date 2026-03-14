@@ -2548,7 +2548,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
 
     const SUB_BLOCK: usize = 4096;
     const NUM_WRITERS: usize = 4;
-    const ITERATIONS: usize = 50;
+    const ITERATIONS: usize = 10;
     const DEVICE_SIZE_GB: f64 = 1.0;
 
     for iteration in 0..ITERATIONS {

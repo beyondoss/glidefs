@@ -488,6 +488,8 @@ impl CacheInner {
         // and compute_flush_batch from accessing flushing_file.
         let ff = self.flushing_file.lock().clone();
         if let Some(ref ff) = ff {
+            // Allocate once, reuse across blocks (avoids per-block 128KB alloc churn).
+            let mut buf = vec![0u8; block_size as usize];
             for block in start_block..=end_block {
                 let idx = block as usize;
                 if idx >= self.num_blocks {
@@ -507,7 +509,6 @@ impl CacheInner {
                 if valid == 0 {
                     continue;
                 }
-                let mut buf = vec![0u8; valid];
                 // Propagate both read and write errors. If reading from
                 // the flushing file fails (SSD error), we must not
                 // silently skip promotion — the active file has zeros for
@@ -515,8 +516,8 @@ impl CacheInner {
                 // non-written portion as zeros instead of the original
                 // data. Failing the write to the guest is safer than
                 // silent data corruption.
-                ff.read_exact_at(&mut buf, offset)?;
-                df.write_all_at(&buf, offset)?;
+                ff.read_exact_at(&mut buf[..valid], offset)?;
+                df.write_all_at(&buf[..valid], offset)?;
                 if state == SparseBlockState::SYNCING {
                     // CAS SYNCING→DIRTY immediately after copying data.
                     // This prevents the flush thread from evicting the block

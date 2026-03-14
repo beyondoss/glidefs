@@ -45,23 +45,7 @@ impl WriteCache<Active> {
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
 
-        // CRITICAL: Mark blocks as present BEFORE writing to file.
-        // This prevents a race with prefetch where:
-        // 1. Prefetch sees is_present=false
-        // 2. Write does pwrite(new_data)
-        // 3. Prefetch does pwrite(s3_data) - OVERWRITES new_data
-        // 4. Write does set_present (too late)
-        //
-        // By setting present first, prefetch's CAS will fail if we've claimed the block,
-        // or if prefetch wins the CAS, our pwrite will overwrite their stale S3 data.
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx < self.inner.num_blocks {
-                self.inner.set_present(idx);
-            }
-        }
-
-        // Hold the data_file read lock across pwrite + dirty marking.
+        // Hold the data_file read lock across promote + pwrite + dirty marking.
         //
         // rotate_and_snapshot() acquires the data_file WRITE lock to snapshot
         // dirty blocks and swap files atomically. If we release the read lock
@@ -73,16 +57,39 @@ impl WriteCache<Active> {
         //      flushing file, not the new active file)
         // The flushing file is deleted after flush, permanently losing the data.
         //
-        // Holding the read lock across both operations prevents rotation from
+        // Holding the read lock across all operations prevents rotation from
         // interleaving. The read lock is shared, so concurrent writers are
         // not blocked — only rotation waits until all writers release.
         let df = self.inner.data_file.read();
 
-        // Promote SYNCING blocks from flushing → active before pwrite.
-        // This ensures the active file has the complete block so the guest's
-        // sub-block write doesn't leave the rest as zeros.
-        // Also recovers NOT_PRESENT blocks if flushing file is still available.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block, false)?;
+        // Promote SYNCING/NOT_PRESENT blocks from flushing → active BEFORE
+        // set_present. promote_syncing_blocks needs to see the real block
+        // state to detect evicted blocks. If set_present runs first, it
+        // masks NOT_PRESENT as CLEAN, and promote silently skips — leaving
+        // zeros on the active file for sub-block writes.
+        //
+        // For sub-block writes (data doesn't cover the full block), require
+        // promotion: if the block was evicted (NOT_PRESENT) and the flushing
+        // file is gone, return BlockEvicted so the caller can re-backfill.
+        // Full-block writes don't need prior data — they overwrite everything.
+        let is_sub_block = data.len() < self.inner.config.block_size
+            || offset % (self.inner.config.block_size as u64) != 0;
+        self.inner.promote_syncing_blocks(&df, start_block, end_block, is_sub_block)?;
+
+        // Mark blocks present AFTER promote but BEFORE pwrite.
+        // This prevents a race with prefetch where:
+        // 1. Prefetch sees is_present=false
+        // 2. Write does pwrite(new_data)
+        // 3. Prefetch does pwrite(s3_data) - OVERWRITES new_data
+        //
+        // By setting present first, prefetch's CAS will fail if we've
+        // claimed the block, or our pwrite will overwrite their stale data.
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                self.inner.set_present(idx);
+            }
+        }
 
         df.write_all_at(data, offset)?;
 

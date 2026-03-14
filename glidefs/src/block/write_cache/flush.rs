@@ -147,14 +147,15 @@ fn compute_flush_batch(
 
             let hash = blake3_128(&chunk_buf);
 
-            // Warm clean_cache: decompressed block data
-            // goes into the Foyer S3-FIFO cache so reads after eviction hit
-            // cache instead of S3. S3-FIFO handles scan resistance.
-            if let Some(ref cache) = clean_cache {
-                cache.insert(hash, Bytes::from(chunk_buf.clone()));
-            }
-
             let compressed = Some(lz4_compress(&chunk_buf[..]));
+
+            // Warm clean_cache: decompressed block data goes into the
+            // Foyer S3-FIFO cache so reads after eviction hit cache
+            // instead of S3. Inserted after compression so we can move
+            // chunk_buf instead of cloning it (saves 128KB alloc per block).
+            if let Some(ref cache) = clean_cache {
+                cache.insert(hash, Bytes::from(chunk_buf));
+            }
 
             Ok(BlockResult::Computed {
                 chunk_index,
@@ -577,13 +578,13 @@ impl WriteCache<Active> {
             // to avoid deadlock.
             let block_size = self.inner.config.block_size;
             let df = self.inner.data_file.write();
-            let mut recovered = Vec::with_capacity(snapshot.len());
+            let mut recovered = std::collections::HashSet::with_capacity(snapshot.len());
             if let Some(ref ff) = *self.inner.flushing_file.lock() {
                 for &idx in &snapshot {
                     if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
                         // Already re-dirtied by a concurrent write — data is
                         // in the active file. Safe to transition.
-                        recovered.push(idx);
+                        recovered.insert(idx);
                         continue;
                     }
                     let offset = idx as u64 * block_size as u64;
@@ -607,7 +608,7 @@ impl WriteCache<Active> {
                                     );
                                     continue;
                                 }
-                                recovered.push(idx);
+                                recovered.insert(idx);
                             }
                             Err(e) => {
                                 // Cannot read block from flushing file. Leave it
@@ -623,7 +624,7 @@ impl WriteCache<Active> {
                             }
                         }
                     } else {
-                        recovered.push(idx);
+                        recovered.insert(idx);
                     }
                 }
             } else {
@@ -631,7 +632,7 @@ impl WriteCache<Active> {
                 // handled by concurrent writes. Only transition those.
                 for &idx in &snapshot {
                     if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
-                        recovered.push(idx);
+                        recovered.insert(idx);
                     }
                 }
             }
@@ -1036,7 +1037,7 @@ impl WriteCache<Active> {
                     last_err = None;
                     break;
                 }
-                Err(e @ ContentStoreError::ObjectStore(object_store::Error::Precondition { .. })) => {
+                Err(e @ ContentStoreError::PreconditionFailed(_)) => {
                     // Another host owns this manifest. Don't retry — every
                     // attempt will fail with the same stale ETag.
                     return Err(e.into());

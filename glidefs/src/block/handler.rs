@@ -276,13 +276,26 @@ impl BlockHandler {
         let start_block = offset / block_size_u64;
         let end_block = (offset + data.len() as u64 - 1) / block_size_u64;
 
-        // Fast path: all blocks already present — skip backfill entirely.
-        let needs_backfill = (start_block..=end_block).any(|b| {
-            !self.cache.is_block_present(b as usize)
-        });
-        if !needs_backfill {
-            self.cache.write(offset, data)?;
-            return Ok(());
+        // Fast path: all blocks already present AND fully written.
+        // DIRTY/SYNCING = data is on local SSD (or promotable from flushing file).
+        // CLEAN = claimed but not yet written — must NOT write sub-range yet.
+        // NOT_PRESENT = needs backfill.
+        {
+            use crate::block::block_map::SparseBlockState;
+            let all_ready = (start_block..=end_block).all(|b| {
+                let state = self.cache.block_state(b as usize);
+                state == SparseBlockState::DIRTY || state == SparseBlockState::SYNCING
+            });
+            if all_ready {
+                match self.cache.write(offset, data) {
+                    Ok(()) => return Ok(()),
+                    Err(super::write_cache::CacheError::BlockEvicted) => {
+                        // Flush evicted a block between state check and pwrite.
+                        // Fall through to slow path which retries per-block.
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
         }
 
         // Slow path: at least one block needs backfill.
@@ -297,122 +310,36 @@ impl BlockHandler {
             let block_local_start = (write_start - block_start) as usize;
             let write_len = (write_end - write_start) as usize;
 
-            {
+            // Resolve the block state. DIRTY/SYNCING blocks have data on
+            // local SSD (or promotable from the flushing file via
+            // promote_syncing_blocks inside cache.write). Safe to pwrite
+            // our sub-range directly. CLEAN means another writer claimed
+            // the block but hasn't written yet — we must wait. NOT_PRESENT
+            // means the block needs backfill from S3.
+            //
+            // After any wait or backfill, re-check state: flush rotation
+            // can transition the block through DIRTY→SYNCING→NOT_PRESENT
+            // at any time. If that happens, we must restart the backfill
+            // for this block rather than writing into an empty file.
+            'block_retry: loop {
                 use crate::block::block_map::SparseBlockState;
                 let state = self.cache.block_state(idx);
-                if state == SparseBlockState::DIRTY || state == SparseBlockState::SYNCING {
-                    // Block is fully written (DIRTY) or being flushed (SYNCING).
-                    // Safe to pwrite our sub-range directly.
-                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                    continue;
-                }
-                if state == SparseBlockState::CLEAN {
-                    // Another writer claimed this block (CAS NOT_PRESENT→CLEAN)
-                    // but hasn't written the merged data yet. Wait for the
-                    // full-block write to complete before writing our sub-range.
-                    loop {
-                        let st = self.cache.block_state(idx);
-                        if st != SparseBlockState::CLEAN {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_micros(50)).await;
-                    }
-                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                    continue;
-                }
-                // NOT_PRESENT — need backfill, fall through.
-            }
 
-            if write_len >= block_size {
-                // Full block overwrite — no prior data to preserve.
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
-            }
-
-            // Sub-block write to a NOT_PRESENT block.
-            // Check if this specific block has S3 data before doing the
-            // expensive resolve. Most first-writes to fresh blocks have no
-            // S3 data — the volume manifest has no pack_ids for them.
-            let (bo, pids) = {
-                let vm = self.volume_manifest.read();
-                let ci = vm.chunk_idx_for_block(block as u64);
-                let bo = vm.block_offset_in_chunk(block as u64);
-                let pids = vm.chunk_pack_ids(ci).map(|ids| ids.to_vec()).unwrap_or_default();
-                (bo, pids)
-            };
-            let has_s3_data = if pids.is_empty() {
-                false
-            } else {
-                // Check if any pack actually contains this block offset.
-                let mut found = false;
-                for &pid in pids.iter().rev() {
-                    if self.pack_index_cache.lookup_block(pid, bo).await.is_some() {
-                        found = true;
-                        break;
-                    }
-                    // If pack index isn't cached, conservatively assume it has data.
-                    if self.pack_index_cache.get_entries(pid).await.is_none() {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            };
-
-            if !has_s3_data {
-                // No prior data in S3 — the data file has zeros from set_len.
-                // Just write the guest's sub-block directly.
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
-            }
-
-            // Fetch prior data BEFORE claiming — resolve_block_for_backfill
-            // checks is_present and reads from the data file if true, so the
-            // block must still be NOT_PRESENT during the fetch.
-            //
-            // If the fetch fails, propagate the error. Silently using zeros
-            // would corrupt the non-written portion of the block — the guest's
-            // sub-block write lands correctly but the rest becomes zeros,
-            // overwriting valid S3 data on the next flush.
-            let prior = self.cache.resolve_block_for_backfill(
-                idx,
-                self.clean_cache.as_ref(),
-                &self.pack_index_cache,
-                &self.volume_manifest,
-                &self.content_store,
-                Some(&self.metrics),
-            ).await.map_err(|e| {
-                tracing::warn!(
-                    block = idx,
-                    error = %e,
-                    "S3 backfill failed for sub-block write — rejecting write to prevent data corruption"
-                );
-                CommandError::IoError
-            })?;
-
-            // Re-check: a concurrent writer may have completed a backfill
-            // while we were fetching from S3.
-            //
-            // Three cases:
-            // - DIRTY/SYNCING: backfill write completed. Safe to pwrite
-            //   our sub-range on top.
-            // - CLEAN: another writer claimed the block (CAS NOT_PRESENT→CLEAN)
-            //   but hasn't written the merged data yet. Our `prior` may be
-            //   stale zeros (resolve_block_for_backfill reads from local SSD
-            //   when is_present=true, which returns the sparse file's zeros).
-            //   We MUST wait for the winner to finish before writing.
-            // - NOT_PRESENT: nobody claimed yet. Fall through to CAS claim.
-            {
-                use crate::block::block_map::SparseBlockState;
-                let state = self.cache.block_state(idx);
                 match state {
                     s if s == SparseBlockState::DIRTY || s == SparseBlockState::SYNCING => {
-                        self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                        continue;
+                        // Block has data locally. cache.write handles SYNCING
+                        // via promote_syncing_blocks (copies from flushing file).
+                        // If the block was evicted between our state check and
+                        // the pwrite (flush completed), BlockEvicted triggers retry.
+                        match self.cache.write(write_start, &data[data_offset..data_offset + write_len]) {
+                            Ok(()) => break 'block_retry,
+                            Err(super::write_cache::CacheError::BlockEvicted) => continue 'block_retry,
+                            Err(e) => return Err(e.into()),
+                        }
                     }
                     s if s == SparseBlockState::CLEAN => {
-                        // Wait for the winner's full-block write to complete
-                        // (CLEAN → DIRTY), then write our sub-range on top.
+                        // Another writer claimed this block but hasn't written
+                        // the merged data yet. Wait for completion.
                         loop {
                             let st = self.cache.block_state(idx);
                             if st != SparseBlockState::CLEAN {
@@ -420,68 +347,113 @@ impl BlockHandler {
                             }
                             tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                         }
-                        self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                        continue;
+                        // State changed — re-enter the outer match to handle
+                        // whatever it became (DIRTY, SYNCING, or NOT_PRESENT
+                        // if flush evicted it).
+                        continue 'block_retry;
                     }
-                    _ => {} // NOT_PRESENT — fall through to CAS claim
-                }
-            }
-
-            // If prior data is all zeros and no one has claimed the block,
-            // just write the guest's sub-block directly — the data file
-            // already has zeros from set_len.
-            if prior.is_empty() || prior.iter().all(|&b| b == 0) {
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
-            }
-
-            // Non-zero prior data: claim the block atomically, then merge
-            // and write. Only the CAS winner does the full-block write;
-            // losers wait until the winner finishes and write their sub-range.
-            if !self.cache.try_claim_block(idx) {
-                // Another writer claimed this block. Wait for their
-                // cache.write to complete (CLEAN → DIRTY transition),
-                // then write our sub-range on top of the backfilled data.
-                //
-                // The winner's post-claim path is bounded: in-memory merge
-                // + single pwrite under the data_file read lock. The only
-                // blocker is flush rotation's write lock (~15µs typical).
-                // No deadline — proceeding early would write our sub-range
-                // into zeros, then the winner's full-block write would
-                // overwrite our data (silent data loss).
-                use crate::block::block_map::SparseBlockState;
-                loop {
-                    let state = self.cache.block_state(idx);
-                    if state != SparseBlockState::CLEAN {
-                        break;
+                    _ => {
+                        // NOT_PRESENT — needs backfill. Fall through.
                     }
-                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                 }
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
-            }
 
-            // We won the claim. Merge guest data onto prior block and write.
-            #[cfg(feature = "test-utils")]
-            eprintln!(
-                "CLAIM_WIN: block={idx} writer_offset={write_start} prior_first=0x{:02X}",
-                prior.first().copied().unwrap_or(0)
-            );
-            let mut block_buf = prior.to_vec();
-            if block_buf.len() != block_size {
-                tracing::error!(
-                    block = idx,
-                    expected = block_size,
-                    actual = block_buf.len(),
-                    "backfill returned truncated block"
-                );
-                return Err(CommandError::IoError);
-            }
-            let end = (block_local_start + write_len).min(block_buf.len());
-            block_buf[block_local_start..end]
-                .copy_from_slice(&data[data_offset..data_offset + write_len]);
+                // === NOT_PRESENT: backfill from S3 ===
 
-            self.cache.write(block_start, &block_buf)?;
+                if write_len >= block_size {
+                    // Full block overwrite — no prior data to preserve.
+                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    break 'block_retry;
+                }
+
+                // Check if this block has S3 data.
+                let has_s3_data = {
+                    let (bo, pids) = {
+                        let vm = self.volume_manifest.read();
+                        let ci = vm.chunk_idx_for_block(block as u64);
+                        let bo = vm.block_offset_in_chunk(block as u64);
+                        let pids = vm.chunk_pack_ids(ci).map(|ids| ids.to_vec()).unwrap_or_default();
+                        (bo, pids)
+                    };
+                    if pids.is_empty() {
+                        false
+                    } else {
+                        let mut found = false;
+                        for &pid in pids.iter().rev() {
+                            if self.pack_index_cache.lookup_block(pid, bo).await.is_some() {
+                                found = true;
+                                break;
+                            }
+                            if self.pack_index_cache.get_entries(pid).await.is_none() {
+                                found = true;
+                                break;
+                            }
+                        }
+                        found
+                    }
+                };
+
+                if !has_s3_data {
+                    // No prior data in S3 — just write the sub-block directly.
+                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    break 'block_retry;
+                }
+
+                // Fetch prior data from S3 BEFORE claiming.
+                let prior = self.cache.resolve_block_for_backfill(
+                    idx,
+                    self.clean_cache.as_ref(),
+                    &self.pack_index_cache,
+                    &self.volume_manifest,
+                    &self.content_store,
+                    Some(&self.metrics),
+                ).await.map_err(|e| {
+                    tracing::warn!(
+                        block = idx,
+                        error = %e,
+                        "S3 backfill failed for sub-block write — rejecting write to prevent data corruption"
+                    );
+                    CommandError::IoError
+                })?;
+
+                // Re-check state after the async fetch. Another writer or
+                // flush rotation may have changed the block state.
+                let post_fetch_state = self.cache.block_state(idx);
+                if post_fetch_state != SparseBlockState::NOT_PRESENT {
+                    // State changed during fetch — re-enter outer match.
+                    continue 'block_retry;
+                }
+
+                // If prior data is all zeros, just write the sub-block.
+                if prior.is_empty() || prior.iter().all(|&b| b == 0) {
+                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    break 'block_retry;
+                }
+
+                // Non-zero prior: claim the block, merge, and write.
+                if !self.cache.try_claim_block(idx) {
+                    // Another writer claimed it. Re-enter outer match to
+                    // wait for their write to complete.
+                    continue 'block_retry;
+                }
+
+                // We won the claim. Merge guest data onto prior block.
+                let mut block_buf = prior.to_vec();
+                if block_buf.len() != block_size {
+                    tracing::error!(
+                        block = idx,
+                        expected = block_size,
+                        actual = block_buf.len(),
+                        "backfill returned truncated block"
+                    );
+                    return Err(CommandError::IoError);
+                }
+                let end = (block_local_start + write_len).min(block_buf.len());
+                block_buf[block_local_start..end]
+                    .copy_from_slice(&data[data_offset..data_offset + write_len]);
+
+                self.cache.write(block_start, &block_buf)?;
+                break 'block_retry;
+            }
         }
 
         Ok(())
@@ -656,7 +628,17 @@ impl BlockHandler {
         //
         // Cost: one backfill per block per eviction cycle. Hot blocks pay
         // once after each flush; cold blocks pay once ever.
-        self.backfill_and_write(offset, data).await?;
+        //
+        // Retry on BlockEvicted: flush rotation can evict a block between
+        // the handler's state check and cache.write's pwrite. The retry
+        // re-checks state and re-backfills from S3 if needed.
+        loop {
+            match self.backfill_and_write(offset, data).await {
+                Ok(()) => break,
+                Err(CommandError::BlockEvicted) => continue,
+                Err(e) => return Err(e),
+            }
+        }
 
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(

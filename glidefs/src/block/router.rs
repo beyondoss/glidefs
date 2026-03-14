@@ -1717,7 +1717,7 @@ impl ExportRouter {
         let mut backoff = Duration::from_millis(100);
         for _ in 0..MAX_DRAIN_ITERATIONS {
             match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
-                Ok(stats) if stats.blocks_claimed == 0 => {
+                Ok(stats) if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 => {
                     drain_done = true;
                     break;
                 }
