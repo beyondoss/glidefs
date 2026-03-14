@@ -41,7 +41,7 @@ async fn test_write_read() {
     let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
     // Write some data
-    cache.write(0, b"hello world", &[]).unwrap();
+    cache.write(0, b"hello world").unwrap();
 
     // Read it back
     let data = cache.read_local_only(0, 11).unwrap();
@@ -60,7 +60,7 @@ async fn test_flush() {
     let cache = cache.finish_recovery().await.unwrap();
     let _clean_cache = crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024);
 
-    cache.write(0, b"data", &[]).unwrap();
+    cache.write(0, b"data").unwrap();
     cache.flush().unwrap();
 
     // Data should still be readable
@@ -78,7 +78,7 @@ async fn test_metadata_persistence() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        cache.write(0, b"persistent", &[]).unwrap();
+        cache.write(0, b"persistent").unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -232,7 +232,7 @@ async fn test_flush_end_to_end() {
     // Write 10 distinct blocks (each 4KB = block_size)
     for i in 0u8..10 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -255,7 +255,7 @@ async fn test_flush_dedup_skips_existing() {
     // Write 5 blocks
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -270,7 +270,7 @@ async fn test_flush_dedup_skips_existing() {
     // Each new block offset gets its own pack entry regardless of content.
     for i in 0u8..5 {
         h.cache
-            .write((i as u64 + 5) * 4096, &vec![i + 1; 4096], &[])
+            .write((i as u64 + 5) * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -288,7 +288,7 @@ async fn test_flush_partial_dedup() {
     // Write 10 blocks with unique data
     for i in 0u8..10 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -301,12 +301,12 @@ async fn test_flush_partial_dedup() {
     // is offset-based (not hash-based across flushes).
     for i in 0u8..5 {
         h.cache
-            .write((i as u64 + 10) * 4096, &vec![i + 1; 4096], &[])
+            .write((i as u64 + 10) * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
     for i in 0u8..5 {
         h.cache
-            .write((i as u64 + 15) * 4096, &vec![i + 100; 4096], &[])
+            .write((i as u64 + 15) * 4096, &vec![i + 100; 4096])
             .unwrap();
     }
 
@@ -323,11 +323,11 @@ async fn test_flush_zero_blocks_skipped() {
 
     // Write one real block
     h.cache
-        .write(0, &vec![42u8; 128 * 1024], &[])
+        .write(0, &vec![42u8; 128 * 1024])
         .unwrap();
     // Write a block of zeros — this should get ZERO_BLOCK_HASH
     h.cache
-        .write(128 * 1024, &vec![0u8; 128 * 1024], &[])
+        .write(128 * 1024, &vec![0u8; 128 * 1024])
         .unwrap();
 
     let stats = h.flush().await;
@@ -342,7 +342,7 @@ async fn test_flush_clears_dirty_state() {
 
     for i in 0u8..3 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -357,11 +357,11 @@ async fn test_flush_clears_dirty_state() {
 async fn test_flush_concurrent_write_stays_dirty() {
     let h = V2Harness::new().await;
 
-    h.cache.write(0, &vec![1u8; 4096], &[]).unwrap();
+    h.cache.write(0, &vec![1u8; 4096]).unwrap();
     h.flush().await;
 
     // Overwrite block 0 with different data
-    h.cache.write(0, &vec![2u8; 4096], &[]).unwrap();
+    h.cache.write(0, &vec![2u8; 4096]).unwrap();
 
     let stats = h.flush().await;
     assert_eq!(
@@ -381,7 +381,7 @@ async fn test_flush_manifest_self_contained() {
         let mut data = vec![0xAAu8; 4096];
         data[..2].copy_from_slice(&(i + 1).to_le_bytes());
         h.cache
-            .write(i as u64 * 4096, &data, &[])
+            .write(i as u64 * 4096, &data)
             .unwrap();
     }
 
@@ -402,7 +402,7 @@ async fn test_flush_manifest_self_contained() {
 async fn test_v2_read_recently_written_block() {
     let h = V2Harness::new().await;
     let data = vec![0xAAu8; 4096];
-    h.cache.write(0, &data, &[]).unwrap();
+    h.cache.write(0, &data).unwrap();
 
     let got = h.read(0, 4096).await;
     assert_eq!(got.as_ref(), &data[..]);
@@ -426,9 +426,9 @@ async fn test_v2_read_trimmed_block() {
 
     // Write a block, then zero it out.
     h.cache
-        .write(0, &vec![0xBBu8; 4096], &[])
+        .write(0, &vec![0xBBu8; 4096])
         .unwrap();
-    h.cache.zero_range(0, 4096, &[]).unwrap();
+    h.cache.zero_range(0, 4096).unwrap();
 
     let got = h.read(0, 4096).await;
     assert!(
@@ -441,7 +441,7 @@ async fn test_v2_read_trimmed_block() {
 async fn test_v2_read_sub_chunk() {
     let h = V2Harness::new().await;
     let data = vec![0xCCu8; 4096];
-    h.cache.write(0, &data, &[]).unwrap();
+    h.cache.write(0, &data).unwrap();
 
     // Read 100 bytes from offset 1000 within the chunk.
     let got = h.read(1000, 100).await;
@@ -455,10 +455,10 @@ async fn test_v2_read_spans_chunks() {
 
     // Write two distinct chunks.
     h.cache
-        .write(0, &vec![0x11u8; 4096], &[])
+        .write(0, &vec![0x11u8; 4096])
         .unwrap();
     h.cache
-        .write(4096, &vec![0x22u8; 4096], &[])
+        .write(4096, &vec![0x22u8; 4096])
         .unwrap();
 
     // Read across the chunk boundary: last 100 bytes of chunk 0 + first 100 of chunk 1.
@@ -483,7 +483,7 @@ async fn test_v2_read_from_s3_pack() {
     // Write blocks, flush to S3, clear clean_cache so reads go to S3.
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
     h.flush().await;
@@ -519,7 +519,7 @@ async fn test_v2_mixed_dirty_and_clean_reads() {
     // Write 5 blocks and flush to S3 (they'll become "clean" once evicted from cache).
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
     h.flush().await;
@@ -533,7 +533,7 @@ async fn test_v2_mixed_dirty_and_clean_reads() {
     // Write 5 more blocks (dirty, not flushed).
     for i in 5u8..10 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -567,7 +567,7 @@ async fn test_v2_read_mixed_cache_hit_and_s3_miss() {
     // Write 8 blocks with distinct data per block
     for i in 0u8..8 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
     h.flush().await;
@@ -636,7 +636,7 @@ async fn test_snapshot_returns_sequence_and_stats() {
     // Write 5 blocks
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -666,7 +666,7 @@ async fn test_snapshot_clears_dirty_state() {
     // Write blocks and snapshot
     for i in 0u8..3 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -702,9 +702,9 @@ async fn test_snapshot_captures_concurrent_writes() {
     let h = V2Harness::new().await;
 
     // Write blocks at different times
-    h.cache.write(0, &vec![0xAA; 4096], &[]).unwrap();
+    h.cache.write(0, &vec![0xAA; 4096]).unwrap();
     h.cache
-        .write(4096, &vec![0xBB; 4096], &[])
+        .write(4096, &vec![0xBB; 4096])
         .unwrap();
 
     let result: SnapshotResult = h
@@ -720,7 +720,7 @@ async fn test_snapshot_captures_concurrent_writes() {
 
     // Write more after snapshot
     h.cache
-        .write(8192, &vec![0xCC; 4096], &[])
+        .write(8192, &vec![0xCC; 4096])
         .unwrap();
 
     // Second snapshot picks up the new write
@@ -764,7 +764,7 @@ async fn test_recovery_verifies_dirty_blocks_readable() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
-        cache.write(0, &original_data, &[]).unwrap();
+        cache.write(0, &original_data).unwrap();
         cache.save_metadata().unwrap();
     }
 
@@ -826,7 +826,7 @@ async fn test_concurrent_flush_and_writes() {
     // Seed some initial dirty blocks
     for i in 0u8..10 {
         cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -855,7 +855,7 @@ async fn test_concurrent_flush_and_writes() {
                 let block_idx = (writer_id as u64 * 2) % 10;
                 let data = vec![writer_id.wrapping_add(round).wrapping_add(100); 4096];
                 cache
-                    .write(block_idx * 4096, &data, &[])
+                    .write(block_idx * 4096, &data)
                     .unwrap();
                 tokio::task::yield_now().await;
             }
@@ -916,8 +916,8 @@ async fn test_draining_state_transition() {
     let cache = cache.finish_recovery().await.unwrap();
 
     // Write some data before draining
-    cache.write(0, &vec![0xAA; 4096], &[]).unwrap();
-    cache.write(4096, &vec![0xBB; 4096], &[]).unwrap();
+    cache.write(0, &vec![0xAA; 4096]).unwrap();
+    cache.write(4096, &vec![0xBB; 4096]).unwrap();
     assert_eq!(cache.dirty_block_count(), 2);
 
     // Save the dirty count before shutdown
@@ -991,7 +991,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
     // Seed blocks with initial data
     for i in 0u8..10 {
         cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
 
@@ -1021,7 +1021,7 @@ async fn test_concurrent_flush_write_s3_convergence() {
             for round in 0..10u8 {
                 let fill = writer_id * 10 + round;
                 cache
-                    .write(block_idx * 4096, &vec![fill; 4096], &[])
+                    .write(block_idx * 4096, &vec![fill; 4096])
                     .unwrap();
                 tokio::task::yield_now().await;
             }
@@ -1094,7 +1094,7 @@ async fn test_crc32_mismatch_skips_block_then_heals() {
 
     // Write a block.
     let original_data = vec![0xABu8; 4096];
-    h.cache.write(0, &original_data, &[]).unwrap();
+    h.cache.write(0, &original_data).unwrap();
     assert_eq!(h.cache.dirty_block_count(), 1);
 
     // Run local checkpoint — computes CRC32 for the dirty block.
@@ -1152,7 +1152,7 @@ async fn test_crc32_cleared_on_write() {
 
     // Write, checkpoint (compute CRC32).
     h.cache
-        .write(0, &vec![0xAAu8; 4096], &[])
+        .write(0, &vec![0xAAu8; 4096])
         .unwrap();
     h.cache.local_checkpoint().await.unwrap();
 
@@ -1161,7 +1161,7 @@ async fn test_crc32_cleared_on_write() {
 
     // Write new data to the same block — CRC32 should be invalidated (sentinel).
     h.cache
-        .write(0, &vec![0xBBu8; 4096], &[])
+        .write(0, &vec![0xBBu8; 4096])
         .unwrap();
     assert_eq!(
         inner.crc_map.load(0).expect("sentinel should exist"),
@@ -1188,7 +1188,7 @@ async fn test_crc32_partial_corruption_flushes_good_blocks() {
     // Write 5 distinct blocks.
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 10; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 10; 4096])
             .unwrap();
     }
     assert_eq!(h.cache.dirty_block_count(), 5);
@@ -1270,7 +1270,7 @@ async fn test_crc32_happy_path_multi_cycle() {
     // Cycle 1: write 3 blocks, checkpoint (computes CRC32), flush.
     for i in 0u8..3 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 10; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 10; 4096])
             .unwrap();
     }
     h.cache.local_checkpoint().await.unwrap();
@@ -1295,12 +1295,12 @@ async fn test_crc32_happy_path_multi_cycle() {
 
     // Cycle 2: write 2 new blocks + overwrite 1 existing block.
     h.cache
-        .write(3 * 4096, &vec![0xDD; 4096], &[])
+        .write(3 * 4096, &vec![0xDD; 4096])
         .unwrap();
     h.cache
-        .write(4 * 4096, &vec![0xEE; 4096], &[])
+        .write(4 * 4096, &vec![0xEE; 4096])
         .unwrap();
-    h.cache.write(0, &vec![0xFF; 4096], &[]).unwrap(); // overwrite block 0
+    h.cache.write(0, &vec![0xFF; 4096]).unwrap(); // overwrite block 0
 
     assert_eq!(h.cache.dirty_block_count(), 3);
 
@@ -1372,7 +1372,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     // Seed blocks with initial data + checkpoint to arm CRC32.
     for i in 0u8..10 {
         cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
     cache.local_checkpoint().await.unwrap();
@@ -1409,7 +1409,7 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
                 let block_idx = (writer_id as u64 * 2) % 10;
                 let fill = writer_id.wrapping_add(round).wrapping_add(100);
                 cache
-                    .write(block_idx * 4096, &vec![fill; 4096], &[])
+                    .write(block_idx * 4096, &vec![fill; 4096])
                     .unwrap();
                 tokio::task::yield_now().await;
             }
@@ -1434,447 +1434,6 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
         .unwrap();
     assert_eq!(stats.blocks_corrupted, 0);
     assert_eq!(cache.dirty_block_count(), 0);
-}
-
-// =========================================================================
-// Partial block data integrity tests
-// =========================================================================
-
-/// Prove that `DashMap::insert` overwrites an existing `AtomicU32`, losing
-/// bitmap bits set by `mark_sub_regions`. This is the mechanism behind the
-/// TOCTOU race in `backfill_missing_blocks`: two concurrent writes to the
-/// same block can both see `is_partial=false`, both call `insert`, and the
-/// second `insert` replaces the first's AtomicU32 — dropping any bitmap
-/// bits the first write's `mark_sub_regions` had set.
-///
-/// The race window in handler.rs write():
-/// 1. T2: is_partial(idx)=false  (before T1 inserts)
-/// 2. T1: partial_blocks.insert(idx, AtomicU32(0))
-/// 3. T1: cache.write → mark_sub_regions sets bits on T1's AtomicU32
-/// 4. T2: partial_blocks.insert(idx, AtomicU32(0)) → REPLACES T1's entry
-/// 5. Background backfill reads bitmap=0 for T1's sub-regions → overwrites
-///    T1's pwrite with stale S3 data.
-///
-/// Step 4 follows step 1 because T2 was delayed between `is_partial` and
-/// `insert` (e.g., acquiring `volume_manifest.read()` at handler.rs:222).
-#[tokio::test]
-async fn test_partial_blocks_insert_overwrites_bitmap_causing_data_loss() {
-    use super::inner::PartialBlockState;
-    use std::sync::atomic::AtomicU32;
-
-    let dir = TempDir::new().unwrap();
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "partial-test".to_string(),
-        device_size: 128 * 1024, // 1 block at 128KB
-        block_size: 128 * 1024,  // 128KB blocks → 32 sub-regions of 4KB
-        wal_sync: false,
-    };
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.skip_recovery_for_test();
-    let inner = cache.inner();
-
-    let block_idx = 0usize;
-
-    let new_state = || PartialBlockState {
-        bitmap: AtomicU32::new(0),
-        write_lock: parking_lot::Mutex::new(()),
-    };
-
-    // Step 2: Thread A's backfill_missing_blocks inserts a partial entry.
-    inner.partial_blocks.insert(block_idx, new_state());
-
-    // Step 3: Thread A's cache.write → mark_sub_regions sets bit for
-    //         sub-region 0 (bytes [0..4096] of the block).
-    inner.mark_sub_regions(block_idx, 0, 4096);
-
-    // Verify the bit IS set on Thread A's entry.
-    let bitmap_before = inner.partial_bitmap(block_idx).unwrap();
-    assert_eq!(
-        bitmap_before & 1,
-        1,
-        "sub-region 0 should be marked as written"
-    );
-
-    // Step 4: Thread B's backfill_missing_blocks calls insert() for the
-    //         same block (Thread B checked is_partial=false before Thread A
-    //         inserted, then got delayed on volume_manifest.read()).
-    //         DashMap::insert REPLACES Thread A's entry.
-    inner.partial_blocks.insert(block_idx, new_state());
-
-    // DATA LOSS: Thread A's bitmap bit for sub-region 0 is gone.
-    let bitmap_after = inner.partial_bitmap(block_idx).unwrap();
-    assert_eq!(
-        bitmap_after, 0,
-        "DashMap::insert replaced entry, losing Thread A's bitmap bits"
-    );
-
-    // Step 5 consequence: background backfill reads bitmap=0 for sub-region 0,
-    // writes stale S3 data over Thread A's pwrite. Thread A's write is lost.
-
-    // ---------------------------------------------------------------
-    // Proof that entry().or_insert_with() preserves existing bits:
-    // ---------------------------------------------------------------
-    inner.partial_blocks.remove(&block_idx);
-
-    // Thread A inserts and sets bitmap bits
-    inner
-        .partial_blocks
-        .entry(block_idx)
-        .or_insert_with(new_state);
-    inner.mark_sub_regions(block_idx, 0, 4096);
-
-    // Thread B uses entry().or_insert_with() — does NOT replace
-    inner
-        .partial_blocks
-        .entry(block_idx)
-        .or_insert_with(new_state);
-
-    // Thread A's bits are preserved
-    let bitmap_fixed = inner.partial_bitmap(block_idx).unwrap();
-    assert_eq!(
-        bitmap_fixed & 1,
-        1,
-        "entry().or_insert_with() preserves existing bitmap bits"
-    );
-}
-
-/// Prove that `merge_partial_block` reads the bitmap once at the start,
-/// missing concurrent writes that set bits during the merge loop.
-///
-/// The race: a read request hits a partial block and calls merge_partial_block.
-/// merge reads bitmap=0 for sub-region N. Concurrently, a write sets bit N
-/// (via mark_sub_regions with Release ordering) and pwrite's new data to SSD.
-/// merge then writes stale S3 data to sub-region N on SSD, overwriting the
-/// concurrent write's data.
-///
-/// The background backfill task (`spawn_background_backfill`) correctly
-/// re-reads the bitmap per sub-region. `merge_partial_block` should do the same.
-#[tokio::test]
-async fn test_merge_partial_block_stale_bitmap_misses_concurrent_write() {
-    use super::inner::PartialBlockState;
-    use std::sync::atomic::AtomicU32;
-
-    let dir = TempDir::new().unwrap();
-    let block_size = 128 * 1024; // 128KB → 32 sub-regions of 4KB
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "merge-test".to_string(),
-        device_size: block_size as u64,
-        block_size,
-        wal_sync: false,
-    };
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.skip_recovery_for_test();
-    let inner = cache.inner();
-
-    let block_idx = 0usize;
-
-    // Set up: block is partial with bitmap=0 (no sub-regions written yet).
-    inner.partial_blocks.insert(
-        block_idx,
-        PartialBlockState {
-            bitmap: AtomicU32::new(0),
-            write_lock: parking_lot::Mutex::new(()),
-        },
-    );
-    inner.set_present(block_idx);
-
-    // merge_partial_block would snapshot the bitmap HERE:
-    let bitmap_snapshot = inner.partial_bitmap(block_idx).unwrap();
-    assert_eq!(bitmap_snapshot, 0, "no sub-regions written yet");
-
-    // Concurrent write arrives: marks sub-region 0 with Release ordering
-    // (happens between merge's bitmap snapshot and its write_sub_region loop).
-    inner.mark_sub_regions(block_idx, 0, 4096);
-
-    // The snapshot is STALE — it doesn't see the concurrent write's bit.
-    assert_eq!(
-        bitmap_snapshot & 1,
-        0,
-        "snapshot is stale — concurrent write to sub-region 0 was missed"
-    );
-
-    // merge_partial_block would proceed to write S3 data to sub-region 0,
-    // overwriting the concurrent write's pwrite data. DATA LOSS.
-
-    // With a per-sub-region re-read (the fix), the concurrent bit IS visible:
-    let fresh_bitmap = inner.partial_bitmap(block_idx).unwrap();
-    assert_eq!(
-        fresh_bitmap & 1,
-        1,
-        "per-sub-region re-read catches the concurrent update"
-    );
-    // merge would skip sub-region 0, preserving the concurrent write's data.
-}
-
-/// Prove that the per-block write_lock prevents backfill from overwriting
-/// guest data on SSD.
-///
-/// The TOCTOU race (without the lock):
-/// 1. Backfill reads bitmap for sub-region N → bit=0
-/// 2. Guest write: mark_sub_regions (sets bit=1) + pwrite (guest data on SSD)
-/// 3. Backfill calls write_sub_region (overwrites guest data with S3 data)
-///
-/// The fix: backfill holds write_lock while checking bitmap + writing.
-/// Guest re-pwrites under the same lock after its main pwrite, guaranteeing
-/// guest data wins even if backfill's write lands between the two guest pwrites.
-#[tokio::test]
-async fn test_backfill_write_sub_region_overwrites_guest_data() {
-    use super::inner::{PartialBlockState, SUB_BLOCK_SIZE};
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    let dir = TempDir::new().unwrap();
-    let block_size = 128 * 1024;
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "backfill-race".to_string(),
-        device_size: block_size as u64,
-        block_size,
-        wal_sync: false,
-    };
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.skip_recovery_for_test();
-    let inner = cache.inner();
-
-    let block_idx = 0usize;
-
-    // Setup: block 0 is partial with empty bitmap.
-    inner.partial_blocks.insert(
-        block_idx,
-        PartialBlockState {
-            bitmap: AtomicU32::new(0),
-            write_lock: parking_lot::Mutex::new(()),
-        },
-    );
-    inner.set_present(block_idx);
-
-    let guest_data = vec![0xBBu8; SUB_BLOCK_SIZE];
-    let s3_data = vec![0xAAu8; SUB_BLOCK_SIZE];
-
-    // --- SIMULATE THE WORST-CASE INTERLEAVING ---
-    // Backfill acquires write_lock first, reads bitmap (bit=0).
-    {
-        let state = inner.partial_blocks.get(&block_idx).unwrap();
-        let _guard = state.value().write_lock.lock();
-        let bitmap = state.value().bitmap.load(Ordering::Acquire);
-        assert_eq!(bitmap & 1, 0, "backfill sees sub-region 0 as unwritten");
-
-        // Guest marks bit and does main pwrite (outside the lock — these are
-        // atomic/positional-IO and don't need the lock).
-        inner.mark_sub_regions(block_idx, 0, SUB_BLOCK_SIZE);
-        inner.data_file.read().write_all_at(&guest_data, 0).unwrap();
-
-        // Backfill writes S3 data (under lock, using stale bitmap).
-        // This overwrites the guest's main pwrite — but the guest will
-        // re-pwrite under the lock next.
-        inner.write_sub_region(0, &s3_data).unwrap();
-    }
-    // Backfill releases lock.
-
-    // Guest acquires write_lock and re-pwrites (THE FIX).
-    // This is what write.rs does after the main pwrite for partial blocks.
-    {
-        let state = inner.partial_blocks.get(&block_idx).unwrap();
-        let _guard = state.value().write_lock.lock();
-        inner.data_file.read().write_all_at(&guest_data, 0).unwrap();
-    }
-
-    // --- VERIFY: guest data survives ---
-    let mut readback = vec![0u8; SUB_BLOCK_SIZE];
-    inner.data_file.read().read_exact_at(&mut readback, 0).unwrap();
-
-    assert_eq!(
-        readback[0], 0xBB,
-        "sub-region 0 should have guest data (0xBB), not S3 data (0xAA) — \
-         guest re-pwrite under write_lock guarantees guest data wins"
-    );
-}
-
-/// Prove that guest data survives when `complete_partial` removes the
-/// DashMap entry between the guest's first pwrite and re-pwrite.
-///
-/// The race (without fix):
-/// 1. Guest marks bitmap, does first pwrite (guest data on SSD)
-/// 2. Backfill (holding write_lock) reads stale bitmap, overwrites sub-region
-/// 3. Backfill releases write_lock, calls complete_partial (removes entry)
-/// 4. Guest reaches re-pwrite loop: partial_blocks.get() → None → SKIPPED
-/// 5. SSD has stale S3 data → DATA CORRUPTION
-///
-/// The fix: track which blocks were partial at the START of write().
-/// Re-pwrite unconditionally for those blocks, with or without the lock.
-#[tokio::test]
-async fn test_complete_partial_before_repwrite_race() {
-    use super::inner::{PartialBlockState, SUB_BLOCK_SIZE};
-    use std::sync::atomic::AtomicU32;
-
-    let dir = TempDir::new().unwrap();
-    let block_size = 128 * 1024;
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "complete-partial-race".to_string(),
-        device_size: block_size as u64,
-        block_size,
-        wal_sync: false,
-    };
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.skip_recovery_for_test();
-
-    let block_idx = 0usize;
-
-    // Setup: insert partial block with empty bitmap, mark present.
-    cache.inner().partial_blocks.insert(
-        block_idx,
-        PartialBlockState {
-            bitmap: AtomicU32::new(0),
-            write_lock: parking_lot::Mutex::new(()),
-        },
-    );
-    cache.inner().set_present(block_idx);
-
-    // Fill the entire block with S3 data (0xAA) — simulates backfill writing
-    // stale data to the SSD.
-    let s3_data = vec![0xAAu8; block_size];
-    cache.inner().data_file.read().write_all_at(&s3_data, 0).unwrap();
-
-    // Backfill completes: removes the partial block entry.
-    // This is the critical step — it happens BEFORE the guest write.
-    // In the real race, it happens between the guest's first pwrite and
-    // re-pwrite within a single write() call.
-    cache.inner().complete_partial(block_idx);
-
-    // Re-insert the partial block to simulate the state AT THE START of
-    // the guest write (the block was partial when write() began).
-    cache.inner().partial_blocks.insert(
-        block_idx,
-        PartialBlockState {
-            bitmap: AtomicU32::new(0),
-            write_lock: parking_lot::Mutex::new(()),
-        },
-    );
-
-    // Guest writes 4KB of 0xBB to sub-region 0 via the normal write path.
-    // write() will: mark bitmap → first pwrite → re-pwrite.
-    // The re-pwrite MUST happen even though backfill already called
-    // complete_partial in the real scenario.
-    let _clean = crate::block::cache::SimpleBlockCache::new(1024);
-    cache
-        .write(0, &[0xBBu8; SUB_BLOCK_SIZE], &[])
-        .unwrap();
-
-    // Simulate what happens in the actual race: between the first pwrite
-    // and re-pwrite, backfill overwrites sub-region 0 with stale S3 data
-    // and removes the partial entry.
-    //
-    // We can't interleave within write() without a hook, so instead verify
-    // the END STATE: after write() completes, guest data must be on SSD.
-    // The re-pwrite (with or without the lock) ensures this.
-    let mut readback = vec![0u8; SUB_BLOCK_SIZE];
-    cache
-        .inner()
-        .data_file
-        .read()
-        .read_exact_at(&mut readback, 0)
-        .unwrap();
-
-    assert!(
-        readback.iter().all(|&b| b == 0xBB),
-        "sub-region 0 must have guest data (0xBB), not stale S3 data (0xAA) — \
-         re-pwrite must run unconditionally for blocks that were partial at write start"
-    );
-
-    // Remaining sub-regions should still have S3 data (backfill wrote it)
-    let mut rest = vec![0u8; block_size - SUB_BLOCK_SIZE];
-    cache
-        .inner()
-        .data_file
-        .read()
-        .read_exact_at(&mut rest, SUB_BLOCK_SIZE as u64)
-        .unwrap();
-    assert!(
-        rest.iter().all(|&b| b == 0xAA),
-        "remaining sub-regions should have S3 data (0xAA)"
-    );
-}
-
-/// Verify that write() re-pwrites for partial blocks even when the DashMap
-/// entry is removed between first pwrite and re-pwrite.
-///
-/// This test uses a two-step approach:
-/// 1. Mark block as partial, write guest data via write()
-/// 2. Simulate backfill overwriting + complete_partial
-/// 3. Write again — second write() must recover from the overwrite
-///
-/// Tests the fix at the WriteCache API level (not raw inner).
-#[tokio::test]
-async fn test_write_survives_complete_partial_removal() {
-    use super::inner::{PartialBlockState, SUB_BLOCK_SIZE};
-    use std::sync::atomic::AtomicU32;
-
-    let dir = TempDir::new().unwrap();
-    let block_size = 128 * 1024;
-    let config = WriteCacheConfig {
-        cache_dir: dir.path().to_path_buf(),
-        device_name: "repwrite-removal".to_string(),
-        device_size: block_size as u64,
-        block_size,
-        wal_sync: false,
-    };
-    let cache = WriteCache::<Initializing>::open(config).unwrap();
-    let cache = cache.skip_recovery_for_test();
-    let _clean = crate::block::cache::SimpleBlockCache::new(1024);
-
-    let block_idx = 0usize;
-
-    // Step 1: Mark partial, write 4KB of 0xBB
-    cache.inner().partial_blocks.insert(
-        block_idx,
-        PartialBlockState {
-            bitmap: AtomicU32::new(0),
-            write_lock: parking_lot::Mutex::new(()),
-        },
-    );
-    cache.write(0, &[0xBBu8; SUB_BLOCK_SIZE], &[]).unwrap();
-
-    // Step 2: Simulate backfill completing — overwrite sub-region 0 with S3
-    // data (0xAA) and remove partial entry.
-    cache
-        .inner()
-        .data_file
-        .read()
-        .write_all_at(&[0xAAu8; SUB_BLOCK_SIZE], 0)
-        .unwrap();
-    cache.inner().complete_partial(block_idx);
-
-    // Step 3: Re-insert partial (simulates a new write arriving while block
-    // is still tracked as partial — the write() call sees is_partial=true).
-    cache.inner().partial_blocks.insert(
-        block_idx,
-        PartialBlockState {
-            bitmap: AtomicU32::new(0),
-            write_lock: parking_lot::Mutex::new(()),
-        },
-    );
-
-    // Write 4KB of 0xCC to sub-region 0. write() must re-pwrite even if
-    // the entry gets removed during execution.
-    cache
-        .write(0, &[0xCCu8; SUB_BLOCK_SIZE], &[])
-        .unwrap();
-
-    // Verify guest data (0xCC) is on SSD, not the stale overwrite (0xAA)
-    let mut readback = vec![0u8; SUB_BLOCK_SIZE];
-    cache
-        .inner()
-        .data_file
-        .read()
-        .read_exact_at(&mut readback, 0)
-        .unwrap();
-
-    assert!(
-        readback.iter().all(|&b| b == 0xCC),
-        "sub-region 0 must have latest guest data (0xCC)"
-    );
 }
 
 // =========================================================================
@@ -1984,8 +1543,8 @@ async fn test_bottomless_rotate_data_file() {
     // Write data to blocks 0 and 1
     let data0 = vec![0xAAu8; 4096];
     let data1 = vec![0xBBu8; 4096];
-    cache.write(0, &data0, &[]).unwrap();
-    cache.write(4096, &data1, &[]).unwrap();
+    cache.write(0, &data0).unwrap();
+    cache.write(4096, &data1).unwrap();
 
     // Before rotation: no flushing file, flushing_active is false
     assert!(cache.inner.flushing_file.lock().is_none());
@@ -2029,7 +1588,7 @@ async fn test_bottomless_eviction_lifecycle() {
     // Write 5 distinct blocks
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 1; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 1; 4096])
             .unwrap();
     }
     assert_eq!(h.cache.dirty_block_count(), 5);
@@ -2083,7 +1642,7 @@ async fn test_bottomless_re_dirty_during_flush() {
 
     // Write block 0 with initial data
     let initial_data = vec![0xAAu8; 4096];
-    cache.write(0, &initial_data, &[]).unwrap();
+    cache.write(0, &initial_data).unwrap();
     assert_eq!(cache.dirty_block_count(), 1);
 
     // Rotate the data file (start of flush)
@@ -2101,7 +1660,7 @@ async fn test_bottomless_re_dirty_during_flush() {
     // Write the same block again with new data (simulates concurrent write during flush)
     // This should CAS SYNCING -> DIRTY via transition_to_dirty
     let new_data = vec![0xBBu8; 4096];
-    cache.write(0, &new_data, &[]).unwrap();
+    cache.write(0, &new_data).unwrap();
 
     // Block should be back to DIRTY
     assert_eq!(cache.inner.state_map.get(0), SparseBlockState::DIRTY);
@@ -2127,62 +1686,6 @@ async fn test_bottomless_re_dirty_during_flush() {
             "flushing file should have the original data"
         );
     }
-}
-
-/// Test 4: Partial blocks excluded from flush snapshot.
-///
-/// Partial blocks are excluded from the dirty snapshot during rotation.
-/// Their data is copied from the old active → new active file under the
-/// write lock, so it survives flushing file deletion.
-///
-/// This exercises the "copy partial blocks during rotation" path in
-/// rotate_data_file_inner.
-#[tokio::test]
-async fn test_bottomless_skipped_block_recovery() {
-    let h = BottomlessHarness::new().await;
-
-    // Write blocks 0 and 1 with distinct data
-    let data0 = vec![0xAAu8; 4096];
-    let data1 = vec![0xBBu8; 4096];
-    h.cache.write(0, &data0, &[]).unwrap();
-    h.cache.write(4096, &data1, &[]).unwrap();
-
-    // Mark block 0 as partial — rotation will exclude it from snapshot
-    // and copy its data from old active → new active.
-    h.cache.insert_partial_block_for_test(0);
-
-    // Flush: block 0 excluded (partial), block 1 flushes normally
-    let stats = h.flush().await;
-    assert_eq!(stats.blocks_claimed, 1, "only non-partial block claimed");
-    assert_eq!(stats.blocks_cas_failed, 0, "no skips needed");
-
-    // Block 0 should still be DIRTY (never claimed, never transitioned)
-    assert_eq!(
-        h.cache.inner.state_map.get(0),
-        SparseBlockState::DIRTY,
-        "partial block should stay DIRTY"
-    );
-
-    // Block 1 should be NOT_PRESENT (flush always evicts; foyer serves reads)
-    assert_eq!(
-        h.cache.inner.state_map.get(1),
-        SparseBlockState::NOT_PRESENT,
-        "flushed block should be NOT_PRESENT after flush"
-    );
-
-    // Block 0's data should have been copied during rotation (old → new active)
-    let mut buf = vec![0u8; 4096];
-    h.cache.inner.data_file.read().read_exact_at(&mut buf, 0).unwrap();
-    assert_eq!(
-        &buf[..], &data0[..],
-        "partial block data must be copied from old to new active during rotation"
-    );
-
-    // Flushing file should be cleaned up
-    assert!(
-        h.cache.inner.flushing_file.lock().is_none(),
-        "flushing_file should be None after flush completes"
-    );
 }
 
 /// Test 5: CLEAN -> NOT_PRESENT migration on open.
@@ -2267,7 +1770,7 @@ async fn test_bottomless_crash_recovery_with_flushing_file() {
         // Write 3 blocks
         for i in 0u8..3 {
             cache
-                .write(i as u64 * block_size as u64, &vec![i + 0x10; block_size], &[])
+                .write(i as u64 * block_size as u64, &vec![i + 0x10; block_size])
                 .unwrap();
         }
 
@@ -2357,7 +1860,7 @@ async fn test_bottomless_flushing_active_flag() {
     // Write a block and flush. The flush internally rotates, so flushing_active
     // should be true during flush and false after.
     h.cache
-        .write(0, &vec![0xDD; 4096], &[])
+        .write(0, &vec![0xDD; 4096])
         .unwrap();
 
     let stats = h.flush().await;
@@ -2407,7 +1910,7 @@ async fn test_bottomless_flush_and_s3_readback() {
     // Write 3 distinct blocks
     for i in 0u8..3 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 0x50; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 0x50; 4096])
             .unwrap();
     }
 
@@ -2458,7 +1961,7 @@ async fn test_bottomless_concurrent_write_during_flush() {
     // Write 10 blocks
     for i in 0u8..10 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 0x10; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 0x10; 4096])
             .unwrap();
     }
 
@@ -2472,7 +1975,7 @@ async fn test_bottomless_concurrent_write_during_flush() {
     // The write path CAS SYNCING→DIRTY races with the flush claiming DIRTY→SYNCING
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 0xA0; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 0xA0; 4096])
             .unwrap();
     }
 
@@ -2571,7 +2074,6 @@ async fn test_bottomless_clean_cache_warming() {
             .write(
                 i as u64 * 4096,
                 &vec![i + 0x60; 4096],
-                &[],
             )
             .unwrap();
     }
@@ -2634,7 +2136,7 @@ async fn test_rotation_claims_atomically() {
     // Write 5 blocks
     for i in 0u8..5 {
         h.cache
-            .write(i as u64 * 4096, &vec![i + 0x30; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 0x30; 4096])
             .unwrap();
     }
 
@@ -2667,7 +2169,7 @@ async fn test_rotation_claims_atomically() {
     // Simulate what a concurrent write would do: write to block 2,
     // which should re-dirty it (CAS SYNCING→DIRTY).
     let new_data = vec![0xFFu8; 4096];
-    h.cache.write(2 * 4096, &new_data, &[]).unwrap();
+    h.cache.write(2 * 4096, &new_data).unwrap();
     assert_eq!(
         h.cache.inner.state_map.get(2),
         SparseBlockState::DIRTY,
@@ -2776,7 +2278,7 @@ async fn test_bottomless_flush_failure_recovery() {
     // Write 3 blocks
     for i in 0u8..3 {
         cache
-            .write(i as u64 * 4096, &vec![i + 0x70; 4096], &[])
+            .write(i as u64 * 4096, &vec![i + 0x70; 4096])
             .unwrap();
     }
 
@@ -2817,334 +2319,3 @@ async fn test_bottomless_flush_failure_recovery() {
     assert!(!config.flushing_path().exists());
 }
 
-// ============================================================================
-// Eviction race tests (bottomless mode)
-// ============================================================================
-
-/// Simulate the eviction race: a block is SYNCING during backfill check,
-/// gets evicted (SYNCING→NOT_PRESENT) before the write, and the sub-block
-/// write must detect this via syncing_blocks and create a partial entry.
-#[tokio::test]
-async fn test_eviction_race_creates_partial_for_sub_block_write() {
-    let h = V2Harness::new().await;
-    let block_size = 4096u64;
-
-    // Step 1: Write a full block (block 0) with known data.
-    let original = vec![0xAAu8; block_size as usize];
-    h.cache.write(0, &original, &[]).unwrap();
-    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::DIRTY);
-
-    // Step 2: Transition to SYNCING (simulates flush claiming the block).
-    assert!(h.cache.inner.transition_dirty_to_syncing(0));
-    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::SYNCING);
-
-    // Step 3: Evict the block (simulates bottomless SYNCING→NOT_PRESENT).
-    assert!(h.cache.inner.transition_syncing_to_not_present(0));
-    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::NOT_PRESENT);
-
-    // Step 4: Sub-block write WITH syncing_blocks=[0].
-    // This simulates what happens when backfill_missing_blocks saw block 0
-    // as SYNCING, but by the time write() runs, it's been evicted.
-    let sub_data = vec![0xBBu8; 512];
-    let needs_backfill = h.cache.write(0, &sub_data, &[0]).unwrap();
-
-    // The write should have detected the eviction race and created a
-    // partial entry for block 0, returning it as needing backfill.
-    assert!(
-        needs_backfill.contains(&0),
-        "block 0 should need backfill after eviction race, got {:?}",
-        needs_backfill
-    );
-    assert!(
-        h.cache.inner.is_partial(0),
-        "block 0 should be partial after eviction race"
-    );
-}
-
-/// Same race but with a FULL-block write: no partial entry needed because
-/// the entire block is being overwritten (no prior data to preserve).
-#[tokio::test]
-async fn test_eviction_race_full_block_write_no_partial() {
-    let h = V2Harness::new().await;
-    let block_size = 4096u64;
-
-    // Write → SYNCING → evict
-    h.cache.write(0, &vec![0xAAu8; block_size as usize], &[]).unwrap();
-    assert!(h.cache.inner.transition_dirty_to_syncing(0));
-    assert!(h.cache.inner.transition_syncing_to_not_present(0));
-
-    // Full-block write with syncing_blocks=[0]
-    let full_data = vec![0xBBu8; block_size as usize];
-    let needs_backfill = h.cache.write(0, &full_data, &[0]).unwrap();
-
-    // No backfill needed — the write fully covers the block.
-    assert!(
-        needs_backfill.is_empty(),
-        "full-block write should not need backfill, got {:?}",
-        needs_backfill
-    );
-    assert!(
-        !h.cache.inner.is_partial(0),
-        "block 0 should NOT be partial after full-block write"
-    );
-}
-
-/// If the block is still SYNCING (not yet evicted) when write() runs,
-/// promote_syncing_blocks handles it — no partial entry needed.
-#[tokio::test]
-async fn test_syncing_block_not_evicted_no_partial() {
-    let h = V2Harness::new().await;
-    let block_size = 4096u64;
-
-    // Write → SYNCING (but do NOT evict)
-    h.cache.write(0, &vec![0xAAu8; block_size as usize], &[]).unwrap();
-    assert!(h.cache.inner.transition_dirty_to_syncing(0));
-    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::SYNCING);
-
-    // Sub-block write with syncing_blocks=[0], block still SYNCING
-    let sub_data = vec![0xBBu8; 512];
-    let needs_backfill = h.cache.write(0, &sub_data, &[0]).unwrap();
-
-    // promote_syncing_blocks should handle it — no backfill needed.
-    // (promote copies data from flushing→active file, but since there's
-    // no flushing file in this test, promote's CAS SYNCING→DIRTY handles it.)
-    assert!(
-        needs_backfill.is_empty(),
-        "still-SYNCING block should not need backfill, got {:?}",
-        needs_backfill
-    );
-}
-
-/// Eviction race with zero_range: sub-block zero should create partial.
-#[tokio::test]
-async fn test_eviction_race_zero_range_creates_partial() {
-    let h = V2Harness::new().await;
-    let block_size = 4096u64;
-
-    // Write → SYNCING → evict
-    h.cache.write(0, &vec![0xAAu8; block_size as usize], &[]).unwrap();
-    assert!(h.cache.inner.transition_dirty_to_syncing(0));
-    assert!(h.cache.inner.transition_syncing_to_not_present(0));
-
-    // Sub-block zero_range with syncing_blocks=[0]
-    let needs_backfill = h.cache.zero_range(0, 512, &[0]).unwrap();
-
-    assert!(
-        needs_backfill.contains(&0),
-        "block 0 should need backfill after eviction race in zero_range"
-    );
-    assert!(
-        h.cache.inner.is_partial(0),
-        "block 0 should be partial after eviction race in zero_range"
-    );
-}
-
-/// Without syncing_blocks, an evicted block gets NO partial entry — this
-/// is the old buggy behavior. We test that empty syncing_blocks means
-/// no eviction detection (the caller is responsible for populating it).
-#[tokio::test]
-async fn test_no_syncing_blocks_no_eviction_detection() {
-    let h = V2Harness::new().await;
-    let block_size = 4096u64;
-
-    // Write → SYNCING → evict
-    h.cache.write(0, &vec![0xAAu8; block_size as usize], &[]).unwrap();
-    assert!(h.cache.inner.transition_dirty_to_syncing(0));
-    assert!(h.cache.inner.transition_syncing_to_not_present(0));
-
-    // Sub-block write with EMPTY syncing_blocks (simulates the bug:
-    // backfill_missing_blocks didn't report block 0 as SYNCING).
-    let sub_data = vec![0xBBu8; 512];
-    let needs_backfill = h.cache.write(0, &sub_data, &[]).unwrap();
-
-    // No eviction detection — no partial entry created.
-    // This is the scenario that causes data loss without the fix.
-    assert!(
-        needs_backfill.is_empty(),
-        "empty syncing_blocks should not trigger eviction detection"
-    );
-}
-
-/// End-to-end proof of the eviction race data corruption.
-///
-/// Demonstrates that WITHOUT syncing_blocks, a sub-block write after
-/// bottomless eviction produces a block with mostly zeros that gets
-/// flushed to S3 — causing data loss on cold read.
-///
-/// The sequence:
-/// 1. Write full block with 0xAA, flush to S3 (block is SYNCING)
-/// 2. Evict (SYNCING→NOT_PRESENT) — simulates bottomless mode
-/// 3. Sub-block write (512 bytes of 0xBB) with empty syncing_blocks
-///    (old buggy path: set_present masks NOT_PRESENT→CLEAN, no partial)
-/// 4. Block is now DIRTY with 512B of 0xBB + rest zeros — no partial
-///    entry, so flush picks it up
-/// 5. Flush to S3 — uploads corrupted block
-/// 6. Cold read from S3 — get the corrupted block
-#[tokio::test]
-async fn test_eviction_race_end_to_end_data_corruption() {
-    let h = V2Harness::new().await;
-    let block_size = 4096usize;
-
-    // Step 1: Write full block with 0xAA.
-    let original = vec![0xAAu8; block_size];
-    h.cache.write(0, &original, &[]).unwrap();
-
-    // Step 2: Flush to S3 — block becomes SYNCING, then we manually evict.
-    let stats = h.flush().await;
-    assert_eq!(stats.blocks_claimed, 1);
-
-    // After flush_to_s3, the block should be evicted (NOT_PRESENT)
-    // because flush_dirty_body calls transition_syncing_to_not_present.
-    assert_eq!(
-        h.cache.inner.state_map.get(0),
-        SparseBlockState::NOT_PRESENT,
-        "block should be NOT_PRESENT after flush (bottomless eviction)"
-    );
-
-    // Step 3: Sub-block write WITHOUT syncing_blocks — the bug.
-    // set_present: NOT_PRESENT→CLEAN, promote sees CLEAN → skips.
-    // No partial entry created. The 512-byte write lands on zeros.
-    let sub_data = vec![0xBBu8; 512];
-    let _needs_backfill = h.cache.write(0, &sub_data, &[]).unwrap();
-
-    // Verify: block is DIRTY with NO partial entry — flush will pick it up.
-    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::DIRTY);
-    assert!(
-        !h.cache.inner.is_partial(0),
-        "BUG: no partial entry without syncing_blocks — flush will upload corrupted data"
-    );
-
-    // Step 4: Flush again — uploads the block with 512B of 0xBB + rest zeros.
-    let stats2 = h.flush().await;
-    assert_eq!(stats2.blocks_claimed, 1);
-
-    // Step 5: Cold read from S3 — should get the corrupted block.
-    // Read through the full tiered path (S3 → clean_cache → local).
-    let read_data = h.read(0, block_size).await;
-
-    // PROOF OF CORRUPTION: first 512 bytes are 0xBB (the sub-block write),
-    // but the rest of the block is zeros instead of the original 0xAA.
-    assert_eq!(
-        &read_data[..512],
-        &vec![0xBBu8; 512][..],
-        "first 512 bytes should be the sub-block write"
-    );
-    assert!(
-        read_data[512..].iter().all(|&b| b == 0),
-        "BUG PROVEN: rest of block is zeros (was 0xAA) — data corruption!\n\
-         first non-zero after 512: {:?}",
-        read_data[512..].iter().position(|&b| b != 0),
-    );
-}
-
-/// Same scenario but WITH the fix: syncing_blocks prevents corruption.
-///
-/// When syncing_blocks=[0] is passed, write() detects the eviction and
-/// creates a partial entry. This blocks the second flush from uploading
-/// the block (flush skips partial blocks). The backfill task (not run
-/// in this unit test) would fill in the missing sub-regions from S3.
-#[tokio::test]
-async fn test_eviction_race_fix_prevents_corruption() {
-    let h = V2Harness::new().await;
-    let block_size = 4096usize;
-
-    // Same setup: write, flush, evict.
-    h.cache.write(0, &vec![0xAAu8; block_size], &[]).unwrap();
-    h.flush().await;
-    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::NOT_PRESENT);
-
-    // Sub-block write WITH syncing_blocks=[0] — the fix.
-    let sub_data = vec![0xBBu8; 512];
-    let needs_backfill = h.cache.write(0, &sub_data, &[0]).unwrap();
-
-    // The fix: partial entry created, backfill requested.
-    assert!(
-        needs_backfill.contains(&0),
-        "fix should detect eviction and request backfill"
-    );
-    assert!(
-        h.cache.inner.is_partial(0),
-        "fix should create partial entry to block flush"
-    );
-
-    // Flush should skip block 0 because it's partial (incomplete backfill).
-    let stats2 = h.flush().await;
-    assert_eq!(
-        stats2.blocks_claimed, 0,
-        "flush should skip partial blocks — no data uploaded"
-    );
-}
-
-/// TOCTOU race between complete_partial and rotate_and_snapshot.
-///
-/// Proves that if complete_partial removes a DashMap entry between the
-/// snapshot's is_partial check (which excludes the block from pre_dirty)
-/// and the partial block copy step, the block's data is NOT lost.
-///
-/// Without the fix (snapshotting partial indices atomically with the
-/// exclusion decision), this test would show data corruption.
-#[tokio::test]
-async fn test_complete_partial_rotation_race_data_preserved() {
-    let h = V2Harness::new().await;
-    let block_size = 4096usize;
-
-    // Step 1: Write full block with 0xAA.
-    h.cache.write(0, &vec![0xAAu8; block_size], &[]).unwrap();
-
-    // Step 2: Flush to S3. Block becomes SYNCING→NOT_PRESENT (evicted).
-    let stats = h.flush().await;
-    assert_eq!(stats.blocks_claimed, 1);
-    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::NOT_PRESENT);
-
-    // Step 3: Simulate guest write + backfill creating partial entry.
-    // Write sub-block (512B of 0xBB), manually create partial entry.
-    h.cache.inner.set_present(0); // NOT_PRESENT→CLEAN
-    {
-        use super::inner::PartialBlockState;
-        h.cache.inner.partial_blocks.entry(0).or_insert_with(|| {
-            PartialBlockState {
-                bitmap: std::sync::atomic::AtomicU32::new(0),
-                write_lock: parking_lot::Mutex::new(()),
-            }
-        });
-    }
-    // Write 512 bytes of guest data and mark those sub-regions.
-    h.cache.inner.mark_sub_regions(0, 0, 512);
-    h.cache.inner.data_file.read().write_all_at(&vec![0xBBu8; 512], 0).unwrap();
-
-    // Simulate backfill writing the rest of the block from S3 (0xAA).
-    h.cache.inner.data_file.read().write_all_at(
-        &vec![0xAAu8; block_size - 512],
-        512,
-    ).unwrap();
-    h.cache.inner.transition_to_dirty(0);
-
-    // Step 4: Simulate the TOCTOU race.
-    // complete_partial removes the DashMap entry RIGHT NOW, before flush.
-    // In the real race, this happens between the snapshot's is_partial
-    // check and the copy loop.
-    h.cache.inner.complete_partial(0);
-
-    // Block is now DIRTY, NOT partial. It will be included in the next
-    // flush's snapshot. The question is: does the active file still have
-    // the correct data after rotation?
-
-    // Step 5: Flush again. This triggers rotate_and_snapshot.
-    // With the fix, the block was captured in partial_to_copy during
-    // the snapshot and its data was copied from old→new active.
-    let stats2 = h.flush().await;
-    assert_eq!(stats2.blocks_claimed, 1, "block should be flushed");
-
-    // Step 6: Cold read from S3 — verify data integrity.
-    let data = h.read(0, block_size).await;
-    assert_eq!(
-        &data[..512],
-        &vec![0xBBu8; 512][..],
-        "first 512 bytes should be guest write (0xBB)"
-    );
-    assert!(
-        data[512..].iter().all(|&b| b == 0xAA),
-        "rest should be backfill data (0xAA), got first non-0xAA at offset {}",
-        data[512..].iter().position(|&b| b != 0xAA).unwrap_or(0) + 512,
-    );
-}

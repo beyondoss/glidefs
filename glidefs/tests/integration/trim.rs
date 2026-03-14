@@ -33,12 +33,12 @@ async fn test_trim_partial_range() {
 
     // Write full block of 0xAA
     let full_data = vec![0xAA; BLOCK_SIZE];
-    cache.write(0, &full_data, &[]).unwrap();
+    cache.write(0, &full_data).unwrap();
 
     // TRIM 512 bytes starting at offset 2048 within the block
     let trim_offset = 2048u64;
     let trim_len = 512u64;
-    cache.zero_range(trim_offset, trim_len, &[]).unwrap();
+    cache.zero_range(trim_offset, trim_len).unwrap();
 
     // Read full block — trimmed region must be zeros, rest must be 0xAA
     let data = cache
@@ -76,11 +76,11 @@ async fn test_trim_then_flush_to_s3() {
         let (cache, cs, pic, vm, _cc, _m) =
             super::create_test_cache(&writer_dir, "trim-flush", Arc::clone(&s3)).await;
 
-        cache.write(0, &vec![0xBB; BLOCK_SIZE], &[]).unwrap();
+        cache.write(0, &vec![0xBB; BLOCK_SIZE]).unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
         // TRIM block 0
-        cache.zero_range(0, BLOCK_SIZE as u64, &[]).unwrap();
+        cache.zero_range(0, BLOCK_SIZE as u64).unwrap();
 
         // Flush again — this should create a tombstone (zero block with comp_length=0)
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
@@ -124,7 +124,7 @@ async fn test_trim_fork_semantics() {
             super::create_test_cache(&parent_dir, "trim-fork-parent", Arc::clone(&s3)).await;
 
         cache
-            .write(0, &vec![0xCC; BLOCK_SIZE], &[])
+            .write(0, &vec![0xCC; BLOCK_SIZE])
             .unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
@@ -152,7 +152,7 @@ async fn test_trim_fork_semantics() {
         let metrics = Arc::new(ExportMetrics::new());
 
         // TRIM block 0 on child
-        cache.zero_range(0, BLOCK_SIZE as u64, &[]).unwrap();
+        cache.zero_range(0, BLOCK_SIZE as u64).unwrap();
 
         // Child must read zeros
         let child_data = cache
@@ -226,10 +226,10 @@ async fn test_trim_crash_recovery() {
         let _cc = SimpleBlockCache::new(1024);
 
         // Write full block of 0xDD
-        cache.write(0, &vec![0xDD; BLOCK_SIZE], &[]).unwrap();
+        cache.write(0, &vec![0xDD; BLOCK_SIZE]).unwrap();
 
         // TRIM same block
-        cache.zero_range(0, BLOCK_SIZE as u64, &[]).unwrap();
+        cache.zero_range(0, BLOCK_SIZE as u64).unwrap();
 
         // Drop without metadata save — simulates crash
     }
@@ -273,13 +273,12 @@ async fn test_trim_large_range() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![fill; BLOCK_SIZE],
-                &[],
             )
             .unwrap();
     }
 
     // TRIM the entire 100MB range in one call
-    cache.zero_range(0, range_size as u64, &[]).unwrap();
+    cache.zero_range(0, range_size as u64).unwrap();
 
     // Verify all blocks are zeros
     for i in 0..num_blocks {

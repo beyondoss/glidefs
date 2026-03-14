@@ -12,7 +12,7 @@
 //! serializes all `write()` calls on the fd, guaranteeing no interleaving of
 //! bytes between concurrent writers. An `RwLock<()>` provides mutual exclusion
 //! between appends (read guard) and truncation (write guard) — truncation is
-//! rare (~5s) and must be atomic with re-appending partial entries.
+//! rare (~5s).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
@@ -20,11 +20,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
-
-/// Bit flag set on block_index to indicate a partial WAL entry (24 bytes
-/// instead of 20). Block indices are at most ~80K (10GB / 128KB), so the
-/// high bit of the u64 is always 0 in normal entries.
-pub const PARTIAL_WAL_FLAG: u64 = 1 << 63;
 
 /// A single WAL entry: records that a chunk was modified.
 ///
@@ -37,8 +32,6 @@ pub const PARTIAL_WAL_FLAG: u64 = 1 << 63;
 pub struct WalEntry {
     pub block_index: u64,
     pub sequence: u64,
-    /// For partial blocks: bitmap of valid 4KB sub-regions. `None` for normal entries.
-    pub partial_bitmap: Option<u32>,
 }
 
 /// Serialize a normal WAL entry (20 bytes) into the buffer.
@@ -59,35 +52,12 @@ pub fn serialize_entry(buf: &mut Vec<u8>, block_index: u64, sequence: u64) {
     buf.extend_from_slice(&crc.to_le_bytes());
 }
 
-/// Serialize a partial WAL entry (24 bytes) into the buffer.
-///
-/// Wire format: `[block_index|HIGH_BIT:u64 LE][sequence:u64 LE][bitmap:u32 LE][crc32:u32 LE]`
-pub fn serialize_partial_entry(buf: &mut Vec<u8>, block_index: u64, sequence: u64, bitmap: u32) {
-    let mut hasher = crc32fast::Hasher::new();
-
-    let tagged_index = block_index | PARTIAL_WAL_FLAG;
-    let block_index_le = tagged_index.to_le_bytes();
-    hasher.update(&block_index_le);
-    buf.extend_from_slice(&block_index_le);
-
-    let sequence_le = sequence.to_le_bytes();
-    hasher.update(&sequence_le);
-    buf.extend_from_slice(&sequence_le);
-
-    let bitmap_le = bitmap.to_le_bytes();
-    hasher.update(&bitmap_le);
-    buf.extend_from_slice(&bitmap_le);
-
-    let crc = hasher.finalize();
-    buf.extend_from_slice(&crc.to_le_bytes());
-}
-
 /// Append-only write-ahead log backed by a file on local SSD.
 ///
 /// Uses O_APPEND for lock-free concurrent appends. Multiple threads can call
 /// `append_batch()` concurrently — the kernel serializes the writes. An
-/// internal `RwLock<()>` ensures `truncate_and_reappend()` has exclusive
-/// access (blocks concurrent appends during the truncate window).
+/// internal `RwLock<()>` ensures `truncate()` has exclusive access (blocks
+/// concurrent appends during the truncate window).
 pub struct Wal {
     /// O_APPEND file descriptor for atomic appends.
     fd: RawFd,
@@ -102,7 +72,7 @@ pub struct Wal {
 // SAFETY: Wal only exposes:
 // - append_batch(): O_APPEND write() under read guard — kernel serializes
 // - sync()/flush(): fdatasync — thread-safe on an fd
-// - truncate_and_reappend(): ftruncate + write under exclusive write guard
+// - truncate(): ftruncate under exclusive write guard
 // The RawFd is derived from the owned File and never used for seek-based I/O.
 unsafe impl Sync for Wal {}
 
@@ -133,7 +103,7 @@ impl Wal {
     /// O_APPEND because the kernel holds the inode rwsem for the duration.
     ///
     /// The `buf` should contain one or more entries serialized via
-    /// `serialize_entry()` / `serialize_partial_entry()`.
+    /// `serialize_entry()`.
     pub fn append_batch(&self, buf: &[u8]) -> io::Result<()> {
         if buf.is_empty() {
             return Ok(());
@@ -193,49 +163,16 @@ impl Wal {
         Ok(())
     }
 
-    /// Atomically truncate the WAL and re-append partial entries.
+    /// Truncate the WAL to zero length.
     ///
     /// Takes an exclusive write guard, blocking all concurrent appends.
     /// This is called by the checkpoint path (~every 5 seconds).
-    ///
-    /// `partial_entries` is a list of `(block_index, sequence, bitmap)` tuples
-    /// that must survive truncation for partial block crash recovery.
-    pub fn truncate_and_reappend(
-        &self,
-        partial_entries: &[(u64, u64, u32)],
-    ) -> io::Result<()> {
+    pub fn truncate(&self) -> io::Result<()> {
         let _guard = self.guard.write();
 
-        // Truncate to zero
         let ret = unsafe { libc::ftruncate(self.fd, 0) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
-        }
-
-        // Re-append partial entries (under exclusive guard, no concurrency)
-        if !partial_entries.is_empty() {
-            let mut buf = Vec::with_capacity(partial_entries.len() * 24);
-            for &(block_index, sequence, bitmap) in partial_entries {
-                serialize_partial_entry(&mut buf, block_index, sequence, bitmap);
-            }
-
-            let written = unsafe {
-                libc::write(
-                    self.fd,
-                    buf.as_ptr() as *const libc::c_void,
-                    buf.len(),
-                )
-            };
-            if written < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let written = written as usize;
-            if written != buf.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    format!("WAL short write: expected {} bytes, wrote {}", buf.len(), written),
-                ));
-            }
         }
 
         Ok(())
@@ -286,7 +223,7 @@ impl Wal {
     fn read_entry(reader: &mut impl Read) -> io::Result<Option<WalEntry>> {
         let mut hasher = crc32fast::Hasher::new();
 
-        // block_index (may have high bit set for partial entries)
+        // block_index
         let mut buf8 = [0u8; 8];
         match reader.read_exact(&mut buf8) {
             Ok(()) => {}
@@ -294,24 +231,12 @@ impl Wal {
             Err(e) => return Err(e),
         }
         hasher.update(&buf8);
-        let raw_block_index = u64::from_le_bytes(buf8);
-        let is_partial = raw_block_index & PARTIAL_WAL_FLAG != 0;
-        let block_index = raw_block_index & !PARTIAL_WAL_FLAG;
+        let block_index = u64::from_le_bytes(buf8);
 
         // sequence
         reader.read_exact(&mut buf8)?;
         hasher.update(&buf8);
         let sequence = u64::from_le_bytes(buf8);
-
-        // For partial entries: read bitmap before CRC
-        let partial_bitmap = if is_partial {
-            let mut buf4 = [0u8; 4];
-            reader.read_exact(&mut buf4)?;
-            hasher.update(&buf4);
-            Some(u32::from_le_bytes(buf4))
-        } else {
-            None
-        };
 
         // crc32
         let mut buf4 = [0u8; 4];
@@ -329,7 +254,6 @@ impl Wal {
         Ok(Some(WalEntry {
             block_index,
             sequence,
-            partial_bitmap,
         }))
     }
 }
@@ -445,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_truncate_and_reappend() {
+    fn test_wal_truncate() {
         let dir = TempDir::new().unwrap();
         let wal_path = dir.path().join("test.wal");
 
@@ -454,39 +378,8 @@ mod tests {
             append_test_entry(&wal, i);
         }
 
-        // Truncate and reappend partial entries
-        wal.truncate_and_reappend(&[
-            (100, 10, 0x000F),
-            (200, 11, 0x00FF),
-            (300, 12, 0xFFFF),
-        ]).unwrap();
-        drop(wal);
-
-        let entries = Wal::replay(&wal_path, 0).unwrap();
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].block_index, 100);
-        assert_eq!(entries[0].sequence, 10);
-        assert_eq!(entries[0].partial_bitmap, Some(0x000F));
-        assert_eq!(entries[1].block_index, 200);
-        assert_eq!(entries[1].sequence, 11);
-        assert_eq!(entries[1].partial_bitmap, Some(0x00FF));
-        assert_eq!(entries[2].block_index, 300);
-        assert_eq!(entries[2].sequence, 12);
-        assert_eq!(entries[2].partial_bitmap, Some(0xFFFF));
-    }
-
-    #[test]
-    fn test_wal_truncate_empty_reappend() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("test.wal");
-
-        let wal = Wal::open(&wal_path).unwrap();
-        for i in 1..=5 {
-            append_test_entry(&wal, i);
-        }
-
-        // Truncate with no partial entries to reappend
-        wal.truncate_and_reappend(&[]).unwrap();
+        // Truncate the WAL
+        wal.truncate().unwrap();
 
         // New entries should work
         for i in 10..=12 {
@@ -638,50 +531,10 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_batch_append() {
-        let dir = TempDir::new().unwrap();
-        let wal_path = dir.path().join("batch.wal");
-
-        {
-            let wal = Wal::open(&wal_path).unwrap();
-
-            // Build a batch of 5 entries in one buffer
-            let mut buf = Vec::new();
-            for i in 1..=5u64 {
-                serialize_entry(&mut buf, i * 10, i);
-            }
-            wal.append_batch(&buf).unwrap();
-
-            // Append a partial entry separately
-            let mut buf2 = Vec::new();
-            serialize_partial_entry(&mut buf2, 100, 6, 0xABCD);
-            wal.append_batch(&buf2).unwrap();
-        }
-
-        let entries = Wal::replay(&wal_path, 0).unwrap();
-        assert_eq!(entries.len(), 6);
-        for (i, entry) in entries.iter().enumerate().take(5) {
-            let seq = (i + 1) as u64;
-            assert_eq!(entry.block_index, seq * 10);
-            assert_eq!(entry.sequence, seq);
-            assert_eq!(entry.partial_bitmap, None);
-        }
-        assert_eq!(entries[5].block_index, 100);
-        assert_eq!(entries[5].sequence, 6);
-        assert_eq!(entries[5].partial_bitmap, Some(0xABCD));
-    }
-
-    #[test]
     fn test_serialize_entry_format() {
         let mut buf = Vec::new();
         serialize_entry(&mut buf, 42, 7);
         assert_eq!(buf.len(), 20); // 8 + 8 + 4
     }
 
-    #[test]
-    fn test_serialize_partial_entry_format() {
-        let mut buf = Vec::new();
-        serialize_partial_entry(&mut buf, 42, 7, 0xFF);
-        assert_eq!(buf.len(), 24); // 8 + 8 + 4 + 4
-    }
 }

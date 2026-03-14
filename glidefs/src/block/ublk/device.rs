@@ -1000,10 +1000,10 @@ async fn io_task_zc(
                 handle_write_zc(q, offset, length, fua, addr, handler).await
             }
             // Cold ops: Box::pin to keep their large async state machines
-            // off the io_task_zc future enum. trim/write_zeroes chain into
-            // backfill_missing_blocks → cache.read → locate_block → S3,
-            // producing multi-KB futures that inflate L1 cache footprint
-            // for the hot read/write paths if left inline.
+            // off the io_task_zc future enum. trim/write_zeroes can chain
+            // into locate_block → S3, producing multi-KB futures that
+            // inflate L1 cache footprint for the hot read/write paths
+            // if left inline.
             _ => Box::pin(dispatch_cold(op, offset, length, fua, handler)).await,
         };
 
@@ -1034,13 +1034,9 @@ async fn handle_write_zc(
     }
 
     // Phase 1: prepare metadata before data lands on disk.
-    // Box::pin: pre_write chains into backfill_missing_blocks (deep async tree).
-    // Without boxing, its state machine inflates the io_task_zc future and
-    // hurts L1 cache locality on the hot read path.
-    let syncing_blocks = match Box::pin(handler.pre_write(offset, length as u64)).await {
-        Ok(sb) => sb,
-        Err(e) => return -e.to_linux_errno(),
-    };
+    if let Err(e) = Box::pin(handler.pre_write(offset, length as u64)).await {
+        return -e.to_linux_errno();
+    }
 
     // Phase 2+3: write data and commit metadata under one data_file read lock.
     //
@@ -1050,7 +1046,7 @@ async fn handle_write_zc(
     // SAFETY: addr points to kernel-mapped bio pages, valid for the
     // duration of this I/O request (between get_iod and commit).
     let data = unsafe { std::slice::from_raw_parts(addr as *const u8, length as usize) };
-    if let Err(e) = handler.pwrite_and_commit(offset, data, fua, &syncing_blocks) {
+    if let Err(e) = handler.pwrite_and_commit(offset, data, fua) {
         return -e.to_linux_errno();
     }
 

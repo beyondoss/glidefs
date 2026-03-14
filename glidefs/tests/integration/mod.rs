@@ -14,7 +14,6 @@ mod flush_ordering;
 mod failure_injection;
 mod flush_safety;
 mod gc;
-mod partial_blocks;
 mod property_tests;
 mod snapshots;
 mod s3_degraded;

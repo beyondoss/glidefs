@@ -215,7 +215,7 @@ async fn test_crash_mid_flush_concurrent_writers_no_data_loss() {
                     ((writer_id as u32) * blocks_per_writer + iteration) % num_blocks;
                 let data = make_block_data(writer_id, block_idx, iteration);
                 let offset = block_idx as u64 * BLOCK_SIZE as u64;
-                cache.write(offset, &data, &[]).unwrap();
+                cache.write(offset, &data).unwrap();
                 write_log
                     .lock()
                     .insert(block_idx, (writer_id, iteration, data));
@@ -254,7 +254,7 @@ async fn test_crash_mid_flush_concurrent_writers_no_data_loss() {
                     let data = make_block_data(writer_id, block_idx, iteration);
                     let offset = block_idx as u64 * BLOCK_SIZE as u64;
 
-                    cache.write(offset, &data, &[]).unwrap();
+                    cache.write(offset, &data).unwrap();
 
                     write_log
                         .lock()
@@ -359,7 +359,7 @@ async fn test_crash_recover_then_flush_to_s3() {
         for i in 0..20u32 {
             let data = make_block_data(0, i, 0);
             cache
-                .write(i as u64 * BLOCK_SIZE as u64, &data, &[])
+                .write(i as u64 * BLOCK_SIZE as u64, &data)
                 .unwrap();
             expected_blocks.insert(i, data);
         }
@@ -469,7 +469,7 @@ async fn test_wal_only_recovery_under_concurrent_load() {
                     let data = make_block_data(writer_id, block_idx, iteration);
                     let offset = block_idx as u64 * BLOCK_SIZE as u64;
 
-                    cache.write(offset, &data, &[]).unwrap();
+                    cache.write(offset, &data).unwrap();
                     write_log.lock().insert(block_idx, data);
                 }
             });

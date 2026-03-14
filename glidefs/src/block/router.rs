@@ -871,9 +871,6 @@ impl ExportRouter {
             None, // TODO: wire up write_trace_path from ExportConfig
         ));
 
-        // Spawn background backfill for any partial blocks recovered from WAL
-        handler.spawn_recovery_backfills();
-
         // Start flush scheduler for this export
         let (flush_shutdown_tx, flush_shutdown_rx) = watch::channel(false);
         let flush_cache = Arc::clone(&cache);

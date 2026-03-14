@@ -33,9 +33,9 @@ async fn test_wake_from_different_node() {
     let block_1_data: Vec<u8> = (0..128 * 1024).map(|i| ((i + 100) % 256) as u8).collect();
     let block_5_data: Vec<u8> = (0..128 * 1024).map(|i| ((i + 200) % 256) as u8).collect();
 
-    cache_a.write(0, &block_0_data, &[]).unwrap();
-    cache_a.write(128 * 1024, &block_1_data, &[]).unwrap();
-    cache_a.write(5 * 128 * 1024, &block_5_data, &[]).unwrap();
+    cache_a.write(0, &block_0_data).unwrap();
+    cache_a.write(128 * 1024, &block_1_data).unwrap();
+    cache_a.write(5 * 128 * 1024, &block_5_data).unwrap();
 
     // Flush to S3 (simulates graceful shutdown)
     cache_a
@@ -145,7 +145,7 @@ async fn test_cache_hit_on_second_read() {
 
     // Write some data
     let data: Vec<u8> = (0..128 * 1024).map(|i| (i % 256) as u8).collect();
-    cache.write(0, &data, &[]).unwrap();
+    cache.write(0, &data).unwrap();
     cache
         .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
@@ -208,7 +208,7 @@ async fn test_batch_prefetch_optimization() {
 
     for i in 0..10u64 {
         let data: Vec<u8> = vec![i as u8; 128 * 1024];
-        writer_cache.write(i * 128 * 1024, &data, &[]).unwrap();
+        writer_cache.write(i * 128 * 1024, &data).unwrap();
     }
     writer_cache
         .flush_to_s3(&writer_content_store, &writer_pack_index_cache, &writer_volume_manifest)
@@ -272,9 +272,9 @@ async fn test_recovery_after_pack_flush_without_drain() {
     let block_1_data: Vec<u8> = vec![0xBB; BLOCK_SIZE];
     let block_2_data: Vec<u8> = vec![0xCC; BLOCK_SIZE];
 
-    cache_a.write(0, &block_0_data, &[]).unwrap();
-    cache_a.write(BLOCK_SIZE as u64, &block_1_data, &[]).unwrap();
-    cache_a.write(2 * BLOCK_SIZE as u64, &block_2_data, &[]).unwrap();
+    cache_a.write(0, &block_0_data).unwrap();
+    cache_a.write(BLOCK_SIZE as u64, &block_1_data).unwrap();
+    cache_a.write(2 * BLOCK_SIZE as u64, &block_2_data).unwrap();
 
     // Simulate what the flush scheduler does: flush_packs + sync_manifest.
     // Critically, we do NOT call flush_to_s3 or drain — this is what happens

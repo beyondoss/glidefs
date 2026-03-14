@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use dashmap::DashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -69,9 +68,6 @@ impl WriteCache<Initializing> {
         // (which was pwrite'd before the WAL entry was appended).
         let mut max_wal_seq = persisted_max_seq;
 
-        // Partial block bitmaps reconstructed from partial WAL entries.
-        let partial_blocks: DashMap<usize, super::inner::PartialBlockState> = DashMap::new();
-
         for entry in &wal_entries {
             let block_index = entry.block_index as usize;
             max_wal_seq = max_wal_seq.max(entry.sequence);
@@ -89,17 +85,6 @@ impl WriteCache<Initializing> {
                     }
                     dirty_count += 1;
                 }
-
-                // Reconstruct partial block bitmap from partial WAL entries
-                if let Some(bitmap) = entry.partial_bitmap {
-                    let entry = partial_blocks
-                        .entry(block_index)
-                        .or_insert_with(|| super::inner::PartialBlockState {
-                            bitmap: std::sync::atomic::AtomicU32::new(0),
-                            write_lock: parking_lot::Mutex::new(()),
-                        });
-                    entry.value().bitmap.fetch_or(bitmap, std::sync::atomic::Ordering::Release);
-                }
             }
         }
 
@@ -115,14 +100,10 @@ impl WriteCache<Initializing> {
         // old corruption and misses all entries written in the previous
         // session. Rewriting ensures a clean WAL for future appends.
         {
-            use crate::block::wal::{serialize_entry, serialize_partial_entry};
+            use crate::block::wal::serialize_entry;
             let mut buf = Vec::new();
             for entry in &wal_entries {
-                if let Some(bitmap) = entry.partial_bitmap {
-                    serialize_partial_entry(&mut buf, entry.block_index, entry.sequence, bitmap);
-                } else {
-                    serialize_entry(&mut buf, entry.block_index, entry.sequence);
-                }
+                serialize_entry(&mut buf, entry.block_index, entry.sequence);
             }
             std::fs::write(&wal_path, &buf)?;
         }
@@ -140,13 +121,6 @@ impl WriteCache<Initializing> {
         let block_size = config.block_size;
         let zbh = zero_block_hash(block_size);
         let zbb = Bytes::from(vec![0u8; block_size]);
-
-        let partial_count = partial_blocks.len();
-        // Count partial blocks that are DIRTY for the flush threshold.
-        let partial_dirty = partial_blocks
-            .iter()
-            .filter(|entry| state_map.get(*entry.key()) == SparseBlockState::DIRTY)
-            .count() as u64;
 
         // Crash recovery: if a flushing file exists, we crashed mid-flush.
         //
@@ -219,7 +193,6 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
-            partial_dirty_count: AtomicU64::new(partial_dirty),
             sequence,
             wal,
             export_name,
@@ -228,7 +201,6 @@ impl WriteCache<Initializing> {
             recovery_warnings: AtomicU64::new(recovery_warning_count),
             crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
-            partial_blocks,
             manifest_etag: parking_lot::Mutex::new(None),
             flushing_active: AtomicBool::new(false),
         });
@@ -236,7 +208,6 @@ impl WriteCache<Initializing> {
         info!(
             dirty_blocks = dirty_count,
             present_blocks = present_count,
-            partial_blocks = partial_count,
             recovery_warnings = recovery_warning_count,
             "cache opened, transitioning to Recovering"
         );
@@ -275,7 +246,6 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
             syncing_block_count: AtomicU64::new(0),
-            partial_dirty_count: AtomicU64::new(0),
             sequence,
             wal,
             export_name,
@@ -284,7 +254,6 @@ impl WriteCache<Initializing> {
             recovery_warnings: AtomicU64::new(0),
             crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
-            partial_blocks: DashMap::new(),
             manifest_etag: parking_lot::Mutex::new(None),
             flushing_active: AtomicBool::new(false),
         });

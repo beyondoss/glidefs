@@ -41,7 +41,7 @@ proptest! {
             let offset = block_idx * BLOCK_SIZE as u64;
 
             // Write data
-            cache.write(offset, &data, &[]).unwrap();
+            cache.write(offset, &data).unwrap();
 
             // Read back (local)
             let read_data = cache.read_local(offset, BLOCK_SIZE).unwrap();
@@ -86,7 +86,7 @@ proptest! {
 
             // Write multiple times
             for data in &writes {
-                cache.write(offset, data, &[]).unwrap();
+                cache.write(offset, data).unwrap();
             }
 
             // Last write should be what we read
@@ -132,7 +132,7 @@ proptest! {
             // Write all blocks
             for (&block_idx, data) in &block_data {
                 let offset = block_idx * BLOCK_SIZE as u64;
-                cache.write(offset, data, &[]).unwrap();
+                cache.write(offset, data).unwrap();
             }
 
             // Verify each block independently
@@ -202,7 +202,7 @@ proptest! {
             }
 
             // Write at batch boundary
-            cache.write(offset, &data, &[]).unwrap();
+            cache.write(offset, &data).unwrap();
 
             // Flush and verify
             cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
@@ -248,7 +248,7 @@ proptest! {
 
         for block_idx in writes {
             let offset = block_idx * BLOCK_SIZE as u64;
-            cache.write(offset, &data, &[]).unwrap();
+            cache.write(offset, &data).unwrap();
             written_blocks.insert(block_idx);
 
             // Dirty count should equal unique blocks written
@@ -308,7 +308,7 @@ proptest! {
             let zeros = vec![0u8; BLOCK_SIZE];
 
             // Write zeros
-            cache.write(offset, &zeros, &[]).unwrap();
+            cache.write(offset, &zeros).unwrap();
 
             // Flush (zero-block optimization may skip S3 write)
             cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();
@@ -360,7 +360,7 @@ async fn test_multi_batch_writes() {
             let data: Vec<u8> = (0..BLOCK_SIZE)
                 .map(|i| ((block_idx as usize + i) % 256) as u8)
                 .collect();
-            cache.write(offset, &data, &[]).unwrap();
+            cache.write(offset, &data).unwrap();
             expected.insert(block_idx, data);
         }
     }
@@ -403,7 +403,7 @@ async fn test_alternating_read_write() {
         if i % 2 == 0 {
             // Write
             let data = vec![i as u8; BLOCK_SIZE];
-            cache.write(offset, &data, &[]).unwrap();
+            cache.write(offset, &data).unwrap();
         } else {
             // Read (should get last written value or zeros)
             let _ = cache
@@ -431,7 +431,7 @@ async fn test_device_boundary() {
 
     // Write to last block
     let data = vec![0xFF; BLOCK_SIZE];
-    cache.write(offset, &data, &[]).unwrap();
+    cache.write(offset, &data).unwrap();
 
     // Flush and verify
     cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await.unwrap();

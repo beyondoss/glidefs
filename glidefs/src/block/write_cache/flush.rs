@@ -63,6 +63,7 @@ fn compute_flush_batch(
     snapshot: &[usize],
     zero_hash: Blake3Hash,
     clean_cache: Option<Arc<dyn BlockCache>>,
+    prior_data: &HashMap<usize, Bytes>,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
 
@@ -80,16 +81,6 @@ fn compute_flush_batch(
     let per_block: Vec<Result<BlockResult, CacheError>> = snapshot
         .par_iter()
         .map(|&chunk_index| {
-            // Skip partial blocks — their unbackfilled sub-regions contain
-            // garbage. They stay DIRTY and will be flushed after backfill.
-            if inner.is_partial(chunk_index) {
-                return Ok(BlockResult::Skipped {
-                    chunk_index,
-                    cas_failed: true,
-                    corrupted: false,
-                });
-            }
-
             let mut chunk_buf = vec![0u8; block_size];
 
             let offset = chunk_index as u64 * block_size as u64;
@@ -107,6 +98,50 @@ fn compute_flush_batch(
             }
             if valid_bytes < block_size {
                 chunk_buf[valid_bytes..].fill(0);
+            }
+
+            // Merge sparse holes with prior S3 data.
+            //
+            // The sparse file's extent map tracks which sub-regions the guest
+            // actually wrote (pwrite allocates). Holes are regions never written
+            // — they read as zeros but should contain prior S3 data. The kernel
+            // maintains this for free; we read it back via lseek(SEEK_DATA/SEEK_HOLE).
+            //
+            // prior_data is pre-fetched from foyer/S3 before entering rayon.
+            // Only blocks that have both holes AND prior S3 data have entries.
+            if let Some(prior) = prior_data.get(&chunk_index) {
+                if let Some(ref ff) = flushing_snap {
+                    if let Ok(regions) = ff.data_regions(offset, valid_bytes as u64) {
+                        let total_data: u64 = regions.iter().map(|(_, len)| len).sum();
+                        if total_data < valid_bytes as u64 {
+                            // Fill holes from prior S3 data.
+                            let mut hole_pos = offset;
+                            for &(data_start, data_len) in &regions {
+                                // Gap before this data region = hole
+                                if data_start > hole_pos {
+                                    let local_start = (hole_pos - offset) as usize;
+                                    let local_end = (data_start - offset) as usize;
+                                    let prior_end = local_end.min(prior.len());
+                                    if local_start < prior_end {
+                                        chunk_buf[local_start..prior_end]
+                                            .copy_from_slice(&prior[local_start..prior_end]);
+                                    }
+                                }
+                                hole_pos = data_start + data_len;
+                            }
+                            // Trailing hole after last data region
+                            if hole_pos < offset + valid_bytes as u64 {
+                                let local_start = (hole_pos - offset) as usize;
+                                let local_end = valid_bytes;
+                                let prior_end = local_end.min(prior.len());
+                                if local_start < prior_end {
+                                    chunk_buf[local_start..prior_end]
+                                        .copy_from_slice(&prior[local_start..prior_end]);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Verify CRC32 if available (detects SSD corruption before BLAKE3).
@@ -362,17 +397,6 @@ impl WriteCache<Active> {
         self.inner.dirty_block_count.load(Ordering::Relaxed)
     }
 
-    /// Get the number of dirty blocks that are actually flushable.
-    ///
-    /// Excludes partial blocks (dirty but unflushable — compute_flush_batch
-    /// skips them). Used by the flush threshold to avoid triggering auto-flush
-    /// when most dirty blocks are partial (incomplete backfill).
-    pub fn flushable_dirty_count(&self) -> u64 {
-        let dirty = self.inner.dirty_block_count.load(Ordering::Relaxed);
-        let partial = self.inner.partial_dirty_count.load(Ordering::Relaxed);
-        dirty.saturating_sub(partial)
-    }
-
     /// Get the number of blocks currently being synced.
     pub fn syncing_block_count(&self) -> u64 {
         self.inner.syncing_block_count.load(Ordering::Relaxed)
@@ -448,14 +472,11 @@ impl WriteCache<Active> {
     /// the Tokio runtime with `sync_all()` + `rename()` syscalls in
     /// `save_block_states`.
     ///
-    /// After truncation, re-appends partial WAL entries so partial block
-    /// bitmaps survive a crash between checkpoint and backfill completion.
     async fn checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
         crate::task::spawn_blocking_named("checkpoint", move || {
             inner.save_block_states()?;
-            let partials = inner.collect_partial_entries();
-            inner.wal.truncate_and_reappend(&partials)?;
+            inner.wal.truncate()?;
             Ok(())
         })
         .await
@@ -476,8 +497,7 @@ impl WriteCache<Active> {
         crate::task::spawn_blocking_named("local-checkpoint", move || {
             compute_dirty_crc32s(&inner);
             inner.save_block_states()?;
-            let partials = inner.collect_partial_entries();
-            inner.wal.truncate_and_reappend(&partials)?;
+            inner.wal.truncate()?;
             debug!("local checkpoint complete");
             Ok(())
         })
@@ -530,10 +550,14 @@ impl WriteCache<Active> {
     ///
     /// The entire rotation is one atomic critical section under a single
     /// write-lock acquisition. This eliminates a class of races where
-    /// state changes (CAS, file swap, partial snapshot) span non-atomic
-    /// windows. The lock holds for ~15µs on typical hardware — rename is
-    /// an inode pointer swap, file creation is a single syscall, and the
-    /// CAS loop touches only cache-hot atomics.
+    /// state changes (CAS, file swap) span non-atomic windows. The lock
+    /// holds for ~15µs on typical hardware — rename is an inode pointer
+    /// swap, file creation is a single syscall, and the CAS loop touches
+    /// only cache-hot atomics.
+    ///
+    /// All DIRTY blocks are claimed (CAS DIRTY→SYNCING). Blocks with
+    /// sparse holes are handled at flush time via lseek(SEEK_DATA/SEEK_HOLE)
+    /// on the immutable flushing file — no partial block tracking needed.
     fn rotate_data_file_inner(&self, snapshot: bool) -> Result<(Vec<usize>, ()), CacheError> {
         let active_path = self.inner.config.data_path();
         let flushing_path = self.inner.config.flushing_path();
@@ -556,64 +580,27 @@ impl WriteCache<Active> {
             self.inner.config.device_size,
         )?;
 
-        // Snapshot dirty blocks AND partial block indices atomically.
-        //
-        // CAS DIRTY→SYNCING happens here, under the lock, so concurrent
-        // writes after lock-release see SYNCING and properly re-dirty via
-        // transition_to_dirty + promote_syncing_blocks.
-        //
-        // Partial indices are captured at the same time as the exclusion
-        // decision — complete_partial can't cause a TOCTOU race because
-        // it needs the data_file read lock (which we hold exclusively).
-        let (claimed, partial_to_copy) = if snapshot {
+        // Snapshot dirty blocks: CAS DIRTY→SYNCING under the lock.
+        // All dirty blocks are claimed — blocks with sparse holes are
+        // merged with prior S3 data at flush time, not skipped.
+        let claimed = if snapshot {
             let mut claimed = Vec::new();
-            let mut partials = Vec::new();
             for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
-                if self.inner.is_partial(idx) {
-                    partials.push(idx);
-                } else {
-                    if self.inner.transition_dirty_to_syncing(idx) {
-                        claimed.push(idx);
-                    }
+                if self.inner.transition_dirty_to_syncing(idx) {
+                    claimed.push(idx);
                 }
             }
-            // Also include non-DIRTY partial blocks (e.g. NOT_PRESENT+partial
-            // from eviction race) — they have guest data in the active file
-            // that must survive rotation.
-            for entry in self.inner.partial_blocks.iter() {
-                let idx = *entry.key();
-                if !partials.contains(&idx) {
-                    partials.push(idx);
-                }
-            }
-            (claimed, partials)
+            claimed
         } else {
-            (Vec::new(), Vec::new())
+            Vec::new()
         };
 
         // Swap file handle: new active file goes into the RwLock.
         let old_file = std::mem::replace(&mut *data_file_guard, new_file);
 
-        // Copy block data from old active → new active for blocks that
-        // must survive rotation. Safe under write lock: no concurrent I/O.
-        {
-            let block_size = self.inner.config.block_size as u64;
-            let device_size = self.inner.config.device_size;
-
-            // Partial blocks: have guest writes in some sub-regions.
-            for &idx in &partial_to_copy {
-                let offset = idx as u64 * block_size;
-                let valid = std::cmp::min(block_size, device_size.saturating_sub(offset)) as usize;
-                if valid == 0 {
-                    continue;
-                }
-                let mut buf = vec![0u8; valid];
-                if old_file.read_exact_at(&mut buf, offset).is_ok() {
-                    let _ = data_file_guard.write_all_at(&buf, offset);
-                }
-            }
-
-        }
+        // No block data copy needed. Blocks with sparse holes (sub-block
+        // writes) are handled at flush time via lseek-based merge with
+        // prior S3 data. The flushing file preserves the sparse extent map.
 
         // Set flushing_file before releasing the write lock.
         // Writers acquiring the read lock after rotation will see
@@ -627,40 +614,122 @@ impl WriteCache<Active> {
         Ok((claimed, ()))
     }
 
-    /// Check whether a block is in the partial_blocks map (has unfilled sub-regions).
+    /// Pre-fetch prior S3 data for blocks with sparse holes in the flushing file.
     ///
-    /// TEST ONLY — exposed via `test-utils` feature for integration test assertions.
-    #[cfg(feature = "test-utils")]
-    #[allow(dead_code)]
-    pub fn is_block_partial(&self, block_idx: usize) -> bool {
-        self.inner.is_partial(block_idx)
-    }
+    /// Walks the flushing file's extent map via lseek(SEEK_DATA/SEEK_HOLE) to
+    /// find blocks with holes. For blocks that have prior S3 data (in foyer or
+    /// S3), fetches the prior version so compute_flush_batch can merge holes.
+    ///
+    /// Returns a HashMap of block_index → prior block data for blocks that need
+    /// merging. Blocks without holes or without S3 data are not included.
+    async fn prefetch_prior_data(
+        &self,
+        chunk_blocks: &[usize],
+        clean_cache: Option<&dyn BlockCache>,
+        pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        content_store: &ContentStore,
+        _blocks_per_chunk: u32,
+    ) -> HashMap<usize, Bytes> {
+        let block_size = self.inner.config.block_size;
+        let mut result = HashMap::new();
 
-    /// Insert a block into partial_blocks with an empty bitmap (all sub-regions
-    /// marked as unfilled). Simulates what `backfill_missing_blocks` does before
-    /// the actual write.
-    ///
-    /// TEST ONLY — exposed via `test-utils` feature for integration test setup.
-    #[cfg(feature = "test-utils")]
-    #[allow(dead_code)]
-    pub fn insert_partial_block_for_test(&self, block_idx: usize) {
-        use std::sync::atomic::AtomicU32;
-        self.inner.partial_blocks.insert(
-            block_idx,
-            super::inner::PartialBlockState {
-                bitmap: AtomicU32::new(0),
-                write_lock: parking_lot::Mutex::new(()),
-            },
-        );
-    }
+        // Identify blocks with holes in the flushing file.
+        let blocks_with_holes: Vec<usize> = {
+            let flushing_guard = self.inner.flushing_file.lock();
+            if let Some(ref ff) = *flushing_guard {
+                chunk_blocks
+                    .iter()
+                    .filter(|&&idx| {
+                        let offset = idx as u64 * block_size as u64;
+                        ff.has_holes(offset, block_size as u64).unwrap_or(false)
+                    })
+                    .copied()
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
 
-    /// Remove a block from partial tracking (simulates backfill completing).
-    ///
-    /// TEST ONLY — used to reproduce the complete_partial race deterministically.
-    #[cfg(feature = "test-utils")]
-    #[allow(dead_code)]
-    pub fn complete_partial_for_test(&self, block_idx: usize) {
-        self.inner.complete_partial(block_idx);
+        if blocks_with_holes.is_empty() {
+            return result;
+        }
+
+        // For blocks with holes, check if they have prior S3 data and fetch it.
+        for &block_idx in &blocks_with_holes {
+            let block_num = block_idx as u64;
+
+            // Check if this block has S3 data via the manifest.
+            // Extract all needed info under lock, then drop before async work.
+            let (chunk_idx, chunk_offset, pack_ids) = {
+                let vm = volume_manifest.read();
+                let ci = vm.chunk_idx_for_block(block_num);
+                let co = vm.block_offset_in_chunk(block_num);
+                let pids = vm
+                    .chunk_pack_ids(ci)
+                    .map(|ids| ids.to_vec())
+                    .unwrap_or_default();
+                (ci, co, pids)
+            };
+            if pack_ids.is_empty() {
+                // No S3 data — holes are genuine zeros (fresh block).
+                continue;
+            }
+            // Search packs newest-first for this block's hash.
+            let mut hash = None;
+            for &pid in pack_ids.iter().rev() {
+                if let Some((h, _pack_offset, _comp_length)) = pack_index_cache
+                    .lookup_block(pid, chunk_offset)
+                    .await
+                {
+                    hash = Some(h);
+                    break;
+                }
+            }
+            let hash = match hash {
+                Some(h) => h,
+                None => continue, // No S3 data for this specific block
+            };
+
+            // Try foyer first (synchronous, in-memory).
+            if let Some(cache) = clean_cache {
+                if let Some(data) = cache.get(&hash).await {
+                    result.insert(block_idx, data);
+                    continue;
+                }
+            }
+
+            // Foyer miss — fetch from S3.
+            for &pid in pack_ids.iter().rev() {
+                if let Some((_hash_val, pack_offset, comp_length)) = pack_index_cache.lookup_block(pid, chunk_offset).await {
+                    match content_store
+                        .get_chunk_block(chunk_idx, pid, pack_offset, comp_length)
+                        .await
+                    {
+                        Ok(compressed) => {
+                            if let Ok(data) = crate::block::block_map::lz4_decompress(&compressed) {
+                                let data = Bytes::from(data);
+                                // Warm foyer for future reads.
+                                if let Some(cache) = clean_cache {
+                                    cache.insert(hash, data.clone());
+                                }
+                                result.insert(block_idx, data);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                block_idx,
+                                error = %e,
+                                "failed to fetch prior block from S3 for hole merge"
+                            );
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        result
     }
 
     /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by
@@ -841,12 +910,27 @@ impl WriteCache<Active> {
 
         // Per-chunk flush
         for (chunk_idx, chunk_blocks) in per_chunk {
+            // Pre-fetch prior S3 data for blocks with sparse holes.
+            //
+            // The flushing file is immutable after rotation. Walk each block's
+            // extent map via lseek(SEEK_DATA/SEEK_HOLE) to find blocks with holes.
+            // For blocks that have prior S3 data, fetch from foyer (sync, in-memory)
+            // or S3 (async) so compute_flush_batch can merge holes.
+            let prior_data = self.prefetch_prior_data(
+                &chunk_blocks,
+                clean_cache.as_ref().map(|a| a.as_ref()),
+                pack_index_cache,
+                volume_manifest,
+                content_store,
+                blocks_per_chunk,
+            ).await;
+
             // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
             let zero_hash = self.inner.zero_block_hash;
             let inner = Arc::clone(&self.inner);
             let clean_cache_clone = clean_cache.map(Arc::clone);
             let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
-                compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone)
+                compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone, &prior_data)
             })
             .await
             .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;

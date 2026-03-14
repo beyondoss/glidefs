@@ -43,7 +43,7 @@ fn write_blocks(
         for (b, byte) in data.iter_mut().enumerate().take(BLOCK_SIZE).skip(3) {
             *byte = ((i + b) % 256) as u8;
         }
-        cache.write(offset as u64, &data, &[]).unwrap();
+        cache.write(offset as u64, &data).unwrap();
     }
 }
 

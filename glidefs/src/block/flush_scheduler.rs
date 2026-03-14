@@ -627,7 +627,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xAA; 128 * 1024], &[])
+                .write(offset, &[0xAA; 128 * 1024])
                 .unwrap();
         }
         assert_eq!(
@@ -697,7 +697,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xBB; 128 * 1024], &[])
+                .write(offset, &[0xBB; 128 * 1024])
                 .unwrap();
         }
 
@@ -785,7 +785,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xCC; 128 * 1024], &[])
+                .write(offset, &[0xCC; 128 * 1024])
                 .unwrap();
         }
 
@@ -827,7 +827,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache_check
-                .write(offset, &[0xDD; 128 * 1024], &[])
+                .write(offset, &[0xDD; 128 * 1024])
                 .unwrap();
         }
 
@@ -869,7 +869,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xEE; 128 * 1024], &[])
+                .write(offset, &[0xEE; 128 * 1024])
                 .unwrap();
         }
 
@@ -937,7 +937,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xFF; 128 * 1024], &[])
+                .write(offset, &[0xFF; 128 * 1024])
                 .unwrap();
         }
         assert_eq!(
