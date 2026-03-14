@@ -39,6 +39,9 @@ pub enum CacheError {
 
     #[error("Block evicted during flush — retry with backfill")]
     BlockEvicted,
+
+    #[error("Volume manifest error: {0}")]
+    VolumeManifest(#[from] crate::block::volume_manifest::VolumeManifestError),
 }
 
 impl CacheError {

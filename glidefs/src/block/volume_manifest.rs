@@ -61,6 +61,8 @@ pub enum VolumeManifestError {
     BadMagic,
     #[error("CRC32 mismatch: stored={stored:#010x}, computed={computed:#010x}")]
     CrcMismatch { stored: u32, computed: u32 },
+    #[error("chunk {chunk_idx} has {pack_count} packs, exceeds u16::MAX (65535)")]
+    PackCountOverflow { chunk_idx: u32, pack_count: usize },
 }
 
 impl VolumeManifest {
@@ -198,7 +200,7 @@ impl VolumeManifest {
     ///
     /// CRC32 trailer: 4 bytes
     /// ```
-    pub fn serialize(&self) -> Vec<u8> {
+    pub fn serialize(&self) -> Result<Vec<u8>, VolumeManifestError> {
         // Pre-compute size.
         let entries_size: usize = self
             .chunks
@@ -220,11 +222,12 @@ impl VolumeManifest {
 
         // Chunk entries (sorted by chunk_idx via BTreeMap iteration order).
         for (&chunk_idx, entry) in &self.chunks {
-            debug_assert!(
-                entry.packs.len() <= u16::MAX as usize,
-                "chunk {chunk_idx} has {} packs, exceeds u16::MAX",
-                entry.packs.len()
-            );
+            if entry.packs.len() > u16::MAX as usize {
+                return Err(VolumeManifestError::PackCountOverflow {
+                    chunk_idx,
+                    pack_count: entry.packs.len(),
+                });
+            }
             buf.extend_from_slice(&chunk_idx.to_le_bytes());
             buf.extend_from_slice(&(entry.packs.len() as u16).to_le_bytes());
             for &pack_id in &entry.packs {
@@ -237,7 +240,7 @@ impl VolumeManifest {
         buf.extend_from_slice(&crc.to_le_bytes());
 
         debug_assert_eq!(buf.len(), total);
-        buf
+        Ok(buf)
     }
 
     /// Deserialize from binary GLVM format.
@@ -334,7 +337,7 @@ mod tests {
         m.append_pack(5, 0x1111111111111111);
         m.append_pack(800, 0x2222222222222222);
 
-        let bytes = m.serialize();
+        let bytes = m.serialize().unwrap();
         let m2 = VolumeManifest::deserialize(&bytes).unwrap();
         assert_eq!(m, m2);
 
@@ -357,7 +360,7 @@ mod tests {
     #[test]
     fn test_v4_sparse_only_written_chunks() {
         let m = VolumeManifest::new(1024 * 1024 * 1024 * 1024, 131072); // 1 TB, empty
-        let bytes = m.serialize();
+        let bytes = m.serialize().unwrap();
         // Header (32) + CRC32 (4) = 36 bytes for empty manifest.
         assert_eq!(bytes.len(), 36);
 
@@ -374,7 +377,7 @@ mod tests {
             // 50% of 8192 chunks
             m.append_pack(i * 2, 0x1234567890ABCDEF);
         }
-        let bytes = m.serialize();
+        let bytes = m.serialize().unwrap();
         // 32 (header) + 4096 * (4 + 2 + 8) (entries) + 4 (crc) = 32 + 57344 + 4 = 57380
         assert_eq!(bytes.len(), 57380);
 
@@ -388,7 +391,7 @@ mod tests {
         let mut m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         m.append_pack(0, 42);
 
-        let mut bytes = m.serialize();
+        let mut bytes = m.serialize().unwrap();
         // Corrupt a data byte.
         bytes[GLVM_HEADER_SIZE + 2] ^= 0xFF;
         let err = VolumeManifest::deserialize(&bytes).unwrap_err();
@@ -398,7 +401,7 @@ mod tests {
     #[test]
     fn test_v4_bad_magic() {
         let m = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        let mut bytes = m.serialize();
+        let mut bytes = m.serialize().unwrap();
         bytes[0] = b'X';
         // Fix CRC so we test magic detection, not CRC.
         let crc_offset = bytes.len() - 4;
@@ -544,7 +547,7 @@ mod tests {
         m.append_pack(0, 42);
         m.append_pack(0, 43);
 
-        let full = m.serialize();
+        let full = m.serialize().unwrap();
         // Keep header + partial entry (first 6 bytes = chunk_idx + pack_count,
         // but not the pack data). Then append a valid CRC for this truncated body.
         let body = &full[..GLVM_HEADER_SIZE + 6];

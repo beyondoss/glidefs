@@ -172,11 +172,21 @@ impl NbdKernelDevice {
         }
     }
 
-    async fn crash(mut self) {
+    /// Crash-disconnect the kernel device and return the old device path.
+    ///
+    /// The caller should pass the returned path to `wait_for_device_released()`
+    /// after lazy-unmounting the filesystem. This ensures the old ext4 mount
+    /// has fully released the gendisk before any recovery reconnects — otherwise
+    /// ext4's error-handling writes (journal abort, superblock error flag) can
+    /// flow through a reconnected device's new session handler and corrupt the
+    /// recovered write cache.
+    async fn crash(mut self) -> PathBuf {
+        let dev_path = self.dev_path.clone();
         self.manager
             .crash_disconnect(&self.export_name)
             .await
             .unwrap_or_else(|e| panic!("crash_disconnect failed: {e}"));
+        dev_path
     }
 
     async fn remove(mut self) {
@@ -184,6 +194,44 @@ impl NbdKernelDevice {
             .remove_device(&self.export_name)
             .await
             .unwrap_or_else(|e| panic!("remove_device failed: {e}"));
+    }
+}
+
+/// Wait for a block device to be released by all holders (e.g., ext4 teardown).
+///
+/// After crash-disconnecting an NBD device and lazy-unmounting its filesystem,
+/// ext4 asynchronously aborts its journal and writes superblock error flags.
+/// These writes target the gendisk via the kernel's block layer. If a new NBD
+/// session reconnects the same device index before ext4 finishes, those stale
+/// writes flow through the new session handler and corrupt the recovered data.
+///
+/// This function polls O_EXCL until the device is free or a timeout elapses.
+#[cfg(target_os = "linux")]
+async fn wait_for_device_released(dev_path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let start = std::time::Instant::now();
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EXCL)
+            .open(dev_path)
+        {
+            Ok(_) => return,
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(_) => return, // device gone or other error — safe to proceed
+        }
+        if start.elapsed() >= MAX_WAIT {
+            eprintln!(
+                "warning: timed out waiting for {} to be released by ext4",
+                dev_path.display()
+            );
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -238,8 +286,9 @@ async fn test_fs_crash_fsync_honored_nbd_kernel() {
     // --- Phase 2: crash ---
     // Crash kernel device first (sockets close → kernel returns I/O errors).
     // Then unmount the dead mount. Then drop the server (simulates process crash).
-    dev.crash().await;
+    let old_dev = dev.crash().await;
     mount.unmount();
+    wait_for_device_released(&old_dev).await;
     // Stop flush schedulers so they release cache file handles. Does NOT
     // drain — dirty blocks stay on SSD for WAL recovery, matching a real
     // crash where the process dies without flushing.
@@ -337,8 +386,9 @@ async fn test_fs_crash_unsynced_write_lost_cleanly_nbd_kernel() {
     // deliberately no fsync
 
     // Crash
-    dev.crash().await;
+    let old_dev = dev.crash().await;
     mount.unmount();
+    wait_for_device_released(&old_dev).await;
     // Stop flush schedulers so they release cache file handles. Does NOT
     // drain — dirty blocks stay on SSD for WAL recovery, matching a real
     // crash where the process dies without flushing.
@@ -444,8 +494,9 @@ async fn test_fs_crash_journal_replay_nbd_kernel() {
     fsync_dir(mountpoint.path());
 
     // Crash mid-write (files 25-49 may not be durable)
-    dev.crash().await;
+    let old_dev = dev.crash().await;
     mount.unmount();
+    wait_for_device_released(&old_dev).await;
     // Stop flush schedulers so they release cache file handles. Does NOT
     // drain — dirty blocks stay on SSD for WAL recovery, matching a real
     // crash where the process dies without flushing.
@@ -595,8 +646,9 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
         fsync_dir(mountpoint.path());
 
         // Crash
-        dev.crash().await;
+        let old_dev = dev.crash().await;
         mount.unmount();
+        wait_for_device_released(&old_dev).await;
         server.crash_shutdown().await;
     }
 
@@ -713,7 +765,8 @@ async fn test_fs_crash_during_flush_to_s3_nbd_kernel() {
     // Brief delay then crash (drain may or may not complete — doesn't matter)
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    dev.crash().await;
+    let old_dev = dev.crash().await;
+    wait_for_device_released(&old_dev).await;
     // Stop flush schedulers so they release cache file handles. Does NOT
     // drain — dirty blocks stay on SSD for WAL recovery, matching a real
     // crash where the process dies without flushing.

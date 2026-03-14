@@ -948,7 +948,7 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
     ) -> Result<(), CacheError> {
-        let manifest_bytes = volume_manifest.read().serialize();
+        let manifest_bytes = volume_manifest.read().serialize()?;
         let expected_etag = self.inner.manifest_etag.lock().clone();
         let new_etag = content_store
             .put_manifest(
@@ -989,7 +989,7 @@ impl WriteCache<Active> {
         let (stats, _seq_cutpoint) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
-        let manifest_bytes = volume_manifest.read().serialize();
+        let manifest_bytes = volume_manifest.read().serialize()?;
         let expected_etag = self.inner.manifest_etag.lock().clone();
         let mut last_err = None;
         for attempt in 0..3u32 {
@@ -1054,7 +1054,7 @@ impl WriteCache<Active> {
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
 
-        let manifest_bytes = volume_manifest.read().serialize();
+        let manifest_bytes = volume_manifest.read().serialize()?;
         let expected_etag = self.inner.manifest_etag.lock().clone();
         let manifest_etag = content_store
             .put_manifest(

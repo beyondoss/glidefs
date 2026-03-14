@@ -86,7 +86,7 @@ async fn test_trim_then_flush_to_s3() {
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
         // Save manifest
-        let manifest_bytes = vm.read().serialize();
+        let manifest_bytes = vm.read().serialize().unwrap();
         cs.put_manifest("trim-flush", manifest_bytes, None).await.unwrap();
     }
 
@@ -128,7 +128,7 @@ async fn test_trim_fork_semantics() {
             .unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
-        let manifest_bytes = vm.read().serialize();
+        let manifest_bytes = vm.read().serialize().unwrap();
         cs.put_manifest("trim-fork-parent", manifest_bytes, None)
             .await
             .unwrap();
@@ -166,7 +166,7 @@ async fn test_trim_fork_semantics() {
 
         // Flush child to S3 with tombstone
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
-        let manifest_bytes = vm.read().serialize();
+        let manifest_bytes = vm.read().serialize().unwrap();
         cs.put_manifest("trim-fork-child", manifest_bytes, None)
             .await
             .unwrap();

@@ -10,7 +10,6 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ptr;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 
 // ============================================================================
@@ -80,22 +79,15 @@ fn zero_block_hash(block_size: usize) -> Blake3Hash {
     blake3_128(&vec![0u8; block_size])
 }
 
-/// Memoized zero-block bytes and hash, shared across all exports.
+/// Returns zero-block bytes and hash for the given block size.
 ///
-/// Initialized on first use. `Bytes::clone()` is an Arc refcount bump;
-/// `Blake3Hash` is `Copy`. Safe to share because both are pure functions
-/// of block size, which is uniform across all exports.
-static ZERO_BLOCK: OnceLock<(Bytes, Blake3Hash)> = OnceLock::new();
-
-/// Returns shared zero-block bytes and hash for the given block size.
+/// Called only during export init (not on the hot path), so computing
+/// fresh each time is fine and avoids a latent bug where a global cache
+/// would silently return wrong results if exports used different block sizes.
 pub fn shared_zero_block(block_size: usize) -> (Bytes, Blake3Hash) {
-    ZERO_BLOCK
-        .get_or_init(|| {
-            let bytes = Bytes::from(vec![0u8; block_size]);
-            let hash = zero_block_hash(block_size);
-            (bytes, hash)
-        })
-        .clone()
+    let bytes = Bytes::from(vec![0u8; block_size]);
+    let hash = zero_block_hash(block_size);
+    (bytes, hash)
 }
 
 // ============================================================================

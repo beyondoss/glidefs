@@ -225,7 +225,7 @@ impl BlockHandler {
                 Some(&self.metrics),
             ).await {
                 Ok(data) => data,
-                Err(_) => continue, // No S3 data — zeros are correct.
+                Err(e) => return Err(e.into()),
             };
             // Skip if the resolved data is all zeros — the data file already
             // has zeros (sparse or set_len). Writing zeros would create
@@ -405,6 +405,15 @@ impl BlockHandler {
 
             // We won the claim. Merge guest data onto prior block and write.
             let mut block_buf = prior.to_vec();
+            if block_buf.len() != block_size {
+                tracing::error!(
+                    block = idx,
+                    expected = block_size,
+                    actual = block_buf.len(),
+                    "backfill returned truncated block"
+                );
+                return Err(CommandError::IoError);
+            }
             let end = (block_local_start + write_len).min(block_buf.len());
             block_buf[block_local_start..end]
                 .copy_from_slice(&data[data_offset..data_offset + write_len]);

@@ -984,7 +984,10 @@ impl ExportRouter {
 
         // If a tag was provided, publish the manifest under that name too.
         if let Some(tag) = tag {
-            let manifest_bytes = volume_manifest.read().serialize();
+            let manifest_bytes = volume_manifest
+                .read()
+                .serialize()
+                .map_err(|e| RouterError::Manifest(e.to_string()))?;
             content_store
                 .put_manifest(tag, manifest_bytes, None)
                 .await
@@ -1012,7 +1015,11 @@ impl ExportRouter {
         let state = exports
             .get(name)
             .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
-        let manifest_bytes = state.volume_manifest.read().serialize();
+        let manifest_bytes = state
+            .volume_manifest
+            .read()
+            .serialize()
+            .map_err(|e| RouterError::Manifest(e.to_string()))?;
         state
             .content_store
             .put_manifest(tag, manifest_bytes, None)
