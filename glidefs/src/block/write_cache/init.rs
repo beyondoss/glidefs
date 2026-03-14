@@ -44,8 +44,17 @@ impl WriteCache<Initializing> {
         // Track recovery issues for metrics
         let mut recovery_warning_count: u64 = 0;
 
-        // Replay WAL entries after persisted sequence
-        let wal_entries = match Wal::replay(&wal_path, persisted_max_seq) {
+        // Replay WAL entries after persisted sequence. When recovering from
+        // a mid-flush crash (rotation_seq > 0), replay from the rotation point
+        // to capture post-rotation writes — these blocks have authoritative data
+        // in the active file (even zeros). Safe: already-DIRTY blocks from the
+        // metadata are skipped (idempotent state transitions).
+        let wal_min_seq = if rotation_seq > 0 && rotation_seq < persisted_max_seq {
+            rotation_seq
+        } else {
+            persisted_max_seq
+        };
+        let wal_entries = match Wal::replay(&wal_path, wal_min_seq) {
             Ok(entries) => {
                 if !entries.is_empty() {
                     info!(
@@ -138,37 +147,51 @@ impl WriteCache<Initializing> {
 
         // Crash recovery: if a flushing file exists, we crashed mid-flush.
         //
-        // The flushing file is the old active file, renamed by rotate_data_file().
-        // After rotation, new writes go to the fresh (sparse) active file. So:
-        //   - Pre-rotation dirty blocks: data in flushing file, active is sparse
-        //   - Post-rotation writes: data in active file
+        // rotate_and_snapshot() CAS'd all DIRTY blocks to SYNCING before
+        // renaming the active file to flushing. Post-rotation guest writes
+        // CAS SYNCING→DIRTY and generate WAL entries. load_metadata()
+        // preserves the SYNCING/DIRTY distinction so we can use it here:
         //
-        // We use `rotation_seq` (persisted in metadata) to identify post-rotation
-        // writes: any WAL entry with sequence > rotation_seq was written AFTER
-        // rotation, so the active file is authoritative for that block — even if
-        // it contains all zeros (e.g., guest trim/write_zeroes).
+        //   SYNCING = pre-rotation data, lives in the flushing file
+        //   DIRTY   = post-rotation write, lives in the active file
         //
-        // For blocks without post-rotation WAL entries, we fall back to the
-        // is_zero_block heuristic: if the active file has zeros, the block was
-        // never written post-rotation and we recover from the flushing file.
+        // When the metadata is from BEFORE the rotation (rotation_seq == 0
+        // but flushing file exists), all blocks appear as DIRTY. In that
+        // case, WAL entries (seq > persisted_max_seq) identify post-rotation
+        // writes; other DIRTY blocks are pre-rotation and need recovery
+        // from the flushing file.
         let flushing_path = config.flushing_path();
         if flushing_path.exists() {
             info!(rotation_seq, "found flushing file — recovering from interrupted flush");
             let flushing_file = SyncFile::open(&flushing_path, false, config.device_size)?;
             let block_size = config.block_size;
 
-            // Build the set of blocks written after rotation. Their data in the
-            // active file is authoritative and must NOT be overwritten by
-            // flushing file data — even if the active data is all zeros.
+            // Identify blocks with post-rotation writes.
             let post_rotation_blocks: HashSet<usize> = if rotation_seq > 0 {
+                // Metadata is from after rotation. DIRTY blocks in metadata
+                // are post-rotation writes. WAL entries (post-checkpoint)
+                // may have CAS'd additional SYNCING→DIRTY blocks.
+                let mut set: HashSet<usize> = state_map
+                    .iter_present()
+                    .filter(|&(_, state)| state == SparseBlockState::DIRTY)
+                    .map(|(idx, _)| idx)
+                    .collect();
+                for entry in &wal_entries {
+                    let idx = entry.block_index as usize;
+                    if idx < num_blocks {
+                        set.insert(idx);
+                    }
+                }
+                set
+            } else {
+                // Metadata is from before rotation. ALL dirty blocks in
+                // metadata were pre-rotation. Only WAL entries identify
+                // post-rotation writes.
                 wal_entries
                     .iter()
-                    .filter(|e| e.sequence > rotation_seq)
                     .map(|e| e.block_index as usize)
                     .filter(|&idx| idx < num_blocks)
                     .collect()
-            } else {
-                HashSet::new()
             };
 
             let mut recovered = 0usize;
@@ -177,36 +200,26 @@ impl WriteCache<Initializing> {
                 let is_dirty = state == SparseBlockState::DIRTY
                     || state == SparseBlockState::SYNCING;
                 if is_dirty {
-                    // Ensure state is DIRTY (SYNCING was already converted by load_metadata)
-                    let _ = state_map.cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY);
-
-                    // Post-rotation write: active file is authoritative (even if zeros).
                     if post_rotation_blocks.contains(&idx) {
+                        // Post-rotation write: active file is authoritative,
+                        // even if it contains all zeros (guest trim/write_zeroes).
                         skipped += 1;
-                        continue;
-                    }
-
-                    let offset = idx as u64 * block_size as u64;
-                    let valid_bytes = std::cmp::min(
-                        block_size as u64,
-                        config.device_size.saturating_sub(offset),
-                    ) as usize;
-                    if valid_bytes > 0 {
-                        // Read from active file — if non-zero, a post-rotation
-                        // write landed here (but wasn't in the WAL, e.g. WAL
-                        // replay failed). Preserve it.
-                        let mut active_buf = vec![0u8; valid_bytes];
-                        data_file.read_exact_at(&mut active_buf, offset)?;
-                        if is_zero_block(&active_buf) {
-                            // Active is empty (sparse) — recover from flushing
+                    } else {
+                        // Pre-rotation data: recover from flushing file.
+                        let offset = idx as u64 * block_size as u64;
+                        let valid_bytes = std::cmp::min(
+                            block_size as u64,
+                            config.device_size.saturating_sub(offset),
+                        ) as usize;
+                        if valid_bytes > 0 {
                             let mut flush_buf = vec![0u8; valid_bytes];
                             flushing_file.read_exact_at(&mut flush_buf, offset)?;
                             data_file.write_all_at(&flush_buf, offset)?;
                             recovered += 1;
-                        } else {
-                            skipped += 1;
                         }
                     }
+                    // Convert SYNCING → DIRTY for subsequent processing.
+                    let _ = state_map.cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY);
                 }
             }
             drop(flushing_file);
@@ -217,6 +230,13 @@ impl WriteCache<Initializing> {
                 post_rotation_blocks = post_rotation_blocks.len(),
                 "flush recovery complete"
             );
+        } else {
+            // No flushing file — convert any SYNCING → DIRTY from metadata.
+            for (idx, state) in state_map.iter_present().collect::<Vec<_>>() {
+                if state == SparseBlockState::SYNCING {
+                    let _ = state_map.cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY);
+                }
+            }
         }
 
         // Transition any CLEAN blocks to NOT_PRESENT. Their data is in S3

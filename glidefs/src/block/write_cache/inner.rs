@@ -806,11 +806,11 @@ impl CacheInner {
                 continue; // skip out-of-bounds (shrink safety)
             }
 
-            // Convert Syncing -> Dirty (conservative for crash recovery)
-            if state == SparseBlockState::SYNCING {
-                state = SparseBlockState::DIRTY;
-            }
-            if state == SparseBlockState::DIRTY {
+            // Count SYNCING and DIRTY blocks (both need eventual flush).
+            // SYNCING→DIRTY conversion is deferred to init.rs so crash
+            // recovery can use the SYNCING state to identify pre-rotation
+            // blocks whose data is in the flushing file.
+            if state == SparseBlockState::DIRTY || state == SparseBlockState::SYNCING {
                 dirty_count += 1;
             }
 

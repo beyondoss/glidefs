@@ -2450,9 +2450,10 @@ async fn test_crash_recovery_preserves_post_rotation_zero_write() {
         // Write non-zero data to block 0
         cache.write(0, &vec![0xAA; block_size]).unwrap();
 
-        // Rotate: block 0's 0xAA data moves to flushing file,
-        // new active file is sparse (zeros).
-        cache.rotate_data_file().unwrap();
+        // Rotate + snapshot (production path): CAS DIRTY→SYNCING, then
+        // rename active → flushing + create new sparse active.
+        // Block 0's 0xAA data moves to flushing file.
+        let _claimed = cache.rotate_and_snapshot().unwrap();
 
         // Post-rotation: write zeros to block 0 in the active file.
         // This simulates a guest trim or write_zeroes — the zeros are
