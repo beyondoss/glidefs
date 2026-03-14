@@ -656,11 +656,8 @@ where
         // GET /metrics - Prometheus metrics for all exports
         (Method::GET, ["metrics"]) => {
             let mut output = String::from(prometheus_header());
-            let names = router.list_export_names().await;
-            for name in names {
-                if let Some(snapshot) = router.get_export_metrics(&name).await {
-                    output.push_str(&snapshot.to_prometheus(&name));
-                }
+            for (name, snapshot) in router.all_export_metrics().await {
+                output.push_str(&snapshot.to_prometheus(&name));
             }
             // Global scrubber metrics
             {

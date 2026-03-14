@@ -1340,17 +1340,28 @@ impl ExportRouter {
     /// Get metrics snapshot for an export.
     pub async fn get_export_metrics(&self, name: &str) -> Option<MetricsSnapshot> {
         let exports = self.exports.read().await;
-        exports.get(name).map(|s| {
-            let block_size = s.cache.block_size() as u64;
-            let dirty_blocks = s.cache.dirty_block_count();
-            let manifest = s.volume_manifest.read();
-            s.metrics.snapshot().with_cache_state(
-                dirty_blocks,
-                s.cache.syncing_block_count(),
-                dirty_blocks * block_size,
-                manifest.chunks.len() as u64 * manifest.chunk_size,
-            )
-        })
+        exports.get(name).map(|s| Self::snapshot_export_metrics(s))
+    }
+
+    /// Snapshot metrics for all exports under a single lock acquisition.
+    pub async fn all_export_metrics(&self) -> Vec<(String, MetricsSnapshot)> {
+        let exports = self.exports.read().await;
+        exports
+            .iter()
+            .map(|(name, s)| (name.clone(), Self::snapshot_export_metrics(s)))
+            .collect()
+    }
+
+    fn snapshot_export_metrics(s: &ExportState) -> MetricsSnapshot {
+        let block_size = s.cache.block_size() as u64;
+        let dirty_blocks = s.cache.dirty_block_count();
+        let manifest = s.volume_manifest.read();
+        s.metrics.snapshot().with_cache_state(
+            dirty_blocks,
+            s.cache.syncing_block_count(),
+            dirty_blocks * block_size,
+            manifest.chunks.len() as u64 * manifest.chunk_size,
+        )
     }
 
     /// Drain an export's dirty blocks to S3.
