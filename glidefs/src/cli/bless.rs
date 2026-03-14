@@ -1,4 +1,4 @@
-use crate::block::block_map::{blake3_128, lz4_compress, zero_block_hash, Blake3Hash};
+use crate::block::block_map::{blake3_128, lz4_compress, shared_zero_block, Blake3Hash};
 use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
 use crate::block::content_store::ContentStore;
 use crate::block::handler::BlockHandler;
@@ -75,7 +75,7 @@ pub async fn run_bless(
     info!(device_size, total_blocks, blocks_per_chunk, "reading image");
 
     // --- Stream image: read blocks, upload each chunk as it completes ---
-    let zero_hash = zero_block_hash(BLOCK_SIZE as usize);
+    let (_, zero_hash) = shared_zero_block(BLOCK_SIZE as usize);
     let mut buf = vec![0u8; BLOCK_SIZE as usize];
 
     let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
@@ -529,7 +529,7 @@ mod tests {
         let device_size = image_data.len() as u64;
         let vm_template = VolumeManifest::new(device_size, BLOCK_SIZE);
         let total_blocks = device_size.div_ceil(BLOCK_SIZE as u64) as usize;
-        let zero_hash = zero_block_hash(BLOCK_SIZE as usize);
+        let (_, zero_hash) = shared_zero_block(BLOCK_SIZE as usize);
 
         let content_store = Arc::new(ContentStore::new(
             content_store.object_store().clone(),

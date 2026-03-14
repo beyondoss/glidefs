@@ -1,11 +1,10 @@
-use bytes::Bytes;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use tracing::{error, info, instrument, warn};
 
 use crate::block::block_map::{
-    SequenceNumber, SparseBlockState, SparseCrcMap, SparseStateMap, zero_block_hash,
+    SequenceNumber, SparseBlockState, SparseCrcMap, SparseStateMap, shared_zero_block,
 };
 use crate::block::state::{Active, Initializing, Recovering};
 use crate::block::wal::Wal;
@@ -119,8 +118,7 @@ impl WriteCache<Initializing> {
         };
 
         let block_size = config.block_size;
-        let zbh = zero_block_hash(block_size);
-        let zbb = Bytes::from(vec![0u8; block_size]);
+        let (zbb, zbh) = shared_zero_block(block_size);
 
         // Crash recovery: if a flushing file exists, we crashed mid-flush.
         //
@@ -235,8 +233,7 @@ impl WriteCache<Initializing> {
         let sequence = SequenceNumber::new(0);
         let wal = Wal::open(&config.wal_path())?;
         let export_name = config.device_name.clone();
-        let zbh = zero_block_hash(block_size);
-        let zbb = Bytes::from(vec![0u8; block_size]);
+        let (zbb, zbh) = shared_zero_block(block_size);
 
         let inner = Arc::new(CacheInner {
             config,

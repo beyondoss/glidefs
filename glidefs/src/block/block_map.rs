@@ -7,9 +7,11 @@
 //! - `SequenceNumber`: Monotonic counter for WAL ordering
 //! - LZ4 compress/decompress helpers
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ptr;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 // ============================================================================
@@ -75,8 +77,26 @@ pub fn blake3_128(data: &[u8]) -> Blake3Hash {
 ///
 /// This is the BLAKE3-128 hash of `block_size` zero bytes. Used by the write cache
 /// to identify trimmed/unwritten chunks for dedup (zero blocks are never uploaded).
-pub fn zero_block_hash(block_size: usize) -> Blake3Hash {
+fn zero_block_hash(block_size: usize) -> Blake3Hash {
     blake3_128(&vec![0u8; block_size])
+}
+
+/// Memoized zero-block bytes and hash, shared across all exports.
+///
+/// Initialized on first use. `Bytes::clone()` is an Arc refcount bump;
+/// `Blake3Hash` is `Copy`. Safe to share because both are pure functions
+/// of block size, which is uniform across all exports.
+static ZERO_BLOCK: OnceLock<(Bytes, Blake3Hash)> = OnceLock::new();
+
+/// Returns shared zero-block bytes and hash for the given block size.
+pub fn shared_zero_block(block_size: usize) -> (Bytes, Blake3Hash) {
+    ZERO_BLOCK
+        .get_or_init(|| {
+            let bytes = Bytes::from(vec![0u8; block_size]);
+            let hash = zero_block_hash(block_size);
+            (bytes, hash)
+        })
+        .clone()
 }
 
 // ============================================================================
