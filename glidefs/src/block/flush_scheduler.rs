@@ -167,10 +167,20 @@ pub async fn flush_scheduler(
             biased;
 
             // Shutdown takes priority.
-            Ok(()) = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    info!("flush scheduler: shutting down");
-                    return;
+            result = shutdown.changed() => {
+                match result {
+                    Ok(()) if *shutdown.borrow() => {
+                        info!("flush scheduler: shutting down");
+                        return;
+                    }
+                    Err(_) => {
+                        // Sender dropped (e.g., ExportRouter dropped without clean
+                        // shutdown). Exit immediately to avoid zombie schedulers
+                        // that corrupt WAL/metadata files of a replacement server.
+                        info!("flush scheduler: sender dropped, exiting");
+                        return;
+                    }
+                    _ => {} // spurious wakeup with value still false
                 }
             }
 
@@ -180,8 +190,8 @@ pub async fn flush_scheduler(
                 if flush_backoff > Duration::ZERO {
                     tokio::select! {
                         biased;
-                        Ok(()) = shutdown.changed() => {
-                            if *shutdown.borrow() {
+                        result = shutdown.changed() => {
+                            if result.is_err() || *shutdown.borrow() {
                                 info!("flush scheduler: shutting down during backoff");
                                 return;
                             }
