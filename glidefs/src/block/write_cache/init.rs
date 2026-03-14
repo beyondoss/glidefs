@@ -142,6 +142,11 @@ impl WriteCache<Initializing> {
         let zbb = Bytes::from(vec![0u8; block_size]);
 
         let partial_count = partial_blocks.len();
+        // Count partial blocks that are DIRTY for the flush threshold.
+        let partial_dirty = partial_blocks
+            .iter()
+            .filter(|entry| state_map.get(*entry.key()) == SparseBlockState::DIRTY)
+            .count() as u64;
 
         // Crash recovery: if a flushing file exists, we crashed mid-flush.
         //
@@ -214,6 +219,7 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
             syncing_block_count: AtomicU64::new(0),
+            partial_dirty_count: AtomicU64::new(partial_dirty),
             sequence,
             wal,
             export_name,
@@ -269,6 +275,7 @@ impl WriteCache<Initializing> {
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
             syncing_block_count: AtomicU64::new(0),
+            partial_dirty_count: AtomicU64::new(0),
             sequence,
             wal,
             export_name,

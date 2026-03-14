@@ -283,6 +283,11 @@ pub(crate) struct CacheInner {
     /// Statistics
     pub(super) dirty_block_count: AtomicU64,
     pub(super) syncing_block_count: AtomicU64,
+    /// Number of dirty blocks that are also partial (have incomplete backfill).
+    /// Partial blocks are dirty but unflushable — compute_flush_batch skips them.
+    /// The flush threshold uses `dirty_block_count - partial_dirty_count` to avoid
+    /// triggering auto-flush when most dirty blocks are unflushable partials.
+    pub(super) partial_dirty_count: AtomicU64,
 
     /// Monotonic sequence counter for WAL replay ordering and snapshot versioning.
     /// Lock-free AtomicU64.
@@ -434,6 +439,9 @@ impl CacheInner {
                     .is_ok()
                 {
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    if self.partial_blocks.contains_key(&idx) {
+                        self.partial_dirty_count.fetch_add(1, Ordering::Relaxed);
+                    }
                     return true;
                 }
             } else if current == SparseBlockState::SYNCING {
@@ -444,6 +452,9 @@ impl CacheInner {
                 {
                     self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    if self.partial_blocks.contains_key(&idx) {
+                        self.partial_dirty_count.fetch_add(1, Ordering::Relaxed);
+                    }
                     return true;
                 }
             } else {
@@ -544,9 +555,16 @@ impl CacheInner {
     }
 
     /// Remove a block from partial tracking (backfill complete).
+    ///
+    /// Decrements `partial_dirty_count` if the block is still DIRTY, keeping
+    /// the flush threshold accurate. After this call the block is flushable.
     #[inline]
     pub(crate) fn complete_partial(&self, block_idx: usize) {
-        self.partial_blocks.remove(&block_idx);
+        if self.partial_blocks.remove(&block_idx).is_some() {
+            if self.state_map.get(block_idx) == SparseBlockState::DIRTY {
+                self.partial_dirty_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Get the current bitmap for a partial block, or None if not partial.

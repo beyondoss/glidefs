@@ -154,7 +154,8 @@ impl BlockHandler {
     /// No-op when blocks_per_pack == 0 (manual flush mode).
     #[inline]
     fn check_flush_threshold(&self) {
-        if self.blocks_per_pack > 0 && self.cache.dirty_block_count() >= self.blocks_per_pack as u64
+        if self.blocks_per_pack > 0
+            && self.cache.flushable_dirty_count() >= self.blocks_per_pack as u64
         {
             self.flush_notify.notify_one();
         }

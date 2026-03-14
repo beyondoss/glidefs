@@ -362,6 +362,17 @@ impl WriteCache<Active> {
         self.inner.dirty_block_count.load(Ordering::Relaxed)
     }
 
+    /// Get the number of dirty blocks that are actually flushable.
+    ///
+    /// Excludes partial blocks (dirty but unflushable — compute_flush_batch
+    /// skips them). Used by the flush threshold to avoid triggering auto-flush
+    /// when most dirty blocks are partial (incomplete backfill).
+    pub fn flushable_dirty_count(&self) -> u64 {
+        let dirty = self.inner.dirty_block_count.load(Ordering::Relaxed);
+        let partial = self.inner.partial_dirty_count.load(Ordering::Relaxed);
+        dirty.saturating_sub(partial)
+    }
+
     /// Get the number of blocks currently being synced.
     pub fn syncing_block_count(&self) -> u64 {
         self.inner.syncing_block_count.load(Ordering::Relaxed)
