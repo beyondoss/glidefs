@@ -618,13 +618,21 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
         // e2fsck before mount (except first cycle where we just formatted)
         if cycle > 0 {
             let (clean, output) = e2fsck_repair(&dev.dev_path);
-            assert!(
-                clean,
-                "e2fsck failed at cycle {cycle} before mount:\n{output}"
-            );
+            if !clean {
+                panic!("e2fsck failed at cycle {cycle} before mount:\n{output}");
+            }
+            eprintln!("cycle {cycle}: e2fsck {output}");
         }
 
         mount.mount(&dev.dev_path, &[]);
+
+        // List directory contents for debugging flakes
+        if let Ok(entries) = std::fs::read_dir(mountpoint.path()) {
+            let names: Vec<_> = entries
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect();
+            eprintln!("cycle {cycle}: files after mount: {names:?}");
+        }
 
         // Verify previous cycles' files survived
         for prev in 0..cycle {
@@ -675,10 +683,20 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
     .await;
 
     let (clean, output) = e2fsck_repair(&dev.dev_path);
-    assert!(clean, "final e2fsck failed:\n{output}");
+    if !clean {
+        panic!("final e2fsck failed:\n{output}");
+    }
+    eprintln!("final: e2fsck {output}");
 
     let mut mount = MountGuard::new(mountpoint.path());
     mount.mount(&dev.dev_path, &[]);
+
+    if let Ok(entries) = std::fs::read_dir(mountpoint.path()) {
+        let names: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        eprintln!("final: files after mount: {names:?}");
+    }
 
     for cycle in 0..5u32 {
         let name = format!("cycle_{cycle}.txt");
