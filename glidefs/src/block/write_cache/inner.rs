@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
-use crate::block::block_map::{
-    Blake3Hash, SequenceNumber, SparseBlockState, SparseCrcMap, SparseStateMap,
-};
+use crate::block::block_map::{Blake3Hash, SequenceNumber, SparseBlockState, SparseStateMap};
 
 use crate::block::wal::Wal;
 
@@ -17,7 +15,7 @@ use super::error::CacheError;
 use bytes::Bytes;
 
 /// Magic bytes for cache metadata file
-pub(super) const METADATA_MAGIC: &[u8; 8] = b"ZFSCACHE";
+pub(super) const METADATA_MAGIC: &[u8; 8] = b"GLIDECCH";
 /// Version 5: sparse state map + trailing max_sequence u64
 pub(super) const METADATA_VERSION: u32 = 5;
 
@@ -97,17 +95,6 @@ mod sync_file {
 }
 
 pub use sync_file::SyncFile;
-
-/// Sentinel value for CRC32 checksums invalidated by a concurrent write.
-///
-/// The write path stores this instead of removing the CRC entry, preventing
-/// `compute_dirty_crc32s` from re-inserting a stale CRC via `or_insert`.
-/// The flush path skips CRC verification when it encounters this sentinel.
-///
-/// CRC32 can legitimately produce u32::MAX (1-in-4-billion chance), in which
-/// case we simply skip corruption detection for that one block — no correctness
-/// impact, only a negligible loss of SSD corruption detection.
-pub(super) const CRC_SENTINEL: u32 = u32::MAX;
 
 /// Check if a block is all zeros.
 ///
@@ -297,14 +284,6 @@ pub(crate) struct CacheInner {
     /// Number of recovery issues encountered during cache open (WAL replay
     /// failure, block map load failure). Exposed via metrics for monitoring.
     pub(super) recovery_warnings: AtomicU64,
-
-    /// CRC32 checksums for dirty blocks, used to detect SSD corruption between
-    /// checkpoint and flush. Concurrently accessed by: the write path (stores
-    /// CRC_SENTINEL on every write), the checkpoint path (computes and stores
-    /// CRCs), and the flush path (takes CRCs for verification). SparseCrcMap
-    /// provides lock-free concurrent access via AtomicU32 leaves in a two-level
-    /// page table, with 5x less memory than DashMap and zero shard contention.
-    pub(super) crc_map: SparseCrcMap,
 
     /// Per-export flush serialization lock.
     ///
@@ -585,22 +564,6 @@ impl CacheInner {
             }
         }
         Ok(())
-    }
-
-    // -- CRC32 SparseCrcMap methods (for dirty-block corruption detection) -----
-
-    /// Store a CRC32 checksum for a dirty block (checkpoint path).
-    /// Only inserts if no entry exists — a concurrent write that re-dirtied
-    /// the block should not overwrite a fresh CRC.
-    #[inline]
-    pub(super) fn crc_store(&self, idx: usize, crc: u32) {
-        self.crc_map.try_insert(idx, crc);
-    }
-
-    /// Remove and return the CRC32 checksum for a block (flush path).
-    #[inline]
-    pub(super) fn crc_take(&self, idx: usize) -> Option<u32> {
-        self.crc_map.take(idx)
     }
 
     /// Persist block states to metadata file.

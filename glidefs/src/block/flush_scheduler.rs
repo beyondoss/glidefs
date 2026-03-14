@@ -283,7 +283,7 @@ pub async fn flush_scheduler(
                             }
                         } else {
                             // No packs uploaded — still checkpoint to persist
-                            // clean block states and compute CRC32s.
+                            // clean block states.
                             if let Err(e) = cache.local_checkpoint().await {
                                 warn!(error = %e, "checkpoint after flush");
                             }

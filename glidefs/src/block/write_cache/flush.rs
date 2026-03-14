@@ -11,7 +11,7 @@ use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
 use crate::block::state::{Active, Draining};
 
-use super::inner::{CRC_SENTINEL, CacheInner, is_zero_block};
+use super::inner::{CacheInner, is_zero_block};
 use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
 
 /// Result of CPU-heavy flush computation (pread + crc32 + blake3 + lz4).
@@ -55,14 +55,17 @@ enum BlockResult {
 /// Phase 2 (sequential): within-batch dedup via seen_hashes (cheap hash-set insertions).
 ///
 /// All blocks in `snapshot` have already been claimed (CAS DIRTY→SYNCING).
-/// CRC verification uses the crc_map (SparseCrcMap) and state discrimination:
-/// - CRC mismatch + state == SYNCING → real SSD corruption
+/// CRC verification uses the ephemeral `crcs` HashMap (computed pre-rotation)
+/// and state discrimination:
+/// - CRC mismatch + state == SYNCING → SSD corruption or stale CRC from write
+///   between pre-pass and rotation (block retries next cycle)
 /// - CRC mismatch + state != SYNCING → concurrent write re-dirtied the block
 fn compute_flush_batch(
     inner: &CacheInner,
     snapshot: &[usize],
     zero_hash: Blake3Hash,
     clean_cache: Option<Arc<dyn BlockCache>>,
+    crcs: &HashMap<usize, u32>,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
 
@@ -102,33 +105,27 @@ fn compute_flush_batch(
                 chunk_buf[valid_bytes..].fill(0);
             }
 
-            // Verify CRC32 if available (detects SSD corruption before BLAKE3).
-            // CRC was stored at checkpoint time. Use state discrimination to
-            // distinguish corruption from concurrent writes:
-            // - Block still SYNCING → no concurrent write → real corruption
+            // Verify CRC32 against the pre-rotation baseline (if available).
+            // State discrimination distinguishes corruption from concurrent writes:
+            // - Block still SYNCING → CRC mismatch is SSD corruption or stale
+            //   CRC from a write between pre-pass and rotation (retries next cycle)
             // - Block now DIRTY → write re-dirtied it → stale CRC, not corruption
-            // - CRC_SENTINEL → write invalidated the CRC, skip verification
-            if let Some(stored_crc) = inner.crc_take(chunk_index)
-                && stored_crc != CRC_SENTINEL
-            {
+            if let Some(&stored_crc) = crcs.get(&chunk_index) {
                 let computed_crc = crc32fast::hash(&chunk_buf);
                 if computed_crc != stored_crc {
                     let current_state = inner.state_map.get(chunk_index);
                     if current_state != SparseBlockState::SYNCING {
-                        // Block was re-dirtied by a concurrent write between
-                        // checkpoint and flush. CRC is stale, not corruption.
                         return Ok(BlockResult::Skipped {
                             chunk_index,
                             cas_failed: true,
                             corrupted: false,
                         });
                     }
-                    // Still SYNCING + CRC mismatch → real SSD corruption.
-                    warn!(
+                    debug!(
                         chunk_index,
                         stored_crc,
                         computed_crc,
-                        "CRC32 mismatch — possible SSD corruption, skipping block this cycle"
+                        "CRC mismatch — block will retry next flush cycle"
                     );
                     return Ok(BlockResult::Skipped {
                         chunk_index,
@@ -225,111 +222,48 @@ fn compute_flush_batch(
     })
 }
 
-/// Compute CRC32 checksums for dirty blocks that don't have one yet.
-///
-/// Stores CRCs in the crc_map (SparseCrcMap) for later verification by the
-/// flush path. Writes invalidate stale CRCs by storing CRC_SENTINEL.
-///
-/// Sentinel handling: when we encounter a sentinel entry, we remove it
-/// before reading the block. If a concurrent write arrives between our
-/// remove and the subsequent `try_insert`, the write stores a fresh
-/// sentinel that prevents our (possibly stale) CRC from being stored.
-///
-/// Capped at MAX_CRC_ENTRIES to bound memory. Blocks beyond the cap skip
-/// CRC verification at flush time — the SYNCING state machine still
-/// guarantees correctness; we just lose SSD corruption detection for those
-/// blocks.
-pub(super) fn compute_dirty_crc32s(inner: &CacheInner) -> usize {
+/// Compute CRC32 checksums for all dirty blocks from the active data file.
+/// Returns (crcs, read_error_count). Called immediately before rotation so
+/// the CRCs can be verified against the flushing file after rotation.
+fn compute_flush_crcs(inner: &CacheInner) -> (HashMap<usize, u32>, usize) {
     use rayon::prelude::*;
-    use std::sync::atomic::AtomicU64;
 
-    /// Maximum crc_map entries per export. 10M entries × 4 bytes
-    /// (SparseCrcMap: AtomicU32 per entry, 4KB pages) ≈ 40MB.
-    /// Covers a fully-dirty 1TB device (8M blocks of 128KB) with headroom.
-    /// Prevents unbounded growth if device_size is ever misconfigured.
-    const MAX_CRC_ENTRIES: usize = 10_000_000;
-
-    // Already at cap — skip entirely.
-    if inner.crc_map.count() >= MAX_CRC_ENTRIES {
-        return 0;
-    }
-
-    // Collect dirty block indices up front so rayon can partition the work.
-    // Capped to leave headroom in the crc_map.
     let dirty_indices: Vec<usize> = inner
         .state_map
         .iter_with_state(SparseBlockState::DIRTY)
-        .take(MAX_CRC_ENTRIES.saturating_sub(inner.crc_map.count()))
         .collect();
 
     if dirty_indices.is_empty() {
-        return 0;
+        return (HashMap::new(), 0);
     }
 
     let block_size = inner.config.block_size;
     let device_size = inner.config.device_size;
-    let computed = AtomicU64::new(0);
-    let read_errors = AtomicU64::new(0);
-
-    // Parallel CRC32 computation: each rayon task allocates its own read
-    // buffer (peak memory = num_threads × block_size, same as compute_flush_batch).
-    dirty_indices.par_iter().for_each(|&idx| {
-        // Soft cap: stop computing CRCs once the map is full. Racy but harmless —
-        // exceeding the cap slightly is fine, the bound prevents runaway growth.
-        if inner.crc_map.count() >= MAX_CRC_ENTRIES {
-            return;
-        }
-
-        // Skip blocks that already have a valid CRC.
-        // If a sentinel is present (invalidated by a concurrent write),
-        // clear it and recompute.
-        if let Some(existing) = inner.crc_map.load(idx) {
-            if existing != CRC_SENTINEL {
-                return; // valid CRC exists, skip
+    let results: Vec<Option<(usize, u32)>> = dirty_indices
+        .par_iter()
+        .map(|&idx| {
+            let offset = idx as u64 * block_size as u64;
+            let valid_bytes = std::cmp::min(
+                block_size as u64,
+                device_size.saturating_sub(offset),
+            ) as usize;
+            if valid_bytes == 0 {
+                return Some((idx, crc32fast::hash(&[])));
             }
-            // Clear sentinel before reading. If a concurrent write arrives
-            // between this remove and our try_insert below, the write will
-            // store a fresh sentinel that prevents our (potentially stale)
-            // CRC from being stored.
-            inner.crc_map.remove(idx);
-        }
+            let mut buf = vec![0u8; block_size];
+            if inner.data_file.read().read_exact_at(&mut buf[..valid_bytes], offset).is_err() {
+                return None;
+            }
+            if valid_bytes < block_size {
+                buf[valid_bytes..].fill(0);
+            }
+            Some((idx, crc32fast::hash(&buf)))
+        })
+        .collect();
 
-        let offset = idx as u64 * block_size as u64;
-        let valid_bytes =
-            std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
-        if valid_bytes == 0 {
-            return;
-        }
-
-        let mut buf = vec![0u8; block_size];
-        if let Err(e) = inner
-            .data_file
-            .read()
-            .read_exact_at(&mut buf[..valid_bytes], offset)
-        {
-            warn!(
-                chunk_index = idx,
-                error = %e,
-                "failed to read block for CRC32 computation"
-            );
-            read_errors.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        if valid_bytes < block_size {
-            buf[valid_bytes..].fill(0);
-        }
-
-        let crc = crc32fast::hash(&buf);
-        inner.crc_store(idx, crc);
-        computed.fetch_add(1, Ordering::Relaxed);
-    });
-
-    let computed = computed.load(Ordering::Relaxed);
-    if computed > 0 {
-        debug!(computed, "computed CRC32 checksums for dirty blocks");
-    }
-
-    read_errors.load(Ordering::Relaxed) as usize
+    let read_errors = results.iter().filter(|r| r.is_none()).count();
+    let crcs: HashMap<usize, u32> = results.into_iter().flatten().collect();
+    (crcs, read_errors)
 }
 
 impl WriteCache<Active> {
@@ -437,11 +371,10 @@ impl WriteCache<Active> {
         .map_err(|e| CacheError::Io(std::io::Error::other(e)))?
     }
 
-    /// Local checkpoint: compute CRC32s for dirty blocks, persist state, truncate WAL.
+    /// Local checkpoint: persist block states and truncate WAL.
     ///
-    /// Runs on a blocking thread via `spawn_blocking` to avoid starving the
-    /// async runtime with synchronous pread + CRC32 computation across
-    /// potentially thousands of dirty blocks.
+    /// Runs on a blocking thread via `spawn_blocking` to avoid blocking
+    /// the Tokio runtime with `sync_all()` + `rename()` syscalls.
     ///
     /// Independent of S3 — keeps the WAL bounded in demand-driven mode
     /// where S3 flushes may be infrequent. Should run every ~5s when
@@ -449,7 +382,6 @@ impl WriteCache<Active> {
     pub async fn local_checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
         crate::task::spawn_blocking_named("local-checkpoint", move || {
-            compute_dirty_crc32s(&inner);
             inner.save_block_states()?;
             inner.wal.truncate()?;
             debug!("local checkpoint complete");
@@ -585,6 +517,19 @@ impl WriteCache<Active> {
     ) -> Result<(FlushStats, u64), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
 
+        // Compute CRC baselines from the active file BEFORE rotation.
+        // These are verified against the flushing file after rotation.
+        let inner_clone = Arc::clone(&self.inner);
+        let crcs = crate::task::spawn_blocking_named("flush-crcs", move || {
+            let (crcs, read_errors) = compute_flush_crcs(&inner_clone);
+            if read_errors > 0 {
+                warn!(read_errors, "dirty blocks had SSD read errors during CRC pre-pass");
+            }
+            crcs
+        })
+        .await
+        .map_err(|e| CacheError::Io(std::io::Error::other(e)))?;
+
         // Snapshot dirty blocks, claim (CAS DIRTY→SYNCING), AND rotate —
         // all under the data_file write lock.
         //
@@ -619,7 +564,7 @@ impl WriteCache<Active> {
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
 
         let result = self
-            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache)
+            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache, &crcs)
             .await;
 
         if result.is_err() {
@@ -685,6 +630,7 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: Option<&Arc<dyn BlockCache>>,
+        crcs: &HashMap<usize, u32>,
     ) -> Result<FlushStats, CacheError> {
         use crate::block::pack::new_pack_id;
 
@@ -755,8 +701,9 @@ impl WriteCache<Active> {
             let zero_hash = self.inner.zero_block_hash;
             let inner = Arc::clone(&self.inner);
             let clean_cache_clone = clean_cache.map(Arc::clone);
+            let crcs = crcs.clone();
             let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
-                compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone)
+                compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone, &crcs)
             })
             .await
             .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;

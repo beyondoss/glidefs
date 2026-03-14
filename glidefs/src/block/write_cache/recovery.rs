@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument};
 
 use crate::block::state::{Active, Recovering};
 
@@ -22,12 +22,8 @@ impl WriteCache<Recovering> {
 
     /// Recover from a previous session and transition to Active.
     ///
-    /// Computes CRC32 baselines for all dirty blocks (parallel via rayon),
-    /// which also serves as an SSD readability check. Blocks that fail
-    /// pread are logged as warnings but do not prevent recovery.
-    ///
-    /// Runs the blocking SSD I/O (pread + CRC32) on a blocking thread to
-    /// avoid starving the async runtime during recovery.
+    /// Persists metadata so crash recovery state is durable before serving I/O.
+    /// SSD readability issues surface at the first flush cycle (CRC pre-pass).
     #[instrument(skip(self))]
     pub async fn finish_recovery(self) -> Result<WriteCache<Active>, CacheError> {
         let dirty_count = self.inner.dirty_block_count.load(Ordering::Relaxed);
@@ -38,26 +34,11 @@ impl WriteCache<Recovering> {
             info!(dirty_blocks = dirty_count, "starting recovery");
 
             let inner = Arc::clone(&self.inner);
-            let warnings = crate::task::spawn_blocking_named("recovery", move || {
-                // Compute CRC32 baselines for dirty blocks before transitioning
-                // to Active. This also verifies SSD readability — blocks that
-                // fail pread are counted as warnings (no separate pass needed).
-                let warnings = super::flush::compute_dirty_crc32s(&inner);
-
-                // Save metadata after recovery
-                inner.save_metadata()?;
-
-                Ok::<usize, CacheError>(warnings)
+            crate::task::spawn_blocking_named("recovery", move || {
+                inner.save_metadata()
             })
             .await
             .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
-
-            if warnings > 0 {
-                warn!(warnings, "some dirty blocks had SSD read errors");
-                self.inner
-                    .recovery_warnings
-                    .fetch_add(warnings as u64, Ordering::Relaxed);
-            }
 
             info!("recovery complete, dirty blocks will be flushed by scheduler");
         }

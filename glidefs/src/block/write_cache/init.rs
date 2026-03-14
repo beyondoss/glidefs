@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use tracing::{error, info, instrument, warn};
 
 use crate::block::block_map::{
-    SequenceNumber, SparseBlockState, SparseCrcMap, SparseStateMap, shared_zero_block,
+    SequenceNumber, SparseBlockState, SparseStateMap, shared_zero_block,
 };
 use crate::block::state::{Active, Initializing, Recovering};
 use crate::block::wal::Wal;
 
-use super::inner::{CacheInner, SyncFile, is_zero_block};
+use super::inner::{CacheInner, SyncFile};
 use super::{CacheError, WriteCache, WriteCacheConfig};
 
 impl WriteCache<Initializing> {
@@ -262,7 +262,7 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(recovery_warning_count),
-            crc_map: SparseCrcMap::new(num_blocks),
+
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),
             flushing_active: AtomicBool::new(false),
@@ -315,7 +315,7 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(0),
-            crc_map: SparseCrcMap::new(num_blocks),
+
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),
             flushing_active: AtomicBool::new(false),

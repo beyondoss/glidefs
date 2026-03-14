@@ -240,6 +240,11 @@ async fn test_fs_crash_fsync_honored_nbd_kernel() {
     // Then unmount the dead mount. Then drop the server (simulates process crash).
     dev.crash().await;
     mount.unmount();
+    // Shut down the router so flush schedulers release cache file handles.
+    // In a real crash the process dies and the OS closes everything; in a
+    // test we need to clean up explicitly or the old scheduler races with
+    // the new server opening the same files.
+    let _ = server.router.shutdown().await;
     server.shutdown.cancel();
     drop(server);
 
@@ -335,6 +340,11 @@ async fn test_fs_crash_unsynced_write_lost_cleanly_nbd_kernel() {
     // Crash
     dev.crash().await;
     mount.unmount();
+    // Shut down the router so flush schedulers release cache file handles.
+    // In a real crash the process dies and the OS closes everything; in a
+    // test we need to clean up explicitly or the old scheduler races with
+    // the new server opening the same files.
+    let _ = server.router.shutdown().await;
     server.shutdown.cancel();
     drop(server);
 
@@ -438,6 +448,11 @@ async fn test_fs_crash_journal_replay_nbd_kernel() {
     // Crash mid-write (files 25-49 may not be durable)
     dev.crash().await;
     mount.unmount();
+    // Shut down the router so flush schedulers release cache file handles.
+    // In a real crash the process dies and the OS closes everything; in a
+    // test we need to clean up explicitly or the old scheduler races with
+    // the new server opening the same files.
+    let _ = server.router.shutdown().await;
     server.shutdown.cancel();
     drop(server);
 
@@ -702,6 +717,11 @@ async fn test_fs_crash_during_flush_to_s3_nbd_kernel() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     dev.crash().await;
+    // Shut down the router so flush schedulers release cache file handles.
+    // In a real crash the process dies and the OS closes everything; in a
+    // test we need to clean up explicitly or the old scheduler races with
+    // the new server opening the same files.
+    let _ = server.router.shutdown().await;
     server.shutdown.cancel();
     drop(server);
 
@@ -803,6 +823,11 @@ async fn test_fs_crash_fsync_honored_ublk() {
     if let Err(e) = ublk.shutdown().await {
         eprintln!("ublk shutdown: {e}");
     }
+    // Shut down the router so flush schedulers release cache file handles.
+    // In a real crash the process dies and the OS closes everything; in a
+    // test we need to clean up explicitly or the old scheduler races with
+    // the new server opening the same files.
+    let _ = server.router.shutdown().await;
     server.shutdown.cancel();
     drop(server);
 

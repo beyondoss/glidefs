@@ -18,7 +18,7 @@ impl WriteCache<Active> {
     /// - Syncing → Dirty: decrement syncing_count, increment dirty_count
     /// - Dirty → Dirty: no-op (WAL entry skipped — already recorded)
     /// Hash computation is deferred to flush-to-S3 time. The write path only
-    /// does: set_present → pwrite → mark dirty → invalidate CRC → WAL append.
+    /// does: set_present → pwrite → mark dirty → WAL append.
     #[instrument(skip(self, data), fields(offset = offset, len = data.len()))]
     pub fn write(
         &self,
@@ -82,8 +82,8 @@ impl WriteCache<Active> {
 
         df.write_all_at(data, offset)?;
 
-        // Mark affected blocks as dirty, invalidate stale CRC32 checksums,
-        // and batch WAL entries. Lock-free: O_APPEND WAL handles concurrency.
+        // Mark affected blocks as dirty and batch WAL entries.
+        // Lock-free: O_APPEND WAL handles concurrency.
         // Skip WAL append for blocks already dirty (redundant — already recorded).
         let mut batch = Vec::new();
         for block in start_block..=end_block {
@@ -92,7 +92,6 @@ impl WriteCache<Active> {
                 continue;
             }
             let state_changed = self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.store(idx, super::inner::CRC_SENTINEL);
 
             if state_changed {
                 let seq = self.inner.sequence.next();
@@ -195,8 +194,8 @@ impl WriteCache<Active> {
             self.zero_range_fallback_with(&df, offset, len)?;
         }
 
-        // Mark affected blocks as dirty, invalidate stale CRCs, and batch
-        // WAL entries. Skip redundant entries for already-dirty blocks.
+        // Mark affected blocks as dirty and batch WAL entries.
+        // Skip redundant entries for already-dirty blocks.
         {
             let block_size = self.inner.config.block_size as u64;
             let start_block = offset / block_size;
@@ -209,7 +208,6 @@ impl WriteCache<Active> {
                     continue;
                 }
                 let state_changed = self.inner.transition_to_dirty(idx);
-                self.inner.crc_map.store(idx, super::inner::CRC_SENTINEL);
 
                 if state_changed {
                     let seq = self.inner.sequence.next();
@@ -355,8 +353,8 @@ impl WriteCache<Active> {
 
         df.write_all_at(data, offset)?;
 
-        // Mark affected blocks as dirty, invalidate stale CRCs, and batch
-        // WAL entries. Skip redundant entries for already-dirty blocks.
+        // Mark affected blocks as dirty and batch WAL entries.
+        // Skip redundant entries for already-dirty blocks.
         let mut batch = Vec::new();
         for block in start_block..=end_block {
             let idx = block as usize;
@@ -364,7 +362,6 @@ impl WriteCache<Active> {
                 continue;
             }
             let state_changed = self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.store(idx, super::inner::CRC_SENTINEL);
 
             if state_changed {
                 let seq = self.inner.sequence.next();
