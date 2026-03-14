@@ -586,6 +586,11 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
         dev.crash().await;
         mount.unmount();
         server.shutdown.cancel();
+        // Wait for the router's flush scheduler to exit and release the data
+        // file before the next cycle opens it. Without this, the detached
+        // server task keeps the router (and flush scheduler) alive, and the
+        // next cycle's WriteCache::open() races with the old flush scheduler.
+        let _ = server.router.shutdown().await;
         drop(server);
     }
 
