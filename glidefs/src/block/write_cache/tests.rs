@@ -2163,11 +2163,11 @@ async fn test_bottomless_skipped_block_recovery() {
         "partial block should stay DIRTY"
     );
 
-    // Block 1 should be CLEAN (auto-flush keeps blocks on SSD)
+    // Block 1 should be NOT_PRESENT (flush always evicts; foyer serves reads)
     assert_eq!(
         h.cache.inner.state_map.get(1),
-        SparseBlockState::CLEAN,
-        "flushed block should be CLEAN after auto-flush"
+        SparseBlockState::NOT_PRESENT,
+        "flushed block should be NOT_PRESENT after flush"
     );
 
     // Block 0's data should have been copied during rotation (old → new active)
@@ -2480,12 +2480,13 @@ async fn test_bottomless_concurrent_write_during_flush() {
     assert!(stats.blocks_claimed > 0, "some blocks should have been claimed");
 
     // After auto-flush, verify all blocks are readable with correct data.
-    // Blocks 0-4: either re-dirtied (latest write = 0xA0+i) or CLEAN on SSD.
-    // Blocks 5-9: CLEAN on SSD (0x10+i) or still dirty.
+    // Blocks 0-4: either re-dirtied (DIRTY, latest write = 0xA0+i) or
+    // evicted (NOT_PRESENT, data in foyer).
+    // Blocks 5-9: NOT_PRESENT (data in foyer) or still DIRTY.
     for i in 0u8..5 {
         let state = h.cache.inner.state_map.get(i as usize);
         assert!(
-            state == SparseBlockState::DIRTY || state == SparseBlockState::CLEAN,
+            state == SparseBlockState::DIRTY || state == SparseBlockState::NOT_PRESENT,
             "block {} unexpected state: {}", i, state,
         );
         let data = h
@@ -2508,8 +2509,7 @@ async fn test_bottomless_concurrent_write_during_flush() {
                 i, i + 0xA0, data[0],
             );
         }
-        // If CLEAN: the flush uploaded and kept 0x10+i on SSD, then the concurrent
-        // write may not have won the race. Either way the block is in a valid state.
+        // If NOT_PRESENT: flush evicted the block, data resolves from foyer/S3.
     }
 
     for i in 5u8..10 {
@@ -2588,12 +2588,13 @@ async fn test_bottomless_clean_cache_warming() {
         .unwrap();
     assert_eq!(stats.blocks_claimed, 3);
 
-    // All blocks should be CLEAN (auto-flush keeps blocks on SSD)
+    // All blocks should be NOT_PRESENT (flush always evicts from data file;
+    // foyer serves as the read cache).
     for i in 0usize..3 {
-        assert_eq!(cache.inner.state_map.get(i), SparseBlockState::CLEAN);
+        assert_eq!(cache.inner.state_map.get(i), SparseBlockState::NOT_PRESENT);
     }
 
-    // Read them back — data resolves from local SSD (CLEAN) or warmed cache.
+    // Read them back — data resolves from foyer (warmed during flush).
     let metrics = crate::block::metrics::ExportMetrics::new();
     for i in 0u8..3 {
         let data = cache
