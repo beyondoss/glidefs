@@ -1315,12 +1315,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_beyond_device_returns_error() {
+    async fn read_beyond_device_returns_zeros() {
         let (handler, _dir) = make_handler(false).await;
-        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut buf = vec![0xFFu8; BLOCK_SIZE];
         let result =
             handle_io(ublk_core::sys::UBLK_IO_OP_READ, DEVICE_SIZE, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
-        assert!(result < 0, "expected negative errno, got {result}");
+        assert_eq!(result, BLOCK_SIZE as i32, "OOB read should succeed with zero-fill");
+        assert!(buf.iter().all(|&b| b == 0), "OOB read should return zeros");
     }
 
     #[tokio::test]

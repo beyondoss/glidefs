@@ -720,24 +720,27 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     });
                 }
                 NBDCommand::Disconnect => {
+                    // Wait for all in-flight writes to complete before
+                    // draining. Without this, the drain can miss writes
+                    // that are still executing their pwrite() calls.
+                    while tasks.join_next().await.is_some() {}
                     info!("Client disconnecting from '{}', draining to S3...", export_name);
                     let _ = response_tx.send(Response::Disconnect { export_name: export_name.to_string() }).await;
                     return Ok(());
                 }
                 NBDCommand::Flush => {
-                    // Flush is synchronous - important for data integrity
-                    let h = Arc::clone(&handler);
-                    let tx = response_tx.clone();
-                    let cookie = request.cookie;
+                    // FLUSH is a write barrier: the NBD spec requires that all
+                    // previously-submitted writes are on stable storage before
+                    // the flush reply is sent. Drain all in-flight tasks first
+                    // so their pwrite()s complete, then fdatasync.
+                    while tasks.join_next().await.is_some() {}
 
-                    tasks.spawn(async move {
-                        let result = h.flush();
-                        let response = match result {
-                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
-                        };
-                        let _ = tx.send(response).await;
-                    });
+                    let result = handler.flush();
+                    let response = match result {
+                        Ok(()) => Response::Simple { cookie: request.cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                        Err(e) => Response::Simple { cookie: request.cookie, error: e.to_nbd_errno(), data: Bytes::new() },
+                    };
+                    let _ = response_tx.send(response).await;
                 }
                 NBDCommand::Trim => {
                     let h = Arc::clone(&handler);

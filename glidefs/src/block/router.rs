@@ -755,17 +755,42 @@ impl ExportRouter {
             let cache = cache.finish_recovery().await?;
             info!("Export '{}' cache ready", name);
 
-            // Empty volume manifest for new exports
-            let volume_manifest = Arc::new(parking_lot::RwLock::new(
-                VolumeManifest::new(device_size, block_size as u32),
-            ));
-
-            // Try to load existing volume manifest from S3
-            if let Ok(Some((data, etag))) = content_store.get_manifest(&name).await && let Ok(vm) = VolumeManifest::deserialize(&data) {
-                *volume_manifest.write() = vm;
-                *cache.inner.manifest_etag.lock() = etag;
-                info!("Loaded existing volume manifest for '{}'", name);
-            }
+            // Load existing manifest from S3 or start fresh.
+            //
+            // CRITICAL: if a manifest exists in S3 but we fail to load it
+            // (transient S3 error, deserialization failure), we MUST fail
+            // rather than start with an empty manifest. Starting empty would
+            // cause the first sync_manifest to unconditionally overwrite the
+            // real manifest (manifest_etag would be None), permanently losing
+            // all previously-flushed block references.
+            let volume_manifest = match content_store.get_manifest(&name).await {
+                Ok(Some((data, etag))) => {
+                    let vm = VolumeManifest::deserialize(&data).map_err(|e| {
+                        RouterError::Manifest(format!(
+                            "failed to deserialize manifest for '{}': {}",
+                            name, e
+                        ))
+                    })?;
+                    let volume_manifest = Arc::new(parking_lot::RwLock::new(vm));
+                    *cache.inner.manifest_etag.lock() = etag;
+                    info!("Loaded existing volume manifest for '{}'", name);
+                    volume_manifest
+                }
+                Ok(None) => {
+                    // No manifest in S3 — genuinely new export.
+                    info!("No existing manifest for '{}', starting fresh", name);
+                    Arc::new(parking_lot::RwLock::new(
+                        VolumeManifest::new(device_size, block_size as u32),
+                    ))
+                }
+                Err(e) => {
+                    return Err(RouterError::Manifest(format!(
+                        "failed to load manifest for '{}' from S3: {} — refusing to start \
+                         with empty manifest (would overwrite existing data on first flush)",
+                        name, e
+                    )));
+                }
+            };
 
             (Arc::new(cache), volume_manifest)
         };

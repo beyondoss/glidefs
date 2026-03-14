@@ -635,13 +635,33 @@ impl WriteCache<Active> {
                     }
                 }
             }
+            // Check if any blocks are still stranded in SYNCING (recovery
+            // failed for them — both the S3 upload and the SSD copy failed).
+            let stranded_syncing = snapshot
+                .iter()
+                .any(|&idx| {
+                    !recovered.contains(&idx)
+                        && self.inner.state_map.get(idx) == SparseBlockState::SYNCING
+                });
+
             drop(df);
             self.inner.flushing_active.store(false, Ordering::Release);
             self.inner.rotation_seq.store(0, Ordering::Release);
-            drop(self.inner.flushing_file.lock().take());
-            let flushing_path = self.inner.config.flushing_path();
-            if flushing_path.exists() {
-                let _ = std::fs::remove_file(&flushing_path);
+
+            if stranded_syncing {
+                // Keep the flushing file alive — it's the only copy of data
+                // for the stranded SYNCING blocks. Crash recovery (init.rs)
+                // will find the flushing file and recover them on restart.
+                warn!(
+                    "keeping flushing file: some blocks still SYNCING with \
+                     data only in flushing file"
+                );
+            } else {
+                drop(self.inner.flushing_file.lock().take());
+                let flushing_path = self.inner.config.flushing_path();
+                if flushing_path.exists() {
+                    let _ = std::fs::remove_file(&flushing_path);
+                }
             }
             // Only transition blocks whose data was successfully recovered.
             for &idx in &recovered {
@@ -782,6 +802,16 @@ impl WriteCache<Active> {
                                     );
                                     continue;
                                 }
+                            } else {
+                                // Cannot read from flushing file. Leave SYNCING
+                                // so crash recovery can attempt it. Do NOT mark
+                                // dirty: the active file has zeros for this block.
+                                warn!(
+                                    block = idx,
+                                    "pread from flushing file failed during \
+                                     skipped-block recovery — block left SYNCING"
+                                );
+                                continue;
                             }
                         }
                     }

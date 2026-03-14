@@ -219,10 +219,27 @@ pub async fn compact_chunk(
             .map(|(chunk_offset, pid, hash, pack_offset, comp_length)| {
                 let cs = content_store;
                 async move {
-                    let data = cs
+                    let compressed = cs
                         .get_chunk_block(chunk_idx, pid, pack_offset, comp_length)
                         .await?;
-                    Ok((hash, chunk_offset, data.to_vec()))
+                    // Verify integrity: decompress and check blake3 hash.
+                    // Compaction is the one data-movement path where corrupted
+                    // S3 data could become the sole copy after GC deletes the
+                    // original packs. The decompress+hash cost is acceptable
+                    // since compaction is not latency-sensitive.
+                    let decompressed = crate::block::block_map::lz4_decompress(&compressed)
+                        .map_err(|e| CacheError::DecompressFailed(format!(
+                            "compaction: chunk {} pack {:016x} offset {}: {}",
+                            chunk_idx, pid, pack_offset, e
+                        )))?;
+                    let actual_hash = crate::block::block_map::blake3_128(&decompressed);
+                    if actual_hash != hash {
+                        return Err(CacheError::HashMismatch {
+                            expected: format!("{:?}", hash),
+                            actual: format!("{:?}", actual_hash),
+                        });
+                    }
+                    Ok((hash, chunk_offset, compressed.to_vec()))
                 }
             })
             .buffer_unordered(8) // bounded concurrency for S3 reads
