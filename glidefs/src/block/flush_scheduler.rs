@@ -29,6 +29,12 @@ use crate::block::write_cache::WriteCache;
 /// Maximum backoff between flush retries.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Duration used to "park" the checkpoint timer when idle. Must be large
+/// enough to never fire during normal operation, but small enough that
+/// `Instant::now() + FAR_FUTURE` does not overflow `Instant`'s internal
+/// representation. 10 years is safe on all platforms.
+const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 10);
+
 /// Result of a flush-and-sync cycle.
 struct FlushResult {
     /// Number of packs uploaded to S3 (0 = no dirty blocks or all deduped).
@@ -182,7 +188,7 @@ pub async fn flush_scheduler(
     // dirty blocks, no pending manifest). Activated on first write or at
     // startup if WAL recovery left dirty blocks. reset() is O(1) — just
     // moves the entry in tokio's timer wheel.
-    let checkpoint_timer = tokio::time::sleep(Duration::MAX);
+    let checkpoint_timer = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(checkpoint_timer);
     let mut checkpoint_active = false;
 
@@ -459,7 +465,7 @@ pub async fn flush_scheduler(
                 } else {
                     checkpoint_timer
                         .as_mut()
-                        .reset(tokio::time::Instant::now() + Duration::MAX);
+                        .reset(tokio::time::Instant::now() + FAR_FUTURE);
                     checkpoint_active = false;
                 }
             }
