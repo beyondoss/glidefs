@@ -344,17 +344,26 @@ impl BlockHandler {
             // Fetch prior data BEFORE claiming — resolve_block_for_backfill
             // checks is_present and reads from the data file if true, so the
             // block must still be NOT_PRESENT during the fetch.
-            let prior = match self.cache.resolve_block_for_backfill(
+            //
+            // If the fetch fails, propagate the error. Silently using zeros
+            // would corrupt the non-written portion of the block — the guest's
+            // sub-block write lands correctly but the rest becomes zeros,
+            // overwriting valid S3 data on the next flush.
+            let prior = self.cache.resolve_block_for_backfill(
                 idx,
                 self.clean_cache.as_ref(),
                 &self.pack_index_cache,
                 &self.volume_manifest,
                 &self.content_store,
                 Some(&self.metrics),
-            ).await {
-                Ok(data) => data,
-                Err(_) => bytes::Bytes::new(),
-            };
+            ).await.map_err(|e| {
+                tracing::warn!(
+                    block = idx,
+                    error = %e,
+                    "S3 backfill failed for sub-block write — rejecting write to prevent data corruption"
+                );
+                CommandError::IoError
+            })?;
 
             // Re-check: a concurrent writer may have completed a backfill
             // while we were fetching from S3.
@@ -372,19 +381,23 @@ impl BlockHandler {
 
             // Non-zero prior data: claim the block atomically, then merge
             // and write. Only the CAS winner does the full-block write;
-            // losers yield until the winner finishes and write their sub-range.
+            // losers wait until the winner finishes and write their sub-range.
             if !self.cache.try_claim_block(idx) {
                 // Another writer claimed this block. Wait for their
                 // cache.write to complete (CLEAN → DIRTY transition),
                 // then write our sub-range on top of the backfilled data.
+                //
+                // The winner's write is a single pwrite + CAS (~µs). Use a
+                // brief sleep-backoff instead of a tight yield_now() loop to
+                // avoid saturating the tokio scheduler under high concurrency.
                 use crate::block::block_map::SparseBlockState;
-                let mut yields = 0;
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(50);
                 while self.cache.block_state(idx) == SparseBlockState::CLEAN {
-                    tokio::task::yield_now().await;
-                    yields += 1;
-                    if yields > 100_000 {
+                    if tokio::time::Instant::now() >= deadline {
                         break;
                     }
+                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                 }
                 self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
                 continue;
@@ -1306,6 +1319,262 @@ mod tests {
         );
 
         (handler, ssd_util, temp_dir)
+    }
+
+    // =========================================================================
+    // Backfill data corruption test
+    // =========================================================================
+
+    /// Object store wrapper that can selectively fail GETs to simulate S3 outages.
+    #[derive(Debug)]
+    struct FailingObjectStore {
+        inner: InMemory,
+        fail_gets: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingObjectStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                fail_gets: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail_gets(&self, fail: bool) {
+            self.fail_gets
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Display for FailingObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingObjectStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FailingObjectStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if self.fail_gets.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "FailingObjectStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Simulated S3 GET failure",
+                    )),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// A sub-block write to an evicted block with S3 data must fail (not
+    /// silently corrupt) when S3 is unreachable. Without the fix, the
+    /// backfill error was swallowed and zeros were substituted for the
+    /// non-written portion of the block.
+    #[tokio::test]
+    async fn test_subblock_write_fails_when_s3_backfill_unavailable() {
+        let temp_dir = TempDir::new().unwrap();
+        let s3 = Arc::new(FailingObjectStore::new());
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "backfill-test".to_string(),
+            device_size: 1024 * 1024, // 1MB
+            block_size: 4096,
+            wal_sync: false,
+        };
+
+        let content_store = Arc::new(ContentStore::new(
+            Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>,
+            "test",
+        ));
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            1024 * 1024,
+            4096,
+        )));
+        let metrics = Arc::new(ExportMetrics::new());
+
+        let cache = WriteCache::open(config).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let cache = Arc::new(cache);
+
+        let handler = BlockHandler::new(
+            Arc::clone(&cache),
+            Arc::clone(&content_store),
+            Arc::clone(&clean_cache),
+            Arc::clone(&pack_index_cache),
+            Arc::clone(&volume_manifest),
+            1024 * 1024,
+            false,
+            metrics,
+            Arc::new(AtomicU64::new(0f64.to_bits())),
+            Arc::new(Notify::const_new()),
+            DEFAULT_BLOCKS_PER_PACK,
+            None,
+        );
+
+        // Step 1: Write a full block of 0xAA.
+        let original_data = vec![0xAAu8; 4096];
+        handler.write(0, &original_data, false).await.unwrap();
+
+        // Step 2: Flush + drain to S3 (evicts block from local SSD).
+        cache
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .await
+            .unwrap();
+        assert!(
+            !cache.is_block_present(0),
+            "block should be evicted after drain"
+        );
+
+        // Step 3: Fail all S3 GETs.
+        s3.set_fail_gets(true);
+
+        // Step 4: Sub-block write must return an error — not silently corrupt.
+        let sub_block = vec![0xBBu8; 512];
+        let result = handler.write(0, &sub_block, false).await;
+        assert!(
+            result.is_err(),
+            "sub-block write must fail when S3 backfill is unavailable"
+        );
+
+        // Step 5: Re-enable S3 and verify original data is intact.
+        s3.set_fail_gets(false);
+        let read_back = handler.read(0, 4096).await.unwrap();
+        assert_eq!(
+            &read_back[..],
+            &original_data[..],
+            "original S3 data must be preserved after failed write"
+        );
+    }
+
+    /// Sub-block write succeeds and preserves surrounding data when S3 is
+    /// reachable — the backfill correctly merges guest data with prior S3 data.
+    #[tokio::test]
+    async fn test_subblock_write_preserves_data_with_working_s3() {
+        let temp_dir = TempDir::new().unwrap();
+        let s3 = Arc::new(FailingObjectStore::new());
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "backfill-ok-test".to_string(),
+            device_size: 1024 * 1024,
+            block_size: 4096,
+            wal_sync: false,
+        };
+
+        let content_store = Arc::new(ContentStore::new(
+            Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>,
+            "test",
+        ));
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            1024 * 1024,
+            4096,
+        )));
+        let metrics = Arc::new(ExportMetrics::new());
+
+        let cache = WriteCache::open(config).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let cache = Arc::new(cache);
+
+        let handler = BlockHandler::new(
+            Arc::clone(&cache),
+            Arc::clone(&content_store),
+            Arc::clone(&clean_cache),
+            Arc::clone(&pack_index_cache),
+            Arc::clone(&volume_manifest),
+            1024 * 1024,
+            false,
+            metrics,
+            Arc::new(AtomicU64::new(0f64.to_bits())),
+            Arc::new(Notify::const_new()),
+            DEFAULT_BLOCKS_PER_PACK,
+            None,
+        );
+
+        // Write full block, flush+drain to S3, evict locally.
+        let original_data = vec![0xAAu8; 4096];
+        handler.write(0, &original_data, false).await.unwrap();
+        cache
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .await
+            .unwrap();
+        assert!(!cache.is_block_present(0));
+
+        // Sub-block write with S3 working — should succeed and merge.
+        let sub_block = vec![0xBBu8; 512];
+        handler.write(0, &sub_block, false).await.unwrap();
+
+        let result = handler.read(0, 4096).await.unwrap();
+        assert_eq!(
+            &result[..512],
+            &[0xBBu8; 512][..],
+            "sub-block write data should be present"
+        );
+        assert_eq!(
+            &result[512..],
+            &vec![0xAAu8; 4096 - 512][..],
+            "remaining bytes must be original S3 data, not zeros"
+        );
     }
 
     /// At >95% SSD utilization, writes to NEW blocks return ENOSPC while
