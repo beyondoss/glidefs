@@ -1729,6 +1729,15 @@ impl ExportRouter {
             );
         }
 
+        // Best-effort final manifest sync — persists references to any packs
+        // that were successfully uploaded even if the full drain didn't complete.
+        if let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await {
+            warn!(
+                "Final manifest sync for '{}' failed: {} — flushed packs may be orphaned",
+                name, e,
+            );
+        }
+
         // 4. Drop the handler (releases its Arc clone)
         drop(handler);
 

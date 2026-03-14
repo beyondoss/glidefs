@@ -145,6 +145,11 @@ impl BlockHandler {
         self.device_size.load(Ordering::Relaxed)
     }
 
+    #[inline]
+    pub fn block_size(&self) -> usize {
+        self.cache.block_size()
+    }
+
     /// Set the device size (for resize).
     /// Only safe to call after draining dirty blocks.
     #[allow(dead_code)]
@@ -496,30 +501,44 @@ impl BlockHandler {
     ) -> CommandResult<usize> {
         let start = Instant::now();
 
-        if offset + length as u64 > self.device_size() {
-            return Err(CommandError::InvalidArgument);
+        // Match read() behavior: OOB reads return zeros instead of errors.
+        // The kernel sends reads past the device boundary during partition
+        // table probing on both NBD and ublk transports.
+        if offset >= self.device_size() {
+            buf[..length as usize].fill(0);
+            return Ok(length as usize);
         }
 
         if length == 0 {
             return Ok(0);
         }
 
-        self.metrics.record_guest_read(length as u64);
+        // Clamp reads that partially extend past the device boundary.
+        let clamped_len = std::cmp::min(
+            length as u64,
+            self.device_size() - offset,
+        ) as u32;
+
+        self.metrics.record_guest_read(clamped_len as u64);
 
         // Fast path: all blocks present on local SSD → pread directly into
         // caller buffer. Zero allocation, zero memcpy.
-        if let Some(result) = self.cache.try_pread_local(offset, length as usize, buf) {
+        if let Some(result) = self.cache.try_pread_local(offset, clamped_len as usize, buf) {
             let n = result?;
+            // Zero-pad if we clamped.
+            if clamped_len < length {
+                buf[n..length as usize].fill(0);
+            }
             self.trigger_readahead(offset);
             self.metrics.record_read_latency(start.elapsed());
-            return Ok(n);
+            return Ok(length as usize);
         }
 
         let data = self
             .cache
             .read(
                 offset,
-                length as usize,
+                clamped_len as usize,
                 self.clean_cache.as_ref(),
                 &self.pack_index_cache,
                 &self.volume_manifest,
@@ -530,10 +549,15 @@ impl BlockHandler {
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
 
+        // Zero-pad if we clamped.
+        if clamped_len < length {
+            buf[n..length as usize].fill(0);
+        }
+
         self.trigger_readahead(offset);
 
         self.metrics.record_read_latency(start.elapsed());
-        Ok(n)
+        Ok(length as usize)
     }
 
     /// Write data to the cache.
@@ -548,7 +572,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset + data.len() as u64 > self.device_size() {
+        if offset.checked_add(data.len() as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -603,7 +627,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset + length as u64 > self.device_size() {
+        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -638,7 +662,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset + length as u64 > self.device_size() {
+        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -667,7 +691,7 @@ impl BlockHandler {
 
     /// Cache hint - no-op for our implementation.
     pub fn cache(&self, offset: u64, length: u32) -> CommandResult<()> {
-        if offset + length as u64 > self.device_size() {
+        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
         Ok(())
@@ -704,7 +728,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset + length > self.device_size() {
+        if offset.checked_add(length).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -809,7 +833,7 @@ impl BlockHandler {
         offset: u64,
         length: u32,
     ) -> CommandResult<super::write_cache::ReadPlan> {
-        if offset + length as u64 > self.device_size() {
+        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use tracing::{error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 
 use crate::block::block_map::{
     SequenceNumber, SparseBlockState, SparseStateMap, shared_zero_block,
@@ -42,7 +42,7 @@ impl WriteCache<Initializing> {
         let export_name = config.device_name.clone();
 
         // Track recovery issues for metrics
-        let mut recovery_warning_count: u64 = 0;
+        let recovery_warning_count: u64 = 0;
 
         // Replay WAL entries after persisted sequence. When recovering from
         // a mid-flush crash (rotation_seq > 0), replay from the rotation point
@@ -66,9 +66,9 @@ impl WriteCache<Initializing> {
                 entries
             }
             Err(e) => {
-                error!(error = %e, "WAL replay failed — dirty blocks since last checkpoint may be lost");
-                recovery_warning_count += 1;
-                vec![]
+                return Err(CacheError::Io(std::io::Error::other(
+                    format!("WAL replay failed, refusing to open cache: {e}"),
+                )));
             }
         };
 

@@ -640,6 +640,7 @@ impl WriteCache<Active> {
 
             let results = futures::future::join_all(fetch_futures).await;
             let mut last_fetch_error = None;
+            let mut failed_pack_ids: Vec<PackId> = Vec::new();
             for (pid, result) in results {
                 match result {
                     Ok(entries) => {
@@ -651,12 +652,22 @@ impl WriteCache<Active> {
                             error = %e,
                             "failed to fetch pack index from S3"
                         );
+                        failed_pack_ids.push(pid);
                         last_fetch_error = Some(e);
                     }
                 }
             }
 
+            // Re-resolve newest-first. If we encounter a failed pack before
+            // finding a resolution, we must error — that pack might contain
+            // a newer version of the block, and returning older data would
+            // be a silent consistency violation.
             for &pack_id in pack_ids.iter().rev() {
+                if failed_pack_ids.contains(&pack_id) {
+                    if let Some(e) = last_fetch_error {
+                        return Err(e.into());
+                    }
+                }
                 if let Some((hash, pack_offset, comp_length)) =
                     pack_index_cache.lookup_block(pack_id, block_offset).await
                 {

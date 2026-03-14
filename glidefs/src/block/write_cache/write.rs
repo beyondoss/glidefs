@@ -1,5 +1,6 @@
 use tracing::{debug, instrument};
 
+use crate::block::block_map::SparseBlockState;
 use crate::block::state::Active;
 use crate::block::wal::serialize_entry;
 
@@ -18,16 +19,19 @@ impl WriteCache<Active> {
     /// - Syncing → Dirty: decrement syncing_count, increment dirty_count
     /// - Dirty → Dirty: no-op (WAL entry skipped — already recorded)
     /// Hash computation is deferred to flush-to-S3 time. The write path only
-    /// does: set_present → pwrite → mark dirty → WAL append.
+    /// does: set_present → pwrite → WAL append → mark dirty.
     #[instrument(skip(self, data), fields(offset = offset, len = data.len()))]
     pub fn write(
         &self,
         offset: u64,
         data: &[u8],
     ) -> Result<(), CacheError> {
-        if offset + data.len() as u64 > self.inner.config.device_size {
+        let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
+            CacheError::offset_out_of_bounds(u64::MAX, self.inner.config.device_size)
+        })?;
+        if end > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
-                offset + data.len() as u64,
+                end,
                 self.inner.config.device_size,
             ));
         }
@@ -39,7 +43,7 @@ impl WriteCache<Active> {
         // Calculate affected blocks
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
-        let end_block = (offset + data.len() as u64 - 1) / block_size;
+        let end_block = (end - 1) / block_size;
 
         // CRITICAL: Mark blocks as present BEFORE writing to file.
         // This prevents a race with prefetch where:
@@ -82,30 +86,38 @@ impl WriteCache<Active> {
 
         df.write_all_at(data, offset)?;
 
-        // Mark affected blocks as dirty and batch WAL entries.
-        // Lock-free: O_APPEND WAL handles concurrency.
-        // Skip WAL append for blocks already dirty (redundant — already recorded).
+        // Build WAL batch for blocks that aren't already dirty, but DON'T
+        // transition state yet. WAL must be durable before state transitions
+        // so a crash between WAL append failure and state change can't leave
+        // blocks dirty-in-memory with no WAL record.
         let mut batch = Vec::new();
+        let mut to_dirty: Vec<usize> = Vec::new();
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx >= self.inner.num_blocks {
                 continue;
             }
-            let state_changed = self.inner.transition_to_dirty(idx);
-
-            if state_changed {
+            let state = self.inner.state_map.get(idx);
+            if state != SparseBlockState::DIRTY {
                 let seq = self.inner.sequence.next();
                 serialize_entry(&mut batch, block, seq);
+                to_dirty.push(idx);
             }
         }
 
         if !batch.is_empty() {
             self.inner.wal.append_batch(&batch)?;
             if self.inner.config.wal_sync {
+                df.sync_all()?;
                 self.inner.wal.sync()?;
             } else {
                 self.inner.wal.flush()?;
             }
+        }
+
+        // WAL is appended — now transition states.
+        for idx in to_dirty {
+            self.inner.transition_to_dirty(idx);
         }
 
         drop(df);
@@ -130,9 +142,12 @@ impl WriteCache<Active> {
             return Ok(());
         }
 
-        if offset + len > self.inner.config.device_size {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            CacheError::offset_out_of_bounds(u64::MAX, self.inner.config.device_size)
+        })?;
+        if end > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
-                offset + len,
+                end,
                 self.inner.config.device_size,
             ));
         }
@@ -142,7 +157,7 @@ impl WriteCache<Active> {
         // could overwrite our zeros with stale S3 data.
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
-        let end_block = (offset + len - 1) / block_size;
+        let end_block = (end - 1) / block_size;
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
@@ -194,34 +209,39 @@ impl WriteCache<Active> {
             self.zero_range_fallback_with(&df, offset, len)?;
         }
 
-        // Mark affected blocks as dirty and batch WAL entries.
-        // Skip redundant entries for already-dirty blocks.
+        // Build WAL batch first, then transition states after WAL is durable.
         {
             let block_size = self.inner.config.block_size as u64;
             let start_block = offset / block_size;
-            let end_block = (offset + len - 1) / block_size;
+            let end_block = (end - 1) / block_size;
 
             let mut batch = Vec::new();
+            let mut to_dirty: Vec<usize> = Vec::new();
             for block in start_block..=end_block {
                 let idx = block as usize;
                 if idx >= self.inner.num_blocks {
                     continue;
                 }
-                let state_changed = self.inner.transition_to_dirty(idx);
-
-                if state_changed {
+                let state = self.inner.state_map.get(idx);
+                if state != SparseBlockState::DIRTY {
                     let seq = self.inner.sequence.next();
                     serialize_entry(&mut batch, block, seq);
+                    to_dirty.push(idx);
                 }
             }
 
             if !batch.is_empty() {
                 self.inner.wal.append_batch(&batch)?;
                 if self.inner.config.wal_sync {
+                    df.sync_all()?;
                     self.inner.wal.sync()?;
                 } else {
                     self.inner.wal.flush()?;
                 }
+            }
+
+            for idx in to_dirty {
+                self.inner.transition_to_dirty(idx);
             }
         }
 
@@ -290,9 +310,12 @@ impl WriteCache<Active> {
     /// this.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     pub fn pre_write(&self, offset: u64, len: u64) -> Result<(), CacheError> {
-        if offset + len > self.inner.config.device_size {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            CacheError::offset_out_of_bounds(u64::MAX, self.inner.config.device_size)
+        })?;
+        if end > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
-                offset + len,
+                end,
                 self.inner.config.device_size,
             ));
         }
@@ -302,7 +325,7 @@ impl WriteCache<Active> {
 
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
-        let end_block = (offset + len - 1) / block_size;
+        let end_block = (end - 1) / block_size;
 
         for block in start_block..=end_block {
             let idx = block as usize;
@@ -353,29 +376,34 @@ impl WriteCache<Active> {
 
         df.write_all_at(data, offset)?;
 
-        // Mark affected blocks as dirty and batch WAL entries.
-        // Skip redundant entries for already-dirty blocks.
+        // Build WAL batch first, then transition states after WAL is durable.
         let mut batch = Vec::new();
+        let mut to_dirty: Vec<usize> = Vec::new();
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx >= self.inner.num_blocks {
                 continue;
             }
-            let state_changed = self.inner.transition_to_dirty(idx);
-
-            if state_changed {
+            let state = self.inner.state_map.get(idx);
+            if state != SparseBlockState::DIRTY {
                 let seq = self.inner.sequence.next();
                 serialize_entry(&mut batch, block, seq);
+                to_dirty.push(idx);
             }
         }
 
         if !batch.is_empty() {
             self.inner.wal.append_batch(&batch)?;
             if self.inner.config.wal_sync {
+                df.sync_all()?;
                 self.inner.wal.sync()?;
             } else {
                 self.inner.wal.flush()?;
             }
+        }
+
+        for idx in to_dirty {
+            self.inner.transition_to_dirty(idx);
         }
 
         drop(df);
