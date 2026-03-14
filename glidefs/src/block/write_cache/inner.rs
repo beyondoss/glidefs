@@ -492,13 +492,16 @@ impl CacheInner {
         use crate::block::block_map::SparseBlockState;
 
         let block_size = self.config.block_size as u64;
-        // Always try the flushing file — don't gate on flushing_active.
-        // There's a window where blocks are evicted (SYNCING→NOT_PRESENT)
-        // but flushing_active is still true and flushing_file still exists.
-        // By skipping the flushing_active check, we also catch blocks that
-        // were evicted between flushing_active=false and flushing_file=None.
-        let flushing_guard = self.flushing_file.lock();
-        if let Some(ref ff) = *flushing_guard {
+        // Clone the flushing file Arc under the lock and release immediately.
+        // The Arc keeps the SyncFile (and its fd) alive even after the flush
+        // thread clears flushing_file and deletes the physical file — Unix
+        // guarantees an unlinked file remains accessible via open fds.
+        //
+        // This avoids holding the Mutex across the entire IO loop (potentially
+        // dozens of pread+pwrite calls), which would block rotate_data_file
+        // and compute_flush_batch from accessing flushing_file.
+        let ff = self.flushing_file.lock().clone();
+        if let Some(ref ff) = ff {
             for block in start_block..=end_block {
                 let idx = block as usize;
                 if idx >= self.num_blocks {

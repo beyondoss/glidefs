@@ -290,6 +290,15 @@ pub async fn flush_scheduler(
                             info!("deferred manifest sync succeeded");
                             manifest_pending = false;
                             metrics.record_manifest_synced();
+                            metrics.set_manifest_pending(false);
+                            // Checkpoint now: persist CLEAN block states and
+                            // truncate the WAL. Without this, blocks that were
+                            // flushed to S3 remain DIRTY in the .meta file and
+                            // WAL entries are never truncated. On recovery,
+                            // those blocks would be unnecessarily re-uploaded.
+                            if let Err(e) = cache.local_checkpoint().await {
+                                warn!(error = %e, "checkpoint after deferred manifest sync");
+                            }
                         }
                         Err(e) => {
                             metrics.record_manifest_sync_error();

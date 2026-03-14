@@ -45,7 +45,7 @@ impl WriteCacheConfig {
         self.cache_dir.join(format!("{}.wal", self.device_name))
     }
 
-    /// Path to the flushing data file (exists only during active flush in bottomless mode).
+    /// Path to the flushing data file (exists only during active flush).
     pub fn flushing_path(&self) -> PathBuf {
         self.cache_dir.join(format!("{}.flushing", self.device_name))
     }

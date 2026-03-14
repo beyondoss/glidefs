@@ -147,7 +147,7 @@ fn compute_flush_batch(
 
             let hash = blake3_128(&chunk_buf);
 
-            // Warm clean_cache for bottomless mode: decompressed block data
+            // Warm clean_cache: decompressed block data
             // goes into the Foyer S3-FIFO cache so reads after eviction hit
             // cache instead of S3. S3-FIFO handles scan resistance.
             if let Some(ref cache) = clean_cache {
@@ -471,7 +471,7 @@ impl WriteCache<Active> {
         Arc::clone(&self.inner)
     }
 
-    /// Rotate the data file for bottomless mode.
+    /// Rotate the data file for flush.
     ///
     /// 1. Rename active file -> flushing file
     /// 2. Create new sparse active file
@@ -555,7 +555,7 @@ impl WriteCache<Active> {
 
         drop(data_file_guard);
 
-        info!("rotated data file for bottomless flush");
+        info!("rotated data file for flush");
         Ok((claimed, ()))
     }
 
