@@ -297,10 +297,30 @@ impl BlockHandler {
             let block_local_start = (write_start - block_start) as usize;
             let write_len = (write_end - write_start) as usize;
 
-            if self.cache.is_block_present(idx) {
-                // Already present — just pwrite the sub-range.
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
+            {
+                use crate::block::block_map::SparseBlockState;
+                let state = self.cache.block_state(idx);
+                if state == SparseBlockState::DIRTY || state == SparseBlockState::SYNCING {
+                    // Block is fully written (DIRTY) or being flushed (SYNCING).
+                    // Safe to pwrite our sub-range directly.
+                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    continue;
+                }
+                if state == SparseBlockState::CLEAN {
+                    // Another writer claimed this block (CAS NOT_PRESENT→CLEAN)
+                    // but hasn't written the merged data yet. Wait for the
+                    // full-block write to complete before writing our sub-range.
+                    loop {
+                        let st = self.cache.block_state(idx);
+                        if st != SparseBlockState::CLEAN {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    }
+                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    continue;
+                }
+                // NOT_PRESENT — need backfill, fall through.
             }
 
             if write_len >= block_size {
@@ -372,13 +392,44 @@ impl BlockHandler {
 
             // Re-check: a concurrent writer may have completed a backfill
             // while we were fetching from S3.
-            if self.cache.is_block_present(idx) {
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
+            //
+            // Three cases:
+            // - DIRTY/SYNCING: backfill write completed. Safe to pwrite
+            //   our sub-range on top.
+            // - CLEAN: another writer claimed the block (CAS NOT_PRESENT→CLEAN)
+            //   but hasn't written the merged data yet. Our `prior` may be
+            //   stale zeros (resolve_block_for_backfill reads from local SSD
+            //   when is_present=true, which returns the sparse file's zeros).
+            //   We MUST wait for the winner to finish before writing.
+            // - NOT_PRESENT: nobody claimed yet. Fall through to CAS claim.
+            {
+                use crate::block::block_map::SparseBlockState;
+                let state = self.cache.block_state(idx);
+                match state {
+                    s if s == SparseBlockState::DIRTY || s == SparseBlockState::SYNCING => {
+                        self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                        continue;
+                    }
+                    s if s == SparseBlockState::CLEAN => {
+                        // Wait for the winner's full-block write to complete
+                        // (CLEAN → DIRTY), then write our sub-range on top.
+                        loop {
+                            let st = self.cache.block_state(idx);
+                            if st != SparseBlockState::CLEAN {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                        }
+                        self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                        continue;
+                    }
+                    _ => {} // NOT_PRESENT — fall through to CAS claim
+                }
             }
 
-            // If prior data is all zeros, just write the guest's sub-block
-            // directly — the data file already has zeros from set_len.
+            // If prior data is all zeros and no one has claimed the block,
+            // just write the guest's sub-block directly — the data file
+            // already has zeros from set_len.
             if prior.is_empty() || prior.iter().all(|&b| b == 0) {
                 self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
                 continue;
@@ -392,14 +443,16 @@ impl BlockHandler {
                 // cache.write to complete (CLEAN → DIRTY transition),
                 // then write our sub-range on top of the backfilled data.
                 //
-                // The winner's write is a single pwrite + CAS (~µs). Use a
-                // brief sleep-backoff instead of a tight yield_now() loop to
-                // avoid saturating the tokio scheduler under high concurrency.
+                // The winner's post-claim path is bounded: in-memory merge
+                // + single pwrite under the data_file read lock. The only
+                // blocker is flush rotation's write lock (~15µs typical).
+                // No deadline — proceeding early would write our sub-range
+                // into zeros, then the winner's full-block write would
+                // overwrite our data (silent data loss).
                 use crate::block::block_map::SparseBlockState;
-                let deadline = tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(50);
-                while self.cache.block_state(idx) == SparseBlockState::CLEAN {
-                    if tokio::time::Instant::now() >= deadline {
+                loop {
+                    let state = self.cache.block_state(idx);
+                    if state != SparseBlockState::CLEAN {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_micros(50)).await;
@@ -409,6 +462,11 @@ impl BlockHandler {
             }
 
             // We won the claim. Merge guest data onto prior block and write.
+            #[cfg(feature = "test-utils")]
+            eprintln!(
+                "CLAIM_WIN: block={idx} writer_offset={write_start} prior_first=0x{:02X}",
+                prior.first().copied().unwrap_or(0)
+            );
             let mut block_buf = prior.to_vec();
             if block_buf.len() != block_size {
                 tracing::error!(

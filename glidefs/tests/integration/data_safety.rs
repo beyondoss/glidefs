@@ -2516,3 +2516,220 @@ async fn test_c2_flush_error_recovery_preserves_data() {
         .expect("retry flush should succeed");
     assert!(stats.packs_uploaded > 0);
 }
+
+// =============================================================================
+// AUDIT: Concurrent sub-block writes to same NOT_PRESENT block
+// =============================================================================
+
+/// Prove: concurrent sub-block writes to the same NOT_PRESENT block (after
+/// fork/cold-wake) must all be visible in the final block.
+///
+/// The backfill_and_write path uses a CAS claim to coordinate concurrent
+/// writers to the same NOT_PRESENT block. The loser must wait for the winner
+/// to complete before writing its sub-range. If the loser proceeds too early,
+/// it writes into zeros and the winner's full-block write overwrites it.
+///
+/// This test:
+/// 1. Writes known data (0xAA) to several blocks, drains to S3
+/// 2. Cold-wakes a fork (all blocks NOT_PRESENT, S3 has prior data)
+/// 3. Spawns N tasks that simultaneously write different 4K sub-ranges of
+///    the same block with distinct fill patterns
+/// 4. Reads back the full block and verifies every sub-range has the correct
+///    fill, and non-written portions retain the original 0xAA
+///
+/// Runs multiple iterations to increase race probability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_sub_block_writes_same_not_present_block() {
+    use glidefs::block::cache::SimpleBlockCache;
+    use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use glidefs::block::router::{ExportRouter, RouterConfig};
+    use glidefs::config::ExportConfig;
+    use tokio::task::JoinSet;
+
+    const SUB_BLOCK: usize = 4096;
+    const NUM_WRITERS: usize = 4;
+    const ITERATIONS: usize = 50;
+    const DEVICE_SIZE_GB: f64 = 1.0;
+
+    for iteration in 0..ITERATIONS {
+        let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // === Phase 1: Write known data to S3 ===
+        let cache_dir1 = TempDir::new().unwrap();
+        let clean_cache1: Arc<dyn glidefs::block::cache::BlockCache> =
+            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+        let router1 = Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store: Arc::clone(&s3),
+                db_path: "sub-block-race".to_string(),
+                cache_dir: cache_dir1.path().to_path_buf(),
+                block_size: BLOCK_SIZE,
+                clean_cache: clean_cache1,
+                wal_sync: false,
+                max_s3_uploads: 128,
+                max_s3_downloads: 512,
+                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                ublk_nr_queues: 4,
+                nbd_dead_conn_timeout: 0,
+            })
+            .await
+            .unwrap(),
+        );
+
+        let config1 = ExportConfig {
+            name: "vol".to_string(),
+            size_gb: DEVICE_SIZE_GB,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router1
+            .create_export(config1, false, None, None)
+            .await
+            .unwrap();
+
+        let handler1 = router1.get_handler("vol").await.unwrap();
+
+        // Write 0xAA to the first 4 blocks (full blocks).
+        let original_data = vec![0xAA; BLOCK_SIZE];
+        for block in 0..4u64 {
+            handler1
+                .write(block * BLOCK_SIZE as u64, &original_data, false)
+                .await
+                .unwrap();
+        }
+
+        // Drain to S3.
+        router1.drain_export("vol").await.unwrap();
+        router1.shutdown().await.unwrap();
+        drop(cache_dir1);
+
+        // === Phase 2: Cold-wake fork (all blocks NOT_PRESENT) ===
+        let cache_dir2 = TempDir::new().unwrap();
+        let clean_cache2: Arc<dyn glidefs::block::cache::BlockCache> =
+            Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+        let router2 = Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store: Arc::clone(&s3),
+                db_path: "sub-block-race".to_string(),
+                cache_dir: cache_dir2.path().to_path_buf(),
+                block_size: BLOCK_SIZE,
+                clean_cache: clean_cache2,
+                wal_sync: false,
+                max_s3_uploads: 128,
+                max_s3_downloads: 512,
+                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                ublk_nr_queues: 4,
+                nbd_dead_conn_timeout: 0,
+            })
+            .await
+            .unwrap(),
+        );
+
+        let config2 = ExportConfig {
+            name: "vol".to_string(),
+            size_gb: DEVICE_SIZE_GB,
+            s3_prefix: None,
+            block_size: None,
+            blocks_per_pack: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router2
+            .create_export(config2, false, Some("vol"), None)
+            .await
+            .unwrap();
+
+        let handler2 = router2.get_handler("vol").await.unwrap();
+
+        // === Phase 3: Concurrent sub-block writes to the SAME block ===
+        // Each writer writes a different 4K sub-range of block 0 with a
+        // distinct fill byte. All blocks are NOT_PRESENT — this exercises
+        // the backfill_and_write CAS claim path.
+        for target_block in 0..4u64 {
+            let mut tasks = JoinSet::new();
+            // Use a barrier to maximize concurrent arrival at the CAS.
+            let barrier = Arc::new(tokio::sync::Barrier::new(NUM_WRITERS));
+            for writer_id in 0..NUM_WRITERS {
+                let h = Arc::clone(&handler2);
+                let b = Arc::clone(&barrier);
+                let fill = (writer_id + 1) as u8; // 0x01, 0x02, 0x03, 0x04
+                let offset = target_block * BLOCK_SIZE as u64
+                    + writer_id as u64 * SUB_BLOCK as u64;
+                let sub_data = vec![fill; SUB_BLOCK];
+                tasks.spawn(async move {
+                    b.wait().await;
+                    h.write(offset, &sub_data, false).await.unwrap();
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        }
+
+        // === Phase 4: Verify every sub-range ===
+        let mut failures = Vec::new();
+        for target_block in 0..4u64 {
+            let offset = target_block * BLOCK_SIZE as u64;
+            let data = handler2.read(offset, BLOCK_SIZE as u32).await.unwrap();
+
+            for writer_id in 0..NUM_WRITERS {
+                let expected_fill = (writer_id + 1) as u8;
+                let sub_start = writer_id * SUB_BLOCK;
+                let sub_end = sub_start + SUB_BLOCK;
+                let actual = data[sub_start];
+                if actual != expected_fill
+                    || data[sub_end - 1] != expected_fill
+                {
+                    // Dump the first 64 bytes of each 4K sub-range for debugging
+                    eprintln!(
+                        "FAIL: block={target_block} writer={writer_id} expected=0x{expected_fill:02X} \
+                         actual=0x{actual:02X} last=0x{:02X}",
+                        data[sub_end - 1]
+                    );
+                    // Show which sub-ranges have which fill values
+                    let subs = BLOCK_SIZE / SUB_BLOCK;
+                    for s in 0..std::cmp::min(8, subs) {
+                        let so = s * SUB_BLOCK;
+                        eprintln!(
+                            "  sub[{s}] at offset {so}: first=0x{:02X} last=0x{:02X}",
+                            data[so], data[so + SUB_BLOCK - 1]
+                        );
+                    }
+                    failures.push((
+                        target_block,
+                        writer_id,
+                        expected_fill,
+                        actual,
+                    ));
+                }
+            }
+
+            // Non-written portion (beyond NUM_WRITERS * SUB_BLOCK) should
+            // retain the original 0xAA from S3.
+            let untouched_start = NUM_WRITERS * SUB_BLOCK;
+            if untouched_start < BLOCK_SIZE {
+                let sample = data[untouched_start];
+                if sample != 0xAA {
+                    failures.push((target_block, NUM_WRITERS, 0xAA, sample));
+                }
+            }
+        }
+
+        router2.shutdown().await.unwrap();
+
+        assert!(
+            failures.is_empty(),
+            "iteration {iteration}: concurrent sub-block write data loss — \
+             {} failures.\nFirst 10: {:?}\n\
+             This means a loser's sub-block write was overwritten by the \
+             winner's full-block backfill write.",
+            failures.len(),
+            &failures[..std::cmp::min(10, failures.len())],
+        );
+    }
+}

@@ -317,15 +317,6 @@ impl NbdDeviceManager {
         // for the previous mount to fully release before returning —
         // otherwise callers like e2fsck will see "device in use".
         wait_for_device_exclusive(&dev_path).await;
-
-        // Invalidate the kernel's page cache for this block device.
-        //
-        // NBD disconnect + reconnect reuses the same gendisk, so the
-        // kernel's buffer cache may retain stale pages from the previous
-        // session. Without invalidation, reads (e.g., from e2fsck or
-        // ext4 mount) hit the stale cache instead of going through the
-        // new NBD session to the recovered write cache.
-        invalidate_block_device_cache(&dev_path).await;
         info!(
             export = %export_name,
             path = %dev_path.display(),
@@ -464,38 +455,6 @@ fn is_nbd_device_alive(index: i32) -> bool {
 
 /// Wait until no filesystem or other subsystem holds the block device exclusively.
 ///
-/// Invalidate the kernel's page/buffer cache for a block device.
-///
-/// After NBD disconnect + reconnect, the gendisk persists and the kernel's
-/// buffer cache may retain stale pages from the previous session. This is
-/// safe in production (the reconnected session serves the same data via hot
-/// reload) but fatal for crash-recovery tests where the write cache state
-/// changes between sessions.
-///
-/// Uses the BLKFLSBUF ioctl, equivalent to `blockdev --flushbufs`.
-async fn invalidate_block_device_cache(dev_path: &Path) {
-    // BLKFLSBUF = 0x1261
-    const BLKFLSBUF: libc::c_ulong = 0x1261;
-
-    let path = dev_path.to_path_buf();
-    let _ = tokio::task::spawn_blocking(move || {
-        match std::fs::OpenOptions::new().read(true).open(&path) {
-            Ok(file) => {
-                use std::os::unix::io::AsRawFd;
-                let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKFLSBUF) };
-                if ret != 0 {
-                    let e = std::io::Error::last_os_error();
-                    warn!(dev = %path.display(), error = %e, "BLKFLSBUF ioctl failed");
-                }
-            }
-            Err(e) => {
-                warn!(dev = %path.display(), error = %e, "open for cache invalidation failed");
-            }
-        }
-    })
-    .await;
-}
-
 /// After a crash, the kernel may still be tearing down a lazy-unmounted
 /// filesystem (aborting journal, writing superblock) on this block device.
 /// Tools like `e2fsck` and `mount` open the device with `O_EXCL` and fail

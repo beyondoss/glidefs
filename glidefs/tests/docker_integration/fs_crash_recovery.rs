@@ -11,10 +11,25 @@ use std::process::Command;
 use std::sync::Arc;
 
 use tempfile::TempDir;
+use tokio::sync::Mutex;
 
 use crate::{TestContext, TestServer, Transport};
 
 const EXPORT_SIZE_GB: f64 = 0.05; // 50MB — enough for ext4 + journal
+
+/// Serialize all crash recovery tests that use kernel NBD devices.
+///
+/// After crash-disconnecting an NBD device, ext4's async error handling
+/// (journal abort, superblock error flag) creates dirty pages in the kernel's
+/// buffer cache for that gendisk. If another test connects a new device on the
+/// same gendisk index before those dirty pages are reclaimed, `sync_blockdev`
+/// during mount writes the stale pages through the new session, corrupting the
+/// recovered write cache.
+///
+/// Serialization ensures one test fully tears down (including kernel-level
+/// buffer cache cleanup) before the next test allocates devices.
+#[cfg(target_os = "linux")]
+static NBD_CRASH_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
 // ---------------------------------------------------------------------------
 // Shell helpers
@@ -247,6 +262,7 @@ async fn test_fs_crash_fsync_honored_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
@@ -345,6 +361,7 @@ async fn test_fs_crash_unsynced_write_lost_cleanly_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
@@ -452,6 +469,7 @@ async fn test_fs_crash_journal_replay_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
@@ -556,6 +574,7 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
@@ -727,6 +746,7 @@ async fn test_fs_crash_during_flush_to_s3_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
