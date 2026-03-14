@@ -7,6 +7,8 @@
 use super::cache::BlockCache;
 use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+use super::write_cache::CacheError;
 use super::metrics::ExportMetrics;
 use super::pack_index_cache::PackIndexCache;
 use super::readahead::SequentialDetector;
@@ -698,6 +700,35 @@ impl BlockHandler {
         self.backfill_blocks_in_range(offset, length).await?;
         self.cache.pre_write(offset, length)?;
 
+        // Guard against a flush completing between backfill and
+        // pwrite_and_commit. If any block was SYNCING during backfill
+        // (skipped as "present"), the flush may have evicted it
+        // (SYNCING→NOT_PRESENT) and taken the flushing file by now.
+        // pwrite_and_commit can't recover from this (sync, no S3 access).
+        // Re-backfill any blocks that were evicted during the gap.
+        {
+            use crate::block::block_map::SparseBlockState;
+            let block_size = self.cache.block_size() as u64;
+            let start_block = offset / block_size;
+            let end_block = (offset + length - 1) / block_size;
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                let state = self.cache.block_state(idx);
+                if state == SparseBlockState::SYNCING
+                    || state == SparseBlockState::NOT_PRESENT
+                {
+                    // Block was evicted or is still being flushed.
+                    // Re-backfill to ensure it's present before pwrite.
+                    self.backfill_blocks_in_range(
+                        block * block_size,
+                        block_size,
+                    )
+                    .await?;
+                    self.cache.pre_write(block * block_size, block_size)?;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -724,7 +755,13 @@ impl BlockHandler {
         self.metrics.record_guest_write(length);
         self.cache
             .pwrite_and_commit(offset, data)
-            .map_err(|e| -> CommandError { e.into() })?;
+            .map_err(|e| match e {
+                CacheError::BlockEvicted => CommandError::BlockEvicted,
+                other => {
+                    tracing::warn!(error = %other, "pwrite_and_commit failed");
+                    CommandError::IoError
+                }
+            })?;
 
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(offset, length, super::write_trace::TraceOp::Write);

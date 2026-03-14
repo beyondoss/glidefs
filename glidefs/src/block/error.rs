@@ -66,9 +66,9 @@ impl CommandError {
 
 impl From<CacheError> for CommandError {
     fn from(err: CacheError) -> Self {
-        match err {
+        match &err {
             CacheError::BlockEvicted => CommandError::BlockEvicted,
-            CacheError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::StorageFull => {
+            CacheError::Io(io_err) if io_err.kind() == std::io::ErrorKind::StorageFull => {
                 tracing::error!(error = %err, "local SSD full (ENOSPC)");
                 CommandError::NoSpace
             }
