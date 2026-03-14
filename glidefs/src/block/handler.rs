@@ -161,6 +161,135 @@ impl BlockHandler {
         }
     }
 
+    /// Backfill NOT_PRESENT blocks in a range without writing guest data.
+    ///
+    /// Used by trim/write_zeroes: fetch complete blocks from foyer/S3 so
+    /// the zero operation only destroys data in the zeroed sub-range, not
+    /// in the rest of the block.
+    async fn backfill_blocks_in_range(&self, offset: u64, len: u64) -> CommandResult<()> {
+        let block_size = self.cache.block_size();
+        let block_size_u64 = block_size as u64;
+        let start_block = offset / block_size_u64;
+        let end_block = (offset + len - 1) / block_size_u64;
+
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if self.cache.is_block_present(idx) {
+                continue;
+            }
+            // Check if the zero covers the full block — no backfill needed.
+            let block_start = block * block_size_u64;
+            let zero_start = offset.max(block_start);
+            let zero_end = (offset + len).min(block_start + block_size_u64);
+            if zero_end - zero_start >= block_size_u64 {
+                continue;
+            }
+            // Fetch from S3 and write the full block.
+            let block_data = match self.cache.resolve_block_for_backfill(
+                idx,
+                self.clean_cache.as_ref(),
+                &self.pack_index_cache,
+                &self.volume_manifest,
+                &self.content_store,
+                Some(&self.metrics),
+            ).await {
+                Ok(data) => data,
+                Err(_) => continue, // No S3 data — zeros are correct.
+            };
+            self.cache.write(block_start, &block_data)?;
+        }
+
+        Ok(())
+    }
+
+    /// Backfill NOT_PRESENT blocks and write guest data in one operation.
+    ///
+    /// For each block in the write range:
+    /// - If the block is already present, just pwrite the guest data.
+    /// - If the block is NOT_PRESENT and the write covers the full block,
+    ///   just pwrite (no prior data to preserve).
+    /// - If the block is NOT_PRESENT and the write is a sub-block, fetch
+    ///   the full block from foyer/S3, overlay the guest's sub-block in
+    ///   memory, and pwrite the merged full block.
+    ///
+    /// After this method, every affected block is DIRTY with complete data.
+    async fn backfill_and_write(&self, offset: u64, data: &[u8]) -> CommandResult<()> {
+        let block_size = self.cache.block_size();
+        let block_size_u64 = block_size as u64;
+        let start_block = offset / block_size_u64;
+        let end_block = (offset + data.len() as u64 - 1) / block_size_u64;
+
+        // Fast path: all blocks already present — skip backfill entirely.
+        let needs_backfill = (start_block..=end_block).any(|b| {
+            !self.cache.is_block_present(b as usize)
+        });
+        if !needs_backfill {
+            self.cache.write(offset, data)?;
+            return Ok(());
+        }
+
+        // Slow path: at least one block needs backfill.
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            let block_start = block * block_size_u64;
+
+            // Slice of guest data that falls within this block.
+            let write_start = offset.max(block_start);
+            let write_end = (offset + data.len() as u64).min(block_start + block_size_u64);
+            let data_offset = (write_start - offset) as usize;
+            let block_local_start = (write_start - block_start) as usize;
+            let write_len = (write_end - write_start) as usize;
+
+            if self.cache.is_block_present(idx) {
+                // Already present — just pwrite the sub-range.
+                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                continue;
+            }
+
+            if write_len >= block_size {
+                // Full block overwrite — no prior data to preserve.
+                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                continue;
+            }
+
+            // Sub-block write to a NOT_PRESENT block. Fetch the full block
+            // from foyer/S3, overlay guest data, write the merged block.
+            let mut block_buf = match self.cache.resolve_block_for_backfill(
+                idx,
+                self.clean_cache.as_ref(),
+                &self.pack_index_cache,
+                &self.volume_manifest,
+                &self.content_store,
+                Some(&self.metrics),
+            ).await {
+                Ok(prior) => prior.to_vec(),
+                Err(_) => {
+                    // No S3 data or fetch failed — start from zeros.
+                    vec![0u8; block_size]
+                }
+            };
+
+            // Re-check after async fetch: a concurrent writer may have
+            // already backfilled this block while we were fetching from S3.
+            // If so, just pwrite the sub-range — the block is now complete.
+            if self.cache.is_block_present(idx) {
+                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                continue;
+            }
+
+            // Overlay guest data onto the fetched block.
+            let end = (block_local_start + write_len).min(block_buf.len());
+            block_buf[block_local_start..end]
+                .copy_from_slice(&data[data_offset..data_offset + write_len]);
+
+            // Write the complete block. This transitions NOT_PRESENT→DIRTY
+            // with a WAL entry, so the backfill survives crash + rotation.
+            self.cache.write(block_start, &block_buf)?;
+        }
+
+        Ok(())
+    }
+
     // ========================================================================
     // Block I/O Operations
     // ========================================================================
@@ -299,7 +428,19 @@ impl BlockHandler {
         }
 
         self.metrics.record_guest_write(data.len() as u64);
-        self.cache.write(offset, data)?;
+
+        // Backfill NOT_PRESENT blocks that receive sub-block writes.
+        //
+        // When a forked export receives its first write to a block, the local
+        // file has no data (it lives in S3 via parent packs). If the write
+        // doesn't cover the full block, fetch the complete block from
+        // foyer/S3, overlay the guest's sub-block data in memory, and write
+        // the merged 128KB block. The local file always has complete data —
+        // no sparse holes, no merge needed at flush or read time.
+        //
+        // Cost: one backfill per block per eviction cycle. Hot blocks pay
+        // once after each flush; cold blocks pay once ever.
+        self.backfill_and_write(offset, data).await?;
 
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(
@@ -336,6 +477,7 @@ impl BlockHandler {
             return Ok(());
         }
 
+        self.backfill_blocks_in_range(offset, length as u64).await?;
         self.cache.zero_range(offset, length as u64)?;
 
         if let Some(ref tracer) = self.write_tracer {
@@ -370,6 +512,7 @@ impl BlockHandler {
             return Ok(());
         }
 
+        self.backfill_blocks_in_range(offset, length as u64).await?;
         self.cache.zero_range(offset, length as u64)?;
 
         if let Some(ref tracer) = self.write_tracer {
@@ -440,6 +583,9 @@ impl BlockHandler {
             return Err(CommandError::NoSpace);
         }
 
+        // Backfill NOT_PRESENT blocks before the io_uring pwrite lands.
+        // Phase 2 (pwrite_and_commit) is synchronous and can't fetch from S3.
+        self.backfill_blocks_in_range(offset, length).await?;
         self.cache.pre_write(offset, length)?;
 
         Ok(())

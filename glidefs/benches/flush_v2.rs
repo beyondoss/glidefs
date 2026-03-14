@@ -106,7 +106,6 @@ fn bench_v2_flush_latency(c: &mut Criterion) {
                                     .write(
                                         i * BLOCK_SIZE as u64,
                                         &data,
-                                        &[],
                                     )
                                     .unwrap();
                             }
@@ -167,7 +166,6 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                                 .write(
                                     i * BLOCK_SIZE as u64,
                                     &data,
-                                    &[],
                                 )
                                 .unwrap();
                         }
@@ -205,7 +203,6 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                                 .write(
                                     i * BLOCK_SIZE as u64,
                                     &data,
-                                    &[],
                                 )
                                 .unwrap();
                         }
@@ -221,7 +218,6 @@ fn bench_v2_dedup_speedup(c: &mut Criterion) {
                                 .write(
                                     (i + dirty_blocks) * BLOCK_SIZE as u64,
                                     &data,
-                                    &[],
                                 )
                                 .unwrap();
                         }

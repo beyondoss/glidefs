@@ -93,102 +93,6 @@ mod sync_file {
             use std::os::unix::io::AsRawFd;
             self.file.as_raw_fd()
         }
-
-        /// Walk the extent map of a byte range using `lseek(SEEK_DATA/SEEK_HOLE)`.
-        ///
-        /// Returns a list of `(offset, length)` pairs for allocated data regions.
-        /// Gaps between regions are sparse holes — bytes never written by `pwrite`.
-        ///
-        /// Used on the flushing file (immutable after rotation) to identify which
-        /// sub-regions of a block were written by the guest. Holes are filled with
-        /// prior S3 data before upload.
-        #[cfg(unix)]
-        pub fn data_regions(&self, start: u64, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
-            use std::os::unix::io::AsRawFd;
-
-            let fd = self.file.as_raw_fd();
-            let end = start + len;
-            let mut regions = Vec::new();
-            let mut pos = start;
-
-            loop {
-                if pos >= end {
-                    break;
-                }
-
-                // Jump to next allocated byte.
-                let data_start =
-                    unsafe { libc::lseek(fd, pos as libc::off_t, libc::SEEK_DATA) };
-                if data_start < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::ENXIO) {
-                        // No more data after pos — rest is hole.
-                        break;
-                    }
-                    return Err(err);
-                }
-                let data_start = data_start as u64;
-                if data_start >= end {
-                    break;
-                }
-
-                // Jump to end of this data region (start of next hole).
-                let hole_start =
-                    unsafe { libc::lseek(fd, data_start as libc::off_t, libc::SEEK_HOLE) };
-                if hole_start < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.raw_os_error() == Some(libc::ENXIO) {
-                        // Data extends to end of file.
-                        regions.push((data_start, end - data_start));
-                        break;
-                    }
-                    return Err(err);
-                }
-                let hole_start = (hole_start as u64).min(end);
-                regions.push((data_start, hole_start - data_start));
-                pos = hole_start;
-            }
-
-            Ok(regions)
-        }
-
-        /// Check whether a byte range contains any sparse holes.
-        ///
-        /// A hole means the guest never wrote to that sub-region — `pread` returns
-        /// zeros but the bytes were never explicitly written. Returns `false` if
-        /// the entire range is allocated (fully written).
-        #[cfg(unix)]
-        pub fn has_holes(&self, start: u64, len: u64) -> std::io::Result<bool> {
-            use std::os::unix::io::AsRawFd;
-
-            let fd = self.file.as_raw_fd();
-            // If SEEK_DATA from the start lands at start, then check SEEK_HOLE.
-            // If SEEK_HOLE lands at or past start+len, the entire range is data.
-            let data_start =
-                unsafe { libc::lseek(fd, start as libc::off_t, libc::SEEK_DATA) };
-            if data_start < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::ENXIO) {
-                    // Entire range is a hole.
-                    return Ok(true);
-                }
-                return Err(err);
-            }
-            if data_start as u64 > start {
-                // Hole at the beginning.
-                return Ok(true);
-            }
-            let hole_start =
-                unsafe { libc::lseek(fd, start as libc::off_t, libc::SEEK_HOLE) };
-            if hole_start < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::ENXIO) {
-                    return Ok(false); // all data
-                }
-                return Err(err);
-            }
-            Ok((hole_start as u64) < start + len)
-        }
     }
 }
 
@@ -450,12 +354,6 @@ impl CacheInner {
         self.state_map.is_present(block_num)
     }
 
-    /// Get the current state of a block as raw u8.
-    #[inline]
-    pub(crate) fn block_state(&self, idx: usize) -> u8 {
-        self.state_map.get(idx)
-    }
-
     /// Mark block as present (lock-free CAS NOT_PRESENT -> CLEAN).
     #[inline]
     pub(super) fn set_present(&self, block_num: usize) {
@@ -544,24 +442,6 @@ impl CacheInner {
         if self
             .state_map
             .cas(idx, SparseBlockState::SYNCING, SparseBlockState::NOT_PRESENT)
-            .is_ok()
-        {
-            self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// CAS SYNCING→CLEAN. Used by auto-flush in bottomless mode to keep the
-    /// block on local SSD after upload. The block is in S3 but stays readable
-    /// from local SSD — no backfill needed on re-write. Only drain evicts
-    /// (SYNCING→NOT_PRESENT) to free SSD space, ensuring the local copy is
-    /// always the most recent when the guest is actively writing.
-    pub(super) fn transition_syncing_to_clean(&self, idx: usize) -> bool {
-        if self
-            .state_map
-            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::CLEAN)
             .is_ok()
         {
             self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);

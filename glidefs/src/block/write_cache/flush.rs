@@ -63,7 +63,6 @@ fn compute_flush_batch(
     snapshot: &[usize],
     zero_hash: Blake3Hash,
     clean_cache: Option<Arc<dyn BlockCache>>,
-    prior_data: &HashMap<usize, Bytes>,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
 
@@ -98,50 +97,6 @@ fn compute_flush_batch(
             }
             if valid_bytes < block_size {
                 chunk_buf[valid_bytes..].fill(0);
-            }
-
-            // Merge sparse holes with prior S3 data.
-            //
-            // The sparse file's extent map tracks which sub-regions the guest
-            // actually wrote (pwrite allocates). Holes are regions never written
-            // — they read as zeros but should contain prior S3 data. The kernel
-            // maintains this for free; we read it back via lseek(SEEK_DATA/SEEK_HOLE).
-            //
-            // prior_data is pre-fetched from foyer/S3 before entering rayon.
-            // Only blocks that have both holes AND prior S3 data have entries.
-            if let Some(prior) = prior_data.get(&chunk_index) {
-                if let Some(ref ff) = flushing_snap {
-                    if let Ok(regions) = ff.data_regions(offset, valid_bytes as u64) {
-                        let total_data: u64 = regions.iter().map(|(_, len)| len).sum();
-                        if total_data < valid_bytes as u64 {
-                            // Fill holes from prior S3 data.
-                            let mut hole_pos = offset;
-                            for &(data_start, data_len) in &regions {
-                                // Gap before this data region = hole
-                                if data_start > hole_pos {
-                                    let local_start = (hole_pos - offset) as usize;
-                                    let local_end = (data_start - offset) as usize;
-                                    let prior_end = local_end.min(prior.len());
-                                    if local_start < prior_end {
-                                        chunk_buf[local_start..prior_end]
-                                            .copy_from_slice(&prior[local_start..prior_end]);
-                                    }
-                                }
-                                hole_pos = data_start + data_len;
-                            }
-                            // Trailing hole after last data region
-                            if hole_pos < offset + valid_bytes as u64 {
-                                let local_start = (hole_pos - offset) as usize;
-                                let local_end = valid_bytes;
-                                let prior_end = local_end.min(prior.len());
-                                if local_start < prior_end {
-                                    chunk_buf[local_start..prior_end]
-                                        .copy_from_slice(&prior[local_start..prior_end]);
-                                }
-                            }
-                        }
-                    }
-                }
             }
 
             // Verify CRC32 if available (detects SSD corruption before BLAKE3).
@@ -424,23 +379,6 @@ impl WriteCache<Active> {
         self.inner.is_present(block_idx)
     }
 
-    /// Write a full block to the data file and mark it present.
-    ///
-    /// Used by the backfill path to populate the SSD with S3 data before
-    /// a sub-block write overlays partial data on top. The caller must
-    /// provide exactly `block_size` bytes.
-    pub fn backfill_block(&self, block_idx: usize, data: &[u8]) -> Result<(), CacheError> {
-        debug_assert_eq!(
-            data.len(),
-            self.inner.config.block_size,
-            "backfill_block requires exactly block_size bytes"
-        );
-        let offset = block_idx as u64 * self.inner.config.block_size as u64;
-        self.inner.data_file.read().write_all_at(data, offset)?;
-        self.inner.set_present(block_idx);
-        Ok(())
-    }
-
     /// Save metadata to disk.
     #[allow(dead_code)]
     pub fn save_metadata(&self) -> Result<(), CacheError> {
@@ -555,9 +493,7 @@ impl WriteCache<Active> {
     /// swap, file creation is a single syscall, and the CAS loop touches
     /// only cache-hot atomics.
     ///
-    /// All DIRTY blocks are claimed (CAS DIRTY→SYNCING). Blocks with
-    /// sparse holes are handled at flush time via lseek(SEEK_DATA/SEEK_HOLE)
-    /// on the immutable flushing file — no partial block tracking needed.
+    /// All DIRTY blocks are claimed (CAS DIRTY→SYNCING).
     fn rotate_data_file_inner(&self, snapshot: bool) -> Result<(Vec<usize>, ()), CacheError> {
         let active_path = self.inner.config.data_path();
         let flushing_path = self.inner.config.flushing_path();
@@ -581,8 +517,6 @@ impl WriteCache<Active> {
         )?;
 
         // Snapshot dirty blocks: CAS DIRTY→SYNCING under the lock.
-        // All dirty blocks are claimed — blocks with sparse holes are
-        // merged with prior S3 data at flush time, not skipped.
         let claimed = if snapshot {
             let mut claimed = Vec::new();
             for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
@@ -598,9 +532,7 @@ impl WriteCache<Active> {
         // Swap file handle: new active file goes into the RwLock.
         let old_file = std::mem::replace(&mut *data_file_guard, new_file);
 
-        // No block data copy needed. Blocks with sparse holes (sub-block
-        // writes) are handled at flush time via lseek-based merge with
-        // prior S3 data. The flushing file preserves the sparse extent map.
+        // No block data copy needed. The flushing file preserves block data.
 
         // Set flushing_file before releasing the write lock.
         // Writers acquiring the read lock after rotation will see
@@ -612,124 +544,6 @@ impl WriteCache<Active> {
 
         info!("rotated data file for bottomless flush");
         Ok((claimed, ()))
-    }
-
-    /// Pre-fetch prior S3 data for blocks with sparse holes in the flushing file.
-    ///
-    /// Walks the flushing file's extent map via lseek(SEEK_DATA/SEEK_HOLE) to
-    /// find blocks with holes. For blocks that have prior S3 data (in foyer or
-    /// S3), fetches the prior version so compute_flush_batch can merge holes.
-    ///
-    /// Returns a HashMap of block_index → prior block data for blocks that need
-    /// merging. Blocks without holes or without S3 data are not included.
-    async fn prefetch_prior_data(
-        &self,
-        chunk_blocks: &[usize],
-        clean_cache: Option<&dyn BlockCache>,
-        pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
-        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
-        content_store: &ContentStore,
-        _blocks_per_chunk: u32,
-    ) -> HashMap<usize, Bytes> {
-        let block_size = self.inner.config.block_size;
-        let mut result = HashMap::new();
-
-        // Identify blocks with holes in the flushing file.
-        let blocks_with_holes: Vec<usize> = {
-            let flushing_guard = self.inner.flushing_file.lock();
-            if let Some(ref ff) = *flushing_guard {
-                chunk_blocks
-                    .iter()
-                    .filter(|&&idx| {
-                        let offset = idx as u64 * block_size as u64;
-                        ff.has_holes(offset, block_size as u64).unwrap_or(false)
-                    })
-                    .copied()
-                    .collect()
-            } else {
-                Vec::new()
-            }
-        };
-
-        if blocks_with_holes.is_empty() {
-            return result;
-        }
-
-        // For blocks with holes, check if they have prior S3 data and fetch it.
-        for &block_idx in &blocks_with_holes {
-            let block_num = block_idx as u64;
-
-            // Check if this block has S3 data via the manifest.
-            // Extract all needed info under lock, then drop before async work.
-            let (chunk_idx, chunk_offset, pack_ids) = {
-                let vm = volume_manifest.read();
-                let ci = vm.chunk_idx_for_block(block_num);
-                let co = vm.block_offset_in_chunk(block_num);
-                let pids = vm
-                    .chunk_pack_ids(ci)
-                    .map(|ids| ids.to_vec())
-                    .unwrap_or_default();
-                (ci, co, pids)
-            };
-            if pack_ids.is_empty() {
-                // No S3 data — holes are genuine zeros (fresh block).
-                continue;
-            }
-            // Search packs newest-first for this block's hash.
-            let mut hash = None;
-            for &pid in pack_ids.iter().rev() {
-                if let Some((h, _pack_offset, _comp_length)) = pack_index_cache
-                    .lookup_block(pid, chunk_offset)
-                    .await
-                {
-                    hash = Some(h);
-                    break;
-                }
-            }
-            let hash = match hash {
-                Some(h) => h,
-                None => continue, // No S3 data for this specific block
-            };
-
-            // Try foyer first (synchronous, in-memory).
-            if let Some(cache) = clean_cache {
-                if let Some(data) = cache.get(&hash).await {
-                    result.insert(block_idx, data);
-                    continue;
-                }
-            }
-
-            // Foyer miss — fetch from S3.
-            for &pid in pack_ids.iter().rev() {
-                if let Some((_hash_val, pack_offset, comp_length)) = pack_index_cache.lookup_block(pid, chunk_offset).await {
-                    match content_store
-                        .get_chunk_block(chunk_idx, pid, pack_offset, comp_length)
-                        .await
-                    {
-                        Ok(compressed) => {
-                            if let Ok(data) = crate::block::block_map::lz4_decompress(&compressed) {
-                                let data = Bytes::from(data);
-                                // Warm foyer for future reads.
-                                if let Some(cache) = clean_cache {
-                                    cache.insert(hash, data.clone());
-                                }
-                                result.insert(block_idx, data);
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                block_idx,
-                                error = %e,
-                                "failed to fetch prior block from S3 for hole merge"
-                            );
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        result
     }
 
     /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by
@@ -910,27 +724,12 @@ impl WriteCache<Active> {
 
         // Per-chunk flush
         for (chunk_idx, chunk_blocks) in per_chunk {
-            // Pre-fetch prior S3 data for blocks with sparse holes.
-            //
-            // The flushing file is immutable after rotation. Walk each block's
-            // extent map via lseek(SEEK_DATA/SEEK_HOLE) to find blocks with holes.
-            // For blocks that have prior S3 data, fetch from foyer (sync, in-memory)
-            // or S3 (async) so compute_flush_batch can merge holes.
-            let prior_data = self.prefetch_prior_data(
-                &chunk_blocks,
-                clean_cache.as_ref().map(|a| a.as_ref()),
-                pack_index_cache,
-                volume_manifest,
-                content_store,
-                blocks_per_chunk,
-            ).await;
-
             // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
             let zero_hash = self.inner.zero_block_hash;
             let inner = Arc::clone(&self.inner);
             let clean_cache_clone = clean_cache.map(Arc::clone);
             let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
-                compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone, &prior_data)
+                compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone)
             })
             .await
             .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;

@@ -142,7 +142,7 @@ fn main() {
             let block_idx = (j * stride) % num_blocks;
             let offset = block_idx as u64 * BLOCK_SIZE as u64;
             cache
-                .write(offset, &write_buf, &[])
+                .write(offset, &write_buf)
                 .unwrap();
         }
     }

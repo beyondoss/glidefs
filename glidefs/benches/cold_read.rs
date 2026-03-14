@@ -67,7 +67,7 @@ impl ReadBenchHarness {
             let mut data = vec![0u8; BLOCK_SIZE];
             rng.fill(&mut data[..]);
             cache
-                .write(i * BLOCK_SIZE as u64, &data, &[])
+                .write(i * BLOCK_SIZE as u64, &data)
                 .unwrap();
         }
 
