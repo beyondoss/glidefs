@@ -1106,6 +1106,7 @@ impl WriteCache<Active> {
             sequence: seq_cutpoint,
             snapshot_persisted,
             stats,
+            manifest_bytes,
         })
     }
 }

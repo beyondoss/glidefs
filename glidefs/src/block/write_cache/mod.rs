@@ -72,6 +72,9 @@ pub struct SnapshotResult {
     pub snapshot_persisted: bool,
     /// Flush statistics.
     pub stats: FlushStats,
+    /// Serialized manifest bytes captured under the flush lock.
+    /// Used for tag publishing to ensure point-in-time consistency.
+    pub manifest_bytes: Vec<u8>,
 }
 
 /// Write-behind cache with typestate lifecycle management.

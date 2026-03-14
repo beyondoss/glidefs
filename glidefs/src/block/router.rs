@@ -145,53 +145,7 @@ pub struct ExportState {
 /// concurrent writes keep producing new dirty blocks faster than we flush.
 const MAX_DRAIN_ITERATIONS: usize = 100;
 
-impl ExportState {
-    /// Drain all dirty blocks to S3 via v2 content-addressed packs.
-    ///
-    /// Returns an error if dirty blocks remain after MAX_DRAIN_ITERATIONS.
-    /// Callers that can tolerate incomplete drains (e.g. teardown) should
-    /// handle `RouterError::DrainIncomplete` explicitly.
-    pub async fn drain(&self, name: &str) -> Result<(), RouterError> {
-        // Loop until no more dirty blocks remain (concurrent writes may
-        // produce new dirty data between flushes).
-        //
-        // Check dirty_block_count() in addition to blocks_claimed: partial
-        // blocks (with incomplete backfill) are excluded from the flush
-        // snapshot to avoid uploading incomplete data. blocks_claimed can
-        // be 0 while dirty partial blocks remain. A short sleep gives
-        // backfill tasks time to complete.
-        for i in 0..MAX_DRAIN_ITERATIONS {
-            let stats = self
-                .cache
-                .flush_to_s3(&self.content_store, &self.pack_index_cache, &self.volume_manifest)
-                .await
-                .map_err(RouterError::Cache)?;
-            if stats.blocks_claimed == 0 && self.cache.dirty_block_count() == 0 {
-                return Ok(());
-            }
-            // Partial blocks excluded from snapshot: yield to let backfill
-            // tasks complete before retrying.
-            if stats.blocks_claimed == 0 {
-                tracing::debug!(
-                    dirty = self.cache.dirty_block_count(),
-                    iteration = i,
-                    "drain: dirty blocks remain (likely partial), waiting for backfill"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-        let remaining = self.cache.dirty_block_count();
-        warn!(
-            "drain hit iteration limit ({}), {} dirty blocks remain",
-            MAX_DRAIN_ITERATIONS, remaining,
-        );
-        Err(RouterError::DrainIncomplete {
-            name: name.to_string(),
-            remaining,
-            iterations: MAX_DRAIN_ITERATIONS,
-        })
-    }
-}
+impl ExportState {}
 
 /// Configuration for the export router.
 pub struct RouterConfig {
@@ -983,13 +937,11 @@ impl ExportRouter {
         );
 
         // If a tag was provided, publish the manifest under that name too.
+        // Uses manifest_bytes captured under the flush lock inside snapshot()
+        // to ensure the tag is a consistent point-in-time snapshot.
         if let Some(tag) = tag {
-            let manifest_bytes = volume_manifest
-                .read()
-                .serialize()
-                .map_err(|e| RouterError::Manifest(e.to_string()))?;
             content_store
-                .put_manifest(tag, manifest_bytes, None)
+                .put_manifest(tag, result.manifest_bytes.clone(), None)
                 .await
                 .map_err(RouterError::ContentStore)?;
             info!("Tagged snapshot of '{}' as '{}'", name, tag);
@@ -1374,15 +1326,53 @@ impl ExportRouter {
     /// Drain an export's dirty blocks to S3.
     pub async fn drain_export(&self, name: &str) -> Result<(), RouterError> {
         validate_export_name(name)?;
-        let exports = self.exports.read().await;
-        let state = exports
-            .get(name)
-            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+
+        // Clone Arc'd components under read lock, then release it so we don't
+        // block export lifecycle operations (create/remove/shutdown) during
+        // the potentially long-running drain.
+        let (cache, content_store, pack_index_cache, volume_manifest) = {
+            let exports = self.exports.read().await;
+            let state = exports
+                .get(name)
+                .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            (
+                Arc::clone(&state.cache),
+                Arc::clone(&state.content_store),
+                Arc::clone(&state.pack_index_cache),
+                Arc::clone(&state.volume_manifest),
+            )
+        };
 
         info!("Draining export '{}'...", name);
-        state.drain(name).await?;
-        info!("Export '{}' drained successfully", name);
-        Ok(())
+        // Inline the drain loop using the cloned components.
+        for i in 0..MAX_DRAIN_ITERATIONS {
+            let stats = cache
+                .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+                .await
+                .map_err(RouterError::Cache)?;
+            if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 {
+                info!("Export '{}' drained successfully", name);
+                return Ok(());
+            }
+            if stats.blocks_claimed == 0 {
+                tracing::debug!(
+                    dirty = cache.dirty_block_count(),
+                    iteration = i,
+                    "drain: dirty blocks remain (likely partial), waiting for backfill"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let remaining = cache.dirty_block_count();
+        warn!(
+            "drain hit iteration limit ({}), {} dirty blocks remain",
+            MAX_DRAIN_ITERATIONS, remaining,
+        );
+        Err(RouterError::DrainIncomplete {
+            name: name.to_string(),
+            remaining,
+            iterations: MAX_DRAIN_ITERATIONS,
+        })
     }
 
     /// Record a drain/flush error for the named export's metrics.
