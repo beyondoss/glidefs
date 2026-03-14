@@ -345,7 +345,6 @@ impl CacheInner {
     }
 
     /// Check if block is present (lock-free read).
-    #[allow(dead_code)]
     #[inline]
     pub(super) fn is_present(&self, block_num: usize) -> bool {
         if block_num >= self.num_blocks {
@@ -361,6 +360,16 @@ impl CacheInner {
             return;
         }
         self.state_map.set_present(block_num);
+    }
+
+    /// Try to claim a NOT_PRESENT block (CAS NOT_PRESENT → CLEAN).
+    /// Returns true if this call won the transition.
+    #[inline]
+    pub(super) fn try_set_present(&self, block_num: usize) -> bool {
+        if block_num >= self.num_blocks {
+            return false;
+        }
+        self.state_map.try_set_present(block_num)
     }
 
     /// CAS loop to transition a block to Dirty state (lock-free).
@@ -510,38 +519,40 @@ impl CacheInner {
                     continue;
                 }
                 let mut buf = vec![0u8; valid];
-                if ff.read_exact_at(&mut buf, offset).is_ok() {
-                    // Propagate write errors: if the active file write fails,
-                    // we must NOT transition the block state. A silent failure
-                    // here would mark the block DIRTY with corrupt/zero data
-                    // in the active file, causing data corruption on next flush.
-                    df.write_all_at(&buf, offset)?;
-                    if state == SparseBlockState::SYNCING {
-                        // CAS SYNCING→DIRTY immediately after copying data.
-                        // This prevents the flush thread from evicting the block
-                        // (SYNCING→NOT_PRESENT) between here and the caller's
-                        // transition_to_dirty. If the CAS fails, either another
-                        // writer promoted it first (fine) or flush already evicted
-                        // it (the data we just copied is still valid in active).
-                        if self
-                            .state_map
-                            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
-                            .is_ok()
-                        {
-                            self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-                            self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                    } else {
-                        // NOT_PRESENT: block was evicted between pre_write (which
-                        // saw SYNCING and skipped backfill) and now. The flushing
-                        // file still has the data. CAS NOT_PRESENT→DIRTY.
-                        if self
-                            .state_map
-                            .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
-                            .is_ok()
-                        {
-                            self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                        }
+                // Propagate both read and write errors. If reading from
+                // the flushing file fails (SSD error), we must not
+                // silently skip promotion — the active file has zeros for
+                // this block, so a sub-block guest write would leave the
+                // non-written portion as zeros instead of the original
+                // data. Failing the write to the guest is safer than
+                // silent data corruption.
+                ff.read_exact_at(&mut buf, offset)?;
+                df.write_all_at(&buf, offset)?;
+                if state == SparseBlockState::SYNCING {
+                    // CAS SYNCING→DIRTY immediately after copying data.
+                    // This prevents the flush thread from evicting the block
+                    // (SYNCING→NOT_PRESENT) between here and the caller's
+                    // transition_to_dirty. If the CAS fails, either another
+                    // writer promoted it first (fine) or flush already evicted
+                    // it (the data we just copied is still valid in active).
+                    if self
+                        .state_map
+                        .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                        .is_ok()
+                    {
+                        self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    // NOT_PRESENT: block was evicted between pre_write (which
+                    // saw SYNCING and skipped backfill) and now. The flushing
+                    // file still has the data. CAS NOT_PRESENT→DIRTY.
+                    if self
+                        .state_map
+                        .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
+                        .is_ok()
+                    {
+                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }

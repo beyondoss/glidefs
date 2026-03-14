@@ -71,9 +71,16 @@ fn compute_flush_batch(
 
     // Snap the flushing file Arc before entering rayon so workers share it
     // lock-free. Without this, every rayon thread serializes on the Mutex
-    // for each pread, defeating parallelism in bottomless mode.
-    let flushing_snap: Option<Arc<super::inner::SyncFile>> =
-        inner.flushing_file.lock().as_ref().map(Arc::clone);
+    // for each pread, defeating parallelism.
+    //
+    // flush_dirty_inner always rotates before calling us, so flushing_file
+    // is always Some here. Unwrap is safe.
+    let flushing_file: Arc<super::inner::SyncFile> = inner
+        .flushing_file
+        .lock()
+        .as_ref()
+        .expect("compute_flush_batch called without prior rotation")
+        .clone();
 
     // Phase 1: parallel per-block compute (pread + crc32 + blake3 + dedup + lz4).
     // Each rayon task allocates its own read buffer; peak memory = num_threads × block_size.
@@ -86,14 +93,7 @@ fn compute_flush_batch(
             let valid_bytes =
                 std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
             if valid_bytes > 0 {
-                if let Some(ref ff) = flushing_snap {
-                    ff.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
-                } else {
-                    inner
-                        .data_file
-                        .read()
-                        .read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
-                }
+                flushing_file.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
             }
             if valid_bytes < block_size {
                 chunk_buf[valid_bytes..].fill(0);
@@ -377,6 +377,19 @@ impl WriteCache<Active> {
     #[inline]
     pub fn is_block_present(&self, block_idx: usize) -> bool {
         self.inner.is_present(block_idx)
+    }
+
+    /// Try to claim a NOT_PRESENT block (CAS NOT_PRESENT → CLEAN).
+    /// Returns true if this call won the transition, false if already present.
+    #[inline]
+    pub fn try_claim_block(&self, block_idx: usize) -> bool {
+        self.inner.try_set_present(block_idx)
+    }
+
+    /// Get the raw block state.
+    #[inline]
+    pub fn block_state(&self, block_idx: usize) -> u8 {
+        self.inner.state_map.get(block_idx)
     }
 
     /// Save metadata to disk.

@@ -220,7 +220,20 @@ impl BlockHandler {
     ///   the full block from foyer/S3, overlay the guest's sub-block in
     ///   memory, and pwrite the merged full block.
     ///
-    /// After this method, every affected block is DIRTY with complete data.
+    /// # Concurrency
+    ///
+    /// The kernel can split a single pwrite() into multiple NBD requests
+    /// at arbitrary sector boundaries (NBD doesn't advertise our block
+    /// size as physical_block_size). Two concurrent requests can target
+    /// different sub-ranges of the same block. Without synchronization,
+    /// both would fetch the same prior data from S3, merge their
+    /// respective sub-ranges, and write the full block — the second
+    /// pwrite clobbers the first's data.
+    ///
+    /// Fix: use `try_claim_block` (CAS NOT_PRESENT→CLEAN) as a gate.
+    /// Only the "winner" does the merge+write. "Losers" yield until the
+    /// block transitions to DIRTY (winner's `cache.write` completed),
+    /// then write their sub-range on top.
     async fn backfill_and_write(&self, offset: u64, data: &[u8]) -> CommandResult<()> {
         let block_size = self.cache.block_size();
         let block_size_u64 = block_size as u64;
@@ -260,8 +273,10 @@ impl BlockHandler {
                 continue;
             }
 
-            // Sub-block write to a NOT_PRESENT block. Fetch the full block
-            // from foyer/S3, overlay guest data, write the merged block.
+            // Sub-block write to a NOT_PRESENT block.
+            // Fetch prior data BEFORE claiming — resolve_block_for_backfill
+            // checks is_present and reads from the data file if true, so the
+            // block must still be NOT_PRESENT during the fetch.
             let prior = match self.cache.resolve_block_for_backfill(
                 idx,
                 self.clean_cache.as_ref(),
@@ -274,31 +289,46 @@ impl BlockHandler {
                 Err(_) => bytes::Bytes::new(),
             };
 
-            // Re-check after async fetch: a concurrent writer may have
-            // already backfilled this block while we were fetching from S3.
-            // If so, just pwrite the sub-range — the block is now complete.
+            // Re-check: a concurrent writer may have completed a backfill
+            // while we were fetching from S3.
             if self.cache.is_block_present(idx) {
                 self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
                 continue;
             }
 
-            // If prior data is all zeros (fresh export, never-written block),
-            // just write the guest's sub-block directly — the data file already
-            // has zeros from set_len. Avoids writing a full 128KB zero block
-            // which would create unnecessary dirty blocks and WAL entries.
+            // If prior data is all zeros, just write the guest's sub-block
+            // directly — the data file already has zeros from set_len.
             if prior.is_empty() || prior.iter().all(|&b| b == 0) {
                 self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
                 continue;
             }
 
-            // Non-zero prior data: overlay guest data onto the fetched block.
+            // Non-zero prior data: claim the block atomically, then merge
+            // and write. Only the CAS winner does the full-block write;
+            // losers yield until the winner finishes and write their sub-range.
+            if !self.cache.try_claim_block(idx) {
+                // Another writer claimed this block. Wait for their
+                // cache.write to complete (CLEAN → DIRTY transition),
+                // then write our sub-range on top of the backfilled data.
+                use crate::block::block_map::SparseBlockState;
+                let mut yields = 0;
+                while self.cache.block_state(idx) == SparseBlockState::CLEAN {
+                    tokio::task::yield_now().await;
+                    yields += 1;
+                    if yields > 100_000 {
+                        break;
+                    }
+                }
+                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                continue;
+            }
+
+            // We won the claim. Merge guest data onto prior block and write.
             let mut block_buf = prior.to_vec();
             let end = (block_local_start + write_len).min(block_buf.len());
             block_buf[block_local_start..end]
                 .copy_from_slice(&data[data_offset..data_offset + write_len]);
 
-            // Write the complete block. This transitions NOT_PRESENT→DIRTY
-            // with a WAL entry, so the backfill survives crash + rotation.
             self.cache.write(block_start, &block_buf)?;
         }
 
@@ -450,7 +480,7 @@ impl BlockHandler {
         // file has no data (it lives in S3 via parent packs). If the write
         // doesn't cover the full block, fetch the complete block from
         // foyer/S3, overlay the guest's sub-block data in memory, and write
-        // the merged 128KB block. The local file always has complete data —
+        // the merged block. The local file always has complete data —
         // no sparse holes, no merge needed at flush or read time.
         //
         // Cost: one backfill per block per eviction cycle. Hot blocks pay
