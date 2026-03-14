@@ -724,10 +724,7 @@ impl BlockHandler {
         self.metrics.record_guest_write(length);
         self.cache
             .pwrite_and_commit(offset, data)
-            .map_err(|e| {
-                tracing::warn!(error = %e, "pwrite_and_commit failed");
-                CommandError::IoError
-            })?;
+            .map_err(|e| -> CommandError { e.into() })?;
 
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(offset, length, super::write_trace::TraceOp::Write);

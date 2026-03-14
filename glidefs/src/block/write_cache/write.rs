@@ -78,7 +78,7 @@ impl WriteCache<Active> {
         // This ensures the active file has the complete block so the guest's
         // sub-block write doesn't leave the rest as zeros.
         // Also recovers NOT_PRESENT blocks if flushing file is still available.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block)?;
+        self.inner.promote_syncing_blocks(&df, start_block, end_block, false)?;
 
         df.write_all_at(data, offset)?;
 
@@ -157,7 +157,7 @@ impl WriteCache<Active> {
 
         // Promote SYNCING blocks from flushing → active before zeroing.
         // Also recovers NOT_PRESENT blocks if flushing file is still available.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block)?;
+        self.inner.promote_syncing_blocks(&df, start_block, end_block, false)?;
 
         // Zero the file range (after claiming blocks via set_present)
         #[cfg(target_os = "linux")]
@@ -348,7 +348,10 @@ impl WriteCache<Active> {
 
         // Promote SYNCING blocks from flushing → active before pwrite.
         // Also recovers NOT_PRESENT blocks if flushing file is still available.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block)?;
+        // require_promotion=true: if the flushing file was already taken and
+        // any block is NOT_PRESENT/SYNCING, return BlockEvicted so the ublk
+        // handler can fall back to the full write path with S3 backfill.
+        self.inner.promote_syncing_blocks(&df, start_block, end_block, true)?;
 
         df.write_all_at(data, offset)?;
 

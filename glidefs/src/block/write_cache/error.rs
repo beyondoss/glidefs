@@ -36,6 +36,9 @@ pub enum CacheError {
         "Unsupported block size {0}: must not exceed {1} (ZERO_BLOCK_BYTES is compiled for this size)"
     )]
     UnsupportedBlockSize(usize, usize),
+
+    #[error("Block evicted during flush — retry with backfill")]
+    BlockEvicted,
 }
 
 impl CacheError {

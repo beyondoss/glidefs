@@ -2319,3 +2319,79 @@ async fn test_bottomless_flush_failure_recovery() {
     assert!(!config.flushing_path().exists());
 }
 
+// ====================================================================
+// Bug-proving tests for audit findings
+// ====================================================================
+
+/// Prove: ublk two-phase write race causes data corruption.
+///
+/// When a flush completes (SYNCING→NOT_PRESENT + flushing_file.take())
+/// between pre_write and pwrite_and_commit, promote_syncing_blocks
+/// silently skips the NOT_PRESENT block. A sub-block pwrite then lands
+/// in a sparse active file, leaving the non-written portion as zeros.
+///
+/// This test simulates the exact interleaving without needing ublk or
+/// Linux — it drives WriteCache internals directly.
+#[tokio::test]
+async fn test_promote_syncing_blocks_silent_skip_when_ff_none() {
+    // 2 blocks of 128KB each (256KB device)
+    let block_size = 128 * 1024usize;
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    // Write a full 128KB block with recognizable data
+    let original_data = vec![0xAA_u8; block_size];
+    h.cache.write(0, &original_data).unwrap();
+    assert_eq!(h.cache.dirty_block_count(), 1);
+
+    // Simulate flush phase 1: rotate (DIRTY→SYNCING)
+    let snapshot = h.cache.rotate_and_snapshot().unwrap();
+    assert_eq!(snapshot, vec![0], "block 0 should be claimed");
+    assert_eq!(
+        h.cache.inner.state_map.get(0),
+        SparseBlockState::SYNCING
+    );
+
+    // Simulate flush completion (what flush.rs:887-897 does after S3 upload):
+    // 1. SYNCING→NOT_PRESENT (evict)
+    // 2. flushing_active = false
+    // 3. flushing_file.take()
+    assert!(h.cache.inner.transition_syncing_to_not_present(0));
+    h.cache
+        .inner
+        .flushing_active
+        .store(false, Ordering::Release);
+    drop(h.cache.inner.flushing_file.lock().take());
+
+    // Block 0 is now NOT_PRESENT, flushing file is gone
+    assert_eq!(
+        h.cache.inner.state_map.get(0),
+        SparseBlockState::NOT_PRESENT
+    );
+    assert!(h.cache.inner.flushing_file.lock().is_none());
+
+    // === Part 1: Without require_promotion (existing behavior, write() path) ===
+    // promote_syncing_blocks with require_promotion=false silently skips.
+    let df = h.cache.inner.data_file.read();
+    let result = h.cache.inner.promote_syncing_blocks(&df, 0, 0, false);
+    assert!(
+        result.is_ok(),
+        "require_promotion=false should silently skip (write() path behavior)"
+    );
+    drop(df);
+
+    // === Part 2: With require_promotion (ublk pwrite_and_commit path) ===
+    // promote_syncing_blocks with require_promotion=true returns BlockEvicted.
+    let df = h.cache.inner.data_file.read();
+    let result = h.cache.inner.promote_syncing_blocks(&df, 0, 0, true);
+    assert!(
+        result.is_err(),
+        "require_promotion=true should return BlockEvicted when ff=None and block is NOT_PRESENT"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, super::CacheError::BlockEvicted),
+        "error should be BlockEvicted, got: {err}"
+    );
+    drop(df);
+}
+

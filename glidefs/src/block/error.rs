@@ -37,6 +37,8 @@ pub enum CommandError {
     NoSpace,
     /// Read-only device (EROFS)
     ReadOnly,
+    /// Block evicted during flush — retry with backfill (ublk only)
+    BlockEvicted,
 }
 
 impl CommandError {
@@ -44,7 +46,7 @@ impl CommandError {
     pub fn to_nbd_errno(self) -> u32 {
         match self {
             CommandError::InvalidArgument => super::protocol::NBD_EINVAL,
-            CommandError::IoError => super::protocol::NBD_EIO,
+            CommandError::IoError | CommandError::BlockEvicted => super::protocol::NBD_EIO,
             CommandError::NoSpace => super::protocol::NBD_ENOSPC,
             CommandError::ReadOnly => super::protocol::NBD_EROFS,
         }
@@ -55,7 +57,7 @@ impl CommandError {
     pub fn to_linux_errno(self) -> i32 {
         match self {
             CommandError::InvalidArgument => libc::EINVAL,
-            CommandError::IoError => libc::EIO,
+            CommandError::IoError | CommandError::BlockEvicted => libc::EIO,
             CommandError::NoSpace => libc::ENOSPC,
             CommandError::ReadOnly => libc::EROFS,
         }
@@ -64,8 +66,9 @@ impl CommandError {
 
 impl From<CacheError> for CommandError {
     fn from(err: CacheError) -> Self {
-        match &err {
-            CacheError::Io(io_err) if io_err.kind() == std::io::ErrorKind::StorageFull => {
+        match err {
+            CacheError::BlockEvicted => CommandError::BlockEvicted,
+            CacheError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::StorageFull => {
                 tracing::error!(error = %err, "local SSD full (ENOSPC)");
                 CommandError::NoSpace
             }

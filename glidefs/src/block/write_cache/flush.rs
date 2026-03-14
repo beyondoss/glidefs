@@ -79,7 +79,10 @@ fn compute_flush_batch(
         .flushing_file
         .lock()
         .as_ref()
-        .expect("compute_flush_batch called without prior rotation")
+        .ok_or_else(|| CacheError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "compute_flush_batch: no flushing file (rotation not performed)",
+        )))?
         .clone();
 
     // Phase 1: parallel per-block compute (pread + crc32 + blake3 + dedup + lz4).

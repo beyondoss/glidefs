@@ -238,8 +238,21 @@ pub async fn flush_scheduler(
 
                 // Acquire global flush semaphore to limit how many exports
                 // prepare + upload pack data simultaneously (memory bound).
+                // Wrapped in select! so shutdown can interrupt the wait.
                 let _flush_permit = match &flush_semaphore {
-                    Some(sem) => Some(sem.acquire().await),
+                    Some(sem) => {
+                        tokio::select! {
+                            biased;
+                            result = shutdown.changed() => {
+                                if result.is_err() || *shutdown.borrow() {
+                                    info!("flush scheduler: shutting down during semaphore wait");
+                                    return;
+                                }
+                                continue; // spurious wakeup
+                            }
+                            permit = sem.acquire() => Some(permit),
+                        }
+                    }
                     None => None,
                 };
 
@@ -1065,6 +1078,67 @@ mod tests {
         assert!(
             recovered.dirty_block_count() > 0,
             "blocks must be dirty after crash with unsynced manifest (got 0 — data loss bug)"
+        );
+    }
+
+    /// Prove: shutdown is blocked when flush semaphore is fully held.
+    ///
+    /// The scheduler's flush_notify handler calls `sem.acquire().await`
+    /// with no shutdown check. If all permits are held, shutdown can't
+    /// be processed until a permit is released.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_blocked_by_held_semaphore() {
+        let (
+            cache,
+            content_store,
+            pack_index_cache,
+            volume_manifest,
+            flush_notify,
+            shutdown_rx,
+            shutdown_tx,
+            metrics,
+            clean_cache,
+            _temp,
+        ) = test_scheduler_components().await;
+
+        // Create a semaphore with 1 permit and hold it
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held_permit = sem.clone().acquire_owned().await.unwrap();
+
+        // Write dirty blocks so flush_notify triggers a flush attempt
+        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+            let offset = i as u64 * 128 * 1024;
+            cache.write(offset, &[0xFF; 128 * 1024]).unwrap();
+        }
+
+        let flush_notify_clone = Arc::clone(&flush_notify);
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache,
+                content_store,
+                pack_index_cache,
+                volume_manifest,
+                clean_cache,
+                flush_notify,
+                shutdown_rx,
+                metrics,
+                Some(sem),
+            )
+            .await;
+        });
+
+        // Trigger flush — scheduler will block on semaphore acquire
+        flush_notify_clone.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Signal shutdown while scheduler is blocked on semaphore
+        shutdown_tx.send(true).unwrap();
+
+        // BUG: scheduler can't exit because it's stuck in sem.acquire().await
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "BUG: scheduler should exit within 5s but is stuck on semaphore"
         );
     }
 }

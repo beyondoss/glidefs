@@ -1046,11 +1046,20 @@ async fn handle_write_zc(
     // SAFETY: addr points to kernel-mapped bio pages, valid for the
     // duration of this I/O request (between get_iod and commit).
     let data = unsafe { std::slice::from_raw_parts(addr as *const u8, length as usize) };
-    if let Err(e) = handler.pwrite_and_commit(offset, data, fua) {
-        return -e.to_linux_errno();
+    match handler.pwrite_and_commit(offset, data, fua) {
+        Ok(()) => length as i32,
+        Err(crate::block::error::CommandError::BlockEvicted) => {
+            // Block evicted during the gap between pre_write and
+            // pwrite_and_commit — the flushing file was taken before
+            // promote_syncing_blocks could copy data. Fall back to the
+            // full write path which does S3 backfill for NOT_PRESENT blocks.
+            match Box::pin(handler.write(offset, data, fua)).await {
+                Ok(()) => length as i32,
+                Err(e) => -e.to_linux_errno(),
+            }
+        }
+        Err(e) => -e.to_linux_errno(),
     }
-
-    length as i32
 }
 
 /// Zero-copy READ: data file → io_uring Read → bio pages.

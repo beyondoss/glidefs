@@ -488,7 +488,8 @@ impl CacheInner {
         df: &SyncFile,
         start_block: u64,
         end_block: u64,
-    ) -> std::io::Result<()> {
+        require_promotion: bool,
+    ) -> Result<(), super::CacheError> {
         use crate::block::block_map::SparseBlockState;
 
         let block_size = self.config.block_size as u64;
@@ -557,6 +558,23 @@ impl CacheInner {
                     {
                         self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+            }
+        } else if require_promotion {
+            // No flushing file available. If any block in the range needs
+            // promotion (SYNCING or NOT_PRESENT from a just-completed flush),
+            // we can't recover its data — the flushing file has been taken.
+            // Return BlockEvicted so the caller falls back to S3 backfill.
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx >= self.num_blocks {
+                    continue;
+                }
+                let state = self.state_map.get(idx);
+                if state == SparseBlockState::SYNCING
+                    || state == SparseBlockState::NOT_PRESENT
+                {
+                    return Err(super::CacheError::BlockEvicted);
                 }
             }
         }

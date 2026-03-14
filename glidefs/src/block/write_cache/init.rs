@@ -98,13 +98,22 @@ impl WriteCache<Initializing> {
         // after the corruption. On the NEXT recovery, replay stops at the
         // old corruption and misses all entries written in the previous
         // session. Rewriting ensures a clean WAL for future appends.
+        //
+        // Uses atomic write (temp → fsync → rename) so a crash during
+        // rewrite leaves the original WAL intact rather than truncated.
         {
             use crate::block::wal::serialize_entry;
+            use std::io::Write as IoWrite;
             let mut buf = Vec::new();
             for entry in &wal_entries {
                 serialize_entry(&mut buf, entry.block_index, entry.sequence);
             }
-            std::fs::write(&wal_path, &buf)?;
+            let tmp_path = wal_path.with_extension("wal.tmp");
+            let mut tmp_file = std::fs::File::create(&tmp_path)?;
+            tmp_file.write_all(&buf)?;
+            tmp_file.sync_all()?;
+            drop(tmp_file);
+            std::fs::rename(&tmp_path, &wal_path)?;
         }
 
         // Open WAL for new appends (clean file, no torn tail)
