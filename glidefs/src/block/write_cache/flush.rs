@@ -517,6 +517,15 @@ impl WriteCache<Active> {
         // === Single write lock: everything below is atomic w.r.t. I/O ===
         let mut data_file_guard = self.inner.data_file.write();
 
+        // Capture rotation_seq under the write lock: all writes with
+        // sequence <= this value have completed their pwrite to the current
+        // active file (which is about to become the flushing file). Used by
+        // crash recovery to distinguish pre- vs post-rotation WAL entries.
+        let rotation_seq = self.inner.sequence.current();
+        self.inner
+            .rotation_seq
+            .store(rotation_seq, Ordering::Release);
+
         // Signal flush rotation in progress. Under the lock so no reader
         // can observe flushing_active=true with stale file state.
         self.inner.flushing_active.store(true, Ordering::Release);
@@ -598,6 +607,7 @@ impl WriteCache<Active> {
             debug!("flush: no dirty blocks to flush");
             // Clean up the empty flushing file (rotated but no dirty blocks)
             self.inner.flushing_active.store(false, Ordering::Release);
+            self.inner.rotation_seq.store(0, Ordering::Release);
             drop(self.inner.flushing_file.lock().take());
             let flushing_path = self.inner.config.flushing_path();
             if flushing_path.exists() {
@@ -647,6 +657,7 @@ impl WriteCache<Active> {
             }
             drop(df);
             self.inner.flushing_active.store(false, Ordering::Release);
+            self.inner.rotation_seq.store(0, Ordering::Release);
             drop(self.inner.flushing_file.lock().take());
             let flushing_path = self.inner.config.flushing_path();
             if flushing_path.exists() {
@@ -894,9 +905,10 @@ impl WriteCache<Active> {
         }
 
         // Drop flushing file handle and delete the file.
-        // Clear flushing_active BEFORE dropping the file so resolve_read_plan
-        // re-enables LocalSsd only after the cleanup is complete.
+        // Clear flushing_active and rotation_seq BEFORE dropping the file so
+        // resolve_read_plan re-enables LocalSsd only after cleanup is complete.
         self.inner.flushing_active.store(false, Ordering::Release);
+        self.inner.rotation_seq.store(0, Ordering::Release);
         drop(self.inner.flushing_file.lock().take());
         let flushing_path = self.inner.config.flushing_path();
         if flushing_path.exists()

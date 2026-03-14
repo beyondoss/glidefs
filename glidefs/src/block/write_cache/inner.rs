@@ -323,6 +323,12 @@ pub(crate) struct CacheInner {
     /// `None` means first upload (unconditional PUT).
     pub(crate) manifest_etag: Mutex<Option<String>>,
 
+    /// Sequence number at the last file rotation. 0 when no rotation is active.
+    /// Persisted to metadata so crash recovery can distinguish pre- vs
+    /// post-rotation WAL entries: entries with sequence > rotation_seq were
+    /// written after rotation, so their data in the active file is
+    /// authoritative (even if all zeros).
+    pub(super) rotation_seq: AtomicU64,
 }
 
 
@@ -651,8 +657,9 @@ impl CacheInner {
             write_hashed!(&[*state]);
         }
 
-        // v5: append max_sequence as trailing u64 LE
+        // Trailing fields: max_sequence + rotation_seq (u64 LE each)
         write_hashed!(&self.sequence.current().to_le_bytes());
+        write_hashed!(&self.rotation_seq.load(Ordering::Relaxed).to_le_bytes());
 
         // CRC32 trailer over all preceding bytes.
         let crc = hasher.finalize();
@@ -703,21 +710,17 @@ impl CacheInner {
 
     /// Load block states and presence from metadata file.
     ///
-    /// Returns `(SparseStateMap, dirty_count, max_sequence)`. Handles legacy
-    /// v1/v2/v3/v4 formats by converting the old encoding (Clean=0, Dirty=1,
-    /// Syncing=2) plus separate presence bitmap into the new sparse encoding
-    /// (NotPresent=0, Clean=1, Dirty=2, Syncing=3). max_sequence is 0 for
-    /// formats prior to v5.
+    /// Returns `(SparseStateMap, dirty_count, max_sequence, rotation_seq)`.
     pub(super) fn load_metadata(
         config: &WriteCacheConfig,
-    ) -> Result<(SparseStateMap, usize, u64), CacheError> {
+    ) -> Result<(SparseStateMap, usize, u64, u64), CacheError> {
         let path = config.metadata_path();
         let num_blocks = config.num_blocks();
 
         if !path.exists() {
             // No metadata file -- all blocks are NOT_PRESENT
             debug!(path = %path.display(), "no metadata file, starting fresh");
-            return Ok((SparseStateMap::new(num_blocks), 0, 0));
+            return Ok((SparseStateMap::new(num_blocks), 0, 0, 0));
         }
 
         let mut file = File::open(&path)?;
@@ -819,12 +822,14 @@ impl CacheInner {
             }
         }
 
-        // v5: read trailing max_sequence
-        if version >= 5 {
-            let mut seq_buf = [0u8; 8];
-            read_hashed!(&mut seq_buf);
-            persisted_max_seq = u64::from_le_bytes(seq_buf);
-        }
+        // Trailing fields: max_sequence + rotation_seq
+        let mut seq_buf = [0u8; 8];
+        read_hashed!(&mut seq_buf);
+        persisted_max_seq = u64::from_le_bytes(seq_buf);
+
+        let mut rot_buf = [0u8; 8];
+        read_hashed!(&mut rot_buf);
+        let rotation_seq = u64::from_le_bytes(rot_buf);
 
         // Verify CRC32 trailer (mandatory).
         let computed_crc = hasher.finalize();
@@ -859,6 +864,6 @@ impl CacheInner {
             "loaded cache metadata"
         );
 
-        Ok((state_map, dirty_count, persisted_max_seq))
+        Ok((state_map, dirty_count, persisted_max_seq, rotation_seq))
     }
 }

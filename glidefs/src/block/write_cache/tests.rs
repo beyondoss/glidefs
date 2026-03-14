@@ -2377,10 +2377,32 @@ async fn test_promote_syncing_blocks_silent_skip_when_ff_none() {
         result.is_ok(),
         "require_promotion=false should silently skip (write() path behavior)"
     );
+
+    // Without the fix, a sub-block pwrite here would land on zeros:
+    df.write_all_at(&[0xBB; 4096], 0).unwrap();
     drop(df);
 
-    // === Part 2: With require_promotion (ublk pwrite_and_commit path) ===
-    // promote_syncing_blocks with require_promotion=true returns BlockEvicted.
+    let mut readback = vec![0u8; block_size];
+    h.cache
+        .inner
+        .data_file
+        .read()
+        .read_exact_at(&mut readback, 0)
+        .unwrap();
+    assert_eq!(&readback[..4096], &[0xBB; 4096], "guest write landed");
+    // Rest is zeros — this IS the data corruption the fix prevents:
+    assert!(
+        readback[4096..].iter().all(|&b| b == 0),
+        "without the fix: non-written portion is zeros (original 0xAA data lost)"
+    );
+
+    // === Part 2: With require_promotion (ublk pwrite_and_commit safety net) ===
+    // promote_syncing_blocks with require_promotion=true returns BlockEvicted,
+    // preventing the corrupt pwrite from happening.
+    //
+    // Reset block to NOT_PRESENT for part 2:
+    let _ = h.cache.inner.state_map.cas(0,
+        SparseBlockState::DIRTY, SparseBlockState::NOT_PRESENT);
     let df = h.cache.inner.data_file.read();
     let result = h.cache.inner.promote_syncing_blocks(&df, 0, 0, true);
     assert!(
@@ -2393,5 +2415,122 @@ async fn test_promote_syncing_blocks_silent_skip_when_ff_none() {
         "error should be BlockEvicted, got: {err}"
     );
     drop(df);
+}
+
+/// Regression test: post-rotation zero-write must survive crash recovery.
+///
+/// Scenario:
+/// 1. Write non-zero data to block 0
+/// 2. Rotate (data moves to flushing file, fresh sparse active file)
+/// 3. Write zeros to block 0 in the new active file (simulates guest trim)
+/// 4. Save metadata but leave flushing file on disk (simulate crash)
+/// 5. Re-open cache (triggers flushing file merge)
+/// 6. Read block 0 — MUST be zeros (the guest's write), not stale 0xAA
+///
+/// Before the fix, `is_zero_block` treated the valid zeros as "sparse" and
+/// restored stale pre-rotation data from the flushing file — silent data loss.
+#[tokio::test]
+async fn test_crash_recovery_preserves_post_rotation_zero_write() {
+    let dir = TempDir::new().unwrap();
+    let block_size = 4096usize;
+    let device_size = 1024 * 1024u64;
+
+    // Phase 1: write, rotate, zero, "crash"
+    {
+        let config = WriteCacheConfig {
+            cache_dir: dir.path().to_path_buf(),
+            device_name: "test".to_string(),
+            device_size,
+            block_size,
+            wal_sync: false,
+        };
+        let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // Write non-zero data to block 0
+        cache.write(0, &vec![0xAA; block_size]).unwrap();
+
+        // Rotate: block 0's 0xAA data moves to flushing file,
+        // new active file is sparse (zeros).
+        cache.rotate_data_file().unwrap();
+
+        // Post-rotation: write zeros to block 0 in the active file.
+        // This simulates a guest trim or write_zeroes — the zeros are
+        // intentional data, not "sparse/unwritten."
+        cache.write(0, &vec![0x00; block_size]).unwrap();
+
+        // Verify: active file has zeros, flushing file has 0xAA
+        {
+            let mut active_buf = vec![0u8; block_size];
+            cache
+                .inner
+                .data_file
+                .read()
+                .read_exact_at(&mut active_buf, 0)
+                .unwrap();
+            assert!(
+                active_buf.iter().all(|&b| b == 0),
+                "active file should have zeros after zero-write"
+            );
+
+            let ff_guard = cache.inner.flushing_file.lock();
+            let ff = ff_guard.as_ref().unwrap();
+            let mut flush_buf = vec![0u8; block_size];
+            ff.read_exact_at(&mut flush_buf, 0).unwrap();
+            assert!(
+                flush_buf.iter().all(|&b| b == 0xAA),
+                "flushing file should still have 0xAA"
+            );
+        }
+
+        // Save metadata (block 0 is DIRTY in the state map).
+        // Leave flushing file on disk to simulate a crash mid-flush.
+        cache.save_metadata().unwrap();
+
+        // Clean up flushing_file handle so the file isn't held open,
+        // but do NOT delete the flushing file — that's the crash scenario.
+        *cache.inner.flushing_file.lock() = None;
+    }
+
+    // Phase 2: Re-open. Recovery sees the flushing file and merges.
+    {
+        let config = WriteCacheConfig {
+            cache_dir: dir.path().to_path_buf(),
+            device_name: "test".to_string(),
+            device_size,
+            block_size,
+            wal_sync: false,
+        };
+        let flushing_path = config.flushing_path();
+        assert!(
+            flushing_path.exists(),
+            "flushing file must exist for crash recovery"
+        );
+
+        let cache = WriteCache::<Initializing>::open(config).unwrap();
+        let cache = cache.finish_recovery().await.unwrap();
+
+        // Flushing file should be cleaned up
+        assert!(
+            !flushing_path.exists(),
+            "flushing file should be deleted after recovery"
+        );
+
+        // THE CRITICAL ASSERTION: block 0 must be zeros (the guest's write),
+        // not 0xAA (the stale pre-rotation data).
+        let mut buf = vec![0u8; block_size];
+        cache
+            .inner
+            .data_file
+            .read()
+            .read_exact_at(&mut buf, 0)
+            .unwrap();
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "block 0 should be zeros (guest's post-rotation write), \
+             but got 0x{:02X} — recovery clobbered it with stale flushing data",
+            buf[0]
+        );
+    }
 }
 
