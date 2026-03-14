@@ -340,6 +340,15 @@ impl CircuitBreaker {
     /// In closed state, resets the failure counter (and window for windowed mode).
     /// In half-open state, closes the circuit (service is healthy again).
     pub fn record_success(&self) {
+        let packed = self.state.load(Ordering::Acquire);
+        let (state, failures, _, _) = Self::unpack(packed);
+
+        // Fast path: already closed with zero failures — nothing to do.
+        // Avoids a CAS loop on every successful S3 call in steady state.
+        if state == STATE_CLOSED && failures == 0 {
+            return;
+        }
+
         // Reset window start for windowed mode
         self.window_start.store(0, Ordering::Release);
 

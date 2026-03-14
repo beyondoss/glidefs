@@ -1000,10 +1000,10 @@ async fn io_task_zc(
                 handle_write_zc(q, offset, length, fua, addr, handler).await
             }
             // Cold ops: Box::pin to keep their large async state machines
-            // off the io_task_zc future enum. trim/write_zeroes chain into
-            // backfill_missing_blocks → cache.read → locate_block → S3,
-            // producing multi-KB futures that inflate L1 cache footprint
-            // for the hot read/write paths if left inline.
+            // off the io_task_zc future enum. trim/write_zeroes can chain
+            // into locate_block → S3, producing multi-KB futures that
+            // inflate L1 cache footprint for the hot read/write paths
+            // if left inline.
             _ => Box::pin(dispatch_cold(op, offset, length, fua, handler)).await,
         };
 
@@ -1012,14 +1012,14 @@ async fn io_task_zc(
     }
 }
 
-/// Zero-copy WRITE: bio pages → io_uring Write → data file.
+/// Zero-copy WRITE: bio pages → pwrite → data file.
 ///
-/// Three-phase protocol:
+/// Two-phase protocol:
 /// 1. `pre_write`: mark blocks present, clear CRC32 (metadata prep)
-/// 2. io_uring Write SQE: transfer data from bio pages to data file
-/// 3. `post_write`: mark blocks dirty, append WAL entries
+/// 2. `pwrite_and_commit`: pwrite data + mark dirty under one data_file
+///    read lock (prevents rotate_and_snapshot from interleaving)
 ///
-/// If the io_uring write fails, only phase 1 has run — blocks are marked
+/// If the pwrite fails, only phase 1 has run — blocks are marked
 /// present (not dirty) with cleared CRCs. Recovery handles this safely.
 async fn handle_write_zc(
     q: &UblkQueue<'_>,
@@ -1034,34 +1034,19 @@ async fn handle_write_zc(
     }
 
     // Phase 1: prepare metadata before data lands on disk.
-    // Box::pin: pre_write chains into backfill_missing_blocks (deep async tree).
-    // Without boxing, its state machine inflates the io_task_zc future and
-    // hurts L1 cache locality on the hot read path.
     if let Err(e) = Box::pin(handler.pre_write(offset, length as u64)).await {
         return -e.to_linux_errno();
     }
 
-    // Phase 2: io_uring Write from bio pages to data file.
-    // types::Fixed(1) = data file fd (registered in tgt_init at fds[1]).
-    let sqe = io_uring::opcode::Write::new(
-        io_uring::types::Fixed(DATA_FILE_FD_INDEX),
-        addr as *const u8,
-        length,
-    )
-    .offset(offset)
-    .build()
-    .flags(io_uring::squeue::Flags::FIXED_FILE);
-
-    let cqe_result = q.ublk_submit_sqe(sqe).await;
-    if cqe_result < 0 {
-        return cqe_result;
-    }
-    if cqe_result as u32 != length {
-        return -libc::EIO;
-    }
-
-    // Phase 3: commit metadata after data is on disk.
-    if let Err(e) = handler.post_write(offset, length as u64, fua) {
+    // Phase 2+3: write data and commit metadata under one data_file read lock.
+    //
+    // Holding the lock across both pwrite and dirty-marking prevents
+    // rotate_and_snapshot() from interleaving — see pwrite_and_commit docs.
+    //
+    // SAFETY: addr points to kernel-mapped bio pages, valid for the
+    // duration of this I/O request (between get_iod and commit).
+    let data = unsafe { std::slice::from_raw_parts(addr as *const u8, length as usize) };
+    if let Err(e) = handler.pwrite_and_commit(offset, data, fua) {
         return -e.to_linux_errno();
     }
 
@@ -1106,26 +1091,6 @@ async fn handle_read_zc(
                 // the duration of this I/O request (between get_iod and commit).
                 unsafe {
                     std::ptr::write_bytes(dst_ptr, 0, entry.slice_len);
-                }
-            }
-            ChunkSource::LocalSsd { file_offset } => {
-                // io_uring Read from data file directly into bio pages.
-                let read_offset = file_offset + entry.slice_start as u64;
-                let sqe = io_uring::opcode::Read::new(
-                    io_uring::types::Fixed(DATA_FILE_FD_INDEX),
-                    dst_ptr,
-                    entry.slice_len as u32,
-                )
-                .offset(read_offset)
-                .build()
-                .flags(io_uring::squeue::Flags::FIXED_FILE);
-
-                let cqe_result = q.ublk_submit_sqe(sqe).await;
-                if cqe_result < 0 {
-                    return cqe_result;
-                }
-                if cqe_result as u32 != entry.slice_len as u32 {
-                    return -libc::EIO;
                 }
             }
             ChunkSource::InMemory(data) => {

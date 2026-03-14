@@ -23,6 +23,7 @@ pub struct IngestOptions {
 /// Runs the ext4 write on a blocking thread (required by BlockAdapter).
 /// After writing, flushes to local SSD. S3 sync happens in the background
 /// via the flush scheduler.
+#[allow(dead_code)]
 pub async fn ingest_tar<R: Read + Send + 'static>(
     handler: Arc<BlockHandler>,
     tar_reader: R,

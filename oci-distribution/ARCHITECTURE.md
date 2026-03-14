@@ -1,93 +1,118 @@
 # OCI Registry Architecture
 
-Read-only OCI Distribution Spec server and publish CLI that expose GlideFS volume snapshots as container-pullable images stored directly in S3.
+Takes a GlideFS volume manifest name and S3 config, exports the volume's filesystem as gzip-compressed tar, uploads OCI blobs and manifests to S3, and serves them over a read-only HTTP server that streams blobs directly from S3 to any OCI-compatible client (Docker, containerd, skopeo).
 
 ## Data Flow
 
 ### Publish (GlideFS snapshot → S3 OCI artifacts)
 
 ```
-GlideFS volume manifest (in S3)
+CLI: --manifest {name} --s3-prefix {export} --tag {tag} -c {config}
       │
-      ▼
- load_readonly_handler()    ← loads manifest, creates in-memory BlockHandler
+      ├─ parse config TOML → object_store connection to S3
+      ├─ load_readonly_handler() → load GlideFS manifest from S3, build BlockHandler
+      │         └── manifest not found ──► anyhow::Error, process exits non-zero
       │
-      │  spawn_blocking (ext4 + gzip work is sync I/O)
+      │  spawn_blocking (ext4 reading + gzip is sync I/O)
       ▼
- export_full_layer()        ← BlockHandler → ext4::Reader → to_tar() → DigestWriter
-      │                        or export_delta_layer() for incremental
-      │  writer chain:
-      │  tar  →  DigestWriter(uncompressed)  →  GzEncoder  →  DigestWriter(compressed)  →  temp file
+ export_full_layer(handler)
+   tar bytes
+     → DigestWriter<uncompressed>   (accumulates diff_id = sha256 of raw tar)
+     → GzEncoder
+     → DigestWriter<compressed>     (accumulates blob_digest = sha256 of gzip)
+     → BufWriter<NamedTempFile>
       │
       ▼
  ExportedLayer { temp_file, diff_id, digest, size }
       │
-      │  (async upload from temp file)
-      ▼
- S3: .../oci/blobs/sha256/{digest}        ← compressed layer blob
- S3: .../oci/blobs/sha256/{config_digest} ← OCI image config JSON
- S3: .../oci/manifests/{tag}              ← OCI manifest (by tag)
- S3: .../oci/manifests/sha256/{digest}    ← OCI manifest (by digest)
+      │  (async multipart upload, 8 MB chunks, streamed from temp file)
+      ├─► S3: {oci_base}/blobs/sha256/{blob_digest}     ← compressed layer
+      │         └── upload error ──► anyhow::Error, process exits non-zero
+      │                               (partial artifacts remain; retry is safe)
+      ├─► S3: {oci_base}/blobs/sha256/{config_digest}   ← OCI image config JSON
+      ├─► S3: {oci_base}/manifests/{tag}                ← OCI manifest (by tag)
+      └─► S3: {oci_base}/manifests/sha256/{manifest_digest} ← (by digest)
 ```
 
 ### Incremental Publish (delta between two snapshots)
 
 ```
-BlockHandler (base)        BlockHandler (target)
-      │                          │
-      ▼ (parallel)               ▼ (parallel)
- export_full_layer()       export_delta_layer()
-      │                          │
-      ▼                          ▼
- base layer (temp file)    delta layer (temp file)
-      │                          │
-      └──────────┬───────────────┘
-                 ▼
-      S3: two layer blobs + config + manifest
-      layer 0 = full base snapshot
-      layer 1 = delta (adds/mods/whiteouts only)
+--base-manifest {base} --manifest {target}
+      │
+      ├─ load_readonly_handler(base)   ─── both loaded before export starts
+      └─ load_readonly_handler(target) ─┘
+                │
+                │ tokio::task::spawn_blocking (two threads run in parallel)
+                ├─────────────────────────────────────────────┐
+                ▼                                             ▼
+   export_full_layer(base)                    export_delta_layer(base, target)
+   base layer (temp file)                     delta layer (temp file)
+                │                                             │
+                └─────────────────┬───────────────────────────┘
+                                  ▼ (both awaited before upload)
+                     S3: 2 blobs + config + manifest
+                     layer 0 = full base snapshot
+                     layer 1 = delta (adds/mods/whiteouts only)
 ```
 
-### Serve (HTTP request → S3 object → response)
+### Serve (HTTP request → S3 stream → response)
 
 ```
-Docker / containerd / skopeo
+Docker / containerd / skopeo / any OCI client
       │
-      │  GET /v2/{name}/manifests/{ref}
-      │  GET /v2/{name}/blobs/sha256:{hex}
-      │  GET /v2/{name}/tags/list
+      │  TCP connect to 0.0.0.0:5000 (default)
       ▼
- handle_request()          ← routes by method + path segments
+ handle_request() ── route by method + path segments
       │
-      ▼
- object_store::get()       ← maps OCI path to S3 object path
+      ├── GET /v2/
+      │         └──► 200 + Docker-Distribution-API-Version header + {} body
       │
-      │  stream from S3
-      ▼
- HTTP response with Docker-Content-Digest header
+      ├── GET|HEAD /v2/{name}/manifests/{ref}
+      │         ├── name != configured name ──► 404 NAME_UNKNOWN
+      │         ├── object_store.get({oci_base}/manifests/{ref})
+      │         │         └── not found ──► 404 MANIFEST_UNKNOWN
+      │         ├── buffer bytes (manifest JSON is small)
+      │         ├── compute sha256 → Docker-Content-Digest header
+      │         └──► 200 + manifest JSON body (HEAD: headers only)
+      │
+      ├── GET|HEAD /v2/{name}/blobs/sha256:{hex}
+      │         ├── digest format invalid ──► 400 DIGEST_INVALID
+      │         ├── object_store.get({oci_base}/blobs/sha256/{hex})
+      │         │         └── not found ──► 404 BLOB_UNKNOWN
+      │         │         └── S3 error during stream ──► 500 BLOB_UNKNOWN
+      │         └──► 200 + stream bytes from S3 (never buffered to memory)
+      │
+      ├── GET /v2/{name}/tags/list
+      │         ├── object_store.list({oci_base}/manifests/)
+      │         ├── filter out sha256/* sub-prefixes
+      │         ├── sort alphabetically
+      │         └──► 200 + {"name": "...", "tags": [...]}
+      │
+      └── anything else ──► 404 NAME_UNKNOWN
 ```
 
 ## Concepts & Terminology
 
-| Term              | Definition                                                                  | NOT                                                |
-| ----------------- | --------------------------------------------------------------------------- | -------------------------------------------------- |
-| Publish           | One-shot CLI command: export GlideFS snapshot to S3 as OCI artifacts       | Not a running service; exits when done             |
-| Serve             | Long-running HTTP server serving previously published OCI artifacts         | Not a push-capable registry; read-only             |
-| OCI manifest      | JSON document listing config + layer blobs with digests and sizes           | Not the GlideFS volume manifest                    |
-| OCI config        | JSON metadata blob: architecture, OS, layer diff_ids                        | Not container entrypoint/env config                |
-| Layer blob        | gzip-compressed tar archive of a filesystem snapshot or delta               | Not a GlideFS pack file                            |
-| diff_id           | sha256 of the _uncompressed_ tar (required by OCI spec)                    | Not the blob digest (sha256 of compressed data)    |
-| Blob digest       | sha256 of the _compressed_ layer blob; used as the S3 key and OCI ref     | Not diff_id                                        |
-| Full layer        | Complete ext4 → tar → gzip export of an entire volume                      | Not a docker image base layer in general           |
-| Delta layer       | ext4 diff between two snapshots exported as tar + gzip (changes only)      | Not a binary diff; still valid OCI tar format      |
-| oci_base          | S3 path prefix for OCI artifacts: `{db_path}/exports/{name}/oci`          | Not the GlideFS ContentStore base path             |
-| Reference         | Tag (e.g., `latest`, `v1`) or `sha256:{hex}` digest addressing a manifest | Not a git ref                                      |
+| Term         | What It Controls                                                       | NOT                                                   |
+| ------------ | ---------------------------------------------------------------------- | ----------------------------------------------------- |
+| Publish      | Whether OCI artifacts exist in S3 and can be served or pulled          | Not a running service; exits when done                |
+| Serve        | Which OCI clients can pull the image and from where                    | Not a push-capable registry; read-only                |
+| OCI manifest | Which blobs a client fetches and in what order (controls the pull)     | Not the GlideFS volume manifest                       |
+| OCI config   | What `docker inspect` reports (architecture, OS, layer chain)          | Not container entrypoint/env — `config` block is empty|
+| Layer blob   | The bytes streamed to the container runtime for filesystem extraction  | Not a GlideFS pack file                               |
+| diff_id      | The layer identity in the image config; computed from uncompressed tar | Not the blob digest (sha256 of compressed data)       |
+| Blob digest  | The S3 key and URL path for fetching a blob; computed from gzip output | Not the diff_id used in the image config              |
+| Full layer   | A layer that contains the entire volume filesystem                     | Not a Docker base layer in general                    |
+| Delta layer  | A layer containing only changed/added/deleted files since base         | Not a binary diff; still valid OCI tar+whiteout format|
+| oci_base     | The S3 prefix where all OCI artifacts for this export live             | Not the GlideFS ContentStore prefix                   |
+| Reference    | The tag or `sha256:{hex}` that maps to a manifest on this server       | Not a git ref                                         |
+| name         | The URL path segment that gates which requests this server accepts     | Not a human-readable label; must match `--s3-prefix`  |
 
 ## Core Mechanism
 
 ### S3 Storage Layout
 
-All OCI artifacts for an export live under a single prefix:
+All OCI artifacts for one export live under a single prefix:
 
 ```
 {db_path}/exports/{s3_prefix}/oci/
@@ -97,153 +122,132 @@ All OCI artifacts for an export live under a single prefix:
   manifests/
     {tag}            ← manifest JSON addressed by tag (e.g., "latest", "v1")
     sha256/
-      {hex}          ← manifest JSON addressed by digest (for `docker pull @sha256:...`)
+      {hex}          ← manifest JSON addressed by digest
 ```
 
-The server maps OCI Distribution Spec URL paths to this layout directly in `serve.rs:handle_manifest()` and `serve.rs:handle_blob()`. No database or index — the object store _is_ the index.
+The server maps OCI Distribution Spec URL paths to this layout directly in `serve.rs:handle_manifest()` and `serve.rs:handle_blob()`. No database or index — the object store *is* the index.
 
 ### Digest-First Upload
 
-The OCI spec requires the layer digest to be known before the blob can be committed. The publish pipeline resolves this by spooling the gzip output to a temp file while simultaneously computing both digests through a layered `DigestWriter` chain:
+The OCI spec requires the blob digest to be known before uploading. The publish pipeline resolves this by computing both digests in a single streaming pass through a layered writer chain:
 
 ```
 tar bytes
-  → DigestWriter<uncompressed>   (computes diff_id as bytes flow through)
+  → DigestWriter<uncompressed>   (accumulates diff_id as bytes flow through)
   → GzEncoder
-  → DigestWriter<compressed>     (computes blob digest as bytes flow through)
+  → DigestWriter<compressed>     (accumulates blob_digest as bytes flow through)
   → BufWriter<NamedTempFile>
 ```
 
-After `finish_layer()` unwraps the chain, both digests are known and the temp file on disk holds the exact bytes to upload. Memory usage is bounded to gzip buffers, never proportional to volume size. The writer chain lives in `glidefs::oci::export_full_layer` and `export_delta_layer`.
+After `finish_layer()`, both digests are known and the temp file holds the exact bytes to upload. Memory usage is bounded to gzip buffers, never proportional to volume size. The writer chain lives in `glidefs::oci::export_full_layer` and `export_delta_layer`.
 
 ### Idempotent Blob Upload
 
 `object_store::put()` is unconditional — publishing the same volume twice overwrites the same S3 keys with identical bytes. Because layer content is content-addressed by sha256, this is safe. Tags (`manifests/latest`) are overwritten to point to the new manifest on each publish.
 
-### Read-Only Registry Protocol
-
-The server implements only the read side of the [OCI Distribution Spec](https://github.com/opencontainers/distribution-spec/blob/main/spec.md):
-
-| Route                                | Method     | Description                                  |
-| ------------------------------------ | ---------- | -------------------------------------------- |
-| `/v2/`                               | GET        | API version check (required by clients)      |
-| `/v2/{name}/manifests/{ref}`         | GET, HEAD  | Manifest by tag or `sha256:` digest          |
-| `/v2/{name}/blobs/sha256:{hex}`      | GET, HEAD  | Blob by digest; GET streams from S3          |
-| `/v2/{name}/tags/list`               | GET        | Lists tag names (excludes `sha256/` entries) |
-
-Push endpoints (`PUT /v2/{name}/blobs/uploads/`, `PUT /v2/{name}/manifests/{ref}`) are intentionally absent. Publishing is a separate offline CLI operation (`glidefs-registry publish`), not an HTTP endpoint.
-
 ### Single-Image-Per-Server
 
-`RegistryState` holds a single `name` string corresponding to one S3 prefix. Requests for any other `{name}` receive `NAME_UNKNOWN 404`. One server instance = one exported volume.
-
-This is intentional. Multiple volumes can be served by running multiple server instances on different ports. It removes the need for multi-tenant routing, authentication, or namespace isolation.
+`RegistryState` holds a single `name` string. Any request where the URL `{name}` doesn't match returns `NAME_UNKNOWN 404` immediately, before any S3 access. One server instance serves one exported volume.
 
 ### Tag Listing
 
-Tags are discovered by listing `{oci_base}/manifests/` in S3 and filtering out `sha256/` sub-prefixes. This means tags are the flat objects directly under `manifests/`. No separate tag index is maintained. Tags are returned sorted alphabetically (`serve.rs:handle_tags_list()`).
+Tags are discovered by listing `{oci_base}/manifests/` in S3 and filtering out entries under `sha256/`. No separate tag index is maintained; tag objects are the flat files directly under `manifests/`, returned sorted alphabetically (`serve.rs:handle_tags_list()`).
 
-## Design Decisions
+## Trust Boundaries
 
-### Why a custom HTTP server instead of a registry library?
+**What the server verifies (rejects if invalid):**
 
-The OCI Distribution Spec subset needed here is tiny: three read-only routes. A full registry library (Harbor, distribution/distribution) would add hundreds of thousands of lines and require a database, auth subsystem, and blob upload protocol — all irrelevant when the storage layer is already S3 and publishing is a separate step.
+- Request `{name}` matches the configured `--s3-prefix` (all others → 404)
+- Blob digest format is `sha256:` + 64 lowercase hex chars (others → 400)
+- S3 object exists for manifests and blobs (missing → 404, not empty response)
 
-Hyper + object_store gives:
-1. **Zero extra dependencies** beyond what glidefs already uses
-2. **Direct S3 streaming** — blobs flow from S3 to the client without buffering
-3. **Trivial deployment** — single binary, no sidecar database
+**What passes through unchecked:**
 
-### Why publish to S3 instead of directly to a registry?
+- **Client identity**: no authentication, no authorization; any client that can reach the port gets the image
+- **Blob integrity on serve**: the server streams bytes from S3 without re-hashing; the `Docker-Content-Digest` header reflects what was uploaded, not what was just served
+- **TLS**: runs plain HTTP; there is no TLS termination in this binary
+- **Manifest content**: the server serves whatever JSON was stored at publish time without schema validation
 
-Publishing large layer blobs to an OCI registry requires a multi-step chunked upload (POST → PATCH × N → PUT). S3 multipart upload is equally complex. By targeting S3 directly and serving with this thin server, we:
+**Why these boundaries are here:**
 
-1. **Avoid double-buffering** — layer data goes to S3 once; the serve path streams it unchanged
-2. **Get colocation** — OCI artifacts live beside the GlideFS packs they were derived from
-3. **Decouple publish from serve** — publish can run as a batch job; the server is stateless
+- The server is designed for private networks or behind an authenticated reverse proxy
+- GlideFS volumes contain VM rootfs images; production deployments must not expose this server publicly without a proxy providing auth and TLS
+- Digest re-verification would require buffering multi-GB layer streams; the container runtime (docker/containerd) re-verifies the digest client-side against the `Docker-Content-Digest` header
 
-External OCI registries (ECR, GHCR, Docker Hub) remain usable via the existing `push_image()` / `push_delta_image()` functions in `glidefs/src/oci/push.rs`.
+## Why It Behaves This Way
 
-### Why run base and delta export in parallel?
+### Why the server streams blobs directly from S3 without buffering
 
-`export_full_layer` and `export_delta_layer` are CPU- and I/O-bound on different block ranges. Running them in parallel with `tokio::task::spawn_blocking` on separate threads halves the wall-clock time for incremental publishes with no added complexity (`publish.rs:45-61`).
+The layer blobs can be multi-GB. Buffering them in memory would exhaust RAM on any concurrent pull. `object_store::get()` returns a `Stream<Bytes>` that drives bytes from S3 through the TCP socket with no intermediate storage (`serve.rs:handle_blob()`).
 
-### Why spool to a temp file instead of streaming the upload?
+### Why publish spools to a temp file instead of streaming uploads directly
 
-OCI blob PUT requires the digest in the URL, which isn't known until the full content has been hashed. Options considered:
+The OCI spec requires the digest in the upload URL, which isn't known until all content has been hashed. Three options were considered:
 
-1. **Two-pass**: read all data twice — once for hashing, once for upload. Doubles I/O.
+1. **Two-pass**: read data twice — once for hashing, once for upload. Doubles I/O cost.
 2. **Buffer in memory**: hold the entire layer in RAM. Prohibitive for large volumes.
-3. **Spool to temp file**: single pass computing digest, then upload from disk. Chosen.
+3. **Spool to temp file**: single pass computing digest, then upload from disk. ← chosen
 
-The temp file path is held in `ExportedLayer::temp_file` (a `NamedTempFile`) which auto-deletes on drop.
+The temp file is held in `ExportedLayer::temp_file` (a `NamedTempFile`) which auto-deletes on drop.
 
-### Why one name per server instance?
+### Why base and delta export run in parallel
 
-Considered: a single server instance serving multiple volumes via URL-based dispatch (`/v2/vol-a/...`, `/v2/vol-b/...`). Rejected because:
+`export_full_layer` and `export_delta_layer` are CPU- and I/O-bound on different block ranges. Running them in parallel with `tokio::task::spawn_blocking` halves wall-clock time for incremental publishes with no added complexity (`publish.rs:45-61`).
 
-- It requires listing all available volumes at startup or dynamic volume registration
-- It complicates routing and makes misconfiguration harder to detect
-- Container runtimes pull from `registry-host:port/name:tag`; the host:port already disambiguates instances
+### Why the server accepts only one image name per instance
 
-Running multiple instances is trivial with a process supervisor and port allocation.
+Serving multiple volumes via URL dispatch would require either listing all available volumes at startup or dynamic volume registration — both require state that isn't in scope. Container runtimes use `registry-host:port/name:tag`; the host:port already disambiguates instances. Multiple volumes = multiple server instances on different ports, trivially managed by a process supervisor.
+
+### Why the server uses a custom HTTP implementation instead of a registry library
+
+The OCI Distribution Spec subset needed here is three read-only routes. A full registry library (distribution/distribution, Harbor) would add hundreds of thousands of lines, require a database, auth subsystem, and blob upload protocol — none of which apply when S3 is the storage layer and publishing is a separate CLI step. Hyper + object_store adds no new dependencies (both are already in the glidefs crate) and gives direct S3 streaming.
+
+### Why OCI artifacts are stored in S3 instead of pushed to an external registry
+
+Publishing to an external OCI registry requires chunked upload (POST → PATCH × N → PUT) with no advantage over S3 multipart upload. Storing artifacts in S3 means the serve path streams them unchanged — no double-buffering — and OCI artifacts are colocated with the GlideFS packs they were derived from. External OCI registries remain usable via `push_image()` / `push_delta_image()` in `glidefs/src/oci/push.rs`.
 
 ## Package Structure
 
-| File             | Purpose                                                                              |
-| ---------------- | ------------------------------------------------------------------------------------ |
-| `src/main.rs`    | CLI entry point: `publish` and `serve` subcommands via `clap`                       |
-| `src/publish.rs` | `run_publish()`: export GlideFS snapshot, upload blobs + config + manifest to S3   |
-| `src/serve.rs`   | `run_serve()`: OCI Distribution HTTP server; routes to manifest/blob/tags handlers |
-| `src/config.rs`  | `setup_object_store()`: parse GlideFS config → object_store; `load_readonly_handler()`: load a volume manifest as a read-only BlockHandler |
+| File             | What It Does                                                                                     |
+| ---------------- | ------------------------------------------------------------------------------------------------ |
+| `src/main.rs`    | Parses CLI (`publish` vs `serve` subcommand via clap); dispatches to `run_publish` or `run_serve` |
+| `src/publish.rs` | Loads volume handlers, runs export(s) on blocking threads, uploads blobs + config + manifest to S3 |
+| `src/serve.rs`   | Binds TCP, routes HTTP requests, streams manifests/blobs from S3, handles graceful shutdown on ctrl-c |
+| `src/config.rs`  | Parses GlideFS config TOML into an `object_store` handle; loads a GlideFS volume manifest into a read-only `BlockHandler` |
 
-The publish and serve paths share no state beyond the `object_store` connection. They can be run as entirely separate processes.
+The publish and serve paths share no state beyond the `object_store` connection and can run as separate processes.
 
 ## Configuration
 
-`glidefs-registry publish` flags:
+`glidefs-registry publish`:
 
-| Flag              | Default    | Purpose                                                             |
-| ----------------- | ---------- | ------------------------------------------------------------------- |
-| `--manifest`      | required   | Volume manifest name in S3 to export                               |
-| `--s3-prefix`     | required   | Export name (used as both S3 path component and OCI image name)    |
-| `--tag`           | `latest`   | OCI image tag to publish under                                      |
-| `--base-manifest` | none       | If set, produce a 2-layer delta image against this base manifest    |
-| `-c`/`--config`   | required   | Path to GlideFS config YAML (S3 credentials, bucket URL)           |
+| Flag              | Default  | What It Controls                                                          |
+| ----------------- | -------- | ------------------------------------------------------------------------- |
+| `--manifest`      | required | Which GlideFS volume snapshot is exported                                 |
+| `--s3-prefix`     | required | S3 path component and OCI image name (must match what `serve` is given)   |
+| `--tag`           | `latest` | Which S3 manifest key is overwritten; determines the tag clients pull     |
+| `--base-manifest` | none     | If set, triggers two-layer delta publish using this as layer 0            |
+| `-c`/`--config`   | required | S3 credentials, bucket URL, and local cache config                        |
 
-`glidefs-registry serve` flags:
+`glidefs-registry serve`:
 
-| Flag              | Default         | Purpose                                                              |
-| ----------------- | --------------- | -------------------------------------------------------------------- |
-| `--listen`        | `0.0.0.0:5000`  | TCP address to bind the HTTP server                                  |
-| `--s3-prefix`     | required        | Export name; must match a published export                          |
-| `-c`/`--config`   | required        | Path to GlideFS config YAML                                          |
+| Flag            | Default        | What It Controls                                                           |
+| --------------- | -------------- | -------------------------------------------------------------------------- |
+| `--listen`      | `0.0.0.0:5000` | TCP address the HTTP server binds; all clients connect here                |
+| `--s3-prefix`   | required       | The only `{name}` that returns non-404; must match a published export      |
+| `-c`/`--config` | required       | S3 credentials and bucket URL for all object_store reads                   |
 
-The `RUST_LOG` environment variable controls log level (default: `info`); logs go to stderr.
+`RUST_LOG` (env var): controls tracing level (default: `info`); logs go to stderr.
 
 ## Failure Modes
 
-| Failure                             | Behavior                                                                                    | Recovery                                      |
-| ----------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| S3 read error during blob serve     | 500 with `BLOB_UNKNOWN` JSON; connection closed                                             | Client retries; transient S3 errors self-heal |
-| Manifest not found in S3            | 404 with `MANIFEST_UNKNOWN`                                                                 | Run `glidefs-registry publish` first          |
-| Unknown `{name}` in URL             | 404 with `NAME_UNKNOWN`                                                                     | Verify `--s3-prefix` matches published export |
-| S3 upload failure during publish    | `anyhow::Error` printed; process exits non-zero; partial artifacts left in S3              | Retry publish; idempotent overwrites are safe |
-| Layer export panic in spawn_blocking | `JoinError` converted to `anyhow::Error`; publish aborts                                   | Check logs; usually a bug in the ext4 reader  |
-| Serve process crash mid-stream      | Client sees truncated response; `Docker-Content-Digest` mismatch → client retries          | Restart server; no persistent state to recover |
-
-## Trust Model
-
-**What the server verifies:**
-- Request path matches `/v2/{expected-name}/...` — all other names get 404
-- Digest format starts with `sha256:` — other algorithms get 400
-- S3 object exists — missing objects get 404, not empty responses
-
-**What the server does NOT verify:**
-- Client identity — no authentication, no authorization
-- Digest integrity of served blobs — S3 is trusted to return correct bytes
-- TLS — runs plain HTTP; deploy behind a TLS-terminating proxy for production
-
-**Why this is acceptable:**
-
-The server is designed to run on a private network or behind an authenticated proxy. GlideFS volumes contain VM rootfs images — production deployments should not expose this server publicly without a reverse proxy providing auth and TLS.
+| Failure | What Actually Happens | Recovery |
+|---------|----------------------|---------|
+| S3 read error during blob serve | 500 with `BLOB_UNKNOWN` JSON; TCP connection closed after partial response | Client's digest check fails; docker/containerd retry automatically |
+| Manifest not found in S3 | 404 `MANIFEST_UNKNOWN` JSON | Run `glidefs-registry publish` first |
+| Unknown `{name}` in URL | 404 `NAME_UNKNOWN` JSON immediately, before any S3 access | Verify `--s3-prefix` matches both publish and serve invocations |
+| S3 upload failure during publish | `anyhow::Error` printed to stderr; process exits non-zero; partial artifacts remain in S3 | Retry publish; idempotent overwrites make retries safe |
+| Layer export panic in spawn_blocking | `JoinError` surfaces as `anyhow::Error`; publish aborts before any upload | Check logs; likely a bug in the ext4 reader |
+| Serve process crash mid-stream | Client sees truncated response; digest mismatch → container runtime retries | Restart server; no persistent state to recover |
+| Invalid blob digest format in URL | 400 `DIGEST_INVALID` JSON | Use correct format: `sha256:` + 64 lowercase hex chars |
+| S3 credentials missing/invalid | `anyhow::Error` from `setup_object_store()` at startup; process exits before serving | Check config file and AWS credential chain |

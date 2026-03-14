@@ -194,7 +194,7 @@ async fn test_ssd_full_reads_still_work() {
 async fn test_ssd_full_flush_frees_dirty_count() {
     let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pic, vm, cc, _metrics) =
+    let (cache, cs, pic, vm, _cc, _metrics) =
         super::create_test_cache(&dir, "ssd-flush", Arc::clone(&s3)).await;
 
     // Write 10 blocks
@@ -203,7 +203,6 @@ async fn test_ssd_full_flush_frees_dirty_count() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
             )
             .unwrap();
     }

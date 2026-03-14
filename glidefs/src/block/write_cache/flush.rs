@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+use bytes::Bytes;
 use tracing::{debug, info, instrument, warn};
 
 use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
+use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
 use crate::block::state::{Active, Draining};
 
@@ -59,36 +62,38 @@ fn compute_flush_batch(
     inner: &CacheInner,
     snapshot: &[usize],
     zero_hash: Blake3Hash,
+    clean_cache: Option<Arc<dyn BlockCache>>,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
 
     let block_size = inner.config.block_size;
     let device_size = inner.config.device_size;
 
+    // Snap the flushing file Arc before entering rayon so workers share it
+    // lock-free. Without this, every rayon thread serializes on the Mutex
+    // for each pread, defeating parallelism.
+    //
+    // flush_dirty_inner always rotates before calling us, so flushing_file
+    // is always Some here. Unwrap is safe.
+    let flushing_file: Arc<super::inner::SyncFile> = inner
+        .flushing_file
+        .lock()
+        .as_ref()
+        .expect("compute_flush_batch called without prior rotation")
+        .clone();
+
     // Phase 1: parallel per-block compute (pread + crc32 + blake3 + dedup + lz4).
     // Each rayon task allocates its own read buffer; peak memory = num_threads × block_size.
     let per_block: Vec<Result<BlockResult, CacheError>> = snapshot
         .par_iter()
         .map(|&chunk_index| {
-            // Skip partial blocks — their unbackfilled sub-regions contain
-            // garbage. They stay DIRTY and will be flushed after backfill.
-            if inner.is_partial(chunk_index) {
-                return Ok(BlockResult::Skipped {
-                    chunk_index,
-                    cas_failed: true,
-                    corrupted: false,
-                });
-            }
-
             let mut chunk_buf = vec![0u8; block_size];
 
             let offset = chunk_index as u64 * block_size as u64;
             let valid_bytes =
                 std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
             if valid_bytes > 0 {
-                inner
-                    .data_file
-                    .read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
+                flushing_file.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
             }
             if valid_bytes < block_size {
                 chunk_buf[valid_bytes..].fill(0);
@@ -141,6 +146,13 @@ fn compute_flush_batch(
             }
 
             let hash = blake3_128(&chunk_buf);
+
+            // Warm clean_cache: decompressed block data
+            // goes into the Foyer S3-FIFO cache so reads after eviction hit
+            // cache instead of S3. S3-FIFO handles scan resistance.
+            if let Some(ref cache) = clean_cache {
+                cache.insert(hash, Bytes::from(chunk_buf.clone()));
+            }
 
             let compressed = Some(lz4_compress(&chunk_buf[..]));
 
@@ -289,6 +301,7 @@ pub(super) fn compute_dirty_crc32s(inner: &CacheInner) -> usize {
         let mut buf = vec![0u8; block_size];
         if let Err(e) = inner
             .data_file
+            .read()
             .read_exact_at(&mut buf[..valid_bytes], offset)
         {
             warn!(
@@ -328,7 +341,7 @@ impl WriteCache<Active> {
     /// the background.
     #[instrument(skip(self))]
     pub fn flush(&self) -> Result<(), CacheError> {
-        self.inner.data_file.sync_all()?;
+        self.inner.data_file.read().sync_all()?;
         self.inner.wal.sync()?;
         debug!("local flush complete");
         Ok(())
@@ -366,21 +379,17 @@ impl WriteCache<Active> {
         self.inner.is_present(block_idx)
     }
 
-    /// Write a full block to the data file and mark it present.
-    ///
-    /// Used by the backfill path to populate the SSD with S3 data before
-    /// a sub-block write overlays partial data on top. The caller must
-    /// provide exactly `block_size` bytes.
-    pub fn backfill_block(&self, block_idx: usize, data: &[u8]) -> Result<(), CacheError> {
-        debug_assert_eq!(
-            data.len(),
-            self.inner.config.block_size,
-            "backfill_block requires exactly block_size bytes"
-        );
-        let offset = block_idx as u64 * self.inner.config.block_size as u64;
-        self.inner.data_file.write_all_at(data, offset)?;
-        self.inner.set_present(block_idx);
-        Ok(())
+    /// Try to claim a NOT_PRESENT block (CAS NOT_PRESENT → CLEAN).
+    /// Returns true if this call won the transition, false if already present.
+    #[inline]
+    pub fn try_claim_block(&self, block_idx: usize) -> bool {
+        self.inner.try_set_present(block_idx)
+    }
+
+    /// Get the raw block state.
+    #[inline]
+    pub fn block_state(&self, block_idx: usize) -> u8 {
+        self.inner.state_map.get(block_idx)
     }
 
     /// Save metadata to disk.
@@ -414,14 +423,11 @@ impl WriteCache<Active> {
     /// the Tokio runtime with `sync_all()` + `rename()` syscalls in
     /// `save_block_states`.
     ///
-    /// After truncation, re-appends partial WAL entries so partial block
-    /// bitmaps survive a crash between checkpoint and backfill completion.
     async fn checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
         crate::task::spawn_blocking_named("checkpoint", move || {
             inner.save_block_states()?;
-            let partials = inner.collect_partial_entries();
-            inner.wal.truncate_and_reappend(&partials)?;
+            inner.wal.truncate()?;
             Ok(())
         })
         .await
@@ -442,8 +448,7 @@ impl WriteCache<Active> {
         crate::task::spawn_blocking_named("local-checkpoint", move || {
             compute_dirty_crc32s(&inner);
             inner.save_block_states()?;
-            let partials = inner.collect_partial_entries();
-            inner.wal.truncate_and_reappend(&partials)?;
+            inner.wal.truncate()?;
             debug!("local checkpoint complete");
             Ok(())
         })
@@ -466,45 +471,97 @@ impl WriteCache<Active> {
         Arc::clone(&self.inner)
     }
 
-    /// Check whether a block is in the partial_blocks map (has unfilled sub-regions).
+    /// Rotate the data file for flush.
     ///
-    /// TEST ONLY — exposed via `test-utils` feature for integration test assertions.
-    #[cfg(feature = "test-utils")]
-    #[allow(dead_code)]
-    pub fn is_block_partial(&self, block_idx: usize) -> bool {
-        self.inner.is_partial(block_idx)
+    /// 1. Rename active file -> flushing file
+    /// 2. Create new sparse active file
+    /// 3. Swap data_file RwLock (write-locked briefly)
+    /// 4. Store old handle in flushing_file Mutex
+    #[cfg_attr(feature = "test-utils", allow(dead_code))]
+    pub(crate) fn rotate_data_file(&self) -> Result<(), CacheError> {
+        let (_, ()) = self.rotate_data_file_inner(false)?;
+        Ok(())
     }
 
-    /// Insert a block into partial_blocks with an empty bitmap (all sub-regions
-    /// marked as unfilled). Simulates what `backfill_missing_blocks` does before
-    /// the actual write.
+    /// Snapshot dirty block indices AND rotate the data file atomically.
     ///
-    /// TEST ONLY — exposed via `test-utils` feature for integration test setup.
-    #[cfg(feature = "test-utils")]
-    #[allow(dead_code)]
-    pub fn insert_partial_block_for_test(&self, block_idx: usize) {
-        use std::sync::atomic::AtomicU32;
-        self.inner.partial_blocks.insert(
-            block_idx,
-            super::inner::PartialBlockState {
-                bitmap: AtomicU32::new(0),
-                write_lock: parking_lot::Mutex::new(()),
-            },
-        );
+    /// Holds the data_file write lock across both operations so no concurrent
+    /// writes can land between the snapshot and the file swap. This prevents
+    /// a race where a block becomes dirty (with data in the new active file)
+    /// after rotation but is picked up by the CAS scan — compute_flush_batch
+    /// would read zeros from the flushing file for that block.
+    #[cfg_attr(feature = "test-utils", allow(dead_code))]
+    pub(crate) fn rotate_and_snapshot(&self) -> Result<Vec<usize>, CacheError> {
+        let (claimed, ()) = self.rotate_data_file_inner(true)?;
+        Ok(claimed)
     }
 
-    /// Remove a block from partial tracking (simulates backfill completing).
+    /// Core rotation logic. If `snapshot` is true, captures dirty block
+    /// indices under the write lock before swapping files.
     ///
-    /// TEST ONLY — used to reproduce the complete_partial race deterministically.
-    #[cfg(feature = "test-utils")]
-    #[allow(dead_code)]
-    pub fn complete_partial_for_test(&self, block_idx: usize) {
-        self.inner.complete_partial(block_idx);
+    /// The entire rotation is one atomic critical section under a single
+    /// write-lock acquisition. This eliminates a class of races where
+    /// state changes (CAS, file swap) span non-atomic windows. The lock
+    /// holds for ~15µs on typical hardware — rename is an inode pointer
+    /// swap, file creation is a single syscall, and the CAS loop touches
+    /// only cache-hot atomics.
+    ///
+    /// All DIRTY blocks are claimed (CAS DIRTY→SYNCING).
+    fn rotate_data_file_inner(&self, snapshot: bool) -> Result<(Vec<usize>, ()), CacheError> {
+        let active_path = self.inner.config.data_path();
+        let flushing_path = self.inner.config.flushing_path();
+
+        // === Single write lock: everything below is atomic w.r.t. I/O ===
+        let mut data_file_guard = self.inner.data_file.write();
+
+        // Signal flush rotation in progress. Under the lock so no reader
+        // can observe flushing_active=true with stale file state.
+        self.inner.flushing_active.store(true, Ordering::Release);
+
+        // Rename active → flushing. The file handle in data_file_guard
+        // still refers to the same inode (now at flushing_path).
+        std::fs::rename(&active_path, &flushing_path)?;
+
+        // Create new sparse active file.
+        let new_file = super::inner::SyncFile::open(
+            &active_path,
+            true,
+            self.inner.config.device_size,
+        )?;
+
+        // Snapshot dirty blocks: CAS DIRTY→SYNCING under the lock.
+        let claimed = if snapshot {
+            let mut claimed = Vec::new();
+            for idx in self.inner.state_map.iter_with_state(SparseBlockState::DIRTY) {
+                if self.inner.transition_dirty_to_syncing(idx) {
+                    claimed.push(idx);
+                }
+            }
+            claimed
+        } else {
+            Vec::new()
+        };
+
+        // Swap file handle: new active file goes into the RwLock.
+        let old_file = std::mem::replace(&mut *data_file_guard, new_file);
+
+        // No block data copy needed. The flushing file preserves block data.
+
+        // Set flushing_file before releasing the write lock.
+        // Writers acquiring the read lock after rotation will see
+        // flushing_active=true AND flushing_file=Some, so
+        // promote_syncing_blocks works correctly.
+        *self.inner.flushing_file.lock() = Some(Arc::new(old_file));
+
+        drop(data_file_guard);
+
+        info!("rotated data file for flush");
+        Ok((claimed, ()))
     }
 
     /// Chunked flush: claim dirty blocks via CAS DIRTY→SYNCING, partition by
     /// chunk (128 MiB), per-chunk dedup/compress/upload as GLPK v3 packs,
-    /// append pack_id to VolumeManifest, CAS SYNCING→CLEAN.
+    /// append pack_id to VolumeManifest, CAS SYNCING→NOT_PRESENT.
     ///
     /// Returns (stats, seq_cutpoint) on success.
     async fn flush_dirty_inner(
@@ -512,29 +569,87 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        clean_cache: Option<&Arc<dyn BlockCache>>,
     ) -> Result<(FlushStats, u64), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
 
-        // Claim dirty blocks: CAS DIRTY→SYNCING.
-        let snapshot: Vec<usize> = self
-            .inner
-            .state_map
-            .iter_with_state(SparseBlockState::DIRTY)
-            .filter(|&idx| self.inner.transition_dirty_to_syncing(idx))
-            .collect();
+        // Snapshot dirty blocks, claim (CAS DIRTY→SYNCING), AND rotate —
+        // all under the data_file write lock.
+        //
+        // The write lock blocks concurrent pwrite/pread, giving us a clean
+        // cut: every block in `snapshot` has its data in the current active
+        // file (now the flushing file) AND is already SYNCING.
+        //
+        // The CAS DIRTY→SYNCING must happen under the write lock to prevent
+        // a race where a concurrent write between lock-release and CAS lands
+        // data in the new active file while the block is still DIRTY. Without
+        // this, the CAS would claim the block, but the flushing file would
+        // have stale data (missing the concurrent write). By claiming under
+        // the lock, concurrent writes after lock-release see SYNCING and
+        // CAS SYNCING→DIRTY in transition_to_dirty, properly re-dirtying
+        // the block. promote_syncing_blocks then copies data from
+        // flushing→active so the new active file has complete block data.
+        let snapshot = self.rotate_and_snapshot()?;
 
         if snapshot.is_empty() {
             debug!("flush: no dirty blocks to flush");
+            // Clean up the empty flushing file (rotated but no dirty blocks)
+            self.inner.flushing_active.store(false, Ordering::Release);
+            drop(self.inner.flushing_file.lock().take());
+            let flushing_path = self.inner.config.flushing_path();
+            if flushing_path.exists() {
+                let _ = std::fs::remove_file(&flushing_path);
+            }
             return Ok((FlushStats::default(), seq_cutpoint));
         }
 
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
 
         let result = self
-            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest)
+            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache)
             .await;
 
         if result.is_err() {
+            // Copy block data from flushing to active BEFORE transitioning
+            // state. If we transition SYNCING→DIRTY first, a concurrent read
+            // sees DIRTY, reads the new active file (which is empty for these
+            // blocks), and serves zeros.
+            //
+            // Write-lock data_file to prevent concurrent writes from
+            // interleaving with the copy. Without this, a write could:
+            // 1. CAS SYNCING→DIRTY, promote, pwrite new data
+            // 2. Then our copy overwrites that new data with stale flushing data
+            // Lock ordering: data_file.write() THEN flushing_file.lock().
+            // Must match sync_read_local_block (data_file.read() → flushing_file)
+            // to avoid deadlock.
+            let block_size = self.inner.config.block_size;
+            let df = self.inner.data_file.write();
+            if let Some(ref ff) = *self.inner.flushing_file.lock() {
+                for &idx in &snapshot {
+                    if self.inner.state_map.get(idx) != SparseBlockState::SYNCING {
+                        continue;
+                    }
+                    let offset = idx as u64 * block_size as u64;
+                    let valid_bytes = std::cmp::min(
+                        block_size as u64,
+                        self.inner.config.device_size.saturating_sub(offset),
+                    ) as usize;
+                    if valid_bytes > 0 {
+                        let mut buf = vec![0u8; valid_bytes];
+                        if ff.read_exact_at(&mut buf, offset).is_ok() {
+                            let _ = df.write_all_at(&buf, offset);
+                        }
+                    }
+                }
+            }
+            drop(df);
+            self.inner.flushing_active.store(false, Ordering::Release);
+            drop(self.inner.flushing_file.lock().take());
+            let flushing_path = self.inner.config.flushing_path();
+            if flushing_path.exists() {
+                let _ = std::fs::remove_file(&flushing_path);
+            }
+            // Now transition all snapshot blocks to DIRTY (after data is in active file).
             for &idx in &snapshot {
                 self.inner.transition_to_dirty(idx);
             }
@@ -555,6 +670,7 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        clean_cache: Option<&Arc<dyn BlockCache>>,
     ) -> Result<FlushStats, CacheError> {
         use crate::block::pack::new_pack_id;
 
@@ -624,8 +740,9 @@ impl WriteCache<Active> {
             // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
             let zero_hash = self.inner.zero_block_hash;
             let inner = Arc::clone(&self.inner);
+            let clean_cache_clone = clean_cache.map(Arc::clone);
             let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
-                compute_flush_batch(&inner, &chunk_blocks, zero_hash)
+                compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone)
             })
             .await
             .map_err(|e| CacheError::Io(std::io::Error::other(e)))??;
@@ -635,9 +752,37 @@ impl WriteCache<Active> {
             total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
             total_stats.blocks_corrupted += batch.stats.blocks_corrupted;
 
-            // Transition skipped blocks back SYNCING→DIRTY
-            for &idx in &batch.skipped {
-                self.inner.transition_to_dirty(idx);
+            // Transition skipped blocks back to DIRTY.
+            //
+            // Blocks still SYNCING (corrupted, partial-not-re-dirtied) need
+            // data promoted from flushing → active before transition, since
+            // no guest write triggered promote-on-write for them.
+            // Blocks already DIRTY (re-dirtied by guest write) were promoted
+            // by the write path — don't overwrite active with stale data.
+            {
+                // Lock ordering: data_file.write() THEN flushing_file.lock()
+                // (same order as sync_read_local_block to avoid deadlock).
+                let df = self.inner.data_file.write();
+                let flushing_guard = self.inner.flushing_file.lock();
+                let block_size = self.inner.config.block_size;
+                for &idx in &batch.skipped {
+                    if self.inner.state_map.get(idx) == SparseBlockState::SYNCING
+                        && let Some(ref ff) = *flushing_guard
+                    {
+                        let offset = idx as u64 * block_size as u64;
+                        let valid = std::cmp::min(
+                            block_size as u64,
+                            self.inner.config.device_size.saturating_sub(offset),
+                        ) as usize;
+                        if valid > 0 {
+                            let mut buf = vec![0u8; valid];
+                            if ff.read_exact_at(&mut buf, offset).is_ok() {
+                                let _ = df.write_all_at(&buf, offset);
+                            }
+                        }
+                    }
+                    self.inner.transition_to_dirty(idx);
+                }
             }
 
             // Build hash → compressed data map from the unique-hash upload set.
@@ -727,11 +872,34 @@ impl WriteCache<Active> {
             }
         }
 
-        // CAS SYNCING→CLEAN for successfully flushed blocks
+        // Finalize flushed blocks: SYNCING→NOT_PRESENT.
+        //
+        // Always evict from the data file. The flush path already inserted
+        // every block into foyer (clean_cache) during compute_flush_batch,
+        // so reads after eviction hit the in-memory S3-FIFO cache. This
+        // keeps the data file as a pure write buffer — born, filled,
+        // consumed, deleted — with no CLEAN blocks to carry forward
+        // across rotations.
+        //
+        // CAS failure means a guest write re-dirtied the block during flush.
+        // Promote-on-write already copied the full block from flushing → active
+        // before the guest pwrite, so the active file has complete data.
         for &chunk_index in &flushed_blocks {
-            if !self.inner.transition_syncing_to_clean(chunk_index) {
+            if !self.inner.transition_syncing_to_not_present(chunk_index) {
                 total_stats.blocks_cas_failed += 1;
             }
+        }
+
+        // Drop flushing file handle and delete the file.
+        // Clear flushing_active BEFORE dropping the file so resolve_read_plan
+        // re-enables LocalSsd only after the cleanup is complete.
+        self.inner.flushing_active.store(false, Ordering::Release);
+        drop(self.inner.flushing_file.lock().take());
+        let flushing_path = self.inner.config.flushing_path();
+        if flushing_path.exists()
+            && let Err(e) = std::fs::remove_file(&flushing_path)
+        {
+            warn!(error = %e, "failed to remove flushing file");
         }
 
         info!(
@@ -757,8 +925,9 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        clean_cache: Option<&Arc<dyn BlockCache>>,
     ) -> Result<(FlushStats, u64), CacheError> {
-        self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+        self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await
     }
 
@@ -803,7 +972,7 @@ impl WriteCache<Active> {
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, _seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
         let manifest_bytes = volume_manifest.read().serialize();
         let expected_etag = self.inner.manifest_etag.lock().clone();
@@ -855,7 +1024,7 @@ impl WriteCache<Active> {
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest)
+            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
 
         let manifest_bytes = volume_manifest.read().serialize();

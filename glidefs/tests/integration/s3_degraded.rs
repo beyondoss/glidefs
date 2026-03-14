@@ -302,7 +302,7 @@ async fn test_s3_slow_uploads_dont_block_writes() {
     s3.set_put_delay_ms(500); // 500ms delay per PUT
 
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pic, vm, cc, _metrics) =
+    let (cache, cs, pic, vm, _cc, _metrics) =
         create_cache_with_store(&dir, "slow-upload", Arc::clone(&s3) as Arc<dyn ObjectStore>).await;
 
     // Writes should be fast (local SSD only)
@@ -312,7 +312,6 @@ async fn test_s3_slow_uploads_dont_block_writes() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
             )
             .unwrap();
     }
@@ -382,7 +381,7 @@ async fn test_s3_slow_downloads_bounded_latency() {
     // Write blocks + flush to S3 with no delay
     let writer_dir = TempDir::new().unwrap();
     {
-        let (cache, cs, pic, vm, cc, _m) =
+        let (cache, cs, pic, vm, _cc, _m) =
             create_cache_with_store(
                 &writer_dir,
                 "slow-download",
@@ -395,7 +394,6 @@ async fn test_s3_slow_downloads_bounded_latency() {
                 .write(
                     (i * BLOCK_SIZE) as u64,
                     &vec![(i as u8) + 1; BLOCK_SIZE],
-                    cc.as_ref(),
                 )
                 .unwrap();
         }
@@ -470,7 +468,7 @@ async fn test_s3_intermittent_failures_eventual_success() {
     s3.set_fail_every_n(2); // Fail every 2nd PUT
 
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pic, vm, cc, _metrics) =
+    let (cache, cs, pic, vm, _cc, _metrics) =
         create_cache_with_store(&dir, "intermittent", Arc::clone(&s3) as Arc<dyn ObjectStore>)
             .await;
 
@@ -480,7 +478,6 @@ async fn test_s3_intermittent_failures_eventual_success() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
             )
             .unwrap();
     }
@@ -562,7 +559,7 @@ async fn test_s3_download_semaphore_exhaustion() {
     // Writer: write 20 blocks, flush to S3
     let writer_dir = TempDir::new().unwrap();
     {
-        let (cache, cs, pic, vm, cc, _m) =
+        let (cache, cs, pic, vm, _cc, _m) =
             super::create_test_cache(&writer_dir, "sem-exhaust", Arc::clone(&s3)).await;
 
         for i in 0..20usize {
@@ -570,7 +567,6 @@ async fn test_s3_download_semaphore_exhaustion() {
                 .write(
                     (i * BLOCK_SIZE) as u64,
                     &vec![(i as u8) + 1; BLOCK_SIZE],
-                    cc.as_ref(),
                 )
                 .unwrap();
         }
@@ -673,7 +669,7 @@ async fn test_s3_upload_semaphore_exhaustion() {
         DEVICE_SIZE,
         BLOCK_SIZE as u32,
     )));
-    let cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let _cc = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
     let _metrics = Arc::new(ExportMetrics::new());
 
     let cache = WriteCache::open(config).unwrap();
@@ -685,7 +681,6 @@ async fn test_s3_upload_semaphore_exhaustion() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
             )
             .unwrap();
     }
@@ -736,7 +731,7 @@ async fn test_s3_manifest_put_fails_after_pack_upload() {
     let s3 = Arc::new(IntermittentObjectStore::new());
 
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pic, vm, cc, _metrics) =
+    let (cache, cs, pic, vm, _cc, _metrics) =
         create_cache_with_store(&dir, "manifest-fail", Arc::clone(&s3) as Arc<dyn ObjectStore>)
             .await;
 
@@ -746,7 +741,6 @@ async fn test_s3_manifest_put_fails_after_pack_upload() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
             )
             .unwrap();
     }

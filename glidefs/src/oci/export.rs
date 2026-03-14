@@ -16,6 +16,7 @@ use super::BlockAdapter;
 /// including PAX xattrs. Runs on a blocking thread (required by BlockAdapter).
 ///
 /// Returns the tar writer after all entries are written.
+#[allow(dead_code)]
 pub async fn export_tar<W: Write + Send + 'static>(
     handler: Arc<BlockHandler>,
     tar_writer: W,

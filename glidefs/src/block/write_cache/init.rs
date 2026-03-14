@@ -1,8 +1,7 @@
 use bytes::Bytes;
-use dashmap::DashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use tracing::{error, info, instrument, warn};
 
 use crate::block::block_map::{
@@ -11,7 +10,7 @@ use crate::block::block_map::{
 use crate::block::state::{Active, Initializing, Recovering};
 use crate::block::wal::Wal;
 
-use super::inner::CacheInner;
+use super::inner::{CacheInner, SyncFile, is_zero_block};
 use super::{CacheError, WriteCache, WriteCacheConfig};
 
 impl WriteCache<Initializing> {
@@ -69,9 +68,6 @@ impl WriteCache<Initializing> {
         // (which was pwrite'd before the WAL entry was appended).
         let mut max_wal_seq = persisted_max_seq;
 
-        // Partial block bitmaps reconstructed from partial WAL entries.
-        let partial_blocks: DashMap<usize, super::inner::PartialBlockState> = DashMap::new();
-
         for entry in &wal_entries {
             let block_index = entry.block_index as usize;
             max_wal_seq = max_wal_seq.max(entry.sequence);
@@ -89,17 +85,6 @@ impl WriteCache<Initializing> {
                     }
                     dirty_count += 1;
                 }
-
-                // Reconstruct partial block bitmap from partial WAL entries
-                if let Some(bitmap) = entry.partial_bitmap {
-                    let entry = partial_blocks
-                        .entry(block_index)
-                        .or_insert_with(|| super::inner::PartialBlockState {
-                            bitmap: std::sync::atomic::AtomicU32::new(0),
-                            write_lock: parking_lot::Mutex::new(()),
-                        });
-                    entry.value().bitmap.fetch_or(bitmap, std::sync::atomic::Ordering::Release);
-                }
             }
         }
 
@@ -115,14 +100,10 @@ impl WriteCache<Initializing> {
         // old corruption and misses all entries written in the previous
         // session. Rewriting ensures a clean WAL for future appends.
         {
-            use crate::block::wal::{serialize_entry, serialize_partial_entry};
+            use crate::block::wal::serialize_entry;
             let mut buf = Vec::new();
             for entry in &wal_entries {
-                if let Some(bitmap) = entry.partial_bitmap {
-                    serialize_partial_entry(&mut buf, entry.block_index, entry.sequence, bitmap);
-                } else {
-                    serialize_entry(&mut buf, entry.block_index, entry.sequence);
-                }
+                serialize_entry(&mut buf, entry.block_index, entry.sequence);
             }
             std::fs::write(&wal_path, &buf)?;
         }
@@ -141,10 +122,73 @@ impl WriteCache<Initializing> {
         let zbh = zero_block_hash(block_size);
         let zbb = Bytes::from(vec![0u8; block_size]);
 
-        let partial_count = partial_blocks.len();
+        // Crash recovery: if a flushing file exists, we crashed mid-flush.
+        //
+        // The flushing file is the old active file, renamed by rotate_data_file().
+        // After rotation, new writes go to the fresh (sparse) active file. So:
+        //   - Pre-rotation dirty blocks: data in flushing file, active is sparse
+        //   - Post-rotation writes: data in active file
+        //
+        // We MERGE by only copying from flushing when the active block is empty
+        // (all zeros / sparse). This preserves post-rotation writes while
+        // recovering pre-rotation data that would otherwise be lost.
+        let flushing_path = config.flushing_path();
+        if flushing_path.exists() {
+            info!("found flushing file — recovering from interrupted flush");
+            let flushing_file = SyncFile::open(&flushing_path, false, config.device_size)?;
+            let block_size = config.block_size;
+            let mut recovered = 0usize;
+            let mut skipped = 0usize;
+            for (idx, state) in state_map.iter_present() {
+                let is_dirty = state == SparseBlockState::DIRTY
+                    || state == SparseBlockState::SYNCING;
+                if is_dirty {
+                    let offset = idx as u64 * block_size as u64;
+                    let valid_bytes = std::cmp::min(
+                        block_size as u64,
+                        config.device_size.saturating_sub(offset),
+                    ) as usize;
+                    if valid_bytes > 0 {
+                        // Read from active file first — if it has data, a
+                        // post-rotation write landed here and takes precedence.
+                        let mut active_buf = vec![0u8; valid_bytes];
+                        data_file.read_exact_at(&mut active_buf, offset)?;
+                        if is_zero_block(&active_buf) {
+                            // Active is empty (sparse) — recover from flushing
+                            let mut flush_buf = vec![0u8; valid_bytes];
+                            flushing_file.read_exact_at(&mut flush_buf, offset)?;
+                            data_file.write_all_at(&flush_buf, offset)?;
+                            recovered += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                    // Ensure state is DIRTY (SYNCING was already converted by load_metadata)
+                    let _ = state_map.cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY);
+                }
+            }
+            drop(flushing_file);
+            std::fs::remove_file(&flushing_path)?;
+            info!(
+                recovered_blocks = recovered,
+                skipped_blocks = skipped,
+                "flush recovery complete"
+            );
+        }
+
+        // Transition any CLEAN blocks to NOT_PRESENT. Their data is in S3
+        // by definition of CLEAN. Without this, reads of CLEAN blocks would
+        // try the active file which may be empty (sparse).
+        for (idx, state) in state_map.iter_present().collect::<Vec<_>>() {
+            if state == SparseBlockState::CLEAN {
+                let _ = state_map.cas(idx, SparseBlockState::CLEAN, SparseBlockState::NOT_PRESENT);
+            }
+        }
+
         let inner = Arc::new(CacheInner {
             config,
-            data_file,
+            data_file: parking_lot::RwLock::new(data_file),
+            flushing_file: parking_lot::Mutex::new(None),
             state_map,
             num_blocks,
             dirty_block_count: AtomicU64::new(dirty_count as u64),
@@ -157,14 +201,13 @@ impl WriteCache<Initializing> {
             recovery_warnings: AtomicU64::new(recovery_warning_count),
             crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
-            partial_blocks,
             manifest_etag: parking_lot::Mutex::new(None),
+            flushing_active: AtomicBool::new(false),
         });
 
         info!(
             dirty_blocks = dirty_count,
             present_blocks = present_count,
-            partial_blocks = partial_count,
             recovery_warnings = recovery_warning_count,
             "cache opened, transitioning to Recovering"
         );
@@ -197,7 +240,8 @@ impl WriteCache<Initializing> {
 
         let inner = Arc::new(CacheInner {
             config,
-            data_file,
+            data_file: parking_lot::RwLock::new(data_file),
+            flushing_file: parking_lot::Mutex::new(None),
             state_map,
             num_blocks,
             dirty_block_count: AtomicU64::new(0),
@@ -210,8 +254,8 @@ impl WriteCache<Initializing> {
             recovery_warnings: AtomicU64::new(0),
             crc_map: SparseCrcMap::new(num_blocks),
             flush_lock: tokio::sync::Mutex::new(()),
-            partial_blocks: DashMap::new(),
             manifest_etag: parking_lot::Mutex::new(None),
+            flushing_active: AtomicBool::new(false),
         });
 
         info!("cache opened fresh for fork, directly Active");

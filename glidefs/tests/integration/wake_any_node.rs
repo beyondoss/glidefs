@@ -25,7 +25,7 @@ async fn test_wake_from_different_node() {
 
     // === NODE A: Write data and flush to S3 ===
     let node_a_dir = TempDir::new().unwrap();
-    let (cache_a, content_store_a, pack_index_cache_a, volume_manifest_a, clean_cache_a, _metrics_a) =
+    let (cache_a, content_store_a, pack_index_cache_a, volume_manifest_a, _clean_cache_a, _metrics_a) =
         create_test_cache(&node_a_dir, "vol1", Arc::clone(&s3) as _).await;
 
     // Write test pattern: blocks 0, 1, 5 with distinct data
@@ -33,9 +33,9 @@ async fn test_wake_from_different_node() {
     let block_1_data: Vec<u8> = (0..128 * 1024).map(|i| ((i + 100) % 256) as u8).collect();
     let block_5_data: Vec<u8> = (0..128 * 1024).map(|i| ((i + 200) % 256) as u8).collect();
 
-    cache_a.write(0, &block_0_data, clean_cache_a.as_ref()).unwrap();
-    cache_a.write(128 * 1024, &block_1_data, clean_cache_a.as_ref()).unwrap();
-    cache_a.write(5 * 128 * 1024, &block_5_data, clean_cache_a.as_ref()).unwrap();
+    cache_a.write(0, &block_0_data).unwrap();
+    cache_a.write(128 * 1024, &block_1_data).unwrap();
+    cache_a.write(5 * 128 * 1024, &block_5_data).unwrap();
 
     // Flush to S3 (simulates graceful shutdown)
     cache_a
@@ -140,12 +140,12 @@ async fn test_unwritten_blocks_return_zeros() {
 async fn test_cache_hit_on_second_read() {
     let s3 = Arc::new(object_store::memory::InMemory::new());
     let temp_dir = TempDir::new().unwrap();
-    let (cache, content_store, pack_index_cache, volume_manifest, clean_cache, _metrics) =
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3) as _).await;
 
     // Write some data
     let data: Vec<u8> = (0..128 * 1024).map(|i| (i % 256) as u8).collect();
-    cache.write(0, &data, clean_cache.as_ref()).unwrap();
+    cache.write(0, &data).unwrap();
     cache
         .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
         .await
@@ -203,12 +203,12 @@ async fn test_batch_prefetch_optimization() {
 
     // Write blocks 0-9 (all in same batch)
     let writer_dir = TempDir::new().unwrap();
-    let (writer_cache, writer_content_store, writer_pack_index_cache, writer_volume_manifest, writer_clean_cache, _) =
+    let (writer_cache, writer_content_store, writer_pack_index_cache, writer_volume_manifest, _writer_clean_cache, _) =
         create_test_cache(&writer_dir, "vol1", Arc::clone(&s3) as _).await;
 
     for i in 0..10u64 {
         let data: Vec<u8> = vec![i as u8; 128 * 1024];
-        writer_cache.write(i * 128 * 1024, &data, writer_clean_cache.as_ref()).unwrap();
+        writer_cache.write(i * 128 * 1024, &data).unwrap();
     }
     writer_cache
         .flush_to_s3(&writer_content_store, &writer_pack_index_cache, &writer_volume_manifest)
@@ -264,7 +264,7 @@ async fn test_recovery_after_pack_flush_without_drain() {
 
     // === NODE A: Write data, flush packs + sync manifest (no drain) ===
     let node_a_dir = TempDir::new().unwrap();
-    let (cache_a, content_store_a, pack_index_cache_a, volume_manifest_a, clean_cache_a, _metrics_a) =
+    let (cache_a, content_store_a, pack_index_cache_a, volume_manifest_a, _clean_cache_a, _metrics_a) =
         create_test_cache(&node_a_dir, "vol1", Arc::clone(&s3)).await;
 
     // Write 3 blocks with distinct patterns
@@ -272,15 +272,15 @@ async fn test_recovery_after_pack_flush_without_drain() {
     let block_1_data: Vec<u8> = vec![0xBB; BLOCK_SIZE];
     let block_2_data: Vec<u8> = vec![0xCC; BLOCK_SIZE];
 
-    cache_a.write(0, &block_0_data, clean_cache_a.as_ref()).unwrap();
-    cache_a.write(BLOCK_SIZE as u64, &block_1_data, clean_cache_a.as_ref()).unwrap();
-    cache_a.write(2 * BLOCK_SIZE as u64, &block_2_data, clean_cache_a.as_ref()).unwrap();
+    cache_a.write(0, &block_0_data).unwrap();
+    cache_a.write(BLOCK_SIZE as u64, &block_1_data).unwrap();
+    cache_a.write(2 * BLOCK_SIZE as u64, &block_2_data).unwrap();
 
     // Simulate what the flush scheduler does: flush_packs + sync_manifest.
     // Critically, we do NOT call flush_to_s3 or drain — this is what happens
     // when the host dies after the scheduler fires but before drain.
     let (stats, _seq_cutpoint) = cache_a
-        .flush_packs(&content_store_a, &pack_index_cache_a, &volume_manifest_a)
+        .flush_packs(&content_store_a, &pack_index_cache_a, &volume_manifest_a, None)
         .await
         .unwrap();
     assert!(stats.packs_uploaded > 0, "should have uploaded packs");

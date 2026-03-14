@@ -33,7 +33,7 @@ async fn test_trim_partial_range() {
 
     // Write full block of 0xAA
     let full_data = vec![0xAA; BLOCK_SIZE];
-    cache.write(0, &full_data, cc.as_ref()).unwrap();
+    cache.write(0, &full_data).unwrap();
 
     // TRIM 512 bytes starting at offset 2048 within the block
     let trim_offset = 2048u64;
@@ -73,10 +73,10 @@ async fn test_trim_then_flush_to_s3() {
     // Writer: write block 0, flush to S3
     let writer_dir = TempDir::new().unwrap();
     {
-        let (cache, cs, pic, vm, cc, _m) =
+        let (cache, cs, pic, vm, _cc, _m) =
             super::create_test_cache(&writer_dir, "trim-flush", Arc::clone(&s3)).await;
 
-        cache.write(0, &vec![0xBB; BLOCK_SIZE], cc.as_ref()).unwrap();
+        cache.write(0, &vec![0xBB; BLOCK_SIZE]).unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
         // TRIM block 0
@@ -120,11 +120,11 @@ async fn test_trim_fork_semantics() {
     // Parent: write block 0 = 0xCC, flush to S3
     let parent_dir = TempDir::new().unwrap();
     let parent_manifest = {
-        let (cache, cs, pic, vm, cc, _m) =
+        let (cache, cs, pic, vm, _cc, _m) =
             super::create_test_cache(&parent_dir, "trim-fork-parent", Arc::clone(&s3)).await;
 
         cache
-            .write(0, &vec![0xCC; BLOCK_SIZE], cc.as_ref())
+            .write(0, &vec![0xCC; BLOCK_SIZE])
             .unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
@@ -223,10 +223,10 @@ async fn test_trim_crash_recovery() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let cc = SimpleBlockCache::new(1024);
+        let _cc = SimpleBlockCache::new(1024);
 
         // Write full block of 0xDD
-        cache.write(0, &vec![0xDD; BLOCK_SIZE], &cc).unwrap();
+        cache.write(0, &vec![0xDD; BLOCK_SIZE]).unwrap();
 
         // TRIM same block
         cache.zero_range(0, BLOCK_SIZE as u64).unwrap();
@@ -273,7 +273,6 @@ async fn test_trim_large_range() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![fill; BLOCK_SIZE],
-                cc.as_ref(),
             )
             .unwrap();
     }

@@ -36,7 +36,6 @@ async fn test_client_storm_concurrent_reads() {
             .write(
                 (i * BLOCK_SIZE) as u64,
                 &vec![(i as u8) + 1; BLOCK_SIZE],
-                cc.as_ref(),
             )
             .unwrap();
     }
@@ -94,11 +93,11 @@ async fn test_concurrent_write_stress() {
 
     for writer_id in 0..num_writers {
         let cache = Arc::clone(&cache);
-        let cc = Arc::clone(&cc);
+        let _cc = Arc::clone(&cc);
         handles.push(tokio::spawn(async move {
             let offset = (writer_id * BLOCK_SIZE) as u64;
             let fill = (writer_id as u8) + 1;
-            cache.write(offset, &vec![fill; BLOCK_SIZE], cc.as_ref()).unwrap();
+            cache.write(offset, &vec![fill; BLOCK_SIZE]).unwrap();
         }));
     }
 
@@ -145,17 +144,17 @@ async fn test_concurrent_read_write_same_block() {
 
     // Initial write: block 0 = 0xAA
     cache
-        .write(0, &vec![0xAA; BLOCK_SIZE], cc.as_ref())
+        .write(0, &vec![0xAA; BLOCK_SIZE])
         .unwrap();
 
     // Spawn 10 writers overwriting block 0 with different patterns
     let mut write_handles = Vec::new();
     for i in 0..10u8 {
         let cache = Arc::clone(&cache);
-        let cc = Arc::clone(&cc);
+        let _cc = Arc::clone(&cc);
         write_handles.push(tokio::spawn(async move {
             let fill = 0xB0 + i;
-            cache.write(0, &vec![fill; BLOCK_SIZE], cc.as_ref()).unwrap();
+            cache.write(0, &vec![fill; BLOCK_SIZE]).unwrap();
         }));
     }
 

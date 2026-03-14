@@ -33,6 +33,7 @@ fn test_config(dir: &TempDir, name: &str) -> WriteCacheConfig {
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
         wal_sync: true, // production-grade: every write durable on SSD before ack
+       
     }
 }
 
@@ -87,17 +88,17 @@ async fn test_flush_ordering_guarantee() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Write block A at offset 0
-        cache.write(0, &block_a_data, &clean_cache).unwrap();
+        cache.write(0, &block_a_data).unwrap();
 
         // Flush to SSD (this is the NBD FLUSH equivalent — syncs data file)
         cache.flush().unwrap();
 
         // Write block B at offset BLOCK_SIZE — WITHOUT flush
         cache
-            .write(BLOCK_SIZE as u64, &block_b_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &block_b_data)
             .unwrap();
 
         // Crash: save metadata (simulates checkpoint) but no flush after block B
@@ -156,12 +157,12 @@ async fn test_flush_ordering_guarantee_wal_sync_false() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
-        cache.write(0, &block_a_data, &clean_cache).unwrap();
+        cache.write(0, &block_a_data).unwrap();
         cache.flush().unwrap();
         cache
-            .write(BLOCK_SIZE as u64, &block_b_data, &clean_cache)
+            .write(BLOCK_SIZE as u64, &block_b_data)
             .unwrap();
 
         // Crash without metadata save — simulates abrupt process death
@@ -214,10 +215,10 @@ async fn test_fua_write_durable_before_response() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Write with FUA — this should sync SSD before returning
-        cache.write(0, &fua_data, &clean_cache).unwrap();
+        cache.write(0, &fua_data).unwrap();
         cache.flush().unwrap(); // FUA triggers flush
 
         // Crash without metadata save
@@ -468,12 +469,12 @@ async fn test_manifest_consistency_after_partial_drain() {
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         for i in 0..block_count {
             let data = vec![(i % 256) as u8; BLOCK_SIZE];
             cache
-                .write(i as u64 * BLOCK_SIZE as u64, &data, &clean_cache)
+                .write(i as u64 * BLOCK_SIZE as u64, &data)
                 .unwrap();
             expected.insert(i, data);
         }

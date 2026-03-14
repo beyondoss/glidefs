@@ -92,7 +92,9 @@ pub struct SparseBlockState;
 impl SparseBlockState {
     /// Block has never been written to the local SSD.
     pub const NOT_PRESENT: u8 = 0;
-    /// Block is present on SSD and synced to S3.
+    /// Block is claimed but not yet dirty. Transient state used by the write
+    /// path (set_present before pwrite) and as a CAS gate for backfill
+    /// synchronization.
     pub const CLEAN: u8 = 1;
     /// Block is present on SSD and needs to be flushed to S3.
     pub const DIRTY: u8 = 2;
@@ -137,7 +139,7 @@ impl StatePage {
 ///
 /// State encoding (2 bits per entry):
 /// - `0` = NotPresent (never written to SSD)
-/// - `1` = Clean (present on SSD, synced to S3)
+/// - `1` = Clean (claimed, not yet dirty — transient)
 /// - `2` = Dirty (present on SSD, needs flush)
 /// - `3` = Syncing (present on SSD, upload in progress)
 pub struct SparseStateMap {
@@ -294,20 +296,30 @@ impl SparseStateMap {
     /// Allocates the page if needed.
     #[inline]
     pub fn set_present(&self, idx: usize) {
+        self.try_set_present(idx);
+    }
+
+    /// Try to claim a NOT_PRESENT block (CAS NOT_PRESENT → CLEAN).
+    ///
+    /// Returns `true` if this call transitioned the block from NOT_PRESENT
+    /// to CLEAN (caller "won" the claim). Returns `false` if the block was
+    /// already present (CLEAN, DIRTY, or SYNCING).
+    #[inline]
+    pub fn try_set_present(&self, idx: usize) -> bool {
         let (page_idx, byte_idx, shift) = Self::split_index(idx);
         let page = self.ensure_page(page_idx);
         let mask = 0x3u8 << shift;
         loop {
             let old = page.data[byte_idx].load(Ordering::Acquire);
             if (old >> shift) & 0x3 != SparseBlockState::NOT_PRESENT {
-                break; // already present
+                return false; // already present
             }
             let new = (old & !mask) | (SparseBlockState::CLEAN << shift);
             if page.data[byte_idx]
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                break;
+                return true;
             }
         }
     }

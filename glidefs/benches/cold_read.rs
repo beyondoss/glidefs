@@ -61,16 +61,13 @@ impl ReadBenchHarness {
         let cache = WriteCache::open(config).expect("Failed to open cache");
         let cache = cache.skip_recovery_for_test();
 
-        // Temporary clean_cache used during setup writes.
-        let setup_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
-
         // Write random data -- realistic compression ratios.
         let mut rng = rand::thread_rng();
         for i in 0..num_blocks {
             let mut data = vec![0u8; BLOCK_SIZE];
             rng.fill(&mut data[..]);
             cache
-                .write(i * BLOCK_SIZE as u64, &data, setup_cache.as_ref())
+                .write(i * BLOCK_SIZE as u64, &data)
                 .unwrap();
         }
 

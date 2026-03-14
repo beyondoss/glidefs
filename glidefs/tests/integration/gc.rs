@@ -32,7 +32,7 @@ fn write_blocks(
     start: usize,
     count: usize,
     seed: u8,
-    clean_cache: &dyn glidefs::block::cache::BlockCache,
+    _clean_cache: &dyn glidefs::block::cache::BlockCache,
 ) {
     for i in 0..count {
         let offset = (start + i) * BLOCK_SIZE;
@@ -43,7 +43,7 @@ fn write_blocks(
         for (b, byte) in data.iter_mut().enumerate().take(BLOCK_SIZE).skip(3) {
             *byte = ((i + b) % 256) as u8;
         }
-        cache.write(offset as u64, &data, clean_cache).unwrap();
+        cache.write(offset as u64, &data).unwrap();
     }
 }
 

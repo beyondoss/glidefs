@@ -1,8 +1,8 @@
-use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::block::block_map::{
@@ -21,15 +21,6 @@ pub(super) const METADATA_MAGIC: &[u8; 8] = b"ZFSCACHE";
 /// Version 5: sparse state map + trailing max_sequence u64
 pub(super) const METADATA_VERSION: u32 = 5;
 
-/// Size of each sub-region tracked in the partial block bitmap.
-pub(crate) const SUB_BLOCK_SIZE: usize = 4096;
-
-/// Number of sub-regions per block (128KB / 4KB = 32).
-pub(crate) const SUBS_PER_BLOCK: usize = 32;
-
-/// Maximum number of partial blocks tracked simultaneously.
-/// Beyond this, fall back to synchronous backfill.
-pub(crate) const MAX_PARTIAL_BLOCKS: usize = 1024;
 
 /// Sealed module for `SyncFile`. The `File` field is private to this module,
 /// preventing any code outside from accessing seek-based methods. This makes
@@ -253,13 +244,27 @@ pub(crate) struct CacheInner {
     /// Configuration
     pub(super) config: WriteCacheConfig,
 
-    /// Local cache file (data) - encrypted at rest
-    /// Uses positional I/O (pread/pwrite) which is lock-free and thread-safe
-    pub(super) data_file: SyncFile,
+    /// Local cache file (data).
+    /// Uses positional I/O (pread/pwrite) which is thread-safe. RwLock is
+    /// read-locked for all I/O (~2ns overhead); write-locked only during
+    /// file rotation (once per flush cycle).
+    pub(super) data_file: parking_lot::RwLock<SyncFile>,
+
+    /// Flushing file: the previous active file being uploaded to S3.
+    /// Only set during an active flush. Immutable once set
+    /// (no writes, only reads by compute_flush_batch).
+    /// Arc-wrapped so rayon workers can share the reference without holding the Mutex.
+    pub(super) flushing_file: parking_lot::Mutex<Option<Arc<SyncFile>>>,
+
+    /// True while a flush rotation is in progress (between rotate_data_file()
+    /// and flushing file deletion). Used by the read path to avoid reading
+    /// SYNCING blocks from the active file (their data lives in the flushing
+    /// file during flush).
+    pub(super) flushing_active: AtomicBool,
 
     /// Sparse block state map - LOCK-FREE
     /// Combines block state and presence into a single sparse page table.
-    /// State encoding: 0=NotPresent, 1=Clean, 2=Dirty, 3=Syncing
+    /// State encoding: 0=NotPresent, 1=Clean (transient), 2=Dirty, 3=Syncing
     pub(super) state_map: SparseStateMap,
 
     /// Number of blocks (for bounds checking)
@@ -318,43 +323,28 @@ pub(crate) struct CacheInner {
     /// `None` means first upload (unconditional PUT).
     pub(crate) manifest_etag: Mutex<Option<String>>,
 
-    /// Partial block tracking for async sub-block backfill.
-    ///
-    /// Maps block_index → partial block state (bitmap + write lock). A set bit
-    /// means the guest has written to that sub-region (or backfill has filled
-    /// it). Background backfill skips set bits when writing S3 data to SSD.
-    ///
-    /// Entries are transient: inserted when a sub-block write hits a NOT_PRESENT
-    /// block with S3 data, removed when backfill completes (all 32 bits set or
-    /// full block fetched from S3). Hard cap at MAX_PARTIAL_BLOCKS.
-    pub(crate) partial_blocks: DashMap<usize, PartialBlockState>,
 }
 
-/// Per-block state for partial block tracking.
-///
-/// The `write_lock` serializes backfill writes with guest re-pwrites to prevent
-/// a TOCTOU race where backfill reads bitmap (bit=0), a guest marks the bit and
-/// pwrites, then backfill overwrites the guest data with stale S3 data.
-///
-/// Protocol:
-/// - **Backfill**: acquires `write_lock`, re-reads bitmap, writes only unset sub-regions.
-/// - **Guest write**: marks bitmap (atomic, no lock), does main pwrite (no lock),
-///   then acquires `write_lock` and re-pwrites to guarantee guest data wins.
-pub(crate) struct PartialBlockState {
-    pub(crate) bitmap: AtomicU32,
-    pub(crate) write_lock: Mutex<()>,
-}
 
 impl CacheInner {
     /// Get the raw file descriptor of the data file (for io_uring registration).
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     #[inline]
     pub(crate) fn data_file_fd(&self) -> std::os::unix::io::RawFd {
-        self.data_file.as_raw_fd()
+        self.data_file.read().as_raw_fd()
+    }
+
+    /// Write data to the data file via the RwLock'd handle (always correct fd).
+    ///
+    /// Used by the ublk write path — pwrite via the RwLock ensures writes
+    /// always target the current active file, even after file rotation.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[inline]
+    pub(crate) fn pwrite_data_file(&self, data: &[u8], offset: u64) -> std::io::Result<()> {
+        self.data_file.read().write_all_at(data, offset)
     }
 
     /// Check if block is present (lock-free read).
-    #[allow(dead_code)]
     #[inline]
     pub(super) fn is_present(&self, block_num: usize) -> bool {
         if block_num >= self.num_blocks {
@@ -372,35 +362,44 @@ impl CacheInner {
         self.state_map.set_present(block_num);
     }
 
+    /// Try to claim a NOT_PRESENT block (CAS NOT_PRESENT → CLEAN).
+    /// Returns true if this call won the transition.
+    #[inline]
+    pub(super) fn try_set_present(&self, block_num: usize) -> bool {
+        if block_num >= self.num_blocks {
+            return false;
+        }
+        self.state_map.try_set_present(block_num)
+    }
+
     /// CAS loop to transition a block to Dirty state (lock-free).
     ///
-    /// Handles three source states (sparse encoding):
+    /// Handles four source states (sparse encoding):
     /// - **Clean(1) -> Dirty(2)**: increments dirty_block_count.
     /// - **Syncing(3) -> Dirty(2)**: decrements syncing_block_count, increments dirty_block_count.
     /// - **Dirty(2) -> Dirty(2)**: no-op.
+    /// - **NotPresent(0) -> Dirty(2)**: increments dirty_block_count. This
+    ///   handles a race where promote_syncing_blocks copied data and the guest
+    ///   wrote, but the flush thread evicted the block (SYNCING→NOT_PRESENT)
+    ///   before this call. The data is already in the active file.
     ///
-    /// Returns `true` if the state actually changed (CLEAN→DIRTY or
-    /// SYNCING→DIRTY), `false` if the block was already DIRTY. Used by the
-    /// write path to skip redundant WAL entries.
+    /// Returns `true` if the state actually changed, `false` if already DIRTY.
+    /// Used by the write path to skip redundant WAL entries.
     #[inline]
     pub(super) fn transition_to_dirty(&self, idx: usize) -> bool {
         loop {
             let current = self.state_map.get(idx);
 
-            debug_assert_ne!(
-                current,
-                SparseBlockState::NOT_PRESENT,
-                "transition_to_dirty called on NOT_PRESENT block {idx}"
-            );
-
             if current == SparseBlockState::DIRTY {
                 return false;
             }
 
-            if current == SparseBlockState::CLEAN {
+            if current == SparseBlockState::CLEAN
+                || current == SparseBlockState::NOT_PRESENT
+            {
                 if self
                     .state_map
-                    .cas(idx, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
+                    .cas(idx, current, SparseBlockState::DIRTY)
                     .is_ok()
                 {
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
@@ -441,16 +440,17 @@ impl CacheInner {
         }
     }
 
-    /// Atomically finalize a flushed block: CAS SYNCING→CLEAN.
+    /// Atomically evict a flushed block: CAS SYNCING→NOT_PRESENT.
     ///
-    /// Returns true if the CAS succeeded (block is now clean).
-    /// Returns false if a concurrent write transitioned SYNCING→DIRTY,
-    /// meaning the block must be re-flushed in the next cycle.
+    /// After a successful S3 upload, the block data lives in S3 (and optionally
+    /// in the clean cache). The local SSD copy is no longer needed.
+    /// Returns true if the CAS succeeded (block evicted).
+    /// Returns false if a concurrent write transitioned SYNCING→DIRTY.
     #[inline]
-    pub(super) fn transition_syncing_to_clean(&self, idx: usize) -> bool {
+    pub(super) fn transition_syncing_to_not_present(&self, idx: usize) -> bool {
         if self
             .state_map
-            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::CLEAN)
+            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::NOT_PRESENT)
             .is_ok()
         {
             self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
@@ -466,52 +466,101 @@ impl CacheInner {
         self.state_map.count_present()
     }
 
-    // -- Partial block methods (for async sub-block backfill) ------------------
-
-    /// Check if a block is tracked as partial (has incomplete backfill).
-    #[inline]
-    pub(crate) fn is_partial(&self, block_idx: usize) -> bool {
-        self.partial_blocks.contains_key(&block_idx)
-    }
-
-    /// Mark sub-regions as valid in a partial block's bitmap.
+    /// Promote SYNCING blocks from flushing → active file before a guest write.
     ///
-    /// Computes which 4KB sub-regions are covered by the byte range
-    /// [offset_in_block..offset_in_block+len) and sets those bits
-    /// via atomic fetch_or.
-    #[inline]
-    pub(crate) fn mark_sub_regions(&self, block_idx: usize, offset_in_block: usize, len: usize) {
-        if let Some(entry) = self.partial_blocks.get(&block_idx) {
-            let start_sub = offset_in_block / SUB_BLOCK_SIZE;
-            let end_sub = (offset_in_block + len - 1) / SUB_BLOCK_SIZE;
-            let mut mask: u32 = 0;
-            for sub in start_sub..=end_sub {
-                if sub < SUBS_PER_BLOCK {
-                    mask |= 1 << sub;
+    /// When a guest writes to a block being flushed (SYNCING), its pre-rotation
+    /// data lives only in the flushing file. Without promotion, the guest's
+    /// sub-block write lands in the active file but the rest of the block is
+    /// zeros — the block is split across two files.
+    ///
+    /// Promote copies the full block from flushing → active BEFORE the guest
+    /// pwrite, so the active file always has complete data for every DIRTY block.
+    /// After the copy, CAS SYNCING→DIRTY so the flush thread's eviction CAS
+    /// will fail — preventing a race where eviction clears the block between
+    /// promote and the caller's transition_to_dirty.
+    ///
+    /// Idempotent: multiple concurrent promotions of the same block copy the
+    /// same data. The flushing file is immutable after rotation.
+    ///
+    /// Called under the data_file read lock (passed as `df`).
+    pub(super) fn promote_syncing_blocks(
+        &self,
+        df: &SyncFile,
+        start_block: u64,
+        end_block: u64,
+    ) -> std::io::Result<()> {
+        use crate::block::block_map::SparseBlockState;
+
+        let block_size = self.config.block_size as u64;
+        // Clone the flushing file Arc under the lock and release immediately.
+        // The Arc keeps the SyncFile (and its fd) alive even after the flush
+        // thread clears flushing_file and deletes the physical file — Unix
+        // guarantees an unlinked file remains accessible via open fds.
+        //
+        // This avoids holding the Mutex across the entire IO loop (potentially
+        // dozens of pread+pwrite calls), which would block rotate_data_file
+        // and compute_flush_batch from accessing flushing_file.
+        let ff = self.flushing_file.lock().clone();
+        if let Some(ref ff) = ff {
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx >= self.num_blocks {
+                    continue;
+                }
+                let state = self.state_map.get(idx);
+                if state != SparseBlockState::SYNCING
+                    && state != SparseBlockState::NOT_PRESENT
+                {
+                    continue;
+                }
+                let offset = block * block_size;
+                let valid = std::cmp::min(
+                    block_size,
+                    self.config.device_size.saturating_sub(offset),
+                ) as usize;
+                if valid == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; valid];
+                // Propagate both read and write errors. If reading from
+                // the flushing file fails (SSD error), we must not
+                // silently skip promotion — the active file has zeros for
+                // this block, so a sub-block guest write would leave the
+                // non-written portion as zeros instead of the original
+                // data. Failing the write to the guest is safer than
+                // silent data corruption.
+                ff.read_exact_at(&mut buf, offset)?;
+                df.write_all_at(&buf, offset)?;
+                if state == SparseBlockState::SYNCING {
+                    // CAS SYNCING→DIRTY immediately after copying data.
+                    // This prevents the flush thread from evicting the block
+                    // (SYNCING→NOT_PRESENT) between here and the caller's
+                    // transition_to_dirty. If the CAS fails, either another
+                    // writer promoted it first (fine) or flush already evicted
+                    // it (the data we just copied is still valid in active).
+                    if self
+                        .state_map
+                        .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                        .is_ok()
+                    {
+                        self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    // NOT_PRESENT: block was evicted between pre_write (which
+                    // saw SYNCING and skipped backfill) and now. The flushing
+                    // file still has the data. CAS NOT_PRESENT→DIRTY.
+                    if self
+                        .state_map
+                        .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
+                        .is_ok()
+                    {
+                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
-            entry.value().bitmap.fetch_or(mask, Ordering::Release);
         }
-    }
-
-    /// Remove a block from partial tracking (backfill complete).
-    #[inline]
-    pub(crate) fn complete_partial(&self, block_idx: usize) {
-        self.partial_blocks.remove(&block_idx);
-    }
-
-    /// Get the current bitmap for a partial block, or None if not partial.
-    #[inline]
-    pub(crate) fn partial_bitmap(&self, block_idx: usize) -> Option<u32> {
-        self.partial_blocks
-            .get(&block_idx)
-            .map(|entry| entry.value().bitmap.load(Ordering::Acquire))
-    }
-
-    /// Write a sub-region to the data file (for background backfill).
-    #[inline]
-    pub(crate) fn write_sub_region(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
-        self.data_file.write_all_at(data, offset)
+        Ok(())
     }
 
     // -- CRC32 SparseCrcMap methods (for dirty-block corruption detection) -----
@@ -571,12 +620,17 @@ impl CacheInner {
         write_hashed!(&(self.num_blocks as u64).to_le_bytes());
 
         // v4/v5 sparse format: entry_count(u64) + entries of (index u32, state u8).
-        let entry_count = self.state_map.count_present() as u64;
+        // Collect into a Vec first so entry_count is consistent with the
+        // entries written. Without this, a concurrent set_present() between
+        // count_present() and iter_present() could yield more entries than
+        // the header claims, failing CRC on reload.
+        let entries: Vec<(usize, u8)> = self.state_map.iter_present().collect();
+        let entry_count = entries.len() as u64;
         write_hashed!(&entry_count.to_le_bytes());
 
-        for (idx, state) in self.state_map.iter_present() {
-            write_hashed!(&(idx as u32).to_le_bytes());
-            write_hashed!(&[state]);
+        for (idx, state) in &entries {
+            write_hashed!(&(*idx as u32).to_le_bytes());
+            write_hashed!(&[*state]);
         }
 
         // v5: append max_sequence as trailing u64 LE
@@ -627,27 +681,6 @@ impl CacheInner {
     /// Persist block states and presence.
     pub(super) fn save_metadata(&self) -> Result<(), CacheError> {
         self.save_block_states()
-    }
-
-    /// Collect partial WAL entries for re-appending after WAL truncation.
-    ///
-    /// Checkpoint truncates the WAL (entries are persisted in metadata).
-    /// But partial block bitmaps live only in the WAL — without this,
-    /// a crash after checkpoint would lose partial block tracking and the
-    /// flush path could upload garbage sub-regions.
-    ///
-    /// Returns `(block_index, sequence, bitmap)` tuples for use with
-    /// `Wal::truncate_and_reappend()`.
-    pub(super) fn collect_partial_entries(&self) -> Vec<(u64, u64, u32)> {
-        self.partial_blocks
-            .iter()
-            .map(|entry| {
-                let block_idx = *entry.key() as u64;
-                let bitmap = entry.value().bitmap.load(Ordering::Acquire);
-                let seq = self.sequence.next();
-                (block_idx, seq, bitmap)
-            })
-            .collect()
     }
 
     /// Load block states and presence from metadata file.

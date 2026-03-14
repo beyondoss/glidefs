@@ -34,7 +34,7 @@ fn write_blocks(
     start: usize,
     count: usize,
     seed: u8,
-    clean_cache: &dyn glidefs::block::cache::BlockCache,
+    _clean_cache: &dyn glidefs::block::cache::BlockCache,
 ) {
     for i in 0..count {
         let offset = (start + i) * BLOCK_SIZE;
@@ -45,7 +45,7 @@ fn write_blocks(
         for (b, byte) in data.iter_mut().enumerate().take(BLOCK_SIZE).skip(3) {
             *byte = ((i + b) % 256) as u8;
         }
-        cache.write(offset as u64, &data, clean_cache).unwrap();
+        cache.write(offset as u64, &data).unwrap();
     }
 }
 
@@ -111,7 +111,7 @@ async fn test_sync_manifest_does_not_create_snapshots() {
     write_blocks(&cache, 0, 3, 1, cc.as_ref());
 
     // flush_packs + sync_manifest (the background flush path)
-    let (_stats, _seq) = cache.flush_packs(&cs, &pack_index_cache, &volume_manifest).await.unwrap();
+    let (_stats, _seq) = cache.flush_packs(&cs, &pack_index_cache, &volume_manifest, None).await.unwrap();
     cache.sync_manifest(&cs, &volume_manifest).await.unwrap();
 
     // No snapshot should be created by sync_manifest
@@ -1033,7 +1033,7 @@ async fn test_zero_overwrite_cold_reader_sees_zeros() {
     for i in 0..3 {
         let offset = i * BLOCK_SIZE;
         cache
-            .write(offset as u64, &vec![0u8; BLOCK_SIZE], cc.as_ref())
+            .write(offset as u64, &vec![0u8; BLOCK_SIZE])
             .unwrap();
     }
     cache
@@ -2043,7 +2043,7 @@ async fn test_snapshot_gc_race() {
 async fn test_snapshot_manifest_growth() {
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
-    let (cache, cs, pack_index_cache, volume_manifest, cc, _m) =
+    let (cache, cs, pack_index_cache, volume_manifest, _cc, _m) =
         create_test_cache(&dir, "vm1", Arc::clone(&s3)).await;
 
     let mut sequences = Vec::new();
@@ -2055,7 +2055,7 @@ async fn test_snapshot_manifest_growth() {
         let offset = (round as usize % 3) * BLOCK_SIZE;
         let mut data = vec![0u8; BLOCK_SIZE];
         data[0..2].copy_from_slice(&round.to_le_bytes());
-        cache.write(offset as u64, &data, cc.as_ref()).unwrap();
+        cache.write(offset as u64, &data).unwrap();
 
         let snap = cache
             .snapshot(&cs, &pack_index_cache, &volume_manifest)

@@ -86,7 +86,7 @@ fn main() {
     println!();
 
     let tmp = tempfile::tempdir().expect("tempdir failed");
-    let clean_cache = Arc::new(SimpleBlockCache::new(1)); // minimal
+    let _clean_cache = Arc::new(SimpleBlockCache::new(1)); // minimal
 
     // Baseline
     let rss_before = rss_mb();
@@ -142,7 +142,7 @@ fn main() {
             let block_idx = (j * stride) % num_blocks;
             let offset = block_idx as u64 * BLOCK_SIZE as u64;
             cache
-                .write(offset, &write_buf, clean_cache.as_ref())
+                .write(offset, &write_buf)
                 .unwrap();
         }
     }

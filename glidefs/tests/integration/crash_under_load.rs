@@ -62,6 +62,7 @@ impl CrashingObjectStore {
         }
     }
 
+    #[allow(dead_code)]
     fn has_crashed(&self) -> bool {
         self.crashed.load(Ordering::SeqCst)
     }
@@ -144,6 +145,7 @@ fn test_config(dir: &TempDir, name: &str) -> WriteCacheConfig {
         device_size: DEVICE_SIZE,
         block_size: BLOCK_SIZE,
         wal_sync: true, // production-grade: every write is durable on SSD
+       
     }
 }
 
@@ -159,8 +161,8 @@ fn make_block_data(writer_id: u8, block_index: u32, generation: u32) -> Vec<u8> 
     data[5..9].copy_from_slice(&generation.to_le_bytes());
     // Fill rest with a deterministic pattern based on header
     let seed = (writer_id as u32) ^ block_index ^ generation;
-    for i in 9..BLOCK_SIZE {
-        data[i] = ((seed.wrapping_mul(i as u32).wrapping_add(7)) & 0xFF) as u8;
+    for (i, byte) in data.iter_mut().enumerate().take(BLOCK_SIZE).skip(9) {
+        *byte = ((seed.wrapping_mul(i as u32).wrapping_add(7)) & 0xFF) as u8;
     }
     data
 }
@@ -191,6 +193,7 @@ async fn test_crash_mid_flush_concurrent_writers_no_data_loss() {
     let config = test_config(&temp_dir, "crash_load");
 
     // Track every successful write: block_index → (writer_id, generation, data)
+    #[allow(clippy::type_complexity)]
     let write_log: Arc<Mutex<HashMap<u32, (u8, u32, Vec<u8>)>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -212,7 +215,7 @@ async fn test_crash_mid_flush_concurrent_writers_no_data_loss() {
                     ((writer_id as u32) * blocks_per_writer + iteration) % num_blocks;
                 let data = make_block_data(writer_id, block_idx, iteration);
                 let offset = block_idx as u64 * BLOCK_SIZE as u64;
-                cache.write(offset, &data, clean_cache.as_ref()).unwrap();
+                cache.write(offset, &data).unwrap();
                 write_log
                     .lock()
                     .insert(block_idx, (writer_id, iteration, data));
@@ -241,7 +244,7 @@ async fn test_crash_mid_flush_concurrent_writers_no_data_loss() {
         let mut writers = JoinSet::new();
         for writer_id in 0..num_writers {
             let cache = Arc::clone(&cache);
-            let clean_cache = Arc::clone(&clean_cache);
+            let _clean_cache = Arc::clone(&clean_cache);
             let write_log = Arc::clone(&write_log);
 
             writers.spawn(async move {
@@ -251,7 +254,7 @@ async fn test_crash_mid_flush_concurrent_writers_no_data_loss() {
                     let data = make_block_data(writer_id, block_idx, iteration);
                     let offset = block_idx as u64 * BLOCK_SIZE as u64;
 
-                    cache.write(offset, &data, clean_cache.as_ref()).unwrap();
+                    cache.write(offset, &data).unwrap();
 
                     write_log
                         .lock()
@@ -350,13 +353,13 @@ async fn test_crash_recover_then_flush_to_s3() {
         let crash_s3 = Arc::new(CrashingObjectStore::new(0));
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.skip_recovery_for_test();
-        let clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
+        let _clean_cache = SimpleBlockCache::new(64 * 1024 * 1024);
 
         // Write 20 blocks
         for i in 0..20u32 {
             let data = make_block_data(0, i, 0);
             cache
-                .write(i as u64 * BLOCK_SIZE as u64, &data, &clean_cache)
+                .write(i as u64 * BLOCK_SIZE as u64, &data)
                 .unwrap();
             expected_blocks.insert(i, data);
         }
@@ -409,7 +412,7 @@ async fn test_crash_recover_then_flush_to_s3() {
         let (cold_cache, content_store, pack_index_cache, volume_manifest, clean_cache, metrics) =
             super::create_cold_reader(&cold_dir, "crash_then_s3", Arc::clone(&s3_backend)).await;
 
-        for (&block_idx, _expected) in &expected_blocks {
+        for &block_idx in expected_blocks.keys() {
             let data = cold_cache
                 .read(
                     block_idx as u64 * BLOCK_SIZE as u64,
@@ -456,7 +459,7 @@ async fn test_wal_only_recovery_under_concurrent_load() {
         let mut writers = JoinSet::new();
         for writer_id in 0..num_writers {
             let cache = Arc::clone(&cache);
-            let clean_cache = Arc::clone(&clean_cache);
+            let _clean_cache = Arc::clone(&clean_cache);
             let write_log = Arc::clone(&write_log);
 
             writers.spawn(async move {
@@ -466,7 +469,7 @@ async fn test_wal_only_recovery_under_concurrent_load() {
                     let data = make_block_data(writer_id, block_idx, iteration);
                     let offset = block_idx as u64 * BLOCK_SIZE as u64;
 
-                    cache.write(offset, &data, clean_cache.as_ref()).unwrap();
+                    cache.write(offset, &data).unwrap();
                     write_log.lock().insert(block_idx, data);
                 }
             });

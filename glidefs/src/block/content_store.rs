@@ -159,6 +159,7 @@ impl ContentStore {
     }
 
     /// Download a manifest from S3. Returns `(data, etag)` or None if not found.
+    #[allow(clippy::type_complexity)]
     #[instrument(skip(self), fields(name = %name))]
     pub async fn get_manifest(
         &self,

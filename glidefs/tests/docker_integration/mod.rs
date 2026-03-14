@@ -919,6 +919,7 @@ impl TestServer {
 // Test modules (declared after macro so transport_test! is in scope)
 // ---------------------------------------------------------------------------
 
+mod bottomless;
 mod cold_wake;
 mod concurrent;
 mod data_integrity;

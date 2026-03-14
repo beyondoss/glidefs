@@ -41,7 +41,7 @@ impl Code for CachedPackIndex {
     fn encode(&self, writer: &mut impl std::io::Write) -> foyer::Result<()> {
         let raw = extent_encode(&self.0);
         let compressed =
-            zstd::bulk::compress(&raw, 1).map_err(|e| foyer::Error::io_error(e))?;
+            zstd::bulk::compress(&raw, 1).map_err(foyer::Error::io_error)?;
         writer
             .write_all(&compressed)
             .map_err(foyer::Error::io_error)
@@ -56,7 +56,7 @@ impl Code for CachedPackIndex {
             .read_to_end(&mut compressed)
             .map_err(foyer::Error::io_error)?;
         let raw = zstd::bulk::decompress(&compressed, 1024 * 1024)
-            .map_err(|e| foyer::Error::io_error(e))?;
+            .map_err(foyer::Error::io_error)?;
         extent_decode(&raw)
             .map(CachedPackIndex)
             .ok_or_else(|| foyer::Error::io_error(
@@ -148,6 +148,7 @@ impl PackIndexCache {
     }
 
     /// Close the cache, releasing file descriptors and flushing SSD state.
+    #[allow(dead_code)]
     pub async fn close(&self) -> anyhow::Result<()> {
         self.inner.close().await.map_err(Into::into)
     }

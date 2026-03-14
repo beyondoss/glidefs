@@ -43,17 +43,19 @@ struct FlushResult {
 /// exponential backoff, records error metric.
 ///
 /// Returns `Some(result)` on flush success, `None` on flush failure.
+#[allow(clippy::too_many_arguments)]
 async fn flush_and_sync(
     cache: &WriteCache<Active>,
     content_store: &ContentStore,
     pack_index_cache: &Arc<PackIndexCache>,
     volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
+    clean_cache: &Arc<dyn BlockCache>,
     metrics: &ExportMetrics,
     flush_backoff: &mut Duration,
     last_flush_failure: &mut Option<tokio::time::Instant>,
 ) -> Option<FlushResult> {
     match cache
-        .flush_packs(content_store, pack_index_cache, volume_manifest)
+        .flush_packs(content_store, pack_index_cache, volume_manifest, Some(clean_cache))
         .await
     {
         Ok((stats, _seq_cutpoint)) => {
@@ -165,10 +167,20 @@ pub async fn flush_scheduler(
             biased;
 
             // Shutdown takes priority.
-            Ok(()) = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    info!("flush scheduler: shutting down");
-                    return;
+            result = shutdown.changed() => {
+                match result {
+                    Ok(()) if *shutdown.borrow() => {
+                        info!("flush scheduler: shutting down");
+                        return;
+                    }
+                    Err(_) => {
+                        // Sender dropped (e.g., ExportRouter dropped without clean
+                        // shutdown). Exit immediately to avoid zombie schedulers
+                        // that corrupt WAL/metadata files of a replacement server.
+                        info!("flush scheduler: sender dropped, exiting");
+                        return;
+                    }
+                    _ => {} // spurious wakeup with value still false
                 }
             }
 
@@ -178,8 +190,8 @@ pub async fn flush_scheduler(
                 if flush_backoff > Duration::ZERO {
                     tokio::select! {
                         biased;
-                        Ok(()) = shutdown.changed() => {
-                            if *shutdown.borrow() {
+                        result = shutdown.changed() => {
+                            if result.is_err() || *shutdown.borrow() {
                                 info!("flush scheduler: shutting down during backoff");
                                 return;
                             }
@@ -204,7 +216,7 @@ pub async fn flush_scheduler(
                     let _flush_guard = cache.flush_lock().lock().await;
                     if let Some(result) = flush_and_sync(
                         &cache, &content_store, &pack_index_cache, &volume_manifest,
-                        &metrics, &mut flush_backoff, &mut last_flush_failure,
+                        &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
                     ).await {
                         metrics.record_s3_put_latency(start.elapsed());
                         packs_uploaded = result.packs_uploaded;
@@ -288,6 +300,15 @@ pub async fn flush_scheduler(
                             info!("deferred manifest sync succeeded");
                             manifest_pending = false;
                             metrics.record_manifest_synced();
+                            metrics.set_manifest_pending(false);
+                            // Checkpoint now: persist CLEAN block states and
+                            // truncate the WAL. Without this, blocks that were
+                            // flushed to S3 remain DIRTY in the .meta file and
+                            // WAL entries are never truncated. On recovery,
+                            // those blocks would be unnecessarily re-uploaded.
+                            if let Err(e) = cache.local_checkpoint().await {
+                                warn!(error = %e, "checkpoint after deferred manifest sync");
+                            }
                         }
                         Err(e) => {
                             metrics.record_manifest_sync_error();
@@ -307,7 +328,7 @@ pub async fn flush_scheduler(
                         let _flush_guard = cache.flush_lock().lock().await;
                         if let Some(result) = flush_and_sync(
                             &cache, &content_store, &pack_index_cache, &volume_manifest,
-                            &metrics, &mut flush_backoff, &mut last_flush_failure,
+                            &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
                         ).await
                             && result.packs_uploaded > 0 {
                             manifest_pending = !result.manifest_synced;
@@ -625,7 +646,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xAA; 128 * 1024], clean_cache.as_ref())
+                .write(offset, &[0xAA; 128 * 1024])
                 .unwrap();
         }
         assert_eq!(
@@ -695,7 +716,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xBB; 128 * 1024], clean_cache.as_ref())
+                .write(offset, &[0xBB; 128 * 1024])
                 .unwrap();
         }
 
@@ -777,13 +798,13 @@ mod tests {
         let metrics_check = Arc::clone(&metrics);
         let cache_check = Arc::clone(&cache);
         let flush_notify_clone = Arc::clone(&flush_notify);
-        let clean_cache_check = Arc::clone(&clean_cache);
+        let _clean_cache_check = Arc::clone(&clean_cache);
 
         // Write dirty blocks
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xCC; 128 * 1024], clean_cache.as_ref())
+                .write(offset, &[0xCC; 128 * 1024])
                 .unwrap();
         }
 
@@ -825,7 +846,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache_check
-                .write(offset, &[0xDD; 128 * 1024], clean_cache_check.as_ref())
+                .write(offset, &[0xDD; 128 * 1024])
                 .unwrap();
         }
 
@@ -867,7 +888,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xEE; 128 * 1024], clean_cache.as_ref())
+                .write(offset, &[0xEE; 128 * 1024])
                 .unwrap();
         }
 
@@ -935,7 +956,7 @@ mod tests {
         for i in 0..DEFAULT_BLOCKS_PER_PACK {
             let offset = i as u64 * 128 * 1024;
             cache
-                .write(offset, &[0xFF; 128 * 1024], clean_cache.as_ref())
+                .write(offset, &[0xFF; 128 * 1024])
                 .unwrap();
         }
         assert_eq!(
