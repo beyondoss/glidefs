@@ -2320,3 +2320,199 @@ async fn test_cold_wake_stress_concurrent_writes() {
         );
     }
 }
+
+// =============================================================================
+// AUDIT: C1 — Flushing file deleted before manifest sync
+// =============================================================================
+
+/// Prove: when pack uploads succeed but manifest sync fails, crash recovery
+/// loses block data because the flushing file was already deleted.
+///
+/// Sequence:
+/// 1. Write known data to blocks
+/// 2. flush_packs succeeds (packs on S3, blocks evicted, flushing file deleted)
+/// 3. sync_manifest fails (manifest not on S3)
+/// 4. Simulate crash (drop everything)
+/// 5. Reopen cache from same directory
+/// 6. Read blocks — should contain original data, but contains zeros (BUG)
+///
+/// This test SHOULD FAIL until the fix is applied.
+#[tokio::test]
+async fn test_c1_flushing_file_deleted_before_manifest_sync_causes_data_loss() {
+    let s3 = Arc::new(ManifestFailingObjectStore::new());
+    let dir = TempDir::new().unwrap();
+    let cache_dir = dir.path().to_path_buf();
+
+    let config = WriteCacheConfig {
+        cache_dir: cache_dir.clone(),
+        device_name: "c1-test".to_string(),
+        device_size: DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: false,
+    };
+
+    let content_store = ContentStore::new(
+        Arc::clone(&s3) as Arc<dyn ObjectStore>,
+        "test",
+    );
+    let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        DEVICE_SIZE,
+        BLOCK_SIZE as u32,
+    )));
+
+    let cache = WriteCache::open(config.clone()).expect("open cache");
+    let cache = cache.skip_recovery_for_test();
+
+    // Step 1: Write known data pattern (0xAA) to 5 blocks.
+    let original_data = vec![0xAA; BLOCK_SIZE];
+    for i in 0..5u64 {
+        cache.write(i * BLOCK_SIZE as u64, &original_data).unwrap();
+    }
+    assert_eq!(cache.dirty_block_count(), 5);
+
+    // Verify data is readable before flush.
+    let pre_flush = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert_eq!(pre_flush[0], 0xAA, "data should be readable before flush");
+
+    // Persist metadata so .meta reflects dirty blocks. In production, the
+    // checkpoint timer (5s) does this periodically. Without this, recovery
+    // won't know the blocks exist.
+    cache.checkpoint().await.unwrap();
+
+    // Step 2: flush_packs — packs upload to S3, blocks evicted, flushing file deleted.
+    let (stats, _seq) = cache
+        .flush_packs(&content_store, &pack_index_cache, &volume_manifest, None)
+        .await
+        .expect("flush_packs should succeed (multipart uploads work)");
+    assert!(stats.packs_uploaded > 0, "packs should have been uploaded");
+
+    // At this point: blocks are NOT_PRESENT, flushing file is deleted,
+    // in-memory VolumeManifest knows about the packs.
+    assert_eq!(cache.dirty_block_count(), 0, "blocks should be evicted");
+
+    // Step 3: sync_manifest fails because manifest PUTs fail.
+    s3.set_fail_manifest(true);
+    let manifest_result = cache.sync_manifest(&content_store, &volume_manifest).await;
+    assert!(manifest_result.is_err(), "manifest sync should fail");
+
+    // No checkpoint ran (sync_manifest checkpoints on success only).
+    // .meta still has the pre-flush state (DIRTY blocks).
+
+    // Step 4: Simulate crash — drop everything.
+    drop(cache);
+
+    // Step 5: Reopen cache from same directory.
+    let recovered = WriteCache::<Initializing>::open(config).expect("reopen cache");
+    let recovered = recovered.finish_recovery().await.expect("recovery");
+
+    // Step 6: Read blocks — they MUST contain 0xAA. If they contain 0x00,
+    // data was lost because the flushing file was deleted before manifest sync.
+    let block0 = recovered.read_local(0, BLOCK_SIZE).unwrap();
+    assert_eq!(
+        block0[0], 0xAA,
+        "C1 BUG: block 0 data lost after manifest sync failure + crash. \
+         Expected 0xAA but got 0x{:02X}. The flushing file was deleted before \
+         the manifest reached S3, so recovery has no source for the block data.",
+        block0[0],
+    );
+
+    for i in 1..5u64 {
+        let block = recovered.read_local(i * BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        assert_eq!(
+            block[0], 0xAA,
+            "C1 BUG: block {i} data lost (got 0x{:02X})",
+            block[0],
+        );
+    }
+}
+
+// =============================================================================
+// AUDIT: C2 — Flush error recovery marks block dirty on flushing file read failure
+// =============================================================================
+
+/// Prove: when flush fails and error recovery can't read from the flushing file,
+/// the block is incorrectly marked DIRTY with zeros in the active file.
+///
+/// Sequence:
+/// 1. Write known data to blocks
+/// 2. Start flush (rotation happens, blocks CAS'd to SYNCING)
+/// 3. S3 upload fails (flush_dirty_body returns Err)
+/// 4. Error recovery tries to copy from flushing→active
+/// 5. Delete the flushing file before recovery reads it (simulating I/O error)
+/// 6. Recovery marks block DIRTY despite active file having zeros
+/// 7. Read returns zeros — data lost
+///
+/// We can't easily inject a read error on the flushing file, but we CAN test
+/// the observable consequence: after a failed flush, the data must be intact
+/// and readable regardless of what happened during error recovery.
+#[tokio::test]
+async fn test_c2_flush_error_recovery_preserves_data() {
+    let s3 = Arc::new(FinishFailingObjectStore::new());
+    let dir = TempDir::new().unwrap();
+
+    let config = WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "c2-test".to_string(),
+        device_size: DEVICE_SIZE,
+        block_size: BLOCK_SIZE,
+        wal_sync: false,
+    };
+
+    let content_store = ContentStore::new(
+        Arc::clone(&s3) as Arc<dyn ObjectStore>,
+        "test",
+    );
+    let pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        DEVICE_SIZE,
+        BLOCK_SIZE as u32,
+    )));
+
+    let cache = WriteCache::open(config).expect("open cache");
+    let cache = cache.skip_recovery_for_test();
+
+    // Write known data.
+    let original_data = vec![0xBB; BLOCK_SIZE];
+    for i in 0..5u64 {
+        cache.write(i * BLOCK_SIZE as u64, &original_data).unwrap();
+    }
+    assert_eq!(cache.dirty_block_count(), 5);
+
+    // Enable multipart completion failure — flush will fail after rotation
+    // but during pack upload (complete() fails).
+    s3.set_fail_finish(true);
+
+    let result = cache
+        .flush_packs(&content_store, &pack_index_cache, &volume_manifest, None)
+        .await;
+    assert!(result.is_err(), "flush should fail (multipart complete fails)");
+
+    // After failed flush, blocks should still be dirty.
+    assert_eq!(
+        cache.dirty_block_count(),
+        5,
+        "blocks should be re-dirtied after flush failure"
+    );
+
+    // Critical check: data must still be readable and correct.
+    for i in 0..5u64 {
+        let block = cache.read_local(i * BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
+        assert_eq!(
+            block[0], 0xBB,
+            "C2 BUG: block {i} data corrupted after flush failure recovery. \
+             Expected 0xBB but got 0x{:02X}. Error recovery failed to preserve \
+             block data when copying from flushing file to active file.",
+            block[0],
+        );
+    }
+
+    // Now disable failures and verify the full cycle works.
+    s3.set_fail_finish(false);
+
+    let (stats, _) = cache
+        .flush_packs(&content_store, &pack_index_cache, &volume_manifest, None)
+        .await
+        .expect("retry flush should succeed");
+    assert!(stats.packs_uploaded > 0);
+}

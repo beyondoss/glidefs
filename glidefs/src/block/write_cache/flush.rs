@@ -500,6 +500,18 @@ impl WriteCache<Active> {
     ) -> Result<(FlushStats, u64), CacheError> {
         let seq_cutpoint = self.inner.sequence.current();
 
+        // Guard: if a flushing file exists on disk from a previous flush whose
+        // manifest hasn't been synced + checkpointed yet, skip this flush cycle.
+        // Rotation would rename active → flushing, overwriting the old flushing
+        // file and destroying the crash-safety net for the previous flush's
+        // blocks. The scheduler retries manifest sync on the checkpoint timer;
+        // once that succeeds and checkpoint deletes the flushing file, the next
+        // flush cycle can proceed.
+        if self.inner.config.flushing_path().exists() {
+            debug!("flush: flushing file still exists (pending manifest sync), skipping");
+            return Ok((FlushStats::default(), seq_cutpoint));
+        }
+
         // Compute CRC baselines from the active file BEFORE rotation.
         // These are verified against the flushing file after rotation.
         let inner_clone = Arc::clone(&self.inner);
@@ -581,22 +593,38 @@ impl WriteCache<Active> {
                     ) as usize;
                     if valid_bytes > 0 {
                         let mut buf = vec![0u8; valid_bytes];
-                        if ff.read_exact_at(&mut buf, offset).is_ok() {
-                            if let Err(e) = df.write_all_at(&buf, offset) {
-                                // Cannot copy block to active file. Leave it
+                        match ff.read_exact_at(&mut buf, offset) {
+                            Ok(()) => {
+                                if let Err(e) = df.write_all_at(&buf, offset) {
+                                    // Cannot copy block to active file. Leave it
+                                    // SYNCING — crash recovery will handle it.
+                                    // Do NOT mark dirty: the active file has zeros.
+                                    warn!(
+                                        block = idx,
+                                        error = %e,
+                                        "pwrite to active file failed during flush \
+                                         recovery — block left SYNCING"
+                                    );
+                                    continue;
+                                }
+                                recovered.push(idx);
+                            }
+                            Err(e) => {
+                                // Cannot read block from flushing file. Leave it
                                 // SYNCING — crash recovery will handle it.
                                 // Do NOT mark dirty: the active file has zeros.
                                 warn!(
                                     block = idx,
                                     error = %e,
-                                    "pwrite to active file failed during flush \
+                                    "pread from flushing file failed during flush \
                                      recovery — block left SYNCING"
                                 );
                                 continue;
                             }
                         }
+                    } else {
+                        recovered.push(idx);
                     }
-                    recovered.push(idx);
                 }
             } else {
                 // No flushing file — blocks not in SYNCING were already
@@ -866,18 +894,19 @@ impl WriteCache<Active> {
             }
         }
 
-        // Drop flushing file handle and delete the file.
-        // Clear flushing_active and rotation_seq BEFORE dropping the file so
+        // Drop flushing file handle but keep the file on disk.
+        //
+        // The flushing file is the crash-safety net for the window between
+        // pack upload and manifest sync + checkpoint. If the host crashes
+        // before the manifest reaches S3 and checkpoint persists block states,
+        // recovery uses the flushing file to restore block data. The file is
+        // deleted by checkpoint() after block states are durably persisted.
+        //
+        // Clear flushing_active and rotation_seq BEFORE dropping the handle so
         // resolve_read_plan re-enables LocalSsd only after cleanup is complete.
         self.inner.flushing_active.store(false, Ordering::Release);
         self.inner.rotation_seq.store(0, Ordering::Release);
         drop(self.inner.flushing_file.lock().take());
-        let flushing_path = self.inner.config.flushing_path();
-        if flushing_path.exists()
-            && let Err(e) = std::fs::remove_file(&flushing_path)
-        {
-            warn!(error = %e, "failed to remove flushing file");
-        }
 
         info!(
             blocks_claimed = total_stats.blocks_claimed,
@@ -930,6 +959,15 @@ impl WriteCache<Active> {
             .await?;
         *self.inner.manifest_etag.lock() = new_etag;
         self.checkpoint().await?;
+        // Manifest synced and checkpoint persisted — the flushing file is no
+        // longer needed as a crash-safety net. Delete it so the next flush
+        // cycle can rotate the data file.
+        let flushing_path = self.inner.config.flushing_path();
+        if flushing_path.exists() {
+            if let Err(e) = std::fs::remove_file(&flushing_path) {
+                warn!(error = %e, "failed to remove flushing file after manifest sync");
+            }
+        }
         Ok(())
     }
 
@@ -992,6 +1030,13 @@ impl WriteCache<Active> {
             return Err(e.into());
         }
         self.checkpoint().await?;
+        // Manifest synced and checkpoint persisted — delete the flushing file.
+        let flushing_path = self.inner.config.flushing_path();
+        if flushing_path.exists() {
+            if let Err(e) = std::fs::remove_file(&flushing_path) {
+                warn!(error = %e, "failed to remove flushing file after flush_to_s3");
+            }
+        }
         Ok(stats)
     }
 
@@ -1049,6 +1094,13 @@ impl WriteCache<Active> {
         };
 
         self.checkpoint().await?;
+        // Manifest synced and checkpoint persisted — delete the flushing file.
+        let flushing_path = self.inner.config.flushing_path();
+        if flushing_path.exists() {
+            if let Err(e) = std::fs::remove_file(&flushing_path) {
+                warn!(error = %e, "failed to remove flushing file after snapshot");
+            }
+        }
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,

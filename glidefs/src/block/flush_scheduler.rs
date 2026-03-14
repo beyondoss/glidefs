@@ -270,6 +270,40 @@ pub async fn flush_scheduler(
                     None => None,
                 };
 
+                // If a previous flush's manifest hasn't been synced yet, retry
+                // that sync before starting a new flush cycle. The flushing file
+                // from the previous flush is kept on disk as a crash-safety net
+                // until checkpoint (after manifest sync) deletes it. Starting a
+                // new flush would rotate the data file, overwriting the flushing
+                // file and destroying that safety net.
+                if manifest_pending {
+                    let _flush_guard = cache.flush_lock().lock().await;
+                    match cache.sync_manifest(&content_store, &volume_manifest).await {
+                        Ok(()) => {
+                            info!("deferred manifest sync succeeded (flush_notify path)");
+                            manifest_pending = false;
+                            metrics.record_manifest_synced();
+                            metrics.set_manifest_pending(false);
+                            if let Err(e) = cache.checkpoint().await {
+                                warn!(error = %e, "checkpoint after deferred manifest sync");
+                            }
+                        }
+                        Err(e) if e.is_manifest_conflict() => {
+                            tracing::error!(
+                                "manifest ETag conflict — another host owns this export, \
+                                 stopping flush scheduler"
+                            );
+                            metrics.record_manifest_sync_error();
+                            return;
+                        }
+                        Err(e) => {
+                            metrics.record_manifest_sync_error();
+                            warn!(error = %e, "deferred manifest sync retry failed (flush_notify path)");
+                        }
+                    }
+                    continue;
+                }
+
                 // Acquire per-export flush lock to serialize with concurrent
                 // drain/snapshot operations. Prevents stale manifest uploads.
                 {
