@@ -894,15 +894,14 @@ impl TestServer {
     /// they detect the dropped shutdown channel. Data remains on the SSD
     /// for WAL recovery by the next server instance.
     pub async fn crash_shutdown(self) {
+        // Shut down the router first so flush schedulers release cache file
+        // handles. In a real crash the process dies and the OS closes
+        // everything; in a test we need to clean up explicitly or the old
+        // scheduler races with the new server opening the same files.
+        let _ = self.router.shutdown().await;
         self.shutdown.cancel();
         self._server_handle.abort();
         let _ = self._server_handle.await;
-        // self is consumed here — router Arc drops, ExportState drops,
-        // flush_shutdown_tx channels close. Brief sleep to let flush
-        // schedulers on other threads observe the close and exit,
-        // releasing their data file handles.
-        drop(self.router);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     /// Drain all exports and shut down gracefully.
