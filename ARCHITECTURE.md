@@ -782,9 +782,9 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 
 | Failure | What Actually Happens | Recovery |
 |---------|----------------------|---------|
-| S3 PUT fails during flush | Blocks stay SYNCING in flushing file. Exponential backoff (1s → 30s max). Manifest sync skipped. Checkpoint still runs (prevents WAL growth). | Retry on next checkpoint tick (5s) or next flush trigger. Blocks are not lost — WAL + SSD preserve them. |
+| S3 PUT fails during flush | Blocks stay SYNCING in flushing file. Exponential backoff (1s → 30s max). Manifest sync skipped. Checkpoint still runs (prevents WAL growth). | Retry on next checkpoint fire (5s interval, demand-driven) or next flush trigger. Blocks are not lost — WAL + SSD preserve them. |
 | S3 GET fails during read | Guest receives EIO. Block stays NOT_PRESENT. No retry in read path. | Next read attempt retries S3. Circuit breaker opens after 5 consecutive failures → fast-fail for 30s. |
-| Manifest PUT fails after pack upload | Packs are orphaned in S3 (uploaded but not referenced). `manifest_pending` flag set. | Retry on next 5s checkpoint tick. On drain/snapshot: 3 retries with exponential backoff. GC grace period (24h) prevents premature deletion of orphaned packs. |
+| Manifest PUT fails after pack upload | Packs are orphaned in S3 (uploaded but not referenced). `manifest_pending` flag set. | Retry on next checkpoint fire (5s interval, active while manifest pending). On drain/snapshot: 3 retries with exponential backoff. GC grace period (24h) prevents premature deletion of orphaned packs. |
 | SSD full (>95%) | New-block writes rejected with ENOSPC. Overwrites succeed. At 90%: pressure-flush dirtiest exports every 5s. | Automatic: pressure-flush frees SSD space. Normal mode resumes when utilization drops below 80%. |
 | WAL append fails | Write returns error to guest. Block state changes are not committed. | Guest retries the write. If SSD is the issue, capacity monitor will pressure-flush. |
 | Crash mid-flush (flushing file exists) | On restart: `load_metadata()` converts SYNCING→DIRTY. Dirty block data copied from flushing file to active file. Flushing file deleted. | Automatic. All blocks re-flushed on next cycle. Packs uploaded before crash may be orphaned — GC cleans them after grace period. |
@@ -821,7 +821,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/write_cache/inner.rs` | `CacheInner`: shared state (data file, state map, WAL, sequence, CRC map) |
 | `block/write_cache/recovery.rs` | Crash recovery: Syncing→Dirty on startup |
 | `block/state.rs` | Typestate marker structs: `Initializing`, `Recovering`, `Active`, `Draining` (compile-time I/O gating) |
-| `block/flush_scheduler.rs` | Per-export flush scheduling: event-driven (dirty count threshold), periodic checkpoint (5s) |
+| `block/flush_scheduler.rs` | Per-export flush scheduling: event-driven (dirty count threshold), demand-driven checkpoint (5s interval, only active when dirty/manifest pending — idle exports consume zero timer resources) |
 | `block/wal.rs` | Append-only WAL with CRC32 per entry; O_APPEND for lock-free concurrent appends; RwLock for truncation |
 
 ### Storage Formats
