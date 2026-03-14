@@ -97,6 +97,10 @@ pub struct ExportInfo {
     pub readonly: bool,
     pub transport: String,
     pub device: Option<PathBuf>,
+    /// Unflushed bytes waiting to be synced to S3.
+    pub dirty_bytes: u64,
+    /// Total logical bytes stored in S3 (chunks × chunk_size).
+    pub s3_bytes: u64,
 }
 
 /// Readiness check result for health endpoint.
@@ -1070,6 +1074,29 @@ impl ExportRouter {
             .map_err(RouterError::ContentStore)
     }
 
+    /// Get info for a single export.
+    pub async fn get_export_info(&self, name: &str) -> Option<ExportInfo> {
+        let mut info = {
+            let exports = self.exports.read().await;
+            let state = exports.get(name)?;
+            let block_size = state.cache.block_size() as u64;
+            let manifest = state.volume_manifest.read();
+            let s3_bytes = manifest.chunks.len() as u64 * manifest.chunk_size;
+            drop(manifest);
+            ExportInfo {
+                name: name.to_string(),
+                size: state.handler.device_size(),
+                readonly: state.readonly,
+                transport: state.transport.clone(),
+                device: None,
+                dirty_bytes: state.cache.dirty_block_count() * block_size,
+                s3_bytes,
+            }
+        };
+        info.device = self.get_device_path(name).await;
+        Some(info)
+    }
+
     /// Get handler for an export (used during NBD negotiation).
     pub async fn get_handler(&self, name: &str) -> Option<Arc<BlockHandler>> {
         let exports = self.exports.read().await;
@@ -1088,12 +1115,18 @@ impl ExportRouter {
         let exports = self.exports.read().await;
         let mut result: Vec<ExportInfo> = exports
             .iter()
-            .map(|(name, state)| ExportInfo {
-                name: name.clone(),
-                size: state.handler.device_size(),
-                readonly: state.readonly,
-                transport: state.transport.clone(),
-                device: None,
+            .map(|(name, state)| {
+                let block_size = state.cache.block_size() as u64;
+                let manifest = state.volume_manifest.read();
+                ExportInfo {
+                    name: name.clone(),
+                    size: state.handler.device_size(),
+                    readonly: state.readonly,
+                    transport: state.transport.clone(),
+                    device: None,
+                    dirty_bytes: state.cache.dirty_block_count() * block_size,
+                    s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
+                }
             })
             .collect();
         drop(exports);
@@ -1308,9 +1341,15 @@ impl ExportRouter {
     pub async fn get_export_metrics(&self, name: &str) -> Option<MetricsSnapshot> {
         let exports = self.exports.read().await;
         exports.get(name).map(|s| {
-            s.metrics
-                .snapshot()
-                .with_cache_state(s.cache.dirty_block_count(), s.cache.syncing_block_count())
+            let block_size = s.cache.block_size() as u64;
+            let dirty_blocks = s.cache.dirty_block_count();
+            let manifest = s.volume_manifest.read();
+            s.metrics.snapshot().with_cache_state(
+                dirty_blocks,
+                s.cache.syncing_block_count(),
+                dirty_blocks * block_size,
+                manifest.chunks.len() as u64 * manifest.chunk_size,
+            )
         })
     }
 

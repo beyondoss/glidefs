@@ -4,7 +4,7 @@
 //! Used by orchestrators for microVM scale-to-zero and live migration.
 
 use crate::block::metrics::prometheus_header;
-use crate::block::router::{ExportRouter, RouterError};
+use crate::block::router::{ExportInfo, ExportRouter, RouterError};
 use crate::config::ExportConfig;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -73,6 +73,24 @@ pub struct ExportInfoResponse {
     pub transport: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// Unflushed bytes waiting to be synced to S3.
+    pub dirty_bytes: u64,
+    /// Total logical bytes stored in S3.
+    pub s3_bytes: u64,
+}
+
+impl From<ExportInfo> for ExportInfoResponse {
+    fn from(e: ExportInfo) -> Self {
+        ExportInfoResponse {
+            name: e.name,
+            size_bytes: e.size,
+            readonly: e.readonly,
+            transport: e.transport,
+            device: e.device.map(|p| p.to_string_lossy().into_owned()),
+            dirty_bytes: e.dirty_bytes,
+            s3_bytes: e.s3_bytes,
+        }
+    }
 }
 
 /// Response for list exports.
@@ -181,13 +199,7 @@ where
             let exports = router.list_exports().await;
             let responses: Vec<_> = exports
                 .into_iter()
-                .map(|e| ExportInfoResponse {
-                    name: e.name,
-                    size_bytes: e.size,
-                    readonly: e.readonly,
-                    transport: e.transport,
-                    device: e.device.map(|p| p.to_string_lossy().into_owned()),
-                })
+                .map(ExportInfoResponse::from)
                 .collect();
             json_response(StatusCode::OK, &ListExportsResponse { exports: responses })
         }
@@ -326,17 +338,16 @@ where
                                     warn!(export = %name, error = %e, "device re-registration after resize failed");
                                 }
                                 let _ = transport; // suppress unused warning on non-Linux
-                                let device = router.get_device_path(name).await;
-                                json_response(
-                                    StatusCode::OK,
-                                    &ExportInfoResponse {
-                                        name: name.to_string(),
-                                        size_bytes: (put_req.size_gb * 1_073_741_824.0) as u64,
-                                        readonly: export.readonly,
-                                        transport: export.transport,
-                                        device: device.map(|p| p.to_string_lossy().into_owned()),
-                                    },
-                                )
+                                match router.get_export_info(name).await {
+                                    Some(info) => json_response(
+                                        StatusCode::OK,
+                                        &ExportInfoResponse::from(info),
+                                    ),
+                                    None => error_response(
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        "Export resized but not found in map",
+                                    ),
+                                }
                             }
                             Err(e) => {
                                 error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
@@ -344,16 +355,7 @@ where
                         }
                     } else {
                         // Already at or above requested size - return current state
-                        json_response(
-                            StatusCode::OK,
-                            &ExportInfoResponse {
-                                name: export.name,
-                                size_bytes: export.size,
-                                readonly: export.readonly,
-                                transport: export.transport,
-                                device: export.device.map(|p| p.to_string_lossy().into_owned()),
-                            },
-                        )
+                        json_response(StatusCode::OK, &ExportInfoResponse::from(export))
                     }
                 }
                 None => {
@@ -394,18 +396,18 @@ where
                                 warn!(export = %name, error = %e, "device registration failed");
                                 // Export still works via NBD protocol, just no /dev/ device.
                             }
+                            let _ = transport; // suppress unused warning on non-Linux
 
-                            let device = router.get_device_path(name).await;
-                            json_response(
-                                StatusCode::CREATED,
-                                &ExportInfoResponse {
-                                    name: name.to_string(),
-                                    size_bytes: config.size_bytes(),
-                                    readonly: put_req.readonly,
-                                    transport,
-                                    device: device.map(|p| p.to_string_lossy().into_owned()),
-                                },
-                            )
+                            match router.get_export_info(name).await {
+                                Some(info) => json_response(
+                                    StatusCode::CREATED,
+                                    &ExportInfoResponse::from(info),
+                                ),
+                                None => error_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Export created but not found in map",
+                                ),
+                            }
                         }
                         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
                     }
@@ -419,13 +421,7 @@ where
             match exports.into_iter().find(|e| e.name == *name) {
                 Some(export) => json_response(
                     StatusCode::OK,
-                    &ExportInfoResponse {
-                        name: export.name,
-                        size_bytes: export.size,
-                        readonly: export.readonly,
-                        transport: export.transport,
-                        device: export.device.map(|p| p.to_string_lossy().into_owned()),
-                    },
+                    &ExportInfoResponse::from(export),
                 ),
                 None => error_response(
                     StatusCode::NOT_FOUND,

@@ -504,6 +504,8 @@ impl ExportMetrics {
             recovery_warnings: self.recovery_warnings.load(Ordering::Relaxed),
             dirty_blocks: None,
             syncing_blocks: None,
+            dirty_bytes: None,
+            s3_bytes: None,
             write_amplification,
             coalesce_ratio,
             cache_hit_rate,
@@ -552,6 +554,14 @@ pub struct MetricsSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub syncing_blocks: Option<u64>,
 
+    // Utilization (populated by router)
+    /// Unflushed bytes waiting to be synced to S3 (dirty_blocks × block_size)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty_bytes: Option<u64>,
+    /// Total logical bytes stored in S3 (chunks × chunk_size)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_bytes: Option<u64>,
+
     // Derived metrics
     /// S3 bytes written / guest bytes written
     /// - `> 1.0` = write amplification (S3 batching overhead)
@@ -588,9 +598,17 @@ pub struct MetricsSnapshot {
 
 impl MetricsSnapshot {
     /// Add cache state to the snapshot.
-    pub fn with_cache_state(mut self, dirty_blocks: u64, syncing_blocks: u64) -> Self {
+    pub fn with_cache_state(
+        mut self,
+        dirty_blocks: u64,
+        syncing_blocks: u64,
+        dirty_bytes: u64,
+        s3_bytes: u64,
+    ) -> Self {
         self.dirty_blocks = Some(dirty_blocks);
         self.syncing_blocks = Some(syncing_blocks);
+        self.dirty_bytes = Some(dirty_bytes);
+        self.s3_bytes = Some(s3_bytes);
         self
     }
 
@@ -636,6 +654,12 @@ impl MetricsSnapshot {
         }
         if let Some(syncing) = self.syncing_blocks {
             let _ = writeln!(out, "glidefs_syncing_blocks{{{label}}} {syncing}");
+        }
+        if let Some(dirty_bytes) = self.dirty_bytes {
+            let _ = writeln!(out, "glidefs_dirty_bytes{{{label}}} {dirty_bytes}");
+        }
+        if let Some(s3_bytes) = self.s3_bytes {
+            let _ = writeln!(out, "glidefs_s3_bytes{{{label}}} {s3_bytes}");
         }
 
         // Derived metrics (gauges)
@@ -732,6 +756,10 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_dirty_blocks gauge
 # HELP glidefs_syncing_blocks Blocks currently syncing to S3
 # TYPE glidefs_syncing_blocks gauge
+# HELP glidefs_dirty_bytes Unflushed bytes waiting to sync to S3
+# TYPE glidefs_dirty_bytes gauge
+# HELP glidefs_s3_bytes Total logical bytes stored in S3
+# TYPE glidefs_s3_bytes gauge
 # HELP glidefs_write_amplification S3 bytes / guest bytes written
 # TYPE glidefs_write_amplification gauge
 # HELP glidefs_coalesce_ratio Guest write ops / S3 batch writes
