@@ -26,6 +26,29 @@ impl WriteCache<Active> {
         offset: u64,
         data: &[u8],
     ) -> Result<(), CacheError> {
+        self.write_inner(offset, data, false)
+    }
+
+    /// Write data with eviction detection for sub-block backfill safety.
+    ///
+    /// Like `write()`, but returns `CacheError::BlockEvicted` if any block
+    /// in the range was evicted (NOT_PRESENT) and the flushing file is gone.
+    /// Used by the handler's backfill path to detect flush eviction races
+    /// and retry with a fresh S3 fetch.
+    pub fn write_with_eviction_check(
+        &self,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), CacheError> {
+        self.write_inner(offset, data, true)
+    }
+
+    fn write_inner(
+        &self,
+        offset: u64,
+        data: &[u8],
+        require_promotion: bool,
+    ) -> Result<(), CacheError> {
         let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
             CacheError::offset_out_of_bounds(u64::MAX, self.inner.config.device_size)
         })?;
@@ -64,17 +87,10 @@ impl WriteCache<Active> {
 
         // Promote SYNCING/NOT_PRESENT blocks from flushing → active BEFORE
         // set_present. promote_syncing_blocks needs to see the real block
-        // state to detect evicted blocks. If set_present runs first, it
-        // masks NOT_PRESENT as CLEAN, and promote silently skips — leaving
-        // zeros on the active file for sub-block writes.
-        //
-        // For sub-block writes (data doesn't cover the full block), require
-        // promotion: if the block was evicted (NOT_PRESENT) and the flushing
-        // file is gone, return BlockEvicted so the caller can re-backfill.
-        // Full-block writes don't need prior data — they overwrite everything.
-        let is_sub_block = data.len() < self.inner.config.block_size
-            || offset % (self.inner.config.block_size as u64) != 0;
-        self.inner.promote_syncing_blocks(&df, start_block, end_block, is_sub_block)?;
+        // state to recover data from the flushing file. If set_present runs
+        // first, it masks NOT_PRESENT as CLEAN, and promote silently skips —
+        // leaving zeros on the active file for sub-block writes.
+        self.inner.promote_syncing_blocks(&df, start_block, end_block, require_promotion)?;
 
         // Mark blocks present AFTER promote but BEFORE pwrite.
         // This prevents a race with prefetch where:

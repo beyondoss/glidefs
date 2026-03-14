@@ -329,9 +329,9 @@ impl BlockHandler {
                     s if s == SparseBlockState::DIRTY || s == SparseBlockState::SYNCING => {
                         // Block has data locally. cache.write handles SYNCING
                         // via promote_syncing_blocks (copies from flushing file).
-                        // If the block was evicted between our state check and
-                        // the pwrite (flush completed), BlockEvicted triggers retry.
-                        match self.cache.write(write_start, &data[data_offset..data_offset + write_len]) {
+                        // Use eviction check: if flush evicted the block between
+                        // our state check and the pwrite, BlockEvicted retries.
+                        match self.cache.write_with_eviction_check(write_start, &data[data_offset..data_offset + write_len]) {
                             Ok(()) => break 'block_retry,
                             Err(super::write_cache::CacheError::BlockEvicted) => continue 'block_retry,
                             Err(e) => return Err(e.into()),
