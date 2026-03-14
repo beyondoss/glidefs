@@ -81,13 +81,17 @@ fn zero_block_hash(block_size: usize) -> Blake3Hash {
 
 /// Returns zero-block bytes and hash for the given block size.
 ///
-/// Called only during export init (not on the hot path), so computing
-/// fresh each time is fine and avoids a latent bug where a global cache
-/// would silently return wrong results if exports used different block sizes.
+/// Cached in a global `OnceLock` — block size is uniform across all exports.
 pub fn shared_zero_block(block_size: usize) -> (Bytes, Blake3Hash) {
-    let bytes = Bytes::from(vec![0u8; block_size]);
-    let hash = zero_block_hash(block_size);
-    (bytes, hash)
+    use std::sync::OnceLock;
+    static ZERO_BLOCK: OnceLock<(Bytes, Blake3Hash)> = OnceLock::new();
+    ZERO_BLOCK
+        .get_or_init(|| {
+            let bytes = Bytes::from(vec![0u8; block_size]);
+            let hash = zero_block_hash(block_size);
+            (bytes, hash)
+        })
+        .clone()
 }
 
 // ============================================================================
