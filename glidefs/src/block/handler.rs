@@ -184,7 +184,7 @@ impl BlockHandler {
             if zero_end - zero_start >= block_size_u64 {
                 continue;
             }
-            // Fetch from S3 and write the full block.
+            // Fetch prior data from S3 and write the full block.
             let block_data = match self.cache.resolve_block_for_backfill(
                 idx,
                 self.clean_cache.as_ref(),
@@ -196,6 +196,14 @@ impl BlockHandler {
                 Ok(data) => data,
                 Err(_) => continue, // No S3 data — zeros are correct.
             };
+            // Skip if the resolved data is all zeros — the data file already
+            // has zeros (sparse or set_len). Writing zeros would create
+            // unnecessary dirty blocks and WAL entries, and on ublk could
+            // trigger a flush rotation that invalidates the io_uring
+            // registered fd.
+            if block_data.iter().all(|&b| b == 0) {
+                continue;
+            }
             self.cache.write(block_start, &block_data)?;
         }
 
@@ -254,7 +262,7 @@ impl BlockHandler {
 
             // Sub-block write to a NOT_PRESENT block. Fetch the full block
             // from foyer/S3, overlay guest data, write the merged block.
-            let mut block_buf = match self.cache.resolve_block_for_backfill(
+            let prior = match self.cache.resolve_block_for_backfill(
                 idx,
                 self.clean_cache.as_ref(),
                 &self.pack_index_cache,
@@ -262,11 +270,8 @@ impl BlockHandler {
                 &self.content_store,
                 Some(&self.metrics),
             ).await {
-                Ok(prior) => prior.to_vec(),
-                Err(_) => {
-                    // No S3 data or fetch failed — start from zeros.
-                    vec![0u8; block_size]
-                }
+                Ok(data) => data,
+                Err(_) => bytes::Bytes::new(),
             };
 
             // Re-check after async fetch: a concurrent writer may have
@@ -277,7 +282,17 @@ impl BlockHandler {
                 continue;
             }
 
-            // Overlay guest data onto the fetched block.
+            // If prior data is all zeros (fresh export, never-written block),
+            // just write the guest's sub-block directly — the data file already
+            // has zeros from set_len. Avoids writing a full 128KB zero block
+            // which would create unnecessary dirty blocks and WAL entries.
+            if prior.is_empty() || prior.iter().all(|&b| b == 0) {
+                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                continue;
+            }
+
+            // Non-zero prior data: overlay guest data onto the fetched block.
+            let mut block_buf = prior.to_vec();
             let end = (block_local_start + write_len).min(block_buf.len());
             block_buf[block_local_start..end]
                 .copy_from_slice(&data[data_offset..data_offset + write_len]);

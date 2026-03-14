@@ -4,7 +4,7 @@ Takes block I/O commands (read/write/flush/trim) from a Linux kernel block devic
 
 ## Data Flow
 
-### Write Path (~5µs)
+### Write Path (~5µs hot, ~50ms cold backfill)
 
 ```
 Guest VM
@@ -18,7 +18,20 @@ Transport ──► ExportRouter ──► BlockHandler
                               │     └── offset > device_size?  → EINVAL
                               │
                               ▼ OK
-                         WriteCache<Active>
+                         BlockHandler::backfill_and_write()
+                              │
+                    ┌─────────┼─────────────────────────────────┐
+                    ▼                                           ▼
+              all blocks PRESENT?                    sub-block to NOT_PRESENT block?
+                    │ yes                                        │
+                    ▼                                    fetch full 128KB from
+              WriteCache::write()                     foyer/S3 (resolve_block_for_backfill)
+              (fast 4KB pwrite)                              │
+                                                       overlay guest data in memory
+                                                             │
+                                                       WriteCache::write(full 128KB)
+                              │
+                         WriteCache::write()
                               │
                   ┌───────────┼───────────┐
                   ▼           ▼           ▼
@@ -27,8 +40,10 @@ Transport ──► ExportRouter ──► BlockHandler
                               │
                          WAL append(block_index, seq)
                               │
-                          return OK     ◄── ~5µs
+                          return OK     ◄── ~5µs (hot) / ~50ms (cold backfill)
 ```
+
+**Backfill on write**: Sub-block writes (e.g., 4KB ext4 blocks into 128KB cache blocks) to NOT_PRESENT blocks fetch the complete block from foyer/S3, overlay the guest data in memory, and write the full 128KB. This ensures every block on SSD is always complete — no partial data, no holes. Once a block is DIRTY, subsequent sub-block writes are fast 4KB pwrites (no backfill until the block is evicted). Cost: one S3 fetch per block per eviction cycle, amortized across all sub-block writes while DIRTY.
 
 Hash computation is **deferred to flush time**. The write path does zero hash or CRC work —
 it only claims the blocks (set_present), writes data, marks them dirty, and appends to the WAL.
@@ -275,16 +290,18 @@ After flush:   {name}.cache          ← active
 
 **Rotation sequence** (inside `flush_dirty_inner`, under `flush_lock`):
 
-1. `flushing_active.store(true)` — signals ublk to stop using io_uring registered fd
-2. `rename("{name}.cache", "{name}.flushing")` — crash recovery boundary
-3. Create new sparse `SyncFile` at `"{name}.cache"` (set_len to device_size)
-4. Swap `data_file` RwLock (write-locked briefly, ~2ns read-lock for all I/O)
-5. Store old handle in `flushing_file: Mutex<Option<SyncFile>>`
-6. CAS DIRTY→SYNCING for all dirty blocks
-7. `compute_flush_batch` reads from `flushing_file`
-8. Upload to S3
-9. Finalize: CAS SYNCING→NOT_PRESENT (evict), copy skipped blocks flushing→active
-10. `unlink("{name}.flushing")`, `flushing_active.store(false)`
+1. Acquire `data_file` **write lock** (blocks all pwrite/pread)
+2. `flushing_active.store(true)` — signals ublk to stop using io_uring registered fd
+3. `rename("{name}.cache", "{name}.flushing")` — crash recovery boundary
+4. Create new sparse `SyncFile` at `"{name}.cache"` (set_len to device_size)
+5. CAS DIRTY→SYNCING for all dirty blocks (snapshot under the lock)
+6. Swap `data_file` handle (new active file goes into the RwLock)
+7. Store old handle in `flushing_file: Mutex<Option<Arc<SyncFile>>>`
+8. Release write lock (~15µs total hold time)
+9. `compute_flush_batch` reads from `flushing_file` (rayon parallel: pread + CRC32 + BLAKE3 + LZ4)
+10. Stream GLPK v3 packs to S3
+11. Finalize: CAS SYNCING→NOT_PRESENT (evict), copy skipped blocks flushing→active
+12. `flushing_active.store(false)`, drop flushing_file, `unlink("{name}.flushing")`
 
 **SSD footprint**: With 128KB blocks, 500 blocks_per_pack, 5s flush interval: ~64MB active + ~64MB flushing = ~128MB per export during flush. Outside flush: just dirty blocks since last flush.
 
@@ -355,7 +372,7 @@ Fork is live:
 
 **Content sharing via PackIndexCache**: The cache is keyed by `PackId`. A fork that hasn't modified a chunk shares the same pack_ids as the parent — those pack indices load once into the cache and are shared across all forks on the host. 180 forks from the same base image load each chunk's pack index once.
 
-**No in-memory overlay**: Forks don't need a `ForkedBlockMap` because reads fall through to S3 via the VolumeManifest — the parent's pack files are still in S3 under their original `chunks/` paths.
+**Backfill on write, not in-memory overlay**: Forks don't need a `ForkedBlockMap`. Reads fall through to S3 via VolumeManifest. Sub-block writes to unwritten blocks backfill the full block from the parent's packs (foyer/S3), overlay the guest data, and write a complete 128KB block to local SSD. This eliminates sparse holes and partial data — every block on SSD is always complete.
 
 ## Snapshots
 
