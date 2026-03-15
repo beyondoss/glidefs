@@ -186,8 +186,8 @@ impl Model for M {
                             s.wl[i] = false; W::CheckState
                         }
                     }
-                    W::PromotePread(d) => { s.ssd[b] = d; W::PromotePwrite(d) }
-                    W::PromotePwrite(_) => W::PromoteCas,
+                    W::PromotePread(d) => W::PromotePwrite(d),  // pread done, buffer has data
+                    W::PromotePwrite(d) => { s.ssd[b] = d; W::PromoteCas },  // pwrite buffer to active
                     W::PromoteCas => {
                         if s.blk[b] == BS::Syncing || s.blk[b] == BS::NP { s.blk[b] = BS::Dirty; }
                         W::PwriteData(s.nv)
@@ -199,6 +199,14 @@ impl Model for M {
                         _ => W::LocateColdFetch,
                     },
                     W::LocateHotPread(_) => {
+                        // sync_read_local_block: acquires read lock, re-checks
+                        // state, preads, releases. Modeled atomically (lock
+                        // prevents rotation between re-check and pread).
+                        // But we DON'T set s.wl[i] because this is a transient
+                        // lock inside locate_block, not the cache.write lock.
+                        // The important property: rotation can't interleave
+                        // between re-check and pread. We model this by reading
+                        // state and data in one step.
                         match s.blk[b] {
                             BS::Dirty => W::FetchDone(s.ssd[b]),
                             BS::Syncing if s.flu_present => W::FetchDone(s.flu[b]),
