@@ -2302,9 +2302,11 @@ async fn pf02_eviction_during_promote_read() {
 }
 
 /// RW-04: Concurrent pread and pwrite to the same block, both under the
-/// data_file read lock. POSIX guarantees pread/pwrite are atomic for
-/// I/O that doesn't cross filesystem block boundaries. For our 128KB
-/// block size (which IS larger than a page), verify no torn reads.
+/// data_file read lock. POSIX does NOT guarantee atomicity for I/O larger
+/// than a filesystem block (typically 4KB). Our 128KB blocks span multiple
+/// pages, so a concurrent pread may observe a partially-written block.
+/// What we verify: no byte corruption (every byte is a valid value from
+/// one of the two writers), proving pwrite doesn't produce garbage.
 #[tokio::test]
 async fn rw04_concurrent_pread_pwrite_same_block() {
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -2332,13 +2334,14 @@ async fn rw04_concurrent_pread_pwrite_same_block() {
         r1.unwrap().unwrap();
         let data = r2.unwrap().unwrap();
 
-        // Data should be entirely 0xAA or entirely 0xBB — never a mix.
-        let first = data[0];
-        let last = data[BLOCK_SIZE - 1];
-        assert!(
-            (first == 0xAA && last == 0xAA) || (first == 0xBB && last == 0xBB),
-            "torn read detected: first=0x{first:02X} last=0x{last:02X}"
-        );
+        // Every byte must be either 0xAA or 0xBB — no corruption.
+        // A mix of 0xAA and 0xBB is acceptable (partial pwrite visibility).
+        for (i, &b) in data.iter().enumerate() {
+            assert!(
+                b == 0xAA || b == 0xBB,
+                "corrupted byte at offset {i}: 0x{b:02X} (expected 0xAA or 0xBB)"
+            );
+        }
     }
 }
 
