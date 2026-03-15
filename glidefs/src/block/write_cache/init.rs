@@ -125,10 +125,10 @@ impl WriteCache<Initializing> {
             drop(tmp_file);
             std::fs::rename(&tmp_path, &wal_path)?;
             // Fsync parent directory so the rename is durable across power loss.
-            if let Some(parent) = wal_path.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
+            if let Some(parent) = wal_path.parent()
+                && let Ok(dir) = std::fs::File::open(parent)
+            {
+                let _ = dir.sync_all();
             }
         }
 

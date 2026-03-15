@@ -1127,10 +1127,10 @@ impl WriteCache<Active> {
         // longer needed as a crash-safety net. Delete it so the next flush
         // cycle can rotate the data file.
         let flushing_path = self.inner.config.flushing_path();
-        if flushing_path.exists() {
-            if let Err(e) = std::fs::remove_file(&flushing_path) {
+        if flushing_path.exists()
+            && let Err(e) = std::fs::remove_file(&flushing_path)
+        {
                 warn!(error = %e, "failed to remove flushing file after manifest sync");
-            }
         }
         Ok(())
     }
@@ -1196,10 +1196,10 @@ impl WriteCache<Active> {
         self.checkpoint().await?;
         // Manifest synced and checkpoint persisted — delete the flushing file.
         let flushing_path = self.inner.config.flushing_path();
-        if flushing_path.exists() {
-            if let Err(e) = std::fs::remove_file(&flushing_path) {
+        if flushing_path.exists()
+            && let Err(e) = std::fs::remove_file(&flushing_path)
+        {
                 warn!(error = %e, "failed to remove flushing file after flush_to_s3");
-            }
         }
         Ok(stats)
     }
@@ -1260,10 +1260,10 @@ impl WriteCache<Active> {
         self.checkpoint().await?;
         // Manifest synced and checkpoint persisted — delete the flushing file.
         let flushing_path = self.inner.config.flushing_path();
-        if flushing_path.exists() {
-            if let Err(e) = std::fs::remove_file(&flushing_path) {
+        if flushing_path.exists()
+            && let Err(e) = std::fs::remove_file(&flushing_path)
+        {
                 warn!(error = %e, "failed to remove flushing file after snapshot");
-            }
         }
         Ok(SnapshotResult {
             manifest_etag,

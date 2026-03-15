@@ -694,16 +694,16 @@ impl WriteCache<Active> {
             // pack might contain a newer version of the block, and returning
             // older data would be a silent consistency violation.
             for &pack_id in pack_ids.iter().rev() {
-                if failed_pack_ids.contains(&pack_id) {
-                    if let Some(e) = last_fetch_error {
-                        return Err(e.into());
-                    }
+                if failed_pack_ids.contains(&pack_id)
+                    && let Some(e) = last_fetch_error
+                {
+                    return Err(e.into());
                 }
-                if let Some(entries) = pack_index_cache.get_entries(pack_id).await {
-                    if let Some(e) = entries.iter().find(|e| e.chunk_offset == block_offset) {
-                        resolved = Some((pack_id, e.hash, e.offset, e.comp_length));
-                        break;
-                    }
+                if let Some(entries) = pack_index_cache.get_entries(pack_id).await
+                    && let Some(e) = entries.iter().find(|e| e.chunk_offset == block_offset)
+                {
+                    resolved = Some((pack_id, e.hash, e.offset, e.comp_length));
+                    break;
                 }
             }
 

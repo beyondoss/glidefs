@@ -2125,6 +2125,7 @@ async fn test_rotation_claims_atomically() {
 async fn test_bottomless_flush_failure_recovery() {
     // Use FailingObjectStore inline — the flush_scheduler's version is private.
     use async_trait::async_trait;
+    use futures::StreamExt;
     use object_store::{
         GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as ObjStore,
         PutMultipartOptions, PutOptions, PutPayload, PutResult,
