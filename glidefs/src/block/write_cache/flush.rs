@@ -390,7 +390,17 @@ impl WriteCache<Active> {
         Arc::clone(&self.inner)
     }
 
-    /// Test-only: expose rotate_and_snapshot for interleaving tests.
+    /// Test-only: fire a flush gate if sync points are attached.
+    #[cfg(feature = "test-utils")]
+    async fn flush_gate(&self, step: super::inner::FlushStep, count: usize) {
+        let sp = self.inner.flush_sync.lock().clone();
+        if let Some(sp) = sp {
+            sp.gate(step, count).await;
+        }
+    }
+
+    /// Test-only: rotate without flushing. Leaves a flushing file on disk,
+    /// which blocks flush_dirty_inner until checkpoint() deletes it.
     #[cfg(feature = "test-utils")]
     pub fn test_rotate_and_snapshot(&self) -> Result<Vec<usize>, CacheError> {
         self.rotate_and_snapshot()
@@ -406,6 +416,18 @@ impl WriteCache<Active> {
     #[cfg(feature = "test-utils")]
     pub fn transition_syncing_to_not_present(&self, block_idx: usize) -> bool {
         self.inner.transition_syncing_to_not_present(block_idx)
+    }
+
+    /// Test-only: attach flush sync points.
+    #[cfg(feature = "test-utils")]
+    pub fn set_flush_sync(&self, sp: std::sync::Arc<super::inner::FlushSyncPoints>) {
+        *self.inner.flush_sync.lock() = Some(sp);
+    }
+
+    /// Test-only: attach promote sync points.
+    #[cfg(feature = "test-utils")]
+    pub fn set_promote_sync(&self, sp: std::sync::Arc<super::inner::PromoteSyncPoints>) {
+        *self.inner.promote_sync.lock() = Some(sp);
     }
 
     /// Rotate the data file for flush.
@@ -526,6 +548,11 @@ impl WriteCache<Active> {
         // blocks. The scheduler retries manifest sync on the checkpoint timer;
         // once that succeeds and checkpoint deletes the flushing file, the next
         // flush cycle can proceed.
+        //
+        // Callers receive FlushStats::default() (packs_uploaded=0) — this is
+        // indistinguishable from "no dirty blocks existed". The flush scheduler
+        // handles this via retry; direct callers of flush_to_s3 must not assume
+        // packs_uploaded>0 implies all dirty blocks were flushed.
         if self.inner.config.flushing_path().exists() {
             debug!("flush: flushing file still exists (pending manifest sync), skipping");
             return Ok((FlushStats::default(), seq_cutpoint));
@@ -544,6 +571,9 @@ impl WriteCache<Active> {
         .await
         .map_err(|e| CacheError::Io(std::io::Error::other(e)))?;
 
+        #[cfg(feature = "test-utils")]
+        self.flush_gate(super::inner::FlushStep::AfterCrcPrepass, crcs.len()).await;
+
         // Snapshot dirty blocks, claim (CAS DIRTY→SYNCING), AND rotate —
         // all under the data_file write lock.
         //
@@ -561,6 +591,9 @@ impl WriteCache<Active> {
         // the block. promote_syncing_blocks then copies data from
         // flushing→active so the new active file has complete block data.
         let snapshot = self.rotate_and_snapshot()?;
+
+        #[cfg(feature = "test-utils")]
+        self.flush_gate(super::inner::FlushStep::AfterRotation, snapshot.len()).await;
 
         if snapshot.is_empty() {
             debug!("flush: no dirty blocks to flush");
@@ -925,6 +958,9 @@ impl WriteCache<Active> {
             }
         }
 
+        #[cfg(feature = "test-utils")]
+        self.flush_gate(super::inner::FlushStep::BeforeEvict, flushed_blocks.len()).await;
+
         // Finalize flushed blocks: SYNCING→NOT_PRESENT.
         //
         // Always evict from the data file. The flush path already inserted
@@ -942,6 +978,9 @@ impl WriteCache<Active> {
                 total_stats.blocks_cas_failed += 1;
             }
         }
+
+        #[cfg(feature = "test-utils")]
+        self.flush_gate(super::inner::FlushStep::AfterEvict, flushed_blocks.len()).await;
 
         // Drop flushing file handle but keep the file on disk.
         //

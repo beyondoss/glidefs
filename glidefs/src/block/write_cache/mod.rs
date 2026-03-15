@@ -40,6 +40,9 @@ pub use error::CacheError;
 pub use read::{ChunkSource, ReadPlan};
 use inner::CacheInner;
 
+#[cfg(feature = "test-utils")]
+pub use inner::{FlushSyncPoints, FlushStep, FlushGateEvent, PromoteSyncPoints, PromoteStep, PromoteGateEvent};
+
 /// Statistics from a flush operation.
 #[derive(Debug, Default)]
 pub struct FlushStats {

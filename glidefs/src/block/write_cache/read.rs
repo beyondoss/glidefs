@@ -658,17 +658,10 @@ impl WriteCache<Active> {
             let results = futures::future::join_all(fetch_futures).await;
             let mut last_fetch_error = None;
             let mut failed_pack_ids: Vec<PackId> = Vec::new();
-            // Keep fetched entries locally — don't rely on foyer round-trip.
-            // foyer's insert() is async/fire-and-forget; a subsequent get()
-            // may not see the value yet. Using the local copy guarantees the
-            // re-resolve sees what we just fetched.
-            let mut local_entries: HashMap<PackId, Vec<super::super::pack::PackIndexEntry>> =
-                HashMap::new();
             for (pid, result) in results {
                 match result {
                     Ok(entries) => {
                         pack_index_cache.insert_entries(pid, &entries);
-                        local_entries.insert(pid, entries);
                     }
                     Err(e) => {
                         warn!(
@@ -682,31 +675,18 @@ impl WriteCache<Active> {
                 }
             }
 
-            // Re-resolve newest-first using local_entries (just fetched) or
-            // foyer (for packs that were already cached before this call).
-            // If we encounter a failed pack before finding a resolution, we
-            // must error — that pack might contain a newer version of the
-            // block, and returning older data would be a silent consistency
-            // violation.
+            // Re-resolve newest-first using get_entries (not lookup_block)
+            // to avoid the foyer async insertion race. If we encounter a
+            // failed pack before finding a resolution, we must error — that
+            // pack might contain a newer version of the block, and returning
+            // older data would be a silent consistency violation.
             for &pack_id in pack_ids.iter().rev() {
                 if failed_pack_ids.contains(&pack_id) {
                     if let Some(e) = last_fetch_error {
                         return Err(e.into());
                     }
                 }
-                // Check local (just-fetched) entries first, then foyer.
-                let entries = if let Some(local) = local_entries.get(&pack_id) {
-                    Some(local.as_slice())
-                } else {
-                    None
-                };
-                // If not in local, try foyer (for packs cached before this call).
-                if let Some(entries) = entries {
-                    if let Some(e) = entries.iter().find(|e| e.chunk_offset == block_offset) {
-                        resolved = Some((pack_id, e.hash, e.offset, e.comp_length));
-                        break;
-                    }
-                } else if let Some(entries) = pack_index_cache.get_entries(pack_id).await {
+                if let Some(entries) = pack_index_cache.get_entries(pack_id).await {
                     if let Some(e) = entries.iter().find(|e| e.chunk_offset == block_offset) {
                         resolved = Some((pack_id, e.hash, e.offset, e.comp_length));
                         break;

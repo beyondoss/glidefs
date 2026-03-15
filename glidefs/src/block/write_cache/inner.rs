@@ -308,6 +308,93 @@ pub(crate) struct CacheInner {
     /// written after rotation, so their data in the active file is
     /// authoritative (even if all zeros).
     pub(super) rotation_seq: AtomicU64,
+
+    /// Test-only: sync points for flush path interleaving tests.
+    #[cfg(feature = "test-utils")]
+    pub(crate) flush_sync: parking_lot::Mutex<Option<std::sync::Arc<FlushSyncPoints>>>,
+
+    /// Test-only: sync points for promote path interleaving tests.
+    #[cfg(feature = "test-utils")]
+    pub(crate) promote_sync: parking_lot::Mutex<Option<std::sync::Arc<PromoteSyncPoints>>>,
+}
+
+// ============================================================================
+// Test-only: sync point types for deterministic interleaving tests
+// ============================================================================
+
+/// Flush pipeline sync points.
+#[cfg(feature = "test-utils")]
+pub struct FlushSyncPoints {
+    pub tx: tokio::sync::mpsc::UnboundedSender<FlushGateEvent>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushStep {
+    AfterCrcPrepass,
+    AfterRotation,
+    AfterCompute,
+    BeforeEvict,
+    AfterEvict,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+pub struct FlushGateEvent {
+    pub step: FlushStep,
+    pub block_count: usize,
+}
+
+#[cfg(feature = "test-utils")]
+impl FlushSyncPoints {
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<FlushGateEvent>, tokio::sync::mpsc::UnboundedSender<()>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self { tx: event_tx, rx: tokio::sync::Mutex::new(proceed_rx) }, event_rx, proceed_tx)
+    }
+
+    pub(crate) async fn gate(&self, step: FlushStep, block_count: usize) {
+        let _ = self.tx.send(FlushGateEvent { step, block_count });
+        let _ = self.rx.lock().await.recv().await;
+    }
+}
+
+/// Promote path sync points.
+#[cfg(feature = "test-utils")]
+pub struct PromoteSyncPoints {
+    pub tx: tokio::sync::mpsc::UnboundedSender<PromoteGateEvent>,
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromoteStep {
+    AfterCloneArc,
+    AfterRead,
+    BeforeCas,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+pub struct PromoteGateEvent {
+    pub step: PromoteStep,
+    pub block_idx: usize,
+}
+
+#[cfg(feature = "test-utils")]
+impl PromoteSyncPoints {
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<PromoteGateEvent>, std::sync::mpsc::SyncSender<()>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+        (Self { tx: event_tx, rx: std::sync::Mutex::new(proceed_rx) }, event_rx, proceed_tx)
+    }
+
+    pub(crate) fn gate_sync(&self, step: PromoteStep, block_idx: usize) {
+        let _ = self.tx.send(PromoteGateEvent { step, block_idx });
+        // Blocking recv for sync (non-async) promote path.
+        let _ = self.rx.lock().unwrap().recv();
+    }
 }
 
 
@@ -487,6 +574,15 @@ impl CacheInner {
         // dozens of pread+pwrite calls), which would block rotate_data_file
         // and compute_flush_batch from accessing flushing_file.
         let ff = self.flushing_file.lock().clone();
+
+        #[cfg(feature = "test-utils")]
+        {
+            let sp = self.promote_sync.lock().clone();
+            if let Some(sp) = sp {
+                sp.gate_sync(PromoteStep::AfterCloneArc, start_block as usize);
+            }
+        }
+
         if let Some(ref ff) = ff {
             // Allocate once, reuse across blocks (avoids per-block 128KB alloc churn).
             let mut buf = vec![0u8; block_size as usize];
@@ -518,6 +614,15 @@ impl CacheInner {
                 // silent data corruption.
                 ff.read_exact_at(&mut buf[..valid], offset)?;
                 df.write_all_at(&buf[..valid], offset)?;
+
+                #[cfg(feature = "test-utils")]
+                {
+                    let sp = self.promote_sync.lock().clone();
+                    if let Some(sp) = sp {
+                        sp.gate_sync(PromoteStep::BeforeCas, idx);
+                    }
+                }
+
                 if state == SparseBlockState::SYNCING {
                     // CAS SYNCING→DIRTY immediately after copying data.
                     // This prevents the flush thread from evicting the block

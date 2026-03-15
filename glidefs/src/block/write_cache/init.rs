@@ -267,6 +267,10 @@ impl WriteCache<Initializing> {
             manifest_etag: parking_lot::Mutex::new(None),
             flushing_active: AtomicBool::new(false),
             rotation_seq: AtomicU64::new(0),
+            #[cfg(feature = "test-utils")]
+            flush_sync: parking_lot::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            promote_sync: parking_lot::Mutex::new(None),
         });
 
         info!(
@@ -320,6 +324,10 @@ impl WriteCache<Initializing> {
             manifest_etag: parking_lot::Mutex::new(None),
             flushing_active: AtomicBool::new(false),
             rotation_seq: AtomicU64::new(0),
+            #[cfg(feature = "test-utils")]
+            flush_sync: parking_lot::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            promote_sync: parking_lot::Mutex::new(None),
         });
 
         info!("cache opened fresh for fork, directly Active");

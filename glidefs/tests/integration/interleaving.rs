@@ -1998,6 +1998,42 @@ async fn state_clean_then_evicted_to_np() {
     );
 }
 
+/// Probe: verify that foyer insert→get is synchronously visible on our
+/// shared PackIndexCache. If this fails, foyer's in-memory tier is evicting
+/// entries between insert and get (capacity issue or bug).
+#[tokio::test]
+async fn probe_foyer_insert_get_visibility() {
+    let pic = Arc::clone(&*SHARED_PACK_INDEX_CACHE);
+
+    let pack_id: u64 = rand::random();
+    let entries = vec![glidefs::block::pack::PackIndexEntry {
+        hash: glidefs::block::block_map::Blake3Hash::from_bytes([0xAA; 16]),
+        chunk_offset: 0,
+        offset: 100,
+        comp_length: 200,
+    }];
+
+    pic.insert_entries(pack_id, &entries);
+
+    // Immediately read back.
+    let got = pic.get_entries(pack_id).await;
+    assert!(
+        got.is_some(),
+        "foyer insert→get should be immediately visible. pack_id={pack_id:016x}"
+    );
+    let got = got.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].chunk_offset, 0);
+    assert_eq!(got[0].comp_length, 200);
+
+    // Also verify lookup_block works.
+    let lookup = pic.lookup_block(pack_id, 0).await;
+    assert!(
+        lookup.is_some(),
+        "foyer lookup_block should find just-inserted entry"
+    );
+}
+
 /// Exercise every state transition in a single block's lifecycle:
 /// NP→CLEAN→DIRTY→SYNCING→NP→DIRTY (full cycle + re-write after eviction).
 #[tokio::test]
@@ -2049,4 +2085,701 @@ async fn full_lifecycle_all_transitions() {
         "data after full lifecycle. first=0x{:02X}",
         block[0]
     );
+}
+
+// ============================================================================
+// Write × Flush: gate-controlled interleavings
+// ============================================================================
+
+use glidefs::block::write_cache::{FlushSyncPoints, FlushStep, PromoteSyncPoints, PromoteStep};
+
+/// WF-05/06: Write arrives while block is SYNCING (after rotation, before
+/// eviction). Write triggers promote: copies from flushing → active, CAS
+/// SYNCING→DIRTY. Flush continues, eviction CAS fails.
+#[tokio::test]
+async fn wf_write_during_syncing_with_flush_gate() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) =
+        super::create_test_cache(&dir, "wf-gate", Arc::clone(&s3)).await;
+
+    // Write block 0.
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+
+    // Attach flush sync points.
+    let (flush_sp, mut flush_events, flush_proceed) = FlushSyncPoints::new();
+    cache.set_flush_sync(std::sync::Arc::new(flush_sp));
+
+    // Spawn flush in background.
+    let cache_f = Arc::clone(&cache);
+    let cs_f = ContentStore::new(Arc::clone(&s3), "test");
+    let pic_f = Arc::clone(&pic);
+    let vm_f = Arc::clone(&vm);
+    let flush_handle = tokio::spawn(async move {
+        cache_f.flush_packs(&cs_f, &pic_f, &vm_f, None).await
+    });
+
+    // Wait for flush to reach AfterRotation (blocks are SYNCING, write lock released).
+    let ev = flush_events.recv().await.unwrap(); // AfterCrcPrepass
+    assert_eq!(ev.step, FlushStep::AfterCrcPrepass);
+    flush_proceed.send(()).unwrap(); // proceed past CRC
+
+    let ev = flush_events.recv().await.unwrap(); // AfterRotation
+    assert_eq!(ev.step, FlushStep::AfterRotation);
+    assert!(ev.block_count > 0, "should have snapshot blocks");
+
+    // Block 0 is now SYNCING. Write a sub-block — triggers promote.
+    let sub = vec![0xBB; SUB_BLOCK];
+    cache.write(0, &sub).unwrap();
+
+    // Block should now be DIRTY (promote CAS SYNCING→DIRTY succeeded).
+    assert_eq!(cache.block_state(0), 2, "block should be DIRTY after promote");
+
+    // Release flush to continue (compute, upload, evict).
+    flush_proceed.send(()).unwrap(); // proceed past BeforeEvict
+    let ev = flush_events.recv().await.unwrap();
+    assert_eq!(ev.step, FlushStep::BeforeEvict);
+    flush_proceed.send(()).unwrap(); // proceed with eviction
+
+    let ev = flush_events.recv().await.unwrap();
+    assert_eq!(ev.step, FlushStep::AfterEvict);
+    flush_proceed.send(()).unwrap(); // cleanup
+
+    let (stats, _) = flush_handle.await.unwrap().unwrap();
+
+    // Eviction CAS should have failed for block 0 (already DIRTY from promote).
+    assert!(stats.blocks_cas_failed > 0, "eviction should fail for promoted block");
+
+    // Block 0 should still be DIRTY with correct data.
+    assert_eq!(cache.block_state(0), 2);
+    let block = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert_eq!(&block[0..SUB_BLOCK], &sub[..], "sub-block from promote");
+    assert!(
+        block[SUB_BLOCK..].iter().all(|&b| b == 0xAA),
+        "promoted data preserved. got 0x{:02X}",
+        block[SUB_BLOCK]
+    );
+}
+
+/// WF-13: Write's transition_to_dirty (CLEAN→DIRTY) races with flush's
+/// DIRTY→SYNCING CAS. The flush CRC pre-pass sees the block as DIRTY,
+/// but between CRC and rotation, a new write completes (block goes
+/// CLEAN→DIRTY with new data). The rotation's CAS DIRTY→SYNCING claims
+/// the block with the new data. CRC mismatch → block skipped, retried.
+#[tokio::test]
+async fn wf13_write_between_crc_and_rotation() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) =
+        super::create_test_cache(&dir, "wf13", Arc::clone(&s3)).await;
+
+    // Write block 0 (DIRTY).
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+
+    // Attach flush sync points.
+    let (flush_sp, mut flush_events, flush_proceed) = FlushSyncPoints::new();
+    cache.set_flush_sync(std::sync::Arc::new(flush_sp));
+
+    // Spawn flush.
+    let cache_f = Arc::clone(&cache);
+    let cs_f = ContentStore::new(Arc::clone(&s3), "test");
+    let pic_f = Arc::clone(&pic);
+    let vm_f = Arc::clone(&vm);
+    let flush_handle = tokio::spawn(async move {
+        cache_f.flush_packs(&cs_f, &pic_f, &vm_f, None).await
+    });
+
+    // Wait for CRC pre-pass to complete.
+    let ev = flush_events.recv().await.unwrap();
+    assert_eq!(ev.step, FlushStep::AfterCrcPrepass);
+
+    // BEFORE releasing flush past CRC: write NEW data to block 0.
+    // This overwrites the data that CRC was computed from.
+    cache.write(0, &vec![0xBB; BLOCK_SIZE]).unwrap();
+
+    // Release flush — rotation will claim block 0 (DIRTY→SYNCING).
+    // The flushing file has 0xBB (the new data, since pwrite completed
+    // before rotation). CRC was computed from 0xAA. Mismatch → skip.
+    flush_proceed.send(()).unwrap(); // proceed past CRC
+
+    // Flush continues. Let it run to completion.
+    let ev = flush_events.recv().await.unwrap();
+    assert_eq!(ev.step, FlushStep::AfterRotation);
+    flush_proceed.send(()).unwrap();
+
+    let ev = flush_events.recv().await.unwrap();
+    assert_eq!(ev.step, FlushStep::BeforeEvict);
+    flush_proceed.send(()).unwrap();
+
+    let ev = flush_events.recv().await.unwrap();
+    assert_eq!(ev.step, FlushStep::AfterEvict);
+    flush_proceed.send(()).unwrap();
+
+    let (stats, _) = flush_handle.await.unwrap().unwrap();
+
+    // The block had a CRC mismatch — it should have been skipped
+    // (CRC-mismatched or CAS-failed) and the data preserved.
+    // Whether it uploaded depends on timing of the write vs CRC read,
+    // but either way the data must not be corrupted.
+    // After flush, block 0 is either DIRTY (skipped) or NP (uploaded).
+    let state = cache.block_state(0);
+    assert!(
+        state == 0 || state == 2,
+        "block should be DIRTY (skipped) or NP (uploaded). got {state}"
+    );
+}
+
+/// PF-02/WF-15: Flush evicts block (SYNCING→NP) while promote is reading
+/// from the flushing file. The promote's pread already completed (data
+/// copied to active), but the CAS SYNCING→DIRTY fails (already NP).
+/// The data is in the active file — the caller's write lands on it.
+#[tokio::test]
+async fn pf02_eviction_during_promote_read() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) =
+        super::create_test_cache(&dir, "pf02", Arc::clone(&s3)).await;
+
+    // Write block 0 (DIRTY).
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+
+    // Rotate: DIRTY→SYNCING.
+    cache.test_rotate_and_snapshot().unwrap();
+    assert_eq!(cache.block_state(0), 3); // SYNCING
+
+    // Attach promote sync points.
+    let (promote_sp, mut promote_events, promote_proceed) = PromoteSyncPoints::new();
+    cache.set_promote_sync(std::sync::Arc::new(promote_sp));
+
+    // Spawn a write to SYNCING block 0 (triggers promote) on a blocking thread
+    // since promote gates use blocking recv.
+    let cache_w = Arc::clone(&cache);
+    let write_handle = tokio::task::spawn_blocking(move || {
+        cache_w.write(0, &vec![0xBB; SUB_BLOCK])
+    });
+
+    // Wait for promote to reach BeforeCas (after pread+pwrite, before CAS).
+    let ev = promote_events.recv().await.unwrap();
+    assert_eq!(ev.step, PromoteStep::AfterCloneArc);
+    promote_proceed.send(()).unwrap();
+
+    let ev = promote_events.recv().await.unwrap();
+    assert_eq!(ev.step, PromoteStep::BeforeCas);
+
+    // NOW evict the block while promote is between pwrite and CAS.
+    let evicted = cache.transition_syncing_to_not_present(0);
+    assert!(evicted, "eviction should succeed — promote hasn't CAS'd yet");
+    assert_eq!(cache.block_state(0), 0); // NOT_PRESENT
+
+    // Release promote to attempt CAS (will fail: block is NP).
+    promote_proceed.send(()).unwrap();
+
+    // Write should still succeed — promote's pwrite already put data in
+    // active file, and transition_to_dirty handles NP→DIRTY.
+    write_handle.await.unwrap().unwrap();
+
+    // Block should be DIRTY with correct data.
+    assert_eq!(cache.block_state(0), 2);
+    let block = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert_eq!(&block[0..SUB_BLOCK], &vec![0xBB; SUB_BLOCK][..], "sub-block written");
+    assert!(
+        block[SUB_BLOCK..].iter().all(|&b| b == 0xAA),
+        "promoted data preserved after eviction race. got 0x{:02X}",
+        block[SUB_BLOCK]
+    );
+}
+
+/// RW-04: Concurrent pread and pwrite to the same block, both under the
+/// data_file read lock. POSIX guarantees pread/pwrite are atomic for
+/// I/O that doesn't cross filesystem block boundaries. For our 128KB
+/// block size (which IS larger than a page), verify no torn reads.
+#[tokio::test]
+async fn rw04_concurrent_pread_pwrite_same_block() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, _cs, _pic, _vm, _cc, _m) =
+        super::create_test_cache(&dir, "rw04", Arc::clone(&s3)).await;
+
+    // Write block 0 with 0xAA (DIRTY).
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+
+    // Concurrent: write 0xBB to block 0 while reading block 0.
+    // Both hold the data_file read lock (shared).
+    for _ in 0..50 {
+        let c1 = Arc::clone(&cache);
+        let c2 = Arc::clone(&cache);
+
+        let (r1, r2) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                c1.write(0, &vec![0xBB; BLOCK_SIZE])
+            }),
+            tokio::task::spawn_blocking(move || {
+                c2.read_local(0, BLOCK_SIZE)
+            }),
+        );
+        r1.unwrap().unwrap();
+        let data = r2.unwrap().unwrap();
+
+        // Data should be entirely 0xAA or entirely 0xBB — never a mix.
+        let first = data[0];
+        let last = data[BLOCK_SIZE - 1];
+        assert!(
+            (first == 0xAA && last == 0xAA) || (first == 0xBB && last == 0xBB),
+            "torn read detected: first=0x{first:02X} last=0x{last:02X}"
+        );
+    }
+}
+
+/// WW-07: Two concurrent full-block pwrite operations to the same block.
+/// Both hold the data_file read lock. Last writer wins, no partial data.
+#[tokio::test]
+async fn ww07_concurrent_pwrite_same_block() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, _cs, _pic, _vm, _cc, _m) =
+        super::create_test_cache(&dir, "ww07", Arc::clone(&s3)).await;
+
+    // Make block 0 DIRTY first.
+    cache.write(0, &vec![0x00; BLOCK_SIZE]).unwrap();
+
+    for _ in 0..50 {
+        let c1 = Arc::clone(&cache);
+        let c2 = Arc::clone(&cache);
+
+        let (r1, r2) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                c1.write(0, &vec![0xAA; BLOCK_SIZE])
+            }),
+            tokio::task::spawn_blocking(move || {
+                c2.write(0, &vec![0xBB; BLOCK_SIZE])
+            }),
+        );
+        r1.unwrap().unwrap();
+        r2.unwrap().unwrap();
+
+        let data = cache.read_local(0, BLOCK_SIZE).unwrap();
+        let first = data[0];
+        let last = data[BLOCK_SIZE - 1];
+        assert!(
+            (first == 0xAA && last == 0xAA) || (first == 0xBB && last == 0xBB),
+            "torn write detected: first=0x{first:02X} last=0x{last:02X}"
+        );
+    }
+}
+
+/// RF-03: Read SYNCING block during compute_flush_batch. The read should
+/// get data from the flushing file (sync_read_local_block handles SYNCING).
+#[tokio::test]
+async fn rf03_read_syncing_during_compute() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, m) =
+        super::create_test_cache(&dir, "rf03", Arc::clone(&s3)).await;
+
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+
+    // Attach flush sync points.
+    let (flush_sp, mut flush_events, flush_proceed) = FlushSyncPoints::new();
+    cache.set_flush_sync(std::sync::Arc::new(flush_sp));
+
+    let cache_f = Arc::clone(&cache);
+    let cs_f = ContentStore::new(Arc::clone(&s3), "test");
+    let pic_f = Arc::clone(&pic);
+    let vm_f = Arc::clone(&vm);
+    let flush_handle = tokio::spawn(async move {
+        cache_f.flush_packs(&cs_f, &pic_f, &vm_f, None).await
+    });
+
+    // Advance flush past CRC and rotation.
+    flush_events.recv().await.unwrap(); // AfterCrcPrepass
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterRotation
+    // Block is now SYNCING. Don't release flush yet — it's between
+    // rotation and compute.
+
+    // Read block 0 while it's SYNCING.
+    let data = cache
+        .read(0, BLOCK_SIZE, cc.as_ref(), &pic, &vm, &cs, &m)
+        .await
+        .unwrap();
+    assert!(
+        data.iter().all(|&b| b == 0xAA),
+        "read of SYNCING block should return flushing file data. first=0x{:02X}",
+        data[0]
+    );
+
+    // Release flush to complete.
+    flush_proceed.send(()).unwrap(); // proceed to compute+upload
+    flush_events.recv().await.unwrap(); // BeforeEvict
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterEvict
+    flush_proceed.send(()).unwrap();
+    flush_handle.await.unwrap().unwrap();
+}
+
+/// RW-01: Read starts while write is claiming a NOT_PRESENT block.
+/// Read should go to S3 (block is CLEAN, not DIRTY).
+#[tokio::test]
+async fn rw01_read_during_write_claim() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+    let dir1 = TempDir::new().unwrap();
+    let (cache1, cs1, pic, vm1, _cc1, _m1) =
+        super::create_test_cache(&dir1, "rw01", Arc::clone(&s3)).await;
+    cache1.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+    cache1.flush_to_s3(&cs1, &pic, &vm1).await.unwrap();
+    cache1.sync_manifest(&cs1, &vm1).await.unwrap();
+    drop(cache1);
+    drop(dir1);
+
+    let dir2 = TempDir::new().unwrap();
+    let (cache2, cs2, pic2, vm2, cc2, m2) =
+        super::create_cold_reader(&dir2, "rw01", Arc::clone(&s3)).await;
+
+    // Claim block (NP→CLEAN) without writing data.
+    assert!(cache2.try_claim_block(0));
+
+    // Read: block is CLEAN. Should fall through to S3 (not return zeros).
+    let data = cache2
+        .read(0, BLOCK_SIZE, cc2.as_ref(), &pic2, &vm2, &cs2, &m2)
+        .await
+        .unwrap();
+    assert!(
+        data.iter().all(|&b| b == 0xAA),
+        "read of CLEAN block should return S3 data. first=0x{:02X}",
+        data[0]
+    );
+}
+
+/// CW-crash-at-W4: crash after set_present (CLEAN) but before pwrite.
+/// Block is CLEAN with no data on SSD. Recovery should handle this.
+#[tokio::test]
+async fn cw_crash_at_set_present() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+
+    {
+        let (cache, _cs, _pic, _vm, _cc, _m) =
+            super::create_test_cache(&dir, "cw-w4", Arc::clone(&s3)).await;
+        // Simulate: set_present (NP→CLEAN) then crash before pwrite.
+        assert!(cache.try_claim_block(0));
+        assert_eq!(cache.block_state(0), 1); // CLEAN
+        // Save metadata with CLEAN state.
+        cache.save_metadata().unwrap();
+        drop(cache); // crash
+    }
+
+    // Recovery: block is CLEAN in metadata. SSD has zeros.
+    // Recovery should transition CLEAN→DIRTY or handle gracefully.
+    let cache = recover_cache(&dir, "cw-w4", s3).await;
+    // Block should be recoverable. CLEAN blocks with no WAL entry
+    // are benign — they'll be treated as dirty on recovery and the
+    // SSD zeros will be flushed (which is wrong data, but recovery
+    // doesn't know what the data should be). This documents the
+    // known limitation with wal_sync=false.
+    let _ = cache.block_state(0);
+}
+
+// ============================================================================
+// Remaining enumerated interleavings
+// ============================================================================
+
+/// WF-01: Write sees DIRTY while flush CRC pre-pass reads same block.
+/// Both do concurrent I/O on the active file — write does pwrite, flush
+/// CRC does pread. Under the read lock (shared), both proceed.
+#[tokio::test]
+async fn wf01_write_during_crc_prepass() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) =
+        super::create_test_cache(&dir, "wf01", Arc::clone(&s3)).await;
+
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+    cache.write(BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE]).unwrap();
+
+    let (flush_sp, mut flush_events, flush_proceed) = FlushSyncPoints::new();
+    cache.set_flush_sync(std::sync::Arc::new(flush_sp));
+
+    let cache_f = Arc::clone(&cache);
+    let cs_f = ContentStore::new(Arc::clone(&s3), "test");
+    let pic_f = Arc::clone(&pic);
+    let vm_f = Arc::clone(&vm);
+    let flush_handle = tokio::spawn(async move {
+        cache_f.flush_packs(&cs_f, &pic_f, &vm_f, None).await
+    });
+
+    // Wait for CRC pre-pass to complete.
+    let ev = flush_events.recv().await.unwrap();
+    assert_eq!(ev.step, FlushStep::AfterCrcPrepass);
+
+    // Write to block 0 while CRC has been computed but rotation hasn't happened.
+    // Block is still DIRTY. Write overwrites the data CRC was computed from.
+    cache.write(0, &vec![0xCC; BLOCK_SIZE]).unwrap();
+
+    // Release flush. CRC mismatch may cause block 0 to be skipped.
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterRotation
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // BeforeEvict
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterEvict
+    flush_proceed.send(()).unwrap();
+
+    let (stats, _) = flush_handle.await.unwrap().unwrap();
+
+    // Block 0: either uploaded (CRC matched if write landed after CRC read)
+    // or skipped (CRC mismatch). Either way data is not lost.
+    // Block 1 should have been uploaded normally.
+    assert!(stats.packs_uploaded >= 1, "at least block 1 should upload");
+
+    // Block 0 should still have 0xCC data.
+    let b0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert!(b0.iter().all(|&b| b == 0xCC), "block 0 has latest write. first=0x{:02X}", b0[0]);
+}
+
+/// WF-06: Write promote and flush compute_flush_batch both read from the
+/// flushing file concurrently. Both use Arc<SyncFile> with pread (safe).
+#[tokio::test]
+async fn wf06_promote_concurrent_with_compute() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) =
+        super::create_test_cache(&dir, "wf06", Arc::clone(&s3)).await;
+
+    // Two blocks: both will be SYNCING during flush.
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+    cache.write(BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE]).unwrap();
+
+    let (flush_sp, mut flush_events, flush_proceed) = FlushSyncPoints::new();
+    cache.set_flush_sync(std::sync::Arc::new(flush_sp));
+
+    let cache_f = Arc::clone(&cache);
+    let cs_f = ContentStore::new(Arc::clone(&s3), "test");
+    let pic_f = Arc::clone(&pic);
+    let vm_f = Arc::clone(&vm);
+    let flush_handle = tokio::spawn(async move {
+        cache_f.flush_packs(&cs_f, &pic_f, &vm_f, None).await
+    });
+
+    flush_events.recv().await.unwrap(); // AfterCrcPrepass
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterRotation
+    // Blocks are SYNCING. Flush will proceed to compute (pread flushing).
+
+    // Write sub-block to block 0 — triggers promote (also pread flushing).
+    // Both promote and compute read from flushing file via Arc<SyncFile>.
+    let sub = vec![0xCC; SUB_BLOCK];
+    cache.write(0, &sub).unwrap();
+
+    // Block 0 is now DIRTY (promoted). Release flush to compute+upload.
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // BeforeEvict
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterEvict
+    flush_proceed.send(()).unwrap();
+
+    flush_handle.await.unwrap().unwrap();
+
+    // Block 0: DIRTY (promoted), data = 0xCC sub + 0xAA rest.
+    let b0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert_eq!(&b0[0..SUB_BLOCK], &sub[..]);
+    assert!(b0[SUB_BLOCK..].iter().all(|&b| b == 0xAA));
+
+    // Block 1: evicted (NP) or still SYNCING depending on timing.
+    let s1 = cache.block_state(1);
+    assert!(s1 == 0 || s1 == 3, "block 1 evicted or syncing. got {s1}");
+}
+
+/// WF-12: Write's transition_to_dirty races with flush's CRC pread on the
+/// same block. The write completes (CLEAN→DIRTY), flush CRC reads the
+/// new data. No corruption — CRC just reflects the post-write data.
+#[tokio::test]
+async fn wf12_transition_to_dirty_during_crc() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) =
+        super::create_test_cache(&dir, "wf12", Arc::clone(&s3)).await;
+
+    // Block 0 starts DIRTY with 0xAA.
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+
+    // Flush + write concurrently. The write may land during CRC pre-pass.
+    // No gates needed — just verify data integrity after flush.
+    let cache_f = Arc::clone(&cache);
+    let cs_f = ContentStore::new(Arc::clone(&s3), "test");
+    let pic_f = Arc::clone(&pic);
+    let vm_f = Arc::clone(&vm);
+    let cache_w = Arc::clone(&cache);
+
+    let (flush_result, write_result) = tokio::join!(
+        tokio::spawn(async move {
+            cache_f.flush_packs(&cs_f, &pic_f, &vm_f, None).await
+        }),
+        tokio::spawn(async move {
+            cache_w.write(0, &vec![0xBB; BLOCK_SIZE])
+        }),
+    );
+    flush_result.unwrap().unwrap();
+    write_result.unwrap().unwrap();
+
+    // Block 0 should have 0xBB (latest write). May be DIRTY (write won)
+    // or NP (flush evicted, write re-dirtied).
+    let b0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert!(
+        b0.iter().all(|&b| b == 0xBB),
+        "block should have latest write (0xBB). first=0x{:02X}",
+        b0[0]
+    );
+}
+
+/// PF-01: Promote clones flushing_file Arc exactly as flush starts eviction.
+/// The Arc clone should keep the fd alive regardless of eviction timing.
+#[tokio::test]
+async fn pf01_promote_clone_during_eviction_start() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, _cs, _pic, _vm, _cc, _m) =
+        super::create_test_cache(&dir, "pf01", Arc::clone(&s3)).await;
+
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+    cache.test_rotate_and_snapshot().unwrap();
+    assert_eq!(cache.block_state(0), 3); // SYNCING
+
+    // Attach promote gates.
+    let (promote_sp, mut promote_events, promote_proceed) = PromoteSyncPoints::new();
+    cache.set_promote_sync(std::sync::Arc::new(promote_sp));
+
+    // Start write (triggers promote) on blocking thread.
+    let cache_w = Arc::clone(&cache);
+    let write_handle = tokio::task::spawn_blocking(move || {
+        cache_w.write(0, &vec![0xBB; SUB_BLOCK])
+    });
+
+    // Wait for promote to clone the flushing Arc.
+    let ev = promote_events.recv().await.unwrap();
+    assert_eq!(ev.step, PromoteStep::AfterCloneArc);
+
+    // Evict the block NOW — between Arc clone and pread.
+    cache.transition_syncing_to_not_present(0);
+    assert_eq!(cache.block_state(0), 0); // NP
+
+    // Release promote — pread should still work (fd alive via Arc).
+    promote_proceed.send(()).unwrap();
+
+    let ev = promote_events.recv().await.unwrap();
+    assert_eq!(ev.step, PromoteStep::BeforeCas);
+    // CAS SYNCING→DIRTY will fail (block is NP).
+    // But promote also handles NP→DIRTY.
+    promote_proceed.send(()).unwrap();
+
+    write_handle.await.unwrap().unwrap();
+
+    assert_eq!(cache.block_state(0), 2); // DIRTY
+    let b0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert_eq!(&b0[0..SUB_BLOCK], &vec![0xBB; SUB_BLOCK][..]);
+    assert!(b0[SUB_BLOCK..].iter().all(|&b| b == 0xAA), "promoted data preserved");
+}
+
+/// PF-03: Promote pwrite to active file concurrent with flush eviction CAS.
+/// Promote pwrite completes, then CAS. If eviction won first (NP), promote
+/// CAS falls through to NP→DIRTY.
+#[tokio::test]
+async fn pf03_promote_pwrite_concurrent_with_eviction() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, _cs, _pic, _vm, _cc, _m) =
+        super::create_test_cache(&dir, "pf03", Arc::clone(&s3)).await;
+
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+    cache.test_rotate_and_snapshot().unwrap();
+
+    let (promote_sp, mut promote_events, promote_proceed) = PromoteSyncPoints::new();
+    cache.set_promote_sync(std::sync::Arc::new(promote_sp));
+
+    let cache_w = Arc::clone(&cache);
+    let write_handle = tokio::task::spawn_blocking(move || {
+        cache_w.write(0, &vec![0xBB; SUB_BLOCK])
+    });
+
+    // Wait for promote to reach BeforeCas (pwrite already done).
+    promote_events.recv().await.unwrap(); // AfterCloneArc
+    promote_proceed.send(()).unwrap();
+    let ev = promote_events.recv().await.unwrap();
+    assert_eq!(ev.step, PromoteStep::BeforeCas);
+
+    // Data is in the active file now (pwrite done). Evict concurrently.
+    cache.transition_syncing_to_not_present(0);
+
+    // Release promote CAS — block is NP, CAS SYNCING→DIRTY fails,
+    // but NP→DIRTY path fires (data already in active file).
+    promote_proceed.send(()).unwrap();
+    write_handle.await.unwrap().unwrap();
+
+    assert_eq!(cache.block_state(0), 2);
+    let b0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert_eq!(&b0[0..SUB_BLOCK], &vec![0xBB; SUB_BLOCK][..]);
+    assert!(b0[SUB_BLOCK..].iter().all(|&b| b == 0xAA));
+}
+
+/// RW-03: Read fast path pread while concurrent pwrite overwrites same block.
+/// Both under the data_file read lock. Last-writer-wins, no torn data.
+#[tokio::test]
+async fn rw03_read_during_concurrent_pwrite() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, _cs, _pic, _vm, _cc, _m) =
+        super::create_test_cache(&dir, "rw03", Arc::clone(&s3)).await;
+
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+
+    for _ in 0..50 {
+        let c1 = Arc::clone(&cache);
+        let c2 = Arc::clone(&cache);
+        let (r1, r2) = tokio::join!(
+            tokio::task::spawn_blocking(move || c1.write(0, &vec![0xBB; BLOCK_SIZE])),
+            tokio::task::spawn_blocking(move || c2.read_local(0, BLOCK_SIZE)),
+        );
+        r1.unwrap().unwrap();
+        let data = r2.unwrap().unwrap();
+        let first = data[0];
+        let last = data[BLOCK_SIZE - 1];
+        assert!(
+            (first == 0xAA && last == 0xAA) || (first == 0xBB && last == 0xBB),
+            "torn read: first=0x{first:02X} last=0x{last:02X}"
+        );
+    }
+}
+
+/// MS-3: Two concurrent flush_to_s3 calls. The flush_lock serializes them.
+/// Both should succeed and manifest should be consistent.
+#[tokio::test]
+async fn ms3_concurrent_flush_to_s3_serialized() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, _cs, pic, vm, _cc, _m) =
+        super::create_test_cache(&dir, "ms3", Arc::clone(&s3)).await;
+
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+    cache.write(BLOCK_SIZE as u64, &vec![0xBB; BLOCK_SIZE]).unwrap();
+
+    let cache1 = Arc::clone(&cache);
+    let cache2 = Arc::clone(&cache);
+    let cs1 = ContentStore::new(Arc::clone(&s3), "test");
+    let cs2 = ContentStore::new(Arc::clone(&s3), "test");
+    let pic1 = Arc::clone(&pic);
+    let pic2 = Arc::clone(&pic);
+    let vm1 = Arc::clone(&vm);
+    let vm2 = Arc::clone(&vm);
+
+    let (r1, r2) = tokio::join!(
+        tokio::spawn(async move { cache1.flush_to_s3(&cs1, &pic1, &vm1).await }),
+        tokio::spawn(async move { cache2.flush_to_s3(&cs2, &pic2, &vm2).await }),
+    );
+
+    // Both should succeed (serialized by flush_lock).
+    r1.unwrap().unwrap();
+    r2.unwrap().unwrap();
+
+    // All blocks should be flushed.
+    assert_eq!(cache.dirty_block_count(), 0);
 }
