@@ -358,6 +358,110 @@ async fn test_push_delta_image_roundtrip() {
     );
 }
 
+/// Push a two-layer delta image, pull it back via pull_image, and verify
+/// the merged ext4 filesystem has the correct content (layer merge with whiteouts).
+#[tokio::test]
+async fn test_pull_multi_layer_roundtrip() {
+    let (_registry, addr) = start_registry().await;
+    let client = http_client();
+    let auth = Credentials::Anonymous;
+
+    // Base: a.txt + b.txt + dir/x.txt
+    let (base_handler, _tmp1) = test_handler().await;
+    write_ext4_files(
+        &base_handler,
+        &[
+            ("a.txt", b"aaa"),
+            ("b.txt", b"bbb"),
+            ("dir/x.txt", b"xxx"),
+        ],
+    )
+    .await;
+
+    // Target: a.txt modified, b.txt deleted (whiteout), c.txt added, dir/x.txt kept
+    let (target_handler, _tmp2) = test_handler().await;
+    write_ext4_files(
+        &target_handler,
+        &[
+            ("a.txt", b"aaa-modified"),
+            ("c.txt", b"ccc"),
+            ("dir/x.txt", b"xxx"),
+        ],
+    )
+    .await;
+
+    let image: Reference = format!("{}/test/pull-multi-layer:v1", addr).parse().unwrap();
+    push_delta_image(
+        &client,
+        &image,
+        &auth,
+        Arc::clone(&base_handler),
+        Arc::clone(&target_handler),
+    )
+    .await
+    .unwrap();
+
+    // Pull into a fresh handler — this exercises the full multi-layer merge.
+    let (pull_handler, _tmp3) = test_handler().await;
+    let options = glidefs::oci::IngestOptions {
+        writer_options: vec![WriterOption::MaximumDiskSize(DEVICE_SIZE as i64)],
+    };
+    glidefs::oci::pull_image(&client, &image, &auth, Arc::clone(&pull_handler), options)
+        .await
+        .unwrap();
+
+    // Read back the ext4 filesystem from the pull handler's blocks.
+    let h = Arc::clone(&pull_handler);
+    let files = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        let adapter = BlockAdapter::new(&h, rt);
+        let mut reader = ext4::Reader::new(adapter).expect("failed to open ext4 reader");
+        let entries = reader.walk().expect("walk failed");
+
+        let mut files = std::collections::HashMap::new();
+        for entry in &entries {
+            // Only check regular files.
+            if entry.mode & format::TYPE_MASK == format::S_IFREG {
+                let inode = reader.read_inode(entry.inode_number).unwrap();
+                let data = reader.read_data(&inode).unwrap();
+                files.insert(entry.path.clone(), data);
+            }
+        }
+        files
+    })
+    .await
+    .unwrap();
+
+    // Verify merged content:
+    // - a.txt should be from the top layer (modified)
+    assert_eq!(
+        files.get("a.txt").map(|d| d.as_slice()),
+        Some(b"aaa-modified".as_slice()),
+        "a.txt should be overridden by top layer"
+    );
+
+    // - b.txt should NOT exist (deleted by whiteout in delta layer)
+    assert!(
+        !files.contains_key("b.txt"),
+        "b.txt should be deleted by whiteout; found files: {:?}",
+        files.keys().collect::<Vec<_>>()
+    );
+
+    // - c.txt should exist (added by top layer)
+    assert_eq!(
+        files.get("c.txt").map(|d| d.as_slice()),
+        Some(b"ccc".as_slice()),
+        "c.txt should be added by top layer"
+    );
+
+    // - dir/x.txt should exist (from base, not overridden)
+    assert_eq!(
+        files.get("dir/x.txt").map(|d| d.as_slice()),
+        Some(b"xxx".as_slice()),
+        "dir/x.txt should survive from base layer"
+    );
+}
+
 /// Push the same image twice — second push should succeed (idempotent blobs).
 #[tokio::test]
 async fn test_push_idempotent() {
