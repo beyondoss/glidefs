@@ -10,6 +10,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ptr;
+
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
+#[cfg(not(feature = "loom"))]
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 
 // ============================================================================
@@ -134,11 +138,20 @@ impl SparseBlockState {
 
 /// Number of 2-bit entries packed into each `AtomicU8`.
 const ENTRIES_PER_BYTE: usize = 4;
-/// Size of one state page in bytes (one OS page).
+
+// Under loom, use tiny pages to avoid stack overflow (loom's AtomicU8 is large)
+// and keep the state space tractable.
+#[cfg(not(feature = "loom"))]
 const STATE_PAGE_BYTES: usize = 4096;
-/// Number of block state entries per page (4096 bytes × 4 entries/byte).
-const STATE_PAGE_ENTRIES: usize = STATE_PAGE_BYTES * ENTRIES_PER_BYTE; // 16384
+#[cfg(feature = "loom")]
+const STATE_PAGE_BYTES: usize = 4;
+
+const STATE_PAGE_ENTRIES: usize = STATE_PAGE_BYTES * ENTRIES_PER_BYTE;
+// log2(STATE_PAGE_ENTRIES)
+#[cfg(not(feature = "loom"))]
 const STATE_PAGE_BITS: usize = 14; // log2(16384)
+#[cfg(feature = "loom")]
+const STATE_PAGE_BITS: usize = 4; // log2(16)
 const STATE_PAGE_MASK: usize = STATE_PAGE_ENTRIES - 1;
 
 /// A page of 16,384 block state entries packed into 4,096 bytes (one OS page).
@@ -148,16 +161,27 @@ const STATE_PAGE_MASK: usize = STATE_PAGE_ENTRIES - 1;
 /// - bits [3:2] = entry 1
 /// - bits [5:4] = entry 2
 /// - bits [7:6] = entry 3
-#[repr(C, align(4096))]
+#[cfg_attr(not(feature = "loom"), repr(C, align(4096)))]
 struct StatePage {
     data: [AtomicU8; STATE_PAGE_BYTES],
 }
 
 impl StatePage {
     fn new_boxed() -> Box<Self> {
-        // SAFETY: All-zeros is valid for StatePage because AtomicU8::new(0) is
-        // represented as a zero byte with #[repr(C)] layout.
-        unsafe { Box::new_zeroed().assume_init() }
+        #[cfg(not(feature = "loom"))]
+        {
+            // SAFETY: All-zeros is valid for StatePage because AtomicU8::new(0) is
+            // represented as a zero byte with #[repr(C)] layout.
+            unsafe { Box::new_zeroed().assume_init() }
+        }
+        #[cfg(feature = "loom")]
+        {
+            // Loom's AtomicU8 has internal tracking state and cannot be
+            // zero-initialized. Construct each element explicitly.
+            Box::new(StatePage {
+                data: std::array::from_fn(|_| AtomicU8::new(0)),
+            })
+        }
     }
 }
 

@@ -79,6 +79,21 @@ jobs:
       - name: Run loom tests
         run: cargo test --release
 
+  stateright:
+    name: Stateright Model Checking
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: glidefs/stateright-model
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "glidefs/stateright-model -> target"
+      - name: Run stateright model checker
+        run: cargo test --release
+
   benchmarks:
     name: Benchmarks
     runs-on: ubuntu-latest

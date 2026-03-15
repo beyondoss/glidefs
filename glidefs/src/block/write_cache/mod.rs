@@ -104,7 +104,7 @@ impl WriteCache<Draining> {
     }
 }
 
-// Loom concurrency tests are in a separate crate: glidefs/loom-tests/
-// This is necessary because loom disables tokio's networking which breaks
-// dependencies like hyper-util. Run loom tests with:
-//   cd loom-tests && cargo test --release
+// Loom concurrency tests: glidefs/loom-tests/
+// Tests the REAL SparseStateMap under exhaustive interleaving exploration.
+// The `loom` cargo feature swaps std atomics for loom atomics in block_map.rs.
+// Run: cd loom-tests && cargo test --release

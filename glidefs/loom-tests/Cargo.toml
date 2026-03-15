@@ -8,11 +8,17 @@ description = "Loom concurrency tests for GlideFS state machine"
 # Standalone crate — not part of the workspace.
 [workspace]
 
-# This crate ONLY contains loom tests - no regular tests
 # Run with: cd loom-tests && cargo test --release
 
 [dependencies]
 loom = "0.7"
+
+# Test the REAL SparseStateMap — the `loom` feature swaps std atomics
+# for loom atomics inside block_map.rs.
+[dependencies.glidefs]
+path = ".."
+default-features = false
+features = ["loom"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
