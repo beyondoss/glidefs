@@ -498,8 +498,21 @@ impl WriteCache<Active> {
 
         // Fsync parent directory so the rename is durable across power loss.
         if let Some(parent) = active_path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
+            match std::fs::File::open(parent) {
+                Ok(dir) => {
+                    if let Err(e) = dir.sync_all() {
+                        warn!(
+                            error = %e,
+                            "dir fsync after rotation failed — durability weakened"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "failed to open parent dir for fsync after rotation — durability weakened"
+                    );
+                }
             }
         }
 
@@ -647,7 +660,7 @@ impl WriteCache<Active> {
         info!(dirty_blocks = snapshot.len(), seq_cutpoint, "starting flush");
 
         let result = self
-            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache, &crcs)
+            .flush_dirty_body(&snapshot, content_store, pack_index_cache, volume_manifest, clean_cache, crcs)
             .await;
 
         if result.is_err() {
@@ -773,7 +786,7 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: Option<&Arc<dyn BlockCache>>,
-        crcs: &HashMap<usize, u32>,
+        crcs: HashMap<usize, u32>,
     ) -> Result<FlushStats, CacheError> {
         use crate::block::pack::new_pack_id;
 
@@ -837,7 +850,7 @@ impl WriteCache<Active> {
         let mut total_stats = FlushStats::default();
         let mut flushed_blocks: Vec<usize> = Vec::new();
         let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
-        let crcs = Arc::new(crcs.clone());
+        let crcs = Arc::new(crcs);
 
         // Per-chunk flush
         for (chunk_idx, chunk_blocks) in per_chunk {

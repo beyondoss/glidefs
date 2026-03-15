@@ -2302,11 +2302,13 @@ async fn pf02_eviction_during_promote_read() {
 }
 
 /// RW-04: Concurrent pread and pwrite to the same block, both under the
-/// data_file read lock. POSIX does NOT guarantee atomicity for I/O larger
-/// than a filesystem block (typically 4KB). Our 128KB blocks span multiple
-/// pages, so a concurrent pread may observe a partially-written block.
-/// What we verify: no byte corruption (every byte is a valid value from
-/// one of the two writers), proving pwrite doesn't produce garbage.
+/// data_file read lock. In production, each export has a single VM whose
+/// block layer serializes I/O to the same block — concurrent read+write
+/// to the same block is a synthetic scenario. POSIX does not guarantee
+/// atomicity for I/O larger than a filesystem block (~4KB), so our 128KB
+/// pwrite may be partially visible to a concurrent pread. What we verify:
+/// no byte corruption (every byte is a valid writer value), proving
+/// pwrite doesn't produce garbage even in this synthetic case.
 #[tokio::test]
 async fn rw04_concurrent_pread_pwrite_same_block() {
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
