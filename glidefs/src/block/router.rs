@@ -97,6 +97,10 @@ pub struct ExportInfo {
     pub readonly: bool,
     pub transport: String,
     pub device: Option<PathBuf>,
+    /// Unflushed bytes waiting to be synced to S3.
+    pub dirty_bytes: u64,
+    /// Total logical bytes stored in S3 (chunks × chunk_size).
+    pub s3_bytes: u64,
 }
 
 /// Readiness check result for health endpoint.
@@ -141,53 +145,7 @@ pub struct ExportState {
 /// concurrent writes keep producing new dirty blocks faster than we flush.
 const MAX_DRAIN_ITERATIONS: usize = 100;
 
-impl ExportState {
-    /// Drain all dirty blocks to S3 via v2 content-addressed packs.
-    ///
-    /// Returns an error if dirty blocks remain after MAX_DRAIN_ITERATIONS.
-    /// Callers that can tolerate incomplete drains (e.g. teardown) should
-    /// handle `RouterError::DrainIncomplete` explicitly.
-    pub async fn drain(&self, name: &str) -> Result<(), RouterError> {
-        // Loop until no more dirty blocks remain (concurrent writes may
-        // produce new dirty data between flushes).
-        //
-        // Check dirty_block_count() in addition to blocks_claimed: partial
-        // blocks (with incomplete backfill) are excluded from the flush
-        // snapshot to avoid uploading incomplete data. blocks_claimed can
-        // be 0 while dirty partial blocks remain. A short sleep gives
-        // backfill tasks time to complete.
-        for i in 0..MAX_DRAIN_ITERATIONS {
-            let stats = self
-                .cache
-                .flush_to_s3(&self.content_store, &self.pack_index_cache, &self.volume_manifest)
-                .await
-                .map_err(RouterError::Cache)?;
-            if stats.blocks_claimed == 0 && self.cache.dirty_block_count() == 0 {
-                return Ok(());
-            }
-            // Partial blocks excluded from snapshot: yield to let backfill
-            // tasks complete before retrying.
-            if stats.blocks_claimed == 0 {
-                tracing::debug!(
-                    dirty = self.cache.dirty_block_count(),
-                    iteration = i,
-                    "drain: dirty blocks remain (likely partial), waiting for backfill"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-        let remaining = self.cache.dirty_block_count();
-        warn!(
-            "drain hit iteration limit ({}), {} dirty blocks remain",
-            MAX_DRAIN_ITERATIONS, remaining,
-        );
-        Err(RouterError::DrainIncomplete {
-            name: name.to_string(),
-            remaining,
-            iterations: MAX_DRAIN_ITERATIONS,
-        })
-    }
-}
+impl ExportState {}
 
 /// Configuration for the export router.
 pub struct RouterConfig {
@@ -797,17 +755,42 @@ impl ExportRouter {
             let cache = cache.finish_recovery().await?;
             info!("Export '{}' cache ready", name);
 
-            // Empty volume manifest for new exports
-            let volume_manifest = Arc::new(parking_lot::RwLock::new(
-                VolumeManifest::new(device_size, block_size as u32),
-            ));
-
-            // Try to load existing volume manifest from S3
-            if let Ok(Some((data, etag))) = content_store.get_manifest(&name).await && let Ok(vm) = VolumeManifest::deserialize(&data) {
-                *volume_manifest.write() = vm;
-                *cache.inner.manifest_etag.lock() = etag;
-                info!("Loaded existing volume manifest for '{}'", name);
-            }
+            // Load existing manifest from S3 or start fresh.
+            //
+            // CRITICAL: if a manifest exists in S3 but we fail to load it
+            // (transient S3 error, deserialization failure), we MUST fail
+            // rather than start with an empty manifest. Starting empty would
+            // cause the first sync_manifest to unconditionally overwrite the
+            // real manifest (manifest_etag would be None), permanently losing
+            // all previously-flushed block references.
+            let volume_manifest = match content_store.get_manifest(&name).await {
+                Ok(Some((data, etag))) => {
+                    let vm = VolumeManifest::deserialize(&data).map_err(|e| {
+                        RouterError::Manifest(format!(
+                            "failed to deserialize manifest for '{}': {}",
+                            name, e
+                        ))
+                    })?;
+                    let volume_manifest = Arc::new(parking_lot::RwLock::new(vm));
+                    *cache.inner.manifest_etag.lock() = etag;
+                    info!("Loaded existing volume manifest for '{}'", name);
+                    volume_manifest
+                }
+                Ok(None) => {
+                    // No manifest in S3 — genuinely new export.
+                    info!("No existing manifest for '{}', starting fresh", name);
+                    Arc::new(parking_lot::RwLock::new(
+                        VolumeManifest::new(device_size, block_size as u32),
+                    ))
+                }
+                Err(e) => {
+                    return Err(RouterError::Manifest(format!(
+                        "failed to load manifest for '{}' from S3: {} — refusing to start \
+                         with empty manifest (would overwrite existing data on first flush)",
+                        name, e
+                    )));
+                }
+            };
 
             (Arc::new(cache), volume_manifest)
         };
@@ -979,10 +962,11 @@ impl ExportRouter {
         );
 
         // If a tag was provided, publish the manifest under that name too.
+        // Uses manifest_bytes captured under the flush lock inside snapshot()
+        // to ensure the tag is a consistent point-in-time snapshot.
         if let Some(tag) = tag {
-            let manifest_bytes = volume_manifest.read().serialize();
             content_store
-                .put_manifest(tag, manifest_bytes, None)
+                .put_manifest(tag, result.manifest_bytes.clone(), None)
                 .await
                 .map_err(RouterError::ContentStore)?;
             info!("Tagged snapshot of '{}' as '{}'", name, tag);
@@ -1008,7 +992,11 @@ impl ExportRouter {
         let state = exports
             .get(name)
             .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
-        let manifest_bytes = state.volume_manifest.read().serialize();
+        let manifest_bytes = state
+            .volume_manifest
+            .read()
+            .serialize()
+            .map_err(|e| RouterError::Manifest(e.to_string()))?;
         state
             .content_store
             .put_manifest(tag, manifest_bytes, None)
@@ -1070,6 +1058,29 @@ impl ExportRouter {
             .map_err(RouterError::ContentStore)
     }
 
+    /// Get info for a single export.
+    pub async fn get_export_info(&self, name: &str) -> Option<ExportInfo> {
+        let mut info = {
+            let exports = self.exports.read().await;
+            let state = exports.get(name)?;
+            let block_size = state.cache.block_size() as u64;
+            let manifest = state.volume_manifest.read();
+            let s3_bytes = manifest.chunks.len() as u64 * manifest.chunk_size;
+            drop(manifest);
+            ExportInfo {
+                name: name.to_string(),
+                size: state.handler.device_size(),
+                readonly: state.readonly,
+                transport: state.transport.clone(),
+                device: None,
+                dirty_bytes: state.cache.dirty_block_count() * block_size,
+                s3_bytes,
+            }
+        };
+        info.device = self.get_device_path(name).await;
+        Some(info)
+    }
+
     /// Get handler for an export (used during NBD negotiation).
     pub async fn get_handler(&self, name: &str) -> Option<Arc<BlockHandler>> {
         let exports = self.exports.read().await;
@@ -1088,12 +1099,18 @@ impl ExportRouter {
         let exports = self.exports.read().await;
         let mut result: Vec<ExportInfo> = exports
             .iter()
-            .map(|(name, state)| ExportInfo {
-                name: name.clone(),
-                size: state.handler.device_size(),
-                readonly: state.readonly,
-                transport: state.transport.clone(),
-                device: None,
+            .map(|(name, state)| {
+                let block_size = state.cache.block_size() as u64;
+                let manifest = state.volume_manifest.read();
+                ExportInfo {
+                    name: name.clone(),
+                    size: state.handler.device_size(),
+                    readonly: state.readonly,
+                    transport: state.transport.clone(),
+                    device: None,
+                    dirty_bytes: state.cache.dirty_block_count() * block_size,
+                    s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
+                }
             })
             .collect();
         drop(exports);
@@ -1307,25 +1324,80 @@ impl ExportRouter {
     /// Get metrics snapshot for an export.
     pub async fn get_export_metrics(&self, name: &str) -> Option<MetricsSnapshot> {
         let exports = self.exports.read().await;
-        exports.get(name).map(|s| {
-            s.metrics
-                .snapshot()
-                .with_cache_state(s.cache.dirty_block_count(), s.cache.syncing_block_count())
-        })
+        exports.get(name).map(|s| Self::snapshot_export_metrics(s))
+    }
+
+    /// Snapshot metrics for all exports under a single lock acquisition.
+    pub async fn all_export_metrics(&self) -> Vec<(String, MetricsSnapshot)> {
+        let exports = self.exports.read().await;
+        exports
+            .iter()
+            .map(|(name, s)| (name.clone(), Self::snapshot_export_metrics(s)))
+            .collect()
+    }
+
+    fn snapshot_export_metrics(s: &ExportState) -> MetricsSnapshot {
+        let block_size = s.cache.block_size() as u64;
+        let dirty_blocks = s.cache.dirty_block_count();
+        let manifest = s.volume_manifest.read();
+        s.metrics.snapshot().with_cache_state(
+            dirty_blocks,
+            s.cache.syncing_block_count(),
+            dirty_blocks * block_size,
+            manifest.chunks.len() as u64 * manifest.chunk_size,
+        )
     }
 
     /// Drain an export's dirty blocks to S3.
     pub async fn drain_export(&self, name: &str) -> Result<(), RouterError> {
         validate_export_name(name)?;
-        let exports = self.exports.read().await;
-        let state = exports
-            .get(name)
-            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+
+        // Clone Arc'd components under read lock, then release it so we don't
+        // block export lifecycle operations (create/remove/shutdown) during
+        // the potentially long-running drain.
+        let (cache, content_store, pack_index_cache, volume_manifest) = {
+            let exports = self.exports.read().await;
+            let state = exports
+                .get(name)
+                .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            (
+                Arc::clone(&state.cache),
+                Arc::clone(&state.content_store),
+                Arc::clone(&state.pack_index_cache),
+                Arc::clone(&state.volume_manifest),
+            )
+        };
 
         info!("Draining export '{}'...", name);
-        state.drain(name).await?;
-        info!("Export '{}' drained successfully", name);
-        Ok(())
+        // Inline the drain loop using the cloned components.
+        for i in 0..MAX_DRAIN_ITERATIONS {
+            let stats = cache
+                .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+                .await
+                .map_err(RouterError::Cache)?;
+            if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 {
+                info!("Export '{}' drained successfully", name);
+                return Ok(());
+            }
+            if stats.blocks_claimed == 0 {
+                tracing::debug!(
+                    dirty = cache.dirty_block_count(),
+                    iteration = i,
+                    "drain: dirty blocks remain (likely partial), waiting for backfill"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        let remaining = cache.dirty_block_count();
+        warn!(
+            "drain hit iteration limit ({}), {} dirty blocks remain",
+            MAX_DRAIN_ITERATIONS, remaining,
+        );
+        Err(RouterError::DrainIncomplete {
+            name: name.to_string(),
+            remaining,
+            iterations: MAX_DRAIN_ITERATIONS,
+        })
     }
 
     /// Record a drain/flush error for the named export's metrics.
@@ -1589,6 +1661,28 @@ impl ExportRouter {
         Ok(())
     }
 
+    /// Stop all flush schedulers without draining. Leaves dirty blocks on
+    /// the local SSD for WAL-based recovery on next startup.
+    ///
+    /// Used by crash simulation in tests: a real process crash kills all
+    /// tasks instantly, but in an in-process test we need to explicitly
+    /// stop the schedulers so they release cache file handles before the
+    /// next server opens the same files.
+    #[cfg(feature = "test-utils")]
+    pub async fn stop_flush_schedulers(&self) {
+        let mut exports = self.exports.write().await;
+        let export_list: Vec<_> = exports.drain().collect();
+        drop(exports);
+
+        for (name, state) in export_list {
+            let _ = state.flush_shutdown_tx.send(true);
+            if let Err(e) = state.flush_handle.await {
+                tracing::warn!("Flush scheduler for '{}' panicked: {}", name, e);
+            }
+            // Deliberately NO drain — dirty blocks stay on SSD.
+        }
+    }
+
     /// Drain dirty blocks, stop flush scheduler, and transition cache through
     /// the Draining typestate. Shared by `remove_export` and `shutdown`.
     ///
@@ -1623,7 +1717,7 @@ impl ExportRouter {
         let mut backoff = Duration::from_millis(100);
         for _ in 0..MAX_DRAIN_ITERATIONS {
             match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
-                Ok(stats) if stats.blocks_claimed == 0 => {
+                Ok(stats) if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 => {
                     drain_done = true;
                     break;
                 }
@@ -1647,6 +1741,15 @@ impl ExportRouter {
             warn!(
                 "Teardown drain for '{}' incomplete, {} dirty blocks remain",
                 name, remaining,
+            );
+        }
+
+        // Best-effort final manifest sync — persists references to any packs
+        // that were successfully uploaded even if the full drain didn't complete.
+        if let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await {
+            warn!(
+                "Final manifest sync for '{}' failed: {} — flushed packs may be orphaned",
+                name, e,
             );
         }
 

@@ -160,7 +160,7 @@ async fn test_torn_write_temp_file() {
     // Only write header, missing block states
     let tmp_path = config.metadata_path().with_extension("meta.tmp");
     let mut truncated = Vec::new();
-    truncated.extend_from_slice(b"ZFSCACHE"); // magic
+    truncated.extend_from_slice(b"GLIDECCH"); // magic
     truncated.extend_from_slice(&3u32.to_le_bytes()); // version
     // Missing: device_size, block_size, num_blocks, states, bitmap
     std::fs::write(&tmp_path, &truncated).unwrap();
@@ -192,7 +192,7 @@ async fn test_truncated_metadata_file() {
     // Create truncated .meta file (header only, no block states)
     let meta_path = config.metadata_path();
     let mut truncated = Vec::new();
-    truncated.extend_from_slice(b"ZFSCACHE");
+    truncated.extend_from_slice(b"GLIDECCH");
     truncated.extend_from_slice(&3u32.to_le_bytes()); // version
     truncated.extend_from_slice(&config.device_size.to_le_bytes());
     truncated.extend_from_slice(&(config.block_size as u64).to_le_bytes());
@@ -336,7 +336,7 @@ async fn test_crash_before_first_metadata_rename() {
     let num_blocks = config.num_blocks();
 
     let mut valid_temp = Vec::new();
-    valid_temp.extend_from_slice(b"ZFSCACHE");
+    valid_temp.extend_from_slice(b"GLIDECCH");
     valid_temp.extend_from_slice(&3u32.to_le_bytes()); // version
     valid_temp.extend_from_slice(&config.device_size.to_le_bytes());
     valid_temp.extend_from_slice(&(config.block_size as u64).to_le_bytes());
@@ -1029,7 +1029,7 @@ async fn test_syncing_blocks_at_crash_become_dirty() {
         }
 
         // Header
-        write_hashed!(b"ZFSCACHE");
+        write_hashed!(b"GLIDECCH");
         write_hashed!(&5u32.to_le_bytes()); // version 5
         write_hashed!(&config.device_size.to_le_bytes());
         write_hashed!(&(config.block_size as u64).to_le_bytes());
@@ -1044,8 +1044,9 @@ async fn test_syncing_blocks_at_crash_become_dirty() {
         write_hashed!(&2u32.to_le_bytes()); // block 2
         write_hashed!(&[2u8]); // DIRTY
 
-        // v5: max_sequence
+        // Trailing fields: max_sequence + rotation_seq
         write_hashed!(&100u64.to_le_bytes());
+        write_hashed!(&0u64.to_le_bytes()); // rotation_seq = 0 (no active rotation)
 
         // CRC32 trailer
         let crc = hasher.finalize();

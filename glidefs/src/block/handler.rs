@@ -7,6 +7,8 @@
 use super::cache::BlockCache;
 use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+use super::write_cache::CacheError;
 use super::metrics::ExportMetrics;
 use super::pack_index_cache::PackIndexCache;
 use super::readahead::SequentialDetector;
@@ -20,6 +22,90 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::Notify;
+
+// ============================================================================
+// Test-only: deterministic interleaving infrastructure
+// ============================================================================
+
+/// Steps in the backfill_and_write path where concurrent writers can interleave.
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillStep {
+    /// After initial block state check (knows if NOT_PRESENT/CLEAN/DIRTY/SYNCING).
+    StateChecked,
+    /// After resolve_block_for_backfill returns (has `prior` data from S3 or SSD).
+    S3FetchDone,
+    /// After post-fetch state re-check.
+    PostFetchRecheck,
+    /// Before try_claim_block CAS.
+    BeforeCas,
+    /// After CAS result (winner or loser decided).
+    AfterCas,
+    /// Before cache.write (full-block merge for winner, sub-block for loser/fast-path).
+    BeforeWrite,
+}
+
+/// Event sent by a writer at each sync point.
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone)]
+pub struct BackfillEvent {
+    pub writer_id: u64,
+    pub step: BackfillStep,
+    pub block_idx: usize,
+    /// Block state at the time of the event.
+    pub block_state: u8,
+}
+
+/// Sync point controller for deterministic interleaving tests.
+///
+/// Each writer sends events at critical points and waits for the test to
+/// release it. The test receives events, decides ordering, and sends
+/// proceed signals to advance specific writers.
+#[cfg(feature = "test-utils")]
+pub struct BackfillSyncPoints {
+    /// Writer → test: "I'm at step X".
+    event_tx: tokio::sync::mpsc::UnboundedSender<BackfillEvent>,
+    /// Per-writer proceed channels. Test sends () to release a specific writer.
+    /// Keyed by writer_id. Writers register on first use.
+    proceed_channels: parking_lot::Mutex<
+        std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<()>>,
+    >,
+    /// Counter for assigning writer IDs.
+    next_writer_id: AtomicU64,
+}
+
+#[cfg(feature = "test-utils")]
+impl BackfillSyncPoints {
+    /// Create a new sync point controller. Returns (controller, event_receiver).
+    pub fn new() -> (
+        Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<BackfillEvent>,
+    ) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sp = Arc::new(Self {
+            event_tx,
+            proceed_channels: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            next_writer_id: AtomicU64::new(0),
+        });
+        (sp, event_rx)
+    }
+
+    /// Allocate a writer ID and return its proceed receiver.
+    fn register_writer(&self) -> (u64, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let id = self.next_writer_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.proceed_channels.lock().insert(id, tx);
+        (id, rx)
+    }
+
+    /// Release a specific writer to proceed past its current gate.
+    pub fn release(&self, writer_id: u64) {
+        let channels = self.proceed_channels.lock();
+        if let Some(tx) = channels.get(&writer_id) {
+            let _ = tx.send(());
+        }
+    }
+}
 
 /// Block device descriptor used during transmission phase.
 #[derive(Clone)]
@@ -84,6 +170,10 @@ pub struct BlockHandler {
 
     /// Optional write trace recorder. Zero cost when None.
     write_tracer: Option<Arc<WriteTracer>>,
+
+    /// Test-only: sync points for deterministic interleaving tests.
+    #[cfg(feature = "test-utils")]
+    backfill_sync: Option<Arc<BackfillSyncPoints>>,
 }
 
 impl BlockHandler {
@@ -123,7 +213,16 @@ impl BlockHandler {
             flush_notify,
             blocks_per_pack,
             write_tracer,
+            #[cfg(feature = "test-utils")]
+            backfill_sync: None,
         }
+    }
+
+    /// Attach sync points for deterministic interleaving tests.
+    #[cfg(feature = "test-utils")]
+    pub fn with_backfill_sync(mut self, sync: Arc<BackfillSyncPoints>) -> Self {
+        self.backfill_sync = Some(sync);
+        self
     }
 
     /// Check if this handler is readonly.
@@ -141,6 +240,11 @@ impl BlockHandler {
     #[inline]
     pub fn device_size(&self) -> u64 {
         self.device_size.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn block_size(&self) -> usize {
+        self.cache.block_size()
     }
 
     /// Set the device size (for resize).
@@ -223,7 +327,7 @@ impl BlockHandler {
                 Some(&self.metrics),
             ).await {
                 Ok(data) => data,
-                Err(_) => continue, // No S3 data — zeros are correct.
+                Err(e) => return Err(e.into()),
             };
             // Skip if the resolved data is all zeros — the data file already
             // has zeros (sparse or set_len). Writing zeros would create
@@ -269,13 +373,57 @@ impl BlockHandler {
         let start_block = offset / block_size_u64;
         let end_block = (offset + data.len() as u64 - 1) / block_size_u64;
 
-        // Fast path: all blocks already present — skip backfill entirely.
-        let needs_backfill = (start_block..=end_block).any(|b| {
-            !self.cache.is_block_present(b as usize)
-        });
-        if !needs_backfill {
-            self.cache.write(offset, data)?;
-            return Ok(());
+        // Test-only: register this writer and get a proceed channel.
+        #[cfg(feature = "test-utils")]
+        let (mut _sync_writer_id, mut _sync_proceed_rx): (Option<u64>, Option<tokio::sync::mpsc::UnboundedReceiver<()>>) =
+            match &self.backfill_sync {
+                Some(sp) => {
+                    let (id, rx) = sp.register_writer();
+                    (Some(id), Some(rx))
+                }
+                None => (None, None),
+            };
+
+        // Test-only gate macro: send event, wait for proceed signal.
+        macro_rules! _backfill_gate {
+            ($step:expr, $block_idx:expr, $state:expr) => {
+                #[cfg(feature = "test-utils")]
+                {
+                    if let Some(sp) = &self.backfill_sync {
+                        if let (Some(id), Some(rx)) = (_sync_writer_id, &mut _sync_proceed_rx) {
+                            let _ = sp.event_tx.send(BackfillEvent {
+                                writer_id: id,
+                                step: $step,
+                                block_idx: $block_idx,
+                                block_state: $state,
+                            });
+                            let _ = rx.recv().await;
+                        }
+                    }
+                }
+            };
+        }
+
+        // Fast path: all blocks already present AND fully written.
+        // DIRTY/SYNCING = data is on local SSD (or promotable from flushing file).
+        // CLEAN = claimed but not yet written — must NOT write sub-range yet.
+        // NOT_PRESENT = needs backfill.
+        {
+            use crate::block::block_map::SparseBlockState;
+            let all_ready = (start_block..=end_block).all(|b| {
+                let state = self.cache.block_state(b as usize);
+                state == SparseBlockState::DIRTY || state == SparseBlockState::SYNCING
+            });
+            if all_ready {
+                match self.cache.write_with_eviction_check(offset, data) {
+                    Ok(()) => return Ok(()),
+                    Err(super::write_cache::CacheError::BlockEvicted) => {
+                        // Flush evicted a block between state check and pwrite.
+                        // Fall through to slow path which retries per-block.
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
         }
 
         // Slow path: at least one block needs backfill.
@@ -290,111 +438,173 @@ impl BlockHandler {
             let block_local_start = (write_start - block_start) as usize;
             let write_len = (write_end - write_start) as usize;
 
-            if self.cache.is_block_present(idx) {
-                // Already present — just pwrite the sub-range.
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
-            }
-
-            if write_len >= block_size {
-                // Full block overwrite — no prior data to preserve.
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
-            }
-
-            // Sub-block write to a NOT_PRESENT block.
-            // Check if this specific block has S3 data before doing the
-            // expensive resolve. Most first-writes to fresh blocks have no
-            // S3 data — the volume manifest has no pack_ids for them.
-            let (bo, pids) = {
-                let vm = self.volume_manifest.read();
-                let ci = vm.chunk_idx_for_block(block as u64);
-                let bo = vm.block_offset_in_chunk(block as u64);
-                let pids = vm.chunk_pack_ids(ci).map(|ids| ids.to_vec()).unwrap_or_default();
-                (bo, pids)
-            };
-            let has_s3_data = if pids.is_empty() {
-                false
-            } else {
-                // Check if any pack actually contains this block offset.
-                let mut found = false;
-                for &pid in pids.iter().rev() {
-                    if self.pack_index_cache.lookup_block(pid, bo).await.is_some() {
-                        found = true;
-                        break;
-                    }
-                    // If pack index isn't cached, conservatively assume it has data.
-                    if self.pack_index_cache.get_entries(pid).await.is_none() {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            };
-
-            if !has_s3_data {
-                // No prior data in S3 — the data file has zeros from set_len.
-                // Just write the guest's sub-block directly.
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
-            }
-
-            // Fetch prior data BEFORE claiming — resolve_block_for_backfill
-            // checks is_present and reads from the data file if true, so the
-            // block must still be NOT_PRESENT during the fetch.
-            let prior = match self.cache.resolve_block_for_backfill(
-                idx,
-                self.clean_cache.as_ref(),
-                &self.pack_index_cache,
-                &self.volume_manifest,
-                &self.content_store,
-                Some(&self.metrics),
-            ).await {
-                Ok(data) => data,
-                Err(_) => bytes::Bytes::new(),
-            };
-
-            // Re-check: a concurrent writer may have completed a backfill
-            // while we were fetching from S3.
-            if self.cache.is_block_present(idx) {
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
-            }
-
-            // If prior data is all zeros, just write the guest's sub-block
-            // directly — the data file already has zeros from set_len.
-            if prior.is_empty() || prior.iter().all(|&b| b == 0) {
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
-            }
-
-            // Non-zero prior data: claim the block atomically, then merge
-            // and write. Only the CAS winner does the full-block write;
-            // losers yield until the winner finishes and write their sub-range.
-            if !self.cache.try_claim_block(idx) {
-                // Another writer claimed this block. Wait for their
-                // cache.write to complete (CLEAN → DIRTY transition),
-                // then write our sub-range on top of the backfilled data.
+            // Resolve the block state. DIRTY/SYNCING blocks have data on
+            // local SSD (or promotable from the flushing file via
+            // promote_syncing_blocks inside cache.write). Safe to pwrite
+            // our sub-range directly. CLEAN means another writer claimed
+            // the block but hasn't written yet — we must wait. NOT_PRESENT
+            // means the block needs backfill from S3.
+            //
+            // After any wait or backfill, re-check state: flush rotation
+            // can transition the block through DIRTY→SYNCING→NOT_PRESENT
+            // at any time. If that happens, we must restart the backfill
+            // for this block rather than writing into an empty file.
+            'block_retry: loop {
                 use crate::block::block_map::SparseBlockState;
-                let mut yields = 0;
-                while self.cache.block_state(idx) == SparseBlockState::CLEAN {
-                    tokio::task::yield_now().await;
-                    yields += 1;
-                    if yields > 100_000 {
-                        break;
+                let state = self.cache.block_state(idx);
+
+                _backfill_gate!(BackfillStep::StateChecked, idx, state);
+
+                match state {
+                    s if s == SparseBlockState::DIRTY || s == SparseBlockState::SYNCING => {
+                        // Block has data locally. cache.write handles SYNCING
+                        // via promote_syncing_blocks (copies from flushing file).
+                        // Use eviction check: if flush evicted the block between
+                        // our state check and the pwrite, BlockEvicted retries.
+                        match self.cache.write_with_eviction_check(write_start, &data[data_offset..data_offset + write_len]) {
+                            Ok(()) => break 'block_retry,
+                            Err(super::write_cache::CacheError::BlockEvicted) => continue 'block_retry,
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    s if s == SparseBlockState::CLEAN => {
+                        // Another writer claimed this block but hasn't written
+                        // the merged data yet. Wait for completion.
+                        loop {
+                            let st = self.cache.block_state(idx);
+                            if st != SparseBlockState::CLEAN {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                        }
+                        // State changed — re-enter the outer match to handle
+                        // whatever it became (DIRTY, SYNCING, or NOT_PRESENT
+                        // if flush evicted it).
+                        continue 'block_retry;
+                    }
+                    _ => {
+                        // NOT_PRESENT — needs backfill. Fall through.
                     }
                 }
-                self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
-                continue;
+
+                // === NOT_PRESENT: backfill from S3 ===
+
+                if write_len >= block_size {
+                    // Full block overwrite — no prior data to preserve.
+                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    break 'block_retry;
+                }
+
+                // Check if this block has S3 data.
+                let has_s3_data = {
+                    let (bo, pids) = {
+                        let vm = self.volume_manifest.read();
+                        let ci = vm.chunk_idx_for_block(block as u64);
+                        let bo = vm.block_offset_in_chunk(block as u64);
+                        let pids = vm.chunk_pack_ids(ci).map(|ids| ids.to_vec()).unwrap_or_default();
+                        (bo, pids)
+                    };
+                    if pids.is_empty() {
+                        false
+                    } else {
+                        let mut found = false;
+                        for &pid in pids.iter().rev() {
+                            match self.pack_index_cache.get_entries(pid).await {
+                                Some(entries) => {
+                                    // Pack index is cached. Check if this block
+                                    // offset is in the entries. Use linear scan
+                                    // (not binary search via lookup_block) to
+                                    // avoid a race where foyer's async insertion
+                                    // hasn't committed for lookup_block's .get()
+                                    // but has for get_entries' .get().
+                                    if entries.iter().any(|e| e.chunk_offset == bo) {
+                                        found = true;
+                                        break;
+                                    }
+                                    // Pack is cached but block isn't in it — try older packs.
+                                }
+                                None => {
+                                    // Pack index not cached — conservatively assume
+                                    // it has data for this block.
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        found
+                    }
+                };
+
+                if !has_s3_data {
+                    // No prior data in S3 — just write the sub-block directly.
+                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    break 'block_retry;
+                }
+
+                // Fetch prior data from S3 BEFORE claiming.
+                let prior = self.cache.resolve_block_for_backfill(
+                    idx,
+                    self.clean_cache.as_ref(),
+                    &self.pack_index_cache,
+                    &self.volume_manifest,
+                    &self.content_store,
+                    Some(&self.metrics),
+                ).await.map_err(|e| {
+                    tracing::warn!(
+                        block = idx,
+                        error = %e,
+                        "S3 backfill failed for sub-block write — rejecting write to prevent data corruption"
+                    );
+                    CommandError::IoError
+                })?;
+
+                _backfill_gate!(BackfillStep::S3FetchDone, idx, self.cache.block_state(idx));
+
+                // Re-check state after the async fetch. Another writer or
+                // flush rotation may have changed the block state.
+                let post_fetch_state = self.cache.block_state(idx);
+                if post_fetch_state != SparseBlockState::NOT_PRESENT {
+                    // State changed during fetch — re-enter outer match.
+                    continue 'block_retry;
+                }
+
+                // If prior data is all zeros, just write the sub-block.
+                if prior.is_empty() || prior.iter().all(|&b| b == 0) {
+                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    break 'block_retry;
+                }
+
+                _backfill_gate!(BackfillStep::BeforeCas, idx, SparseBlockState::NOT_PRESENT);
+
+                // Non-zero prior: claim the block, merge, and write.
+                if !self.cache.try_claim_block(idx) {
+                    // Another writer claimed it. Re-enter outer match to
+                    // wait for their write to complete.
+                    continue 'block_retry;
+                }
+
+                _backfill_gate!(BackfillStep::AfterCas, idx, self.cache.block_state(idx));
+
+                // We won the claim. Merge guest data onto prior block.
+                let mut block_buf = prior.to_vec();
+                if block_buf.len() != block_size {
+                    tracing::error!(
+                        block = idx,
+                        expected = block_size,
+                        actual = block_buf.len(),
+                        "backfill returned truncated block"
+                    );
+                    return Err(CommandError::IoError);
+                }
+                let end = (block_local_start + write_len).min(block_buf.len());
+                block_buf[block_local_start..end]
+                    .copy_from_slice(&data[data_offset..data_offset + write_len]);
+
+                _backfill_gate!(BackfillStep::BeforeWrite, idx, self.cache.block_state(idx));
+
+                self.cache.write(block_start, &block_buf)?;
+                break 'block_retry;
             }
-
-            // We won the claim. Merge guest data onto prior block and write.
-            let mut block_buf = prior.to_vec();
-            let end = (block_local_start + write_len).min(block_buf.len());
-            block_buf[block_local_start..end]
-                .copy_from_slice(&data[data_offset..data_offset + write_len]);
-
-            self.cache.write(block_start, &block_buf)?;
         }
 
         Ok(())
@@ -472,30 +682,44 @@ impl BlockHandler {
     ) -> CommandResult<usize> {
         let start = Instant::now();
 
-        if offset + length as u64 > self.device_size() {
-            return Err(CommandError::InvalidArgument);
+        // Match read() behavior: OOB reads return zeros instead of errors.
+        // The kernel sends reads past the device boundary during partition
+        // table probing on both NBD and ublk transports.
+        if offset >= self.device_size() {
+            buf[..length as usize].fill(0);
+            return Ok(length as usize);
         }
 
         if length == 0 {
             return Ok(0);
         }
 
-        self.metrics.record_guest_read(length as u64);
+        // Clamp reads that partially extend past the device boundary.
+        let clamped_len = std::cmp::min(
+            length as u64,
+            self.device_size() - offset,
+        ) as u32;
+
+        self.metrics.record_guest_read(clamped_len as u64);
 
         // Fast path: all blocks present on local SSD → pread directly into
         // caller buffer. Zero allocation, zero memcpy.
-        if let Some(result) = self.cache.try_pread_local(offset, length as usize, buf) {
+        if let Some(result) = self.cache.try_pread_local(offset, clamped_len as usize, buf) {
             let n = result?;
+            // Zero-pad if we clamped.
+            if clamped_len < length {
+                buf[n..length as usize].fill(0);
+            }
             self.trigger_readahead(offset);
             self.metrics.record_read_latency(start.elapsed());
-            return Ok(n);
+            return Ok(length as usize);
         }
 
         let data = self
             .cache
             .read(
                 offset,
-                length as usize,
+                clamped_len as usize,
                 self.clean_cache.as_ref(),
                 &self.pack_index_cache,
                 &self.volume_manifest,
@@ -506,10 +730,15 @@ impl BlockHandler {
         let n = data.len().min(buf.len());
         buf[..n].copy_from_slice(&data[..n]);
 
+        // Zero-pad if we clamped.
+        if clamped_len < length {
+            buf[n..length as usize].fill(0);
+        }
+
         self.trigger_readahead(offset);
 
         self.metrics.record_read_latency(start.elapsed());
-        Ok(n)
+        Ok(length as usize)
     }
 
     /// Write data to the cache.
@@ -524,7 +753,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset + data.len() as u64 > self.device_size() {
+        if offset.checked_add(data.len() as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -550,6 +779,7 @@ impl BlockHandler {
         //
         // Cost: one backfill per block per eviction cycle. Hot blocks pay
         // once after each flush; cold blocks pay once ever.
+        //
         self.backfill_and_write(offset, data).await?;
 
         if let Some(ref tracer) = self.write_tracer {
@@ -579,7 +809,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset + length as u64 > self.device_size() {
+        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -614,7 +844,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset + length as u64 > self.device_size() {
+        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -643,7 +873,7 @@ impl BlockHandler {
 
     /// Cache hint - no-op for our implementation.
     pub fn cache(&self, offset: u64, length: u32) -> CommandResult<()> {
-        if offset + length as u64 > self.device_size() {
+        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
         Ok(())
@@ -680,7 +910,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset + length > self.device_size() {
+        if offset.checked_add(length).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -697,6 +927,35 @@ impl BlockHandler {
         // Phase 2 (pwrite_and_commit) is synchronous and can't fetch from S3.
         self.backfill_blocks_in_range(offset, length).await?;
         self.cache.pre_write(offset, length)?;
+
+        // Guard against a flush completing between backfill and
+        // pwrite_and_commit. If any block was SYNCING during backfill
+        // (skipped as "present"), the flush may have evicted it
+        // (SYNCING→NOT_PRESENT) and taken the flushing file by now.
+        // pwrite_and_commit can't recover from this (sync, no S3 access).
+        // Re-backfill any blocks that were evicted during the gap.
+        {
+            use crate::block::block_map::SparseBlockState;
+            let block_size = self.cache.block_size() as u64;
+            let start_block = offset / block_size;
+            let end_block = (offset + length - 1) / block_size;
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                let state = self.cache.block_state(idx);
+                if state == SparseBlockState::SYNCING
+                    || state == SparseBlockState::NOT_PRESENT
+                {
+                    // Block was evicted or is still being flushed.
+                    // Re-backfill to ensure it's present before pwrite.
+                    self.backfill_blocks_in_range(
+                        block * block_size,
+                        block_size,
+                    )
+                    .await?;
+                    self.cache.pre_write(block * block_size, block_size)?;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -724,9 +983,12 @@ impl BlockHandler {
         self.metrics.record_guest_write(length);
         self.cache
             .pwrite_and_commit(offset, data)
-            .map_err(|e| {
-                tracing::warn!(error = %e, "pwrite_and_commit failed");
-                CommandError::IoError
+            .map_err(|e| match e {
+                CacheError::BlockEvicted => CommandError::BlockEvicted,
+                other => {
+                    tracing::warn!(error = %other, "pwrite_and_commit failed");
+                    CommandError::IoError
+                }
             })?;
 
         if let Some(ref tracer) = self.write_tracer {
@@ -753,7 +1015,7 @@ impl BlockHandler {
         offset: u64,
         length: u32,
     ) -> CommandResult<super::write_cache::ReadPlan> {
-        if offset + length as u64 > self.device_size() {
+        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -1272,6 +1534,262 @@ mod tests {
         );
 
         (handler, ssd_util, temp_dir)
+    }
+
+    // =========================================================================
+    // Backfill data corruption test
+    // =========================================================================
+
+    /// Object store wrapper that can selectively fail GETs to simulate S3 outages.
+    #[derive(Debug)]
+    struct FailingObjectStore {
+        inner: InMemory,
+        fail_gets: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailingObjectStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemory::new(),
+                fail_gets: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail_gets(&self, fail: bool) {
+            self.fail_gets
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Display for FailingObjectStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingObjectStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FailingObjectStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if self.fail_gets.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "FailingObjectStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Simulated S3 GET failure",
+                    )),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    /// A sub-block write to an evicted block with S3 data must fail (not
+    /// silently corrupt) when S3 is unreachable. Without the fix, the
+    /// backfill error was swallowed and zeros were substituted for the
+    /// non-written portion of the block.
+    #[tokio::test]
+    async fn test_subblock_write_fails_when_s3_backfill_unavailable() {
+        let temp_dir = TempDir::new().unwrap();
+        let s3 = Arc::new(FailingObjectStore::new());
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "backfill-test".to_string(),
+            device_size: 1024 * 1024, // 1MB
+            block_size: 4096,
+            wal_sync: false,
+        };
+
+        let content_store = Arc::new(ContentStore::new(
+            Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>,
+            "test",
+        ));
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            1024 * 1024,
+            4096,
+        )));
+        let metrics = Arc::new(ExportMetrics::new());
+
+        let cache = WriteCache::open(config).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let cache = Arc::new(cache);
+
+        let handler = BlockHandler::new(
+            Arc::clone(&cache),
+            Arc::clone(&content_store),
+            Arc::clone(&clean_cache),
+            Arc::clone(&pack_index_cache),
+            Arc::clone(&volume_manifest),
+            1024 * 1024,
+            false,
+            metrics,
+            Arc::new(AtomicU64::new(0f64.to_bits())),
+            Arc::new(Notify::const_new()),
+            DEFAULT_BLOCKS_PER_PACK,
+            None,
+        );
+
+        // Step 1: Write a full block of 0xAA.
+        let original_data = vec![0xAAu8; 4096];
+        handler.write(0, &original_data, false).await.unwrap();
+
+        // Step 2: Flush + drain to S3 (evicts block from local SSD).
+        cache
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .await
+            .unwrap();
+        assert!(
+            !cache.is_block_present(0),
+            "block should be evicted after drain"
+        );
+
+        // Step 3: Fail all S3 GETs.
+        s3.set_fail_gets(true);
+
+        // Step 4: Sub-block write must return an error — not silently corrupt.
+        let sub_block = vec![0xBBu8; 512];
+        let result = handler.write(0, &sub_block, false).await;
+        assert!(
+            result.is_err(),
+            "sub-block write must fail when S3 backfill is unavailable"
+        );
+
+        // Step 5: Re-enable S3 and verify original data is intact.
+        s3.set_fail_gets(false);
+        let read_back = handler.read(0, 4096).await.unwrap();
+        assert_eq!(
+            &read_back[..],
+            &original_data[..],
+            "original S3 data must be preserved after failed write"
+        );
+    }
+
+    /// Sub-block write succeeds and preserves surrounding data when S3 is
+    /// reachable — the backfill correctly merges guest data with prior S3 data.
+    #[tokio::test]
+    async fn test_subblock_write_preserves_data_with_working_s3() {
+        let temp_dir = TempDir::new().unwrap();
+        let s3 = Arc::new(FailingObjectStore::new());
+        let config = WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: "backfill-ok-test".to_string(),
+            device_size: 1024 * 1024,
+            block_size: 4096,
+            wal_sync: false,
+        };
+
+        let content_store = Arc::new(ContentStore::new(
+            Arc::clone(&s3) as Arc<dyn object_store::ObjectStore>,
+            "test",
+        ));
+        let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+        let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            1024 * 1024,
+            4096,
+        )));
+        let metrics = Arc::new(ExportMetrics::new());
+
+        let cache = WriteCache::open(config).unwrap();
+        let cache = cache.skip_recovery_for_test();
+        let cache = Arc::new(cache);
+
+        let handler = BlockHandler::new(
+            Arc::clone(&cache),
+            Arc::clone(&content_store),
+            Arc::clone(&clean_cache),
+            Arc::clone(&pack_index_cache),
+            Arc::clone(&volume_manifest),
+            1024 * 1024,
+            false,
+            metrics,
+            Arc::new(AtomicU64::new(0f64.to_bits())),
+            Arc::new(Notify::const_new()),
+            DEFAULT_BLOCKS_PER_PACK,
+            None,
+        );
+
+        // Write full block, flush+drain to S3, evict locally.
+        let original_data = vec![0xAAu8; 4096];
+        handler.write(0, &original_data, false).await.unwrap();
+        cache
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .await
+            .unwrap();
+        assert!(!cache.is_block_present(0));
+
+        // Sub-block write with S3 working — should succeed and merge.
+        let sub_block = vec![0xBBu8; 512];
+        handler.write(0, &sub_block, false).await.unwrap();
+
+        let result = handler.read(0, 4096).await.unwrap();
+        assert_eq!(
+            &result[..512],
+            &[0xBBu8; 512][..],
+            "sub-block write data should be present"
+        );
+        assert_eq!(
+            &result[512..],
+            &vec![0xAAu8; 4096 - 512][..],
+            "remaining bytes must be original S3 data, not zeros"
+        );
     }
 
     /// At >95% SSD utilization, writes to NEW blocks return ENOSPC while

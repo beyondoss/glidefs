@@ -1,459 +1,338 @@
 //! Loom concurrency tests for GlideFS write cache state machine.
 //!
-//! These tests verify the lock-free CAS-based state machine used in write_cache.rs
-//! by exploring all possible thread interleavings.
+//! These tests exercise the REAL `SparseStateMap` from glidefs under loom's
+//! exhaustive interleaving explorer. The `loom` feature in glidefs swaps
+//! `std::sync::atomic` for `loom::sync::atomic` in `block_map.rs`, so every
+//! CAS, load, and store is intercepted by loom's scheduler.
 //!
-//! Run with: cargo test --release
-//!
-//! The tests mirror the actual CAS logic from write_cache.rs:
-//! - Clean → Dirty (write path, lines 821-836)
-//! - Syncing → Dirty (write during sync, lines 838-855)
-//! - Dirty → Syncing (claim_dirty_blocks, lines 1270-1282)
-//! - Syncing → Clean (mark_synced, lines 1300-1310)
-//! - Syncing → Dirty (mark_sync_failed, lines 1321-1334)
-//! - Presence bitmap CAS (prefetch race, lines 1013-1029)
+//! Run with: cd loom-tests && cargo test --release
 
-// Test infrastructure used by loom::model closures
-#![allow(dead_code)]
-#![allow(unused_imports)]
-
-use loom::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use loom::sync::Mutex;
+use glidefs::block::block_map::{DirtyTransition, SparseBlockState, SparseStateMap};
+use loom::sync::Arc;
 use loom::thread;
-use std::collections::VecDeque;
-use std::sync::Arc;
 
-// Block states (must match BlockState enum values in write_cache.rs)
-const CLEAN: u8 = 0;
-const DIRTY: u8 = 1;
-const SYNCING: u8 = 2;
+// Shorthand
+const NP: u8 = SparseBlockState::NOT_PRESENT;
+const CL: u8 = SparseBlockState::CLEAN;
+const DI: u8 = SparseBlockState::DIRTY;
+const SY: u8 = SparseBlockState::SYNCING;
 
-/// Mock queue for loom testing (crossbeam SegQueue doesn't support loom).
-#[derive(Debug)]
-struct MockSegQueue<T> {
-    inner: Mutex<VecDeque<T>>,
-}
+// ============================================================================
+// Adjacent slot contention (the 2-bit packing invariant)
+// ============================================================================
 
-impl<T> MockSegQueue<T> {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    fn push(&self, value: T) {
-        self.inner.lock().unwrap().push_back(value);
-    }
-
-    fn pop(&self) -> Option<T> {
-        self.inner.lock().unwrap().pop_front()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
-    }
-}
-
-/// Minimal state machine for testing CAS transitions.
-/// Reproduces the lock-free logic from CacheInner without file I/O.
-struct TestStateMachine {
-    block_state: AtomicU8,
-    dirty_count: AtomicU64,
-    syncing_count: AtomicU64,
-    dirty_queue: MockSegQueue<u64>,
-}
-
-impl TestStateMachine {
-    fn new(initial_state: u8) -> Self {
-        let dirty_count = if initial_state == DIRTY { 1 } else { 0 };
-        let syncing_count = if initial_state == SYNCING { 1 } else { 0 };
-        Self {
-            block_state: AtomicU8::new(initial_state),
-            dirty_count: AtomicU64::new(dirty_count),
-            syncing_count: AtomicU64::new(syncing_count),
-            dirty_queue: MockSegQueue::new(),
-        }
-    }
-
-    /// Write path: transition to Dirty (from Clean or Syncing)
-    /// Mirrors write_cache.rs lines 812-860
-    fn write(&self) -> bool {
-        loop {
-            let current = self.block_state.load(Ordering::Acquire);
-
-            if current == DIRTY {
-                // Already dirty, nothing to do
-                return false;
-            }
-
-            if current == CLEAN {
-                // Clean → Dirty
-                if self
-                    .block_state
-                    .compare_exchange(current, DIRTY, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    self.dirty_count.fetch_add(1, Ordering::Relaxed);
-                    self.dirty_queue.push(0);
-                    return true;
-                }
-                // CAS failed, retry
-            } else if current == SYNCING {
-                // Syncing → Dirty (write during sync)
-                if self
-                    .block_state
-                    .compare_exchange(current, DIRTY, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    self.syncing_count.fetch_sub(1, Ordering::Relaxed);
-                    self.dirty_count.fetch_add(1, Ordering::Relaxed);
-                    self.dirty_queue.push(0);
-                    return true;
-                }
-                // CAS failed, retry
-            } else {
-                // Unknown state
-                return false;
-            }
-        }
-    }
-
-    /// Claim dirty block for sync: Dirty → Syncing
-    /// Mirrors write_cache.rs lines 1270-1282
-    fn claim_dirty(&self) -> bool {
-        if self.dirty_queue.pop().is_none() {
-            return false;
-        }
-
-        if self
-            .block_state
-            .compare_exchange(DIRTY, SYNCING, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.dirty_count.fetch_sub(1, Ordering::Relaxed);
-            self.syncing_count.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            // Block is no longer dirty (write converted it back, etc.)
-            false
-        }
-    }
-
-    /// Mark block as synced: Syncing → Clean
-    /// Mirrors write_cache.rs lines 1300-1310
-    fn mark_synced(&self) -> bool {
-        if self
-            .block_state
-            .compare_exchange(SYNCING, CLEAN, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.syncing_count.fetch_sub(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Mark sync as failed: Syncing → Dirty (re-queue for retry)
-    /// Mirrors write_cache.rs lines 1321-1334
-    fn mark_sync_failed(&self) -> bool {
-        if self
-            .block_state
-            .compare_exchange(SYNCING, DIRTY, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.syncing_count.fetch_sub(1, Ordering::Relaxed);
-            self.dirty_count.fetch_add(1, Ordering::Relaxed);
-            self.dirty_queue.push(0);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn state(&self) -> u8 {
-        self.block_state.load(Ordering::Acquire)
-    }
-
-    fn dirty_count(&self) -> u64 {
-        self.dirty_count.load(Ordering::Relaxed)
-    }
-
-    fn syncing_count(&self) -> u64 {
-        self.syncing_count.load(Ordering::Relaxed)
-    }
-}
-
-/// Test concurrent writes both trying to transition Clean → Dirty.
-/// Invariant: Exactly one write should succeed in incrementing dirty_count.
+/// Two threads CAS adjacent slots (same AtomicU8) concurrently.
+/// Both must succeed despite byte-level CAS contention.
 #[test]
-fn test_clean_to_dirty_concurrent() {
+fn adjacent_slots_both_transition() {
     loom::model(|| {
-        let sm = Arc::new(TestStateMachine::new(CLEAN));
-        let sm1 = Arc::clone(&sm);
-        let sm2 = Arc::clone(&sm);
+        let map = Arc::new(SparseStateMap::new(4));
+        map.set_present(0);
+        map.set_present(1);
 
-        let t1 = thread::spawn(move || sm1.write());
-        let t2 = thread::spawn(move || sm2.write());
+        let m1 = Arc::clone(&map);
+        let m2 = Arc::clone(&map);
+
+        let t1 = thread::spawn(move || m1.cas(0, CL, DI));
+        let t2 = thread::spawn(move || m2.cas(1, CL, SY));
+
+        assert!(t1.join().unwrap().is_ok(), "slot 0 CAS must succeed");
+        assert!(t2.join().unwrap().is_ok(), "slot 1 CAS must succeed");
+        assert_eq!(map.get(0), DI);
+        assert_eq!(map.get(1), SY);
+        assert_eq!(map.get(2), NP);
+        assert_eq!(map.get(3), NP);
+    });
+}
+
+// ============================================================================
+// try_set_present races
+// ============================================================================
+
+/// Two threads race to claim the same NOT_PRESENT block.
+/// Exactly one must win.
+#[test]
+fn try_set_present_exactly_one_wins() {
+    loom::model(|| {
+        let map = Arc::new(SparseStateMap::new(4));
+        let m1 = Arc::clone(&map);
+        let m2 = Arc::clone(&map);
+
+        let t1 = thread::spawn(move || m1.try_set_present(0));
+        let t2 = thread::spawn(move || m2.try_set_present(0));
 
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
 
-        // Exactly one should have transitioned
         assert!(
             (r1 && !r2) || (!r1 && r2),
-            "Exactly one write should transition Clean→Dirty"
+            "exactly one thread must win try_set_present"
         );
-        assert_eq!(sm.state(), DIRTY);
-        assert_eq!(sm.dirty_count(), 1);
-        assert_eq!(sm.syncing_count(), 0);
+        assert_eq!(map.get(0), CL);
     });
 }
 
-/// Test write during sync: one thread syncing, another writing.
-/// Possible outcomes:
-/// 1. Write wins CAS: Syncing → Dirty (sync fails)
-/// 2. Sync wins CAS: Syncing → Clean, then write may transition Clean → Dirty
+/// try_set_present on adjacent slots — both must succeed.
 #[test]
-fn test_write_during_sync() {
+fn try_set_present_adjacent_both_succeed() {
     loom::model(|| {
-        // Start in Syncing state (simulates sync worker claimed the block)
-        let sm = Arc::new(TestStateMachine::new(SYNCING));
-        let sm_write = Arc::clone(&sm);
-        let sm_sync = Arc::clone(&sm);
+        let map = Arc::new(SparseStateMap::new(4));
+        let m1 = Arc::clone(&map);
+        let m2 = Arc::clone(&map);
 
-        // Writer tries to dirty the block
-        let t_write = thread::spawn(move || sm_write.write());
+        let t1 = thread::spawn(move || m1.try_set_present(0));
+        let t2 = thread::spawn(move || m2.try_set_present(1));
 
-        // Sync worker tries to mark as synced
-        let t_sync = thread::spawn(move || sm_sync.mark_synced());
-
-        let write_won = t_write.join().unwrap();
-        let sync_won = t_sync.join().unwrap();
-
-        let state = sm.state();
-        let dirty = sm.dirty_count();
-        let syncing = sm.syncing_count();
-
-        // Valid outcomes:
-        // 1. write_won && !sync_won: Write interrupted sync (Syncing → Dirty)
-        // 2. !write_won && sync_won: Sync completed, write was no-op (saw Dirty? No, saw Syncing and lost)
-        // 3. sync_won && write_won: Sync completed (Syncing → Clean), then write ran (Clean → Dirty)
-        //
-        // Case 3 is valid: sync finishes first, then write sees Clean and transitions to Dirty
-
-        if write_won && !sync_won {
-            // Write interrupted sync: Syncing → Dirty
-            assert_eq!(state, DIRTY, "Write won: state should be Dirty");
-            assert_eq!(dirty, 1);
-            assert_eq!(syncing, 0);
-        } else if !write_won && sync_won {
-            // Sync completed, write saw Syncing and lost CAS
-            assert_eq!(state, CLEAN, "Sync won, write lost: state should be Clean");
-            assert_eq!(dirty, 0);
-            assert_eq!(syncing, 0);
-        } else if sync_won && write_won {
-            // Sync completed first (Syncing → Clean), then write ran (Clean → Dirty)
-            assert_eq!(state, DIRTY, "Both succeeded sequentially: state should be Dirty");
-            assert_eq!(dirty, 1);
-            assert_eq!(syncing, 0);
-        } else {
-            // Neither won - shouldn't happen with these two operations
-            panic!("Unexpected: neither write nor sync succeeded");
-        }
+        assert!(t1.join().unwrap(), "slot 0 must succeed");
+        assert!(t2.join().unwrap(), "slot 1 must succeed");
+        assert_eq!(map.get(0), CL);
+        assert_eq!(map.get(1), CL);
     });
 }
 
-/// Test claiming dirty blocks with concurrent writes.
-/// The claim should either succeed or the block should end up dirty.
+// ============================================================================
+// transition_to_dirty — the real method on SparseStateMap
+// ============================================================================
+
+/// Two concurrent writes to the same CLEAN block.
+/// Exactly one should transition CLEAN → DIRTY.
 #[test]
-fn test_claim_dirty_block() {
+fn concurrent_writes_same_block() {
     loom::model(|| {
-        let sm = Arc::new(TestStateMachine::new(DIRTY));
-        // Pre-populate queue as write() does
-        sm.dirty_queue.push(0);
+        let map = Arc::new(SparseStateMap::new(4));
+        map.set_present(0);
 
-        let sm_claim = Arc::clone(&sm);
-        let sm_write = Arc::clone(&sm);
+        let m1 = Arc::clone(&map);
+        let m2 = Arc::clone(&map);
 
-        let t_claim = thread::spawn(move || sm_claim.claim_dirty());
-        let t_write = thread::spawn(move || sm_write.write());
+        let t1 = thread::spawn(move || m1.transition_to_dirty(0));
+        let t2 = thread::spawn(move || m2.transition_to_dirty(0));
 
-        let claim_result = t_claim.join().unwrap();
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        // Exactly one transitions, the other sees AlreadyDirty
+        assert!(
+            matches!(
+                (r1, r2),
+                (DirtyTransition::FromCleanOrNotPresent, DirtyTransition::AlreadyDirty)
+                    | (DirtyTransition::AlreadyDirty, DirtyTransition::FromCleanOrNotPresent)
+            ),
+            "exactly one write should transition CLEAN→DIRTY, got ({:?}, {:?})",
+            r1, r2
+        );
+        assert_eq!(map.get(0), DI);
+    });
+}
+
+/// Two concurrent writes to adjacent slots — both must succeed.
+#[test]
+fn concurrent_writes_adjacent_slots() {
+    loom::model(|| {
+        let map = Arc::new(SparseStateMap::new(4));
+        map.set_present(0);
+        map.set_present(1);
+
+        let m1 = Arc::clone(&map);
+        let m2 = Arc::clone(&map);
+
+        let t1 = thread::spawn(move || m1.transition_to_dirty(0));
+        let t2 = thread::spawn(move || m2.transition_to_dirty(1));
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        assert_eq!(r1, DirtyTransition::FromCleanOrNotPresent);
+        assert_eq!(r2, DirtyTransition::FromCleanOrNotPresent);
+        assert_eq!(map.get(0), DI);
+        assert_eq!(map.get(1), DI);
+    });
+}
+
+/// Write during flush: transition_to_dirty vs transition_dirty_to_syncing.
+#[test]
+fn write_vs_flush_claim() {
+    loom::model(|| {
+        let map = Arc::new(SparseStateMap::new(4));
+        map.set_present(0);
+        map.cas(0, CL, DI).unwrap();
+
+        let m_flush = Arc::clone(&map);
+        let m_write = Arc::clone(&map);
+
+        let t_flush = thread::spawn(move || m_flush.transition_dirty_to_syncing(0));
+        let t_write = thread::spawn(move || m_write.transition_to_dirty(0));
+
+        let flush_won = t_flush.join().unwrap();
         let write_result = t_write.join().unwrap();
 
-        // Final state must be consistent
-        let state = sm.state();
-        let dirty = sm.dirty_count();
-        let syncing = sm.syncing_count();
+        let state = map.get(0);
 
-        match (claim_result, write_result) {
-            (true, false) => {
-                // Claim won, write saw Dirty (no-op) or Syncing
-                assert!(state == SYNCING || state == DIRTY);
+        match (flush_won, write_result) {
+            (true, DirtyTransition::FromSyncing) => {
+                // Flush claimed DIRTY→SYNCING, then writer re-dirtied SYNCING→DIRTY
+                assert_eq!(state, DI);
             }
-            (true, true) => {
-                // Claim won, then write converted Syncing → Dirty
-                assert_eq!(state, DIRTY);
+            (true, DirtyTransition::AlreadyDirty) => {
+                // Writer saw DIRTY (no-op) before flush CAS, flush won
+                assert_eq!(state, SY);
             }
-            (false, _) => {
-                // Claim failed (state wasn't Dirty when CAS ran)
-                // Block could be Clean, Dirty, or Syncing depending on interleaving
+            (false, DirtyTransition::AlreadyDirty) => {
+                // Writer saw DIRTY (no-op), flush CAS failed — shouldn't happen
+                // with no adjacent contention (flush CAS should succeed if state
+                // is still DIRTY). But loom will tell us.
+                assert_eq!(state, DI);
             }
-        }
-
-        // Key invariant: counts must match state
-        if state == DIRTY {
-            assert!(dirty >= 1, "Dirty state must have dirty_count >= 1");
-        }
-        if state == SYNCING {
-            assert_eq!(syncing, 1, "Syncing state must have syncing_count == 1");
-        }
-        if state == CLEAN {
-            assert_eq!(dirty, 0);
-            assert_eq!(syncing, 0);
+            other => {
+                panic!("unexpected outcome: {:?}", other);
+            }
         }
     });
 }
 
-/// Test mark_synced with concurrent write.
-/// Invariant: Block should end up either Clean (sync won) or Dirty (write won).
+/// Eviction vs concurrent write: SYNCING→NP vs transition_to_dirty.
+/// The writer must always end up with the block DIRTY (data preservation).
 #[test]
-fn test_mark_synced() {
+fn eviction_vs_write() {
     loom::model(|| {
-        let sm = Arc::new(TestStateMachine::new(SYNCING));
-        let sm_sync = Arc::clone(&sm);
-        let sm_write = Arc::clone(&sm);
+        let map = Arc::new(SparseStateMap::new(4));
+        map.set_present(0);
+        map.cas(0, CL, SY).unwrap();
 
-        let t_sync = thread::spawn(move || sm_sync.mark_synced());
-        let t_write = thread::spawn(move || sm_write.write());
+        let m_evict = Arc::clone(&map);
+        let m_write = Arc::clone(&map);
 
-        let sync_won = t_sync.join().unwrap();
-        let write_won = t_write.join().unwrap();
+        let t_evict = thread::spawn(move || m_evict.transition_syncing_to_not_present(0));
+        let t_write = thread::spawn(move || m_write.transition_to_dirty(0));
 
-        // At most one should win the CAS (both can fail if interleaved weirdly,
-        // but in practice with 2 threads, one will win)
-        let state = sm.state();
+        let _evict_won = t_evict.join().unwrap();
+        let write_result = t_write.join().unwrap();
 
-        if sync_won {
-            // Sync completed first: Syncing → Clean
-            // Write either did nothing (saw Clean) or saw Syncing and lost
-            if !write_won {
-                assert_eq!(state, CLEAN);
-            } else {
-                // Write won after sync - shouldn't happen since sync transitions to Clean
-                // and write on Clean → Dirty
-                assert_eq!(state, DIRTY);
-            }
-        } else if write_won {
-            // Write won: Syncing → Dirty
-            assert_eq!(state, DIRTY);
-        }
-
-        // Invariant: dirty + syncing counts match state
-        let dirty = sm.dirty_count();
-        let syncing = sm.syncing_count();
-        match state {
-            CLEAN => {
-                assert_eq!(dirty, 0);
-                assert_eq!(syncing, 0);
-            }
-            DIRTY => {
-                assert!(dirty >= 1);
-                assert_eq!(syncing, 0);
-            }
-            SYNCING => {
-                assert_eq!(syncing, 1);
-            }
-            _ => panic!("Invalid state"),
-        }
-    });
-}
-
-/// Test sync failure with re-queue and concurrent write.
-/// Invariant: After failure, block must be Dirty and re-queued.
-#[test]
-fn test_sync_failed_requeue() {
-    loom::model(|| {
-        let sm = Arc::new(TestStateMachine::new(SYNCING));
-        let sm_fail = Arc::clone(&sm);
-        let sm_write = Arc::clone(&sm);
-
-        let t_fail = thread::spawn(move || sm_fail.mark_sync_failed());
-        let t_write = thread::spawn(move || sm_write.write());
-
-        let fail_won = t_fail.join().unwrap();
-        let write_won = t_write.join().unwrap();
-
-        // Both try Syncing → Dirty, exactly one should win
+        // Writer must always succeed — either SYNCING→DIRTY or NP→DIRTY
         assert!(
-            (fail_won && !write_won) || (!fail_won && write_won),
-            "Exactly one should transition Syncing→Dirty"
+            matches!(
+                write_result,
+                DirtyTransition::FromSyncing | DirtyTransition::FromCleanOrNotPresent
+            ),
+            "writer must transition to DIRTY, got {:?}",
+            write_result
         );
-
-        // Final state must be Dirty
-        assert_eq!(sm.state(), DIRTY);
-        assert_eq!(sm.dirty_count(), 1);
-        assert_eq!(sm.syncing_count(), 0);
-
-        // Block must be in queue for retry
-        assert!(!sm.dirty_queue.is_empty(), "Block must be re-queued");
+        assert_eq!(map.get(0), DI, "final state must be DIRTY — data loss!");
     });
 }
 
-/// Minimal presence bitmap CAS test.
-/// Tests the race between write (setting present) and S3 fetch (setting present).
+/// Full flush cycle: DIRTY→SYNCING→NP with a concurrent write.
+/// If the write lands, data must not be lost (state must be DIRTY).
 #[test]
-fn test_presence_bitmap_race() {
+fn full_flush_cycle_with_concurrent_write() {
     loom::model(|| {
-        let present = Arc::new(AtomicU64::new(0));
-        let p1 = Arc::clone(&present);
-        let p2 = Arc::clone(&present);
+        let map = Arc::new(SparseStateMap::new(4));
+        map.set_present(0);
+        map.cas(0, CL, DI).unwrap();
 
-        let bit_mask: u64 = 1 << 5; // Testing bit 5
+        let m_flush = Arc::clone(&map);
+        let m_write = Arc::clone(&map);
 
-        // Simulate two threads racing to set the same presence bit
-        let t1 = thread::spawn(move || {
-            loop {
-                let old = p1.load(Ordering::Acquire);
-                if (old & bit_mask) != 0 {
-                    return false; // Someone else set it
-                }
-                if p1
-                    .compare_exchange(old, old | bit_mask, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return true; // We set it
-                }
-                // Retry
+        let t_flush = thread::spawn(move || {
+            if m_flush.transition_dirty_to_syncing(0) {
+                m_flush.transition_syncing_to_not_present(0);
             }
         });
 
-        let t2 = thread::spawn(move || {
-            loop {
-                let old = p2.load(Ordering::Acquire);
-                if (old & bit_mask) != 0 {
-                    return false;
-                }
-                if p2
-                    .compare_exchange(old, old | bit_mask, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return true;
-                }
-            }
-        });
+        let t_write = thread::spawn(move || m_write.transition_to_dirty(0));
+
+        t_flush.join().unwrap();
+        let write_result = t_write.join().unwrap();
+
+        let state = map.get(0);
+
+        if write_result != DirtyTransition::AlreadyDirty {
+            // Write actually transitioned — block must be DIRTY
+            assert_eq!(state, DI, "write landed but state is not DIRTY — data loss!");
+        }
+    });
+}
+
+/// Two concurrent promotes of the same SYNCING block.
+/// Exactly one wins SYNCING→DIRTY, the other sees AlreadyDirty.
+#[test]
+fn concurrent_promote_same_block() {
+    loom::model(|| {
+        let map = Arc::new(SparseStateMap::new(4));
+        map.set_present(0);
+        map.cas(0, CL, SY).unwrap();
+
+        let m1 = Arc::clone(&map);
+        let m2 = Arc::clone(&map);
+
+        let t1 = thread::spawn(move || m1.transition_to_dirty(0));
+        let t2 = thread::spawn(move || m2.transition_to_dirty(0));
 
         let r1 = t1.join().unwrap();
         let r2 = t2.join().unwrap();
 
-        // Exactly one should win
         assert!(
-            (r1 && !r2) || (!r1 && r2),
-            "Exactly one thread should set the presence bit"
+            matches!(
+                (r1, r2),
+                (DirtyTransition::FromSyncing, DirtyTransition::AlreadyDirty)
+                    | (DirtyTransition::AlreadyDirty, DirtyTransition::FromSyncing)
+            ),
+            "exactly one should transition SYNCING→DIRTY, got ({:?}, {:?})",
+            r1, r2
         );
+        assert_eq!(map.get(0), DI);
+    });
+}
 
-        // Bit must be set
-        assert_ne!(present.load(Ordering::Relaxed) & bit_mask, 0);
+/// Write to NOT_PRESENT block (NP→DIRTY).
+/// This path fires when promote's CAS fails because flush already evicted.
+#[test]
+fn write_to_not_present() {
+    loom::model(|| {
+        let map = Arc::new(SparseStateMap::new(4));
+
+        let result = map.transition_to_dirty(0);
+
+        assert_eq!(result, DirtyTransition::FromCleanOrNotPresent);
+        assert_eq!(map.get(0), DI);
+    });
+}
+
+/// Flush claims two adjacent dirty blocks concurrently.
+/// transition_dirty_to_syncing has no retry loop — this verifies whether
+/// byte-level contention can cause a missed claim.
+#[test]
+fn flush_claims_adjacent_blocks() {
+    loom::model(|| {
+        let map = Arc::new(SparseStateMap::new(4));
+        map.set_present(0);
+        map.set_present(1);
+        map.cas(0, CL, DI).unwrap();
+        map.cas(1, CL, DI).unwrap();
+
+        let m1 = Arc::clone(&map);
+        let m2 = Arc::clone(&map);
+
+        let t1 = thread::spawn(move || m1.transition_dirty_to_syncing(0));
+        let t2 = thread::spawn(move || m2.transition_dirty_to_syncing(1));
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        let s0 = map.get(0);
+        let s1 = map.get(1);
+
+        // Verify state matches result
+        if r1 {
+            assert_eq!(s0, SY);
+        } else {
+            assert_eq!(s0, DI, "failed claim should leave block DIRTY");
+        }
+
+        if r2 {
+            assert_eq!(s1, SY);
+        } else {
+            assert_eq!(s1, DI, "failed claim should leave block DIRTY");
+        }
     });
 }

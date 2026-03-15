@@ -1,0 +1,15 @@
+[package]
+name = "glidefs-stateright-model"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Stateright model checker for GlideFS write cache state machine"
+
+# Standalone crate — not part of the workspace.
+[workspace]
+
+# Run with: cd stateright-model && cargo test --release
+# Explorer: cd stateright-model && cargo run --release
+
+[dependencies]
+stateright = "0.30"

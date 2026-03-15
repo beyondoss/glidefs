@@ -338,7 +338,7 @@ async fn test_s3_slow_uploads_dont_block_writes() {
     // Disable delay for cold reader verification
     s3.disable();
 
-    let manifest_bytes = vm.read().serialize();
+    let manifest_bytes = vm.read().serialize().unwrap();
     cs.put_manifest("slow-upload", manifest_bytes, None)
         .await
         .unwrap();
@@ -398,7 +398,7 @@ async fn test_s3_slow_downloads_bounded_latency() {
                 .unwrap();
         }
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
-        let manifest_bytes = vm.read().serialize();
+        let manifest_bytes = vm.read().serialize().unwrap();
         cs.put_manifest("slow-download", manifest_bytes, None)
             .await
             .unwrap();
@@ -511,7 +511,7 @@ async fn test_s3_intermittent_failures_eventual_success() {
     // Disable intermittent failures for verification
     s3.set_fail_every_n(0);
 
-    let manifest_bytes = vm.read().serialize();
+    let manifest_bytes = vm.read().serialize().unwrap();
     cs.put_manifest("intermittent", manifest_bytes, None)
         .await
         .unwrap();
@@ -572,7 +572,7 @@ async fn test_s3_download_semaphore_exhaustion() {
         }
 
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
-        let manifest_bytes = vm.read().serialize();
+        let manifest_bytes = vm.read().serialize().unwrap();
         cs.put_manifest("sem-exhaust", manifest_bytes, None)
             .await
             .unwrap();
@@ -691,7 +691,7 @@ async fn test_s3_upload_semaphore_exhaustion() {
     assert_eq!(cache.dirty_block_count(), 0, "no dirty blocks after flush");
 
     // Verify via cold reader
-    let manifest_bytes = vm.read().serialize();
+    let manifest_bytes = vm.read().serialize().unwrap();
     cs.put_manifest("sem-upload", manifest_bytes, None)
         .await
         .unwrap();
@@ -751,7 +751,7 @@ async fn test_s3_manifest_put_fails_after_pack_upload() {
 
     // Now fail the manifest PUT
     s3.set_fail_all_puts(true);
-    let manifest_bytes = vm.read().serialize();
+    let manifest_bytes = vm.read().serialize().unwrap();
     let result = cs.put_manifest("manifest-fail", manifest_bytes.clone(), None).await;
     assert!(result.is_err(), "manifest PUT should fail");
 

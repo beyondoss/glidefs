@@ -671,6 +671,7 @@ fn run_device(
     };
 
     // Target init: set device size, block parameters, and export metadata.
+    let bs_shift = handler.block_size().trailing_zeros() as u8;
     let tgt_init = move |dev: &mut UblkDev| {
         dev.tgt.dev_size = dev_size;
         dev.set_target_json(serde_json::json!({ "export_name": export_name }));
@@ -680,10 +681,10 @@ fn run_device(
                 // Volatile cache + FUA: writes land in local SSD cache,
                 // FUA forces an fdatasync before returning.
                 attrs: sys::UBLK_ATTR_VOLATILE_CACHE | sys::UBLK_ATTR_FUA,
-                logical_bs_shift: 9,   // 512 bytes (standard sector)
-                physical_bs_shift: 17, // 128KB (our block size)
-                io_opt_shift: 17,      // 128KB optimal I/O
-                io_min_shift: 9,       // 512 bytes minimum
+                logical_bs_shift: 9,       // 512 bytes (standard sector)
+                physical_bs_shift: bs_shift, // our block size
+                io_opt_shift: bs_shift,      // optimal I/O = block size
+                io_min_shift: 9,           // 512 bytes minimum
                 max_sectors: dev.dev_info.max_io_buf_bytes >> 9,
                 dev_sectors: dev_size >> 9,
                 ..Default::default()
@@ -1314,12 +1315,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_beyond_device_returns_error() {
+    async fn read_beyond_device_returns_zeros() {
         let (handler, _dir) = make_handler(false).await;
-        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut buf = vec![0xFFu8; BLOCK_SIZE];
         let result =
             handle_io(ublk_core::sys::UBLK_IO_OP_READ, DEVICE_SIZE, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
-        assert!(result < 0, "expected negative errno, got {result}");
+        assert_eq!(result, BLOCK_SIZE as i32, "OOB read should succeed with zero-fill");
+        assert!(buf.iter().all(|&b| b == 0), "OOB read should return zeros");
     }
 
     #[tokio::test]

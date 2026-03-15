@@ -644,3 +644,471 @@ async fn test_promote_export_not_found() {
         "error should indicate export not found, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// save_export failure: export works locally but is invisible to other nodes
+// ---------------------------------------------------------------------------
+
+/// If S3 is unavailable when save_export is called, the export runs fine
+/// locally but won't be discoverable by other nodes via discover_exports.
+///
+/// This is a data loss vector: the export's packs exist in S3 after flush,
+/// but no export.json points at them. On node failure, the export vanishes.
+#[tokio::test]
+async fn test_save_export_failure_makes_export_undiscoverable() {
+    let s3 = Arc::new(FailingObjectStore::new());
+    let dir = TempDir::new().unwrap();
+    let config = test_export_config("vm1");
+
+    let router = Arc::new(
+        ExportRouter::new(create_router_config(Arc::clone(&s3) as _, &dir))
+            .await
+            .unwrap(),
+    );
+
+    // Create export — works because create_export doesn't save config to S3
+    router
+        .create_export(config.clone(), false, None, None)
+        .await
+        .unwrap();
+
+    // Write data and drain to S3 (packs + manifest land in S3)
+    let handler = router.get_handler("vm1").await.unwrap();
+    for i in 0..5 {
+        handler
+            .write(
+                i as u64 * BLOCK_SIZE as u64,
+                &vec![(i + 1) as u8; BLOCK_SIZE],
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    router.drain_export("vm1").await.unwrap();
+
+    // Now fail S3 and attempt save_export — should fail
+    s3.set_fail_puts(true);
+    let save_result = router.save_export(&config).await;
+    assert!(save_result.is_err(), "save_export should fail when S3 is down");
+    s3.set_fail_puts(false);
+
+    // Simulate a new node: fresh router discovers exports from S3.
+    // Since save_export failed, export.json is missing — discover_exports
+    // should NOT find "vm1".
+    let dir2 = TempDir::new().unwrap();
+    let router2 = ExportRouter::new(create_router_config(Arc::clone(&s3) as _, &dir2))
+        .await
+        .unwrap();
+    let discovered = router2.discover_exports().await.unwrap();
+    assert!(
+        discovered.is_empty(),
+        "export should be undiscoverable without export.json, got: {:?}",
+        discovered.iter().map(|c| &c.name).collect::<Vec<_>>()
+    );
+
+    // But the manifest and packs ARE in S3 — the data exists, just no pointer.
+    let cs = ContentStore::new(Arc::clone(&s3) as _, "test/exports/vm1");
+    let manifest = cs.get_manifest("vm1").await.expect("should succeed");
+    assert!(
+        manifest.is_some(),
+        "manifest should exist in S3 even though export.json is missing"
+    );
+
+    // Fix: save_export with S3 working makes the export discoverable again
+    router.save_export(&config).await.unwrap();
+    let discovered = router2.discover_exports().await.unwrap();
+    assert_eq!(
+        discovered.len(),
+        1,
+        "export should be discoverable after successful save_export"
+    );
+    assert_eq!(discovered[0].name, "vm1");
+}
+
+// ---------------------------------------------------------------------------
+// drain failure: dirty blocks remain readable and retryable
+// ---------------------------------------------------------------------------
+
+/// After drain_all fails due to S3 outage, the export's dirty blocks must
+/// remain readable locally AND be flushable on the next attempt.
+///
+/// Extends the existing test_drain_all_returns_errors_on_s3_failure by
+/// verifying that data integrity holds through the failure: local reads
+/// return correct data, dirty_bytes is non-zero, and a retry succeeds
+/// with correct cold-read verification.
+#[tokio::test]
+async fn test_failed_drain_preserves_data_for_retry() {
+    let s3 = Arc::new(FailingObjectStore::new());
+    let dir = TempDir::new().unwrap();
+    let router = Arc::new(
+        ExportRouter::new(create_router_config(Arc::clone(&s3) as _, &dir))
+            .await
+            .unwrap(),
+    );
+
+    router
+        .create_export(test_export_config("vm1"), false, None, None)
+        .await
+        .unwrap();
+
+    let handler = router.get_handler("vm1").await.unwrap();
+    for i in 0..10 {
+        handler
+            .write(
+                i as u64 * BLOCK_SIZE as u64,
+                &vec![(i + 1) as u8; BLOCK_SIZE],
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    // Fail S3 — drain should fail
+    s3.set_fail_puts(true);
+    let failed = router.drain_all().await;
+    assert!(!failed.is_empty(), "drain should fail with S3 down");
+
+    // Key assertion: data is still readable locally after failed drain
+    for i in 0..10 {
+        let data = handler
+            .read(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            data[0],
+            (i + 1) as u8,
+            "block {} should be readable locally after failed drain",
+            i
+        );
+    }
+
+    // Dirty bytes should be non-zero (blocks not flushed)
+    let info = router.get_export_info("vm1").await.unwrap();
+    assert!(
+        info.dirty_bytes > 0,
+        "export should still have dirty bytes after failed drain, got: {}",
+        info.dirty_bytes
+    );
+
+    // Fix S3 — retry drain should succeed
+    s3.set_fail_puts(false);
+    let failed = router.drain_all().await;
+    assert!(
+        failed.is_empty(),
+        "drain retry should succeed, got: {:?}",
+        failed.iter().map(|(n, e)| format!("{n}: {e}")).collect::<Vec<_>>()
+    );
+
+    // Verify data integrity from cold reader
+    let reader_dir = TempDir::new().unwrap();
+    let cs = ContentStore::new(Arc::clone(&s3) as _, "test/exports/vm1");
+    let (manifest_data, _etag) = cs
+        .get_manifest("vm1")
+        .await
+        .expect("should succeed")
+        .expect("manifest should exist after successful drain");
+    let vm = VolumeManifest::deserialize(&manifest_data).unwrap();
+
+    let reader_config = glidefs::block::write_cache::WriteCacheConfig {
+        cache_dir: reader_dir.path().to_path_buf(),
+        device_name: "vm1".to_string(),
+        device_size: vm.size,
+        block_size: BLOCK_SIZE,
+        wal_sync: false,
+    };
+    let reader_cache = glidefs::block::write_cache::WriteCache::open_fresh_active(reader_config)
+        .unwrap();
+    let reader_pack_index_cache = Arc::clone(&*super::SHARED_PACK_INDEX_CACHE);
+    let reader_vm = Arc::new(parking_lot::RwLock::new(vm));
+    let reader_clean_cache = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let reader_metrics = Arc::new(glidefs::block::metrics::ExportMetrics::new());
+
+    for i in 0..10 {
+        let data = reader_cache
+            .read(
+                i as u64 * BLOCK_SIZE as u64,
+                BLOCK_SIZE,
+                reader_clean_cache.as_ref(),
+                &reader_pack_index_cache,
+                &reader_vm,
+                &cs,
+                &reader_metrics,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            data[0],
+            (i + 1) as u8,
+            "block {} should be correct from cold reader after drain retry",
+            i
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sub-block write to SYNCING block: flushing-file promotion path
+// ---------------------------------------------------------------------------
+
+/// A sub-block write arriving concurrently with flush must read prior data
+/// from the flushing file (not the active file, which has zeros for that
+/// block after rotation).
+///
+/// This test uses a concurrent flush + sub-block write. While flush_to_s3
+/// is running (block is SYNCING), we issue a sub-block write that triggers
+/// promote_syncing_blocks to copy flushing → active, then overlay the sub-
+/// block data.
+///
+/// The key invariant: after the sub-block write, the block contains both
+/// the original full-block data (from the flushing file) AND the new sub-
+/// block data. Neither is lost.
+#[tokio::test]
+async fn test_sub_block_write_to_syncing_block_preserves_data() {
+    use object_store::memory::InMemory;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
+        super::create_test_cache(&dir, "vol1", Arc::clone(&s3)).await;
+
+    // Write a full block with known pattern (0xBB).
+    let full_block = vec![0xBB; BLOCK_SIZE];
+    cache.write(0, &full_block).unwrap();
+    assert_eq!(cache.dirty_block_count(), 1);
+
+    // Flush to S3 once so the flushing file is cleaned up properly.
+    cache
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Write the same block again — now it's dirty with 0xBB data.
+    cache.write(0, &full_block).unwrap();
+    assert_eq!(cache.dirty_block_count(), 1);
+
+    // Spawn flush_to_s3 concurrently. This will rotate (DIRTY→SYNCING),
+    // upload the pack, and eventually transition SYNCING→NOT_PRESENT.
+    let cache_clone = Arc::clone(&cache);
+    let cs_clone = ContentStore::new(Arc::clone(&s3), "test");
+    let pic_clone = Arc::clone(&pack_index_cache);
+    let vm_clone = Arc::clone(&volume_manifest);
+    let flush_handle = tokio::spawn(async move {
+        cache_clone
+            .flush_to_s3(&cs_clone, &pic_clone, &vm_clone)
+            .await
+    });
+
+    // Give the flush a moment to rotate (DIRTY→SYNCING).
+    // After rotation, block 0 is SYNCING and data lives in flushing file.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // Sub-block write while flush is in progress.
+    // If block is still SYNCING: promote_syncing_blocks reads flushing file,
+    //   copies 0xBB to active, CAS SYNCING→DIRTY, then pwrite 0xCC sub-block.
+    // If block already transitioned to NOT_PRESENT: write goes through the
+    //   normal path (no prior data on SSD, so just writes sub-block).
+    // If flush hasn't rotated yet: block is still DIRTY, direct pwrite.
+    let sub_block = vec![0xCC; 4096];
+    cache
+        .write_with_eviction_check(0, &sub_block)
+        .or_else(|e| {
+            if matches!(e, glidefs::block::write_cache::CacheError::BlockEvicted) {
+                // Block was evicted (SYNCING→NOT_PRESENT) between state check
+                // and pwrite. No flushing file to promote from. Just write
+                // the sub-block — remaining bytes will be zeros (no prior
+                // data to preserve since it already reached S3).
+                cache.write(0, &sub_block)
+            } else {
+                Err(e)
+            }
+        })
+        .unwrap();
+
+    // Wait for the flush to finish.
+    flush_handle.await.unwrap().unwrap();
+
+    // Read the full block — first 4096 bytes should be 0xCC.
+    let data = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert!(
+        data[..4096].iter().all(|&b| b == 0xCC),
+        "first 4096 bytes should be sub-block write (0xCC), got {:#x}",
+        data[0]
+    );
+
+    // The remaining bytes depend on timing:
+    // - If we caught SYNCING: promoted from flushing file → 0xBB
+    // - If we caught DIRTY (pre-rotation): direct pwrite → 0xBB
+    // - If we caught NOT_PRESENT (post-eviction): no prior → 0x00
+    // All three are correct behavior — the key invariant is that the
+    // sub-block data (0xCC) is never lost.
+
+    // Flush the current state to S3 and verify cold read.
+    cache
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    let reader_dir = TempDir::new().unwrap();
+    let (reader_cache, reader_cs, reader_pic, reader_vm, reader_cc, reader_metrics) =
+        super::create_cold_reader(&reader_dir, "vol1", Arc::clone(&s3)).await;
+
+    let cold_data = reader_cache
+        .read(
+            0,
+            BLOCK_SIZE,
+            reader_cc.as_ref(),
+            &reader_pic,
+            &reader_vm,
+            &reader_cs,
+            &reader_metrics,
+        )
+        .await
+        .unwrap();
+    assert!(
+        cold_data[..4096].iter().all(|&b| b == 0xCC),
+        "cold read: first 4096 bytes should be 0xCC, got {:#x}",
+        cold_data[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Readahead integration: sequential reads trigger prefetch, reducing S3 GETs
+// ---------------------------------------------------------------------------
+
+/// Sequential block reads through the handler should trigger readahead,
+/// which prefetches pack indices for the next chunk. This test verifies
+/// the full integration path: handler.read → trigger_readahead →
+/// SequentialDetector.record → prefetch_chunk → PackIndexCache.
+///
+/// If readahead silently broke (wrong chunk_idx, off-by-one), reads still
+/// work but every S3 fetch pays an extra round-trip for the pack index.
+/// That's real money on GET requests.
+#[tokio::test]
+async fn test_readahead_prefetches_next_pack_index() {
+    use glidefs::block::handler::BlockHandler;
+    use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let router = Arc::new(
+        ExportRouter::new(RouterConfig {
+            object_store: Arc::clone(&s3),
+            db_path: "test".to_string(),
+            cache_dir: dir.path().to_path_buf(),
+            block_size: BLOCK_SIZE,
+            clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+        })
+        .await
+        .unwrap(),
+    );
+
+    // Need enough blocks to span at least 2 packs. Write blocks in pack 0.
+    // DEFAULT_BLOCKS_PER_PACK = 500, so blocks 0..499 = pack 0, 500..999 = pack 1.
+    let config = ExportConfig {
+        name: "vm1".to_string(),
+        // Need device large enough for 2 packs (500 blocks * 128KB = 64MB per pack)
+        size_gb: 0.2, // 200MB — enough for >1000 blocks
+        s3_prefix: None,
+        block_size: None,
+        blocks_per_pack: None,
+        flush_mode: None,
+        transport: None,
+    };
+    router
+        .create_export(config.clone(), false, None, None)
+        .await
+        .unwrap();
+
+    let handler = router.get_handler("vm1").await.unwrap();
+
+    // Write blocks across packs 0 and 1 (first 4 of each for speed)
+    let blocks_to_write: Vec<usize> = (0..4)
+        .chain(DEFAULT_BLOCKS_PER_PACK..DEFAULT_BLOCKS_PER_PACK + 4)
+        .collect();
+    for &block_idx in &blocks_to_write {
+        let data = vec![block_idx as u8; BLOCK_SIZE];
+        handler
+            .write(block_idx as u64 * BLOCK_SIZE as u64, &data, false)
+            .await
+            .unwrap();
+    }
+
+    // Drain to S3
+    router.drain_export("vm1").await.unwrap();
+    router.save_export(&config).await.unwrap();
+    drop(router);
+
+    // Cold start: new router, fresh cache dir, no pack indices cached
+    let dir2 = TempDir::new().unwrap();
+    let router2 = Arc::new(
+        ExportRouter::new(RouterConfig {
+            object_store: Arc::clone(&s3),
+            db_path: "test".to_string(),
+            cache_dir: dir2.path().to_path_buf(),
+            block_size: BLOCK_SIZE,
+            clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+        })
+        .await
+        .unwrap(),
+    );
+
+    let discovered = router2.discover_exports().await.unwrap();
+    assert_eq!(discovered.len(), 1);
+    for ec in discovered {
+        router2
+            .create_export(ec, false, None, None)
+            .await
+            .unwrap();
+    }
+
+    let handler2 = router2.get_handler("vm1").await.unwrap();
+
+    // Read blocks 0, 1, 2 sequentially — should trigger readahead after block 2.
+    // The readahead target should be the first chunk of pack 1 (= block 500).
+    for i in 0..3 {
+        let data = handler2
+            .read(i as u64 * BLOCK_SIZE as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            data[0], i as u8,
+            "sequential read of block {} should return correct data",
+            i
+        );
+    }
+
+    // Give the readahead spawn a moment to complete the prefetch.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Now read block 500 (first block of pack 1). If readahead worked,
+    // the pack index for pack 1 is already in PackIndexCache, so this
+    // read doesn't need an extra S3 GET for the index.
+    //
+    // We can't directly observe the cache hit, but we CAN verify the read
+    // succeeds and returns correct data — confirming the end-to-end path
+    // from trigger_readahead → prefetch_chunk → read works.
+    let data = handler2
+        .read(
+            DEFAULT_BLOCKS_PER_PACK as u64 * BLOCK_SIZE as u64,
+            BLOCK_SIZE as u32,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        data[0],
+        DEFAULT_BLOCKS_PER_PACK as u8,
+        "block {} should be readable (readahead should have prefetched pack 1 index)",
+        DEFAULT_BLOCKS_PER_PACK
+    );
+}

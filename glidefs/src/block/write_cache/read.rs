@@ -88,11 +88,12 @@ impl WriteCache<Active> {
             return None;
         }
 
+        // Only take the fast path for DIRTY blocks. CLEAN blocks may not
+        // have data on SSD yet (CAS'd but not pwritten). SYNCING blocks
+        // have data in the flushing file, not the active file.
         if !(start_block..=end_block).all(|i| {
-            let idx = i as usize;
-            self.inner.is_present(idx)
-                && self.inner.state_map.get(idx)
-                    != crate::block::block_map::SparseBlockState::SYNCING
+            self.inner.state_map.get(i as usize)
+                == crate::block::block_map::SparseBlockState::DIRTY
         }) {
             return None;
         }
@@ -426,12 +427,14 @@ impl WriteCache<Active> {
         // can't swap the file handle between them (swap needs write lock).
         {
             let df = self.inner.data_file.read();
+            // Fast path only for DIRTY blocks — guaranteed to have data on SSD.
+            // CLEAN: CAS'd but may not have data yet (sparse zeros).
+            // SYNCING: data in flushing file, not active file.
+            // NOT_PRESENT: needs S3 fetch.
             let can_fast_path = !self.inner.flushing_active.load(Ordering::Acquire)
                 && (start_block..=end_block).all(|i| {
-                    let idx = i as usize;
-                    self.inner.is_present(idx)
-                        && self.inner.state_map.get(idx)
-                            != crate::block::block_map::SparseBlockState::SYNCING
+                    self.inner.state_map.get(i as usize)
+                        == crate::block::block_map::SparseBlockState::DIRTY
                 });
 
             if can_fast_path {
@@ -560,14 +563,37 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<BlockLocation, CacheError> {
-        // Hot path: block is present on local SSD.
+        // Hot path: block has data on local SSD (DIRTY or SYNCING).
+        //
+        // CLEAN blocks are excluded: CLEAN means another writer CAS'd
+        // (NOT_PRESENT→CLEAN) but may not have pwritten data yet. The
+        // SSD file is still sparse zeros for that block. Reading it would
+        // return zeros instead of the real S3 data, causing backfill loss.
+        //
         // sync_read_local_block returns None if the block was evicted
-        // (SYNCING→NOT_PRESENT) between our is_present() check and the
-        // actual read — in that case, fall through to the cold path.
-        if self.inner.is_present(block_index)
-            && let Some(data) = self.sync_read_local_block(block_index as u64)?
+        // (SYNCING→NOT_PRESENT) between our state check and the actual
+        // read — in that case, fall through to the cold path.
         {
-            return Ok(BlockLocation::Local(data));
+            let state = self.inner.state_map.get(block_index);
+
+            #[cfg(feature = "test-utils")]
+            {
+                let sp = self.inner.read_sync.lock().clone();
+                if let Some(sp) = sp {
+                    sp.gate(
+                        super::inner::ReadStep::AfterStateCheck,
+                        block_index,
+                        state,
+                    ).await;
+                }
+            }
+
+            if (state == crate::block::block_map::SparseBlockState::DIRTY
+                || state == crate::block::block_map::SparseBlockState::SYNCING)
+                && let Some(data) = self.sync_read_local_block(block_index as u64)?
+            {
+                return Ok(BlockLocation::Local(data));
+            }
         }
 
         // Cold path: resolve via VolumeManifest → PackIndexCache
@@ -603,15 +629,19 @@ impl WriteCache<Active> {
                 }
                 continue;
             }
-            match pack_index_cache.lookup_block(pack_id, block_offset).await {
-                Some((hash, pack_offset, comp_length)) => {
-                    resolved = Some((pack_id, hash, pack_offset, comp_length));
-                    break;
+            // Use get_entries + linear scan instead of lookup_block to avoid
+            // a race where foyer's async insertion hasn't committed for
+            // lookup_block's .get() but has for get_entries' .get(). Both
+            // call the same foyer .get(), but the timing can differ.
+            match pack_index_cache.get_entries(pack_id).await {
+                Some(entries) => {
+                    if let Some(e) = entries.iter().find(|e| e.chunk_offset == block_offset) {
+                        resolved = Some((pack_id, e.hash, e.offset, e.comp_length));
+                        break;
+                    }
+                    // Pack cached but block not in it — try older packs.
                 }
                 None => {
-                    if pack_index_cache.get_entries(pack_id).await.is_some() {
-                        continue;
-                    }
                     uncached_packs.push(pack_id);
                 }
             }
@@ -640,6 +670,7 @@ impl WriteCache<Active> {
 
             let results = futures::future::join_all(fetch_futures).await;
             let mut last_fetch_error = None;
+            let mut failed_pack_ids: Vec<PackId> = Vec::new();
             for (pid, result) in results {
                 match result {
                     Ok(entries) => {
@@ -651,17 +682,28 @@ impl WriteCache<Active> {
                             error = %e,
                             "failed to fetch pack index from S3"
                         );
+                        failed_pack_ids.push(pid);
                         last_fetch_error = Some(e);
                     }
                 }
             }
 
+            // Re-resolve newest-first using get_entries (not lookup_block)
+            // to avoid the foyer async insertion race. If we encounter a
+            // failed pack before finding a resolution, we must error — that
+            // pack might contain a newer version of the block, and returning
+            // older data would be a silent consistency violation.
             for &pack_id in pack_ids.iter().rev() {
-                if let Some((hash, pack_offset, comp_length)) =
-                    pack_index_cache.lookup_block(pack_id, block_offset).await
-                {
-                    resolved = Some((pack_id, hash, pack_offset, comp_length));
-                    break;
+                if failed_pack_ids.contains(&pack_id) {
+                    if let Some(e) = last_fetch_error {
+                        return Err(e.into());
+                    }
+                }
+                if let Some(entries) = pack_index_cache.get_entries(pack_id).await {
+                    if let Some(e) = entries.iter().find(|e| e.chunk_offset == block_offset) {
+                        resolved = Some((pack_id, e.hash, e.offset, e.comp_length));
+                        break;
+                    }
                 }
             }
 

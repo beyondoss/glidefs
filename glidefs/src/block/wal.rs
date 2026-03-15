@@ -128,7 +128,7 @@ impl Wal {
         let written = written as usize;
         if written != buf.len() {
             return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
+                io::ErrorKind::Other,
                 format!("WAL short write: expected {} bytes, wrote {}", buf.len(), written),
             ));
         }

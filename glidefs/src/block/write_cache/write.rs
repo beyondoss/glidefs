@@ -1,11 +1,55 @@
 use tracing::{debug, instrument};
 
+use crate::block::block_map::SparseBlockState;
 use crate::block::state::Active;
 use crate::block::wal::serialize_entry;
 
 use super::{CacheError, WriteCache};
 
 impl WriteCache<Active> {
+    /// Build WAL entries for non-dirty blocks, append to WAL, sync if configured,
+    /// then transition states to DIRTY.
+    ///
+    /// Must be called while holding a `data_file` lock guard (read or write).
+    /// The `df` reference is needed for `sync_all()` when `wal_sync` is enabled.
+    fn wal_append_and_mark_dirty(
+        &self,
+        df: &super::inner::SyncFile,
+        start_block: u64,
+        end_block: u64,
+    ) -> Result<(), CacheError> {
+        let mut batch = Vec::new();
+        let mut to_dirty: Vec<usize> = Vec::new();
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx >= self.inner.num_blocks {
+                continue;
+            }
+            let state = self.inner.state_map.get(idx);
+            if state != SparseBlockState::DIRTY {
+                let seq = self.inner.sequence.next();
+                serialize_entry(&mut batch, block, seq);
+                to_dirty.push(idx);
+            }
+        }
+
+        if !batch.is_empty() {
+            self.inner.wal.append_batch(&batch)?;
+            if self.inner.config.wal_sync {
+                df.sync_all()?;
+                self.inner.wal.sync()?;
+            } else {
+                self.inner.wal.flush()?;
+            }
+        }
+
+        for idx in to_dirty {
+            self.inner.transition_to_dirty(idx);
+        }
+
+        Ok(())
+    }
+
     /// Write data to the cache.
     ///
     /// Data is written to the local SSD and the affected blocks are marked dirty and present.
@@ -18,16 +62,42 @@ impl WriteCache<Active> {
     /// - Syncing → Dirty: decrement syncing_count, increment dirty_count
     /// - Dirty → Dirty: no-op (WAL entry skipped — already recorded)
     /// Hash computation is deferred to flush-to-S3 time. The write path only
-    /// does: set_present → pwrite → mark dirty → invalidate CRC → WAL append.
+    /// does: set_present → pwrite → WAL append → mark dirty.
     #[instrument(skip(self, data), fields(offset = offset, len = data.len()))]
     pub fn write(
         &self,
         offset: u64,
         data: &[u8],
     ) -> Result<(), CacheError> {
-        if offset + data.len() as u64 > self.inner.config.device_size {
+        self.write_inner(offset, data, false)
+    }
+
+    /// Write data with eviction detection for sub-block backfill safety.
+    ///
+    /// Like `write()`, but returns `CacheError::BlockEvicted` if any block
+    /// in the range was evicted (NOT_PRESENT) and the flushing file is gone.
+    /// Used by the handler's backfill path to detect flush eviction races
+    /// and retry with a fresh S3 fetch.
+    pub fn write_with_eviction_check(
+        &self,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), CacheError> {
+        self.write_inner(offset, data, true)
+    }
+
+    fn write_inner(
+        &self,
+        offset: u64,
+        data: &[u8],
+        require_promotion: bool,
+    ) -> Result<(), CacheError> {
+        let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
+            CacheError::offset_out_of_bounds(u64::MAX, self.inner.config.device_size)
+        })?;
+        if end > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
-                offset + data.len() as u64,
+                end,
                 self.inner.config.device_size,
             ));
         }
@@ -39,25 +109,9 @@ impl WriteCache<Active> {
         // Calculate affected blocks
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
-        let end_block = (offset + data.len() as u64 - 1) / block_size;
+        let end_block = (end - 1) / block_size;
 
-        // CRITICAL: Mark blocks as present BEFORE writing to file.
-        // This prevents a race with prefetch where:
-        // 1. Prefetch sees is_present=false
-        // 2. Write does pwrite(new_data)
-        // 3. Prefetch does pwrite(s3_data) - OVERWRITES new_data
-        // 4. Write does set_present (too late)
-        //
-        // By setting present first, prefetch's CAS will fail if we've claimed the block,
-        // or if prefetch wins the CAS, our pwrite will overwrite their stale S3 data.
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx < self.inner.num_blocks {
-                self.inner.set_present(idx);
-            }
-        }
-
-        // Hold the data_file read lock across pwrite + dirty marking.
+        // Hold the data_file read lock across promote + pwrite + dirty marking.
         //
         // rotate_and_snapshot() acquires the data_file WRITE lock to snapshot
         // dirty blocks and swap files atomically. If we release the read lock
@@ -69,45 +123,36 @@ impl WriteCache<Active> {
         //      flushing file, not the new active file)
         // The flushing file is deleted after flush, permanently losing the data.
         //
-        // Holding the read lock across both operations prevents rotation from
+        // Holding the read lock across all operations prevents rotation from
         // interleaving. The read lock is shared, so concurrent writers are
         // not blocked — only rotation waits until all writers release.
         let df = self.inner.data_file.read();
 
-        // Promote SYNCING blocks from flushing → active before pwrite.
-        // This ensures the active file has the complete block so the guest's
-        // sub-block write doesn't leave the rest as zeros.
-        // Also recovers NOT_PRESENT blocks if flushing file is still available.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block)?;
+        // Promote SYNCING/NOT_PRESENT blocks from flushing → active BEFORE
+        // set_present. promote_syncing_blocks needs to see the real block
+        // state to recover data from the flushing file. If set_present runs
+        // first, it masks NOT_PRESENT as CLEAN, and promote silently skips —
+        // leaving zeros on the active file for sub-block writes.
+        self.inner.promote_syncing_blocks(&df, start_block, end_block, require_promotion)?;
+
+        // Mark blocks present AFTER promote but BEFORE pwrite.
+        // This prevents a race with prefetch where:
+        // 1. Prefetch sees is_present=false
+        // 2. Write does pwrite(new_data)
+        // 3. Prefetch does pwrite(s3_data) - OVERWRITES new_data
+        //
+        // By setting present first, prefetch's CAS will fail if we've
+        // claimed the block, or our pwrite will overwrite their stale data.
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx < self.inner.num_blocks {
+                self.inner.set_present(idx);
+            }
+        }
 
         df.write_all_at(data, offset)?;
 
-        // Mark affected blocks as dirty, invalidate stale CRC32 checksums,
-        // and batch WAL entries. Lock-free: O_APPEND WAL handles concurrency.
-        // Skip WAL append for blocks already dirty (redundant — already recorded).
-        let mut batch = Vec::new();
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx >= self.inner.num_blocks {
-                continue;
-            }
-            let state_changed = self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.store(idx, super::inner::CRC_SENTINEL);
-
-            if state_changed {
-                let seq = self.inner.sequence.next();
-                serialize_entry(&mut batch, block, seq);
-            }
-        }
-
-        if !batch.is_empty() {
-            self.inner.wal.append_batch(&batch)?;
-            if self.inner.config.wal_sync {
-                self.inner.wal.sync()?;
-            } else {
-                self.inner.wal.flush()?;
-            }
-        }
+        self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
 
         drop(df);
 
@@ -131,33 +176,37 @@ impl WriteCache<Active> {
             return Ok(());
         }
 
-        if offset + len > self.inner.config.device_size {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            CacheError::offset_out_of_bounds(u64::MAX, self.inner.config.device_size)
+        })?;
+        if end > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
-                offset + len,
+                end,
                 self.inner.config.device_size,
             ));
         }
 
-        // CRITICAL: Mark blocks as present BEFORE writing zeros to file.
-        // Same invariant as write() — prevents prefetch race where prefetch
-        // could overwrite our zeros with stale S3 data.
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
-        let end_block = (offset + len - 1) / block_size;
+        let end_block = (end - 1) / block_size;
+
+        // Hold the data_file read lock across promote + set_present + zero +
+        // dirty marking (same rotation race as write() — see comment there).
+        let df = self.inner.data_file.read();
+
+        // Promote SYNCING blocks from flushing → active before zeroing.
+        // Also recovers NOT_PRESENT blocks if flushing file is still available.
+        self.inner.promote_syncing_blocks(&df, start_block, end_block, false)?;
+
+        // Mark blocks present AFTER promote but BEFORE zero write.
+        // Same invariant as write() — prevents prefetch race where prefetch
+        // could overwrite our zeros with stale S3 data.
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
             }
         }
-
-        // Hold the data_file read lock across zero + dirty marking (same
-        // rotation race as write() — see comment there).
-        let df = self.inner.data_file.read();
-
-        // Promote SYNCING blocks from flushing → active before zeroing.
-        // Also recovers NOT_PRESENT blocks if flushing file is still available.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block)?;
 
         // Zero the file range (after claiming blocks via set_present)
         #[cfg(target_os = "linux")]
@@ -195,37 +244,7 @@ impl WriteCache<Active> {
             self.zero_range_fallback_with(&df, offset, len)?;
         }
 
-        // Mark affected blocks as dirty, invalidate stale CRCs, and batch
-        // WAL entries. Skip redundant entries for already-dirty blocks.
-        {
-            let block_size = self.inner.config.block_size as u64;
-            let start_block = offset / block_size;
-            let end_block = (offset + len - 1) / block_size;
-
-            let mut batch = Vec::new();
-            for block in start_block..=end_block {
-                let idx = block as usize;
-                if idx >= self.inner.num_blocks {
-                    continue;
-                }
-                let state_changed = self.inner.transition_to_dirty(idx);
-                self.inner.crc_map.store(idx, super::inner::CRC_SENTINEL);
-
-                if state_changed {
-                    let seq = self.inner.sequence.next();
-                    serialize_entry(&mut batch, block, seq);
-                }
-            }
-
-            if !batch.is_empty() {
-                self.inner.wal.append_batch(&batch)?;
-                if self.inner.config.wal_sync {
-                    self.inner.wal.sync()?;
-                } else {
-                    self.inner.wal.flush()?;
-                }
-            }
-        }
+        self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
 
         drop(df);
 
@@ -292,9 +311,12 @@ impl WriteCache<Active> {
     /// this.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     pub fn pre_write(&self, offset: u64, len: u64) -> Result<(), CacheError> {
-        if offset + len > self.inner.config.device_size {
+        let end = offset.checked_add(len).ok_or_else(|| {
+            CacheError::offset_out_of_bounds(u64::MAX, self.inner.config.device_size)
+        })?;
+        if end > self.inner.config.device_size {
             return Err(CacheError::offset_out_of_bounds(
-                offset + len,
+                end,
                 self.inner.config.device_size,
             ));
         }
@@ -304,7 +326,7 @@ impl WriteCache<Active> {
 
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
-        let end_block = (offset + len - 1) / block_size;
+        let end_block = (end - 1) / block_size;
 
         for block in start_block..=end_block {
             let idx = block as usize;
@@ -348,35 +370,14 @@ impl WriteCache<Active> {
 
         // Promote SYNCING blocks from flushing → active before pwrite.
         // Also recovers NOT_PRESENT blocks if flushing file is still available.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block)?;
+        // require_promotion=true: if the flushing file was already taken and
+        // any block is NOT_PRESENT/SYNCING, return BlockEvicted so the ublk
+        // handler can fall back to the full write path with S3 backfill.
+        self.inner.promote_syncing_blocks(&df, start_block, end_block, true)?;
 
         df.write_all_at(data, offset)?;
 
-        // Mark affected blocks as dirty, invalidate stale CRCs, and batch
-        // WAL entries. Skip redundant entries for already-dirty blocks.
-        let mut batch = Vec::new();
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx >= self.inner.num_blocks {
-                continue;
-            }
-            let state_changed = self.inner.transition_to_dirty(idx);
-            self.inner.crc_map.store(idx, super::inner::CRC_SENTINEL);
-
-            if state_changed {
-                let seq = self.inner.sequence.next();
-                serialize_entry(&mut batch, block, seq);
-            }
-        }
-
-        if !batch.is_empty() {
-            self.inner.wal.append_batch(&batch)?;
-            if self.inner.config.wal_sync {
-                self.inner.wal.sync()?;
-            } else {
-                self.inner.wal.flush()?;
-            }
-        }
+        self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
 
         drop(df);
 

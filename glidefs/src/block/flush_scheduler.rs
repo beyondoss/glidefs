@@ -4,8 +4,9 @@
 //! - **Pack-size flush** (event-driven): when dirty blocks reach the per-export
 //!   `blocks_per_pack` threshold, the write path notifies the scheduler to flush
 //!   packs + sync manifest to S3. Disabled in manual mode (blocks_per_pack = 0).
-//! - **Local checkpoint** (periodic, 5s): persists block states and truncates the
-//!   WAL. No S3 involvement.
+//! - **Local checkpoint** (demand-driven, 5s interval when active): persists block
+//!   states and truncates the WAL. Only runs when dirty blocks or a pending manifest
+//!   sync exist. Idle exports consume zero timer resources.
 //!
 //! Manifest sync happens after every successful pack upload so that flushed packs
 //! are immediately discoverable on cross-host recovery (host death without drain).
@@ -28,12 +29,21 @@ use crate::block::write_cache::WriteCache;
 /// Maximum backoff between flush retries.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
+/// Duration used to "park" the checkpoint timer when idle. Must be large
+/// enough to never fire during normal operation, but small enough that
+/// `Instant::now() + FAR_FUTURE` does not overflow `Instant`'s internal
+/// representation. 10 years is safe on all platforms.
+const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 10);
+
 /// Result of a flush-and-sync cycle.
 struct FlushResult {
     /// Number of packs uploaded to S3 (0 = no dirty blocks or all deduped).
     packs_uploaded: usize,
     /// Whether the manifest was successfully synced to S3.
     manifest_synced: bool,
+    /// Another host owns this export's manifest (ETag conflict).
+    /// When true, the scheduler should stop flushing entirely.
+    manifest_conflict: bool,
 }
 
 /// Execute flush_packs + sync_manifest (with retries).
@@ -62,9 +72,10 @@ async fn flush_and_sync(
             *flush_backoff = Duration::ZERO;
             *last_flush_failure = None;
             metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
-            metrics.record_flush_blocks_corrupted(stats.blocks_corrupted);
+            metrics.record_flush_blocks_crc_mismatched(stats.blocks_crc_mismatched);
 
             let mut manifest_synced = false;
+            let mut manifest_conflict = false;
             if stats.packs_uploaded > 0 {
                 info!(
                     packs = stats.packs_uploaded,
@@ -80,6 +91,15 @@ async fn flush_and_sync(
                         Ok(()) => {
                             manifest_synced = true;
                             metrics.record_manifest_synced();
+                            break;
+                        }
+                        Err(e) if e.is_manifest_conflict() => {
+                            tracing::error!(
+                                "manifest ETag conflict — another host owns this export, \
+                                 stopping flush scheduler"
+                            );
+                            metrics.record_manifest_sync_error();
+                            manifest_conflict = true;
                             break;
                         }
                         Err(e) => {
@@ -102,6 +122,7 @@ async fn flush_and_sync(
             Some(FlushResult {
                 packs_uploaded: stats.packs_uploaded,
                 manifest_synced,
+                manifest_conflict,
             })
         }
         Err(e) => {
@@ -126,7 +147,12 @@ async fn flush_and_sync(
 ///
 /// Loops until `shutdown` signals true. Two select branches:
 /// 1. `flush_notify` — event-driven pack flush when dirty count crosses threshold
-/// 2. Checkpoint ticker — periodic WAL truncation every 5s
+/// 2. Checkpoint timer — demand-driven WAL truncation (5s interval, only when active)
+///
+/// The checkpoint timer is parked (`Duration::MAX`) when the export has no dirty
+/// blocks and no pending manifest sync. This means idle exports consume zero timer
+/// resources in tokio's timer wheel — critical for high-density deployments with
+/// thousands of mostly-idle exports.
 #[allow(clippy::too_many_arguments)]
 pub async fn flush_scheduler(
     cache: Arc<WriteCache<Active>>,
@@ -141,26 +167,50 @@ pub async fn flush_scheduler(
 ) {
     info!("flush scheduler started");
 
-    // Jitter the checkpoint start so 2K exports don't all checkpoint at the same instant.
-    let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..5000));
-    let checkpoint_interval = Duration::from_secs(5);
-    let mut checkpoint_ticker =
-        tokio::time::interval_at(tokio::time::Instant::now() + jitter, checkpoint_interval);
+    const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
     // Backoff state: when flush fails (e.g., S3 down), wait before retrying
     // to avoid a tight spin of failed flush_packs calls.
     let mut flush_backoff = Duration::ZERO;
 
-    // Track when the last flush failure occurred so the checkpoint ticker
+    // Track when the last flush failure occurred so the checkpoint timer
     // can retry S3 flushes after the backoff has elapsed. Without this,
     // dirty blocks can sit unsynced indefinitely if S3 recovers but no
     // new writes trigger flush_notify.
     let mut last_flush_failure: Option<tokio::time::Instant> = None;
 
     // Pending manifest sync: if sync_manifest fails after a successful pack
-    // flush, we retry on the next checkpoint tick to close the window where
+    // flush, we retry on the next checkpoint fire to close the window where
     // packs are on S3 but not referenced by any manifest.
     let mut manifest_pending = false;
+
+    // Demand-driven checkpoint timer. Parked at Duration::MAX when idle (no
+    // dirty blocks, no pending manifest). Activated on first write or at
+    // startup if WAL recovery left dirty blocks. reset() is O(1) — just
+    // moves the entry in tokio's timer wheel.
+    let checkpoint_timer = tokio::time::sleep(FAR_FUTURE);
+    tokio::pin!(checkpoint_timer);
+    let mut checkpoint_active = false;
+
+    // Activate the checkpoint timer (idempotent). First activation includes
+    // jitter to spread checkpoint storms across exports.
+    macro_rules! activate_checkpoint {
+        ($timer:expr, $active:expr) => {
+            if !$active {
+                let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..5000));
+                $timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + CHECKPOINT_INTERVAL + jitter);
+                $active = true;
+            }
+        };
+    }
+
+    // If WAL recovery left dirty blocks, activate the timer immediately so
+    // they get checkpointed and eventually flushed to S3.
+    if cache.dirty_block_count() > 0 {
+        activate_checkpoint!(checkpoint_timer, checkpoint_active);
+    }
 
     loop {
         tokio::select! {
@@ -186,6 +236,9 @@ pub async fn flush_scheduler(
 
             // Event-driven: write path notifies when dirty count crosses blocks_per_pack.
             () = flush_notify.notified() => {
+                // Writes have landed — ensure the checkpoint timer is running.
+                activate_checkpoint!(checkpoint_timer, checkpoint_active);
+
                 // If we're in backoff after a previous failure, wait before retrying.
                 if flush_backoff > Duration::ZERO {
                     tokio::select! {
@@ -205,10 +258,57 @@ pub async fn flush_scheduler(
 
                 // Acquire global flush semaphore to limit how many exports
                 // prepare + upload pack data simultaneously (memory bound).
+                // Wrapped in select! so shutdown can interrupt the wait.
                 let _flush_permit = match &flush_semaphore {
-                    Some(sem) => Some(sem.acquire().await),
+                    Some(sem) => {
+                        tokio::select! {
+                            biased;
+                            result = shutdown.changed() => {
+                                if result.is_err() || *shutdown.borrow() {
+                                    info!("flush scheduler: shutting down during semaphore wait");
+                                    return;
+                                }
+                                continue; // spurious wakeup
+                            }
+                            permit = sem.acquire() => Some(permit),
+                        }
+                    }
                     None => None,
                 };
+
+                // If a previous flush's manifest hasn't been synced yet, retry
+                // that sync before starting a new flush cycle. The flushing file
+                // from the previous flush is kept on disk as a crash-safety net
+                // until checkpoint (after manifest sync) deletes it. Starting a
+                // new flush would rotate the data file, overwriting the flushing
+                // file and destroying that safety net.
+                if manifest_pending {
+                    let _flush_guard = cache.flush_lock().lock().await;
+                    match cache.sync_manifest(&content_store, &volume_manifest).await {
+                        Ok(()) => {
+                            info!("deferred manifest sync succeeded (flush_notify path)");
+                            manifest_pending = false;
+                            metrics.record_manifest_synced();
+                            metrics.set_manifest_pending(false);
+                            if let Err(e) = cache.checkpoint().await {
+                                warn!(error = %e, "checkpoint after deferred manifest sync");
+                            }
+                        }
+                        Err(e) if e.is_manifest_conflict() => {
+                            tracing::error!(
+                                "manifest ETag conflict — another host owns this export, \
+                                 stopping flush scheduler"
+                            );
+                            metrics.record_manifest_sync_error();
+                            return;
+                        }
+                        Err(e) => {
+                            metrics.record_manifest_sync_error();
+                            warn!(error = %e, "deferred manifest sync retry failed (flush_notify path)");
+                        }
+                    }
+                    continue;
+                }
 
                 // Acquire per-export flush lock to serialize with concurrent
                 // drain/snapshot operations. Prevents stale manifest uploads.
@@ -220,32 +320,35 @@ pub async fn flush_scheduler(
                     ).await {
                         metrics.record_s3_put_latency(start.elapsed());
                         packs_uploaded = result.packs_uploaded;
+                        if result.manifest_conflict {
+                            return;
+                        }
                         if result.packs_uploaded > 0 {
                             if result.manifest_synced {
                                 manifest_pending = false;
                                 metrics.set_manifest_pending(false);
                             } else {
-                                // Do NOT checkpoint here. local_checkpoint persists
+                                // Do NOT checkpoint here. checkpoint persists
                                 // block states as CLEAN and truncates the WAL. If the
                                 // host crashes before manifest sync succeeds, those
                                 // blocks become irrecoverable (CLEAN on disk, but S3
-                                // manifest doesn't reference the packs). The 5s
-                                // checkpoint ticker retries manifest sync and will
-                                // checkpoint after it succeeds.
+                                // manifest doesn't reference the packs). The checkpoint
+                                // timer retries manifest sync and will checkpoint after
+                                // it succeeds.
                                 manifest_pending = true;
                                 metrics.set_manifest_pending(true);
                             }
                         } else {
                             // No packs uploaded — still checkpoint to persist
-                            // clean block states and compute CRC32s.
-                            if let Err(e) = cache.local_checkpoint().await {
+                            // clean block states.
+                            if let Err(e) = cache.checkpoint().await {
                                 warn!(error = %e, "checkpoint after flush");
                             }
                         }
                     } else {
                         // Flush failed — still checkpoint to prevent WAL growth
                         // when S3 is down and flush_notify fires continuously.
-                        if let Err(e) = cache.local_checkpoint().await {
+                        if let Err(e) = cache.checkpoint().await {
                             warn!(error = %e, "checkpoint after flush error");
                         }
                     }
@@ -289,9 +392,9 @@ pub async fn flush_scheduler(
                 }
             }
 
-            // Periodic: checkpoint every 5s + retry pending manifest sync +
-            // retry S3 flush after backoff has elapsed.
-            _ = checkpoint_ticker.tick() => {
+            // Demand-driven: checkpoint + retry manifest sync + retry S3 flush.
+            // Only fires when dirty blocks or pending manifest exist.
+            () = &mut checkpoint_timer => {
                 // Retry manifest sync that failed after a previous pack flush.
                 if manifest_pending {
                     let _flush_guard = cache.flush_lock().lock().await;
@@ -306,9 +409,17 @@ pub async fn flush_scheduler(
                             // flushed to S3 remain DIRTY in the .meta file and
                             // WAL entries are never truncated. On recovery,
                             // those blocks would be unnecessarily re-uploaded.
-                            if let Err(e) = cache.local_checkpoint().await {
+                            if let Err(e) = cache.checkpoint().await {
                                 warn!(error = %e, "checkpoint after deferred manifest sync");
                             }
+                        }
+                        Err(e) if e.is_manifest_conflict() => {
+                            tracing::error!(
+                                "manifest ETag conflict — another host owns this export, \
+                                 stopping flush scheduler"
+                            );
+                            metrics.record_manifest_sync_error();
+                            return;
                         }
                         Err(e) => {
                             metrics.record_manifest_sync_error();
@@ -329,17 +440,33 @@ pub async fn flush_scheduler(
                         if let Some(result) = flush_and_sync(
                             &cache, &content_store, &pack_index_cache, &volume_manifest,
                             &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
-                        ).await
-                            && result.packs_uploaded > 0 {
-                            manifest_pending = !result.manifest_synced;
-                            metrics.set_manifest_pending(manifest_pending);
+                        ).await {
+                            if result.manifest_conflict {
+                                return;
+                            }
+                            if result.packs_uploaded > 0 {
+                                manifest_pending = !result.manifest_synced;
+                                metrics.set_manifest_pending(manifest_pending);
+                            }
                         }
                     }
 
                     // Always checkpoint locally when dirty.
-                    if let Err(e) = cache.local_checkpoint().await {
+                    if let Err(e) = cache.checkpoint().await {
                         warn!(error = %e, "local checkpoint failed");
                     }
+                }
+
+                // Reschedule if still needed, otherwise park the timer.
+                if cache.dirty_block_count() > 0 || manifest_pending {
+                    checkpoint_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + CHECKPOINT_INTERVAL);
+                } else {
+                    checkpoint_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + FAR_FUTURE);
+                    checkpoint_active = false;
                 }
             }
         }
@@ -1015,11 +1142,72 @@ mod tests {
 
         // After recovery, blocks MUST still be dirty. The manifest never
         // synced, so these blocks exist as unreferenced packs on S3. If
-        // local_checkpoint() ran after the failed manifest sync, .meta
+        // checkpoint() ran after the failed manifest sync, .meta
         // would show CLEAN + WAL truncated = data loss on crash.
         assert!(
             recovered.dirty_block_count() > 0,
             "blocks must be dirty after crash with unsynced manifest (got 0 — data loss bug)"
+        );
+    }
+
+    /// Prove: shutdown is blocked when flush semaphore is fully held.
+    ///
+    /// The scheduler's flush_notify handler calls `sem.acquire().await`
+    /// with no shutdown check. If all permits are held, shutdown can't
+    /// be processed until a permit is released.
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_blocked_by_held_semaphore() {
+        let (
+            cache,
+            content_store,
+            pack_index_cache,
+            volume_manifest,
+            flush_notify,
+            shutdown_rx,
+            shutdown_tx,
+            metrics,
+            clean_cache,
+            _temp,
+        ) = test_scheduler_components().await;
+
+        // Create a semaphore with 1 permit and hold it
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held_permit = sem.clone().acquire_owned().await.unwrap();
+
+        // Write dirty blocks so flush_notify triggers a flush attempt
+        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+            let offset = i as u64 * 128 * 1024;
+            cache.write(offset, &[0xFF; 128 * 1024]).unwrap();
+        }
+
+        let flush_notify_clone = Arc::clone(&flush_notify);
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache,
+                content_store,
+                pack_index_cache,
+                volume_manifest,
+                clean_cache,
+                flush_notify,
+                shutdown_rx,
+                metrics,
+                Some(sem),
+            )
+            .await;
+        });
+
+        // Trigger flush — scheduler will block on semaphore acquire
+        flush_notify_clone.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Signal shutdown while scheduler is blocked on semaphore
+        shutdown_tx.send(true).unwrap();
+
+        // BUG: scheduler can't exit because it's stuck in sem.acquire().await
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            result.is_ok(),
+            "BUG: scheduler should exit within 5s but is stuck on semaphore"
         );
     }
 }

@@ -40,6 +40,13 @@ pub use error::CacheError;
 pub use read::{ChunkSource, ReadPlan};
 use inner::CacheInner;
 
+#[cfg(feature = "test-utils")]
+pub use inner::{
+    FlushSyncPoints, FlushStep, FlushGateEvent,
+    PromoteSyncPoints, PromoteStep, PromoteGateEvent,
+    ReadSyncPoints, ReadStep, ReadGateEvent,
+};
+
 /// Statistics from a flush operation.
 #[derive(Debug, Default)]
 pub struct FlushStats {
@@ -52,8 +59,12 @@ pub struct FlushStats {
     /// Blocks left dirty because a concurrent write changed their sequence
     /// during the flush cycle (CAS failure on the sequence-number check).
     pub blocks_cas_failed: usize,
-    /// Blocks skipped due to CRC32 mismatch (SSD corruption detected).
-    pub blocks_corrupted: usize,
+    /// Blocks skipped due to CRC32 mismatch while still SYNCING. Includes both
+    /// benign write races (a write landed between CRC pre-pass and rotation,
+    /// producing a stale baseline CRC) and genuine SSD read instability.
+    /// Occasional spikes under write-heavy workloads are expected; a persistent
+    /// non-zero value at low write rates warrants SSD health investigation.
+    pub blocks_crc_mismatched: usize,
     /// Number of pack objects uploaded.
     pub packs_uploaded: usize,
     /// Total bytes uploaded to S3.
@@ -72,6 +83,9 @@ pub struct SnapshotResult {
     pub snapshot_persisted: bool,
     /// Flush statistics.
     pub stats: FlushStats,
+    /// Serialized manifest bytes captured under the flush lock.
+    /// Used for tag publishing to ensure point-in-time consistency.
+    pub manifest_bytes: Vec<u8>,
 }
 
 /// Write-behind cache with typestate lifecycle management.
@@ -94,7 +108,7 @@ impl WriteCache<Draining> {
     }
 }
 
-// Loom concurrency tests are in a separate crate: glidefs/loom-tests/
-// This is necessary because loom disables tokio's networking which breaks
-// dependencies like hyper-util. Run loom tests with:
-//   cd loom-tests && cargo test --release
+// Loom concurrency tests: glidefs/loom-tests/
+// Tests the REAL SparseStateMap under exhaustive interleaving exploration.
+// The `loom` cargo feature swaps std atomics for loom atomics in block_map.rs.
+// Run: cd loom-tests && cargo test --release

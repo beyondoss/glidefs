@@ -26,6 +26,9 @@ ublk = ["dep:ublk-core", "dep:io-uring"]
 fio-bench = ["ublk", "test-utils"]
 # Linux blktests suite against ublk + nbd kernel devices
 blktests = ["ublk", "test-utils"]
+# Loom concurrency model checking — swaps std atomics for loom atomics
+# in SparseStateMap. Used by the standalone loom-tests crate.
+loom = ["dep:loom"]
 
 [dependencies]
 console-subscriber = { version = "0.5", optional = true }
@@ -69,6 +72,7 @@ ext4 = { path = "../ext4" }
 oci-registry = { path = "../oci-registry" }
 flate2 = "1"
 zstd = "0.13"
+loom = { version = "0.7", optional = true }
 sha2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -84,12 +88,8 @@ paste = "1"
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
-
 [lints.rust]
-# Allow loom and ublk cfg flags
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(tokio_unstable)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [lints.clippy]
 # Real bugs — deny in CI

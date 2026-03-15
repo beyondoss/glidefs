@@ -818,7 +818,7 @@ mod tests {
         let mut vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         vm.append_pack(chunk_idx, pack_a);
         content_store
-            .put_manifest("vm1", vm.serialize(), None)
+            .put_manifest("vm1", vm.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -870,7 +870,7 @@ mod tests {
         // Create a VolumeManifest with no packs (empty manifest -> no live packs)
         let vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         content_store
-            .put_manifest("vm1", vm.serialize(), None)
+            .put_manifest("vm1", vm.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -947,7 +947,7 @@ mod tests {
         // Empty manifest -> dead_pack is unreferenced.
         let vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         content_store
-            .put_manifest("vm1", vm.serialize(), None)
+            .put_manifest("vm1", vm.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -991,7 +991,7 @@ mod tests {
 
         let vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         content_store
-            .put_manifest("vm1", vm.serialize(), None)
+            .put_manifest("vm1", vm.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -1030,7 +1030,7 @@ mod tests {
         // First: manifest does NOT reference pack -> it's dead.
         let vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         content_store
-            .put_manifest("vm1", vm.serialize(), None)
+            .put_manifest("vm1", vm.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -1053,7 +1053,7 @@ mod tests {
         let mut vm2 = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         vm2.append_pack(chunk_idx, pack_id);
         content_store
-            .put_manifest("vm1", vm2.serialize(), None)
+            .put_manifest("vm1", vm2.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -1101,7 +1101,7 @@ mod tests {
         vm.append_pack(0, pack_0a);
         vm.append_pack(5, pack_5a);
         content_store
-            .put_manifest("vm1", vm.serialize(), None)
+            .put_manifest("vm1", vm.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -1147,7 +1147,7 @@ mod tests {
         let mut vm_main = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         vm_main.append_pack(chunk_idx, pack_main);
         content_store
-            .put_manifest("vm1", vm_main.serialize(), None)
+            .put_manifest("vm1", vm_main.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -1155,7 +1155,7 @@ mod tests {
         let mut vm_snap = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         vm_snap.append_pack(chunk_idx, pack_snap);
         content_store
-            .put_snapshot("vm1", 1, vm_snap.serialize())
+            .put_snapshot("vm1", 1, vm_snap.serialize().unwrap())
             .await
             .unwrap();
 
@@ -1195,7 +1195,7 @@ mod tests {
         // Empty manifest -> all packs are dead.
         let vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         content_store
-            .put_manifest("vm1", vm.serialize(), None)
+            .put_manifest("vm1", vm.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -1388,7 +1388,7 @@ mod tests {
         let mut vm_main = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         vm_main.append_pack(chunk_idx, pack_main);
         content_store
-            .put_manifest("vm1", vm_main.serialize(), None)
+            .put_manifest("vm1", vm_main.serialize().unwrap(), None)
             .await
             .unwrap();
 
@@ -1396,7 +1396,7 @@ mod tests {
         let mut vm_snap = VolumeManifest::new(1024 * 1024 * 1024, 131072);
         vm_snap.append_pack(chunk_idx, pack_snap_only);
         content_store
-            .put_snapshot("vm1", 1, vm_snap.serialize())
+            .put_snapshot("vm1", 1, vm_snap.serialize().unwrap())
             .await
             .unwrap();
 

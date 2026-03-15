@@ -11,10 +11,25 @@ use std::process::Command;
 use std::sync::Arc;
 
 use tempfile::TempDir;
+use tokio::sync::Mutex;
 
 use crate::{TestContext, TestServer, Transport};
 
 const EXPORT_SIZE_GB: f64 = 0.05; // 50MB — enough for ext4 + journal
+
+/// Serialize all crash recovery tests that use kernel NBD devices.
+///
+/// After crash-disconnecting an NBD device, ext4's async error handling
+/// (journal abort, superblock error flag) creates dirty pages in the kernel's
+/// buffer cache for that gendisk. If another test connects a new device on the
+/// same gendisk index before those dirty pages are reclaimed, `sync_blockdev`
+/// during mount writes the stale pages through the new session, corrupting the
+/// recovered write cache.
+///
+/// Serialization ensures one test fully tears down (including kernel-level
+/// buffer cache cleanup) before the next test allocates devices.
+#[cfg(target_os = "linux")]
+static NBD_CRASH_LOCK: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
 // ---------------------------------------------------------------------------
 // Shell helpers
@@ -172,11 +187,21 @@ impl NbdKernelDevice {
         }
     }
 
-    async fn crash(mut self) {
+    /// Crash-disconnect the kernel device and return the old device path.
+    ///
+    /// The caller should pass the returned path to `wait_for_device_released()`
+    /// after lazy-unmounting the filesystem. This ensures the old ext4 mount
+    /// has fully released the gendisk before any recovery reconnects — otherwise
+    /// ext4's error-handling writes (journal abort, superblock error flag) can
+    /// flow through a reconnected device's new session handler and corrupt the
+    /// recovered write cache.
+    async fn crash(mut self) -> PathBuf {
+        let dev_path = self.dev_path.clone();
         self.manager
             .crash_disconnect(&self.export_name)
             .await
             .unwrap_or_else(|e| panic!("crash_disconnect failed: {e}"));
+        dev_path
     }
 
     async fn remove(mut self) {
@@ -184,6 +209,44 @@ impl NbdKernelDevice {
             .remove_device(&self.export_name)
             .await
             .unwrap_or_else(|e| panic!("remove_device failed: {e}"));
+    }
+}
+
+/// Wait for a block device to be released by all holders (e.g., ext4 teardown).
+///
+/// After crash-disconnecting an NBD device and lazy-unmounting its filesystem,
+/// ext4 asynchronously aborts its journal and writes superblock error flags.
+/// These writes target the gendisk via the kernel's block layer. If a new NBD
+/// session reconnects the same device index before ext4 finishes, those stale
+/// writes flow through the new session handler and corrupt the recovered data.
+///
+/// This function polls O_EXCL until the device is free or a timeout elapses.
+#[cfg(target_os = "linux")]
+async fn wait_for_device_released(dev_path: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    let start = std::time::Instant::now();
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EXCL)
+            .open(dev_path)
+        {
+            Ok(_) => return,
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(_) => return, // device gone or other error — safe to proceed
+        }
+        if start.elapsed() >= MAX_WAIT {
+            eprintln!(
+                "warning: timed out waiting for {} to be released by ext4",
+                dev_path.display()
+            );
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -199,6 +262,7 @@ async fn test_fs_crash_fsync_honored_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
@@ -238,8 +302,13 @@ async fn test_fs_crash_fsync_honored_nbd_kernel() {
     // --- Phase 2: crash ---
     // Crash kernel device first (sockets close → kernel returns I/O errors).
     // Then unmount the dead mount. Then drop the server (simulates process crash).
-    dev.crash().await;
+    let old_dev = dev.crash().await;
     mount.unmount();
+    wait_for_device_released(&old_dev).await;
+    // Stop flush schedulers so they release cache file handles. Does NOT
+    // drain — dirty blocks stay on SSD for WAL recovery, matching a real
+    // crash where the process dies without flushing.
+    server.router.stop_flush_schedulers().await;
     server.shutdown.cancel();
     drop(server);
 
@@ -292,6 +361,7 @@ async fn test_fs_crash_unsynced_write_lost_cleanly_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
@@ -333,8 +403,13 @@ async fn test_fs_crash_unsynced_write_lost_cleanly_nbd_kernel() {
     // deliberately no fsync
 
     // Crash
-    dev.crash().await;
+    let old_dev = dev.crash().await;
     mount.unmount();
+    wait_for_device_released(&old_dev).await;
+    // Stop flush schedulers so they release cache file handles. Does NOT
+    // drain — dirty blocks stay on SSD for WAL recovery, matching a real
+    // crash where the process dies without flushing.
+    server.router.stop_flush_schedulers().await;
     server.shutdown.cancel();
     drop(server);
 
@@ -394,6 +469,7 @@ async fn test_fs_crash_journal_replay_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
@@ -436,8 +512,13 @@ async fn test_fs_crash_journal_replay_nbd_kernel() {
     fsync_dir(mountpoint.path());
 
     // Crash mid-write (files 25-49 may not be durable)
-    dev.crash().await;
+    let old_dev = dev.crash().await;
     mount.unmount();
+    wait_for_device_released(&old_dev).await;
+    // Stop flush schedulers so they release cache file handles. Does NOT
+    // drain — dirty blocks stay on SSD for WAL recovery, matching a real
+    // crash where the process dies without flushing.
+    server.router.stop_flush_schedulers().await;
     server.shutdown.cancel();
     drop(server);
 
@@ -493,6 +574,7 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
@@ -555,13 +637,21 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
         // e2fsck before mount (except first cycle where we just formatted)
         if cycle > 0 {
             let (clean, output) = e2fsck_repair(&dev.dev_path);
-            assert!(
-                clean,
-                "e2fsck failed at cycle {cycle} before mount:\n{output}"
-            );
+            if !clean {
+                panic!("e2fsck failed at cycle {cycle} before mount:\n{output}");
+            }
+            eprintln!("cycle {cycle}: e2fsck {output}");
         }
 
         mount.mount(&dev.dev_path, &[]);
+
+        // List directory contents for debugging flakes
+        if let Ok(entries) = std::fs::read_dir(mountpoint.path()) {
+            let names: Vec<_> = entries
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect();
+            eprintln!("cycle {cycle}: files after mount: {names:?}");
+        }
 
         // Verify previous cycles' files survived
         for prev in 0..cycle {
@@ -583,10 +673,10 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
         fsync_dir(mountpoint.path());
 
         // Crash
-        dev.crash().await;
+        let old_dev = dev.crash().await;
         mount.unmount();
-        server.shutdown.cancel();
-        drop(server);
+        wait_for_device_released(&old_dev).await;
+        server.crash_shutdown().await;
     }
 
     // Final verification: recover and check all 5 files
@@ -612,10 +702,20 @@ async fn test_fs_repeated_crash_recovery_nbd_kernel() {
     .await;
 
     let (clean, output) = e2fsck_repair(&dev.dev_path);
-    assert!(clean, "final e2fsck failed:\n{output}");
+    if !clean {
+        panic!("final e2fsck failed:\n{output}");
+    }
+    eprintln!("final: e2fsck {output}");
 
     let mut mount = MountGuard::new(mountpoint.path());
     mount.mount(&dev.dev_path, &[]);
+
+    if let Ok(entries) = std::fs::read_dir(mountpoint.path()) {
+        let names: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        eprintln!("final: files after mount: {names:?}");
+    }
 
     for cycle in 0..5u32 {
         let name = format!("cycle_{cycle}.txt");
@@ -646,6 +746,7 @@ async fn test_fs_crash_during_flush_to_s3_nbd_kernel() {
         eprintln!("skipping: requires nbd module + root");
         return;
     }
+    let _lock = NBD_CRASH_LOCK.lock().await;
 
     let ctx = TestContext::new().await;
     let cache_dir = TempDir::new().unwrap();
@@ -702,7 +803,12 @@ async fn test_fs_crash_during_flush_to_s3_nbd_kernel() {
     // Brief delay then crash (drain may or may not complete — doesn't matter)
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    dev.crash().await;
+    let old_dev = dev.crash().await;
+    wait_for_device_released(&old_dev).await;
+    // Stop flush schedulers so they release cache file handles. Does NOT
+    // drain — dirty blocks stay on SSD for WAL recovery, matching a real
+    // crash where the process dies without flushing.
+    server.router.stop_flush_schedulers().await;
     server.shutdown.cancel();
     drop(server);
 
@@ -804,6 +910,10 @@ async fn test_fs_crash_fsync_honored_ublk() {
     if let Err(e) = ublk.shutdown().await {
         eprintln!("ublk shutdown: {e}");
     }
+    // Stop flush schedulers so they release cache file handles. Does NOT
+    // drain — dirty blocks stay on SSD for WAL recovery, matching a real
+    // crash where the process dies without flushing.
+    server.router.stop_flush_schedulers().await;
     server.shutdown.cancel();
     drop(server);
 

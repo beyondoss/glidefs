@@ -64,8 +64,8 @@ pub struct ExportMetrics {
     /// Blocks left dirty per flush due to concurrent-write CAS failures
     pub flush_blocks_cas_failed: AtomicU64,
 
-    /// Blocks skipped due to SSD corruption (CRC mismatch while still SYNCING)
-    pub flush_blocks_corrupted: AtomicU64,
+    /// Blocks skipped due to CRC mismatch while SYNCING (write race or SSD corruption)
+    pub flush_blocks_crc_mismatched: AtomicU64,
 
     /// Failed manifest syncs after successful pack flush
     pub manifest_sync_errors: AtomicU64,
@@ -267,7 +267,7 @@ impl Default for ExportMetrics {
             s3_get_errors: AtomicU64::new(0),
             flush_errors: AtomicU64::new(0),
             flush_blocks_cas_failed: AtomicU64::new(0),
-            flush_blocks_corrupted: AtomicU64::new(0),
+            flush_blocks_crc_mismatched: AtomicU64::new(0),
             manifest_sync_errors: AtomicU64::new(0),
             manifest_pending: AtomicU64::new(0),
             manifest_last_sync_epoch: AtomicU64::new(0),
@@ -397,11 +397,11 @@ impl ExportMetrics {
         }
     }
 
-    /// Record blocks skipped due to SSD corruption during flush.
+    /// Record blocks skipped due to CRC mismatch during flush (write race or SSD corruption).
     #[inline]
-    pub fn record_flush_blocks_corrupted(&self, count: usize) {
+    pub fn record_flush_blocks_crc_mismatched(&self, count: usize) {
         if count > 0 {
-            self.flush_blocks_corrupted
+            self.flush_blocks_crc_mismatched
                 .fetch_add(count as u64, Ordering::Relaxed);
         }
     }
@@ -497,13 +497,15 @@ impl ExportMetrics {
             s3_get_errors: self.s3_get_errors.load(Ordering::Relaxed),
             flush_errors: self.flush_errors.load(Ordering::Relaxed),
             flush_blocks_cas_failed: self.flush_blocks_cas_failed.load(Ordering::Relaxed),
-            flush_blocks_corrupted: self.flush_blocks_corrupted.load(Ordering::Relaxed),
+            flush_blocks_crc_mismatched: self.flush_blocks_crc_mismatched.load(Ordering::Relaxed),
             manifest_sync_errors: self.manifest_sync_errors.load(Ordering::Relaxed),
             manifest_pending: self.manifest_pending.load(Ordering::Relaxed) != 0,
             manifest_last_sync_epoch: self.manifest_last_sync_epoch.load(Ordering::Relaxed),
             recovery_warnings: self.recovery_warnings.load(Ordering::Relaxed),
             dirty_blocks: None,
             syncing_blocks: None,
+            dirty_bytes: None,
+            s3_bytes: None,
             write_amplification,
             coalesce_ratio,
             cache_hit_rate,
@@ -536,7 +538,7 @@ pub struct MetricsSnapshot {
     pub s3_get_errors: u64,
     pub flush_errors: u64,
     pub flush_blocks_cas_failed: u64,
-    pub flush_blocks_corrupted: u64,
+    pub flush_blocks_crc_mismatched: u64,
     pub manifest_sync_errors: u64,
     /// Whether a manifest sync is pending (packs on S3 but manifest not yet updated)
     pub manifest_pending: bool,
@@ -551,6 +553,14 @@ pub struct MetricsSnapshot {
     /// Number of blocks currently being synced to S3
     #[serde(skip_serializing_if = "Option::is_none")]
     pub syncing_blocks: Option<u64>,
+
+    // Utilization (populated by router)
+    /// Unflushed bytes waiting to be synced to S3 (dirty_blocks × block_size)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty_bytes: Option<u64>,
+    /// Total logical bytes stored in S3 (chunks × chunk_size)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_bytes: Option<u64>,
 
     // Derived metrics
     /// S3 bytes written / guest bytes written
@@ -588,9 +598,17 @@ pub struct MetricsSnapshot {
 
 impl MetricsSnapshot {
     /// Add cache state to the snapshot.
-    pub fn with_cache_state(mut self, dirty_blocks: u64, syncing_blocks: u64) -> Self {
+    pub fn with_cache_state(
+        mut self,
+        dirty_blocks: u64,
+        syncing_blocks: u64,
+        dirty_bytes: u64,
+        s3_bytes: u64,
+    ) -> Self {
         self.dirty_blocks = Some(dirty_blocks);
         self.syncing_blocks = Some(syncing_blocks);
+        self.dirty_bytes = Some(dirty_bytes);
+        self.s3_bytes = Some(s3_bytes);
         self
     }
 
@@ -624,7 +642,7 @@ impl MetricsSnapshot {
         let _ = writeln!(out, "glidefs_s3_get_errors_total{{{label}}} {}", self.s3_get_errors);
         let _ = writeln!(out, "glidefs_flush_errors_total{{{label}}} {}", self.flush_errors);
         let _ = writeln!(out, "glidefs_flush_blocks_cas_failed_total{{{label}}} {}", self.flush_blocks_cas_failed);
-        let _ = writeln!(out, "glidefs_flush_blocks_corrupted_total{{{label}}} {}", self.flush_blocks_corrupted);
+        let _ = writeln!(out, "glidefs_flush_blocks_crc_mismatched_total{{{label}}} {}", self.flush_blocks_crc_mismatched);
         let _ = writeln!(out, "glidefs_manifest_sync_errors_total{{{label}}} {}", self.manifest_sync_errors);
         let _ = writeln!(out, "glidefs_manifest_pending{{{label}}} {}", u64::from(self.manifest_pending));
         let _ = writeln!(out, "glidefs_manifest_last_sync_epoch{{{label}}} {}", self.manifest_last_sync_epoch);
@@ -636,6 +654,12 @@ impl MetricsSnapshot {
         }
         if let Some(syncing) = self.syncing_blocks {
             let _ = writeln!(out, "glidefs_syncing_blocks{{{label}}} {syncing}");
+        }
+        if let Some(dirty_bytes) = self.dirty_bytes {
+            let _ = writeln!(out, "glidefs_dirty_bytes{{{label}}} {dirty_bytes}");
+        }
+        if let Some(s3_bytes) = self.s3_bytes {
+            let _ = writeln!(out, "glidefs_s3_bytes{{{label}}} {s3_bytes}");
         }
 
         // Derived metrics (gauges)
@@ -732,6 +756,10 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_dirty_blocks gauge
 # HELP glidefs_syncing_blocks Blocks currently syncing to S3
 # TYPE glidefs_syncing_blocks gauge
+# HELP glidefs_dirty_bytes Unflushed bytes waiting to sync to S3
+# TYPE glidefs_dirty_bytes gauge
+# HELP glidefs_s3_bytes Total logical bytes stored in S3
+# TYPE glidefs_s3_bytes gauge
 # HELP glidefs_write_amplification S3 bytes / guest bytes written
 # TYPE glidefs_write_amplification gauge
 # HELP glidefs_coalesce_ratio Guest write ops / S3 batch writes
@@ -746,8 +774,8 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_flush_errors_total counter
 # HELP glidefs_flush_blocks_cas_failed_total Blocks left dirty per flush due to concurrent-write CAS failures
 # TYPE glidefs_flush_blocks_cas_failed_total counter
-# HELP glidefs_flush_blocks_corrupted_total Blocks skipped due to SSD corruption (CRC mismatch while SYNCING)
-# TYPE glidefs_flush_blocks_corrupted_total counter
+# HELP glidefs_flush_blocks_crc_mismatched_total Blocks skipped due to CRC mismatch while SYNCING (write race or SSD corruption)
+# TYPE glidefs_flush_blocks_crc_mismatched_total counter
 # HELP glidefs_manifest_sync_errors_total Failed manifest syncs after successful pack flush
 # TYPE glidefs_manifest_sync_errors_total counter
 # HELP glidefs_manifest_pending Whether packs exist on S3 not yet referenced by manifest

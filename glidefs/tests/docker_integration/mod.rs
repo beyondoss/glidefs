@@ -889,6 +889,21 @@ impl TestServer {
         }
     }
 
+    /// Simulate a process crash: abort the server task and drop the router
+    /// without draining dirty blocks. Background flush schedulers exit once
+    /// they detect the dropped shutdown channel. Data remains on the SSD
+    /// for WAL recovery by the next server instance.
+    pub async fn crash_shutdown(self) {
+        // Stop flush schedulers so they release cache file handles.
+        // Deliberately does NOT drain — dirty blocks stay on SSD for
+        // WAL-based recovery, matching what happens in a real crash
+        // (process dies, OS closes fds, nothing is flushed to S3).
+        self.router.stop_flush_schedulers().await;
+        self.shutdown.cancel();
+        self._server_handle.abort();
+        let _ = self._server_handle.await;
+    }
+
     /// Drain all exports and shut down gracefully.
     pub async fn shutdown(self) {
         // Shut down kernel devices first (they hold handler/router refs).

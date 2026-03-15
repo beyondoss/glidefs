@@ -3,14 +3,18 @@
 //! This module provides:
 //! - `Blake3Hash`: 16-byte truncated BLAKE3 hash for content addressing
 //! - `SparseBlockState` / `SparseStateMap`: Lock-free sparse block state tracking
-//! - `SparseCrcMap`: Lock-free sparse CRC32 tracking (AtomicU32 page table)
 //! - `SequenceNumber`: Monotonic counter for WAL ordering
 //! - LZ4 compress/decompress helpers
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+
+#[cfg(feature = "loom")]
+use loom::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
+#[cfg(not(feature = "loom"))]
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 
 // ============================================================================
 // Blake3Hash -- 16-byte truncated content hash
@@ -75,8 +79,38 @@ pub fn blake3_128(data: &[u8]) -> Blake3Hash {
 ///
 /// This is the BLAKE3-128 hash of `block_size` zero bytes. Used by the write cache
 /// to identify trimmed/unwritten chunks for dedup (zero blocks are never uploaded).
-pub fn zero_block_hash(block_size: usize) -> Blake3Hash {
+fn zero_block_hash(block_size: usize) -> Blake3Hash {
     blake3_128(&vec![0u8; block_size])
+}
+
+/// Returns zero-block bytes and hash for the given block size.
+///
+/// Memoized: computes once per unique block_size, returns cached result
+/// thereafter. Typical deployments use 1-2 block sizes so the linear
+/// scan is negligible.
+pub fn shared_zero_block(block_size: usize) -> (Bytes, Blake3Hash) {
+    use parking_lot::Mutex;
+    use std::sync::LazyLock;
+
+    static CACHE: LazyLock<Mutex<Vec<(usize, Bytes, Blake3Hash)>>> =
+        LazyLock::new(|| Mutex::new(Vec::with_capacity(2)));
+
+    let cache = CACHE.lock();
+    if let Some((_, bytes, hash)) = cache.iter().find(|(bs, _, _)| *bs == block_size) {
+        return (bytes.clone(), *hash);
+    }
+    drop(cache);
+
+    let bytes = Bytes::from(vec![0u8; block_size]);
+    let hash = zero_block_hash(block_size);
+
+    let mut cache = CACHE.lock();
+    // Double-check after re-acquiring (another thread may have inserted).
+    if let Some((_, bytes, hash)) = cache.iter().find(|(bs, _, _)| *bs == block_size) {
+        return (bytes.clone(), *hash);
+    }
+    cache.push((block_size, bytes.clone(), hash));
+    (bytes, hash)
 }
 
 // ============================================================================
@@ -102,13 +136,36 @@ impl SparseBlockState {
     pub const SYNCING: u8 = 3;
 }
 
+/// Result of `SparseStateMap::transition_to_dirty()`.
+///
+/// Tells the caller which source state the block transitioned from,
+/// so it can update the appropriate counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyTransition {
+    /// Block was already DIRTY — no state change.
+    AlreadyDirty,
+    /// Transitioned from CLEAN or NOT_PRESENT → DIRTY.
+    FromCleanOrNotPresent,
+    /// Transitioned from SYNCING → DIRTY.
+    FromSyncing,
+}
+
 /// Number of 2-bit entries packed into each `AtomicU8`.
 const ENTRIES_PER_BYTE: usize = 4;
-/// Size of one state page in bytes (one OS page).
+
+// Under loom, use tiny pages to avoid stack overflow (loom's AtomicU8 is large)
+// and keep the state space tractable.
+#[cfg(not(feature = "loom"))]
 const STATE_PAGE_BYTES: usize = 4096;
-/// Number of block state entries per page (4096 bytes × 4 entries/byte).
-const STATE_PAGE_ENTRIES: usize = STATE_PAGE_BYTES * ENTRIES_PER_BYTE; // 16384
+#[cfg(feature = "loom")]
+const STATE_PAGE_BYTES: usize = 4;
+
+const STATE_PAGE_ENTRIES: usize = STATE_PAGE_BYTES * ENTRIES_PER_BYTE;
+// log2(STATE_PAGE_ENTRIES)
+#[cfg(not(feature = "loom"))]
 const STATE_PAGE_BITS: usize = 14; // log2(16384)
+#[cfg(feature = "loom")]
+const STATE_PAGE_BITS: usize = 4; // log2(16)
 const STATE_PAGE_MASK: usize = STATE_PAGE_ENTRIES - 1;
 
 /// A page of 16,384 block state entries packed into 4,096 bytes (one OS page).
@@ -118,16 +175,27 @@ const STATE_PAGE_MASK: usize = STATE_PAGE_ENTRIES - 1;
 /// - bits [3:2] = entry 1
 /// - bits [5:4] = entry 2
 /// - bits [7:6] = entry 3
-#[repr(C, align(4096))]
+#[cfg_attr(not(feature = "loom"), repr(C, align(4096)))]
 struct StatePage {
     data: [AtomicU8; STATE_PAGE_BYTES],
 }
 
 impl StatePage {
     fn new_boxed() -> Box<Self> {
-        // SAFETY: All-zeros is valid for StatePage because AtomicU8::new(0) is
-        // represented as a zero byte with #[repr(C)] layout.
-        unsafe { Box::new_zeroed().assume_init() }
+        #[cfg(not(feature = "loom"))]
+        {
+            // SAFETY: All-zeros is valid for StatePage because AtomicU8::new(0) is
+            // represented as a zero byte with #[repr(C)] layout.
+            unsafe { Box::new_zeroed().assume_init() }
+        }
+        #[cfg(feature = "loom")]
+        {
+            // Loom's AtomicU8 has internal tracking state and cannot be
+            // zero-initialized. Construct each element explicitly.
+            Box::new(StatePage {
+                data: std::array::from_fn(|_| AtomicU8::new(0)),
+            })
+        }
     }
 }
 
@@ -441,6 +509,66 @@ impl SparseStateMap {
         })
     }
 
+    // -- High-level transition methods ----------------------------------------
+    //
+    // These encode the CAS loop logic that CacheInner delegates to.
+    // Placing them here means loom tests exercise the real code path.
+
+    /// CAS loop to transition a block to Dirty.
+    ///
+    /// Handles all four source states:
+    /// - **DIRTY → DIRTY**: no-op, returns `DirtyTransition::AlreadyDirty`.
+    /// - **CLEAN or NOT_PRESENT → DIRTY**: returns `DirtyTransition::FromCleanOrNotPresent`.
+    /// - **SYNCING → DIRTY**: returns `DirtyTransition::FromSyncing`.
+    ///
+    /// The caller is responsible for updating counters based on the result.
+    pub fn transition_to_dirty(&self, idx: usize) -> DirtyTransition {
+        loop {
+            let current = self.get(idx);
+
+            if current == SparseBlockState::DIRTY {
+                return DirtyTransition::AlreadyDirty;
+            }
+
+            if current == SparseBlockState::CLEAN
+                || current == SparseBlockState::NOT_PRESENT
+            {
+                if self.cas(idx, current, SparseBlockState::DIRTY).is_ok() {
+                    return DirtyTransition::FromCleanOrNotPresent;
+                }
+            } else if current == SparseBlockState::SYNCING {
+                if self
+                    .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                    .is_ok()
+                {
+                    return DirtyTransition::FromSyncing;
+                }
+            } else {
+                unreachable!("invalid 2-bit block state: {current}");
+            }
+        }
+    }
+
+    /// Single CAS: DIRTY → SYNCING.
+    ///
+    /// Returns `true` if the CAS succeeded (block claimed for flush).
+    /// No retry loop — a single attempt. Caller is responsible for counters.
+    #[inline]
+    pub fn transition_dirty_to_syncing(&self, idx: usize) -> bool {
+        self.cas(idx, SparseBlockState::DIRTY, SparseBlockState::SYNCING)
+            .is_ok()
+    }
+
+    /// Single CAS: SYNCING → NOT_PRESENT.
+    ///
+    /// Returns `true` if the CAS succeeded (block evicted).
+    /// Caller is responsible for counters.
+    #[inline]
+    pub fn transition_syncing_to_not_present(&self, idx: usize) -> bool {
+        self.cas(idx, SparseBlockState::SYNCING, SparseBlockState::NOT_PRESENT)
+            .is_ok()
+    }
+
     /// Count blocks with a non-zero state (present blocks).
     pub fn count_present(&self) -> usize {
         let mut count = 0;
@@ -468,229 +596,6 @@ impl SparseStateMap {
     }
 }
 
-// ============================================================================
-// SparseCrcMap -- lock-free sparse CRC32 tracking
-// ============================================================================
-
-/// Number of `AtomicU32` entries per CRC page (1024 × 4B = 4096B = one OS page).
-const CRC_PAGE_ENTRIES: usize = 1024;
-const CRC_PAGE_BITS: usize = 10; // log2(1024)
-const CRC_PAGE_MASK: usize = CRC_PAGE_ENTRIES - 1;
-
-/// A page of 1,024 CRC32 entries stored as `AtomicU32`, fitting in one 4KB OS page.
-///
-/// Value `0` means "empty slot" (no CRC stored). All other values are CRC32
-/// checksums or sentinel values. A CRC32 that naturally computes to 0 is treated
-/// as "no CRC" — verification is skipped for that block (1-in-4B chance, same
-/// acceptable tradeoff as `CRC_SENTINEL`).
-#[repr(C, align(4096))]
-struct CrcPage {
-    data: [AtomicU32; CRC_PAGE_ENTRIES],
-}
-
-impl CrcPage {
-    fn new_boxed() -> Box<Self> {
-        // SAFETY: All-zeros is valid for CrcPage because AtomicU32::new(0) is
-        // represented as zero bytes with #[repr(C)] layout.
-        unsafe { Box::new_zeroed().assume_init() }
-    }
-}
-
-/// Lock-free sparse CRC32 map using a two-level page table with `AtomicU32` leaves.
-///
-/// Only allocates 4KB pages on first write to a block range. Unallocated pages
-/// implicitly contain "empty" (0) for all entries. Each page holds 1,024 entries.
-///
-/// Value encoding:
-/// - `0` = empty (no CRC stored)
-/// - `u32::MAX` = CRC_SENTINEL (write invalidated this CRC)
-/// - all others = real CRC32 checksum
-///
-/// Replaces `DashMap<usize, u32>` with 5x less memory and zero lock contention.
-pub struct SparseCrcMap {
-    directory: Box<[AtomicPtr<CrcPage>]>,
-    #[allow(dead_code)]
-    num_entries: usize,
-    /// Approximate entry count for cap checks. May briefly be off by 1 under
-    /// concurrent access — cap checks are already racy (same as DashMap::len).
-    count: AtomicUsize,
-}
-
-// SAFETY: Pages are heap-allocated, never freed during the map's lifetime
-// (only in Drop), and directory slots transition null → valid exactly once (CAS).
-unsafe impl Send for SparseCrcMap {}
-unsafe impl Sync for SparseCrcMap {}
-
-impl Drop for SparseCrcMap {
-    fn drop(&mut self) {
-        for slot in self.directory.iter() {
-            let ptr = slot.load(Ordering::Relaxed);
-            if !ptr.is_null() {
-                unsafe {
-                    drop(Box::from_raw(ptr));
-                }
-            }
-        }
-    }
-}
-
-impl SparseCrcMap {
-    /// Create a new sparse CRC map with no pages allocated.
-    pub fn new(num_entries: usize) -> Self {
-        let num_pages = num_entries.div_ceil(CRC_PAGE_ENTRIES);
-        let directory = (0..num_pages)
-            .map(|_| AtomicPtr::new(ptr::null_mut()))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        SparseCrcMap {
-            directory,
-            num_entries,
-            count: AtomicUsize::new(0),
-        }
-    }
-
-    // -- Index decomposition --------------------------------------------------
-
-    #[inline(always)]
-    fn split_index(idx: usize) -> (usize, usize) {
-        let page_idx = idx >> CRC_PAGE_BITS;
-        let entry_idx = idx & CRC_PAGE_MASK;
-        (page_idx, entry_idx)
-    }
-
-    // -- Page access helpers --------------------------------------------------
-
-    #[inline]
-    fn load_page(&self, page_idx: usize) -> Option<&CrcPage> {
-        let ptr = self.directory[page_idx].load(Ordering::Acquire);
-        if ptr.is_null() {
-            None
-        } else {
-            Some(unsafe { &*ptr })
-        }
-    }
-
-    #[inline]
-    fn ensure_page(&self, page_idx: usize) -> &CrcPage {
-        let ptr = self.directory[page_idx].load(Ordering::Acquire);
-        if !ptr.is_null() {
-            return unsafe { &*ptr };
-        }
-        self.allocate_page(page_idx)
-    }
-
-    #[cold]
-    fn allocate_page(&self, page_idx: usize) -> &CrcPage {
-        let new_page = CrcPage::new_boxed();
-        let new_ptr = Box::into_raw(new_page);
-
-        match self.directory[page_idx].compare_exchange(
-            ptr::null_mut(),
-            new_ptr,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => unsafe { &*new_ptr },
-            Err(existing) => {
-                unsafe {
-                    drop(Box::from_raw(new_ptr));
-                }
-                unsafe { &*existing }
-            }
-        }
-    }
-
-    // -- CRC operations -------------------------------------------------------
-
-    /// Load the CRC for a block. Returns `None` if the page is not allocated
-    /// or the slot is empty (value == 0).
-    #[inline]
-    pub fn load(&self, idx: usize) -> Option<u32> {
-        let (page_idx, entry_idx) = Self::split_index(idx);
-        match self.load_page(page_idx) {
-            Some(page) => {
-                let val = page.data[entry_idx].load(Ordering::Acquire);
-                if val == 0 { None } else { Some(val) }
-            }
-            None => None,
-        }
-    }
-
-    /// Unconditionally store a CRC value. Adjusts the approximate count.
-    ///
-    /// Used by the write path to insert `CRC_SENTINEL` on every write.
-    #[inline]
-    pub fn store(&self, idx: usize, val: u32) {
-        let (page_idx, entry_idx) = Self::split_index(idx);
-        let page = self.ensure_page(page_idx);
-        let old = page.data[entry_idx].swap(val, Ordering::AcqRel);
-        if old == 0 && val != 0 {
-            self.count.fetch_add(1, Ordering::Relaxed);
-        } else if old != 0 && val == 0 {
-            self.count.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Insert a CRC only if the slot is empty (CAS 0 → val).
-    ///
-    /// Used by the checkpoint path (`crc_store`) to avoid overwriting a
-    /// sentinel or existing CRC from a concurrent write.
-    #[inline]
-    pub fn try_insert(&self, idx: usize, val: u32) {
-        if val == 0 {
-            return; // storing 0 is a no-op (indistinguishable from empty)
-        }
-        let (page_idx, entry_idx) = Self::split_index(idx);
-        let page = self.ensure_page(page_idx);
-        if page.data[entry_idx]
-            .compare_exchange(0, val, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.count.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Remove and return the CRC for a block (swap to 0).
-    ///
-    /// Used by the flush path to consume a CRC for verification.
-    #[inline]
-    pub fn take(&self, idx: usize) -> Option<u32> {
-        let (page_idx, entry_idx) = Self::split_index(idx);
-        match self.load_page(page_idx) {
-            Some(page) => {
-                let old = page.data[entry_idx].swap(0, Ordering::AcqRel);
-                if old != 0 {
-                    self.count.fetch_sub(1, Ordering::Relaxed);
-                    Some(old)
-                } else {
-                    None
-                }
-            }
-            None => None,
-        }
-    }
-
-    /// Clear the CRC for a block (store 0). Decrements count if non-empty.
-    ///
-    /// Used by the checkpoint path to clear a sentinel before recomputing.
-    #[inline]
-    pub fn remove(&self, idx: usize) {
-        let (page_idx, entry_idx) = Self::split_index(idx);
-        if let Some(page) = self.load_page(page_idx) {
-            let old = page.data[entry_idx].swap(0, Ordering::AcqRel);
-            if old != 0 {
-                self.count.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    /// Approximate number of non-empty entries. May briefly be off by 1
-    /// under concurrent access — used for soft cap checks only.
-    #[inline]
-    pub fn count(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
-    }
-}
 
 // ============================================================================
 // SequenceNumber -- monotonic counter
@@ -1204,178 +1109,4 @@ mod tests {
         assert!(present.iter().all(|&(idx, _)| idx < n));
     }
 
-    // ========================================================================
-    // SparseCrcMap tests
-    // ========================================================================
-
-    #[test]
-    fn test_sparse_crc_map_initial_state() {
-        let map = SparseCrcMap::new(1000);
-        assert_eq!(map.count(), 0);
-        for i in [0, 1, 500, 999] {
-            assert!(map.load(i).is_none());
-        }
-    }
-
-    #[test]
-    fn test_sparse_crc_map_store_and_load() {
-        let map = SparseCrcMap::new(100);
-        map.store(5, 0x12345678);
-        assert_eq!(map.load(5), Some(0x12345678));
-        assert_eq!(map.count(), 1);
-
-        // Overwrite
-        map.store(5, 0xABCDEF00);
-        assert_eq!(map.load(5), Some(0xABCDEF00));
-        assert_eq!(map.count(), 1); // count unchanged on overwrite
-    }
-
-    #[test]
-    fn test_sparse_crc_map_store_zero_clears() {
-        let map = SparseCrcMap::new(10);
-        map.store(3, 42);
-        assert_eq!(map.count(), 1);
-        map.store(3, 0); // storing 0 = clearing
-        assert!(map.load(3).is_none());
-        assert_eq!(map.count(), 0);
-    }
-
-    #[test]
-    fn test_sparse_crc_map_try_insert_empty() {
-        let map = SparseCrcMap::new(10);
-        map.try_insert(0, 100);
-        assert_eq!(map.load(0), Some(100));
-        assert_eq!(map.count(), 1);
-    }
-
-    #[test]
-    fn test_sparse_crc_map_try_insert_occupied() {
-        let map = SparseCrcMap::new(10);
-        map.store(0, 100);
-        map.try_insert(0, 200); // should not overwrite
-        assert_eq!(map.load(0), Some(100));
-        assert_eq!(map.count(), 1);
-    }
-
-    #[test]
-    fn test_sparse_crc_map_try_insert_zero_is_noop() {
-        let map = SparseCrcMap::new(10);
-        map.try_insert(0, 0); // 0 is "empty", no-op
-        assert!(map.load(0).is_none());
-        assert_eq!(map.count(), 0);
-    }
-
-    #[test]
-    fn test_sparse_crc_map_take() {
-        let map = SparseCrcMap::new(10);
-        map.store(5, 42);
-        assert_eq!(map.take(5), Some(42));
-        assert!(map.load(5).is_none());
-        assert_eq!(map.count(), 0);
-
-        // Take from empty slot
-        assert_eq!(map.take(5), None);
-    }
-
-    #[test]
-    fn test_sparse_crc_map_remove() {
-        let map = SparseCrcMap::new(10);
-        map.store(3, 99);
-        assert_eq!(map.count(), 1);
-        map.remove(3);
-        assert!(map.load(3).is_none());
-        assert_eq!(map.count(), 0);
-
-        // Remove from empty slot — no-op
-        map.remove(3);
-        assert_eq!(map.count(), 0);
-    }
-
-    #[test]
-    fn test_sparse_crc_map_cross_page() {
-        // Entries on different pages work independently
-        let n = CRC_PAGE_ENTRIES * 2 + 10;
-        let map = SparseCrcMap::new(n);
-
-        let idx_page0 = 0;
-        let idx_page1 = CRC_PAGE_ENTRIES;
-        let idx_page2 = CRC_PAGE_ENTRIES * 2 + 5;
-
-        map.store(idx_page0, 1);
-        map.store(idx_page1, 2);
-        map.store(idx_page2, 3);
-
-        assert_eq!(map.load(idx_page0), Some(1));
-        assert_eq!(map.load(idx_page1), Some(2));
-        assert_eq!(map.load(idx_page2), Some(3));
-        assert_eq!(map.count(), 3);
-    }
-
-    #[test]
-    fn test_sparse_crc_map_sentinel_lifecycle() {
-        // Simulates the write → checkpoint → flush lifecycle
-        let map = SparseCrcMap::new(10);
-
-        // Write path: store sentinel
-        map.store(0, u32::MAX);
-        assert_eq!(map.load(0), Some(u32::MAX));
-        assert_eq!(map.count(), 1);
-
-        // Checkpoint: clear sentinel, then try_insert real CRC
-        map.remove(0);
-        assert_eq!(map.count(), 0);
-        map.try_insert(0, 0xDEADBEEF);
-        assert_eq!(map.load(0), Some(0xDEADBEEF));
-        assert_eq!(map.count(), 1);
-
-        // Flush: take CRC for verification
-        let crc = map.take(0);
-        assert_eq!(crc, Some(0xDEADBEEF));
-        assert_eq!(map.count(), 0);
-    }
-
-    #[test]
-    fn test_sparse_crc_map_concurrent_store_take() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let map = Arc::new(SparseCrcMap::new(1024));
-
-        // Writer threads store sentinels
-        let mut handles = Vec::new();
-        for t in 0..4 {
-            let map = Arc::clone(&map);
-            handles.push(thread::spawn(move || {
-                for i in 0..256 {
-                    let idx = t * 256 + i;
-                    map.store(idx, u32::MAX);
-                }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-
-        assert_eq!(map.count(), 1024);
-
-        // Taker threads consume all entries
-        let mut handles = Vec::new();
-        for t in 0..4 {
-            let map = Arc::clone(&map);
-            handles.push(thread::spawn(move || {
-                let mut taken = 0;
-                for i in 0..256 {
-                    let idx = t * 256 + i;
-                    if map.take(idx).is_some() {
-                        taken += 1;
-                    }
-                }
-                taken
-            }));
-        }
-
-        let total_taken: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
-        assert_eq!(total_taken, 1024);
-        assert_eq!(map.count(), 0);
-    }
 }

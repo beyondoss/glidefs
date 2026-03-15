@@ -5,9 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
-use crate::block::block_map::{
-    Blake3Hash, SequenceNumber, SparseBlockState, SparseCrcMap, SparseStateMap,
-};
+use crate::block::block_map::{Blake3Hash, SequenceNumber, SparseBlockState, SparseStateMap};
 
 use crate::block::wal::Wal;
 
@@ -17,7 +15,7 @@ use super::error::CacheError;
 use bytes::Bytes;
 
 /// Magic bytes for cache metadata file
-pub(super) const METADATA_MAGIC: &[u8; 8] = b"ZFSCACHE";
+pub(super) const METADATA_MAGIC: &[u8; 8] = b"GLIDECCH";
 /// Version 5: sparse state map + trailing max_sequence u64
 pub(super) const METADATA_VERSION: u32 = 5;
 
@@ -97,17 +95,6 @@ mod sync_file {
 }
 
 pub use sync_file::SyncFile;
-
-/// Sentinel value for CRC32 checksums invalidated by a concurrent write.
-///
-/// The write path stores this instead of removing the CRC entry, preventing
-/// `compute_dirty_crc32s` from re-inserting a stale CRC via `or_insert`.
-/// The flush path skips CRC verification when it encounters this sentinel.
-///
-/// CRC32 can legitimately produce u32::MAX (1-in-4-billion chance), in which
-/// case we simply skip corruption detection for that one block — no correctness
-/// impact, only a negligible loss of SSD corruption detection.
-pub(super) const CRC_SENTINEL: u32 = u32::MAX;
 
 /// Check if a block is all zeros.
 ///
@@ -298,14 +285,6 @@ pub(crate) struct CacheInner {
     /// failure, block map load failure). Exposed via metrics for monitoring.
     pub(super) recovery_warnings: AtomicU64,
 
-    /// CRC32 checksums for dirty blocks, used to detect SSD corruption between
-    /// checkpoint and flush. Concurrently accessed by: the write path (stores
-    /// CRC_SENTINEL on every write), the checkpoint path (computes and stores
-    /// CRCs), and the flush path (takes CRCs for verification). SparseCrcMap
-    /// provides lock-free concurrent access via AtomicU32 leaves in a two-level
-    /// page table, with 5x less memory than DashMap and zero shard contention.
-    pub(super) crc_map: SparseCrcMap,
-
     /// Per-export flush serialization lock.
     ///
     /// Serializes flush + manifest upload operations to prevent concurrent
@@ -323,6 +302,140 @@ pub(crate) struct CacheInner {
     /// `None` means first upload (unconditional PUT).
     pub(crate) manifest_etag: Mutex<Option<String>>,
 
+    /// Sequence number at the last file rotation. 0 when no rotation is active.
+    /// Persisted to metadata so crash recovery can distinguish pre- vs
+    /// post-rotation WAL entries: entries with sequence > rotation_seq were
+    /// written after rotation, so their data in the active file is
+    /// authoritative (even if all zeros).
+    pub(super) rotation_seq: AtomicU64,
+
+    /// Test-only: sync points for flush path interleaving tests.
+    #[cfg(feature = "test-utils")]
+    pub(crate) flush_sync: parking_lot::Mutex<Option<std::sync::Arc<FlushSyncPoints>>>,
+
+    /// Test-only: sync points for promote path interleaving tests.
+    #[cfg(feature = "test-utils")]
+    pub(crate) promote_sync: parking_lot::Mutex<Option<std::sync::Arc<PromoteSyncPoints>>>,
+
+    /// Test-only: sync points for read path interleaving tests.
+    #[cfg(feature = "test-utils")]
+    pub(crate) read_sync: parking_lot::Mutex<Option<std::sync::Arc<ReadSyncPoints>>>,
+}
+
+// ============================================================================
+// Test-only: sync point types for deterministic interleaving tests
+// ============================================================================
+
+/// Flush pipeline sync points.
+#[cfg(feature = "test-utils")]
+pub struct FlushSyncPoints {
+    pub tx: tokio::sync::mpsc::UnboundedSender<FlushGateEvent>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushStep {
+    AfterCrcPrepass,  // F1→F2
+    AfterRotation,    // F5
+    AfterCompute,     // F6→F7
+    BeforeEvict,      // F7→F8
+    AfterEvict,       // F8→F9
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+pub struct FlushGateEvent {
+    pub step: FlushStep,
+    pub block_count: usize,
+}
+
+#[cfg(feature = "test-utils")]
+impl FlushSyncPoints {
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<FlushGateEvent>, tokio::sync::mpsc::UnboundedSender<()>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self { tx: event_tx, rx: tokio::sync::Mutex::new(proceed_rx) }, event_rx, proceed_tx)
+    }
+
+    pub(crate) async fn gate(&self, step: FlushStep, block_count: usize) {
+        let _ = self.tx.send(FlushGateEvent { step, block_count });
+        let _ = self.rx.lock().await.recv().await;
+    }
+}
+
+/// Promote path sync points.
+#[cfg(feature = "test-utils")]
+pub struct PromoteSyncPoints {
+    pub tx: tokio::sync::mpsc::UnboundedSender<PromoteGateEvent>,
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromoteStep {
+    AfterCloneArc,  // P1
+    AfterRead,      // P3→P4 (between pread and pwrite)
+    BeforeCas,      // P4→P5 (between pwrite and CAS)
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+pub struct PromoteGateEvent {
+    pub step: PromoteStep,
+    pub block_idx: usize,
+}
+
+/// Read path sync points.
+#[cfg(feature = "test-utils")]
+pub struct ReadSyncPoints {
+    pub tx: tokio::sync::mpsc::UnboundedSender<ReadGateEvent>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadStep {
+    AfterStateCheck,   // R3: after locate_block state check
+    AfterRecheck,      // R4: after sync_read_local_block re-check
+    BeforePread,       // R2/R5: before pread from active or flushing file
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+pub struct ReadGateEvent {
+    pub step: ReadStep,
+    pub block_idx: usize,
+    pub block_state: u8,
+}
+
+#[cfg(feature = "test-utils")]
+impl ReadSyncPoints {
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<ReadGateEvent>, tokio::sync::mpsc::UnboundedSender<()>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self { tx: event_tx, rx: tokio::sync::Mutex::new(proceed_rx) }, event_rx, proceed_tx)
+    }
+
+    pub(crate) async fn gate(&self, step: ReadStep, block_idx: usize, block_state: u8) {
+        let _ = self.tx.send(ReadGateEvent { step, block_idx, block_state });
+        let _ = self.rx.lock().await.recv().await;
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl PromoteSyncPoints {
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<PromoteGateEvent>, std::sync::mpsc::SyncSender<()>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::sync_channel(1);
+        (Self { tx: event_tx, rx: std::sync::Mutex::new(proceed_rx) }, event_rx, proceed_tx)
+    }
+
+    pub(crate) fn gate_sync(&self, step: PromoteStep, block_idx: usize) {
+        let _ = self.tx.send(PromoteGateEvent { step, block_idx });
+        // Blocking recv for sync (non-async) promote path.
+        let _ = self.rx.lock().unwrap().recv();
+    }
 }
 
 
@@ -374,49 +487,24 @@ impl CacheInner {
 
     /// CAS loop to transition a block to Dirty state (lock-free).
     ///
-    /// Handles four source states (sparse encoding):
-    /// - **Clean(1) -> Dirty(2)**: increments dirty_block_count.
-    /// - **Syncing(3) -> Dirty(2)**: decrements syncing_block_count, increments dirty_block_count.
-    /// - **Dirty(2) -> Dirty(2)**: no-op.
-    /// - **NotPresent(0) -> Dirty(2)**: increments dirty_block_count. This
-    ///   handles a race where promote_syncing_blocks copied data and the guest
-    ///   wrote, but the flush thread evicted the block (SYNCING→NOT_PRESENT)
-    ///   before this call. The data is already in the active file.
+    /// Delegates the CAS logic to `SparseStateMap::transition_to_dirty()` and
+    /// handles counter bookkeeping based on the result.
     ///
     /// Returns `true` if the state actually changed, `false` if already DIRTY.
     /// Used by the write path to skip redundant WAL entries.
     #[inline]
     pub(super) fn transition_to_dirty(&self, idx: usize) -> bool {
-        loop {
-            let current = self.state_map.get(idx);
-
-            if current == SparseBlockState::DIRTY {
-                return false;
+        use crate::block::block_map::DirtyTransition;
+        match self.state_map.transition_to_dirty(idx) {
+            DirtyTransition::AlreadyDirty => false,
+            DirtyTransition::FromCleanOrNotPresent => {
+                self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                true
             }
-
-            if current == SparseBlockState::CLEAN
-                || current == SparseBlockState::NOT_PRESENT
-            {
-                if self
-                    .state_map
-                    .cas(idx, current, SparseBlockState::DIRTY)
-                    .is_ok()
-                {
-                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-            } else if current == SparseBlockState::SYNCING {
-                if self
-                    .state_map
-                    .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
-                    .is_ok()
-                {
-                    self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-            } else {
-                return false;
+            DirtyTransition::FromSyncing => {
+                self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+                self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                true
             }
         }
     }
@@ -427,11 +515,7 @@ impl CacheInner {
     /// Returns false if the block is no longer DIRTY (already claimed or cleaned).
     #[inline]
     pub(super) fn transition_dirty_to_syncing(&self, idx: usize) -> bool {
-        if self
-            .state_map
-            .cas(idx, SparseBlockState::DIRTY, SparseBlockState::SYNCING)
-            .is_ok()
-        {
+        if self.state_map.transition_dirty_to_syncing(idx) {
             self.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
             self.syncing_block_count.fetch_add(1, Ordering::Relaxed);
             true
@@ -448,11 +532,7 @@ impl CacheInner {
     /// Returns false if a concurrent write transitioned SYNCING→DIRTY.
     #[inline]
     pub(super) fn transition_syncing_to_not_present(&self, idx: usize) -> bool {
-        if self
-            .state_map
-            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::NOT_PRESENT)
-            .is_ok()
-        {
+        if self.state_map.transition_syncing_to_not_present(idx) {
             self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
             true
         } else {
@@ -488,7 +568,8 @@ impl CacheInner {
         df: &SyncFile,
         start_block: u64,
         end_block: u64,
-    ) -> std::io::Result<()> {
+        require_promotion: bool,
+    ) -> Result<(), super::CacheError> {
         use crate::block::block_map::SparseBlockState;
 
         let block_size = self.config.block_size as u64;
@@ -501,7 +582,18 @@ impl CacheInner {
         // dozens of pread+pwrite calls), which would block rotate_data_file
         // and compute_flush_batch from accessing flushing_file.
         let ff = self.flushing_file.lock().clone();
+
+        #[cfg(feature = "test-utils")]
+        {
+            let sp = self.promote_sync.lock().clone();
+            if let Some(sp) = sp {
+                sp.gate_sync(PromoteStep::AfterCloneArc, start_block as usize);
+            }
+        }
+
         if let Some(ref ff) = ff {
+            // Allocate once, reuse across blocks (avoids per-block 128KB alloc churn).
+            let mut buf = vec![0u8; block_size as usize];
             for block in start_block..=end_block {
                 let idx = block as usize;
                 if idx >= self.num_blocks {
@@ -521,7 +613,6 @@ impl CacheInner {
                 if valid == 0 {
                     continue;
                 }
-                let mut buf = vec![0u8; valid];
                 // Propagate both read and write errors. If reading from
                 // the flushing file fails (SSD error), we must not
                 // silently skip promotion — the active file has zeros for
@@ -529,8 +620,26 @@ impl CacheInner {
                 // non-written portion as zeros instead of the original
                 // data. Failing the write to the guest is safer than
                 // silent data corruption.
-                ff.read_exact_at(&mut buf, offset)?;
-                df.write_all_at(&buf, offset)?;
+                ff.read_exact_at(&mut buf[..valid], offset)?;
+
+                #[cfg(feature = "test-utils")]
+                {
+                    let sp = self.promote_sync.lock().clone();
+                    if let Some(sp) = sp {
+                        sp.gate_sync(PromoteStep::AfterRead, idx);
+                    }
+                }
+
+                df.write_all_at(&buf[..valid], offset)?;
+
+                #[cfg(feature = "test-utils")]
+                {
+                    let sp = self.promote_sync.lock().clone();
+                    if let Some(sp) = sp {
+                        sp.gate_sync(PromoteStep::BeforeCas, idx);
+                    }
+                }
+
                 if state == SparseBlockState::SYNCING {
                     // CAS SYNCING→DIRTY immediately after copying data.
                     // This prevents the flush thread from evicting the block
@@ -559,24 +668,25 @@ impl CacheInner {
                     }
                 }
             }
+        } else if require_promotion {
+            // No flushing file available. If any block in the range needs
+            // promotion (SYNCING or NOT_PRESENT from a just-completed flush),
+            // we can't recover its data — the flushing file has been taken.
+            // Return BlockEvicted so the caller falls back to S3 backfill.
+            for block in start_block..=end_block {
+                let idx = block as usize;
+                if idx >= self.num_blocks {
+                    continue;
+                }
+                let state = self.state_map.get(idx);
+                if state == SparseBlockState::SYNCING
+                    || state == SparseBlockState::NOT_PRESENT
+                {
+                    return Err(super::CacheError::BlockEvicted);
+                }
+            }
         }
         Ok(())
-    }
-
-    // -- CRC32 SparseCrcMap methods (for dirty-block corruption detection) -----
-
-    /// Store a CRC32 checksum for a dirty block (checkpoint path).
-    /// Only inserts if no entry exists — a concurrent write that re-dirtied
-    /// the block should not overwrite a fresh CRC.
-    #[inline]
-    pub(super) fn crc_store(&self, idx: usize, crc: u32) {
-        self.crc_map.try_insert(idx, crc);
-    }
-
-    /// Remove and return the CRC32 checksum for a block (flush path).
-    #[inline]
-    pub(super) fn crc_take(&self, idx: usize) -> Option<u32> {
-        self.crc_map.take(idx)
     }
 
     /// Persist block states to metadata file.
@@ -588,7 +698,7 @@ impl CacheInner {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = self.config.metadata_path();
         // Use a unique temp file name to prevent a race between concurrent
-        // callers (flush_to_s3's checkpoint vs flush_scheduler's local_checkpoint).
+        // callers (flush_to_s3's checkpoint vs flush_scheduler's checkpoint).
         // Without this, the first caller's rename moves .meta.tmp away and
         // the second caller's rename fails with ENOENT.
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -633,8 +743,9 @@ impl CacheInner {
             write_hashed!(&[*state]);
         }
 
-        // v5: append max_sequence as trailing u64 LE
+        // Trailing fields: max_sequence + rotation_seq (u64 LE each)
         write_hashed!(&self.sequence.current().to_le_bytes());
+        write_hashed!(&self.rotation_seq.load(Ordering::Relaxed).to_le_bytes());
 
         // CRC32 trailer over all preceding bytes.
         let crc = hasher.finalize();
@@ -685,21 +796,17 @@ impl CacheInner {
 
     /// Load block states and presence from metadata file.
     ///
-    /// Returns `(SparseStateMap, dirty_count, max_sequence)`. Handles legacy
-    /// v1/v2/v3/v4 formats by converting the old encoding (Clean=0, Dirty=1,
-    /// Syncing=2) plus separate presence bitmap into the new sparse encoding
-    /// (NotPresent=0, Clean=1, Dirty=2, Syncing=3). max_sequence is 0 for
-    /// formats prior to v5.
+    /// Returns `(SparseStateMap, dirty_count, max_sequence, rotation_seq)`.
     pub(super) fn load_metadata(
         config: &WriteCacheConfig,
-    ) -> Result<(SparseStateMap, usize, u64), CacheError> {
+    ) -> Result<(SparseStateMap, usize, u64, u64), CacheError> {
         let path = config.metadata_path();
         let num_blocks = config.num_blocks();
 
         if !path.exists() {
             // No metadata file -- all blocks are NOT_PRESENT
             debug!(path = %path.display(), "no metadata file, starting fresh");
-            return Ok((SparseStateMap::new(num_blocks), 0, 0));
+            return Ok((SparseStateMap::new(num_blocks), 0, 0, 0));
         }
 
         let mut file = File::open(&path)?;
@@ -785,11 +892,11 @@ impl CacheInner {
                 continue; // skip out-of-bounds (shrink safety)
             }
 
-            // Convert Syncing -> Dirty (conservative for crash recovery)
-            if state == SparseBlockState::SYNCING {
-                state = SparseBlockState::DIRTY;
-            }
-            if state == SparseBlockState::DIRTY {
+            // Count SYNCING and DIRTY blocks (both need eventual flush).
+            // SYNCING→DIRTY conversion is deferred to init.rs so crash
+            // recovery can use the SYNCING state to identify pre-rotation
+            // blocks whose data is in the flushing file.
+            if state == SparseBlockState::DIRTY || state == SparseBlockState::SYNCING {
                 dirty_count += 1;
             }
 
@@ -801,12 +908,14 @@ impl CacheInner {
             }
         }
 
-        // v5: read trailing max_sequence
-        if version >= 5 {
-            let mut seq_buf = [0u8; 8];
-            read_hashed!(&mut seq_buf);
-            persisted_max_seq = u64::from_le_bytes(seq_buf);
-        }
+        // Trailing fields: max_sequence + rotation_seq
+        let mut seq_buf = [0u8; 8];
+        read_hashed!(&mut seq_buf);
+        persisted_max_seq = u64::from_le_bytes(seq_buf);
+
+        let mut rot_buf = [0u8; 8];
+        read_hashed!(&mut rot_buf);
+        let rotation_seq = u64::from_le_bytes(rot_buf);
 
         // Verify CRC32 trailer (mandatory).
         let computed_crc = hasher.finalize();
@@ -841,6 +950,6 @@ impl CacheInner {
             "loaded cache metadata"
         );
 
-        Ok((state_map, dirty_count, persisted_max_seq))
+        Ok((state_map, dirty_count, persisted_max_seq, rotation_seq))
     }
 }

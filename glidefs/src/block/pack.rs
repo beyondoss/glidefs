@@ -120,7 +120,12 @@ pub fn assemble_pack(
             offset: running_offset,
             comp_length,
         });
-        running_offset += comp_length;
+        running_offset = running_offset.checked_add(comp_length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pack data exceeds u32::MAX bytes at block {}", entries.len()),
+            )
+        })?;
         total_compressed += compressed.len();
     }
 
@@ -197,7 +202,12 @@ pub fn stream_pack_to_writer(
             offset: running_offset,
             comp_length,
         });
-        running_offset += comp_length;
+        running_offset = running_offset.checked_add(comp_length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pack data exceeds u32::MAX bytes at block {}", entries.len()),
+            )
+        })?;
         writer.put(Bytes::from(compressed));
     }
 

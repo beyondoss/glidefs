@@ -17,13 +17,25 @@ use super::manifest::{manifest_s3_key, snapshot_s3_key};
 #[derive(Error, Debug)]
 pub enum ContentStoreError {
     #[error("S3 operation failed: {0}")]
-    ObjectStore(#[from] object_store::Error),
+    ObjectStore(object_store::Error),
+
+    #[error("S3 precondition failed (ETag mismatch): {0}")]
+    PreconditionFailed(object_store::Error),
 
     #[error("S3 circuit breaker is open (service temporarily unavailable)")]
     CircuitOpen,
 
     #[error("S3 concurrency semaphore closed")]
     SemaphoreClosed,
+}
+
+impl From<object_store::Error> for ContentStoreError {
+    fn from(e: object_store::Error) -> Self {
+        match e {
+            e @ object_store::Error::Precondition { .. } => Self::PreconditionFailed(e),
+            e => Self::ObjectStore(e),
+        }
+    }
 }
 
 /// Returns true for errors that indicate S3 connectivity failure (network,
