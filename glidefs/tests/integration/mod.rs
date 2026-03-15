@@ -7,6 +7,7 @@
 //! 4. Crash recovery - dirty blocks survive process crashes
 
 mod chunk_prefetch;
+mod interleaving;
 mod crash_recovery;
 mod crash_under_load;
 mod data_safety;

@@ -23,6 +23,90 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::Notify;
 
+// ============================================================================
+// Test-only: deterministic interleaving infrastructure
+// ============================================================================
+
+/// Steps in the backfill_and_write path where concurrent writers can interleave.
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackfillStep {
+    /// After initial block state check (knows if NOT_PRESENT/CLEAN/DIRTY/SYNCING).
+    StateChecked,
+    /// After resolve_block_for_backfill returns (has `prior` data from S3 or SSD).
+    S3FetchDone,
+    /// After post-fetch state re-check.
+    PostFetchRecheck,
+    /// Before try_claim_block CAS.
+    BeforeCas,
+    /// After CAS result (winner or loser decided).
+    AfterCas,
+    /// Before cache.write (full-block merge for winner, sub-block for loser/fast-path).
+    BeforeWrite,
+}
+
+/// Event sent by a writer at each sync point.
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone)]
+pub struct BackfillEvent {
+    pub writer_id: u64,
+    pub step: BackfillStep,
+    pub block_idx: usize,
+    /// Block state at the time of the event.
+    pub block_state: u8,
+}
+
+/// Sync point controller for deterministic interleaving tests.
+///
+/// Each writer sends events at critical points and waits for the test to
+/// release it. The test receives events, decides ordering, and sends
+/// proceed signals to advance specific writers.
+#[cfg(feature = "test-utils")]
+pub struct BackfillSyncPoints {
+    /// Writer → test: "I'm at step X".
+    event_tx: tokio::sync::mpsc::UnboundedSender<BackfillEvent>,
+    /// Per-writer proceed channels. Test sends () to release a specific writer.
+    /// Keyed by writer_id. Writers register on first use.
+    proceed_channels: parking_lot::Mutex<
+        std::collections::HashMap<u64, tokio::sync::mpsc::UnboundedSender<()>>,
+    >,
+    /// Counter for assigning writer IDs.
+    next_writer_id: AtomicU64,
+}
+
+#[cfg(feature = "test-utils")]
+impl BackfillSyncPoints {
+    /// Create a new sync point controller. Returns (controller, event_receiver).
+    pub fn new() -> (
+        Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<BackfillEvent>,
+    ) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sp = Arc::new(Self {
+            event_tx,
+            proceed_channels: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            next_writer_id: AtomicU64::new(0),
+        });
+        (sp, event_rx)
+    }
+
+    /// Allocate a writer ID and return its proceed receiver.
+    fn register_writer(&self) -> (u64, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let id = self.next_writer_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.proceed_channels.lock().insert(id, tx);
+        (id, rx)
+    }
+
+    /// Release a specific writer to proceed past its current gate.
+    pub fn release(&self, writer_id: u64) {
+        let channels = self.proceed_channels.lock();
+        if let Some(tx) = channels.get(&writer_id) {
+            let _ = tx.send(());
+        }
+    }
+}
+
 /// Block device descriptor used during transmission phase.
 #[derive(Clone)]
 pub struct BlockDevice {
@@ -86,6 +170,10 @@ pub struct BlockHandler {
 
     /// Optional write trace recorder. Zero cost when None.
     write_tracer: Option<Arc<WriteTracer>>,
+
+    /// Test-only: sync points for deterministic interleaving tests.
+    #[cfg(feature = "test-utils")]
+    backfill_sync: Option<Arc<BackfillSyncPoints>>,
 }
 
 impl BlockHandler {
@@ -125,7 +213,16 @@ impl BlockHandler {
             flush_notify,
             blocks_per_pack,
             write_tracer,
+            #[cfg(feature = "test-utils")]
+            backfill_sync: None,
         }
+    }
+
+    /// Attach sync points for deterministic interleaving tests.
+    #[cfg(feature = "test-utils")]
+    pub fn with_backfill_sync(mut self, sync: Arc<BackfillSyncPoints>) -> Self {
+        self.backfill_sync = Some(sync);
+        self
     }
 
     /// Check if this handler is readonly.
@@ -276,6 +373,37 @@ impl BlockHandler {
         let start_block = offset / block_size_u64;
         let end_block = (offset + data.len() as u64 - 1) / block_size_u64;
 
+        // Test-only: register this writer and get a proceed channel.
+        #[cfg(feature = "test-utils")]
+        let (mut _sync_writer_id, mut _sync_proceed_rx): (Option<u64>, Option<tokio::sync::mpsc::UnboundedReceiver<()>>) =
+            match &self.backfill_sync {
+                Some(sp) => {
+                    let (id, rx) = sp.register_writer();
+                    (Some(id), Some(rx))
+                }
+                None => (None, None),
+            };
+
+        // Test-only gate macro: send event, wait for proceed signal.
+        macro_rules! _backfill_gate {
+            ($step:expr, $block_idx:expr, $state:expr) => {
+                #[cfg(feature = "test-utils")]
+                {
+                    if let Some(sp) = &self.backfill_sync {
+                        if let (Some(id), Some(rx)) = (_sync_writer_id, &mut _sync_proceed_rx) {
+                            let _ = sp.event_tx.send(BackfillEvent {
+                                writer_id: id,
+                                step: $step,
+                                block_idx: $block_idx,
+                                block_state: $state,
+                            });
+                            let _ = rx.recv().await;
+                        }
+                    }
+                }
+            };
+        }
+
         // Fast path: all blocks already present AND fully written.
         // DIRTY/SYNCING = data is on local SSD (or promotable from flushing file).
         // CLEAN = claimed but not yet written — must NOT write sub-range yet.
@@ -287,7 +415,7 @@ impl BlockHandler {
                 state == SparseBlockState::DIRTY || state == SparseBlockState::SYNCING
             });
             if all_ready {
-                match self.cache.write(offset, data) {
+                match self.cache.write_with_eviction_check(offset, data) {
                     Ok(()) => return Ok(()),
                     Err(super::write_cache::CacheError::BlockEvicted) => {
                         // Flush evicted a block between state check and pwrite.
@@ -324,6 +452,8 @@ impl BlockHandler {
             'block_retry: loop {
                 use crate::block::block_map::SparseBlockState;
                 let state = self.cache.block_state(idx);
+
+                _backfill_gate!(BackfillStep::StateChecked, idx, state);
 
                 match state {
                     s if s == SparseBlockState::DIRTY || s == SparseBlockState::SYNCING => {
@@ -379,13 +509,26 @@ impl BlockHandler {
                     } else {
                         let mut found = false;
                         for &pid in pids.iter().rev() {
-                            if self.pack_index_cache.lookup_block(pid, bo).await.is_some() {
-                                found = true;
-                                break;
-                            }
-                            if self.pack_index_cache.get_entries(pid).await.is_none() {
-                                found = true;
-                                break;
+                            match self.pack_index_cache.get_entries(pid).await {
+                                Some(entries) => {
+                                    // Pack index is cached. Check if this block
+                                    // offset is in the entries. Use linear scan
+                                    // (not binary search via lookup_block) to
+                                    // avoid a race where foyer's async insertion
+                                    // hasn't committed for lookup_block's .get()
+                                    // but has for get_entries' .get().
+                                    if entries.iter().any(|e| e.chunk_offset == bo) {
+                                        found = true;
+                                        break;
+                                    }
+                                    // Pack is cached but block isn't in it — try older packs.
+                                }
+                                None => {
+                                    // Pack index not cached — conservatively assume
+                                    // it has data for this block.
+                                    found = true;
+                                    break;
+                                }
                             }
                         }
                         found
@@ -415,6 +558,8 @@ impl BlockHandler {
                     CommandError::IoError
                 })?;
 
+                _backfill_gate!(BackfillStep::S3FetchDone, idx, self.cache.block_state(idx));
+
                 // Re-check state after the async fetch. Another writer or
                 // flush rotation may have changed the block state.
                 let post_fetch_state = self.cache.block_state(idx);
@@ -429,12 +574,16 @@ impl BlockHandler {
                     break 'block_retry;
                 }
 
+                _backfill_gate!(BackfillStep::BeforeCas, idx, SparseBlockState::NOT_PRESENT);
+
                 // Non-zero prior: claim the block, merge, and write.
                 if !self.cache.try_claim_block(idx) {
                     // Another writer claimed it. Re-enter outer match to
                     // wait for their write to complete.
                     continue 'block_retry;
                 }
+
+                _backfill_gate!(BackfillStep::AfterCas, idx, self.cache.block_state(idx));
 
                 // We won the claim. Merge guest data onto prior block.
                 let mut block_buf = prior.to_vec();
@@ -450,6 +599,8 @@ impl BlockHandler {
                 let end = (block_local_start + write_len).min(block_buf.len());
                 block_buf[block_local_start..end]
                     .copy_from_slice(&data[data_offset..data_offset + write_len]);
+
+                _backfill_gate!(BackfillStep::BeforeWrite, idx, self.cache.block_state(idx));
 
                 self.cache.write(block_start, &block_buf)?;
                 break 'block_retry;

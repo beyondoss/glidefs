@@ -390,6 +390,24 @@ impl WriteCache<Active> {
         Arc::clone(&self.inner)
     }
 
+    /// Test-only: expose rotate_and_snapshot for interleaving tests.
+    #[cfg(feature = "test-utils")]
+    pub fn test_rotate_and_snapshot(&self) -> Result<Vec<usize>, CacheError> {
+        self.rotate_and_snapshot()
+    }
+
+    /// Test-only: expose inner for direct state manipulation in tests.
+    #[cfg(feature = "test-utils")]
+    pub fn test_inner(&self) -> Arc<CacheInner> {
+        self.inner()
+    }
+
+    /// Test-only: try CAS SYNCING→NOT_PRESENT for a specific block.
+    #[cfg(feature = "test-utils")]
+    pub fn transition_syncing_to_not_present(&self, block_idx: usize) -> bool {
+        self.inner.transition_syncing_to_not_present(block_idx)
+    }
+
     /// Rotate the data file for flush.
     ///
     /// 1. Rename active file -> flushing file
