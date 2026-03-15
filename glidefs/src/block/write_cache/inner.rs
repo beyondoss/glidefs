@@ -487,49 +487,24 @@ impl CacheInner {
 
     /// CAS loop to transition a block to Dirty state (lock-free).
     ///
-    /// Handles four source states (sparse encoding):
-    /// - **Clean(1) -> Dirty(2)**: increments dirty_block_count.
-    /// - **Syncing(3) -> Dirty(2)**: decrements syncing_block_count, increments dirty_block_count.
-    /// - **Dirty(2) -> Dirty(2)**: no-op.
-    /// - **NotPresent(0) -> Dirty(2)**: increments dirty_block_count. This
-    ///   handles a race where promote_syncing_blocks copied data and the guest
-    ///   wrote, but the flush thread evicted the block (SYNCING→NOT_PRESENT)
-    ///   before this call. The data is already in the active file.
+    /// Delegates the CAS logic to `SparseStateMap::transition_to_dirty()` and
+    /// handles counter bookkeeping based on the result.
     ///
     /// Returns `true` if the state actually changed, `false` if already DIRTY.
     /// Used by the write path to skip redundant WAL entries.
     #[inline]
     pub(super) fn transition_to_dirty(&self, idx: usize) -> bool {
-        loop {
-            let current = self.state_map.get(idx);
-
-            if current == SparseBlockState::DIRTY {
-                return false;
+        use crate::block::block_map::DirtyTransition;
+        match self.state_map.transition_to_dirty(idx) {
+            DirtyTransition::AlreadyDirty => false,
+            DirtyTransition::FromCleanOrNotPresent => {
+                self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                true
             }
-
-            if current == SparseBlockState::CLEAN
-                || current == SparseBlockState::NOT_PRESENT
-            {
-                if self
-                    .state_map
-                    .cas(idx, current, SparseBlockState::DIRTY)
-                    .is_ok()
-                {
-                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-            } else if current == SparseBlockState::SYNCING {
-                if self
-                    .state_map
-                    .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
-                    .is_ok()
-                {
-                    self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    return true;
-                }
-            } else {
-                return false;
+            DirtyTransition::FromSyncing => {
+                self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+                self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                true
             }
         }
     }
@@ -540,11 +515,7 @@ impl CacheInner {
     /// Returns false if the block is no longer DIRTY (already claimed or cleaned).
     #[inline]
     pub(super) fn transition_dirty_to_syncing(&self, idx: usize) -> bool {
-        if self
-            .state_map
-            .cas(idx, SparseBlockState::DIRTY, SparseBlockState::SYNCING)
-            .is_ok()
-        {
+        if self.state_map.transition_dirty_to_syncing(idx) {
             self.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
             self.syncing_block_count.fetch_add(1, Ordering::Relaxed);
             true
@@ -561,11 +532,7 @@ impl CacheInner {
     /// Returns false if a concurrent write transitioned SYNCING→DIRTY.
     #[inline]
     pub(super) fn transition_syncing_to_not_present(&self, idx: usize) -> bool {
-        if self
-            .state_map
-            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::NOT_PRESENT)
-            .is_ok()
-        {
+        if self.state_map.transition_syncing_to_not_present(idx) {
             self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
             true
         } else {

@@ -136,6 +136,20 @@ impl SparseBlockState {
     pub const SYNCING: u8 = 3;
 }
 
+/// Result of `SparseStateMap::transition_to_dirty()`.
+///
+/// Tells the caller which source state the block transitioned from,
+/// so it can update the appropriate counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyTransition {
+    /// Block was already DIRTY — no state change.
+    AlreadyDirty,
+    /// Transitioned from CLEAN or NOT_PRESENT → DIRTY.
+    FromCleanOrNotPresent,
+    /// Transitioned from SYNCING → DIRTY.
+    FromSyncing,
+}
+
 /// Number of 2-bit entries packed into each `AtomicU8`.
 const ENTRIES_PER_BYTE: usize = 4;
 
@@ -493,6 +507,66 @@ impl SparseStateMap {
                 }))
             }).flatten()
         })
+    }
+
+    // -- High-level transition methods ----------------------------------------
+    //
+    // These encode the CAS loop logic that CacheInner delegates to.
+    // Placing them here means loom tests exercise the real code path.
+
+    /// CAS loop to transition a block to Dirty.
+    ///
+    /// Handles all four source states:
+    /// - **DIRTY → DIRTY**: no-op, returns `DirtyTransition::AlreadyDirty`.
+    /// - **CLEAN or NOT_PRESENT → DIRTY**: returns `DirtyTransition::FromCleanOrNotPresent`.
+    /// - **SYNCING → DIRTY**: returns `DirtyTransition::FromSyncing`.
+    ///
+    /// The caller is responsible for updating counters based on the result.
+    pub fn transition_to_dirty(&self, idx: usize) -> DirtyTransition {
+        loop {
+            let current = self.get(idx);
+
+            if current == SparseBlockState::DIRTY {
+                return DirtyTransition::AlreadyDirty;
+            }
+
+            if current == SparseBlockState::CLEAN
+                || current == SparseBlockState::NOT_PRESENT
+            {
+                if self.cas(idx, current, SparseBlockState::DIRTY).is_ok() {
+                    return DirtyTransition::FromCleanOrNotPresent;
+                }
+            } else if current == SparseBlockState::SYNCING {
+                if self
+                    .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                    .is_ok()
+                {
+                    return DirtyTransition::FromSyncing;
+                }
+            } else {
+                return DirtyTransition::AlreadyDirty;
+            }
+        }
+    }
+
+    /// Single CAS: DIRTY → SYNCING.
+    ///
+    /// Returns `true` if the CAS succeeded (block claimed for flush).
+    /// No retry loop — a single attempt. Caller is responsible for counters.
+    #[inline]
+    pub fn transition_dirty_to_syncing(&self, idx: usize) -> bool {
+        self.cas(idx, SparseBlockState::DIRTY, SparseBlockState::SYNCING)
+            .is_ok()
+    }
+
+    /// Single CAS: SYNCING → NOT_PRESENT.
+    ///
+    /// Returns `true` if the CAS succeeded (block evicted).
+    /// Caller is responsible for counters.
+    #[inline]
+    pub fn transition_syncing_to_not_present(&self, idx: usize) -> bool {
+        self.cas(idx, SparseBlockState::SYNCING, SparseBlockState::NOT_PRESENT)
+            .is_ok()
     }
 
     /// Count blocks with a non-zero state (present blocks).

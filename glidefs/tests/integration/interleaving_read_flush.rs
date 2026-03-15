@@ -384,6 +384,69 @@ async fn wf10_crc_prepass_skips_clean_blocks() {
     assert_eq!(cache.block_state(1), 1); // CLEAN (untouched)
 }
 
+/// Stateright-derived: writer at BeforeCas while flush is rotating.
+/// The writer's CAS targets NP→CLEAN. The flush's rotation targets
+/// DIRTY→SYNCING. They can't conflict on the same block, but verify
+/// the writer retries correctly when the block state changed.
+#[tokio::test]
+async fn sr_writer_cas_during_flush_rotation() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) =
+        super::create_test_cache(&dir, "sr-cas-rot", Arc::clone(&s3)).await;
+
+    // Write block 0 to make it DIRTY.
+    cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
+
+    // Flush to S3 and evict (block becomes NP).
+    cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    cache.sync_manifest(&cs, &vm).await.unwrap();
+    assert_eq!(cache.block_state(0), 0); // NP
+
+    // Write again (NP→DIRTY).
+    cache.write(0, &vec![0xBB; BLOCK_SIZE]).unwrap();
+    assert_eq!(cache.block_state(0), 2); // DIRTY
+
+    // Now concurrent: flush starts rotating (DIRTY→SYNCING) while
+    // another write is about to CAS on the same block.
+    // The write should see SYNCING (not NP), enter promote path, succeed.
+    let (flush_sp, mut flush_events, flush_proceed) = FlushSyncPoints::new();
+    cache.set_flush_sync(Arc::new(flush_sp));
+
+    let cache_f = Arc::clone(&cache);
+    let cs_f = ContentStore::new(Arc::clone(&s3), "test");
+    let pic_f = Arc::clone(&pic);
+    let vm_f = Arc::clone(&vm);
+    let flush_handle = tokio::spawn(async move {
+        cache_f.flush_packs(&cs_f, &pic_f, &vm_f, None).await
+    });
+
+    // Advance flush past rotation.
+    flush_events.recv().await.unwrap(); // AfterCrcPrepass
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterRotation
+    // Block is SYNCING. Flush paused.
+
+    // Write sub-block — will see SYNCING, promote from flushing file.
+    cache.write(0, &vec![0xCC; SUB_BLOCK]).unwrap();
+    assert_eq!(cache.block_state(0), 2); // DIRTY (promoted)
+
+    // Finish flush.
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterCompute
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // BeforeEvict
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterEvict
+    flush_proceed.send(()).unwrap();
+    flush_handle.await.unwrap().unwrap();
+
+    // Block should be DIRTY with correct data.
+    let b0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+    assert_eq!(&b0[0..SUB_BLOCK], &vec![0xCC; SUB_BLOCK][..]);
+    assert!(b0[SUB_BLOCK..].iter().all(|&b| b == 0xBB));
+}
+
 /// WF-11/18: Verify that during flush, a block can only be in ONE state.
 /// A CLEAN block on the new active file and a SYNCING block on the flushing
 /// file cannot be the same block — the CAS is exclusive.
