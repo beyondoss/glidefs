@@ -750,19 +750,42 @@ impl WriteCache<Active> {
             self.inner.rotation_seq.store(0, Ordering::Release);
 
             if stranded_syncing {
-                // Keep the flushing file alive — it's the only copy of data
-                // for the stranded SYNCING blocks. Crash recovery (init.rs)
-                // will find the flushing file and recover them on restart.
-                warn!(
-                    "keeping flushing file: some blocks still SYNCING with \
-                     data only in flushing file"
-                );
-            } else {
-                drop(self.inner.flushing_file.lock().take());
-                let flushing_path = self.inner.config.flushing_path();
-                if flushing_path.exists() {
-                    let _ = std::fs::remove_file(&flushing_path);
+                // Stranded SYNCING blocks: both the S3 upload failed AND the
+                // SSD copy (flushing→active) failed. The data exists only in
+                // the flushing file's open fd, but the SSD can't read it
+                // reliably (that's why recovery failed). Keeping the flushing
+                // file alive would permanently block all future flushes —
+                // every subsequent flush_dirty_inner call sees the flushing
+                // file on disk + flushing_file=Some and returns early.
+                //
+                // Accept data loss for the unrecoverable blocks: transition
+                // them to NOT_PRESENT so the read path fetches from S3 (if a
+                // previous flush succeeded) or returns zeros (if not). This
+                // is strictly better than losing ALL future flushes for every
+                // block on this export.
+                let mut stranded_count = 0u64;
+                for &idx in &snapshot {
+                    if !recovered.contains(&idx)
+                        && self.inner.state_map.get(idx) == SparseBlockState::SYNCING
+                    {
+                        self.inner.transition_syncing_to_not_present(idx);
+                        stranded_count += 1;
+                    }
                 }
+                tracing::error!(
+                    stranded_blocks = stranded_count,
+                    "DATA LOSS: {stranded_count} blocks could not be recovered \
+                     after flush failure (S3 upload failed + SSD copy failed). \
+                     Blocks marked NOT_PRESENT to unblock future flushes."
+                );
+            }
+            // Drop the flushing file and delete the physical file so future
+            // flush cycles can rotate normally. For the stranded case, the
+            // unrecoverable blocks have already been marked NOT_PRESENT above.
+            drop(self.inner.flushing_file.lock().take());
+            let flushing_path = self.inner.config.flushing_path();
+            if flushing_path.exists() {
+                let _ = std::fs::remove_file(&flushing_path);
             }
             // Only transition blocks whose data was successfully recovered.
             for &idx in &recovered {
