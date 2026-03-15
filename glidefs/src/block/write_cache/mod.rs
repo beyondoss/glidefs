@@ -41,7 +41,11 @@ pub use read::{ChunkSource, ReadPlan};
 use inner::CacheInner;
 
 #[cfg(feature = "test-utils")]
-pub use inner::{FlushSyncPoints, FlushStep, FlushGateEvent, PromoteSyncPoints, PromoteStep, PromoteGateEvent};
+pub use inner::{
+    FlushSyncPoints, FlushStep, FlushGateEvent,
+    PromoteSyncPoints, PromoteStep, PromoteGateEvent,
+    ReadSyncPoints, ReadStep, ReadGateEvent,
+};
 
 /// Statistics from a flush operation.
 #[derive(Debug, Default)]

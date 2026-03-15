@@ -8,6 +8,7 @@
 
 mod chunk_prefetch;
 mod interleaving;
+mod interleaving_read_flush;
 mod crash_recovery;
 mod crash_under_load;
 mod data_safety;

@@ -575,6 +575,19 @@ impl WriteCache<Active> {
         // read — in that case, fall through to the cold path.
         {
             let state = self.inner.state_map.get(block_index);
+
+            #[cfg(feature = "test-utils")]
+            {
+                let sp = self.inner.read_sync.lock().clone();
+                if let Some(sp) = sp {
+                    sp.gate(
+                        super::inner::ReadStep::AfterStateCheck,
+                        block_index,
+                        state,
+                    ).await;
+                }
+            }
+
             if (state == crate::block::block_map::SparseBlockState::DIRTY
                 || state == crate::block::block_map::SparseBlockState::SYNCING)
                 && let Some(data) = self.sync_read_local_block(block_index as u64)?

@@ -271,6 +271,8 @@ impl WriteCache<Initializing> {
             flush_sync: parking_lot::Mutex::new(None),
             #[cfg(feature = "test-utils")]
             promote_sync: parking_lot::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            read_sync: parking_lot::Mutex::new(None),
         });
 
         info!(
@@ -328,6 +330,8 @@ impl WriteCache<Initializing> {
             flush_sync: parking_lot::Mutex::new(None),
             #[cfg(feature = "test-utils")]
             promote_sync: parking_lot::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            read_sync: parking_lot::Mutex::new(None),
         });
 
         info!("cache opened fresh for fork, directly Active");

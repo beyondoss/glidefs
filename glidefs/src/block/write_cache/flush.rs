@@ -430,6 +430,12 @@ impl WriteCache<Active> {
         *self.inner.promote_sync.lock() = Some(sp);
     }
 
+    /// Test-only: attach read sync points.
+    #[cfg(feature = "test-utils")]
+    pub fn set_read_sync(&self, sp: std::sync::Arc<super::inner::ReadSyncPoints>) {
+        *self.inner.read_sync.lock() = Some(sp);
+    }
+
     /// Rotate the data file for flush.
     ///
     /// 1. Rename active file -> flushing file
@@ -957,6 +963,9 @@ impl WriteCache<Active> {
                 vm.append_pack(chunk_idx, pack_id);
             }
         }
+
+        #[cfg(feature = "test-utils")]
+        self.flush_gate(super::inner::FlushStep::AfterCompute, flushed_blocks.len()).await;
 
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::BeforeEvict, flushed_blocks.len()).await;

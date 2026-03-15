@@ -316,6 +316,10 @@ pub(crate) struct CacheInner {
     /// Test-only: sync points for promote path interleaving tests.
     #[cfg(feature = "test-utils")]
     pub(crate) promote_sync: parking_lot::Mutex<Option<std::sync::Arc<PromoteSyncPoints>>>,
+
+    /// Test-only: sync points for read path interleaving tests.
+    #[cfg(feature = "test-utils")]
+    pub(crate) read_sync: parking_lot::Mutex<Option<std::sync::Arc<ReadSyncPoints>>>,
 }
 
 // ============================================================================
@@ -332,11 +336,11 @@ pub struct FlushSyncPoints {
 #[cfg(feature = "test-utils")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushStep {
-    AfterCrcPrepass,
-    AfterRotation,
-    AfterCompute,
-    BeforeEvict,
-    AfterEvict,
+    AfterCrcPrepass,  // F1→F2
+    AfterRotation,    // F5
+    AfterCompute,     // F6→F7
+    BeforeEvict,      // F7→F8
+    AfterEvict,       // F8→F9
 }
 
 #[cfg(feature = "test-utils")]
@@ -370,9 +374,9 @@ pub struct PromoteSyncPoints {
 #[cfg(feature = "test-utils")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromoteStep {
-    AfterCloneArc,
-    AfterRead,
-    BeforeCas,
+    AfterCloneArc,  // P1
+    AfterRead,      // P3→P4 (between pread and pwrite)
+    BeforeCas,      // P4→P5 (between pwrite and CAS)
 }
 
 #[cfg(feature = "test-utils")]
@@ -380,6 +384,43 @@ pub enum PromoteStep {
 pub struct PromoteGateEvent {
     pub step: PromoteStep,
     pub block_idx: usize,
+}
+
+/// Read path sync points.
+#[cfg(feature = "test-utils")]
+pub struct ReadSyncPoints {
+    pub tx: tokio::sync::mpsc::UnboundedSender<ReadGateEvent>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadStep {
+    AfterStateCheck,   // R3: after locate_block state check
+    AfterRecheck,      // R4: after sync_read_local_block re-check
+    BeforePread,       // R2/R5: before pread from active or flushing file
+}
+
+#[cfg(feature = "test-utils")]
+#[derive(Debug)]
+pub struct ReadGateEvent {
+    pub step: ReadStep,
+    pub block_idx: usize,
+    pub block_state: u8,
+}
+
+#[cfg(feature = "test-utils")]
+impl ReadSyncPoints {
+    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<ReadGateEvent>, tokio::sync::mpsc::UnboundedSender<()>) {
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self { tx: event_tx, rx: tokio::sync::Mutex::new(proceed_rx) }, event_rx, proceed_tx)
+    }
+
+    pub(crate) async fn gate(&self, step: ReadStep, block_idx: usize, block_state: u8) {
+        let _ = self.tx.send(ReadGateEvent { step, block_idx, block_state });
+        let _ = self.rx.lock().await.recv().await;
+    }
 }
 
 #[cfg(feature = "test-utils")]
@@ -613,6 +654,15 @@ impl CacheInner {
                 // data. Failing the write to the guest is safer than
                 // silent data corruption.
                 ff.read_exact_at(&mut buf[..valid], offset)?;
+
+                #[cfg(feature = "test-utils")]
+                {
+                    let sp = self.promote_sync.lock().clone();
+                    if let Some(sp) = sp {
+                        sp.gate_sync(PromoteStep::AfterRead, idx);
+                    }
+                }
+
                 df.write_all_at(&buf[..valid], offset)?;
 
                 #[cfg(feature = "test-utils")]
