@@ -1107,53 +1107,48 @@ async fn test_concurrent_flush_write_s3_convergence() {
 // and test_rebuild_manifest_hashes_prevents_prune_loss) have been removed.
 // Pack index pruning is no longer relevant with PackIndexCache.
 
-/// CRC32 mismatch at flush time: block is skipped and retried next flush.
-/// Corruption between the CRC pre-pass and the flushing-file read causes
-/// the flush to skip the block, which remains dirty for the next cycle.
+/// CRC32 mismatch at flush time: SSD corruption detected and block skipped.
+///
+/// Write-time CRCs are captured from the guest's write buffer, so corrupting
+/// the SSD after pwrite causes a mismatch at flush time. The block is skipped
+/// and retried next cycle. A subsequent flush with uncorrupted data succeeds.
 #[tokio::test]
 async fn test_crc32_mismatch_skips_block_then_heals() {
     let h = V2Harness::new().await;
 
-    // Write a block.
+    // Write a block — CRC captured from the 0xAB write buffer.
     h.cache.write(0, &vec![0xABu8; 4096]).unwrap();
     assert_eq!(h.cache.dirty_block_count(), 1);
 
     let inner = h.cache.inner();
 
-    // Corrupt the block on SSD (simulate bit rot).
-    // The flush CRC pre-pass reads the corrupted data, then rotation renames
-    // the file. The flushing-file read in compute_flush_batch reads the same
-    // corrupted data, so CRC matches and the block uploads. To actually
-    // trigger a mismatch, we need to corrupt AFTER the CRC pre-pass but
-    // BEFORE the flushing-file read. Since both happen on the same file
-    // (pre-rotation), we corrupt the data between write and flush — the
-    // pre-pass computes a CRC from the original data, rotation happens,
-    // then we corrupt the flushing file.
-    //
-    // For this test, write original data, then manually corrupt the file
-    // after the CRC pre-pass would have run. Since flush_packs does the
-    // pre-pass internally, we instead test the end-to-end behavior:
-    // corrupt the block, flush (pre-pass reads corrupted, flushing reads
-    // corrupted, CRC matches = no corruption detected). This is correct:
-    // the ephemeral CRC detects corruption that happens BETWEEN pre-pass
-    // and flushing-file read (e.g., bit rot during rotation).
-    //
-    // To test actual mismatch detection, we use a second write that changes
-    // the data between pre-pass and rotation (simulated via concurrent write).
-    // But the simplest end-to-end test: corrupt, flush succeeds (CRC matches
-    // the corrupted data). This validates the happy path.
+    // Corrupt the block on SSD (simulate bit rot). The write-time CRC
+    // was captured from 0xAB, but the flushing file now contains 0xFF.
     let corrupted_data = vec![0xFFu8; 4096];
     inner.data_file.read().write_all_at(&corrupted_data, 0).unwrap();
 
-    // Flush reads the corrupted data consistently (pre-pass and flushing file
-    // are the same file before rotation), so CRC matches and block uploads.
+    // Flush detects CRC mismatch: write-time baseline (0xAB) != flushing
+    // file contents (0xFF). Block is skipped and remains dirty.
     let (stats, _seq) = h
         .cache
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
-    assert_eq!(stats.blocks_crc_mismatched, 0, "consistent read = no mismatch");
-    assert_eq!(stats.blocks_claimed, 1);
+    assert_eq!(stats.blocks_crc_mismatched, 1, "SSD corruption detected");
+    assert_eq!(stats.blocks_claimed, 1, "block claimed but skipped due to CRC mismatch");
+    assert_eq!(h.cache.dirty_block_count(), 1, "block remains dirty for retry");
+
+    // "Heal" the block by overwriting with fresh data (new write-time CRC).
+    h.cache.write(0, &vec![0xCCu8; 4096]).unwrap();
+
+    // Second flush succeeds — write-time CRC matches flushing file.
+    let (stats2, _seq2) = h
+        .cache
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
+        .await
+        .unwrap();
+    assert_eq!(stats2.blocks_crc_mismatched, 0, "healed — no mismatch");
+    assert_eq!(stats2.blocks_claimed, 1);
     assert_eq!(h.cache.dirty_block_count(), 0, "block flushed");
 }
 

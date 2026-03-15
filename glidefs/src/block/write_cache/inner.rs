@@ -302,6 +302,15 @@ pub(crate) struct CacheInner {
     /// `None` means first upload (unconditional PUT).
     pub(crate) manifest_etag: Mutex<Option<String>>,
 
+    /// CRC32 checksums captured at pwrite time from the guest's write buffer.
+    /// Drained at flush time and used as the CRC baseline instead of re-reading
+    /// from SSD. Entries are (block_index, data_crc). Sub-block writes set
+    /// data_crc to 0 (invalidated). Linear scan for dedup — fits in L1 cache.
+    pub(super) write_crcs: Mutex<Vec<(u32, u32)>>,
+
+    /// Pre-computed CRC32 of a zero block for this export's block_size.
+    pub(super) zero_block_crc: u32,
+
     /// Sequence number at the last file rotation. 0 when no rotation is active.
     /// Persisted to metadata so crash recovery can distinguish pre- vs
     /// post-rotation WAL entries: entries with sequence > rotation_seq were
@@ -455,6 +464,65 @@ impl CacheInner {
     #[inline]
     pub(crate) fn pwrite_data_file(&self, data: &[u8], offset: u64) -> std::io::Result<()> {
         self.data_file.read().write_all_at(data, offset)
+    }
+
+    /// Record write-time CRCs from the guest's write buffer.
+    ///
+    /// For each block fully covered by the write, stores its CRC32.
+    /// For each block partially covered, stores 0 (invalidated —
+    /// a prior full-block CRC is stale after a partial overwrite).
+    pub(super) fn capture_write_crcs(&self, offset: u64, data: &[u8]) {
+        let block_size = self.config.block_size as u64;
+        let end = offset + data.len() as u64;
+        let start_block = offset / block_size;
+        let end_block = (end - 1) / block_size;
+
+        let mut crcs = self.write_crcs.lock();
+        for block in start_block..=end_block {
+            let idx = block as u32;
+            let block_start = block * block_size;
+            let block_end = block_start + block_size;
+            let data_crc = if offset <= block_start && end >= block_end {
+                let slice_start = (block_start - offset) as usize;
+                let slice_end = slice_start + block_size as usize;
+                crc32fast::hash(&data[slice_start..slice_end])
+            } else {
+                0
+            };
+            if let Some(entry) = crcs.iter_mut().find(|(i, _)| *i == idx) {
+                entry.1 = data_crc;
+            } else {
+                crcs.push((idx, data_crc));
+            }
+        }
+    }
+
+    /// Record write-time CRCs for a zero_range operation.
+    ///
+    /// For each block fully covered, stores the pre-computed zero-block CRC.
+    /// For partially covered blocks, stores 0 (invalidated).
+    pub(super) fn capture_zero_crcs(&self, offset: u64, len: u64) {
+        let block_size = self.config.block_size as u64;
+        let end = offset + len;
+        let start_block = offset / block_size;
+        let end_block = (end - 1) / block_size;
+
+        let mut crcs = self.write_crcs.lock();
+        for block in start_block..=end_block {
+            let idx = block as u32;
+            let block_start = block * block_size;
+            let block_end = block_start + block_size;
+            let data_crc = if offset <= block_start && end >= block_end {
+                self.zero_block_crc
+            } else {
+                0
+            };
+            if let Some(entry) = crcs.iter_mut().find(|(i, _)| *i == idx) {
+                entry.1 = data_crc;
+            } else {
+                crcs.push((idx, data_crc));
+            }
+        }
     }
 
     /// Check if block is present (lock-free read).

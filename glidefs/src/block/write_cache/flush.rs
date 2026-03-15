@@ -223,48 +223,23 @@ fn compute_flush_batch(
     })
 }
 
-/// Compute CRC32 checksums for all dirty blocks from the active data file.
-/// Returns (crcs, read_error_count). Called immediately before rotation so
-/// the CRCs can be verified against the flushing file after rotation.
-fn compute_flush_crcs(inner: &CacheInner) -> (HashMap<usize, u32>, usize) {
-    use rayon::prelude::*;
-
-    let dirty_indices: Vec<usize> = inner
-        .state_map
-        .iter_with_state(SparseBlockState::DIRTY)
-        .collect();
-
-    if dirty_indices.is_empty() {
-        return (HashMap::new(), 0);
+/// Drain write-time CRC32 baselines captured at pwrite time.
+///
+/// Atomically takes the Vec of (block_index, data_crc) entries and builds
+/// a HashMap for O(1) lookup in compute_flush_batch. Last-write-wins for
+/// duplicate block indices. Entries with data_crc == 0 (sub-block writes)
+/// are skipped — those blocks skip CRC verification at flush time.
+fn drain_write_crcs(inner: &CacheInner) -> HashMap<usize, u32> {
+    let entries = std::mem::take(&mut *inner.write_crcs.lock());
+    let mut map = HashMap::with_capacity(entries.len());
+    for (idx, crc) in entries {
+        if crc != 0 {
+            map.insert(idx as usize, crc);
+        } else {
+            map.remove(&(idx as usize));
+        }
     }
-
-    let block_size = inner.config.block_size;
-    let device_size = inner.config.device_size;
-    let results: Vec<Option<(usize, u32)>> = dirty_indices
-        .par_iter()
-        .map(|&idx| {
-            let offset = idx as u64 * block_size as u64;
-            let valid_bytes = std::cmp::min(
-                block_size as u64,
-                device_size.saturating_sub(offset),
-            ) as usize;
-            if valid_bytes == 0 {
-                return Some((idx, crc32fast::hash(&[])));
-            }
-            let mut buf = vec![0u8; block_size];
-            if inner.data_file.read().read_exact_at(&mut buf[..valid_bytes], offset).is_err() {
-                return None;
-            }
-            if valid_bytes < block_size {
-                buf[valid_bytes..].fill(0);
-            }
-            Some((idx, crc32fast::hash(&buf)))
-        })
-        .collect();
-
-    let read_errors = results.iter().filter(|r| r.is_none()).count();
-    let crcs: HashMap<usize, u32> = results.into_iter().flatten().collect();
-    (crcs, read_errors)
+    map
 }
 
 impl WriteCache<Active> {
@@ -607,18 +582,9 @@ impl WriteCache<Active> {
             }
         }
 
-        // Compute CRC baselines from the active file BEFORE rotation.
-        // These are verified against the flushing file after rotation.
-        let inner_clone = Arc::clone(&self.inner);
-        let crcs = crate::task::spawn_blocking_named("flush-crcs", move || {
-            let (crcs, read_errors) = compute_flush_crcs(&inner_clone);
-            if read_errors > 0 {
-                warn!(read_errors, "dirty blocks had SSD read errors during CRC pre-pass");
-            }
-            crcs
-        })
-        .await
-        .map_err(|e| CacheError::Io(std::io::Error::other(e)))?;
+        // Drain write-time CRC baselines BEFORE rotation.
+        // These were captured from guest write buffers at pwrite time.
+        let crcs = drain_write_crcs(&self.inner);
 
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::AfterCrcPrepass, crcs.len()).await;
