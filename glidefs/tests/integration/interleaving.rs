@@ -2264,6 +2264,10 @@ async fn pf02_eviction_during_promote_read() {
     promote_proceed.send(()).unwrap();
 
     let ev = promote_events.recv().await.unwrap();
+    assert_eq!(ev.step, PromoteStep::AfterRead);
+    promote_proceed.send(()).unwrap();
+
+    let ev = promote_events.recv().await.unwrap();
     assert_eq!(ev.step, PromoteStep::BeforeCas);
 
     // NOW evict the block while promote is between pwrite and CAS.
@@ -2719,6 +2723,12 @@ async fn pf01_promote_clone_during_eviction_start() {
     // Release promote — pread should still work (fd alive via Arc).
     promote_proceed.send(()).unwrap();
 
+    // Block is NP but promote still reads from the flushing file
+    // (handles both SYNCING and NOT_PRESENT).
+    let ev = promote_events.recv().await.unwrap();
+    assert_eq!(ev.step, PromoteStep::AfterRead);
+    promote_proceed.send(()).unwrap();
+
     let ev = promote_events.recv().await.unwrap();
     assert_eq!(ev.step, PromoteStep::BeforeCas);
     // CAS SYNCING→DIRTY will fail (block is NP).
@@ -2756,6 +2766,9 @@ async fn pf03_promote_pwrite_concurrent_with_eviction() {
 
     // Wait for promote to reach BeforeCas (pwrite already done).
     promote_events.recv().await.unwrap(); // AfterCloneArc
+    promote_proceed.send(()).unwrap();
+    let ev = promote_events.recv().await.unwrap();
+    assert_eq!(ev.step, PromoteStep::AfterRead);
     promote_proceed.send(()).unwrap();
     let ev = promote_events.recv().await.unwrap();
     assert_eq!(ev.step, PromoteStep::BeforeCas);

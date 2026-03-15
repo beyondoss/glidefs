@@ -59,7 +59,11 @@ pub struct FlushStats {
     /// Blocks left dirty because a concurrent write changed their sequence
     /// during the flush cycle (CAS failure on the sequence-number check).
     pub blocks_cas_failed: usize,
-    /// Blocks skipped due to CRC32 mismatch while SYNCING (write race or SSD corruption).
+    /// Blocks skipped due to CRC32 mismatch while still SYNCING. Includes both
+    /// benign write races (a write landed between CRC pre-pass and rotation,
+    /// producing a stale baseline CRC) and genuine SSD read instability.
+    /// Occasional spikes under write-heavy workloads are expected; a persistent
+    /// non-zero value at low write rates warrants SSD health investigation.
     pub blocks_crc_mismatched: usize,
     /// Number of pack objects uploaded.
     pub packs_uploaded: usize,

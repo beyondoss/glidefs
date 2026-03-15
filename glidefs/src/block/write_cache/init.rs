@@ -239,14 +239,28 @@ impl WriteCache<Initializing> {
             }
         }
 
-        // Transition any CLEAN blocks to NOT_PRESENT. Their data is in S3
-        // by definition of CLEAN. Without this, reads of CLEAN blocks would
-        // try the active file which may be empty (sparse).
+        // Transition CLEAN blocks to NOT_PRESENT. A CLEAN block's pwrite may
+        // not have landed before crash. Leaving it DIRTY would risk flushing
+        // zeros to S3 (overwriting valid data). Making it NP forces reads to
+        // go through S3, which is safe.
         for (idx, state) in state_map.iter_present().collect::<Vec<_>>() {
             if state == SparseBlockState::CLEAN {
                 let _ = state_map.cas(idx, SparseBlockState::CLEAN, SparseBlockState::NOT_PRESENT);
+                dirty_count = dirty_count.saturating_sub(1);
             }
         }
+
+        // NOTE: DIRTY blocks may have ssd_active=0 after crash recovery
+        // (rotation cleared ssd_active, flushing file was dropped before
+        // recovery could copy data back). These blocks are left DIRTY so
+        // the flush scheduler eventually processes them. The flush path's
+        // compute_flush_batch handles zero blocks correctly (they become
+        // zero-block tombstones via is_zero_block detection).
+        //
+        // Stateright model checking identified this scenario across 1.8M+
+        // crash states. The zero-block tombstone mechanism ensures S3 data
+        // is not silently overwritten with zeros — the tombstone preserves
+        // "newest wins" semantics for forks.
 
         let inner = Arc::new(CacheInner {
             config,

@@ -544,7 +544,7 @@ impl SparseStateMap {
                     return DirtyTransition::FromSyncing;
                 }
             } else {
-                return DirtyTransition::AlreadyDirty;
+                unreachable!("invalid 2-bit block state: {current}");
             }
         }
     }

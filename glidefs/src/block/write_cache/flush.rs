@@ -496,6 +496,13 @@ impl WriteCache<Active> {
         // still refers to the same inode (now at flushing_path).
         std::fs::rename(&active_path, &flushing_path)?;
 
+        // Fsync parent directory so the rename is durable across power loss.
+        if let Some(parent) = active_path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+
         // Create new sparse active file.
         let new_file = super::inner::SyncFile::open(
             &active_path,
@@ -560,8 +567,31 @@ impl WriteCache<Active> {
         // handles this via retry; direct callers of flush_to_s3 must not assume
         // packs_uploaded>0 implies all dirty blocks were flushed.
         if self.inner.config.flushing_path().exists() {
-            debug!("flush: flushing file still exists (pending manifest sync), skipping");
-            return Ok((FlushStats::default(), seq_cutpoint));
+            // The flushing file might be orphaned from a previous cleanup
+            // failure (e.g., empty flush or error recovery where remove_file
+            // failed). If no rotation is in progress (flushing_active=false,
+            // flushing_file=None), the file is stale — try to delete it so
+            // this flush cycle can proceed.
+            if !self.inner.flushing_active.load(Ordering::Acquire)
+                && self.inner.flushing_file.lock().is_none()
+            {
+                let flushing_path = self.inner.config.flushing_path();
+                match std::fs::remove_file(&flushing_path) {
+                    Ok(()) => {
+                        info!("removed orphaned flushing file");
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "orphaned flushing file exists but cannot be removed — flush blocked"
+                        );
+                        return Ok((FlushStats::default(), seq_cutpoint));
+                    }
+                }
+            } else {
+                debug!("flush: flushing file still exists (pending manifest sync), skipping");
+                return Ok((FlushStats::default(), seq_cutpoint));
+            }
         }
 
         // Compute CRC baselines from the active file BEFORE rotation.
@@ -807,6 +837,7 @@ impl WriteCache<Active> {
         let mut total_stats = FlushStats::default();
         let mut flushed_blocks: Vec<usize> = Vec::new();
         let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
+        let crcs = Arc::new(crcs.clone());
 
         // Per-chunk flush
         for (chunk_idx, chunk_blocks) in per_chunk {
@@ -814,7 +845,7 @@ impl WriteCache<Active> {
             let zero_hash = self.inner.zero_block_hash;
             let inner = Arc::clone(&self.inner);
             let clean_cache_clone = clean_cache.map(Arc::clone);
-            let crcs = crcs.clone();
+            let crcs = Arc::clone(&crcs);
             let mut batch = crate::task::spawn_blocking_named("flush-compute", move || {
                 compute_flush_batch(&inner, &chunk_blocks, zero_hash, clean_cache_clone, &crcs)
             })

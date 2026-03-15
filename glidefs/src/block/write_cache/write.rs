@@ -175,26 +175,27 @@ impl WriteCache<Active> {
             ));
         }
 
-        // CRITICAL: Mark blocks as present BEFORE writing zeros to file.
-        // Same invariant as write() — prevents prefetch race where prefetch
-        // could overwrite our zeros with stale S3 data.
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
+
+        // Hold the data_file read lock across promote + set_present + zero +
+        // dirty marking (same rotation race as write() — see comment there).
+        let df = self.inner.data_file.read();
+
+        // Promote SYNCING blocks from flushing → active before zeroing.
+        // Also recovers NOT_PRESENT blocks if flushing file is still available.
+        self.inner.promote_syncing_blocks(&df, start_block, end_block, false)?;
+
+        // Mark blocks present AFTER promote but BEFORE zero write.
+        // Same invariant as write() — prevents prefetch race where prefetch
+        // could overwrite our zeros with stale S3 data.
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx < self.inner.num_blocks {
                 self.inner.set_present(idx);
             }
         }
-
-        // Hold the data_file read lock across zero + dirty marking (same
-        // rotation race as write() — see comment there).
-        let df = self.inner.data_file.read();
-
-        // Promote SYNCING blocks from flushing → active before zeroing.
-        // Also recovers NOT_PRESENT blocks if flushing file is still available.
-        self.inner.promote_syncing_blocks(&df, start_block, end_block, false)?;
 
         // Zero the file range (after claiming blocks via set_present)
         #[cfg(target_os = "linux")]
