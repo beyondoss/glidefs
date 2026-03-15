@@ -477,7 +477,9 @@ impl CacheInner {
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
 
-        let mut crcs = self.write_crcs.lock();
+        // Compute CRCs outside the lock — CRC32 is the expensive part.
+        let num_blocks = (end_block - start_block + 1) as usize;
+        let mut computed = Vec::with_capacity(num_blocks);
         for block in start_block..=end_block {
             let idx = block as u32;
             let block_start = block * block_size;
@@ -489,6 +491,11 @@ impl CacheInner {
             } else {
                 0
             };
+            computed.push((idx, data_crc));
+        }
+
+        let mut crcs = self.write_crcs.lock();
+        for (idx, data_crc) in computed {
             if let Some(entry) = crcs.iter_mut().find(|(i, _)| *i == idx) {
                 entry.1 = data_crc;
             } else {
