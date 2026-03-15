@@ -780,16 +780,7 @@ impl BlockHandler {
         // Cost: one backfill per block per eviction cycle. Hot blocks pay
         // once after each flush; cold blocks pay once ever.
         //
-        // Retry on BlockEvicted: flush rotation can evict a block between
-        // the handler's state check and cache.write's pwrite. The retry
-        // re-checks state and re-backfills from S3 if needed.
-        loop {
-            match self.backfill_and_write(offset, data).await {
-                Ok(()) => break,
-                Err(CommandError::BlockEvicted) => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        self.backfill_and_write(offset, data).await?;
 
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(
