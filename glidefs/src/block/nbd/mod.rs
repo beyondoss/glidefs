@@ -317,6 +317,17 @@ impl NbdDeviceManager {
         // for the previous mount to fully release before returning —
         // otherwise callers like e2fsck will see "device in use".
         wait_for_device_exclusive(&dev_path).await;
+
+        // Flush the kernel's buffer cache for this block device. After a
+        // crash-disconnect, ext4's error-handling path creates dirty pages
+        // (superblock error flags, journal abort) AFTER the disconnect's
+        // set_capacity(0) truncated the page cache. These orphaned dirty
+        // pages survive reconnection because set_capacity(N) only truncates
+        // pages beyond N. Without this flush, subsequent readers (e2fsck,
+        // mount) hit the stale buffer cache instead of reading fresh data
+        // through the new NBD session, causing cumulative corruption.
+        flush_block_device_buffers(&dev_path);
+
         info!(
             export = %export_name,
             path = %dev_path.display(),
@@ -492,6 +503,29 @@ async fn wait_for_device_exclusive(dev_path: &Path) {
             return;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Flush the kernel's buffer cache for a block device.
+///
+/// Uses the `BLKFLSBUF` ioctl to discard all cached pages, forcing
+/// subsequent reads to go through the block device (and thus through
+/// the NBD session handler) instead of serving stale data.
+fn flush_block_device_buffers(dev_path: &Path) {
+    use std::os::unix::io::AsRawFd;
+
+    // BLKFLSBUF = 0x1261
+    const BLKFLSBUF: libc::c_ulong = 0x1261;
+
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(dev_path) else {
+        warn!(dev = %dev_path.display(), "could not open device to flush buffer cache");
+        return;
+    };
+    // SAFETY: BLKFLSBUF takes no argument (third param ignored).
+    let ret = unsafe { libc::ioctl(file.as_raw_fd(), BLKFLSBUF) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        warn!(dev = %dev_path.display(), error = %err, "BLKFLSBUF ioctl failed");
     }
 }
 
