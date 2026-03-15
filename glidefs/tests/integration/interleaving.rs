@@ -2136,7 +2136,11 @@ async fn wf_write_during_syncing_with_flush_gate() {
     assert_eq!(cache.block_state(0), 2, "block should be DIRTY after promote");
 
     // Release flush to continue (compute, upload, evict).
+    flush_proceed.send(()).unwrap(); // proceed past AfterCompute
+    let ev = flush_events.recv().await.unwrap();
+    assert_eq!(ev.step, FlushStep::AfterCompute);
     flush_proceed.send(()).unwrap(); // proceed past BeforeEvict
+
     let ev = flush_events.recv().await.unwrap();
     assert_eq!(ev.step, FlushStep::BeforeEvict);
     flush_proceed.send(()).unwrap(); // proceed with eviction
@@ -2205,6 +2209,10 @@ async fn wf13_write_between_crc_and_rotation() {
     // Flush continues. Let it run to completion.
     let ev = flush_events.recv().await.unwrap();
     assert_eq!(ev.step, FlushStep::AfterRotation);
+    flush_proceed.send(()).unwrap();
+
+    let ev = flush_events.recv().await.unwrap();
+    assert_eq!(ev.step, FlushStep::AfterCompute);
     flush_proceed.send(()).unwrap();
 
     let ev = flush_events.recv().await.unwrap();
@@ -2414,6 +2422,8 @@ async fn rf03_read_syncing_during_compute() {
 
     // Release flush to complete.
     flush_proceed.send(()).unwrap(); // proceed to compute+upload
+    flush_events.recv().await.unwrap(); // AfterCompute
+    flush_proceed.send(()).unwrap();
     flush_events.recv().await.unwrap(); // BeforeEvict
     flush_proceed.send(()).unwrap();
     flush_events.recv().await.unwrap(); // AfterEvict
@@ -2567,6 +2577,8 @@ async fn wf01_write_during_crc_prepass() {
     flush_proceed.send(()).unwrap();
     flush_events.recv().await.unwrap(); // AfterRotation
     flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterCompute
+    flush_proceed.send(()).unwrap();
     flush_events.recv().await.unwrap(); // BeforeEvict
     flush_proceed.send(()).unwrap();
     flush_events.recv().await.unwrap(); // AfterEvict
@@ -2619,6 +2631,8 @@ async fn wf06_promote_concurrent_with_compute() {
     cache.write(0, &sub).unwrap();
 
     // Block 0 is now DIRTY (promoted). Release flush to compute+upload.
+    flush_proceed.send(()).unwrap();
+    flush_events.recv().await.unwrap(); // AfterCompute
     flush_proceed.send(()).unwrap();
     flush_events.recv().await.unwrap(); // BeforeEvict
     flush_proceed.send(()).unwrap();

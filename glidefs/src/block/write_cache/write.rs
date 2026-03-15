@@ -7,6 +7,49 @@ use crate::block::wal::serialize_entry;
 use super::{CacheError, WriteCache};
 
 impl WriteCache<Active> {
+    /// Build WAL entries for non-dirty blocks, append to WAL, sync if configured,
+    /// then transition states to DIRTY.
+    ///
+    /// Must be called while holding a `data_file` lock guard (read or write).
+    /// The `df` reference is needed for `sync_all()` when `wal_sync` is enabled.
+    fn wal_append_and_mark_dirty(
+        &self,
+        df: &super::inner::SyncFile,
+        start_block: u64,
+        end_block: u64,
+    ) -> Result<(), CacheError> {
+        let mut batch = Vec::new();
+        let mut to_dirty: Vec<usize> = Vec::new();
+        for block in start_block..=end_block {
+            let idx = block as usize;
+            if idx >= self.inner.num_blocks {
+                continue;
+            }
+            let state = self.inner.state_map.get(idx);
+            if state != SparseBlockState::DIRTY {
+                let seq = self.inner.sequence.next();
+                serialize_entry(&mut batch, block, seq);
+                to_dirty.push(idx);
+            }
+        }
+
+        if !batch.is_empty() {
+            self.inner.wal.append_batch(&batch)?;
+            if self.inner.config.wal_sync {
+                df.sync_all()?;
+                self.inner.wal.sync()?;
+            } else {
+                self.inner.wal.flush()?;
+            }
+        }
+
+        for idx in to_dirty {
+            self.inner.transition_to_dirty(idx);
+        }
+
+        Ok(())
+    }
+
     /// Write data to the cache.
     ///
     /// Data is written to the local SSD and the affected blocks are marked dirty and present.
@@ -109,39 +152,7 @@ impl WriteCache<Active> {
 
         df.write_all_at(data, offset)?;
 
-        // Build WAL batch for blocks that aren't already dirty, but DON'T
-        // transition state yet. WAL must be durable before state transitions
-        // so a crash between WAL append failure and state change can't leave
-        // blocks dirty-in-memory with no WAL record.
-        let mut batch = Vec::new();
-        let mut to_dirty: Vec<usize> = Vec::new();
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx >= self.inner.num_blocks {
-                continue;
-            }
-            let state = self.inner.state_map.get(idx);
-            if state != SparseBlockState::DIRTY {
-                let seq = self.inner.sequence.next();
-                serialize_entry(&mut batch, block, seq);
-                to_dirty.push(idx);
-            }
-        }
-
-        if !batch.is_empty() {
-            self.inner.wal.append_batch(&batch)?;
-            if self.inner.config.wal_sync {
-                df.sync_all()?;
-                self.inner.wal.sync()?;
-            } else {
-                self.inner.wal.flush()?;
-            }
-        }
-
-        // WAL is appended — now transition states.
-        for idx in to_dirty {
-            self.inner.transition_to_dirty(idx);
-        }
+        self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
 
         drop(df);
 
@@ -233,41 +244,7 @@ impl WriteCache<Active> {
             self.zero_range_fallback_with(&df, offset, len)?;
         }
 
-        // Build WAL batch first, then transition states after WAL is durable.
-        {
-            let block_size = self.inner.config.block_size as u64;
-            let start_block = offset / block_size;
-            let end_block = (end - 1) / block_size;
-
-            let mut batch = Vec::new();
-            let mut to_dirty: Vec<usize> = Vec::new();
-            for block in start_block..=end_block {
-                let idx = block as usize;
-                if idx >= self.inner.num_blocks {
-                    continue;
-                }
-                let state = self.inner.state_map.get(idx);
-                if state != SparseBlockState::DIRTY {
-                    let seq = self.inner.sequence.next();
-                    serialize_entry(&mut batch, block, seq);
-                    to_dirty.push(idx);
-                }
-            }
-
-            if !batch.is_empty() {
-                self.inner.wal.append_batch(&batch)?;
-                if self.inner.config.wal_sync {
-                    df.sync_all()?;
-                    self.inner.wal.sync()?;
-                } else {
-                    self.inner.wal.flush()?;
-                }
-            }
-
-            for idx in to_dirty {
-                self.inner.transition_to_dirty(idx);
-            }
-        }
+        self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
 
         drop(df);
 
@@ -400,35 +377,7 @@ impl WriteCache<Active> {
 
         df.write_all_at(data, offset)?;
 
-        // Build WAL batch first, then transition states after WAL is durable.
-        let mut batch = Vec::new();
-        let mut to_dirty: Vec<usize> = Vec::new();
-        for block in start_block..=end_block {
-            let idx = block as usize;
-            if idx >= self.inner.num_blocks {
-                continue;
-            }
-            let state = self.inner.state_map.get(idx);
-            if state != SparseBlockState::DIRTY {
-                let seq = self.inner.sequence.next();
-                serialize_entry(&mut batch, block, seq);
-                to_dirty.push(idx);
-            }
-        }
-
-        if !batch.is_empty() {
-            self.inner.wal.append_batch(&batch)?;
-            if self.inner.config.wal_sync {
-                df.sync_all()?;
-                self.inner.wal.sync()?;
-            } else {
-                self.inner.wal.flush()?;
-            }
-        }
-
-        for idx in to_dirty {
-            self.inner.transition_to_dirty(idx);
-        }
+        self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
 
         drop(df);
 
