@@ -308,10 +308,10 @@ pub(crate) struct CacheInner {
     pub(crate) manifest_etag: Mutex<Option<String>>,
 
     /// Per-page CRC32C checksums captured at pwrite time from the guest's write
-    /// buffer. Lock-free queue of (block, page, crc) tuples — writes push
-    /// entries with zero contention, drain pops them in bulk at flush time.
-    /// Memory scales with write throughput, not device size.
-    pub(super) page_crcs: crossbeam::queue::SegQueue<(u32, u16, u32)>,
+    /// buffer. One entry per block, value is per-page CRC array. Upsert via
+    /// `insert()` — allocation happens outside the shard lock, lock hold time
+    /// is just a pointer swap.
+    pub(super) page_crcs: dashmap::DashMap<u32, Box<[u32]>>,
 
     /// Number of 4KB pages per block (block_size / 4096).
     pub(super) pages_per_block: usize,
@@ -474,9 +474,8 @@ impl CacheInner {
     /// Record per-page CRCs from the guest's write buffer.
     ///
     /// For each 4KB page fully covered by the write, computes CRC32C and
-    /// pushes (block, page, crc) to the lock-free queue. Partially covered
-    /// pages push CRC = 0 (skip verification). Lock-free: no shard locks,
-    /// no hashing, no allocations on 31/32 pushes.
+    /// upserts into the DashMap. Allocation of the per-block CRC array
+    /// happens outside the shard lock — lock hold time is a pointer swap.
     #[inline]
     pub(super) fn capture_page_crcs(&self, offset: u64, data: &[u8]) {
         const PAGE_SIZE: u64 = 4096;
@@ -484,15 +483,24 @@ impl CacheInner {
         let end = offset + data.len() as u64;
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
+        let ppb = self.pages_per_block;
 
         // Fast path: single page-aligned write within one block (common case).
         if start_block == end_block
             && offset % PAGE_SIZE == 0
             && data.len() == PAGE_SIZE as usize
         {
-            let page = ((offset % block_size) / PAGE_SIZE) as u16;
+            let page = ((offset % block_size) / PAGE_SIZE) as usize;
             let crc = crc_fast::crc32_iscsi(data);
-            self.page_crcs.push((start_block as u32, page, crc));
+            // Try update existing entry first (common after first write).
+            if let Some(mut entry) = self.page_crcs.get_mut(&(start_block as u32)) {
+                entry[page] = crc;
+            } else {
+                // Allocate outside any lock, then insert.
+                let mut crcs = vec![0u32; ppb].into_boxed_slice();
+                crcs[page] = crc;
+                self.page_crcs.insert(start_block as u32, crcs);
+            }
             return;
         }
 
@@ -500,27 +508,39 @@ impl CacheInner {
         for block in start_block..=end_block {
             let block_start = block * block_size;
 
-            for page in 0..self.pages_per_block {
-                let page_start = block_start + (page as u64) * PAGE_SIZE;
-                let page_end = page_start + PAGE_SIZE;
-
-                if offset <= page_start && end >= page_end {
-                    let slice_start = (page_start - offset) as usize;
-                    let crc = crc_fast::crc32_iscsi(
-                        &data[slice_start..slice_start + PAGE_SIZE as usize],
-                    );
-                    self.page_crcs.push((block as u32, page as u16, crc));
-                } else if end > page_start && offset < page_end {
-                    self.page_crcs.push((block as u32, page as u16, 0));
+            if let Some(mut entry) = self.page_crcs.get_mut(&(block as u32)) {
+                for page in 0..ppb {
+                    let page_start = block_start + (page as u64) * PAGE_SIZE;
+                    let page_end = page_start + PAGE_SIZE;
+                    if offset <= page_start && end >= page_end {
+                        let slice_start = (page_start - offset) as usize;
+                        entry[page] = crc_fast::crc32_iscsi(
+                            &data[slice_start..slice_start + PAGE_SIZE as usize],
+                        );
+                    } else if end > page_start && offset < page_end {
+                        entry[page] = 0;
+                    }
                 }
+            } else {
+                let mut crcs = vec![0u32; ppb].into_boxed_slice();
+                for page in 0..ppb {
+                    let page_start = block_start + (page as u64) * PAGE_SIZE;
+                    let page_end = page_start + PAGE_SIZE;
+                    if offset <= page_start && end >= page_end {
+                        let slice_start = (page_start - offset) as usize;
+                        crcs[page] = crc_fast::crc32_iscsi(
+                            &data[slice_start..slice_start + PAGE_SIZE as usize],
+                        );
+                    } else if end > page_start && offset < page_end {
+                        crcs[page] = 0;
+                    }
+                }
+                self.page_crcs.insert(block as u32, crcs);
             }
         }
     }
 
     /// Record per-page CRCs for a zero_range operation.
-    ///
-    /// Each fully-zeroed 4KB page gets CRC32C of 4096 zero bytes.
-    /// Partially zeroed pages get CRC = 0 (no verification).
     pub(super) fn capture_zero_page_crcs(&self, offset: u64, len: u64) {
         const PAGE_SIZE: u64 = 4096;
         let zero_page_crc = crc_fast::crc32_iscsi(&[0u8; 4096]);
@@ -528,19 +548,33 @@ impl CacheInner {
         let end = offset + len;
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
+        let ppb = self.pages_per_block;
 
         for block in start_block..=end_block {
             let block_start = block * block_size;
 
-            for page in 0..self.pages_per_block {
-                let page_start = block_start + (page as u64) * PAGE_SIZE;
-                let page_end = page_start + PAGE_SIZE;
-
-                if offset <= page_start && end >= page_end {
-                    self.page_crcs.push((block as u32, page as u16, zero_page_crc));
-                } else if end > page_start && offset < page_end {
-                    self.page_crcs.push((block as u32, page as u16, 0));
+            if let Some(mut entry) = self.page_crcs.get_mut(&(block as u32)) {
+                for page in 0..ppb {
+                    let page_start = block_start + (page as u64) * PAGE_SIZE;
+                    let page_end = page_start + PAGE_SIZE;
+                    if offset <= page_start && end >= page_end {
+                        entry[page] = zero_page_crc;
+                    } else if end > page_start && offset < page_end {
+                        entry[page] = 0;
+                    }
                 }
+            } else {
+                let mut crcs = vec![0u32; ppb].into_boxed_slice();
+                for page in 0..ppb {
+                    let page_start = block_start + (page as u64) * PAGE_SIZE;
+                    let page_end = page_start + PAGE_SIZE;
+                    if offset <= page_start && end >= page_end {
+                        crcs[page] = zero_page_crc;
+                    } else if end > page_start && offset < page_end {
+                        crcs[page] = 0;
+                    }
+                }
+                self.page_crcs.insert(block as u32, crcs);
             }
         }
     }
