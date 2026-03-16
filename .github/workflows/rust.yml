@@ -151,9 +151,9 @@ jobs:
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
       - name: fio benchmark (ublk)
-        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features fio-bench --test fio_bench -- --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
       - name: fio verify (ublk)
-        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features fio-bench --test fio_verify -- --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
       - name: Test (ublk)
         run: cargo test -p glidefs --features ublk,test-utils --verbose
       - name: Docker integration (ublk)

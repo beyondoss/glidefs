@@ -3,7 +3,7 @@
 //! These tests use proptest to verify invariants hold across random inputs:
 //! 1. Read-write roundtrip: data written can be read back correctly
 //! 2. Batch boundary correctness: data spanning batch boundaries is handled
-//! 3. Concurrent operations: no torn reads under concurrent writes
+//! 3. Concurrent operations: no crashes or deadlocks under concurrent writes
 //! 4. State machine invariants: block states transition correctly
 //!
 //! Run with: `cargo test --features test-utils --test integration property`

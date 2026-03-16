@@ -65,6 +65,12 @@ pub struct FlushStats {
     /// Occasional spikes under write-heavy workloads are expected; a persistent
     /// non-zero value at low write rates warrants SSD health investigation.
     pub blocks_crc_mismatched: usize,
+    /// CRC queue entries drained this flush cycle. Includes duplicates from
+    /// overwrites to the same page between flushes.
+    pub crc_entries_drained: usize,
+    /// Unique blocks with CRC data after dedup (queue entries collapsed to
+    /// one entry per page). Ratio of drained/unique = duplication factor.
+    pub crc_unique_blocks: usize,
     /// Number of pack objects uploaded.
     pub packs_uploaded: usize,
     /// Total bytes uploaded to S3.

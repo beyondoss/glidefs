@@ -65,7 +65,7 @@ fn compute_flush_batch(
     snapshot: &[usize],
     zero_hash: Blake3Hash,
     clean_cache: Option<Arc<dyn BlockCache>>,
-    crcs: &HashMap<usize, u32>,
+    crcs: &HashMap<usize, Box<[u32]>>,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
 
@@ -105,14 +105,25 @@ fn compute_flush_batch(
                 chunk_buf[valid_bytes..].fill(0);
             }
 
-            // Verify CRC32 against the pre-rotation baseline (if available).
-            // State discrimination distinguishes corruption from concurrent writes:
-            // - Block still SYNCING → CRC mismatch is SSD corruption or stale
-            //   CRC from a write between pre-pass and rotation (retries next cycle)
-            // - Block now DIRTY → write re-dirtied it → stale CRC, not corruption
-            if let Some(&stored_crc) = crcs.get(&chunk_index) {
-                let computed_crc = crc32fast::hash(&chunk_buf);
-                if computed_crc != stored_crc {
+            // Verify per-page CRC32C against write-time baselines.
+            // Each 4KB page within the block is checked independently.
+            // Pages with stored CRC = 0 are skipped (partial writes).
+            if let Some(page_crcs) = crcs.get(&chunk_index) {
+                const PAGE_SIZE: usize = 4096;
+                let mut any_mismatch = false;
+                for (page, &stored_crc) in page_crcs.iter().enumerate() {
+                    if stored_crc == 0 {
+                        continue;
+                    }
+                    let page_start = page * PAGE_SIZE;
+                    let page_end = (page_start + PAGE_SIZE).min(chunk_buf.len());
+                    let computed_crc = crc_fast::crc32_iscsi(&chunk_buf[page_start..page_end]);
+                    if computed_crc != stored_crc {
+                        any_mismatch = true;
+                        break;
+                    }
+                }
+                if any_mismatch {
                     let current_state = inner.state_map.get(chunk_index);
                     if current_state != SparseBlockState::SYNCING {
                         return Ok(BlockResult::Skipped {
@@ -123,9 +134,7 @@ fn compute_flush_batch(
                     }
                     debug!(
                         chunk_index,
-                        stored_crc,
-                        computed_crc,
-                        "CRC mismatch — block will retry next flush cycle"
+                        "page CRC mismatch — block will retry next flush cycle"
                     );
                     return Ok(BlockResult::Skipped {
                         chunk_index,
@@ -223,48 +232,21 @@ fn compute_flush_batch(
     })
 }
 
-/// Compute CRC32 checksums for all dirty blocks from the active data file.
-/// Returns (crcs, read_error_count). Called immediately before rotation so
-/// the CRCs can be verified against the flushing file after rotation.
-fn compute_flush_crcs(inner: &CacheInner) -> (HashMap<usize, u32>, usize) {
-    use rayon::prelude::*;
-
-    let dirty_indices: Vec<usize> = inner
-        .state_map
-        .iter_with_state(SparseBlockState::DIRTY)
-        .collect();
-
-    if dirty_indices.is_empty() {
-        return (HashMap::new(), 0);
-    }
-
-    let block_size = inner.config.block_size;
-    let device_size = inner.config.device_size;
-    let results: Vec<Option<(usize, u32)>> = dirty_indices
-        .par_iter()
-        .map(|&idx| {
-            let offset = idx as u64 * block_size as u64;
-            let valid_bytes = std::cmp::min(
-                block_size as u64,
-                device_size.saturating_sub(offset),
-            ) as usize;
-            if valid_bytes == 0 {
-                return Some((idx, crc32fast::hash(&[])));
-            }
-            let mut buf = vec![0u8; block_size];
-            if inner.data_file.read().read_exact_at(&mut buf[..valid_bytes], offset).is_err() {
-                return None;
-            }
-            if valid_bytes < block_size {
-                buf[valid_bytes..].fill(0);
-            }
-            Some((idx, crc32fast::hash(&buf)))
-        })
-        .collect();
-
-    let read_errors = results.iter().filter(|r| r.is_none()).count();
-    let crcs: HashMap<usize, u32> = results.into_iter().flatten().collect();
-    (crcs, read_errors)
+/// Drain per-page CRC32C baselines captured at pwrite time.
+///
+/// Drain per-page CRC32C baselines captured at pwrite time.
+///
+/// Removes all entries from the DashMap, returning them for verification.
+/// The DashMap shrinks back to empty after each flush cycle.
+fn drain_page_crcs(inner: &CacheInner) -> HashMap<usize, Box<[u32]>> {
+    let mut map = HashMap::with_capacity(inner.page_crcs.len());
+    // retain() with always-false predicate: removes every entry, giving
+    // us ownership of the values. Locks each shard once.
+    inner.page_crcs.retain(|key, value| {
+        map.insert(*key as usize, value.clone());
+        false // remove
+    });
+    map
 }
 
 impl WriteCache<Active> {
@@ -293,6 +275,12 @@ impl WriteCache<Active> {
     /// Get the number of blocks currently being synced.
     pub fn syncing_block_count(&self) -> u64 {
         self.inner.syncing_block_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of CRC entries pending drain. Indicates queue memory pressure —
+    /// grows with write throughput between flush cycles, drains to zero on flush.
+    pub fn pending_crc_count(&self) -> usize {
+        self.inner.page_crcs.len()
     }
 
     /// Number of recovery issues encountered during cache open.
@@ -464,12 +452,13 @@ impl WriteCache<Active> {
     /// Core rotation logic. If `snapshot` is true, captures dirty block
     /// indices under the write lock before swapping files.
     ///
-    /// The entire rotation is one atomic critical section under a single
-    /// write-lock acquisition. This eliminates a class of races where
-    /// state changes (CAS, file swap) span non-atomic windows. The lock
-    /// holds for ~15µs on typical hardware — rename is an inode pointer
-    /// swap, file creation is a single syscall, and the CAS loop touches
-    /// only cache-hot atomics.
+    /// The critical section under the write lock covers: rename, new file
+    /// creation, CAS DIRTY→SYNCING, handle swap, and flushing_file
+    /// assignment. Dir fsync runs after the lock is released — it only
+    /// makes the rename durable across power loss and does not affect
+    /// correctness of concurrent I/O. If a crash occurs before dir fsync,
+    /// the rename may be lost, but crash recovery handles the resulting
+    /// state (no flushing file → SYNCING blocks converted to DIRTY).
     ///
     /// All DIRTY blocks are claimed (CAS DIRTY→SYNCING).
     fn rotate_data_file_inner(&self, snapshot: bool) -> Result<(Vec<usize>, ()), CacheError> {
@@ -496,32 +485,26 @@ impl WriteCache<Active> {
         // still refers to the same inode (now at flushing_path).
         std::fs::rename(&active_path, &flushing_path)?;
 
-        // Fsync parent directory so the rename is durable across power loss.
-        if let Some(parent) = active_path.parent() {
-            match std::fs::File::open(parent) {
-                Ok(dir) => {
-                    if let Err(e) = dir.sync_all() {
-                        warn!(
-                            error = %e,
-                            "dir fsync after rotation failed — durability weakened"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "failed to open parent dir for fsync after rotation — durability weakened"
-                    );
-                }
-            }
-        }
-
-        // Create new sparse active file.
-        let new_file = super::inner::SyncFile::open(
+        // Create new sparse active file. If this fails (e.g. inode
+        // exhaustion), undo the rename and reset flags so future flush
+        // cycles aren't permanently blocked.
+        let new_file = match super::inner::SyncFile::open(
             &active_path,
             true,
             self.inner.config.device_size,
-        )?;
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                // Undo: rename flushing back to active. The data_file_guard
+                // still holds the old fd (same inode), so I/O continues
+                // against whatever path the inode lives at. Restoring the
+                // original path keeps the on-disk state consistent.
+                let _ = std::fs::rename(&flushing_path, &active_path);
+                self.inner.flushing_active.store(false, Ordering::Release);
+                self.inner.rotation_seq.store(0, Ordering::Release);
+                return Err(CacheError::Io(e));
+            }
+        };
 
         // Snapshot dirty blocks: CAS DIRTY→SYNCING under the lock.
         let claimed = if snapshot {
@@ -548,6 +531,31 @@ impl WriteCache<Active> {
         *self.inner.flushing_file.lock() = Some(Arc::new(old_file));
 
         drop(data_file_guard);
+        // === Write lock released — concurrent I/O resumes ===
+
+        // Fsync parent directory so the rename is durable across power loss.
+        // Runs outside the write lock: dir fsync can take 1-5ms on SATA SSDs
+        // and we don't need to block concurrent reads/writes for it. If we
+        // crash before this completes, the rename may be lost — recovery
+        // finds no flushing file and converts SYNCING→DIRTY (safe).
+        if let Some(parent) = active_path.parent() {
+            match std::fs::File::open(parent) {
+                Ok(dir) => {
+                    if let Err(e) = dir.sync_all() {
+                        warn!(
+                            error = %e,
+                            "dir fsync after rotation failed — durability weakened"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "failed to open parent dir for fsync after rotation — durability weakened"
+                    );
+                }
+            }
+        }
 
         info!("rotated data file for flush");
         Ok((claimed, ()))
@@ -607,18 +615,9 @@ impl WriteCache<Active> {
             }
         }
 
-        // Compute CRC baselines from the active file BEFORE rotation.
-        // These are verified against the flushing file after rotation.
-        let inner_clone = Arc::clone(&self.inner);
-        let crcs = crate::task::spawn_blocking_named("flush-crcs", move || {
-            let (crcs, read_errors) = compute_flush_crcs(&inner_clone);
-            if read_errors > 0 {
-                warn!(read_errors, "dirty blocks had SSD read errors during CRC pre-pass");
-            }
-            crcs
-        })
-        .await
-        .map_err(|e| CacheError::Io(std::io::Error::other(e)))?;
+        // Drain write-time CRC baselines BEFORE rotation.
+        // These were captured from guest write buffers at pwrite time.
+        let crcs = drain_page_crcs(&self.inner);
 
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::AfterCrcPrepass, crcs.len()).await;
@@ -809,7 +808,7 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: Option<&Arc<dyn BlockCache>>,
-        crcs: HashMap<usize, u32>,
+        crcs: HashMap<usize, Box<[u32]>>,
     ) -> Result<FlushStats, CacheError> {
         use crate::block::pack::new_pack_id;
 

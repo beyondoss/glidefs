@@ -562,21 +562,12 @@ async fn test_s3_data_corruption_detected_by_blake3() {
 /// Other blocks should flush successfully.
 #[tokio::test]
 async fn test_ssd_corruption_detected_during_flush() {
-    // With ephemeral CRCs, corruption detection works by comparing two
-    // independent reads of the same physical data: the CRC pre-pass reads
-    // from the active file, then rotation makes it the flushing file, and
-    // compute_flush_batch reads from the flushing file. If the SSD returns
-    // different data for the two reads, the CRC mismatch is detected.
+    // Write-time CRCs are captured from the guest's write buffer at pwrite
+    // time, providing end-to-end integrity: if the SSD silently corrupts
+    // data between pwrite and flush, the CRC mismatch is detected.
     //
-    // Corruption that occurs BEFORE flush_to_s3 is called won't be caught
-    // because both reads see the same (corrupted) data. This is acceptable:
-    // the CRC window is the flush duration (~100ms), and persistent SSD
-    // corruption would need to be detected at the storage layer (dm-integrity,
-    // ZFS checksums).
-    //
-    // This test verifies that flush still works correctly when data is
-    // modified on the active file: write data, flush all blocks, verify
-    // convergence.
+    // This test verifies that SSD corruption after write is detected and
+    // the block retries on the next flush cycle.
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
     let config = test_config(dir.path(), "ssd-corrupt");
@@ -612,8 +603,7 @@ async fn test_ssd_corruption_detected_during_flush() {
     assert_eq!(cache.dirty_block_count(), 0, "all blocks flushed");
 
     // Write new data, then overwrite on SSD (simulating corruption after write).
-    // Both CRC pre-pass and flush will see the overwritten data, so no
-    // mismatch is detected — the "corrupted" data is uploaded as-is.
+    // Write-time CRC was captured from the 0x11 buffer, but the SSD now has 0xFF.
     cache.write(0, &data0).unwrap();
     {
         use std::os::unix::fs::FileExt;
@@ -627,9 +617,9 @@ async fn test_ssd_corruption_detected_during_flush() {
     }
 
     let stats2 = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
-    // No CRC mismatch because both reads see the same "garbage" data.
-    assert_eq!(stats2.blocks_crc_mismatched, 0);
-    assert_eq!(cache.dirty_block_count(), 0);
+    // Write-time CRC detects the corruption: baseline (0x11) != flushing file (0xFF).
+    assert_eq!(stats2.blocks_crc_mismatched, 1);
+    assert_eq!(cache.dirty_block_count(), 1, "corrupted block remains dirty");
 
     // Fix: overwrite with correct data and flush again.
     cache.write(0, &data0).unwrap();

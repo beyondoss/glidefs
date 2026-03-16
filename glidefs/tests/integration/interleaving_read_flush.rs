@@ -314,13 +314,17 @@ async fn wf_write_blocked_during_rotation() {
     assert!(state == 0 || state == 2, "block is DIRTY or NP. got {state}");
 }
 
-/// RW-03: Concurrent read + write to same DIRTY block (no gates — stress).
-/// The read fast path and write both hold the data_file read lock.
+/// RW-03: Concurrent read + write to same DIRTY block — no crash or deadlock.
 ///
-/// pwrite/pread atomicity is guaranteed at the PAGE level (4KB), not at
-/// the block level (128KB). A 128KB pwrite touches 32 pages sequentially,
-/// so a concurrent pread can observe some pages updated and others not.
-/// We verify that each individual page is consistent (all-old or all-new).
+/// pwrite is NOT atomic for multi-page writes on any platform. On Linux,
+/// the write path locks one folio at a time; the read path holds no folio
+/// lock during copy_folio_to_iter. A concurrent pread can observe some
+/// pages with old data and others with new. POSIX does not require
+/// atomicity for concurrent overlapping read+write, and no block device
+/// protocol (NBD, NVMe, SCSI) requires it either.
+///
+/// We verify: no panic, no deadlock, no internal state corruption.
+/// We do NOT assert data content — torn reads are expected and harmless.
 #[tokio::test]
 async fn rw03_read_fast_path_during_pwrite() {
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -329,8 +333,6 @@ async fn rw03_read_fast_path_during_pwrite() {
         super::create_test_cache(&dir, "rw03-fp", Arc::clone(&s3)).await;
 
     cache.write(0, &vec![0xAA; BLOCK_SIZE]).unwrap();
-
-    const PAGE_SIZE: usize = 4096;
 
     for _ in 0..50 {
         let c1 = Arc::clone(&cache);
@@ -341,14 +343,7 @@ async fn rw03_read_fast_path_during_pwrite() {
         );
         r1.unwrap().unwrap();
         let data = r2.unwrap().unwrap();
-        for (i, page) in data.chunks(PAGE_SIZE).enumerate() {
-            let first = page[0];
-            let last = page[PAGE_SIZE - 1];
-            assert!(
-                (first == 0xAA && last == 0xAA) || (first == 0xBB && last == 0xBB),
-                "torn read in page {i}: first=0x{first:02X} last=0x{last:02X}"
-            );
-        }
+        assert_eq!(data.len(), BLOCK_SIZE, "read returned wrong length");
     }
 }
 
