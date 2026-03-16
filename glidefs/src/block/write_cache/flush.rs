@@ -126,10 +126,15 @@ fn compute_flush_batch(
                 if any_mismatch {
                     let current_state = inner.state_map.get(chunk_index);
                     if current_state != SparseBlockState::SYNCING {
+                        // CRC mismatch + block no longer SYNCING: a concurrent
+                        // write re-dirtied the block after our CRC pre-pass.
+                        // Both flags are set so metrics correctly attribute this
+                        // as a CRC mismatch caused by a concurrent write (not
+                        // SSD corruption).
                         return Ok(BlockResult::Skipped {
                             chunk_index,
                             cas_failed: true,
-                            crc_mismatched: false,
+                            crc_mismatched: true,
                         });
                     }
                     debug!(
@@ -312,10 +317,10 @@ impl WriteCache<Active> {
         self.inner.try_set_present(block_idx)
     }
 
-    /// Get the raw block state.
+    /// Get the block state as a typed value.
     #[inline]
-    pub fn block_state(&self, block_idx: usize) -> u8 {
-        self.inner.state_map.get(block_idx)
+    pub fn block_state(&self, block_idx: usize) -> crate::block::block_map::BlockState {
+        crate::block::block_map::BlockState::from_raw(self.inner.state_map.get(block_idx))
     }
 
     /// Save metadata to disk.

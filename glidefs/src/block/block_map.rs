@@ -136,6 +136,73 @@ impl SparseBlockState {
     pub const SYNCING: u8 = 3;
 }
 
+/// Typed block state returned by `WriteCache::block_state()`.
+///
+/// Wraps the raw `u8` from `SparseStateMap` to prevent misuse at the public API
+/// boundary. Internal CAS operations continue using raw `u8` for efficiency.
+///
+/// `PartialEq<u8>` is provided for test ergonomics (`assert_eq!(state, 2)`).
+/// Production code should prefer the named methods (`is_dirty()`, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockState(u8);
+
+impl PartialEq<u8> for BlockState {
+    fn eq(&self, other: &u8) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::fmt::Display for BlockState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => write!(f, "NOT_PRESENT(0)"),
+            1 => write!(f, "CLEAN(1)"),
+            2 => write!(f, "DIRTY(2)"),
+            3 => write!(f, "SYNCING(3)"),
+            v => write!(f, "UNKNOWN({v})"),
+        }
+    }
+}
+
+impl BlockState {
+    #[inline]
+    pub fn is_not_present(self) -> bool {
+        self.0 == SparseBlockState::NOT_PRESENT
+    }
+
+    #[inline]
+    pub fn is_clean(self) -> bool {
+        self.0 == SparseBlockState::CLEAN
+    }
+
+    #[inline]
+    pub fn is_dirty(self) -> bool {
+        self.0 == SparseBlockState::DIRTY
+    }
+
+    #[inline]
+    pub fn is_syncing(self) -> bool {
+        self.0 == SparseBlockState::SYNCING
+    }
+
+    /// True if block has data on local SSD (DIRTY or SYNCING).
+    #[inline]
+    pub fn has_local_data(self) -> bool {
+        self.is_dirty() || self.is_syncing()
+    }
+
+    /// Raw value for test-only instrumentation (BackfillEvent).
+    #[inline]
+    pub fn raw(self) -> u8 {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) fn from_raw(v: u8) -> Self {
+        BlockState(v)
+    }
+}
+
 /// Result of `SparseStateMap::transition_to_dirty()`.
 ///
 /// Tells the caller which source state the block transitioned from,

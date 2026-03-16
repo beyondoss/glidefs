@@ -2693,18 +2693,16 @@ async fn wf12_transition_to_dirty_during_crc() {
     // - NP with data in S3 (flush evicted after write)
     // Either is valid. The key: no corruption, no panic.
     let state = cache.block_state(0);
-    match state {
-        2 => {
-            // DIRTY: write landed after eviction, data on SSD.
-            let b0 = cache.read_local(0, BLOCK_SIZE).unwrap();
-            assert!(b0.iter().all(|&b| b == 0xBB), "DIRTY block has 0xBB. first=0x{:02X}", b0[0]);
-        }
-        0 => {
-            // NP: flush evicted after write. Data is either 0xAA (original)
-            // or 0xBB (write landed before rotation) in S3. Both are valid
-            // last-writer-wins outcomes.
-        }
-        other => panic!("unexpected state {other}"),
+    if state.is_dirty() {
+        // DIRTY: write landed after eviction, data on SSD.
+        let b0 = cache.read_local(0, BLOCK_SIZE).unwrap();
+        assert!(b0.iter().all(|&b| b == 0xBB), "DIRTY block has 0xBB. first=0x{:02X}", b0[0]);
+    } else if state.is_not_present() {
+        // NP: flush evicted after write. Data is either 0xAA (original)
+        // or 0xBB (write landed before rotation) in S3. Both are valid
+        // last-writer-wins outcomes.
+    } else {
+        panic!("unexpected state {state}");
     }
 }
 

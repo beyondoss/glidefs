@@ -409,10 +409,8 @@ impl BlockHandler {
         // CLEAN = claimed but not yet written — must NOT write sub-range yet.
         // NOT_PRESENT = needs backfill.
         {
-            use crate::block::block_map::SparseBlockState;
             let all_ready = (start_block..=end_block).all(|b| {
-                let state = self.cache.block_state(b as usize);
-                state == SparseBlockState::DIRTY || state == SparseBlockState::SYNCING
+                self.cache.block_state(b as usize).has_local_data()
             });
             if all_ready {
                 match self.cache.write_with_eviction_check(offset, data) {
@@ -450,13 +448,12 @@ impl BlockHandler {
             // at any time. If that happens, we must restart the backfill
             // for this block rather than writing into an empty file.
             'block_retry: loop {
-                use crate::block::block_map::SparseBlockState;
                 let state = self.cache.block_state(idx);
 
-                _backfill_gate!(BackfillStep::StateChecked, idx, state);
+                _backfill_gate!(BackfillStep::StateChecked, idx, state.raw());
 
-                match state {
-                    s if s == SparseBlockState::DIRTY || s == SparseBlockState::SYNCING => {
+                match () {
+                    _ if state.has_local_data() => {
                         // Block has data locally. cache.write handles SYNCING
                         // via promote_syncing_blocks (copies from flushing file).
                         // Use eviction check: if flush evicted the block between
@@ -467,12 +464,11 @@ impl BlockHandler {
                             Err(e) => return Err(e.into()),
                         }
                     }
-                    s if s == SparseBlockState::CLEAN => {
+                    _ if state.is_clean() => {
                         // Another writer claimed this block but hasn't written
                         // the merged data yet. Wait for completion.
                         loop {
-                            let st = self.cache.block_state(idx);
-                            if st != SparseBlockState::CLEAN {
+                            if !self.cache.block_state(idx).is_clean() {
                                 break;
                             }
                             tokio::time::sleep(std::time::Duration::from_micros(50)).await;
@@ -558,12 +554,11 @@ impl BlockHandler {
                     CommandError::IoError
                 })?;
 
-                _backfill_gate!(BackfillStep::S3FetchDone, idx, self.cache.block_state(idx));
+                _backfill_gate!(BackfillStep::S3FetchDone, idx, self.cache.block_state(idx).raw());
 
                 // Re-check state after the async fetch. Another writer or
                 // flush rotation may have changed the block state.
-                let post_fetch_state = self.cache.block_state(idx);
-                if post_fetch_state != SparseBlockState::NOT_PRESENT {
+                if !self.cache.block_state(idx).is_not_present() {
                     // State changed during fetch — re-enter outer match.
                     continue 'block_retry;
                 }
@@ -574,7 +569,7 @@ impl BlockHandler {
                     break 'block_retry;
                 }
 
-                _backfill_gate!(BackfillStep::BeforeCas, idx, SparseBlockState::NOT_PRESENT);
+                _backfill_gate!(BackfillStep::BeforeCas, idx, crate::block::block_map::SparseBlockState::NOT_PRESENT);
 
                 // Non-zero prior: claim the block, merge, and write.
                 if !self.cache.try_claim_block(idx) {
@@ -583,7 +578,7 @@ impl BlockHandler {
                     continue 'block_retry;
                 }
 
-                _backfill_gate!(BackfillStep::AfterCas, idx, self.cache.block_state(idx));
+                _backfill_gate!(BackfillStep::AfterCas, idx, self.cache.block_state(idx).raw());
 
                 // We won the claim. Merge guest data onto prior block.
                 let mut block_buf = prior.to_vec();
@@ -600,7 +595,7 @@ impl BlockHandler {
                 block_buf[block_local_start..end]
                     .copy_from_slice(&data[data_offset..data_offset + write_len]);
 
-                _backfill_gate!(BackfillStep::BeforeWrite, idx, self.cache.block_state(idx));
+                _backfill_gate!(BackfillStep::BeforeWrite, idx, self.cache.block_state(idx).raw());
 
                 self.cache.write(block_start, &block_buf)?;
                 break 'block_retry;
@@ -935,16 +930,13 @@ impl BlockHandler {
         // pwrite_and_commit can't recover from this (sync, no S3 access).
         // Re-backfill any blocks that were evicted during the gap.
         {
-            use crate::block::block_map::SparseBlockState;
             let block_size = self.cache.block_size() as u64;
             let start_block = offset / block_size;
             let end_block = (offset + length - 1) / block_size;
             for block in start_block..=end_block {
                 let idx = block as usize;
                 let state = self.cache.block_state(idx);
-                if state == SparseBlockState::SYNCING
-                    || state == SparseBlockState::NOT_PRESENT
-                {
+                if state.is_syncing() || state.is_not_present() {
                     // Block was evicted or is still being flushed.
                     // Re-backfill to ensure it's present before pwrite.
                     self.backfill_blocks_in_range(

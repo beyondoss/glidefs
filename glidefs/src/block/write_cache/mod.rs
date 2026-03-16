@@ -56,14 +56,18 @@ pub struct FlushStats {
     pub blocks_claimed: usize,
     /// Blocks skipped (already in S3 or zero blocks).
     pub blocks_deduped: usize,
-    /// Blocks left dirty because a concurrent write changed their sequence
-    /// during the flush cycle (CAS failure on the sequence-number check).
+    /// Blocks left dirty because a concurrent write re-dirtied them during
+    /// the flush cycle. Detected either by CAS failure on SYNCING→NOT_PRESENT
+    /// or by CRC mismatch when the block is no longer SYNCING.
     pub blocks_cas_failed: usize,
-    /// Blocks skipped due to CRC32 mismatch while still SYNCING. Includes both
-    /// benign write races (a write landed between CRC pre-pass and rotation,
-    /// producing a stale baseline CRC) and genuine SSD read instability.
-    /// Occasional spikes under write-heavy workloads are expected; a persistent
-    /// non-zero value at low write rates warrants SSD health investigation.
+    /// Blocks skipped due to CRC32 mismatch. Includes both benign write races
+    /// (a concurrent write landed between CRC pre-pass and rotation, producing
+    /// a stale baseline CRC — these also increment `blocks_cas_failed`) and
+    /// genuine SSD read instability (state still SYNCING, `blocks_cas_failed`
+    /// NOT incremented). Occasional spikes under write-heavy workloads are
+    /// expected; a persistent non-zero delta of
+    /// `blocks_crc_mismatched - blocks_cas_failed` at low write rates warrants
+    /// SSD health investigation.
     pub blocks_crc_mismatched: usize,
     /// CRC queue entries drained this flush cycle. Includes duplicates from
     /// overwrites to the same page between flushes.
