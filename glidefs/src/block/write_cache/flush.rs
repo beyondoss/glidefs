@@ -445,12 +445,13 @@ impl WriteCache<Active> {
     /// Core rotation logic. If `snapshot` is true, captures dirty block
     /// indices under the write lock before swapping files.
     ///
-    /// The entire rotation is one atomic critical section under a single
-    /// write-lock acquisition. This eliminates a class of races where
-    /// state changes (CAS, file swap) span non-atomic windows. The lock
-    /// holds for ~15µs on typical hardware — rename is an inode pointer
-    /// swap, file creation is a single syscall, and the CAS loop touches
-    /// only cache-hot atomics.
+    /// The critical section under the write lock covers: rename, new file
+    /// creation, CAS DIRTY→SYNCING, handle swap, and flushing_file
+    /// assignment. Dir fsync runs after the lock is released — it only
+    /// makes the rename durable across power loss and does not affect
+    /// correctness of concurrent I/O. If a crash occurs before dir fsync,
+    /// the rename may be lost, but crash recovery handles the resulting
+    /// state (no flushing file → SYNCING blocks converted to DIRTY).
     ///
     /// All DIRTY blocks are claimed (CAS DIRTY→SYNCING).
     fn rotate_data_file_inner(&self, snapshot: bool) -> Result<(Vec<usize>, ()), CacheError> {
@@ -477,32 +478,26 @@ impl WriteCache<Active> {
         // still refers to the same inode (now at flushing_path).
         std::fs::rename(&active_path, &flushing_path)?;
 
-        // Fsync parent directory so the rename is durable across power loss.
-        if let Some(parent) = active_path.parent() {
-            match std::fs::File::open(parent) {
-                Ok(dir) => {
-                    if let Err(e) = dir.sync_all() {
-                        warn!(
-                            error = %e,
-                            "dir fsync after rotation failed — durability weakened"
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "failed to open parent dir for fsync after rotation — durability weakened"
-                    );
-                }
-            }
-        }
-
-        // Create new sparse active file.
-        let new_file = super::inner::SyncFile::open(
+        // Create new sparse active file. If this fails (e.g. inode
+        // exhaustion), undo the rename and reset flags so future flush
+        // cycles aren't permanently blocked.
+        let new_file = match super::inner::SyncFile::open(
             &active_path,
             true,
             self.inner.config.device_size,
-        )?;
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                // Undo: rename flushing back to active. The data_file_guard
+                // still holds the old fd (same inode), so I/O continues
+                // against whatever path the inode lives at. Restoring the
+                // original path keeps the on-disk state consistent.
+                let _ = std::fs::rename(&flushing_path, &active_path);
+                self.inner.flushing_active.store(false, Ordering::Release);
+                self.inner.rotation_seq.store(0, Ordering::Release);
+                return Err(CacheError::Io(e));
+            }
+        };
 
         // Snapshot dirty blocks: CAS DIRTY→SYNCING under the lock.
         let claimed = if snapshot {
@@ -529,6 +524,31 @@ impl WriteCache<Active> {
         *self.inner.flushing_file.lock() = Some(Arc::new(old_file));
 
         drop(data_file_guard);
+        // === Write lock released — concurrent I/O resumes ===
+
+        // Fsync parent directory so the rename is durable across power loss.
+        // Runs outside the write lock: dir fsync can take 1-5ms on SATA SSDs
+        // and we don't need to block concurrent reads/writes for it. If we
+        // crash before this completes, the rename may be lost — recovery
+        // finds no flushing file and converts SYNCING→DIRTY (safe).
+        if let Some(parent) = active_path.parent() {
+            match std::fs::File::open(parent) {
+                Ok(dir) => {
+                    if let Err(e) = dir.sync_all() {
+                        warn!(
+                            error = %e,
+                            "dir fsync after rotation failed — durability weakened"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "failed to open parent dir for fsync after rotation — durability weakened"
+                    );
+                }
+            }
+        }
 
         info!("rotated data file for flush");
         Ok((claimed, ()))
