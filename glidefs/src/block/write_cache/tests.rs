@@ -1333,40 +1333,33 @@ async fn test_crc32_concurrent_writes_never_false_corruption() {
     assert_eq!(cache.dirty_block_count(), 0, "all blocks should eventually flush");
 }
 
-/// CRC queue growth: writing the same block N times produces N queue entries
-/// (one per write), all of which are duplicates. Drain collapses them into
-/// a single HashMap entry. Verifies the queue overhead is proportional to
-/// write count, not unique blocks.
+/// CRC dedup: writing the same block 1000 times stores 1 DashMap entry.
+/// Upsert overwrites in place — no duplication, no memory waste.
 #[tokio::test]
-async fn test_crc_queue_growth_on_hot_block() {
+async fn test_crc_dedup_hot_block() {
     let h = V2Harness::new().await;
 
-    // Write the same block 1000 times.
     for i in 0u32..1000 {
-        let fill = (i & 0xFF) as u8;
-        h.cache.write(0, &vec![fill; 4096]).unwrap();
+        h.cache.write(0, &vec![(i & 0xFF) as u8; 4096]).unwrap();
     }
 
-    // Queue has 1000 entries — one per write, all for block 0.
-    assert_eq!(h.cache.pending_crc_count(), 1000);
+    // 1 entry, not 1000.
+    assert_eq!(h.cache.pending_crc_count(), 1);
 
-    // Flush drains the queue completely.
     let (stats, _) = h
         .cache
         .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
         .await
         .unwrap();
     assert_eq!(stats.blocks_crc_mismatched, 0);
-    assert_eq!(h.cache.pending_crc_count(), 0, "queue drained to zero after flush");
+    assert_eq!(h.cache.pending_crc_count(), 0, "drained to zero after flush");
 }
 
-/// CRC queue growth: N distinct blocks produce N entries. Queue depth equals
-/// unique pages written (1 entry per 4K page write).
+/// CRC storage: N distinct blocks = N entries. Drain removes all.
 #[tokio::test]
-async fn test_crc_queue_growth_distinct_blocks() {
+async fn test_crc_distinct_blocks() {
     let h = V2Harness::new().await;
 
-    // Write 50 distinct blocks.
     for i in 0u64..50 {
         h.cache.write(i * 4096, &vec![(i & 0xFF) as u8; 4096]).unwrap();
     }
@@ -1379,7 +1372,7 @@ async fn test_crc_queue_growth_distinct_blocks() {
         .await
         .unwrap();
     assert_eq!(stats.blocks_crc_mismatched, 0);
-    assert_eq!(h.cache.pending_crc_count(), 0);
+    assert_eq!(h.cache.pending_crc_count(), 0, "drained to zero after flush");
 }
 
 // =========================================================================
