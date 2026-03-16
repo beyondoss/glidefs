@@ -145,8 +145,6 @@ pub struct ExportState {
 /// concurrent writes keep producing new dirty blocks faster than we flush.
 const MAX_DRAIN_ITERATIONS: usize = 100;
 
-impl ExportState {}
-
 /// Configuration for the export router.
 pub struct RouterConfig {
     /// S3/MinIO/etc backend
@@ -493,7 +491,7 @@ impl ExportRouter {
             let Ok(_flush_guard) = cache.flush_lock().try_lock() else {
                 continue;
             };
-            match cache.flush_packs(cs, cmc, vm, None).await {
+            match cache.flush_packs(cs, cmc, vm, Some(&self.clean_cache)).await {
                 Ok((stats, _)) if stats.packs_uploaded > 0 => {
                     if let Err(e) = cache.sync_manifest(cs, vm).await {
                         warn!(export = %name, error = %e, "pressure flush manifest sync failed");
