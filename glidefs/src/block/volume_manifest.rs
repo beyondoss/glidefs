@@ -236,7 +236,7 @@ impl VolumeManifest {
         }
 
         // CRC32 trailer.
-        let crc = crc32fast::hash(&buf);
+        let crc = crc_fast::crc32_iscsi(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
         debug_assert_eq!(buf.len(), total);
@@ -252,7 +252,7 @@ impl VolumeManifest {
         // Verify CRC32.
         let crc_offset = data.len() - 4;
         let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
-        let computed_crc = crc32fast::hash(&data[..crc_offset]);
+        let computed_crc = crc_fast::crc32_iscsi(&data[..crc_offset]);
         if stored_crc != computed_crc {
             return Err(VolumeManifestError::CrcMismatch {
                 stored: stored_crc,
@@ -405,7 +405,7 @@ mod tests {
         bytes[0] = b'X';
         // Fix CRC so we test magic detection, not CRC.
         let crc_offset = bytes.len() - 4;
-        let crc = crc32fast::hash(&bytes[..crc_offset]);
+        let crc = crc_fast::crc32_iscsi(&bytes[..crc_offset]);
         bytes[crc_offset..].copy_from_slice(&crc.to_le_bytes());
 
         let err = VolumeManifest::deserialize(&bytes).unwrap_err();
@@ -552,7 +552,7 @@ mod tests {
         // but not the pack data). Then append a valid CRC for this truncated body.
         let body = &full[..GLVM_HEADER_SIZE + 6];
         let mut truncated = body.to_vec();
-        let crc = crc32fast::hash(&truncated);
+        let crc = crc_fast::crc32_iscsi(&truncated);
         truncated.extend_from_slice(&crc.to_le_bytes());
 
         let err = VolumeManifest::deserialize(&truncated).unwrap_err();

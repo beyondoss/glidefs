@@ -111,7 +111,7 @@ fn compute_flush_batch(
             //   CRC from a write between pre-pass and rotation (retries next cycle)
             // - Block now DIRTY → write re-dirtied it → stale CRC, not corruption
             if let Some(&stored_crc) = crcs.get(&chunk_index) {
-                let computed_crc = crc32fast::hash(&chunk_buf);
+                let computed_crc = crc_fast::crc32_iscsi(&chunk_buf);
                 if computed_crc != stored_crc {
                     let current_state = inner.state_map.get(chunk_index);
                     if current_state != SparseBlockState::SYNCING {

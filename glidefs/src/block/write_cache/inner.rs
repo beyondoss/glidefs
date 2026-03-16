@@ -302,14 +302,14 @@ pub(crate) struct CacheInner {
     /// `None` means first upload (unconditional PUT).
     pub(crate) manifest_etag: Mutex<Option<String>>,
 
-    /// CRC32 checksums captured at pwrite time from the guest's write buffer.
-    /// Drained at flush time and used as the CRC baseline instead of re-reading
-    /// from SSD. Entries are (block_index, data_crc). Sub-block writes set
-    /// data_crc to 0 (invalidated). Linear scan for dedup — fits in L1 cache.
-    pub(super) write_crcs: Mutex<Vec<(u32, u32)>>,
+    /// Per-page CRC32C checksums captured at pwrite time from the guest's write
+    /// buffer. Key: block index. Value: one CRC per 4KB page within the block.
+    /// Pages with CRC = 0 have no write-time baseline (partial page writes).
+    /// Drained at flush time for verification against the flushing file.
+    pub(super) page_crcs: dashmap::DashMap<u32, Box<[u32]>>,
 
-    /// Pre-computed CRC32 of a zero block for this export's block_size.
-    pub(super) zero_block_crc: u32,
+    /// Number of 4KB pages per block (block_size / 4096).
+    pub(super) pages_per_block: usize,
 
     /// Sequence number at the last file rotation. 0 when no rotation is active.
     /// Persisted to metadata so crash recovery can distinguish pre- vs
@@ -466,68 +466,82 @@ impl CacheInner {
         self.data_file.read().write_all_at(data, offset)
     }
 
-    /// Record write-time CRCs from the guest's write buffer.
+    /// Record per-page CRCs from the guest's write buffer.
     ///
-    /// For each block fully covered by the write, stores its CRC32.
-    /// For each block partially covered, stores 0 (invalidated —
-    /// a prior full-block CRC is stale after a partial overwrite).
-    pub(super) fn capture_write_crcs(&self, offset: u64, data: &[u8]) {
+    /// For each 4KB page fully covered by the write, computes CRC32C from the
+    /// write buffer and stores it. Partially covered pages get CRC = 0 (no
+    /// verification). Untouched pages within the block are left as-is.
+    ///
+    /// CRC computation happens before the DashMap shard lock — the lock hold
+    /// time is just indexed u32 writes.
+    pub(super) fn capture_page_crcs(&self, offset: u64, data: &[u8]) {
+        const PAGE_SIZE: u64 = 4096;
         let block_size = self.config.block_size as u64;
         let end = offset + data.len() as u64;
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
 
-        // Compute CRCs outside the lock — CRC32 is the expensive part.
-        let num_blocks = (end_block - start_block + 1) as usize;
-        let mut computed = Vec::with_capacity(num_blocks);
         for block in start_block..=end_block {
-            let idx = block as u32;
             let block_start = block * block_size;
-            let block_end = block_start + block_size;
-            let data_crc = if offset <= block_start && end >= block_end {
-                let slice_start = (block_start - offset) as usize;
-                let slice_end = slice_start + block_size as usize;
-                crc32fast::hash(&data[slice_start..slice_end])
-            } else {
-                0
-            };
-            computed.push((idx, data_crc));
-        }
 
-        let mut crcs = self.write_crcs.lock();
-        for (idx, data_crc) in computed {
-            if let Some(entry) = crcs.iter_mut().find(|(i, _)| *i == idx) {
-                entry.1 = data_crc;
-            } else {
-                crcs.push((idx, data_crc));
+            // Pre-compute page CRCs on the stack before touching the DashMap.
+            let mut updates: [(usize, u32); 32] = [(0, 0); 32];
+            let mut num_updates = 0;
+
+            for page in 0..self.pages_per_block {
+                let page_start = block_start + (page as u64) * PAGE_SIZE;
+                let page_end = page_start + PAGE_SIZE;
+
+                if offset <= page_start && end >= page_end {
+                    // Full page covered — CRC from write buffer.
+                    let slice_start = (page_start - offset) as usize;
+                    let crc = crc_fast::crc32_iscsi(&data[slice_start..slice_start + PAGE_SIZE as usize]);
+                    updates[num_updates] = (page, crc);
+                    num_updates += 1;
+                } else if end > page_start && offset < page_end {
+                    // Partial page — invalidate.
+                    updates[num_updates] = (page, 0);
+                    num_updates += 1;
+                }
+            }
+
+            // Single DashMap access per block — shard lock held only for u32 writes.
+            let mut entry = self.page_crcs
+                .entry(block as u32)
+                .or_insert_with(|| vec![0u32; self.pages_per_block].into_boxed_slice());
+            for &(page, crc) in &updates[..num_updates] {
+                entry[page] = crc;
             }
         }
     }
 
-    /// Record write-time CRCs for a zero_range operation.
+    /// Record per-page CRCs for a zero_range operation.
     ///
-    /// For each block fully covered, stores the pre-computed zero-block CRC.
-    /// For partially covered blocks, stores 0 (invalidated).
-    pub(super) fn capture_zero_crcs(&self, offset: u64, len: u64) {
+    /// Each fully-zeroed 4KB page gets CRC32C of 4096 zero bytes.
+    /// Partially zeroed pages get CRC = 0 (no verification).
+    pub(super) fn capture_zero_page_crcs(&self, offset: u64, len: u64) {
+        const PAGE_SIZE: u64 = 4096;
+        let zero_page_crc = crc_fast::crc32_iscsi(&[0u8; 4096]);
         let block_size = self.config.block_size as u64;
         let end = offset + len;
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
 
-        let mut crcs = self.write_crcs.lock();
         for block in start_block..=end_block {
-            let idx = block as u32;
             let block_start = block * block_size;
-            let block_end = block_start + block_size;
-            let data_crc = if offset <= block_start && end >= block_end {
-                self.zero_block_crc
-            } else {
-                0
-            };
-            if let Some(entry) = crcs.iter_mut().find(|(i, _)| *i == idx) {
-                entry.1 = data_crc;
-            } else {
-                crcs.push((idx, data_crc));
+            let mut entry = self.page_crcs
+                .entry(block as u32)
+                .or_insert_with(|| vec![0u32; self.pages_per_block].into_boxed_slice());
+
+            for page in 0..self.pages_per_block {
+                let page_start = block_start + (page as u64) * PAGE_SIZE;
+                let page_end = page_start + PAGE_SIZE;
+
+                if offset <= page_start && end >= page_end {
+                    entry[page] = zero_page_crc;
+                } else if end > page_start && offset < page_end {
+                    entry[page] = 0;
+                }
             }
         }
     }
@@ -786,7 +800,7 @@ impl CacheInner {
             .open(&tmp_path)?;
 
         // Incremental CRC32 hasher — fed every byte written to the file.
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
 
         // Helper: write to file and feed the hasher.
         macro_rules! write_hashed {
@@ -823,7 +837,7 @@ impl CacheInner {
         write_hashed!(&self.rotation_seq.load(Ordering::Relaxed).to_le_bytes());
 
         // CRC32 trailer over all preceding bytes.
-        let crc = hasher.finalize();
+        let crc = hasher.finalize() as u32;
         file.write_all(&crc.to_le_bytes())?;
 
         // Fsync temp file to ensure data is on disk
@@ -885,7 +899,7 @@ impl CacheInner {
         }
 
         let mut file = File::open(&path)?;
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
 
         // Helper: read from file and feed the hasher.
         macro_rules! read_hashed {
@@ -993,7 +1007,7 @@ impl CacheInner {
         let rotation_seq = u64::from_le_bytes(rot_buf);
 
         // Verify CRC32 trailer (mandatory).
-        let computed_crc = hasher.finalize();
+        let computed_crc = hasher.finalize() as u32;
         let mut crc_buf = [0u8; 4];
         file.read_exact(&mut crc_buf).map_err(|_| {
             warn!("metadata file missing CRC32 trailer");

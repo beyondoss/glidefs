@@ -1017,7 +1017,7 @@ async fn test_syncing_blocks_at_crash_become_dirty() {
         let meta_path = config.metadata_path();
         let num_blocks = config.num_blocks();
 
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
         let mut buf = Vec::new();
 
         macro_rules! write_hashed {
@@ -1049,7 +1049,7 @@ async fn test_syncing_blocks_at_crash_become_dirty() {
         write_hashed!(&0u64.to_le_bytes()); // rotation_seq = 0 (no active rotation)
 
         // CRC32 trailer
-        let crc = hasher.finalize();
+        let crc = hasher.finalize() as u32;
         buf.extend_from_slice(&crc.to_le_bytes());
 
         std::fs::write(&meta_path, &buf).unwrap();

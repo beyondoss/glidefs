@@ -279,8 +279,8 @@ impl WriteCache<Initializing> {
 
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),
-            write_crcs: parking_lot::Mutex::new(Vec::new()),
-            zero_block_crc: crc32fast::hash(&vec![0u8; block_size]),
+            page_crcs: dashmap::DashMap::new(),
+            pages_per_block: block_size / 4096,
             flushing_active: AtomicBool::new(false),
             rotation_seq: AtomicU64::new(0),
             #[cfg(feature = "test-utils")]
@@ -340,8 +340,8 @@ impl WriteCache<Initializing> {
 
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),
-            write_crcs: parking_lot::Mutex::new(Vec::new()),
-            zero_block_crc: crc32fast::hash(&vec![0u8; block_size]),
+            page_crcs: dashmap::DashMap::new(),
+            pages_per_block: block_size / 4096,
             flushing_active: AtomicBool::new(false),
             rotation_seq: AtomicU64::new(0),
             #[cfg(feature = "test-utils")]

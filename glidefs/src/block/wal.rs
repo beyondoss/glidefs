@@ -38,7 +38,7 @@ pub struct WalEntry {
 ///
 /// Wire format: `[block_index:u64 LE][sequence:u64 LE][crc32:u32 LE]`
 pub fn serialize_entry(buf: &mut Vec<u8>, block_index: u64, sequence: u64) {
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
 
     let block_index_le = block_index.to_le_bytes();
     hasher.update(&block_index_le);
@@ -48,7 +48,7 @@ pub fn serialize_entry(buf: &mut Vec<u8>, block_index: u64, sequence: u64) {
     hasher.update(&sequence_le);
     buf.extend_from_slice(&sequence_le);
 
-    let crc = hasher.finalize();
+    let crc = hasher.finalize() as u32;
     buf.extend_from_slice(&crc.to_le_bytes());
 }
 
@@ -221,7 +221,7 @@ impl Wal {
     /// - `Ok(None)` on clean EOF (zero bytes remaining)
     /// - `Err(_)` on CRC mismatch or short read (torn entry)
     fn read_entry(reader: &mut impl Read) -> io::Result<Option<WalEntry>> {
-        let mut hasher = crc32fast::Hasher::new();
+        let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
 
         // block_index
         let mut buf8 = [0u8; 8];
@@ -242,7 +242,7 @@ impl Wal {
         let mut buf4 = [0u8; 4];
         reader.read_exact(&mut buf4)?;
         let stored_crc = u32::from_le_bytes(buf4);
-        let computed_crc = hasher.finalize();
+        let computed_crc = hasher.finalize() as u32;
 
         if stored_crc != computed_crc {
             return Err(io::Error::new(
