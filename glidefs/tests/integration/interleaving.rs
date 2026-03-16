@@ -2809,9 +2809,11 @@ async fn pf03_promote_pwrite_concurrent_with_eviction() {
 /// RW-03: Read fast path pread while concurrent pwrite overwrites same block.
 /// Both under the data_file read lock.
 ///
-/// pwrite is NOT atomic for multi-page writes. Torn reads are expected
-/// and harmless — the block device protocol does not require atomicity
-/// for concurrent overlapping requests. We verify no panic/deadlock.
+/// pwrite is NOT atomic for multi-page writes. On Linux, the write path
+/// locks one folio at a time; the read path holds no folio lock during
+/// copy. Torn reads are expected — POSIX and block device protocols do
+/// not require atomicity for concurrent overlapping requests.
+/// We verify: no panic, no deadlock, correct read length.
 #[tokio::test]
 async fn rw03_read_during_concurrent_pwrite() {
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

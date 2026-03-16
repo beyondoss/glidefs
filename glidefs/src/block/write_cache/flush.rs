@@ -237,16 +237,21 @@ fn compute_flush_batch(
 /// Pops all entries from the lock-free queue and collects them into a
 /// per-block HashMap for verification. Last-writer-wins for each page
 /// (correct: later writes overwrite earlier CRCs for the same page).
-fn drain_page_crcs(inner: &CacheInner) -> HashMap<usize, Box<[u32]>> {
+///
+/// Returns (map, entries_drained) so callers can report the duplication
+/// factor (entries_drained / map.len()).
+fn drain_page_crcs(inner: &CacheInner) -> (HashMap<usize, Box<[u32]>>, usize) {
     let ppb = inner.pages_per_block;
     let mut map: HashMap<usize, Box<[u32]>> = HashMap::new();
+    let mut drained = 0usize;
     while let Some((block, page, crc)) = inner.page_crcs.pop() {
+        drained += 1;
         let entry = map
             .entry(block as usize)
             .or_insert_with(|| vec![0u32; ppb].into_boxed_slice());
         entry[page as usize] = crc;
     }
-    map
+    (map, drained)
 }
 
 impl WriteCache<Active> {
@@ -275,6 +280,12 @@ impl WriteCache<Active> {
     /// Get the number of blocks currently being synced.
     pub fn syncing_block_count(&self) -> u64 {
         self.inner.syncing_block_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of CRC entries pending drain. Indicates queue memory pressure —
+    /// grows with write throughput between flush cycles, drains to zero on flush.
+    pub fn pending_crc_count(&self) -> usize {
+        self.inner.page_crcs.len()
     }
 
     /// Number of recovery issues encountered during cache open.

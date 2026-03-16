@@ -316,11 +316,12 @@ async fn wf_write_blocked_during_rotation() {
 
 /// RW-03: Concurrent read + write to same DIRTY block — no crash or deadlock.
 ///
-/// pwrite is NOT atomic for multi-page writes. A concurrent pread can
-/// observe partially-written data (torn read). This is fine: the block
-/// device protocol (NBD, NVMe, SCSI) does not require atomicity for
-/// concurrent overlapping requests. The guest filesystem/page cache
-/// serializes overlapping I/O before it reaches us.
+/// pwrite is NOT atomic for multi-page writes on any platform. On Linux,
+/// the write path locks one folio at a time; the read path holds no folio
+/// lock during copy_folio_to_iter. A concurrent pread can observe some
+/// pages with old data and others with new. POSIX does not require
+/// atomicity for concurrent overlapping read+write, and no block device
+/// protocol (NBD, NVMe, SCSI) requires it either.
 ///
 /// We verify: no panic, no deadlock, no internal state corruption.
 /// We do NOT assert data content — torn reads are expected and harmless.
