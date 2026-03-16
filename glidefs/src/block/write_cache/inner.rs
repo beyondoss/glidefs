@@ -308,11 +308,10 @@ pub(crate) struct CacheInner {
     pub(crate) manifest_etag: Mutex<Option<String>>,
 
     /// Per-page CRC32C checksums captured at pwrite time from the guest's write
-    /// buffer. Key: block index. Value: one CRC per 4KB page within the block.
-    /// Pages with CRC = 0 have no write-time baseline (partial page writes).
-    /// Drained at flush time for verification against the flushing file.
-    /// Lazily allocated on first write.
-    pub(super) page_crcs: std::sync::OnceLock<dashmap::DashMap<u32, Box<[u32]>>>,
+    /// buffer. Lock-free queue of (block, page, crc) tuples — writes push
+    /// entries with zero contention, drain pops them in bulk at flush time.
+    /// Memory scales with write throughput, not device size.
+    pub(super) page_crcs: crossbeam::queue::SegQueue<(u32, u16, u32)>,
 
     /// Number of 4KB pages per block (block_size / 4096).
     pub(super) pages_per_block: usize,
@@ -472,19 +471,13 @@ impl CacheInner {
         self.data_file.read().write_all_at(data, offset)
     }
 
-    /// Get or lazily initialize the page CRC DashMap.
-    fn page_crcs_map(&self) -> &dashmap::DashMap<u32, Box<[u32]>> {
-        self.page_crcs.get_or_init(dashmap::DashMap::new)
-    }
-
     /// Record per-page CRCs from the guest's write buffer.
     ///
-    /// For each 4KB page fully covered by the write, computes CRC32C from the
-    /// write buffer and stores it. Partially covered pages get CRC = 0 (no
-    /// verification). Untouched pages within the block are left as-is.
-    ///
-    /// CRC computation happens before the DashMap shard lock — the lock hold
-    /// time is just indexed u32 writes.
+    /// For each 4KB page fully covered by the write, computes CRC32C and
+    /// pushes (block, page, crc) to the lock-free queue. Partially covered
+    /// pages push CRC = 0 (skip verification). Lock-free: no shard locks,
+    /// no hashing, no allocations on 31/32 pushes.
+    #[inline]
     pub(super) fn capture_page_crcs(&self, offset: u64, data: &[u8]) {
         const PAGE_SIZE: u64 = 4096;
         let block_size = self.config.block_size as u64;
@@ -497,21 +490,15 @@ impl CacheInner {
             && offset % PAGE_SIZE == 0
             && data.len() == PAGE_SIZE as usize
         {
-            let page = ((offset % block_size) / PAGE_SIZE) as usize;
+            let page = ((offset % block_size) / PAGE_SIZE) as u16;
             let crc = crc_fast::crc32_iscsi(data);
-            let map = self.page_crcs_map();
-            let mut entry = map
-                .entry(start_block as u32)
-                .or_insert_with(|| vec![0u32; self.pages_per_block].into_boxed_slice());
-            entry[page] = crc;
+            self.page_crcs.push((start_block as u32, page, crc));
             return;
         }
 
         // General path: multi-page or unaligned writes.
         for block in start_block..=end_block {
             let block_start = block * block_size;
-            let mut updates: [(usize, u32); 32] = [(0, 0); 32];
-            let mut num_updates = 0;
 
             for page in 0..self.pages_per_block {
                 let page_start = block_start + (page as u64) * PAGE_SIZE;
@@ -519,21 +506,13 @@ impl CacheInner {
 
                 if offset <= page_start && end >= page_end {
                     let slice_start = (page_start - offset) as usize;
-                    let crc = crc_fast::crc32_iscsi(&data[slice_start..slice_start + PAGE_SIZE as usize]);
-                    updates[num_updates] = (page, crc);
-                    num_updates += 1;
+                    let crc = crc_fast::crc32_iscsi(
+                        &data[slice_start..slice_start + PAGE_SIZE as usize],
+                    );
+                    self.page_crcs.push((block as u32, page as u16, crc));
                 } else if end > page_start && offset < page_end {
-                    updates[num_updates] = (page, 0);
-                    num_updates += 1;
+                    self.page_crcs.push((block as u32, page as u16, 0));
                 }
-            }
-
-            let map = self.page_crcs_map();
-            let mut entry = map
-                .entry(block as u32)
-                .or_insert_with(|| vec![0u32; self.pages_per_block].into_boxed_slice());
-            for &(page, crc) in &updates[..num_updates] {
-                entry[page] = crc;
             }
         }
     }
@@ -550,21 +529,17 @@ impl CacheInner {
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
 
-        let map = self.page_crcs_map();
         for block in start_block..=end_block {
             let block_start = block * block_size;
-            let mut entry = map
-                .entry(block as u32)
-                .or_insert_with(|| vec![0u32; self.pages_per_block].into_boxed_slice());
 
             for page in 0..self.pages_per_block {
                 let page_start = block_start + (page as u64) * PAGE_SIZE;
                 let page_end = page_start + PAGE_SIZE;
 
                 if offset <= page_start && end >= page_end {
-                    entry[page] = zero_page_crc;
+                    self.page_crcs.push((block as u32, page as u16, zero_page_crc));
                 } else if end > page_start && offset < page_end {
-                    entry[page] = 0;
+                    self.page_crcs.push((block as u32, page as u16, 0));
                 }
             }
         }
