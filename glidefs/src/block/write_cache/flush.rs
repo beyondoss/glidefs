@@ -232,19 +232,23 @@ fn compute_flush_batch(
     })
 }
 
-/// Drain per-page CRC32C baselines captured at pwrite time.
+/// Snapshot per-page CRC32C baselines and reset entries to zero.
 ///
-/// Takes all entries from the DashMap, returning per-page CRCs for each
-/// dirty block. Pages with CRC = 0 skip verification at flush time.
+/// Copies page CRCs out for verification, then zeros the arrays in place
+/// so they're ready for the next cycle. Entries (Box<[u32]>) are NOT
+/// deallocated — avoids cross-thread alloc/dealloc churn between ublk
+/// writer threads and the flush thread.
 fn drain_page_crcs(inner: &CacheInner) -> HashMap<usize, Box<[u32]>> {
     let Some(page_crcs) = inner.page_crcs.get() else {
         return HashMap::new();
     };
     let mut map = HashMap::with_capacity(page_crcs.len());
-    for entry in page_crcs.iter() {
-        map.insert(*entry.key() as usize, entry.value().clone());
+    for mut entry in page_crcs.iter_mut() {
+        let crcs = entry.value().clone();
+        // Zero in place — reuse the allocation for the next flush cycle.
+        entry.value_mut().fill(0);
+        map.insert(*entry.key() as usize, crcs);
     }
-    page_crcs.clear();
     map
 }
 

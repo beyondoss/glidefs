@@ -32,16 +32,21 @@ mod sync_file {
     /// A file handle safe for concurrent positional I/O.
     ///
     /// Only exposes positional I/O methods (`read_exact_at`, `write_all_at`)
-    /// which use `pread`/`pwrite` system calls — atomic per POSIX, no shared
-    /// file position. The inner `File` is module-private so no code outside
-    /// this module can call seek-based methods.
+    /// which use `pread`/`pwrite` system calls — no shared file position.
+    /// Note: pwrite is NOT atomic for multi-page writes. A 128KB pwrite
+    /// touches 32 pages; a concurrent pread can see partial updates.
+    /// This is acceptable: the block device protocol does not require
+    /// atomicity for concurrent overlapping requests.
+    /// The inner `File` is module-private so no code outside this module
+    /// can call seek-based methods.
     #[derive(Debug)]
     pub struct SyncFile {
         file: File,
     }
 
     // SAFETY: SyncFile only exposes positional I/O methods (pread/pwrite via
-    // FileExt::{read_exact_at, write_all_at}) which are atomic per POSIX.
+    // FileExt::{read_exact_at, write_all_at}) which use independent offsets
+    // per call — no shared file position that could race.
     // The `file` field is private to this module — no external code can access
     // seek-based methods (read, write, seek) that would introduce data races.
     unsafe impl Sync for SyncFile {}
