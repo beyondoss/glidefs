@@ -487,10 +487,24 @@ impl CacheInner {
         let start_block = offset / block_size;
         let end_block = (end - 1) / block_size;
 
+        // Fast path: single page-aligned write within one block (common case).
+        if start_block == end_block
+            && offset % PAGE_SIZE == 0
+            && data.len() == PAGE_SIZE as usize
+        {
+            let page = ((offset % block_size) / PAGE_SIZE) as usize;
+            let crc = crc_fast::crc32_iscsi(data);
+            let map = self.page_crcs_map();
+            let mut entry = map
+                .entry(start_block as u32)
+                .or_insert_with(|| vec![0u32; self.pages_per_block].into_boxed_slice());
+            entry[page] = crc;
+            return;
+        }
+
+        // General path: multi-page or unaligned writes.
         for block in start_block..=end_block {
             let block_start = block * block_size;
-
-            // Pre-compute page CRCs on the stack before touching the DashMap.
             let mut updates: [(usize, u32); 32] = [(0, 0); 32];
             let mut num_updates = 0;
 
