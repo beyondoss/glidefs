@@ -152,7 +152,7 @@ impl WriteCache<Active> {
 
         df.write_all_at(data, offset)?;
 
-        self.inner.capture_write_crcs(offset, data);
+        self.inner.capture_page_crcs(offset, data);
 
         self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
 
@@ -246,7 +246,7 @@ impl WriteCache<Active> {
             self.zero_range_fallback_with(&df, offset, len)?;
         }
 
-        self.inner.capture_zero_crcs(offset, len);
+        self.inner.capture_zero_page_crcs(offset, len);
 
         self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
 
@@ -381,7 +381,7 @@ impl WriteCache<Active> {
 
         df.write_all_at(data, offset)?;
 
-        self.inner.capture_write_crcs(offset, data);
+        self.inner.capture_page_crcs(offset, data);
 
         self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
 

@@ -65,7 +65,7 @@ fn compute_flush_batch(
     snapshot: &[usize],
     zero_hash: Blake3Hash,
     clean_cache: Option<Arc<dyn BlockCache>>,
-    crcs: &HashMap<usize, u32>,
+    crcs: &HashMap<usize, Box<[u32]>>,
 ) -> Result<FlushBatch, CacheError> {
     use rayon::prelude::*;
 
@@ -105,14 +105,25 @@ fn compute_flush_batch(
                 chunk_buf[valid_bytes..].fill(0);
             }
 
-            // Verify CRC32 against the pre-rotation baseline (if available).
-            // State discrimination distinguishes corruption from concurrent writes:
-            // - Block still SYNCING → CRC mismatch is SSD corruption or stale
-            //   CRC from a write between pre-pass and rotation (retries next cycle)
-            // - Block now DIRTY → write re-dirtied it → stale CRC, not corruption
-            if let Some(&stored_crc) = crcs.get(&chunk_index) {
-                let computed_crc = crc_fast::crc32_iscsi(&chunk_buf);
-                if computed_crc != stored_crc {
+            // Verify per-page CRC32C against write-time baselines.
+            // Each 4KB page within the block is checked independently.
+            // Pages with stored CRC = 0 are skipped (partial writes).
+            if let Some(page_crcs) = crcs.get(&chunk_index) {
+                const PAGE_SIZE: usize = 4096;
+                let mut any_mismatch = false;
+                for (page, &stored_crc) in page_crcs.iter().enumerate() {
+                    if stored_crc == 0 {
+                        continue;
+                    }
+                    let page_start = page * PAGE_SIZE;
+                    let page_end = (page_start + PAGE_SIZE).min(chunk_buf.len());
+                    let computed_crc = crc_fast::crc32_iscsi(&chunk_buf[page_start..page_end]);
+                    if computed_crc != stored_crc {
+                        any_mismatch = true;
+                        break;
+                    }
+                }
+                if any_mismatch {
                     let current_state = inner.state_map.get(chunk_index);
                     if current_state != SparseBlockState::SYNCING {
                         return Ok(BlockResult::Skipped {
@@ -123,9 +134,7 @@ fn compute_flush_batch(
                     }
                     debug!(
                         chunk_index,
-                        stored_crc,
-                        computed_crc,
-                        "CRC mismatch — block will retry next flush cycle"
+                        "page CRC mismatch — block will retry next flush cycle"
                     );
                     return Ok(BlockResult::Skipped {
                         chunk_index,
@@ -223,22 +232,19 @@ fn compute_flush_batch(
     })
 }
 
-/// Drain write-time CRC32 baselines captured at pwrite time.
+/// Drain per-page CRC32C baselines captured at pwrite time.
 ///
-/// Atomically takes the Vec of (block_index, data_crc) entries and builds
-/// a HashMap for O(1) lookup in compute_flush_batch. Last-write-wins for
-/// duplicate block indices. Entries with data_crc == 0 (sub-block writes)
-/// are skipped — those blocks skip CRC verification at flush time.
-fn drain_write_crcs(inner: &CacheInner) -> HashMap<usize, u32> {
-    let entries = std::mem::take(&mut *inner.write_crcs.lock());
-    let mut map = HashMap::with_capacity(entries.len());
-    for (idx, crc) in entries {
-        if crc != 0 {
-            map.insert(idx as usize, crc);
-        } else {
-            map.remove(&(idx as usize));
-        }
+/// Takes all entries from the DashMap, returning per-page CRCs for each
+/// dirty block. Pages with CRC = 0 skip verification at flush time.
+fn drain_page_crcs(inner: &CacheInner) -> HashMap<usize, Box<[u32]>> {
+    let Some(page_crcs) = inner.page_crcs.get() else {
+        return HashMap::new();
+    };
+    let mut map = HashMap::with_capacity(page_crcs.len());
+    for entry in page_crcs.iter() {
+        map.insert(*entry.key() as usize, entry.value().clone());
     }
+    page_crcs.clear();
     map
 }
 
@@ -584,7 +590,7 @@ impl WriteCache<Active> {
 
         // Drain write-time CRC baselines BEFORE rotation.
         // These were captured from guest write buffers at pwrite time.
-        let crcs = drain_write_crcs(&self.inner);
+        let crcs = drain_page_crcs(&self.inner);
 
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::AfterCrcPrepass, crcs.len()).await;
@@ -775,7 +781,7 @@ impl WriteCache<Active> {
         pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: Option<&Arc<dyn BlockCache>>,
-        crcs: HashMap<usize, u32>,
+        crcs: HashMap<usize, Box<[u32]>>,
     ) -> Result<FlushStats, CacheError> {
         use crate::block::pack::new_pack_id;
 
