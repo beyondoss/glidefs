@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tracing::{debug, info, warn};
 
 use crate::block::cache::BlockCache;
@@ -24,7 +25,7 @@ use crate::block::block_map::Blake3Hash;
 
 use super::CacheError;
 
-type FetchResult = Result<(Blake3Hash, u32, Vec<u8>), CacheError>;
+type FetchResult = Result<(Blake3Hash, u32, Bytes), CacheError>;
 
 /// Default compaction threshold: compact when a chunk has more than this many packs.
 pub const DEFAULT_COMPACTION_THRESHOLD: usize = 16;
@@ -66,17 +67,17 @@ async fn dead_block_ratio(
     let mut owner: HashMap<u32, usize> = HashMap::new();
 
     for (pack_idx, &pack_id) in pack_ids.iter().enumerate() {
-        let entries = match pack_index_cache.get_entries(pack_id).await {
+        let entries: std::sync::Arc<[super::super::pack::PackIndexEntry]> = match pack_index_cache.get_entries(pack_id).await {
             Some(entries) => entries,
             None => {
                 // Cache miss — fetch from S3 (cold path, acceptable)
                 let fetched = content_store.get_pack_index(chunk_idx, pack_id).await?;
                 pack_index_cache.insert_entries(pack_id, &fetched);
-                fetched
+                std::sync::Arc::from(fetched)
             }
         };
         total_entries += entries.len();
-        for entry in &entries {
+        for entry in entries.iter() {
             // Last writer (highest pack_idx) wins
             owner.insert(entry.chunk_offset, pack_idx);
         }
@@ -121,18 +122,18 @@ pub async fn compact_chunk(
     // 1. Load all pack indices in parallel (from cache, or fetch from S3 on miss)
     use futures::stream::{self, StreamExt};
 
-    let all_entries: Vec<(PackId, Vec<PackIndexEntry>)> = {
-        let results: Vec<Result<(PackId, Vec<PackIndexEntry>), CacheError>> =
+    let all_entries: Vec<(PackId, std::sync::Arc<[PackIndexEntry]>)> = {
+        let results: Vec<Result<(PackId, std::sync::Arc<[PackIndexEntry]>), CacheError>> =
             stream::iter(pack_ids.iter().copied())
                 .map(|pid| async move {
-                    let entries = match pack_index_cache.get_entries(pid).await {
+                    let entries: std::sync::Arc<[PackIndexEntry]> = match pack_index_cache.get_entries(pid).await {
                         Some(e) => e,
                         None => {
                             let fetched = content_store
                                 .get_pack_index(chunk_idx, pid)
                                 .await?;
                             pack_index_cache.insert_entries(pid, &fetched);
-                            fetched
+                            std::sync::Arc::from(fetched)
                         }
                     };
                     Ok((pid, entries))
@@ -159,7 +160,7 @@ pub async fn compact_chunk(
     // pack_ids are ordered oldest-to-newest, so we iterate forward and overwrite.
     let mut merged: HashMap<u32, (PackId, Blake3Hash, u32, u32)> = HashMap::new();
     for (pid, entries) in &all_entries {
-        for entry in entries {
+        for entry in entries.iter() {
             merged.insert(
                 entry.chunk_offset,
                 (*pid, entry.hash, entry.offset, entry.comp_length),
@@ -195,11 +196,11 @@ pub async fn compact_chunk(
     // 3. Fetch compressed block data from source packs.
     // Partition: zero tombstones (comp_length == 0) go directly into the output
     // without an S3 fetch. Non-zero blocks use concurrent range-reads.
-    let mut zero_tombstones: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
+    let mut zero_tombstones: Vec<(Blake3Hash, u32, Bytes)> = Vec::new();
     let mut blocks_to_fetch: Vec<(u32, PackId, Blake3Hash, u32, u32)> = Vec::new();
     for (chunk_offset, (pid, hash, pack_offset, comp_length)) in merged {
         if comp_length == 0 {
-            zero_tombstones.push((hash, chunk_offset, Vec::new()));
+            zero_tombstones.push((hash, chunk_offset, Bytes::new()));
         } else {
             blocks_to_fetch.push((chunk_offset, pid, hash, pack_offset, comp_length));
         }
@@ -239,7 +240,7 @@ pub async fn compact_chunk(
                             actual: format!("{:?}", actual_hash),
                         });
                     }
-                    Ok((hash, chunk_offset, compressed.to_vec()))
+                    Ok((hash, chunk_offset, Bytes::copy_from_slice(&compressed)))
                 }
             })
             .buffer_unordered(8) // bounded concurrency for S3 reads
@@ -247,7 +248,7 @@ pub async fn compact_chunk(
             .await;
 
     // Collect results, propagating errors
-    let mut blocks_for_pack: Vec<(Blake3Hash, u32, Vec<u8>)> =
+    let mut blocks_for_pack: Vec<(Blake3Hash, u32, Bytes)> =
         Vec::with_capacity(live_block_count);
     blocks_for_pack.extend(zero_tombstones);
     for result in fetched_blocks {

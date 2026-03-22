@@ -20,7 +20,7 @@ use super::{CacheError, FlushStats, SnapshotResult, WriteCache};
 /// the async portion of `flush_dirty_inner` for S3 uploads.
 struct FlushBatch {
     /// Compressed blocks ready for S3 upload: (hash, compressed_bytes).
-    to_upload: Vec<(Blake3Hash, Vec<u8>)>,
+    to_upload: Vec<(Blake3Hash, Bytes)>,
     /// Computed hashes for post-upload CAS clearing: (chunk_index, hash).
     computed: Vec<(usize, Blake3Hash)>,
     /// Blocks skipped due to CRC mismatch or concurrent write.
@@ -38,7 +38,7 @@ enum BlockResult {
         hash: Blake3Hash,
         /// `Some(compressed)` if block is new (not zero).
         /// `None` if deduped (zero block).
-        compressed: Option<Vec<u8>>,
+        compressed: Option<Bytes>,
     },
     /// Block skipped due to CRC mismatch or concurrent write.
     Skipped {
@@ -93,95 +93,84 @@ fn compute_flush_batch(
     let per_block: Vec<Result<BlockResult, CacheError>> = snapshot
         .par_iter()
         .map(|&chunk_index| {
-            let mut chunk_buf = vec![0u8; block_size];
+                let mut chunk_buf = vec![0u8; block_size];
 
-            let offset = chunk_index as u64 * block_size as u64;
-            let valid_bytes =
-                std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
-            if valid_bytes > 0 {
-                flushing_file.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
-            }
-            if valid_bytes < block_size {
-                chunk_buf[valid_bytes..].fill(0);
-            }
-
-            // Verify per-page CRC32C against write-time baselines.
-            // Each 4KB page within the block is checked independently.
-            // Pages with stored CRC = 0 are skipped (partial writes).
-            if let Some(page_crcs) = crcs.get(&chunk_index) {
-                const PAGE_SIZE: usize = 4096;
-                let mut any_mismatch = false;
-                for (page, &stored_crc) in page_crcs.iter().enumerate() {
-                    if stored_crc == 0 {
-                        continue;
-                    }
-                    let page_start = page * PAGE_SIZE;
-                    let page_end = (page_start + PAGE_SIZE).min(chunk_buf.len());
-                    let computed_crc = crc_fast::crc32_iscsi(&chunk_buf[page_start..page_end]);
-                    if computed_crc != stored_crc {
-                        any_mismatch = true;
-                        break;
-                    }
+                let offset = chunk_index as u64 * block_size as u64;
+                let valid_bytes =
+                    std::cmp::min(block_size as u64, device_size.saturating_sub(offset)) as usize;
+                if valid_bytes > 0 {
+                    flushing_file.read_exact_at(&mut chunk_buf[..valid_bytes], offset)?;
                 }
-                if any_mismatch {
-                    let current_state = inner.state_map.get(chunk_index);
-                    if current_state != SparseBlockState::SYNCING {
-                        // CRC mismatch + block no longer SYNCING: a concurrent
-                        // write re-dirtied the block after our CRC pre-pass.
-                        // Both flags are set so metrics correctly attribute this
-                        // as a CRC mismatch caused by a concurrent write (not
-                        // SSD corruption).
+                if valid_bytes < block_size {
+                    chunk_buf[valid_bytes..].fill(0);
+                }
+
+                // Verify per-page CRC32C against write-time baselines.
+                if let Some(page_crcs) = crcs.get(&chunk_index) {
+                    const PAGE_SIZE: usize = 4096;
+                    let mut any_mismatch = false;
+                    for (page, &stored_crc) in page_crcs.iter().enumerate() {
+                        if stored_crc == 0 {
+                            continue;
+                        }
+                        let page_start = page * PAGE_SIZE;
+                        let page_end = (page_start + PAGE_SIZE).min(chunk_buf.len());
+                        let computed_crc = crc_fast::crc32_iscsi(&chunk_buf[page_start..page_end]);
+                        if computed_crc != stored_crc {
+                            any_mismatch = true;
+                            break;
+                        }
+                    }
+                    if any_mismatch {
+                        let current_state = inner.state_map.get(chunk_index);
+                        if current_state != SparseBlockState::SYNCING {
+                            return Ok(BlockResult::Skipped {
+                                chunk_index,
+                                cas_failed: true,
+                                crc_mismatched: true,
+                            });
+                        }
+                        debug!(
+                            chunk_index,
+                            "page CRC mismatch — block will retry next flush cycle"
+                        );
                         return Ok(BlockResult::Skipped {
                             chunk_index,
-                            cas_failed: true,
+                            cas_failed: false,
                             crc_mismatched: true,
                         });
                     }
-                    debug!(
+                }
+
+                // Fast zero-block detection (AVX2 on x86_64) before BLAKE3.
+                if is_zero_block(&chunk_buf) {
+                    return Ok(BlockResult::Computed {
                         chunk_index,
-                        "page CRC mismatch — block will retry next flush cycle"
-                    );
-                    return Ok(BlockResult::Skipped {
-                        chunk_index,
-                        cas_failed: false,
-                        crc_mismatched: true,
+                        hash: zero_hash,
+                        compressed: None,
                     });
                 }
-            }
 
-            // Fast zero-block detection (AVX2 on x86_64) before BLAKE3.
-            // Avoids the full hash + compress for trimmed/unwritten blocks.
-            if is_zero_block(&chunk_buf) {
-                return Ok(BlockResult::Computed {
+                let hash = blake3_128(&chunk_buf);
+
+                let compressed = Some(Bytes::from(lz4_compress(&chunk_buf[..])));
+
+                // Warm clean_cache
+                if let Some(ref cache) = clean_cache {
+                    cache.insert(hash, Bytes::from(chunk_buf));
+                }
+
+                Ok(BlockResult::Computed {
                     chunk_index,
-                    hash: zero_hash,
-                    compressed: None,
-                });
-            }
-
-            let hash = blake3_128(&chunk_buf);
-
-            let compressed = Some(lz4_compress(&chunk_buf[..]));
-
-            // Warm clean_cache: decompressed block data goes into the
-            // Foyer S3-FIFO cache so reads after eviction hit cache
-            // instead of S3. Inserted after compression so we can move
-            // chunk_buf instead of cloning it (saves 128KB alloc per block).
-            if let Some(ref cache) = clean_cache {
-                cache.insert(hash, Bytes::from(chunk_buf));
-            }
-
-            Ok(BlockResult::Computed {
-                chunk_index,
-                hash,
-                compressed,
-            })
+                    hash,
+                    compressed,
+                })
         })
         .collect();
 
     // Phase 2: sequential aggregation — within-batch dedup + stats.
     let mut stats = FlushStats::default();
-    let mut to_upload: Vec<(Blake3Hash, Vec<u8>)> = Vec::new();
+    let mut to_upload: Vec<(Blake3Hash, Bytes)> = Vec::new();
     let mut seen_hashes = HashSet::new();
     let mut computed: Vec<(usize, Blake3Hash)> = Vec::new();
     let mut skipped: Vec<usize> = Vec::new();
@@ -951,7 +940,7 @@ impl WriteCache<Active> {
             // Build hash → compressed data map from the unique-hash upload set.
             // Within-batch dedup (seen_hashes in compute_flush_batch) ensures one
             // copy of compressed data per unique hash.
-            let hash_to_compressed: HashMap<Blake3Hash, Vec<u8>> =
+            let hash_to_compressed: HashMap<Blake3Hash, Bytes> =
                 std::mem::take(&mut batch.to_upload).into_iter().collect();
 
             // Build one pack entry per dirty block, each at its actual
@@ -965,13 +954,13 @@ impl WriteCache<Active> {
             // a block overwritten with zeros would resolve to its previous non-zero
             // pack entry on a fork (where the local SSD is empty).
             let zero_hash = self.inner.zero_block_hash;
-            let mut blocks_for_pack: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
+            let mut blocks_for_pack: Vec<(Blake3Hash, u32, Bytes)> = Vec::new();
             let mut packed_indices: Vec<usize> = Vec::new();
             {
                 let vm = volume_manifest.read();
                 for &(block_index, hash) in &batch.computed {
                     let compressed = if hash == zero_hash {
-                        Vec::new() // zero block tombstone: comp_length = 0
+                        Bytes::new() // zero block tombstone: comp_length = 0
                     } else {
                         match hash_to_compressed.get(&hash) {
                             Some(data) => data.clone(),

@@ -170,7 +170,7 @@ pub fn assemble_pack(
 ///
 /// Returns sorted index entries (for `PackIndexCache` insertion).
 pub fn stream_pack_to_writer(
-    mut blocks: Vec<(Blake3Hash, u32, Vec<u8>)>,
+    mut blocks: Vec<(Blake3Hash, u32, Bytes)>,
     chunk_size: u32,
     writer: &mut WriteMultipart,
 ) -> io::Result<Vec<PackIndexEntry>> {
@@ -208,7 +208,7 @@ pub fn stream_pack_to_writer(
                 format!("pack data exceeds u32::MAX bytes at block {}", entries.len()),
             )
         })?;
-        writer.put(Bytes::from(compressed));
+        writer.put(compressed);
     }
 
     // -- Block Index footer (28 bytes per entry) --

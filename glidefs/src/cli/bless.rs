@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use crate::block::block_map::{blake3_128, lz4_compress, shared_zero_block, Blake3Hash};
 use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
 use crate::block::content_store::ContentStore;
@@ -109,7 +110,7 @@ pub async fn run_bless(
 
         stats.unique_blocks += 1;
 
-        let compressed = lz4_compress(&buf);
+        let compressed = Bytes::from(lz4_compress(&buf));
 
         // If we've moved to a new chunk, prepare and upload the previous one.
         if pending_chunk.as_ref().is_some_and(|(idx, _)| *idx != chunk_idx) {
@@ -368,7 +369,7 @@ pub async fn run_bless_oci(
         for (chunk_idx, packs) in &chunk_packs {
             for &pack_id in packs {
                 if let Some(entries) = pack_index_cache.get_entries(pack_id).await {
-                    for e in &entries {
+                    for e in entries.iter() {
                         let global_block = *chunk_idx as u64 * blocks_per_chunk + e.chunk_offset as u64;
                         indices.push(global_block);
                     }
@@ -445,7 +446,7 @@ async fn start_chunk_upload(
 ) -> Result<Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>> {
     // CPU: dedup + assemble pack
     let mut seen: HashSet<Blake3Hash> = HashSet::new();
-    let mut pack_blocks: Vec<(Blake3Hash, u32, Vec<u8>)> = Vec::new();
+    let mut pack_blocks: Vec<(Blake3Hash, u32, Bytes)> = Vec::new();
 
     for block in blocks {
         if seen.insert(block.hash) {
@@ -487,7 +488,7 @@ async fn start_chunk_upload(
 struct BlockInfo {
     block_offset: u32,
     hash: Blake3Hash,
-    compressed: Vec<u8>,
+    compressed: Bytes,
 }
 
 #[derive(Default)]
@@ -561,7 +562,7 @@ mod tests {
 
             stats.unique_blocks += 1;
 
-            let compressed = lz4_compress(&buf);
+            let compressed = Bytes::from(lz4_compress(&buf));
 
             if pending_chunk.as_ref().is_some_and(|(idx, _)| *idx != chunk_idx) {
                 let (completed_idx, blocks) = pending_chunk.take().unwrap();

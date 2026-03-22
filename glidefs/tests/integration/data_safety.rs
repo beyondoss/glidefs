@@ -1974,18 +1974,18 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
         };
         for (chunk_idx, packs) in &chunks_snapshot {
             for &pack_id in packs {
-                let entries = match pic.get_entries(pack_id).await {
+                let entries: std::sync::Arc<[glidefs::block::pack::PackIndexEntry]> = match pic.get_entries(pack_id).await {
                     Some(e) => e,
                     None => {
                         // Fetch from S3 if not cached
                         let fetched = cs.get_pack_index(*chunk_idx, pack_id).await
                             .expect("pack index should be fetchable");
                         pic.insert_entries(pack_id, &fetched);
-                        fetched
+                        std::sync::Arc::from(fetched)
                     }
                 };
                 let mut offsets_seen = HashSet::new();
-                for entry in &entries {
+                for entry in entries.iter() {
                     assert!(
                         offsets_seen.insert(entry.chunk_offset),
                         "pack {pack_id} in chunk {chunk_idx} has duplicate chunk_offset {}",
