@@ -3,10 +3,10 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tracing::{debug, info, instrument, warn};
 
-use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress_arena};
+use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
 use crate::block::cache::BlockCache;
 use crate::block::content_store::{ContentStore, ContentStoreError};
 use crate::block::state::{Active, Draining};
@@ -90,17 +90,9 @@ fn compute_flush_batch(
 
     // Phase 1: parallel per-block compute (pread + crc32 + blake3 + dedup + lz4).
     // Each rayon task allocates its own read buffer; peak memory = num_threads × block_size.
-    // map_init gives each rayon thread a reusable BytesMut arena for LZ4 output,
-    // reducing allocations from 1-per-block to 1-per-thread.
-    let max_compressed = lz4_flex::block::get_maximum_output_size(block_size) + 4;
-    let blocks_per_thread = (snapshot.len() / rayon::current_num_threads().max(1)) + 1;
-    let arena_capacity = max_compressed * blocks_per_thread;
-
     let per_block: Vec<Result<BlockResult, CacheError>> = snapshot
         .par_iter()
-        .map_init(
-            || BytesMut::with_capacity(arena_capacity),
-            |compress_arena, &chunk_index| {
+        .map(|&chunk_index| {
                 let mut chunk_buf = vec![0u8; block_size];
 
                 let offset = chunk_index as u64 * block_size as u64;
@@ -161,7 +153,7 @@ fn compute_flush_batch(
 
                 let hash = blake3_128(&chunk_buf);
 
-                let compressed = Some(lz4_compress_arena(&chunk_buf[..], compress_arena));
+                let compressed = Some(Bytes::from(lz4_compress(&chunk_buf[..])));
 
                 // Warm clean_cache
                 if let Some(ref cache) = clean_cache {
@@ -173,8 +165,7 @@ fn compute_flush_batch(
                     hash,
                     compressed,
                 })
-            },
-        )
+        })
         .collect();
 
     // Phase 2: sequential aggregation — within-batch dedup + stats.

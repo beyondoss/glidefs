@@ -725,36 +725,6 @@ pub fn lz4_compress(data: &[u8]) -> Vec<u8> {
     lz4_flex::compress_prepend_size(data)
 }
 
-/// Compress `data` into the `arena`, matching `compress_prepend_size` wire format
-/// (4-byte LE original size prefix + compressed payload). The compressed region
-/// is split off and returned as a zero-copy `Bytes`.
-///
-/// If the arena's remaining capacity is insufficient, it is replaced with a
-/// fresh allocation (previous splits remain valid — they share the old backing).
-#[inline]
-pub fn lz4_compress_arena(data: &[u8], arena: &mut bytes::BytesMut) -> bytes::Bytes {
-    let max_compressed = lz4_flex::block::get_maximum_output_size(data.len());
-    let needed = 4 + max_compressed;
-
-    // Grow arena if needed (previous Bytes splits keep the old backing alive via Arc).
-    if arena.capacity() - arena.len() < needed {
-        let new_cap = needed.max(64 * needed); // batch-amortize
-        *arena = bytes::BytesMut::with_capacity(new_cap);
-    }
-
-    let start = arena.len();
-    // Write 4-byte LE size prefix
-    arena.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    // Reserve space for worst-case compressed output
-    arena.resize(start + needed, 0);
-    let n = lz4_flex::block::compress_into(data, &mut arena[start + 4..])
-        .expect("arena sized for worst-case output");
-    arena.truncate(start + 4 + n);
-
-    // Split off this block's compressed data as shared Bytes
-    arena.split().freeze()
-}
-
 /// Decompress LZ4 data (expects size-prepended format from `lz4_compress`).
 ///
 /// Validates that the claimed uncompressed size does not exceed `MAX_DECOMPRESSED_SIZE`

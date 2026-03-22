@@ -19,7 +19,7 @@ impl WriteCache<Active> {
         end_block: u64,
     ) -> Result<(), CacheError> {
         use smallvec::SmallVec;
-        let mut batch: SmallVec<[u8; 256]> = SmallVec::new();
+        let mut batch = Vec::new();
         let mut to_dirty: SmallVec<[usize; 16]> = SmallVec::new();
         for block in start_block..=end_block {
             let idx = block as usize;
