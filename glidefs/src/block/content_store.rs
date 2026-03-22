@@ -520,7 +520,7 @@ impl ContentStore {
         &self,
         chunk_idx: u32,
         pack_id: super::pack::PackId,
-        blocks: Vec<(super::block_map::Blake3Hash, u32, Vec<u8>)>,
+        blocks: Vec<(super::block_map::Blake3Hash, u32, bytes::Bytes)>,
         chunk_size: u32,
     ) -> Result<Vec<super::pack::PackIndexEntry>, ContentStoreError> {
         use super::pack::stream_pack_to_writer;
@@ -836,7 +836,7 @@ mod tests {
             let hash = blake3_128(&data);
             let compressed = lz4_compress(&data);
             originals.push((chunk_offset, data));
-            blocks.push((hash, chunk_offset, compressed));
+            blocks.push((hash, chunk_offset, bytes::Bytes::from(compressed)));
         }
 
         // Upload via the streaming production path.
@@ -941,7 +941,7 @@ mod tests {
             let hash = blake3_128(&data);
             let compressed = lz4_compress(&data);
             originals.push((chunk_offset, data));
-            blocks.push((hash, chunk_offset, compressed));
+            blocks.push((hash, chunk_offset, bytes::Bytes::from(compressed)));
         }
 
         // Upload via streaming path

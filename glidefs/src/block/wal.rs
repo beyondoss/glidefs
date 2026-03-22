@@ -37,19 +37,19 @@ pub struct WalEntry {
 /// Serialize a normal WAL entry (20 bytes) into the buffer.
 ///
 /// Wire format: `[block_index:u64 LE][sequence:u64 LE][crc32:u32 LE]`
-pub fn serialize_entry(buf: &mut Vec<u8>, block_index: u64, sequence: u64) {
+pub fn serialize_entry(buf: &mut impl Extend<u8>, block_index: u64, sequence: u64) {
     let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
 
     let block_index_le = block_index.to_le_bytes();
     hasher.update(&block_index_le);
-    buf.extend_from_slice(&block_index_le);
+    buf.extend(block_index_le);
 
     let sequence_le = sequence.to_le_bytes();
     hasher.update(&sequence_le);
-    buf.extend_from_slice(&sequence_le);
+    buf.extend(sequence_le);
 
     let crc = hasher.finalize() as u32;
-    buf.extend_from_slice(&crc.to_le_bytes());
+    buf.extend(crc.to_le_bytes());
 }
 
 /// Append-only write-ahead log backed by a file on local SSD.

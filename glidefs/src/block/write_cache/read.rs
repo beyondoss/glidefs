@@ -477,16 +477,16 @@ impl WriteCache<Active> {
             .collect();
         let locations = futures::future::try_join_all(locate_futures).await?;
 
-        let mut resolved_blocks: HashMap<usize, Bytes> = HashMap::new();
+        let mut resolved_blocks: Vec<Option<Bytes>> = vec![None; num_blocks];
         let mut fetch_entries = Vec::new();
 
         for (i, location) in locations.into_iter().enumerate() {
             match location {
                 BlockLocation::Local(data) | BlockLocation::Cached(data) => {
-                    resolved_blocks.insert(i, data);
+                    resolved_blocks[i] = Some(data);
                 }
                 BlockLocation::Zero => {
-                    resolved_blocks.insert(i, self.inner.zero_block_bytes.clone());
+                    resolved_blocks[i] = Some(self.inner.zero_block_bytes.clone());
                 }
                 BlockLocation::NeedsFetch {
                     pack_id,
@@ -508,14 +508,16 @@ impl WriteCache<Active> {
                 Some(metrics),
             )
             .await?;
-            resolved_blocks.extend(fetched);
+            for (i, data) in fetched {
+                resolved_blocks[i] = Some(data);
+            }
         }
 
         let block_data_vec: Vec<Bytes> = {
             let mut vec = Vec::with_capacity(num_blocks);
-            for i in 0..num_blocks {
-                let data = resolved_blocks.remove(&i).ok_or_else(|| {
-                    CacheError::DecompressFailed("missing block in coalesced read".to_string())
+            for (i, slot) in resolved_blocks.into_iter().enumerate() {
+                let data = slot.ok_or_else(|| {
+                    CacheError::DecompressFailed(format!("missing block {} in coalesced read", i))
                 })?;
                 vec.push(data);
             }

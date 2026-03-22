@@ -18,8 +18,9 @@ impl WriteCache<Active> {
         start_block: u64,
         end_block: u64,
     ) -> Result<(), CacheError> {
-        let mut batch = Vec::new();
-        let mut to_dirty: Vec<usize> = Vec::new();
+        use smallvec::SmallVec;
+        let mut batch: SmallVec<[u8; 256]> = SmallVec::new();
+        let mut to_dirty: SmallVec<[usize; 16]> = SmallVec::new();
         for block in start_block..=end_block {
             let idx = block as usize;
             if idx >= self.inner.num_blocks {

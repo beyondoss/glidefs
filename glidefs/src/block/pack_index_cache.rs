@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use foyer::{
     BlockEngineConfig, Code, DeviceBuilder, EvictionConfig, FsDeviceBuilder, HybridCache,
@@ -35,7 +36,7 @@ const DEFAULT_SSD_BYTES: usize = 128 * 1024 * 1024;
 /// In the memory tier, this holds the parsed entries directly (zero-cost access).
 /// On SSD, entries are extent-encoded + zstd-compressed via the `Code` trait.
 #[derive(Debug, Clone)]
-struct CachedPackIndex(Vec<PackIndexEntry>);
+struct CachedPackIndex(Arc<[PackIndexEntry]>);
 
 impl Code for CachedPackIndex {
     fn encode(&self, writer: &mut impl std::io::Write) -> foyer::Result<()> {
@@ -58,7 +59,7 @@ impl Code for CachedPackIndex {
         let raw = zstd::bulk::decompress(&compressed, 1024 * 1024)
             .map_err(foyer::Error::io_error)?;
         extent_decode(&raw)
-            .map(CachedPackIndex)
+            .map(|v| CachedPackIndex(Arc::from(v)))
             .ok_or_else(|| foyer::Error::io_error(
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid extent-encoded pack index"),
             ))
@@ -111,9 +112,12 @@ impl PackIndexCache {
     }
 
     /// Get all index entries for a pack.
-    pub async fn get_entries(&self, pack_id: PackId) -> Option<Vec<PackIndexEntry>> {
+    ///
+    /// Returns an `Arc<[PackIndexEntry]>` — callers share the cached slice
+    /// without cloning ~14 KB of entry data per call.
+    pub async fn get_entries(&self, pack_id: PackId) -> Option<Arc<[PackIndexEntry]>> {
         match self.inner.get(&pack_id).await {
-            Ok(Some(entry)) => Some(entry.value().0.clone()),
+            Ok(Some(entry)) => Some(Arc::clone(&entry.value().0)),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!(pack_id, error = %e, "pack index cache error, treating as miss");
@@ -125,7 +129,7 @@ impl PackIndexCache {
     /// Insert pack index entries into the cache (fire-and-forget).
     pub fn insert_entries(&self, pack_id: PackId, entries: &[PackIndexEntry]) {
         self.inner
-            .insert(pack_id, CachedPackIndex(entries.to_vec()));
+            .insert(pack_id, CachedPackIndex(Arc::from(entries)));
     }
 
     /// Look up a single block by chunk_offset within a cached pack index.
@@ -158,7 +162,7 @@ impl PackIndexCache {
         let mut hashes = HashSet::new();
         for &pack_id in pack_ids {
             if let Some(entries) = self.get_entries(pack_id).await {
-                for entry in &entries {
+                for entry in entries.iter() {
                     hashes.insert(entry.hash);
                 }
             }
@@ -491,7 +495,7 @@ mod tests {
         use std::io::Cursor;
 
         let entries = make_consecutive_entries(0, 100, 63000);
-        let cached = CachedPackIndex(entries.clone());
+        let cached = CachedPackIndex(Arc::from(entries.clone()));
 
         let mut buf = Vec::new();
         cached.encode(&mut buf).expect("encode should succeed");
