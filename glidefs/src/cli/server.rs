@@ -93,6 +93,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
         .context("Failed to open foyer clean cache")?,
     );
 
+    let db_path_for_prewarm = db_path.clone();
     let router = Arc::new(
         ExportRouter::new(crate::block::router::RouterConfig {
             object_store: Arc::clone(&object_store),
@@ -120,6 +121,13 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
             let total = discovered.len();
             info!("Found {} export(s) in S3, recovering in parallel...", total);
+
+            // Collect unique S3 prefixes for base cache pre-warming.
+            let s3_prefixes: std::collections::HashSet<String> = discovered
+                .iter()
+                .map(|c| format!("{}/exports/{}", &db_path_for_prewarm, c.s3_prefix()))
+                .collect();
+
             let count: usize = stream::iter(discovered)
                 .map(|config| {
                     let router = Arc::clone(&router);
@@ -141,6 +149,13 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                 .fold(0usize, |acc, n| async move { acc + n })
                 .await;
             info!("Discovered {}/{} export(s) from S3", count, total);
+
+            // Pre-warm base manifest and hot set caches so the first fork
+            // from each base avoids an S3 round-trip.
+            for prefix in &s3_prefixes {
+                router.prewarm_base_caches(prefix).await;
+            }
+
             count
         }
         Err(e) => {

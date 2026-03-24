@@ -31,6 +31,11 @@ use tokio::sync::{Notify, RwLock, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+/// Maximum number of entries in the base manifest / hot set caches.
+/// Bases are immutable after bless, so eviction policy doesn't matter —
+/// we just cap memory usage. 64 entries ≈ a few MB at most.
+const MAX_BASE_CACHE_ENTRIES: usize = 64;
+
 /// Errors that can occur during export operations.
 #[derive(Error, Debug)]
 pub enum RouterError {
@@ -231,6 +236,15 @@ pub struct ExportRouter {
     /// ublk device manager (Linux + ublk feature only).
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     ublk_server: tokio::sync::Mutex<crate::block::ublk::UblkServer>,
+
+    /// Bounded cache for blessed base manifests (bases/* are immutable after bless).
+    /// Key: "{s3_prefix}:{manifest_name}" → deserialized VolumeManifest.
+    /// Cloning the Arc is ~0ns vs ~100ms for an S3 round-trip.
+    base_manifest_cache: parking_lot::Mutex<HashMap<String, Arc<VolumeManifest>>>,
+
+    /// Bounded cache for boot hot sets (immutable, paired with base manifests).
+    /// Key: "{s3_prefix}:{hot_set_name}" → parsed block indices.
+    hot_set_cache: parking_lot::Mutex<HashMap<String, Arc<Vec<u64>>>>,
 }
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
@@ -329,12 +343,123 @@ impl ExportRouter {
             nbd_devices,
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             ublk_server,
+            base_manifest_cache: parking_lot::Mutex::new(HashMap::new()),
+            hot_set_cache: parking_lot::Mutex::new(HashMap::new()),
         })
     }
 
     /// Get a reference to the shared clean cache (for scrubber).
     pub fn clean_cache(&self) -> &Arc<dyn BlockCache> {
         &self.clean_cache
+    }
+
+    /// Pre-warm the base manifest and hot set caches for a given S3 prefix.
+    ///
+    /// Lists all `bases/*` manifests under `{s3_prefix}/manifests/` and loads
+    /// them into memory. Call after router construction (e.g. after
+    /// `discover_exports`) so the first fork from each base avoids an S3
+    /// round-trip.
+    pub async fn prewarm_base_caches(&self, s3_prefix: &str) {
+        use futures::stream::{self, StreamExt};
+
+        let cs = ContentStore::new(Arc::clone(&self.object_store), s3_prefix)
+            .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker));
+
+        let manifests = match cs.list_all_manifests().await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("prewarm: failed to list manifests: {}", e);
+                return;
+            }
+        };
+
+        let remaining_capacity = MAX_BASE_CACHE_ENTRIES
+            .saturating_sub(self.base_manifest_cache.lock().len());
+        let bases: Vec<_> = manifests
+            .into_iter()
+            .filter(|name| name.starts_with("bases/"))
+            .take(remaining_capacity)
+            .collect();
+        if bases.is_empty() {
+            debug!("prewarm: no base manifests found under {}", s3_prefix);
+            return;
+        }
+
+        info!(
+            count = bases.len(),
+            s3_prefix = %s3_prefix,
+            "pre-warming base manifest and hot set caches"
+        );
+
+        // Fetch all base manifests + hot sets concurrently.
+        let cs = Arc::new(cs);
+        stream::iter(bases)
+            .for_each_concurrent(8, |manifest_name| {
+                let cs = Arc::clone(&cs);
+                async move {
+                    let cache_key = format!("{}:{}", s3_prefix, &manifest_name);
+
+                    // Manifest
+                    if !self.base_manifest_cache.lock().contains_key(&cache_key) {
+                        match cs.get_manifest(&manifest_name).await {
+                            Ok(Some((data, _etag))) => match VolumeManifest::deserialize(&data) {
+                                Ok(vm) => {
+                                    let mut cache_map = self.base_manifest_cache.lock();
+                                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
+                                        cache_map.insert(cache_key.clone(), Arc::new(vm));
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    manifest = %manifest_name,
+                                    "prewarm: failed to deserialize manifest: {}", e
+                                ),
+                            },
+                            Ok(None) => debug!(manifest = %manifest_name, "prewarm: manifest not found"),
+                            Err(e) => warn!(
+                                manifest = %manifest_name,
+                                "prewarm: failed to fetch manifest: {}", e
+                            ),
+                        }
+                    }
+
+                    // Hot set
+                    let hot_set_name = manifest_name
+                        .strip_prefix("bases/")
+                        .unwrap_or(&manifest_name);
+                    let hot_cache_key = format!("{}:{}", s3_prefix, hot_set_name);
+
+                    if !self.hot_set_cache.lock().contains_key(&hot_cache_key) {
+                        match cs.get_hot_set(hot_set_name).await {
+                            Ok(Some(data)) => match deserialize_hot_set(&data) {
+                                Ok(chunks) => {
+                                    let mut cache_map = self.hot_set_cache.lock();
+                                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
+                                        cache_map.insert(hot_cache_key, Arc::new(chunks));
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    hot_set = %hot_set_name,
+                                    "prewarm: failed to deserialize hot set: {}", e
+                                ),
+                            },
+                            Ok(None) => debug!(hot_set = %hot_set_name, "prewarm: no hot set found"),
+                            Err(e) => warn!(
+                                hot_set = %hot_set_name,
+                                "prewarm: failed to fetch hot set: {}", e
+                            ),
+                        }
+                    }
+                }
+            })
+            .await;
+
+        let manifest_count = self.base_manifest_cache.lock().len();
+        let hot_set_count = self.hot_set_cache.lock().len();
+        info!(
+            manifests = manifest_count,
+            hot_sets = hot_set_count,
+            "base cache pre-warm complete"
+        );
     }
 
     /// Get the shared scrubber metrics (for scrubber + prometheus).
@@ -669,9 +794,12 @@ impl ExportRouter {
         let mut device_size = config.size_bytes();
 
         let (cache, volume_manifest) = if let Some(manifest_name) = manifest_name {
-            // Fork path: try to load VolumeManifest from S3
+            // Fork path: load VolumeManifest, preferring in-memory cache for bases/*
+            let is_base = manifest_name.starts_with("bases/");
+            let cache_key = format!("{}:{}", s3_prefix, manifest_name);
+
             let fork_vm = if let Some(seq) = snapshot_sequence {
-                // Fork from a specific versioned snapshot
+                // Fork from a specific versioned snapshot (never cached — snapshots are mutable)
                 match content_store.get_snapshot(manifest_name, seq).await {
                     Ok(Some(data)) => VolumeManifest::deserialize(&data)
                         .map_err(|e| RouterError::Manifest(format!("failed to deserialize snapshot volume manifest: {}", e)))?,
@@ -688,8 +816,37 @@ impl ExportRouter {
                         )));
                     }
                 }
+            } else if is_base {
+                // Check base manifest cache first (bases/* are immutable after bless)
+                if let Some(cached) = self.base_manifest_cache.lock().get(&cache_key) {
+                    debug!(manifest = %manifest_name, "base manifest cache hit");
+                    VolumeManifest::clone(cached)
+                } else {
+                    // Cache miss — fetch from S3 and populate
+                    let vm = match content_store.get_manifest(manifest_name).await {
+                        Ok(Some((data, _etag))) => VolumeManifest::deserialize(&data)
+                            .map_err(|e| RouterError::Manifest(format!("failed to deserialize volume manifest: {}", e)))?,
+                        Ok(None) => {
+                            return Err(RouterError::Manifest(format!(
+                                "manifest '{}' not found",
+                                manifest_name
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(RouterError::Manifest(format!(
+                                "manifest '{}' fetch error: {}",
+                                manifest_name, e
+                            )));
+                        }
+                    };
+                    let mut cache_map = self.base_manifest_cache.lock();
+                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
+                        cache_map.insert(cache_key.clone(), Arc::new(vm.clone()));
+                    }
+                    vm
+                }
             } else {
-                // Fork from current manifest
+                // Non-base manifest (mutable) — always fetch from S3
                 match content_store.get_manifest(manifest_name).await {
                     Ok(Some((data, _etag))) => VolumeManifest::deserialize(&data)
                         .map_err(|e| RouterError::Manifest(format!("failed to deserialize volume manifest: {}", e)))?,
@@ -807,25 +964,61 @@ impl ExportRouter {
             let hot_set_name = manifest_name
                 .strip_prefix("bases/")
                 .unwrap_or(manifest_name);
-            match content_store.get_hot_set(hot_set_name).await {
-                Ok(Some(hot_set_data)) => match deserialize_hot_set(&hot_set_data) {
-                    Ok(chunks) => {
-                        info!(chunks = chunks.len(), "prefetching boot hot set");
-                        let cache_clone = Arc::clone(&cache);
-                        let cmc = Arc::clone(&pack_index_cache);
-                        let vm = Arc::clone(&volume_manifest);
-                        let cs = Arc::clone(&content_store);
-                        spawn_named("hot-set-prefetch", async move {
-                            cache_clone
-                                .prefetch_chunks(&chunks, &cmc, &vm, &cs)
-                                .await;
-                            info!("boot hot set prefetch complete");
-                        });
+
+            // Try hot set cache first (bases/* hot sets are immutable)
+            let is_base = manifest_name.starts_with("bases/");
+            let hot_cache_key = format!("{}:{}", s3_prefix, hot_set_name);
+
+            let cached_hot_set = if is_base {
+                self.hot_set_cache.lock().get(&hot_cache_key).cloned()
+            } else {
+                None
+            };
+
+            let chunks = if let Some(chunks) = cached_hot_set {
+                debug!(hot_set = %hot_set_name, "hot set cache hit");
+                Some(chunks)
+            } else {
+                match content_store.get_hot_set(hot_set_name).await {
+                    Ok(Some(hot_set_data)) => match deserialize_hot_set(&hot_set_data) {
+                        Ok(chunks) => {
+                            let chunks = Arc::new(chunks);
+                            if is_base {
+                                let mut cache_map = self.hot_set_cache.lock();
+                                if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
+                                    cache_map.insert(hot_cache_key, Arc::clone(&chunks));
+                                }
+                            }
+                            Some(chunks)
+                        }
+                        Err(e) => {
+                            warn!("failed to deserialize hot set: {}", e);
+                            None
+                        }
+                    },
+                    Ok(None) => {
+                        debug!("no hot set found for '{}'", hot_set_name);
+                        None
                     }
-                    Err(e) => warn!("failed to deserialize hot set: {}", e),
-                },
-                Ok(None) => debug!("no hot set found for '{}'", hot_set_name),
-                Err(e) => warn!("failed to fetch hot set: {}", e),
+                    Err(e) => {
+                        warn!("failed to fetch hot set: {}", e);
+                        None
+                    }
+                }
+            };
+
+            if let Some(chunks) = chunks {
+                info!(chunks = chunks.len(), "prefetching boot hot set");
+                let cache_clone = Arc::clone(&cache);
+                let cmc = Arc::clone(&pack_index_cache);
+                let vm = Arc::clone(&volume_manifest);
+                let cs = Arc::clone(&content_store);
+                spawn_named("hot-set-prefetch", async move {
+                    cache_clone
+                        .prefetch_chunks(&chunks, &cmc, &vm, &cs)
+                        .await;
+                    info!("boot hot set prefetch complete");
+                });
             }
         }
 
