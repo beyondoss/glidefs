@@ -155,6 +155,21 @@ impl ContentStore {
         Ok(put_result.e_tag)
     }
 
+    /// Delete a manifest from S3 (idempotent).
+    #[instrument(skip(self), fields(name = %name))]
+    pub async fn delete_manifest(&self, name: &str) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/{}", self.base_path, manifest_s3_key(name));
+        let path = ObjectPath::from(key);
+        let result = self.object_store.delete(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Check if a manifest exists in S3 (HEAD request, no data transfer).
     #[instrument(skip(self), fields(name = %name))]
     pub async fn head_manifest(&self, name: &str) -> Result<bool, ContentStoreError> {
@@ -722,6 +737,33 @@ mod tests {
             .expect("manifest should exist");
 
         assert_eq!(got, data);
+    }
+
+    #[tokio::test]
+    async fn test_delete_manifest_idempotent() {
+        let store = test_store("test-bucket");
+        let name = "vm-to-delete";
+        let data = b"manifest data".to_vec();
+
+        store
+            .put_manifest(name, data, None)
+            .await
+            .expect("put should succeed");
+
+        // First delete succeeds
+        store
+            .delete_manifest(name)
+            .await
+            .expect("delete should succeed");
+
+        // Manifest is gone
+        assert!(store.get_manifest(name).await.unwrap().is_none());
+
+        // Second delete is idempotent (NotFound is Ok)
+        store
+            .delete_manifest(name)
+            .await
+            .expect("delete of missing manifest should succeed");
     }
 
     #[tokio::test]

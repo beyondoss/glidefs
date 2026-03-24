@@ -1737,14 +1737,53 @@ impl ExportRouter {
                 Some(state) => state,
                 None => {
                     info!("Export '{}' doesn't exist, nothing to remove", name);
-                    // Still purge local files if requested (idempotent cleanup)
                     if purge {
+                        // Clean local cache files
                         let cache_file = self.cache_dir.join(format!("{}.cache", name));
                         let meta_file = self.cache_dir.join(format!("{}.meta", name));
                         let wal_file = self.cache_dir.join(format!("{}.wal", name));
                         remove_file_if_exists(&cache_file);
                         remove_file_if_exists(&meta_file);
                         remove_file_if_exists(&wal_file);
+
+                        // S3 cleanup: load export config to discover s3_prefix,
+                        // then delete manifest, snapshots, and export definition.
+                        match self.load_export(name).await {
+                            Ok(Some(config)) => {
+                                let s3_prefix = format!(
+                                    "{}/exports/{}",
+                                    self.db_path,
+                                    config.s3_prefix()
+                                );
+                                let cs = ContentStore::new(
+                                    Arc::clone(&self.object_store),
+                                    &s3_prefix,
+                                )
+                                .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker));
+
+                                if let Err(e) = cs.delete_manifest(name).await {
+                                    warn!("Failed to delete manifest from S3: {}", e);
+                                }
+                                if let Err(e) = cs.delete_all_snapshots(name).await {
+                                    warn!("Failed to delete snapshots from S3: {}", e);
+                                }
+                                if let Err(e) = self.delete_export_definition(name).await {
+                                    warn!("Failed to delete export definition from S3: {}", e);
+                                }
+                            }
+                            Ok(None) => {
+                                debug!(
+                                    "No export definition in S3 for '{}', skipping S3 cleanup",
+                                    name
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to load export definition for S3 cleanup: {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                     return Ok(());
                 }
@@ -1768,7 +1807,7 @@ impl ExportRouter {
             }
         }
 
-        let remaining = Self::teardown_export(name, state).await;
+        let remaining = Self::teardown_export(name, state, purge).await;
 
         if purge {
             let cache_file = self.cache_dir.join(format!("{}.cache", name));
@@ -1782,6 +1821,11 @@ impl ExportRouter {
             // Also delete export definition from S3
             if let Err(e) = self.delete_export_definition(name).await {
                 warn!("Failed to delete export definition from S3: {}", e);
+            }
+
+            // Delete the manifest from S3 (best-effort).
+            if let Some(cs) = &snapshot_cs && let Err(e) = cs.delete_manifest(name).await {
+                warn!("Failed to delete manifest from S3: {}", e);
             }
 
             // Delete all versioned snapshots from S3 (best-effort).
@@ -1826,7 +1870,7 @@ impl ExportRouter {
         let incomplete: Vec<(String, u64)> = stream::iter(export_list)
             .map(|(name, state)| async move {
                 info!("Shutting down export '{}'...", name);
-                let remaining = Self::teardown_export(&name, state).await;
+                let remaining = Self::teardown_export(&name, state, false).await;
                 (name, remaining)
             })
             .buffer_unordered(16)
@@ -1877,8 +1921,12 @@ impl ExportRouter {
     /// Drain dirty blocks, stop flush scheduler, and transition cache through
     /// the Draining typestate. Shared by `remove_export` and `shutdown`.
     ///
-    /// Returns the number of dirty blocks remaining (0 = fully drained).
-    async fn teardown_export(name: &str, state: ExportState) -> u64 {
+    /// When `skip_drain` is true, dirty blocks are discarded without flushing
+    /// to S3. Used when purging — the S3 data will be deleted anyway, so
+    /// draining is wasted work.
+    ///
+    /// Returns the number of dirty blocks remaining (0 = fully drained or skipped).
+    async fn teardown_export(name: &str, state: ExportState, skip_drain: bool) -> u64 {
         let ExportState {
             handler,
             cache,
@@ -1899,50 +1947,59 @@ impl ExportRouter {
             warn!("Flush scheduler for '{}' panicked: {}", name, e);
         }
 
-        // 3. V2 drain: flush remaining dirty data.
-        //    Continue on errors (may be transient S3 failures) instead of
-        //    breaking — matches the public ExportState::drain() behavior.
-        //    Exponential backoff on consecutive errors prevents tight-looping
-        //    when S3 is down (100 rapid retries → log spam + wasted network).
-        let mut drain_done = false;
-        let mut backoff = Duration::from_millis(100);
-        for _ in 0..MAX_DRAIN_ITERATIONS {
-            match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
-                Ok(stats) if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 => {
-                    drain_done = true;
-                    break;
-                }
-                Ok(_) => {
-                    backoff = Duration::from_millis(100);
-                }
-                Err(e) => {
-                    metrics.record_flush_error();
-                    warn!("Drain error for '{}' (retrying in {:?}): {}", name, backoff, e);
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
-                }
-            }
-        }
-        let remaining = if drain_done {
+        let remaining = if skip_drain {
+            // Purge path: skip drain entirely — dirty blocks are discarded.
+            // No manifest sync needed since S3 data will be deleted.
+            info!("Skipping drain for '{}' (purge)", name);
             0
         } else {
-            cache.dirty_block_count()
-        };
-        if remaining > 0 {
-            warn!(
-                "Teardown drain for '{}' incomplete, {} dirty blocks remain",
-                name, remaining,
-            );
-        }
+            // 3. V2 drain: flush remaining dirty data.
+            //    Continue on errors (may be transient S3 failures) instead of
+            //    breaking — matches the public ExportState::drain() behavior.
+            //    Exponential backoff on consecutive errors prevents tight-looping
+            //    when S3 is down (100 rapid retries → log spam + wasted network).
+            let mut drain_done = false;
+            let mut backoff = Duration::from_millis(100);
+            for _ in 0..MAX_DRAIN_ITERATIONS {
+                match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
+                    Ok(stats) if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 => {
+                        drain_done = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        backoff = Duration::from_millis(100);
+                    }
+                    Err(e) => {
+                        metrics.record_flush_error();
+                        warn!("Drain error for '{}' (retrying in {:?}): {}", name, backoff, e);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+            let remaining = if drain_done {
+                0
+            } else {
+                cache.dirty_block_count()
+            };
+            if remaining > 0 {
+                warn!(
+                    "Teardown drain for '{}' incomplete, {} dirty blocks remain",
+                    name, remaining,
+                );
+            }
 
-        // Best-effort final manifest sync — persists references to any packs
-        // that were successfully uploaded even if the full drain didn't complete.
-        if let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await {
-            warn!(
-                "Final manifest sync for '{}' failed: {} — flushed packs may be orphaned",
-                name, e,
-            );
-        }
+            // Best-effort final manifest sync — persists references to any packs
+            // that were successfully uploaded even if the full drain didn't complete.
+            if let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await {
+                warn!(
+                    "Final manifest sync for '{}' failed: {} — flushed packs may be orphaned",
+                    name, e,
+                );
+            }
+
+            remaining
+        };
 
         // 4. Drop the handler (releases its Arc clone)
         drop(handler);
@@ -2527,6 +2584,87 @@ mod tests {
         // Verify deleted from S3
         let loaded = router.load_export("purge-vol").await.unwrap();
         assert!(loaded.is_none(), "Should be deleted from S3");
+    }
+
+    #[tokio::test]
+    async fn test_purge_deletes_manifest_from_s3() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // Create export, write data, flush to create a manifest in S3
+        let config = test_export_config("purge-manifest");
+        router
+            .create_export(config.clone(), false, None, None)
+            .await
+            .unwrap();
+        let handler = router.get_handler("purge-manifest").await.unwrap();
+        handler.write(0, &[0xAA; 4096], false).await.unwrap();
+        router.drain_export("purge-manifest").await.unwrap();
+
+        // Manifest should exist
+        assert!(
+            router
+                .head_manifest("purge-manifest", "purge-manifest")
+                .await
+                .unwrap(),
+            "manifest should exist after drain"
+        );
+
+        // Purge
+        router.remove_export("purge-manifest", true).await.unwrap();
+
+        // Manifest should be gone
+        assert!(
+            !router
+                .head_manifest("purge-manifest", "purge-manifest")
+                .await
+                .unwrap(),
+            "manifest should be deleted after purge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_when_already_gone_cleans_s3() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // Create export, persist config to S3, write + drain to create manifest
+        let config = test_export_config("gone-purge");
+        router
+            .create_export(config.clone(), false, None, None)
+            .await
+            .unwrap();
+        router.save_export(&config).await.unwrap();
+        let handler = router.get_handler("gone-purge").await.unwrap();
+        handler.write(0, &[0xBB; 4096], false).await.unwrap();
+        router.drain_export("gone-purge").await.unwrap();
+
+        // Verify manifest + export definition exist
+        assert!(router.head_manifest("gone-purge", "gone-purge").await.unwrap());
+        assert!(router.load_export("gone-purge").await.unwrap().is_some());
+
+        // Remove WITHOUT purge (simulates shutdown drain)
+        router.remove_export("gone-purge", false).await.unwrap();
+
+        // Export is gone from memory, but S3 artifacts remain
+        assert!(router.head_manifest("gone-purge", "gone-purge").await.unwrap());
+        assert!(router.load_export("gone-purge").await.unwrap().is_some());
+
+        // Now purge the already-gone export
+        router.remove_export("gone-purge", true).await.unwrap();
+
+        // S3 artifacts should be cleaned up
+        assert!(
+            !router
+                .head_manifest("gone-purge", "gone-purge")
+                .await
+                .unwrap(),
+            "manifest should be deleted after purge-when-gone"
+        );
+        assert!(
+            router.load_export("gone-purge").await.unwrap().is_none(),
+            "export definition should be deleted after purge-when-gone"
+        );
     }
 
     // =========================================================================
