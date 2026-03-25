@@ -989,13 +989,16 @@ impl WriteCache<Active> {
                     let chunk_offset = vm.block_offset_in_chunk(block_index as u64);
 
                     // Cross-flush dedup: skip if existing pack has same
-                    // content at this offset.
-                    if let Some(&existing_hash) = existing_hashes.get(&chunk_offset) {
-                        if existing_hash == hash {
-                            total_stats.blocks_cross_deduped += 1;
-                            packed_indices.push(block_index);
-                            continue;
-                        }
+                    // content at this offset, OR if the block is zero and
+                    // no prior entry exists (reads return zeros by default).
+                    let dominated = match existing_hashes.get(&chunk_offset) {
+                        Some(&existing_hash) => existing_hash == hash,
+                        None => hash == zero_hash,
+                    };
+                    if dominated {
+                        total_stats.blocks_cross_deduped += 1;
+                        packed_indices.push(block_index);
+                        continue;
                     }
 
                     let compressed = if hash == zero_hash {
@@ -1046,39 +1049,11 @@ impl WriteCache<Active> {
                 }
             }
 
-            // Cross-export dedup: check if another export already uploaded
-            // this pack to S3 (same content → same S3 key).
-            match content_store.head_chunk_pack(chunk_idx, pack_id).await {
-                Ok(true) => {
-                    // Pack exists in S3 but not in our manifest. Add reference
-                    // without re-uploading. Load index into cache.
-                    match content_store.get_pack_index(chunk_idx, pack_id).await {
-                        Ok(entries) => {
-                            pack_index_cache.insert_entries(pack_id, &entries);
-                            staged_appends.push((chunk_idx, pack_id));
-                            total_stats.packs_skipped += 1;
-                            continue;
-                        }
-                        Err(e) => {
-                            // Can't read the index — fall through to upload.
-                            warn!(
-                                chunk_idx, pack_id,
-                                error = %e,
-                                "HEAD found pack but index read failed, re-uploading"
-                            );
-                        }
-                    }
-                }
-                Ok(false) => {} // Not in S3, upload below
-                Err(e) => {
-                    // HEAD failed — upload anyway (safe, idempotent).
-                    warn!(
-                        chunk_idx, pack_id,
-                        error = %e,
-                        "HEAD check failed, uploading pack"
-                    );
-                }
-            }
+            // Cross-export dedup: content-addressed pack_id means identical
+            // packs from different exports map to the same S3 key. The PUT is
+            // idempotent — writing the same bytes to the same key is safe.
+            // We always upload rather than HEAD-then-skip to avoid a race with
+            // GC (GC could delete the pack between our HEAD and manifest sync).
 
             // Push upload future — runs concurrently with next chunk's compute.
             let cs = &content_store;
