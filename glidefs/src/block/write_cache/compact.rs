@@ -336,26 +336,44 @@ pub async fn compact_if_needed(
         (compact, candidates)
     };
 
-    // Evaluate dead-block ratio for candidates not already above pack-count threshold
-    for (chunk_idx, pack_ids) in ratio_candidates {
-        match dead_block_ratio(&pack_ids, pack_index_cache, content_store, chunk_idx).await {
-            Ok(ratio) if ratio > dead_ratio_threshold => {
-                debug!(
-                    chunk_idx,
-                    packs = pack_ids.len(),
-                    dead_ratio = format!("{:.1}%", ratio * 100.0),
-                    "dead-block ratio exceeds threshold"
-                );
-                chunks_to_compact.push((chunk_idx, pack_ids));
-            }
-            Ok(_) => {} // below threshold, skip
-            Err(e) => {
-                // Non-fatal: skip this candidate, will retry next cycle
-                warn!(
-                    chunk_idx,
-                    error = %e,
-                    "failed to compute dead-block ratio, skipping"
-                );
+    // Evaluate dead-block ratio for candidates concurrently.
+    {
+        use futures::stream::{self, StreamExt};
+
+        let ratio_results: Vec<(u32, Vec<PackId>, Result<f32, CacheError>)> =
+            stream::iter(ratio_candidates)
+                .map(|(chunk_idx, pack_ids)| {
+                    let cs = &content_store;
+                    let pic = &pack_index_cache;
+                    async move {
+                        let result = dead_block_ratio(&pack_ids, pic, cs, chunk_idx).await;
+                        (chunk_idx, pack_ids, result)
+                    }
+                })
+                .buffer_unordered(16)
+                .collect()
+                .await;
+
+        for (chunk_idx, pack_ids, result) in ratio_results {
+            match result {
+                Ok(ratio) if ratio > dead_ratio_threshold => {
+                    debug!(
+                        chunk_idx,
+                        packs = pack_ids.len(),
+                        dead_ratio = format!("{:.1}%", ratio * 100.0),
+                        "dead-block ratio exceeds threshold"
+                    );
+                    chunks_to_compact.push((chunk_idx, pack_ids));
+                }
+                Ok(_) => {} // below threshold, skip
+                Err(e) => {
+                    // Non-fatal: skip this candidate, will retry next cycle
+                    warn!(
+                        chunk_idx,
+                        error = %e,
+                        "failed to compute dead-block ratio, skipping"
+                    );
+                }
             }
         }
     }
@@ -369,25 +387,43 @@ pub async fn compact_if_needed(
         threshold, "compacting chunks"
     );
 
-    let mut results = Vec::new();
-
     let blocks_per_chunk = {
         let vm = volume_manifest.read();
         vm.blocks_per_chunk()
     };
 
-    for (chunk_idx, pack_ids) in chunks_to_compact {
-        match compact_chunk(
-            chunk_idx,
-            &pack_ids,
-            blocks_per_chunk,
-            content_store,
-            pack_index_cache,
-            volume_manifest,
-            clean_cache,
-        )
-        .await
-        {
+    // Compact chunks concurrently. Each compact_chunk does S3 reads +
+    // upload + manifest CAS independently.
+    use futures::stream::{self, StreamExt};
+
+    let compact_results: Vec<(u32, Result<CompactionResult, CacheError>)> =
+        stream::iter(chunks_to_compact)
+            .map(|(chunk_idx, pack_ids)| {
+                let cs = &content_store;
+                let pic = &pack_index_cache;
+                let vm = &volume_manifest;
+                let cc = &clean_cache;
+                async move {
+                    let result = compact_chunk(
+                        chunk_idx,
+                        &pack_ids,
+                        blocks_per_chunk,
+                        cs,
+                        pic,
+                        vm,
+                        cc,
+                    )
+                    .await;
+                    (chunk_idx, result)
+                }
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+
+    let mut results = Vec::new();
+    for (chunk_idx, result) in compact_results {
+        match result {
             Ok(result) => results.push(result),
             Err(e) => {
                 warn!(

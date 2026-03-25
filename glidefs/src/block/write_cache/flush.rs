@@ -868,7 +868,16 @@ impl WriteCache<Active> {
         let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
         let crcs = Arc::new(crcs);
 
-        // Per-chunk flush
+        // Phase 1: Compute all batches sequentially (needs flushing file + shared state).
+        // Collect packs ready for upload.
+        struct PackUpload {
+            chunk_idx: u32,
+            pack_id: crate::block::pack::PackId,
+            blocks: Vec<(Blake3Hash, u32, Bytes)>,
+            packed_indices: Vec<usize>,
+        }
+        let mut uploads: Vec<PackUpload> = Vec::new();
+
         for (chunk_idx, chunk_blocks) in per_chunk {
             // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
             let zero_hash = self.inner.zero_block_hash;
@@ -992,27 +1001,76 @@ impl WriteCache<Active> {
                 continue;
             }
 
-            // Stream GLPK v3 pack to S3 (blocks freed as they upload)
-            let pack_id = new_pack_id();
+            // Skip pack upload if ALL entries are zero-block tombstones AND
+            // the chunk has no prior packs in the manifest. In that case,
+            // reads already return zeros (no pack entry → zero-fill), so
+            // the tombstones are redundant. This avoids creating empty packs
+            // from trim/write_zeroes on unwritten regions of forked exports.
+            {
+                let all_zero_tombstones = blocks_for_pack.iter().all(|(_, _, data)| data.is_empty());
+                if all_zero_tombstones {
+                    let vm = volume_manifest.read();
+                    let has_prior_packs = vm
+                        .chunk_pack_ids(chunk_idx)
+                        .is_some_and(|packs| !packs.is_empty());
+                    if !has_prior_packs {
+                        // No prior data in this chunk — zeros are the default.
+                        // Transition blocks SYNCING→NOT_PRESENT (same as
+                        // normal flushed blocks). CAS handles concurrent
+                        // re-dirties safely.
+                        for &idx in &packed_indices {
+                            self.inner.transition_syncing_to_not_present(idx);
+                        }
+                        continue;
+                    }
+                }
+            }
 
-            let index_entries = content_store
-                .stream_chunk_pack(chunk_idx, pack_id, blocks_for_pack, blocks_per_chunk)
-                .await?;
+            uploads.push(PackUpload {
+                chunk_idx,
+                pack_id: new_pack_id(),
+                blocks: blocks_for_pack,
+                packed_indices,
+            });
+        }
 
-            total_stats.packs_uploaded += 1;
-            total_stats.bytes_uploaded += index_entries
-                .iter()
-                .map(|e| e.comp_length as u64)
-                .sum::<u64>();
+        // Phase 2: Upload all packs to S3 concurrently.
+        // The upload semaphore in ContentStore bounds actual S3 concurrency.
+        {
+            use futures::stream::{self, StreamExt};
 
-            // Update PackIndexCache with new entries
-            pack_index_cache.insert_entries(pack_id, &index_entries);
+            let results: Vec<Result<(u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>, Vec<usize>), CacheError>> =
+                stream::iter(uploads)
+                    .map(|upload| {
+                        let cs = &content_store;
+                        async move {
+                            let entries = cs
+                                .stream_chunk_pack(upload.chunk_idx, upload.pack_id, upload.blocks, blocks_per_chunk)
+                                .await?;
+                            Ok((upload.chunk_idx, upload.pack_id, entries, upload.packed_indices))
+                        }
+                    })
+                    .buffer_unordered(64)
+                    .collect()
+                    .await;
 
-            // Stage manifest append (applied after all chunk uploads succeed).
-            // This avoids orphaned manifest entries if a later chunk's S3 upload fails.
-            staged_appends.push((chunk_idx, pack_id));
+            for result in results {
+                let (chunk_idx, pack_id, index_entries, packed_indices) = result?;
 
-            flushed_blocks.extend(packed_indices);
+                total_stats.packs_uploaded += 1;
+                total_stats.bytes_uploaded += index_entries
+                    .iter()
+                    .map(|e| e.comp_length as u64)
+                    .sum::<u64>();
+
+                // Update PackIndexCache with new entries
+                pack_index_cache.insert_entries(pack_id, &index_entries);
+
+                // Stage manifest append (applied after all chunk uploads succeed).
+                staged_appends.push((chunk_idx, pack_id));
+
+                flushed_blocks.extend(packed_indices);
+            }
         }
 
         // Apply all staged manifest appends atomically.
