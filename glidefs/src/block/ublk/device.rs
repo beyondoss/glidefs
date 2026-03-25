@@ -690,10 +690,12 @@ fn run_device(
                 ..Default::default()
             },
             discard: sys::ublk_param_discard {
-                // Discard not advertised: content after discard is undefined
-                // per the block protocol, so there is nothing to persist.
+                // Discard not advertised (max_discard_sectors=0): content after
+                // discard is undefined per the block protocol, so there is
+                // nothing to persist. write_zeroes is kept (hard zero guarantee).
+                // granularity must be non-zero for kernel param validation.
                 discard_alignment: 0,
-                discard_granularity: 0,
+                discard_granularity: 4096,
                 max_discard_sectors: 0,
                 max_write_zeroes_sectors: 1 << 15,
                 max_discard_segments: 0,
