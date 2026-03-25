@@ -7,7 +7,7 @@
 /// 2. **Write rate timeline**: unique blocks/sec over configurable windows
 /// 3. **Hot set analysis**: blocks by write frequency distribution
 /// 4. **Overwrite ratio**: raw writes vs unique dirty blocks over time
-/// 5. **Pack fill simulation**: at various blocks_per_pack, how many flushes?
+/// 5. **Pack fill simulation**: at various flush_threshold, how many flushes?
 /// 6. **Burst detection**: periods of high vs low write activity
 ///
 /// Usage:

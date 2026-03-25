@@ -37,7 +37,7 @@ mod tests {
     use crate::block::cache::SimpleBlockCache;
     use crate::block::content_store::ContentStore;
     use crate::block::metrics::ExportMetrics;
-    use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use crate::block::pack::DEFAULT_FLUSH_THRESHOLD;
     use crate::block::pack_index_cache::PackIndexCache;
     use crate::block::volume_manifest::VolumeManifest;
     use crate::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -83,7 +83,7 @@ mod tests {
             metrics,
             Arc::new(AtomicU64::new(0f64.to_bits())),
             Arc::new(Notify::const_new()),
-            DEFAULT_BLOCKS_PER_PACK,
+            DEFAULT_FLUSH_THRESHOLD,
             None,
         ));
 

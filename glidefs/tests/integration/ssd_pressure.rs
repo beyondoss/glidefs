@@ -18,7 +18,7 @@ use glidefs::block::content_store::ContentStore;
 use glidefs::block::error::CommandError;
 use glidefs::block::handler::BlockHandler;
 use glidefs::block::metrics::ExportMetrics;
-use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
+use glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD;
 use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -64,7 +64,7 @@ async fn handler_with_ssd_util() -> (BlockHandler, Arc<AtomicU64>, TempDir) {
         metrics,
         Arc::clone(&ssd_util),
         Arc::new(Notify::const_new()),
-        DEFAULT_BLOCKS_PER_PACK,
+        DEFAULT_FLUSH_THRESHOLD,
         None,
     );
 

@@ -119,7 +119,7 @@ fn read_blocks(images: &[PathBuf], skip_zeros: bool, max_blocks: usize) -> Vec<V
 }
 
 struct PackMeasurement {
-    blocks_per_pack: usize,
+    flush_threshold: usize,
     num_packs: usize,
     // Sizes (averaged across all packs)
     avg_compressed_pack_bytes: usize,
@@ -140,21 +140,21 @@ struct PackMeasurement {
 
 fn measure_pack_size(
     all_blocks: &[Vec<u8>],
-    blocks_per_pack: usize,
+    flush_threshold: usize,
     iters: usize,
     s3_latency_ms: f64,
     s3_bandwidth_mbps: f64,
 ) -> PackMeasurement {
     // Split blocks into packs (drop remainder)
-    let num_packs = all_blocks.len() / blocks_per_pack;
+    let num_packs = all_blocks.len() / flush_threshold;
     if num_packs == 0 {
         eprintln!(
             "warning: only {} blocks available, need at least {} for this pack size",
             all_blocks.len(),
-            blocks_per_pack
+            flush_threshold
         );
         return PackMeasurement {
-            blocks_per_pack,
+            flush_threshold,
             num_packs: 0,
             avg_compressed_pack_bytes: 0,
             min_compressed_pack_bytes: 0,
@@ -171,7 +171,7 @@ fn measure_pack_size(
     }
 
     let packs: Vec<&[Vec<u8>]> = (0..num_packs)
-        .map(|i| &all_blocks[i * blocks_per_pack..(i + 1) * blocks_per_pack])
+        .map(|i| &all_blocks[i * flush_threshold..(i + 1) * flush_threshold])
         .collect();
 
     // Pre-compute hashes + compressed data for each pack (with synthetic chunk_offsets)
@@ -195,7 +195,7 @@ fn measure_pack_size(
         .iter()
         .map(|prepared| {
             let (pack_bytes, _entries) =
-                assemble_pack(prepared.clone(), blocks_per_pack as u32).unwrap();
+                assemble_pack(prepared.clone(), flush_threshold as u32).unwrap();
             pack_bytes
         })
         .collect();
@@ -205,8 +205,8 @@ fn measure_pack_size(
     let avg_compressed_pack_bytes = pack_sizes.iter().sum::<usize>() / pack_sizes.len();
     let min_compressed_pack_bytes = *pack_sizes.iter().min().unwrap();
     let max_compressed_pack_bytes = *pack_sizes.iter().max().unwrap();
-    let index_overhead_bytes = PACK_HEADER_SIZE + blocks_per_pack * PACK_INDEX_ENTRY_SIZE;
-    let raw_total = num_packs * blocks_per_pack * BLOCK_SIZE;
+    let index_overhead_bytes = PACK_HEADER_SIZE + flush_threshold * PACK_INDEX_ENTRY_SIZE;
+    let raw_total = num_packs * flush_threshold * BLOCK_SIZE;
     let compressed_total: usize = pack_sizes.iter().sum();
     let avg_lz4_ratio = raw_total as f64 / compressed_total as f64;
 
@@ -222,7 +222,7 @@ fn measure_pack_size(
                 .enumerate()
                 .map(|(i, data)| (blake3_128(data), i as u32, lz4_compress(data)))
                 .collect();
-            let (pack, _) = assemble_pack(prepped, blocks_per_pack as u32).unwrap();
+            let (pack, _) = assemble_pack(prepped, flush_threshold as u32).unwrap();
             std::hint::black_box(&pack);
         }
     }
@@ -236,7 +236,7 @@ fn measure_pack_size(
                 .enumerate()
                 .map(|(i, data)| (blake3_128(data), i as u32, lz4_compress(data)))
                 .collect();
-            let (_pack, _entries) = assemble_pack(prepped, blocks_per_pack as u32).unwrap();
+            let (_pack, _entries) = assemble_pack(prepped, flush_threshold as u32).unwrap();
             assembly_times.push(start.elapsed().as_micros() as f64);
         }
     }
@@ -301,13 +301,13 @@ fn measure_pack_size(
     let s3_transfer_ms =
         avg_compressed_pack_bytes as f64 / (s3_bandwidth_mbps * 1024.0 * 1024.0) * 1000.0;
     let s3_get_ms = s3_latency_ms + s3_transfer_ms;
-    let amortized_per_block_ms = s3_get_ms / blocks_per_pack as f64;
+    let amortized_per_block_ms = s3_get_ms / flush_threshold as f64;
 
     // Peak memory per pack during assembly (owned: output buffer only, input freed as consumed)
     let peak_memory_mb = avg_compressed_pack_bytes as f64 / (1024.0 * 1024.0);
 
     PackMeasurement {
-        blocks_per_pack,
+        flush_threshold,
         num_packs,
         avg_compressed_pack_bytes,
         min_compressed_pack_bytes,
@@ -444,11 +444,11 @@ fn main() {
         "├────────────┼──────────┼──────────────┼──────────────┼──────────────┼───────────┼─────────────┼────────────┤"
     );
     for m in &results {
-        let raw = m.blocks_per_pack * BLOCK_SIZE;
+        let raw = m.flush_threshold * BLOCK_SIZE;
         let oh_pct = m.index_overhead_bytes as f64 / m.avg_compressed_pack_bytes as f64 * 100.0;
         println!(
             "│ {:>10} │ {:>8} │ {:>12} │ {:>12} │ {:>5}/{:<5} │ {:>8.2}x │ {:>11} │ {:>9.2}% │",
-            m.blocks_per_pack,
+            m.flush_threshold,
             m.num_packs,
             human(raw),
             human(m.avg_compressed_pack_bytes),
@@ -482,11 +482,11 @@ fn main() {
         "├────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┤"
     );
     for m in &results {
-        let per_block_asm = m.assembly_us / m.blocks_per_pack as f64;
-        let per_block_prefetch = m.prefetch_us / m.blocks_per_pack as f64;
+        let per_block_asm = m.assembly_us / m.flush_threshold as f64;
+        let per_block_prefetch = m.prefetch_us / m.flush_threshold as f64;
         println!(
             "│ {:>10} │ {:>10.0}us │ {:>10.1}us │ {:>10.0}us │ {:>10.1}us │ {:>10.1}us │",
-            m.blocks_per_pack,
+            m.flush_threshold,
             m.assembly_us,
             per_block_asm,
             m.prefetch_us,
@@ -515,7 +515,7 @@ fn main() {
         let total_with_decomp = m.s3_get_ms + m.prefetch_us / 1000.0;
         println!(
             "│ {:>10} │ {:>9.1}ms │ {:>9.1}ms │ {:>9.2}ms │ {:>9.1}ms │",
-            m.blocks_per_pack, xfer_ms, m.s3_get_ms, m.amortized_per_block_ms, total_with_decomp,
+            m.flush_threshold, xfer_ms, m.s3_get_ms, m.amortized_per_block_ms, total_with_decomp,
         );
     }
     println!("└────────────┴──────────────┴──────────────┴──────────────┴──────────────┘");
@@ -535,12 +535,12 @@ fn main() {
     println!("│ Blocks/Pack│ PUTs/VM/day  │ PUTs/Mo (1K) │ PUT Cost/Mo  │");
     println!("├────────────┼──────────────┼──────────────┼──────────────┤");
     for m in &results {
-        let puts_per_vm_day = unique_blocks_per_day / m.blocks_per_pack as f64;
+        let puts_per_vm_day = unique_blocks_per_day / m.flush_threshold as f64;
         let puts_per_month = puts_per_vm_day * 30.0 * vms;
         let cost = puts_per_month * 0.005 / 1000.0;
         println!(
             "│ {:>10} │ {:>12.0} │ {:>11.1}M │ ${:>10.0} │",
-            m.blocks_per_pack,
+            m.flush_threshold,
             puts_per_vm_day,
             puts_per_month / 1e6,
             cost,
@@ -557,7 +557,7 @@ fn main() {
     for m in &results {
         println!(
             "│ {:>10} │ {:>10.1}MB │",
-            m.blocks_per_pack, m.peak_memory_mb,
+            m.flush_threshold, m.peak_memory_mb,
         );
     }
     println!("└────────────┴──────────────┘");

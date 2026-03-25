@@ -166,7 +166,7 @@ pub struct BlockHandler {
 
     /// Flush threshold: auto-flush when dirty blocks reach this count.
     /// 0 = manual mode (no auto-flush, drain/snapshot only).
-    blocks_per_pack: usize,
+    flush_threshold: usize,
 
     /// Optional write trace recorder. Zero cost when None.
     write_tracer: Option<Arc<WriteTracer>>,
@@ -196,7 +196,7 @@ impl BlockHandler {
         metrics: Arc<ExportMetrics>,
         ssd_utilization: Arc<AtomicU64>,
         flush_notify: Arc<Notify>,
-        blocks_per_pack: usize,
+        flush_threshold: usize,
         write_tracer: Option<Arc<WriteTracer>>,
     ) -> Self {
         Self {
@@ -211,7 +211,7 @@ impl BlockHandler {
             readahead: Mutex::new(SequentialDetector::new()),
             ssd_utilization,
             flush_notify,
-            blocks_per_pack,
+            flush_threshold,
             write_tracer,
             #[cfg(feature = "test-utils")]
             backfill_sync: None,
@@ -255,11 +255,11 @@ impl BlockHandler {
     }
 
     /// Notify the flush scheduler if dirty blocks have reached the threshold.
-    /// No-op when blocks_per_pack == 0 (manual flush mode).
+    /// No-op when flush_threshold == 0 (manual flush mode).
     #[inline]
     fn check_flush_threshold(&self) {
-        if self.blocks_per_pack > 0
-            && self.cache.dirty_block_count() >= self.blocks_per_pack as u64
+        if self.flush_threshold > 0
+            && self.cache.dirty_block_count() >= self.flush_threshold as u64
         {
             self.flush_notify.notify_one();
         }
@@ -1070,7 +1070,7 @@ impl BlockHandler {
 mod tests {
     use super::*;
     use crate::block::cache::SimpleBlockCache;
-    use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use crate::block::pack::DEFAULT_FLUSH_THRESHOLD;
     use crate::block::pack_index_cache::PackIndexCache;
     use crate::block::volume_manifest::VolumeManifest;
     use crate::block::write_cache::WriteCacheConfig;
@@ -1119,7 +1119,7 @@ mod tests {
             metrics,
             Arc::new(AtomicU64::new(0f64.to_bits())),
             Arc::new(Notify::const_new()),
-            DEFAULT_BLOCKS_PER_PACK,
+            DEFAULT_FLUSH_THRESHOLD,
             None,
         );
 
@@ -1370,10 +1370,10 @@ mod tests {
     // Per-export flush threshold tests
     // =========================================================================
 
-    /// Helper: create a handler with a specific blocks_per_pack and a shared
+    /// Helper: create a handler with a specific flush_threshold and a shared
     /// Notify so we can observe whether auto-flush was triggered.
     async fn test_handler_with_flush_config(
-        blocks_per_pack: usize,
+        flush_threshold: usize,
     ) -> (BlockHandler, Arc<Notify>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         // 256 blocks × 4096 = 1MB device, enough for threshold tests
@@ -1408,7 +1408,7 @@ mod tests {
             metrics,
             Arc::new(AtomicU64::new(0f64.to_bits())),
             Arc::clone(&flush_notify),
-            blocks_per_pack,
+            flush_threshold,
             None,
         );
 
@@ -1417,7 +1417,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_manual_mode_never_notifies() {
-        // blocks_per_pack = 0 → manual mode, no auto-flush
+        // flush_threshold = 0 → manual mode, no auto-flush
         let (handler, flush_notify, _temp) = test_handler_with_flush_config(0).await;
 
         // Write 200 blocks — well above any reasonable threshold
@@ -1435,13 +1435,13 @@ mod tests {
         .is_ok();
         assert!(
             !was_notified,
-            "manual mode (blocks_per_pack=0) should never notify flush scheduler"
+            "manual mode (flush_threshold=0) should never notify flush scheduler"
         );
     }
 
     #[tokio::test]
     async fn test_custom_threshold_triggers_at_configured_value() {
-        // blocks_per_pack = 5 → auto-flush after 5 dirty blocks
+        // flush_threshold = 5 → auto-flush after 5 dirty blocks
         let (handler, flush_notify, _temp) = test_handler_with_flush_config(5).await;
 
         // Write 4 blocks — below threshold, should NOT notify
@@ -1473,12 +1473,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_default_threshold_matches_default_blocks_per_pack() {
-        // Verify the default handler uses DEFAULT_BLOCKS_PER_PACK
+    async fn test_default_threshold_matches_default_flush_threshold() {
+        // Verify the default handler uses DEFAULT_FLUSH_THRESHOLD
         let (handler, _temp) = test_handler().await;
         assert_eq!(
-            handler.blocks_per_pack, DEFAULT_BLOCKS_PER_PACK,
-            "default handler should use DEFAULT_BLOCKS_PER_PACK"
+            handler.flush_threshold, DEFAULT_FLUSH_THRESHOLD,
+            "default handler should use DEFAULT_FLUSH_THRESHOLD"
         );
     }
 
@@ -1521,7 +1521,7 @@ mod tests {
             metrics,
             Arc::clone(&ssd_util),
             Arc::new(Notify::const_new()),
-            DEFAULT_BLOCKS_PER_PACK,
+            DEFAULT_FLUSH_THRESHOLD,
             None,
         );
 
@@ -1674,7 +1674,7 @@ mod tests {
             metrics,
             Arc::new(AtomicU64::new(0f64.to_bits())),
             Arc::new(Notify::const_new()),
-            DEFAULT_BLOCKS_PER_PACK,
+            DEFAULT_FLUSH_THRESHOLD,
             None,
         );
 
@@ -1754,7 +1754,7 @@ mod tests {
             metrics,
             Arc::new(AtomicU64::new(0f64.to_bits())),
             Arc::new(Notify::const_new()),
-            DEFAULT_BLOCKS_PER_PACK,
+            DEFAULT_FLUSH_THRESHOLD,
             None,
         );
 

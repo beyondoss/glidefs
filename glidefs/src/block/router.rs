@@ -169,7 +169,7 @@ pub struct RouterConfig {
     /// Max concurrent S3 pack downloads across all exports (0 = unlimited).
     pub max_s3_downloads: usize,
     /// Default blocks per pack for new exports (from NbdConfig).
-    pub default_blocks_per_pack: usize,
+    pub default_flush_threshold: usize,
     /// Number of ublk I/O queues per device (Linux + ublk feature only).
     #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
     pub ublk_nr_queues: u16,
@@ -208,7 +208,7 @@ pub struct ExportRouter {
     wal_sync: bool,
 
     /// Default blocks per pack for new exports (from global config).
-    default_blocks_per_pack: usize,
+    default_flush_threshold: usize,
 
     /// Scrubber metrics (global, not per-export)
     scrubber_metrics: Arc<crate::block::scrubber::ScrubberMetrics>,
@@ -332,7 +332,7 @@ impl ExportRouter {
             pack_index_cache,
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
-            default_blocks_per_pack: config.default_blocks_per_pack,
+            default_flush_threshold: config.default_flush_threshold,
             scrubber_metrics: Arc::new(crate::block::scrubber::ScrubberMetrics::new()),
             s3_circuit_breaker,
             upload_semaphore,
@@ -1022,11 +1022,11 @@ impl ExportRouter {
             }
         }
 
-        // Resolve per-export blocks_per_pack: export config > global default.
+        // Resolve per-export flush_threshold: export config > global default.
         // 0 = manual mode (no auto-flush).
-        let blocks_per_pack = config.blocks_per_pack_or(self.default_blocks_per_pack);
+        let flush_threshold = config.flush_threshold_or(self.default_flush_threshold);
 
-        // Shared notify: write path signals when dirty count crosses blocks_per_pack
+        // Shared notify: write path signals when dirty count crosses flush_threshold
         let flush_notify = Arc::new(Notify::new());
 
         // Create handler for block I/O
@@ -1041,7 +1041,7 @@ impl ExportRouter {
             Arc::clone(&metrics),
             Arc::clone(&self.ssd_utilization),
             Arc::clone(&flush_notify),
-            blocks_per_pack,
+            flush_threshold,
             None, // TODO: wire up write_trace_path from ExportConfig
         ));
 
@@ -1710,7 +1710,7 @@ impl ExportRouter {
             size_gb: new_size_gb,
             s3_prefix: orig_s3_prefix,
             block_size: Some(block_size),
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: Some(transport),
         };
@@ -2045,7 +2045,7 @@ impl ExportRouter {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -2088,7 +2088,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -2102,7 +2102,7 @@ mod tests {
             size_gb: 0.01, // 10MB
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         }
@@ -2505,7 +2505,7 @@ mod tests {
                 size_gb: 1.0,
                 s3_prefix: None,
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             },
@@ -2514,7 +2514,7 @@ mod tests {
                 size_gb: 2.0,
                 s3_prefix: None,
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             },
@@ -2523,7 +2523,7 @@ mod tests {
                 size_gb: 3.0,
                 s3_prefix: None,
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             },
@@ -2738,7 +2738,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("source".to_string()), // same S3 prefix as source
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2777,7 +2777,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("src".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2829,7 +2829,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("src".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2862,7 +2862,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("nonexistent-source".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2900,7 +2900,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("a".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2921,7 +2921,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("a".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -3039,7 +3039,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -3337,13 +3337,13 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: Some("manual".to_string()),
             transport: None,
         };
         router.create_export(config, false, None, None).await.unwrap();
 
-        // Write many blocks — well above DEFAULT_BLOCKS_PER_PACK
+        // Write many blocks — well above DEFAULT_FLUSH_THRESHOLD
         let handler = router.get_handler("manual-vm").await.unwrap();
         // 50 blocks × 128KB = 6.4MB (within our 10MB device)
         for i in 0..50u64 {
@@ -3386,7 +3386,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: Some("manual".to_string()),
             transport: None,
         };
@@ -3419,8 +3419,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_blocks_per_pack_config_resolution() {
-        // Verify ExportConfig.blocks_per_pack_or() cascade:
+    async fn test_flush_threshold_config_resolution() {
+        // Verify ExportConfig.flush_threshold_or() cascade:
         // 1. flush_mode = "manual" → 0
         // 2. export override → export value
         // 3. fallback → global default
@@ -3429,12 +3429,12 @@ mod tests {
             size_gb: 1.0,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: Some(1000),
+            flush_threshold: Some(1000),
             flush_mode: Some("manual".to_string()),
             transport: None,
         };
         assert_eq!(
-            manual.blocks_per_pack_or(500),
+            manual.flush_threshold_or(500),
             0,
             "manual mode always returns 0"
         );
@@ -3444,23 +3444,23 @@ mod tests {
             size_gb: 1.0,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: Some(1000),
+            flush_threshold: Some(1000),
             flush_mode: None,
             transport: None,
         };
-        assert_eq!(custom.blocks_per_pack_or(500), 1000, "export override wins");
+        assert_eq!(custom.flush_threshold_or(500), 1000, "export override wins");
 
         let default = ExportConfig {
             name: "d".to_string(),
             size_gb: 1.0,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
         assert_eq!(
-            default.blocks_per_pack_or(500),
+            default.flush_threshold_or(500),
             500,
             "falls back to global default"
         );
@@ -3602,7 +3602,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3638,7 +3638,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3685,7 +3685,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3714,7 +3714,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3726,7 +3726,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -3802,7 +3802,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         }).await.unwrap();
@@ -3819,7 +3819,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3832,7 +3832,7 @@ mod tests {
                     size_gb: 0.01,
                     s3_prefix: Some("parent".to_string()),
                     block_size: None,
-                    blocks_per_pack: None,
+                    flush_threshold: None,
                     flush_mode: None,
                     transport: None,
                 },
@@ -3945,7 +3945,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };

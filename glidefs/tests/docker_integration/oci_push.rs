@@ -22,7 +22,7 @@ use glidefs::block::cache::{BlockCache, SimpleBlockCache};
 use glidefs::block::content_store::ContentStore;
 use glidefs::block::handler::BlockHandler;
 use glidefs::block::metrics::ExportMetrics;
-use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
+use glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD;
 use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -126,7 +126,7 @@ async fn test_handler() -> (Arc<BlockHandler>, TempDir) {
         metrics,
         Arc::new(AtomicU64::new(0f64.to_bits())),
         Arc::new(Notify::const_new()),
-        DEFAULT_BLOCKS_PER_PACK,
+        DEFAULT_FLUSH_THRESHOLD,
         None,
     );
 

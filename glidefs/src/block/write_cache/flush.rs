@@ -1005,31 +1005,6 @@ impl WriteCache<Active> {
                 continue;
             }
 
-            // Skip pack upload if ALL entries are zero-block tombstones AND
-            // the chunk has no prior packs in the manifest. In that case,
-            // reads already return zeros (no pack entry → zero-fill), so
-            // the tombstones are redundant. This avoids creating empty packs
-            // from trim/write_zeroes on unwritten regions of forked exports.
-            {
-                let all_zero_tombstones = blocks_for_pack.iter().all(|(_, _, data)| data.is_empty());
-                if all_zero_tombstones {
-                    let vm = volume_manifest.read();
-                    let has_prior_packs = vm
-                        .chunk_pack_ids(chunk_idx)
-                        .is_some_and(|packs| !packs.is_empty());
-                    if !has_prior_packs {
-                        // No prior data in this chunk — zeros are the default.
-                        // Transition blocks SYNCING→NOT_PRESENT (same as
-                        // normal flushed blocks). CAS handles concurrent
-                        // re-dirties safely.
-                        for &idx in &packed_indices {
-                            self.inner.transition_syncing_to_not_present(idx);
-                        }
-                        continue;
-                    }
-                }
-            }
-
             // Push upload future — runs concurrently with next chunk's compute.
             let pack_id = new_pack_id();
             let cs = &content_store;
