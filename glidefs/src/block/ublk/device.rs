@@ -690,11 +690,13 @@ fn run_device(
                 ..Default::default()
             },
             discard: sys::ublk_param_discard {
+                // Discard not advertised: content after discard is undefined
+                // per the block protocol, so there is nothing to persist.
                 discard_alignment: 0,
-                discard_granularity: 4096,
-                max_discard_sectors: 1 << 15, // 16MB
+                discard_granularity: 0,
+                max_discard_sectors: 0,
                 max_write_zeroes_sectors: 1 << 15,
-                max_discard_segments: 1,
+                max_discard_segments: 0,
                 reserved0: 0,
             },
             ..Default::default()

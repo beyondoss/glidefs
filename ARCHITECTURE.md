@@ -1,6 +1,6 @@
 # GlideFS Architecture
 
-Takes block I/O commands (read/write/flush/trim) from a Linux kernel block device (`/dev/nbdN` or `/dev/ublkbN`), serves reads from a tiered cache (local SSD → in-memory Foyer → SSD Foyer → S3), buffers writes to local SSD (~5µs), and asynchronously uploads dirty blocks to S3 as LZ4-compressed, content-addressed packs. Transport-agnostic: NBD (default, cross-platform) and ublk (Linux 6.0+, io_uring-based, opt-in via `--features ublk`).
+Takes block I/O commands (read/write/flush/write_zeroes) from a Linux kernel block device (`/dev/nbdN` or `/dev/ublkbN`), serves reads from a tiered cache (local SSD → in-memory Foyer → SSD Foyer → S3), buffers writes to local SSD (~5µs), and asynchronously uploads dirty blocks to S3 as LZ4-compressed, content-addressed packs. Transport-agnostic: NBD (default, cross-platform) and ublk (Linux 6.0+, io_uring-based, opt-in via `--features ublk`).
 
 ## Data Flow
 
@@ -151,7 +151,7 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 | Term | Definition | NOT |
 |------|-----------|-----|
 | Transport | The kernel-to-userspace block I/O channel: NBD (TCP/Unix socket, cross-platform) or ublk (io_uring, Linux 6.0+) | Not the storage layer — both transports use the same `BlockHandler` |
-| BlockHandler | Transport-agnostic I/O handler: read/write/flush/trim/write_zeroes/cache. Used by both NBD and ublk. | Not protocol-specific — knows nothing about NBD or ublk wire formats |
+| BlockHandler | Transport-agnostic I/O handler: read/write/flush/write_zeroes/cache. TRIM/discard is not advertised — content after discard is undefined per the block protocol, so there is nothing to persist. | Not protocol-specific — knows nothing about NBD or ublk wire formats |
 | Export | A virtual block device served over a transport, with its own cache and S3 prefix | Not a filesystem — raw blocks only |
 | Block | Fixed-size unit of data (default 128 KB to match ZFS recordsize) | Not variable-sized |
 | Volume Chunk | 128 MiB range of blocks (1,024 blocks of 128 KB = 1 ext4 block group). The unit of pack scoping, compaction, and metadata management. | Not a 128 KB block — "chunk" means 128 MiB range. Aligns with ext4 block groups, bounding database scatter to 2–3 chunks per flush |
@@ -811,7 +811,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | File | Purpose |
 |------|---------|
 | `block/router.rs` | `ExportRouter`: export lifecycle (create/fork/snapshot/drain/remove), SSD capacity enforcement, S3 semaphores |
-| `block/handler.rs` | `BlockHandler`: transport-agnostic read/write/flush/trim/write_zeroes |
+| `block/handler.rs` | `BlockHandler`: transport-agnostic read/write/flush/write_zeroes |
 | `block/write_cache/mod.rs` | `WriteCache<S>` typestate; `FlushStats`, `SnapshotResult` |
 | `block/write_cache/write.rs` | Write path: `set_present` + `pwrite` + `transition_to_dirty` + WAL append |
 | `block/write_cache/read.rs` | Read path: `resolve_block` (SSD → PackIndexCache → parallel prefetch → S3); `prefetch_chunk` |
@@ -843,7 +843,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/scrubber.rs` | Background hash verification for CleanCache entries; evicts mismatches for re-fetch from S3 |
 | `block/readahead.rs` | Sequential read detection (ring buffer) and pack index prefetch |
 | `block/capacity_monitor.rs` | `statvfs` polling every 5s; warns ≥80%, pressure-flushes dirtiest exports ≥90% |
-| `block/write_trace.rs` | Optional binary trace recorder (GLIDETRC format): every write/trim/zero with µs timestamps; zero cost when disabled |
+| `block/write_trace.rs` | Optional binary trace recorder (GLIDETRC format): every write/zero with µs timestamps; zero cost when disabled |
 | `block/metrics.rs` | Per-export Prometheus metrics (counters, gauges, histograms) |
 | `block/api.rs` | HTTP REST API handlers |
 | `block/error.rs` | `NBDError` and `Result` type aliases |
