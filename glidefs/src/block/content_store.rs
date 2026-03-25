@@ -300,17 +300,53 @@ impl ContentStore {
     }
 
     /// Delete all snapshot manifests for an export (idempotent, best-effort).
+    ///
+    /// Streams the S3 list directly into concurrent deletes (`buffer_unordered`)
+    /// so listing and deletion overlap without materializing the full snapshot list.
     #[instrument(skip(self), fields(name = %name))]
     pub async fn delete_all_snapshots(&self, name: &str) -> Result<(), ContentStoreError> {
-        let sequences = self.list_snapshots(name).await?;
-        for seq in sequences {
-            if let Err(e) = self.delete_snapshot(name, seq).await {
-                tracing::warn!(
-                    name = %name, sequence = seq, error = %e,
-                    "failed to delete snapshot during cleanup (continuing)"
-                );
-            }
-        }
+        self.check_circuit()?;
+        let prefix_str = format!("{}/snapshots/{}/", self.base_path, name);
+        let prefix = ObjectPath::from(prefix_str);
+        let store = Arc::clone(&self.object_store);
+        let cb = self.circuit_breaker.clone();
+
+        self.object_store
+            .list(Some(&prefix))
+            .map(move |result| {
+                let store = Arc::clone(&store);
+                let cb = cb.clone();
+                async move {
+                    let meta = match result {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to list snapshot during delete_all (continuing)");
+                            return;
+                        }
+                    };
+                    let seq_str = meta.location.filename().unwrap_or_default().to_string();
+                    let result = store.delete(&meta.location).await;
+                    if let Some(cb) = &cb {
+                        match &result {
+                            Ok(_) => cb.record_success(),
+                            Err(e) if is_connectivity_error(e) => cb.record_failure(),
+                            Err(_) => cb.record_success(),
+                        }
+                    }
+                    if let Err(e) = &result
+                        && !matches!(e, object_store::Error::NotFound { .. })
+                    {
+                        tracing::warn!(
+                            snapshot = %seq_str, error = %e,
+                            "failed to delete snapshot during cleanup (continuing)"
+                        );
+                    }
+                }
+            })
+            .buffer_unordered(16)
+            .for_each(|()| async {})
+            .await;
+
         Ok(())
     }
 

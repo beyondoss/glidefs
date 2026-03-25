@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 use tracing::{debug, info, warn};
 
 use crate::block::cache::BlockCache;
@@ -62,24 +63,39 @@ async fn dead_block_ratio(
         return Ok(0.0);
     }
 
-    // Collect entries from each pack (oldest→newest order).
+    // Fetch all pack indices concurrently (cache hits resolve immediately,
+    // S3 misses run in parallel via buffer_unordered).
+    let results: Vec<Result<(usize, Arc<[PackIndexEntry]>), CacheError>> =
+        stream::iter(pack_ids.iter().copied().enumerate())
+            .map(|(pack_idx, pack_id)| async move {
+                let entries: Arc<[PackIndexEntry]> =
+                    match pack_index_cache.get_entries(pack_id).await {
+                        Some(entries) => entries,
+                        None => {
+                            let fetched =
+                                content_store.get_pack_index(chunk_idx, pack_id).await?;
+                            pack_index_cache.insert_entries(pack_id, &fetched);
+                            Arc::from(fetched)
+                        }
+                    };
+                Ok((pack_idx, entries))
+            })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+
+    // Build ownership map — highest pack_idx wins per offset (order-independent).
     let mut total_entries = 0usize;
     let mut owner: HashMap<u32, usize> = HashMap::new();
 
-    for (pack_idx, &pack_id) in pack_ids.iter().enumerate() {
-        let entries: std::sync::Arc<[super::super::pack::PackIndexEntry]> = match pack_index_cache.get_entries(pack_id).await {
-            Some(entries) => entries,
-            None => {
-                // Cache miss — fetch from S3 (cold path, acceptable)
-                let fetched = content_store.get_pack_index(chunk_idx, pack_id).await?;
-                pack_index_cache.insert_entries(pack_id, &fetched);
-                std::sync::Arc::from(fetched)
-            }
-        };
+    for result in results {
+        let (pack_idx, entries) = result?;
         total_entries += entries.len();
         for entry in entries.iter() {
-            // Last writer (highest pack_idx) wins
-            owner.insert(entry.chunk_offset, pack_idx);
+            owner
+                .entry(entry.chunk_offset)
+                .and_modify(|existing| *existing = (*existing).max(pack_idx))
+                .or_insert(pack_idx);
         }
     }
 
@@ -120,8 +136,6 @@ pub async fn compact_chunk(
     );
 
     // 1. Load all pack indices in parallel (from cache, or fetch from S3 on miss)
-    use futures::stream::{self, StreamExt};
-
     let all_entries: Vec<(PackId, std::sync::Arc<[PackIndexEntry]>)> = {
         let results: Vec<Result<(PackId, std::sync::Arc<[PackIndexEntry]>), CacheError>> =
             stream::iter(pack_ids.iter().copied())

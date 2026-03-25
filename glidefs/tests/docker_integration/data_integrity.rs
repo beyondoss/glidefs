@@ -125,7 +125,7 @@ transport_test! {
             size_gb: 0.01,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };

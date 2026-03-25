@@ -369,30 +369,69 @@ async fn reconcile_prefix(
     let mut delta = GcStateDelta::default();
     let mut manifest_failed = false;
 
-    // Pass 1a: Read live manifests, collect live (chunk_idx, pack_id) pairs.
+    // Pass 1a: Stream live manifests 16-wide parallel, collect live (chunk_idx, pack_id) pairs.
     // This is bounded by the volume's current pack count, not snapshot count.
     let mut live_packs: HashSet<(u32, PackId)> = HashSet::new();
 
-    let manifest_names = content_store.list_all_manifests().await?;
+    let base = content_store.base_path();
+    let manifests_prefix_str = format!("{}/manifests/", base);
+    let manifests_prefix = ObjectPath::from(manifests_prefix_str.clone());
 
-    for name in &manifest_names {
-        match content_store.get_manifest(name).await {
-            Ok(Some((data, _))) => match VolumeManifest::deserialize(&data) {
-                Ok(vm) => {
-                    live_packs.extend(vm.all_pack_ids());
-                    stats.manifests_scanned += 1;
+    let store = std::sync::Arc::clone(content_store.object_store());
+    let prefix_for_map = manifests_prefix_str.clone();
+    let mut manifest_results = content_store
+        .object_store()
+        .list(Some(&manifests_prefix))
+        .map(move |result| {
+            let store = std::sync::Arc::clone(&store);
+            let prefix = prefix_for_map.clone();
+            async move {
+                let meta = result
+                    .map_err(|e| anyhow::anyhow!("failed to list manifests: {}", e))?;
+                let path_str = meta.location.to_string();
+                let name = match path_str.strip_prefix(&prefix) {
+                    Some(r) if !r.is_empty() && !r.ends_with(".hot-set") => r.to_string(),
+                    _ => return Ok(None), // skip .hot-set and non-manifest entries
+                };
+                let response = match store.get(&meta.location).await {
+                    Ok(r) => r,
+                    Err(object_store::Error::NotFound { .. }) => {
+                        warn!(manifest = %name, "manifest disappeared during GC");
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to fetch manifest {}: {}",
+                            name,
+                            e
+                        ))
+                    }
+                };
+                let data = response
+                    .bytes()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to read manifest {} bytes: {}", name, e))?;
+                match VolumeManifest::deserialize(&data.to_vec()) {
+                    Ok(vm) => Ok(Some((name, vm.all_pack_ids()))),
+                    Err(e) => Err(anyhow::anyhow!(
+                        "failed to parse volume manifest {}: {}",
+                        name,
+                        e
+                    )),
                 }
-                Err(e) => {
-                    warn!(manifest = %name, error = %e, "failed to parse volume manifest — treating all packs in prefix as live");
-                    stats.manifest_errors += 1;
-                    manifest_failed = true;
-                }
-            },
-            Ok(None) => {
-                warn!(manifest = %name, "manifest disappeared during GC");
             }
+        })
+        .buffer_unordered(16);
+
+    while let Some(result) = manifest_results.next().await {
+        match result {
+            Ok(Some((_name, pack_ids))) => {
+                live_packs.extend(pack_ids);
+                stats.manifests_scanned += 1;
+            }
+            Ok(None) => {} // manifest disappeared, already warned above
             Err(e) => {
-                warn!(manifest = %name, error = %e, "failed to fetch manifest — treating all packs in prefix as live");
+                warn!("{} — treating all packs in prefix as live", e);
                 stats.manifest_errors += 1;
                 manifest_failed = true;
             }

@@ -30,7 +30,7 @@ async fn test_prefetch_chunk_metas_cold_start() {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: 500,
+            default_flush_threshold: 500,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -43,7 +43,7 @@ async fn test_prefetch_chunk_metas_cold_start() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -82,7 +82,7 @@ async fn test_prefetch_chunk_metas_cold_start() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -145,7 +145,7 @@ async fn test_prefetch_empty_router() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })

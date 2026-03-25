@@ -137,7 +137,7 @@ async fn test_fork_from_snapshot() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -149,7 +149,7 @@ async fn test_fork_from_snapshot() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -173,7 +173,7 @@ async fn test_fork_from_snapshot() {
         size_gb: 0.01,
         s3_prefix: Some("vm1".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -317,7 +317,7 @@ async fn test_purge_export_deletes_snapshots() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -329,7 +329,7 @@ async fn test_purge_export_deletes_snapshots() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -373,7 +373,7 @@ async fn test_api_list_and_delete_snapshots() {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: 500,
+            default_flush_threshold: 500,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -488,7 +488,7 @@ async fn test_remove_without_purge_preserves_snapshots() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -500,7 +500,7 @@ async fn test_remove_without_purge_preserves_snapshots() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -543,7 +543,7 @@ async fn test_snapshot_tag_and_fork() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -556,7 +556,7 @@ async fn test_snapshot_tag_and_fork() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -578,7 +578,7 @@ async fn test_snapshot_tag_and_fork() {
         size_gb: 0.01,
         s3_prefix: Some("vm1".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -610,7 +610,7 @@ async fn test_standalone_tag() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -622,7 +622,7 @@ async fn test_standalone_tag() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -644,7 +644,7 @@ async fn test_standalone_tag() {
         size_gb: 0.01,
         s3_prefix: Some("vm1".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1096,7 +1096,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -1108,7 +1108,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1146,7 +1146,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
         size_gb: 0.01,
         s3_prefix: Some("vm1".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1175,7 +1175,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
         size_gb: 0.01,
         s3_prefix: Some("vm1".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1341,7 +1341,7 @@ async fn test_head_manifest_not_found() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -1375,7 +1375,7 @@ async fn test_fork_parent_deleted_child_survives() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -1388,7 +1388,7 @@ async fn test_fork_parent_deleted_child_survives() {
         size_gb: 0.1,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1415,7 +1415,7 @@ async fn test_fork_parent_deleted_child_survives() {
         size_gb: 0.1,
         s3_prefix: Some("parent".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1456,7 +1456,7 @@ async fn test_fork_parent_deleted_child_survives() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -1469,7 +1469,7 @@ async fn test_fork_parent_deleted_child_survives() {
         size_gb: 0.1,
         s3_prefix: Some("parent".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1537,7 +1537,7 @@ async fn test_fork_concurrent_parent_write_during_fork() {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: 500,
+            default_flush_threshold: 500,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -1551,7 +1551,7 @@ async fn test_fork_concurrent_parent_write_during_fork() {
         size_gb: 0.1,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1590,7 +1590,7 @@ async fn test_fork_concurrent_parent_write_during_fork() {
         size_gb: 0.1,
         s3_prefix: Some("parent".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1645,7 +1645,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -1661,7 +1661,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         size_gb,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1685,7 +1685,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         size_gb,
         s3_prefix: Some("parent".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1716,7 +1716,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -1728,7 +1728,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         size_gb,
         s3_prefix: Some("parent".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1771,7 +1771,7 @@ async fn test_fork_from_snapshot_during_active_writes() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -1783,7 +1783,7 @@ async fn test_fork_from_snapshot_during_active_writes() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1818,7 +1818,7 @@ async fn test_fork_from_snapshot_during_active_writes() {
         size_gb: 0.01,
         s3_prefix: Some("vm1".to_string()),
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1865,7 +1865,7 @@ async fn test_fork_both_children_from_same_parent() {
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     })
@@ -1878,7 +1878,7 @@ async fn test_fork_both_children_from_same_parent() {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1901,7 +1901,7 @@ async fn test_fork_both_children_from_same_parent() {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
