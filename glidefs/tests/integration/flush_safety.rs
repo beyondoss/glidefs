@@ -130,7 +130,7 @@ fn create_router_config(s3: Arc<dyn ObjectStore>, dir: &TempDir) -> RouterConfig
         wal_sync: false,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     }
@@ -142,7 +142,7 @@ fn test_export_config(name: &str) -> ExportConfig {
         size_gb: 0.01, // 10MB
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     }
@@ -985,7 +985,7 @@ async fn test_sub_block_write_to_syncing_block_preserves_data() {
 #[tokio::test]
 async fn test_readahead_prefetches_next_pack_index() {
     use glidefs::block::handler::BlockHandler;
-    use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD;
 
     let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let dir = TempDir::new().unwrap();
@@ -999,7 +999,7 @@ async fn test_readahead_prefetches_next_pack_index() {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -1008,14 +1008,14 @@ async fn test_readahead_prefetches_next_pack_index() {
     );
 
     // Need enough blocks to span at least 2 packs. Write blocks in pack 0.
-    // DEFAULT_BLOCKS_PER_PACK = 500, so blocks 0..499 = pack 0, 500..999 = pack 1.
+    // DEFAULT_FLUSH_THRESHOLD = 500, so blocks 0..499 = pack 0, 500..999 = pack 1.
     let config = ExportConfig {
         name: "vm1".to_string(),
         // Need device large enough for 2 packs (500 blocks * 128KB = 64MB per pack)
         size_gb: 0.2, // 200MB — enough for >1000 blocks
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     };
@@ -1028,7 +1028,7 @@ async fn test_readahead_prefetches_next_pack_index() {
 
     // Write blocks across packs 0 and 1 (first 4 of each for speed)
     let blocks_to_write: Vec<usize> = (0..4)
-        .chain(DEFAULT_BLOCKS_PER_PACK..DEFAULT_BLOCKS_PER_PACK + 4)
+        .chain(DEFAULT_FLUSH_THRESHOLD..DEFAULT_FLUSH_THRESHOLD + 4)
         .collect();
     for &block_idx in &blocks_to_write {
         let data = vec![block_idx as u8; BLOCK_SIZE];
@@ -1055,7 +1055,7 @@ async fn test_readahead_prefetches_next_pack_index() {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -1100,15 +1100,15 @@ async fn test_readahead_prefetches_next_pack_index() {
     // from trigger_readahead → prefetch_chunk → read works.
     let data = handler2
         .read(
-            DEFAULT_BLOCKS_PER_PACK as u64 * BLOCK_SIZE as u64,
+            DEFAULT_FLUSH_THRESHOLD as u64 * BLOCK_SIZE as u64,
             BLOCK_SIZE as u32,
         )
         .await
         .unwrap();
     assert_eq!(
         data[0],
-        DEFAULT_BLOCKS_PER_PACK as u8,
+        DEFAULT_FLUSH_THRESHOLD as u8,
         "block {} should be readable (readahead should have prefetched pack 1 index)",
-        DEFAULT_BLOCKS_PER_PACK
+        DEFAULT_FLUSH_THRESHOLD
     );
 }

@@ -2,8 +2,8 @@
 //!
 //! Each export runs one scheduler that handles two concerns:
 //! - **Pack-size flush** (event-driven): when dirty blocks reach the per-export
-//!   `blocks_per_pack` threshold, the write path notifies the scheduler to flush
-//!   packs + sync manifest to S3. Disabled in manual mode (blocks_per_pack = 0).
+//!   `flush_threshold` threshold, the write path notifies the scheduler to flush
+//!   packs + sync manifest to S3. Disabled in manual mode (flush_threshold = 0).
 //! - **Local checkpoint** (demand-driven, 5s interval when active): persists block
 //!   states and truncates the WAL. Only runs when dirty blocks or a pending manifest
 //!   sync exist. Idle exports consume zero timer resources.
@@ -234,7 +234,7 @@ pub async fn flush_scheduler(
                 }
             }
 
-            // Event-driven: write path notifies when dirty count crosses blocks_per_pack.
+            // Event-driven: write path notifies when dirty count crosses flush_threshold.
             () = flush_notify.notified() => {
                 // Writes have landed — ensure the checkpoint timer is running.
                 activate_checkpoint!(checkpoint_timer, checkpoint_active);
@@ -479,7 +479,7 @@ mod tests {
 
     use crate::block::cache::{BlockCache, SimpleBlockCache};
     use crate::block::content_store::ContentStore;
-    use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use crate::block::pack::DEFAULT_FLUSH_THRESHOLD;
     use crate::block::pack_index_cache::PackIndexCache;
     use crate::block::state::Initializing;
     use crate::block::volume_manifest::VolumeManifest;
@@ -612,7 +612,7 @@ mod tests {
     }
 
     fn device_size() -> u64 {
-        128 * 1024 * (DEFAULT_BLOCKS_PER_PACK as u64 + 10)
+        128 * 1024 * (DEFAULT_FLUSH_THRESHOLD as u64 + 10)
     }
 
     #[allow(clippy::type_complexity)]
@@ -769,8 +769,8 @@ mod tests {
         let cache_check = Arc::clone(&cache);
         let flush_notify_clone = Arc::clone(&flush_notify);
 
-        // Write DEFAULT_BLOCKS_PER_PACK dirty blocks
-        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+        // Write DEFAULT_FLUSH_THRESHOLD dirty blocks
+        for i in 0..DEFAULT_FLUSH_THRESHOLD {
             let offset = i as u64 * 128 * 1024;
             cache
                 .write(offset, &[0xAA; 128 * 1024])
@@ -778,7 +778,7 @@ mod tests {
         }
         assert_eq!(
             cache_check.dirty_block_count(),
-            DEFAULT_BLOCKS_PER_PACK as u64
+            DEFAULT_FLUSH_THRESHOLD as u64
         );
 
         let handle = tokio::spawn(async move {
@@ -840,7 +840,7 @@ mod tests {
         let flush_notify_clone = Arc::clone(&flush_notify);
 
         // Write enough dirty blocks to trigger flush
-        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+        for i in 0..DEFAULT_FLUSH_THRESHOLD {
             let offset = i as u64 * 128 * 1024;
             cache
                 .write(offset, &[0xBB; 128 * 1024])
@@ -928,7 +928,7 @@ mod tests {
         let _clean_cache_check = Arc::clone(&clean_cache);
 
         // Write dirty blocks
-        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+        for i in 0..DEFAULT_FLUSH_THRESHOLD {
             let offset = i as u64 * 128 * 1024;
             cache
                 .write(offset, &[0xCC; 128 * 1024])
@@ -970,7 +970,7 @@ mod tests {
 
         // Write more blocks and fail again — should start from 1s, not 2s
         failing_s3.set_fail_puts(true);
-        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+        for i in 0..DEFAULT_FLUSH_THRESHOLD {
             let offset = i as u64 * 128 * 1024;
             cache_check
                 .write(offset, &[0xDD; 128 * 1024])
@@ -1012,7 +1012,7 @@ mod tests {
         let flush_notify_clone = Arc::clone(&flush_notify);
 
         // Write dirty blocks
-        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+        for i in 0..DEFAULT_FLUSH_THRESHOLD {
             let offset = i as u64 * 128 * 1024;
             cache
                 .write(offset, &[0xEE; 128 * 1024])
@@ -1079,8 +1079,8 @@ mod tests {
         let flush_notify_clone = Arc::clone(&flush_notify);
         let cache_dir = temp.path().to_path_buf();
 
-        // Write DEFAULT_BLOCKS_PER_PACK dirty blocks.
-        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+        // Write DEFAULT_FLUSH_THRESHOLD dirty blocks.
+        for i in 0..DEFAULT_FLUSH_THRESHOLD {
             let offset = i as u64 * 128 * 1024;
             cache
                 .write(offset, &[0xFF; 128 * 1024])
@@ -1088,7 +1088,7 @@ mod tests {
         }
         assert_eq!(
             cache_check.dirty_block_count(),
-            DEFAULT_BLOCKS_PER_PACK as u64
+            DEFAULT_FLUSH_THRESHOLD as u64
         );
 
         let handle = tokio::spawn(async move {
@@ -1175,7 +1175,7 @@ mod tests {
         let _held_permit = sem.clone().acquire_owned().await.unwrap();
 
         // Write dirty blocks so flush_notify triggers a flush attempt
-        for i in 0..DEFAULT_BLOCKS_PER_PACK {
+        for i in 0..DEFAULT_FLUSH_THRESHOLD {
             let offset = i as u64 * 128 * 1024;
             cache.write(offset, &[0xFF; 128 * 1024]).unwrap();
         }

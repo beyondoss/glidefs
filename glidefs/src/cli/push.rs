@@ -2,7 +2,7 @@ use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
 use crate::block::content_store::ContentStore;
 use crate::block::handler::BlockHandler;
 use crate::block::metrics::ExportMetrics;
-use crate::block::pack::DEFAULT_BLOCKS_PER_PACK;
+use crate::block::pack::DEFAULT_FLUSH_THRESHOLD;
 use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -182,7 +182,7 @@ async fn load_readonly_handler(
         metrics,
         Arc::new(AtomicU64::new(0f64.to_bits())),
         flush_notify,
-        DEFAULT_BLOCKS_PER_PACK,
+        DEFAULT_FLUSH_THRESHOLD,
         None,
     ));
 

@@ -5,7 +5,7 @@ use crate::block::content_store::ContentStore;
 use crate::block::handler::BlockHandler;
 use crate::block::manifest::serialize_hot_set;
 use crate::block::metrics::ExportMetrics;
-use crate::block::pack::{new_pack_id, PackId, DEFAULT_BLOCKS_PER_PACK};
+use crate::block::pack::{new_pack_id, PackId, DEFAULT_FLUSH_THRESHOLD};
 use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -311,7 +311,7 @@ pub async fn run_bless_oci(
         metrics,
         Arc::new(AtomicU64::new(0f64.to_bits())),
         flush_notify,
-        DEFAULT_BLOCKS_PER_PACK,
+        DEFAULT_FLUSH_THRESHOLD,
         None,
     ));
 

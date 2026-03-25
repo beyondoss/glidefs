@@ -40,7 +40,9 @@ use super::block_map::Blake3Hash;
 
 pub const PACK_MAGIC: &[u8; 4] = b"GLPK";
 pub const PACK_VERSION: u16 = 3;
-pub const DEFAULT_BLOCKS_PER_PACK: usize = 500;
+/// Default flush threshold: 1 chunk worth of dirty blocks triggers a flush.
+/// 128 MiB chunk / 128 KiB block = 1024 blocks.
+pub const DEFAULT_FLUSH_THRESHOLD: usize = 1024;
 pub const PACK_HEADER_SIZE: usize = 16;
 /// Index entry size (28 bytes with chunk_offset).
 pub const PACK_INDEX_ENTRY_SIZE: usize = 28;
@@ -354,7 +356,7 @@ mod tests {
     #[test]
     fn test_pack_round_trip() {
         let chunk_size: u32 = 131072;
-        let block_count = DEFAULT_BLOCKS_PER_PACK;
+        let block_count = DEFAULT_FLUSH_THRESHOLD;
 
         let mut blocks = Vec::with_capacity(block_count);
         let mut originals = Vec::with_capacity(block_count);

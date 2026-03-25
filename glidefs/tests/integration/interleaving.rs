@@ -13,7 +13,7 @@ use tempfile::TempDir;
 use glidefs::block::cache::SimpleBlockCache;
 use glidefs::block::handler::{BackfillEvent, BackfillStep, BackfillSyncPoints, BlockHandler};
 use glidefs::block::metrics::ExportMetrics;
-use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
+use glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD;
 use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::state::Active;
 use glidefs::block::volume_manifest::VolumeManifest;

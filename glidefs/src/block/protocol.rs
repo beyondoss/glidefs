@@ -31,7 +31,10 @@ pub const NBD_CMD_FLAG_FUA: u16 = 1 << 0;
 pub const TRANSMISSION_FLAGS: u16 = NBD_FLAG_HAS_FLAGS
     | NBD_FLAG_SEND_FLUSH
     | NBD_FLAG_SEND_FUA
-    | NBD_FLAG_SEND_TRIM
+    // TRIM/discard not advertised: content after discard is undefined per the
+    // block protocol, so there is nothing to persist. Advertising TRIM would
+    // cause fstrim to dirty thousands of blocks with zero tombstones that add
+    // S3 overhead with no storage reclamation benefit.
     | NBD_FLAG_SEND_WRITE_ZEROES
     | NBD_FLAG_CAN_MULTI_CONN
     | NBD_FLAG_SEND_CACHE

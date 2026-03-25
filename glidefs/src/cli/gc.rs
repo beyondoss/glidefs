@@ -369,30 +369,69 @@ async fn reconcile_prefix(
     let mut delta = GcStateDelta::default();
     let mut manifest_failed = false;
 
-    // Pass 1a: Read live manifests, collect live (chunk_idx, pack_id) pairs.
+    // Pass 1a: Stream live manifests 16-wide parallel, collect live (chunk_idx, pack_id) pairs.
     // This is bounded by the volume's current pack count, not snapshot count.
     let mut live_packs: HashSet<(u32, PackId)> = HashSet::new();
 
-    let manifest_names = content_store.list_all_manifests().await?;
+    let base = content_store.base_path();
+    let manifests_prefix_str = format!("{}/manifests/", base);
+    let manifests_prefix = ObjectPath::from(manifests_prefix_str.clone());
 
-    for name in &manifest_names {
-        match content_store.get_manifest(name).await {
-            Ok(Some((data, _))) => match VolumeManifest::deserialize(&data) {
-                Ok(vm) => {
-                    live_packs.extend(vm.all_pack_ids());
-                    stats.manifests_scanned += 1;
+    let store = std::sync::Arc::clone(content_store.object_store());
+    let prefix_for_map = manifests_prefix_str.clone();
+    let mut manifest_results = content_store
+        .object_store()
+        .list(Some(&manifests_prefix))
+        .map(move |result| {
+            let store = std::sync::Arc::clone(&store);
+            let prefix = prefix_for_map.clone();
+            async move {
+                let meta = result
+                    .map_err(|e| anyhow::anyhow!("failed to list manifests: {}", e))?;
+                let path_str = meta.location.to_string();
+                let name = match path_str.strip_prefix(&prefix) {
+                    Some(r) if !r.is_empty() && !r.ends_with(".hot-set") => r.to_string(),
+                    _ => return Ok(None), // skip .hot-set and non-manifest entries
+                };
+                let response = match store.get(&meta.location).await {
+                    Ok(r) => r,
+                    Err(object_store::Error::NotFound { .. }) => {
+                        warn!(manifest = %name, "manifest disappeared during GC");
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "failed to fetch manifest {}: {}",
+                            name,
+                            e
+                        ))
+                    }
+                };
+                let data = response
+                    .bytes()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("failed to read manifest {} bytes: {}", name, e))?;
+                match VolumeManifest::deserialize(&data.to_vec()) {
+                    Ok(vm) => Ok(Some((name, vm.all_pack_ids()))),
+                    Err(e) => Err(anyhow::anyhow!(
+                        "failed to parse volume manifest {}: {}",
+                        name,
+                        e
+                    )),
                 }
-                Err(e) => {
-                    warn!(manifest = %name, error = %e, "failed to parse volume manifest — treating all packs in prefix as live");
-                    stats.manifest_errors += 1;
-                    manifest_failed = true;
-                }
-            },
-            Ok(None) => {
-                warn!(manifest = %name, "manifest disappeared during GC");
             }
+        })
+        .buffer_unordered(16);
+
+    while let Some(result) = manifest_results.next().await {
+        match result {
+            Ok(Some((_name, pack_ids))) => {
+                live_packs.extend(pack_ids);
+                stats.manifests_scanned += 1;
+            }
+            Ok(None) => {} // manifest disappeared, already warned above
             Err(e) => {
-                warn!(manifest = %name, error = %e, "failed to fetch manifest — treating all packs in prefix as live");
+                warn!("{} — treating all packs in prefix as live", e);
                 stats.manifest_errors += 1;
                 manifest_failed = true;
             }
@@ -1432,5 +1471,166 @@ mod tests {
             packs.contains(&(chunk_idx, pack_snap_only)),
             "snapshot-pinned pack must survive when snapshot read fails"
         );
+    }
+
+    /// Verify that GC on a shared prefix cannot delete packs referenced by
+    /// the base manifest, even when fork manifests are added/removed.
+    ///
+    /// Reproduces the scenario:
+    /// 1. Base manifest references packs A, B, C
+    /// 2. Fork manifest references packs A, B, C + D (fork's own write)
+    /// 3. Fork is removed WITHOUT purge (manifest stays — the purge bug)
+    /// 4. GC runs — all packs should be live (base + orphaned fork manifests)
+    /// 5. Fork manifest is manually deleted
+    /// 6. GC runs again — pack D is dead, but A, B, C are still live via base
+    /// 7. New fork created from base — should be able to read A, B, C
+    #[tokio::test]
+    async fn test_gc_shared_prefix_base_packs_survive_fork_cleanup() {
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/bases");
+
+        let chunk_idx = 0u32;
+        let pack_a: PackId = 0xAAAAAAAAAAAAAAAA;
+        let pack_b: PackId = 0xBBBBBBBBBBBBBBBB;
+        let pack_c: PackId = 0xCCCCCCCCCCCCCCCC;
+        let pack_d: PackId = 0xDDDDDDDDDDDDDDDD; // fork-only pack
+
+        // Upload all packs to S3
+        for &pid in &[pack_a, pack_b, pack_c, pack_d] {
+            content_store
+                .put_chunk_pack(chunk_idx, pid, vec![0u8; 100])
+                .await
+                .unwrap();
+        }
+
+        // Base manifest references A, B, C
+        let mut base_vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        base_vm.append_pack(chunk_idx, pack_a);
+        base_vm.append_pack(chunk_idx, pack_b);
+        base_vm.append_pack(chunk_idx, pack_c);
+        content_store
+            .put_manifest("bases/ubuntu", base_vm.serialize().unwrap(), None)
+            .await
+            .unwrap();
+
+        // Fork manifest references A, B, C + D
+        let mut fork_vm = base_vm.clone();
+        fork_vm.append_pack(chunk_idx, pack_d);
+        content_store
+            .put_manifest("fork-1", fork_vm.serialize().unwrap(), None)
+            .await
+            .unwrap();
+
+        // GC run 1: both manifests present, all packs live
+        let mut state = new_gc_state_for_test();
+        let report = reconcile_prefix_for_test(
+            &content_store,
+            &mut state,
+            Duration::ZERO,
+            100,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.manifests_scanned(), 2);
+        assert_eq!(report.live_packs(), 4);
+        assert_eq!(report.dead_found(), 0);
+        assert_eq!(report.packs_deleted(), 0);
+
+        // Simulate fork cleanup: delete fork manifest (as our purge fix does)
+        content_store.delete_manifest("fork-1").await.unwrap();
+
+        // GC run 2: only base manifest, pack_d should be dead
+        let mut state2 = new_gc_state_for_test();
+        let report2 = reconcile_prefix_for_test(
+            &content_store,
+            &mut state2,
+            Duration::ZERO,
+            100,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report2.manifests_scanned(), 1, "only base manifest");
+        assert_eq!(report2.live_packs(), 3, "A, B, C still live");
+        assert_eq!(report2.dead_found(), 1, "only pack_d is dead");
+        assert_eq!(report2.packs_deleted(), 1, "pack_d deleted");
+
+        // Verify base packs survive
+        let packs = list_all_packs(&content_store).await.unwrap();
+        assert!(packs.contains(&(chunk_idx, pack_a)), "base pack A must survive");
+        assert!(packs.contains(&(chunk_idx, pack_b)), "base pack B must survive");
+        assert!(packs.contains(&(chunk_idx, pack_c)), "base pack C must survive");
+        assert!(!packs.contains(&(chunk_idx, pack_d)), "fork pack D should be deleted");
+    }
+
+    /// Verify the live > known invariant: after GC, every pack referenced
+    /// by a manifest must exist in S3. Tests that GC cannot create a state
+    /// where live_packs > known_packs.
+    #[tokio::test]
+    async fn test_gc_never_deletes_live_packs() {
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let content_store = ContentStore::new(Arc::clone(&s3), "test/exports/bases");
+
+        let chunk_idx = 0u32;
+        let base_pack: PackId = 0x1111111111111111;
+        let fork_pack: PackId = 0x2222222222222222;
+        let orphan_pack: PackId = 0x3333333333333333;
+
+        // Upload packs
+        for &pid in &[base_pack, fork_pack, orphan_pack] {
+            content_store
+                .put_chunk_pack(chunk_idx, pid, vec![0u8; 100])
+                .await
+                .unwrap();
+        }
+
+        // Base manifest references base_pack
+        let mut base_vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+        base_vm.append_pack(chunk_idx, base_pack);
+        content_store
+            .put_manifest("bases/ubuntu", base_vm.serialize().unwrap(), None)
+            .await
+            .unwrap();
+
+        // Fork manifest references base_pack + fork_pack
+        let mut fork_vm = base_vm.clone();
+        fork_vm.append_pack(chunk_idx, fork_pack);
+        content_store
+            .put_manifest("fork-1", fork_vm.serialize().unwrap(), None)
+            .await
+            .unwrap();
+
+        // Run GC with zero grace period — orphan_pack should be deleted
+        let mut state = new_gc_state_for_test();
+        let report = reconcile_prefix_for_test(
+            &content_store,
+            &mut state,
+            Duration::ZERO,
+            100,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.packs_deleted(), 1, "only orphan_pack deleted");
+
+        // Verify invariant: every pack in every manifest must exist in S3
+        let surviving_packs = list_all_packs(&content_store).await.unwrap();
+        let manifest_names = content_store.list_all_manifests().await.unwrap();
+        for name in &manifest_names {
+            if let Ok(Some((data, _))) = content_store.get_manifest(name).await {
+                let vm = VolumeManifest::deserialize(&data).unwrap();
+                for (cidx, pid) in vm.all_pack_ids() {
+                    assert!(
+                        surviving_packs.contains(&(cidx, pid)),
+                        "manifest '{}' references pack ({}, {:016x}) which was deleted by GC",
+                        name, cidx, pid,
+                    );
+                }
+            }
+        }
     }
 }

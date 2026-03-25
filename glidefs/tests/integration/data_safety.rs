@@ -1809,7 +1809,7 @@ async fn test_compaction_dedup_correctness() {
     }
 
     // Flush in two batches to create multiple packs
-    // (flush_to_s3 creates packs based on blocks_per_pack)
+    // (flush_to_s3 creates packs based on flush_threshold)
     cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
 
     let _packs_before_compact = vm.read().chunk_pack_ids(0).unwrap().len();
@@ -2173,7 +2173,7 @@ async fn test_full_chunk_cold_wake() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_cold_wake_stress_concurrent_writes() {
     use glidefs::block::cache::SimpleBlockCache;
-    use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD;
     use glidefs::block::router::{ExportRouter, RouterConfig};
     use glidefs::config::ExportConfig;
 
@@ -2201,7 +2201,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
-                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
             })
@@ -2214,7 +2214,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
             size_gb: DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2266,7 +2266,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
-                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
             })
@@ -2279,7 +2279,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
             size_gb: DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2531,7 +2531,7 @@ async fn test_c2_flush_error_recovery_preserves_data() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_sub_block_writes_same_not_present_block() {
     use glidefs::block::cache::SimpleBlockCache;
-    use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD;
     use glidefs::block::router::{ExportRouter, RouterConfig};
     use glidefs::config::ExportConfig;
     use tokio::task::JoinSet;
@@ -2559,7 +2559,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
-                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
             })
@@ -2572,7 +2572,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
             size_gb: DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2612,7 +2612,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
-                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
             })
@@ -2625,7 +2625,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
             size_gb: DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };

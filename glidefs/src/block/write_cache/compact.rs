@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::stream::{self, StreamExt};
 use tracing::{debug, info, warn};
 
 use crate::block::cache::BlockCache;
@@ -62,24 +63,39 @@ async fn dead_block_ratio(
         return Ok(0.0);
     }
 
-    // Collect entries from each pack (oldest→newest order).
+    // Fetch all pack indices concurrently (cache hits resolve immediately,
+    // S3 misses run in parallel via buffer_unordered).
+    let results: Vec<Result<(usize, Arc<[PackIndexEntry]>), CacheError>> =
+        stream::iter(pack_ids.iter().copied().enumerate())
+            .map(|(pack_idx, pack_id)| async move {
+                let entries: Arc<[PackIndexEntry]> =
+                    match pack_index_cache.get_entries(pack_id).await {
+                        Some(entries) => entries,
+                        None => {
+                            let fetched =
+                                content_store.get_pack_index(chunk_idx, pack_id).await?;
+                            pack_index_cache.insert_entries(pack_id, &fetched);
+                            Arc::from(fetched)
+                        }
+                    };
+                Ok((pack_idx, entries))
+            })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+
+    // Build ownership map — highest pack_idx wins per offset (order-independent).
     let mut total_entries = 0usize;
     let mut owner: HashMap<u32, usize> = HashMap::new();
 
-    for (pack_idx, &pack_id) in pack_ids.iter().enumerate() {
-        let entries: std::sync::Arc<[super::super::pack::PackIndexEntry]> = match pack_index_cache.get_entries(pack_id).await {
-            Some(entries) => entries,
-            None => {
-                // Cache miss — fetch from S3 (cold path, acceptable)
-                let fetched = content_store.get_pack_index(chunk_idx, pack_id).await?;
-                pack_index_cache.insert_entries(pack_id, &fetched);
-                std::sync::Arc::from(fetched)
-            }
-        };
+    for result in results {
+        let (pack_idx, entries) = result?;
         total_entries += entries.len();
         for entry in entries.iter() {
-            // Last writer (highest pack_idx) wins
-            owner.insert(entry.chunk_offset, pack_idx);
+            owner
+                .entry(entry.chunk_offset)
+                .and_modify(|existing| *existing = (*existing).max(pack_idx))
+                .or_insert(pack_idx);
         }
     }
 
@@ -120,8 +136,6 @@ pub async fn compact_chunk(
     );
 
     // 1. Load all pack indices in parallel (from cache, or fetch from S3 on miss)
-    use futures::stream::{self, StreamExt};
-
     let all_entries: Vec<(PackId, std::sync::Arc<[PackIndexEntry]>)> = {
         let results: Vec<Result<(PackId, std::sync::Arc<[PackIndexEntry]>), CacheError>> =
             stream::iter(pack_ids.iter().copied())
@@ -336,26 +350,44 @@ pub async fn compact_if_needed(
         (compact, candidates)
     };
 
-    // Evaluate dead-block ratio for candidates not already above pack-count threshold
-    for (chunk_idx, pack_ids) in ratio_candidates {
-        match dead_block_ratio(&pack_ids, pack_index_cache, content_store, chunk_idx).await {
-            Ok(ratio) if ratio > dead_ratio_threshold => {
-                debug!(
-                    chunk_idx,
-                    packs = pack_ids.len(),
-                    dead_ratio = format!("{:.1}%", ratio * 100.0),
-                    "dead-block ratio exceeds threshold"
-                );
-                chunks_to_compact.push((chunk_idx, pack_ids));
-            }
-            Ok(_) => {} // below threshold, skip
-            Err(e) => {
-                // Non-fatal: skip this candidate, will retry next cycle
-                warn!(
-                    chunk_idx,
-                    error = %e,
-                    "failed to compute dead-block ratio, skipping"
-                );
+    // Evaluate dead-block ratio for candidates concurrently.
+    {
+        use futures::stream::{self, StreamExt};
+
+        let ratio_results: Vec<(u32, Vec<PackId>, Result<f32, CacheError>)> =
+            stream::iter(ratio_candidates)
+                .map(|(chunk_idx, pack_ids)| {
+                    let cs = &content_store;
+                    let pic = &pack_index_cache;
+                    async move {
+                        let result = dead_block_ratio(&pack_ids, pic, cs, chunk_idx).await;
+                        (chunk_idx, pack_ids, result)
+                    }
+                })
+                .buffer_unordered(16)
+                .collect()
+                .await;
+
+        for (chunk_idx, pack_ids, result) in ratio_results {
+            match result {
+                Ok(ratio) if ratio > dead_ratio_threshold => {
+                    debug!(
+                        chunk_idx,
+                        packs = pack_ids.len(),
+                        dead_ratio = format!("{:.1}%", ratio * 100.0),
+                        "dead-block ratio exceeds threshold"
+                    );
+                    chunks_to_compact.push((chunk_idx, pack_ids));
+                }
+                Ok(_) => {} // below threshold, skip
+                Err(e) => {
+                    // Non-fatal: skip this candidate, will retry next cycle
+                    warn!(
+                        chunk_idx,
+                        error = %e,
+                        "failed to compute dead-block ratio, skipping"
+                    );
+                }
             }
         }
     }
@@ -369,25 +401,43 @@ pub async fn compact_if_needed(
         threshold, "compacting chunks"
     );
 
-    let mut results = Vec::new();
-
     let blocks_per_chunk = {
         let vm = volume_manifest.read();
         vm.blocks_per_chunk()
     };
 
-    for (chunk_idx, pack_ids) in chunks_to_compact {
-        match compact_chunk(
-            chunk_idx,
-            &pack_ids,
-            blocks_per_chunk,
-            content_store,
-            pack_index_cache,
-            volume_manifest,
-            clean_cache,
-        )
-        .await
-        {
+    // Compact chunks concurrently. Each compact_chunk does S3 reads +
+    // upload + manifest CAS independently.
+    use futures::stream::{self, StreamExt};
+
+    let compact_results: Vec<(u32, Result<CompactionResult, CacheError>)> =
+        stream::iter(chunks_to_compact)
+            .map(|(chunk_idx, pack_ids)| {
+                let cs = &content_store;
+                let pic = &pack_index_cache;
+                let vm = &volume_manifest;
+                let cc = &clean_cache;
+                async move {
+                    let result = compact_chunk(
+                        chunk_idx,
+                        &pack_ids,
+                        blocks_per_chunk,
+                        cs,
+                        pic,
+                        vm,
+                        cc,
+                    )
+                    .await;
+                    (chunk_idx, result)
+                }
+            })
+            .buffer_unordered(16)
+            .collect()
+            .await;
+
+    let mut results = Vec::new();
+    for (chunk_idx, result) in compact_results {
+        match result {
             Ok(result) => results.push(result),
             Err(e) => {
                 warn!(

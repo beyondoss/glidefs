@@ -37,7 +37,7 @@ pub struct PutExportRequest {
     pub manifest_name: Option<String>,
     /// Blocks per S3 pack (default: inherit from global config). 0 = manual mode.
     #[serde(default)]
-    pub blocks_per_pack: Option<usize>,
+    pub flush_threshold: Option<usize>,
     /// Flush mode: "auto" (default) or "manual" (drain-only).
     #[serde(default)]
     pub flush_mode: Option<String>,
@@ -366,7 +366,7 @@ where
                         size_gb: put_req.size_gb,
                         s3_prefix: put_req.s3_prefix,
                         block_size: put_req.block_size,
-                        blocks_per_pack: put_req.blocks_per_pack,
+                        flush_threshold: put_req.flush_threshold,
                         flush_mode: put_req.flush_mode,
                         transport: put_req.transport,
                     };
@@ -802,7 +802,7 @@ mod tests {
                 wal_sync: false,
                 max_s3_uploads: 0,
                 max_s3_downloads: 0,
-                default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+                default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
             })

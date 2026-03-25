@@ -48,7 +48,7 @@ struct Args {
 
     /// Blocks per pack (default 500).
     #[arg(long, default_value_t = 500)]
-    blocks_per_pack: usize,
+    flush_threshold: usize,
 
     /// Skip all-zero blocks (default true).
     #[arg(long, default_value_t = true)]
@@ -142,13 +142,13 @@ fn read_blocks(
 // ============================================================================
 
 /// Simulate packing: assign blocks to packs with real chunk_offsets and offsets.
-fn build_packs(blocks: &[RealBlock], blocks_per_pack: usize) -> Vec<Vec<PackIndexEntry>> {
-    let num_packs = blocks.len() / blocks_per_pack;
+fn build_packs(blocks: &[RealBlock], flush_threshold: usize) -> Vec<Vec<PackIndexEntry>> {
+    let num_packs = blocks.len() / flush_threshold;
     let mut packs = Vec::with_capacity(num_packs);
 
     for p in 0..num_packs {
-        let pack_blocks = &blocks[p * blocks_per_pack..(p + 1) * blocks_per_pack];
-        let mut entries = Vec::with_capacity(blocks_per_pack);
+        let pack_blocks = &blocks[p * flush_threshold..(p + 1) * flush_threshold];
+        let mut entries = Vec::with_capacity(flush_threshold);
         let mut offset: u32 = 16; // PACK_HEADER_SIZE
 
         for b in pack_blocks {
@@ -776,13 +776,13 @@ fn human(bytes: usize) -> String {
 fn main() {
     let args = Args::parse();
     let block_size = args.block_size;
-    let blocks_per_pack = args.blocks_per_pack;
+    let flush_threshold = args.flush_threshold;
 
     // Print config
     println!("Pack Index Encoding Analysis (Real Data)");
     println!("========================================");
     println!("Block size:      {} KB", block_size / 1024);
-    println!("Blocks per pack: {blocks_per_pack}");
+    println!("Blocks per pack: {flush_threshold}");
     println!();
 
     // Print image info
@@ -827,7 +827,7 @@ fn main() {
     );
 
     // Build packs
-    let packs = build_packs(&blocks, blocks_per_pack);
+    let packs = build_packs(&blocks, flush_threshold);
     let num_packs = packs.len();
     let total_entries: usize = packs.iter().map(|p| p.len()).sum();
     println!("Built {num_packs} packs ({total_entries} total entries)");
@@ -837,7 +837,7 @@ fn main() {
         eprintln!(
             "error: not enough blocks ({}) for {} blocks/pack",
             blocks.len(),
-            blocks_per_pack
+            flush_threshold
         );
         std::process::exit(1);
     }

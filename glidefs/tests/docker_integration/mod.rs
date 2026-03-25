@@ -385,7 +385,7 @@ impl TestServer {
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
-                default_blocks_per_pack: glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK,
+                default_flush_threshold: glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
             })
@@ -476,7 +476,7 @@ impl TestServer {
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
-                default_blocks_per_pack: glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK,
+                default_flush_threshold: glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
             })
@@ -627,7 +627,7 @@ impl TestServer {
             size_gb,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -646,7 +646,7 @@ impl TestServer {
             size_gb,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -660,7 +660,7 @@ impl TestServer {
             size_gb,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -679,7 +679,7 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_prefix.to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -703,7 +703,7 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_manifest.to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -728,7 +728,7 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_manifest.to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -747,7 +747,7 @@ impl TestServer {
             size_gb,
             s3_prefix: Some(source_manifest.to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };

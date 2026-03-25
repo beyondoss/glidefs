@@ -1442,7 +1442,7 @@ async fn fork_chain_integrity() {
             // s3_prefix = "grandparent" — that's where parent's manifest and all packs live
             s3_prefix: Some("grandparent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -1549,7 +1549,7 @@ async fn fork_deep_chain_read_through() {
                 size_gb,
                 s3_prefix: Some(root_prefix.to_string()),
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             };
@@ -2603,7 +2603,7 @@ async fn soak_mixed_operations() {
                             size_gb,
                             s3_prefix: Some("vol-0".to_string()),
                             block_size: None,
-                            blocks_per_pack: None,
+                            flush_threshold: None,
                             flush_mode: None,
                             transport: None,
                         };
@@ -2986,7 +2986,7 @@ async fn soak_fork_chain_churn() {
                 size_gb,
                 s3_prefix: Some(root_name.clone()),
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             };

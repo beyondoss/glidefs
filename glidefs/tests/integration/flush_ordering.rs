@@ -47,7 +47,7 @@ fn create_router_config(s3: Arc<dyn ObjectStore>, dir: &TempDir) -> RouterConfig
         wal_sync: true,
         max_s3_uploads: 0,
         max_s3_downloads: 0,
-        default_blocks_per_pack: 500,
+        default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
     }
@@ -59,7 +59,7 @@ fn test_export_config(name: &str) -> ExportConfig {
         size_gb: 0.01,
         s3_prefix: None,
         block_size: None,
-        blocks_per_pack: None,
+        flush_threshold: None,
         flush_mode: None,
         transport: None,
     }

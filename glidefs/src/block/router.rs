@@ -169,7 +169,7 @@ pub struct RouterConfig {
     /// Max concurrent S3 pack downloads across all exports (0 = unlimited).
     pub max_s3_downloads: usize,
     /// Default blocks per pack for new exports (from NbdConfig).
-    pub default_blocks_per_pack: usize,
+    pub default_flush_threshold: usize,
     /// Number of ublk I/O queues per device (Linux + ublk feature only).
     #[cfg_attr(not(all(target_os = "linux", feature = "ublk")), allow(dead_code))]
     pub ublk_nr_queues: u16,
@@ -208,7 +208,7 @@ pub struct ExportRouter {
     wal_sync: bool,
 
     /// Default blocks per pack for new exports (from global config).
-    default_blocks_per_pack: usize,
+    default_flush_threshold: usize,
 
     /// Scrubber metrics (global, not per-export)
     scrubber_metrics: Arc<crate::block::scrubber::ScrubberMetrics>,
@@ -332,7 +332,7 @@ impl ExportRouter {
             pack_index_cache,
             clean_cache: config.clean_cache,
             wal_sync: config.wal_sync,
-            default_blocks_per_pack: config.default_blocks_per_pack,
+            default_flush_threshold: config.default_flush_threshold,
             scrubber_metrics: Arc::new(crate::block::scrubber::ScrubberMetrics::new()),
             s3_circuit_breaker,
             upload_semaphore,
@@ -1022,11 +1022,11 @@ impl ExportRouter {
             }
         }
 
-        // Resolve per-export blocks_per_pack: export config > global default.
+        // Resolve per-export flush_threshold: export config > global default.
         // 0 = manual mode (no auto-flush).
-        let blocks_per_pack = config.blocks_per_pack_or(self.default_blocks_per_pack);
+        let flush_threshold = config.flush_threshold_or(self.default_flush_threshold);
 
-        // Shared notify: write path signals when dirty count crosses blocks_per_pack
+        // Shared notify: write path signals when dirty count crosses flush_threshold
         let flush_notify = Arc::new(Notify::new());
 
         // Create handler for block I/O
@@ -1041,7 +1041,7 @@ impl ExportRouter {
             Arc::clone(&metrics),
             Arc::clone(&self.ssd_utilization),
             Arc::clone(&flush_notify),
-            blocks_per_pack,
+            flush_threshold,
             None, // TODO: wire up write_trace_path from ExportConfig
         ));
 
@@ -1710,7 +1710,7 @@ impl ExportRouter {
             size_gb: new_size_gb,
             s3_prefix: orig_s3_prefix,
             block_size: Some(block_size),
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: Some(transport),
         };
@@ -1737,14 +1737,53 @@ impl ExportRouter {
                 Some(state) => state,
                 None => {
                     info!("Export '{}' doesn't exist, nothing to remove", name);
-                    // Still purge local files if requested (idempotent cleanup)
                     if purge {
+                        // Clean local cache files
                         let cache_file = self.cache_dir.join(format!("{}.cache", name));
                         let meta_file = self.cache_dir.join(format!("{}.meta", name));
                         let wal_file = self.cache_dir.join(format!("{}.wal", name));
                         remove_file_if_exists(&cache_file);
                         remove_file_if_exists(&meta_file);
                         remove_file_if_exists(&wal_file);
+
+                        // S3 cleanup: load export config to discover s3_prefix,
+                        // then delete manifest, snapshots, and export definition.
+                        match self.load_export(name).await {
+                            Ok(Some(config)) => {
+                                let s3_prefix = format!(
+                                    "{}/exports/{}",
+                                    self.db_path,
+                                    config.s3_prefix()
+                                );
+                                let cs = ContentStore::new(
+                                    Arc::clone(&self.object_store),
+                                    &s3_prefix,
+                                )
+                                .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker));
+
+                                if let Err(e) = cs.delete_manifest(name).await {
+                                    warn!("Failed to delete manifest from S3: {}", e);
+                                }
+                                if let Err(e) = cs.delete_all_snapshots(name).await {
+                                    warn!("Failed to delete snapshots from S3: {}", e);
+                                }
+                                if let Err(e) = self.delete_export_definition(name).await {
+                                    warn!("Failed to delete export definition from S3: {}", e);
+                                }
+                            }
+                            Ok(None) => {
+                                debug!(
+                                    "No export definition in S3 for '{}', skipping S3 cleanup",
+                                    name
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to load export definition for S3 cleanup: {}",
+                                    e
+                                );
+                            }
+                        }
                     }
                     return Ok(());
                 }
@@ -1768,7 +1807,7 @@ impl ExportRouter {
             }
         }
 
-        let remaining = Self::teardown_export(name, state).await;
+        let remaining = Self::teardown_export(name, state, purge).await;
 
         if purge {
             let cache_file = self.cache_dir.join(format!("{}.cache", name));
@@ -1782,6 +1821,11 @@ impl ExportRouter {
             // Also delete export definition from S3
             if let Err(e) = self.delete_export_definition(name).await {
                 warn!("Failed to delete export definition from S3: {}", e);
+            }
+
+            // Delete the manifest from S3 (best-effort).
+            if let Some(cs) = &snapshot_cs && let Err(e) = cs.delete_manifest(name).await {
+                warn!("Failed to delete manifest from S3: {}", e);
             }
 
             // Delete all versioned snapshots from S3 (best-effort).
@@ -1826,7 +1870,7 @@ impl ExportRouter {
         let incomplete: Vec<(String, u64)> = stream::iter(export_list)
             .map(|(name, state)| async move {
                 info!("Shutting down export '{}'...", name);
-                let remaining = Self::teardown_export(&name, state).await;
+                let remaining = Self::teardown_export(&name, state, false).await;
                 (name, remaining)
             })
             .buffer_unordered(16)
@@ -1877,8 +1921,12 @@ impl ExportRouter {
     /// Drain dirty blocks, stop flush scheduler, and transition cache through
     /// the Draining typestate. Shared by `remove_export` and `shutdown`.
     ///
-    /// Returns the number of dirty blocks remaining (0 = fully drained).
-    async fn teardown_export(name: &str, state: ExportState) -> u64 {
+    /// When `skip_drain` is true, dirty blocks are discarded without flushing
+    /// to S3. Used when purging — the S3 data will be deleted anyway, so
+    /// draining is wasted work.
+    ///
+    /// Returns the number of dirty blocks remaining (0 = fully drained or skipped).
+    async fn teardown_export(name: &str, state: ExportState, skip_drain: bool) -> u64 {
         let ExportState {
             handler,
             cache,
@@ -1899,50 +1947,59 @@ impl ExportRouter {
             warn!("Flush scheduler for '{}' panicked: {}", name, e);
         }
 
-        // 3. V2 drain: flush remaining dirty data.
-        //    Continue on errors (may be transient S3 failures) instead of
-        //    breaking — matches the public ExportState::drain() behavior.
-        //    Exponential backoff on consecutive errors prevents tight-looping
-        //    when S3 is down (100 rapid retries → log spam + wasted network).
-        let mut drain_done = false;
-        let mut backoff = Duration::from_millis(100);
-        for _ in 0..MAX_DRAIN_ITERATIONS {
-            match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
-                Ok(stats) if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 => {
-                    drain_done = true;
-                    break;
-                }
-                Ok(_) => {
-                    backoff = Duration::from_millis(100);
-                }
-                Err(e) => {
-                    metrics.record_flush_error();
-                    warn!("Drain error for '{}' (retrying in {:?}): {}", name, backoff, e);
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(Duration::from_secs(5));
-                }
-            }
-        }
-        let remaining = if drain_done {
+        let remaining = if skip_drain {
+            // Purge path: skip drain entirely — dirty blocks are discarded.
+            // No manifest sync needed since S3 data will be deleted.
+            info!("Skipping drain for '{}' (purge)", name);
             0
         } else {
-            cache.dirty_block_count()
-        };
-        if remaining > 0 {
-            warn!(
-                "Teardown drain for '{}' incomplete, {} dirty blocks remain",
-                name, remaining,
-            );
-        }
+            // 3. V2 drain: flush remaining dirty data.
+            //    Continue on errors (may be transient S3 failures) instead of
+            //    breaking — matches the public ExportState::drain() behavior.
+            //    Exponential backoff on consecutive errors prevents tight-looping
+            //    when S3 is down (100 rapid retries → log spam + wasted network).
+            let mut drain_done = false;
+            let mut backoff = Duration::from_millis(100);
+            for _ in 0..MAX_DRAIN_ITERATIONS {
+                match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
+                    Ok(stats) if stats.blocks_claimed == 0 && cache.dirty_block_count() == 0 => {
+                        drain_done = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        backoff = Duration::from_millis(100);
+                    }
+                    Err(e) => {
+                        metrics.record_flush_error();
+                        warn!("Drain error for '{}' (retrying in {:?}): {}", name, backoff, e);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+            let remaining = if drain_done {
+                0
+            } else {
+                cache.dirty_block_count()
+            };
+            if remaining > 0 {
+                warn!(
+                    "Teardown drain for '{}' incomplete, {} dirty blocks remain",
+                    name, remaining,
+                );
+            }
 
-        // Best-effort final manifest sync — persists references to any packs
-        // that were successfully uploaded even if the full drain didn't complete.
-        if let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await {
-            warn!(
-                "Final manifest sync for '{}' failed: {} — flushed packs may be orphaned",
-                name, e,
-            );
-        }
+            // Best-effort final manifest sync — persists references to any packs
+            // that were successfully uploaded even if the full drain didn't complete.
+            if let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await {
+                warn!(
+                    "Final manifest sync for '{}' failed: {} — flushed packs may be orphaned",
+                    name, e,
+                );
+            }
+
+            remaining
+        };
 
         // 4. Drop the handler (releases its Arc clone)
         drop(handler);
@@ -1988,7 +2045,7 @@ impl ExportRouter {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -2031,7 +2088,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -2045,7 +2102,7 @@ mod tests {
             size_gb: 0.01, // 10MB
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         }
@@ -2448,7 +2505,7 @@ mod tests {
                 size_gb: 1.0,
                 s3_prefix: None,
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             },
@@ -2457,7 +2514,7 @@ mod tests {
                 size_gb: 2.0,
                 s3_prefix: None,
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             },
@@ -2466,7 +2523,7 @@ mod tests {
                 size_gb: 3.0,
                 s3_prefix: None,
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             },
@@ -2527,6 +2584,87 @@ mod tests {
         // Verify deleted from S3
         let loaded = router.load_export("purge-vol").await.unwrap();
         assert!(loaded.is_none(), "Should be deleted from S3");
+    }
+
+    #[tokio::test]
+    async fn test_purge_deletes_manifest_from_s3() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // Create export, write data, flush to create a manifest in S3
+        let config = test_export_config("purge-manifest");
+        router
+            .create_export(config.clone(), false, None, None)
+            .await
+            .unwrap();
+        let handler = router.get_handler("purge-manifest").await.unwrap();
+        handler.write(0, &[0xAA; 4096], false).await.unwrap();
+        router.drain_export("purge-manifest").await.unwrap();
+
+        // Manifest should exist
+        assert!(
+            router
+                .head_manifest("purge-manifest", "purge-manifest")
+                .await
+                .unwrap(),
+            "manifest should exist after drain"
+        );
+
+        // Purge
+        router.remove_export("purge-manifest", true).await.unwrap();
+
+        // Manifest should be gone
+        assert!(
+            !router
+                .head_manifest("purge-manifest", "purge-manifest")
+                .await
+                .unwrap(),
+            "manifest should be deleted after purge"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_when_already_gone_cleans_s3() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // Create export, persist config to S3, write + drain to create manifest
+        let config = test_export_config("gone-purge");
+        router
+            .create_export(config.clone(), false, None, None)
+            .await
+            .unwrap();
+        router.save_export(&config).await.unwrap();
+        let handler = router.get_handler("gone-purge").await.unwrap();
+        handler.write(0, &[0xBB; 4096], false).await.unwrap();
+        router.drain_export("gone-purge").await.unwrap();
+
+        // Verify manifest + export definition exist
+        assert!(router.head_manifest("gone-purge", "gone-purge").await.unwrap());
+        assert!(router.load_export("gone-purge").await.unwrap().is_some());
+
+        // Remove WITHOUT purge (simulates shutdown drain)
+        router.remove_export("gone-purge", false).await.unwrap();
+
+        // Export is gone from memory, but S3 artifacts remain
+        assert!(router.head_manifest("gone-purge", "gone-purge").await.unwrap());
+        assert!(router.load_export("gone-purge").await.unwrap().is_some());
+
+        // Now purge the already-gone export
+        router.remove_export("gone-purge", true).await.unwrap();
+
+        // S3 artifacts should be cleaned up
+        assert!(
+            !router
+                .head_manifest("gone-purge", "gone-purge")
+                .await
+                .unwrap(),
+            "manifest should be deleted after purge-when-gone"
+        );
+        assert!(
+            router.load_export("gone-purge").await.unwrap().is_none(),
+            "export definition should be deleted after purge-when-gone"
+        );
     }
 
     // =========================================================================
@@ -2600,7 +2738,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("source".to_string()), // same S3 prefix as source
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2639,7 +2777,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("src".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2691,7 +2829,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("src".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2724,7 +2862,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("nonexistent-source".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2762,7 +2900,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("a".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2783,7 +2921,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("a".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -2901,7 +3039,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -3199,13 +3337,13 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: Some("manual".to_string()),
             transport: None,
         };
         router.create_export(config, false, None, None).await.unwrap();
 
-        // Write many blocks — well above DEFAULT_BLOCKS_PER_PACK
+        // Write many blocks — well above DEFAULT_FLUSH_THRESHOLD
         let handler = router.get_handler("manual-vm").await.unwrap();
         // 50 blocks × 128KB = 6.4MB (within our 10MB device)
         for i in 0..50u64 {
@@ -3248,7 +3386,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: Some("manual".to_string()),
             transport: None,
         };
@@ -3281,8 +3419,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_blocks_per_pack_config_resolution() {
-        // Verify ExportConfig.blocks_per_pack_or() cascade:
+    async fn test_flush_threshold_config_resolution() {
+        // Verify ExportConfig.flush_threshold_or() cascade:
         // 1. flush_mode = "manual" → 0
         // 2. export override → export value
         // 3. fallback → global default
@@ -3291,12 +3429,12 @@ mod tests {
             size_gb: 1.0,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: Some(1000),
+            flush_threshold: Some(1000),
             flush_mode: Some("manual".to_string()),
             transport: None,
         };
         assert_eq!(
-            manual.blocks_per_pack_or(500),
+            manual.flush_threshold_or(500),
             0,
             "manual mode always returns 0"
         );
@@ -3306,23 +3444,23 @@ mod tests {
             size_gb: 1.0,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: Some(1000),
+            flush_threshold: Some(1000),
             flush_mode: None,
             transport: None,
         };
-        assert_eq!(custom.blocks_per_pack_or(500), 1000, "export override wins");
+        assert_eq!(custom.flush_threshold_or(500), 1000, "export override wins");
 
         let default = ExportConfig {
             name: "d".to_string(),
             size_gb: 1.0,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
         assert_eq!(
-            default.blocks_per_pack_or(500),
+            default.flush_threshold_or(500),
             500,
             "falls back to global default"
         );
@@ -3464,7 +3602,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3500,7 +3638,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3547,7 +3685,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3576,7 +3714,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3588,7 +3726,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -3664,7 +3802,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         }).await.unwrap();
@@ -3681,7 +3819,7 @@ mod tests {
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
-            default_blocks_per_pack: crate::block::pack::DEFAULT_BLOCKS_PER_PACK,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
         })
@@ -3694,7 +3832,7 @@ mod tests {
                     size_gb: 0.01,
                     s3_prefix: Some("parent".to_string()),
                     block_size: None,
-                    blocks_per_pack: None,
+                    flush_threshold: None,
                     flush_mode: None,
                     transport: None,
                 },
@@ -3807,7 +3945,7 @@ mod tests {
             size_gb: 0.01,
             s3_prefix: Some("parent".to_string()),
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };

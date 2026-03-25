@@ -18,7 +18,7 @@ mod fio_verify {
     use std::sync::Arc;
 
     use glidefs::block::cache::{BlockCache, SimpleBlockCache};
-    use glidefs::block::pack::DEFAULT_BLOCKS_PER_PACK;
+    use glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD;
     use glidefs::block::router::{ExportRouter, RouterConfig};
     use glidefs::block::ublk::UblkServer;
     use glidefs::config::ExportConfig;
@@ -72,7 +72,7 @@ mod fio_verify {
                     wal_sync: false,
                     max_s3_uploads: 128,
                     max_s3_downloads: 512,
-                    default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                    default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                     ublk_nr_queues: 4,
                     nbd_dead_conn_timeout: 0,
                 })
@@ -85,7 +85,7 @@ mod fio_verify {
                 size_gb: DEVICE_SIZE_GB,
                 s3_prefix: None,
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             };
@@ -337,7 +337,7 @@ mod fio_verify {
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
-                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
             })
@@ -351,7 +351,7 @@ mod fio_verify {
             size_gb: DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
@@ -468,7 +468,7 @@ mod fio_verify {
                     wal_sync: false,
                     max_s3_uploads: 128,
                     max_s3_downloads: 512,
-                    default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                    default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                     ublk_nr_queues: 4,
                     nbd_dead_conn_timeout: 0,
                 })
@@ -481,7 +481,7 @@ mod fio_verify {
                 size_gb: DEVICE_SIZE_GB,
                 s3_prefix: None,
                 block_size: None,
-                blocks_per_pack: None,
+                flush_threshold: None,
                 flush_mode: None,
                 transport: None,
             };
@@ -537,7 +537,7 @@ mod fio_verify {
 
         // Phase 1: random writes for 60s with high concurrency.
         // The flush scheduler should fire multiple times during this window
-        // (threshold = DEFAULT_BLOCKS_PER_PACK = 500 dirty blocks).
+        // (threshold = DEFAULT_FLUSH_THRESHOLD = 500 dirty blocks).
         let server = VerifyServer::start(Arc::clone(&s3)).await;
         let dev = &server.dev_path;
 
@@ -575,7 +575,7 @@ mod fio_verify {
                 wal_sync: false,
                 max_s3_uploads: 128,
                 max_s3_downloads: 512,
-                default_blocks_per_pack: DEFAULT_BLOCKS_PER_PACK,
+                default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
             })
@@ -588,7 +588,7 @@ mod fio_verify {
             size_gb: DEVICE_SIZE_GB,
             s3_prefix: None,
             block_size: None,
-            blocks_per_pack: None,
+            flush_threshold: None,
             flush_mode: None,
             transport: None,
         };
