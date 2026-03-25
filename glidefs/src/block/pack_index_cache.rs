@@ -176,19 +176,23 @@ impl PackIndexCache {
     /// `VolumeManifest::chunk_pack_ids` ordering). Later entries overwrite
     /// earlier ones (newest wins). Used for cross-flush dedup: if a block's
     /// (chunk_offset, hash) matches the map, it's already in S3.
+    ///
+    /// Returns `None` if any pack index is missing from the cache. An
+    /// incomplete map could cause the caller to skip a necessary upload
+    /// (e.g., treating a zero block as deduped when a non-zero entry exists
+    /// in the uncached pack). Callers must treat `None` as "dedup unsafe."
     pub async fn existing_block_hashes(
         &self,
         pack_ids: &[PackId],
-    ) -> std::collections::HashMap<u32, Blake3Hash> {
+    ) -> Option<std::collections::HashMap<u32, Blake3Hash>> {
         let mut map = std::collections::HashMap::new();
         for &pack_id in pack_ids {
-            if let Some(entries) = self.get_entries(pack_id).await {
-                for entry in entries.iter() {
-                    map.insert(entry.chunk_offset, entry.hash);
-                }
+            let entries = self.get_entries(pack_id).await?;
+            for entry in entries.iter() {
+                map.insert(entry.chunk_offset, entry.hash);
             }
         }
-        map
+        Some(map)
     }
 }
 
@@ -532,5 +536,48 @@ mod tests {
 
         // Verify compression: encoded should be smaller than raw 28B * 100
         assert!(buf.len() < 100 * 28, "compressed size {} should be < {}", buf.len(), 100 * 28);
+    }
+
+    #[tokio::test]
+    async fn test_existing_block_hashes_all_cached() {
+        let tmp = TempDir::new().unwrap();
+        let cache = open_test_cache(tmp.path()).await;
+
+        let pack_a = 0xAAAA;
+        let pack_b = 0xBBBB;
+        cache.insert_entries(pack_a, &[make_entry(0), make_entry(1)]);
+        cache.insert_entries(pack_b, &[make_entry(1), make_entry(2)]);
+
+        // Newest wins: pack_b's entry at offset 1 overrides pack_a's.
+        let map = cache.existing_block_hashes(&[pack_a, pack_b]).await;
+        assert!(map.is_some(), "all packs cached → Some");
+        let map = map.unwrap();
+        assert_eq!(map.len(), 3); // offsets 0, 1, 2
+        // Offset 1: pack_b's hash (newest wins)
+        assert_eq!(map[&1], make_entry(1).hash);
+    }
+
+    #[tokio::test]
+    async fn test_existing_block_hashes_missing_pack_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cache = open_test_cache(tmp.path()).await;
+
+        let pack_a = 0xAAAA;
+        let pack_missing = 0xDEAD;
+        cache.insert_entries(pack_a, &[make_entry(0)]);
+        // pack_missing is NOT in the cache.
+
+        let map = cache.existing_block_hashes(&[pack_a, pack_missing]).await;
+        assert!(map.is_none(), "missing pack → None (dedup unsafe)");
+    }
+
+    #[tokio::test]
+    async fn test_existing_block_hashes_empty_input() {
+        let tmp = TempDir::new().unwrap();
+        let cache = open_test_cache(tmp.path()).await;
+
+        let map = cache.existing_block_hashes(&[]).await;
+        assert!(map.is_some(), "empty input → Some(empty map)");
+        assert!(map.unwrap().is_empty());
     }
 }

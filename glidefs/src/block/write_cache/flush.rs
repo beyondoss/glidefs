@@ -958,8 +958,9 @@ impl WriteCache<Active> {
 
             // Cross-flush dedup: build merged view of existing blocks for this
             // chunk. Pack indices are already warmed (above), so get_entries
-            // hits the in-memory cache (~100ns per pack).
-            let existing_hashes = {
+            // hits the in-memory cache (~100ns per pack). Returns None if any
+            // pack index is missing — dedup is unsafe without the full picture.
+            let existing_hashes: Option<std::collections::HashMap<u32, Blake3Hash>> = {
                 let pack_ids = volume_manifest.read()
                     .chunk_pack_ids(chunk_idx)
                     .map(|ids| ids.to_vec())
@@ -991,14 +992,17 @@ impl WriteCache<Active> {
                     // Cross-flush dedup: skip if existing pack has same
                     // content at this offset, OR if the block is zero and
                     // no prior entry exists (reads return zeros by default).
-                    let dominated = match existing_hashes.get(&chunk_offset) {
-                        Some(&existing_hash) => existing_hash == hash,
-                        None => hash == zero_hash,
-                    };
-                    if dominated {
-                        total_stats.blocks_cross_deduped += 1;
-                        packed_indices.push(block_index);
-                        continue;
+                    // Only safe when ALL pack indices are cached (Some map).
+                    if let Some(ref existing) = existing_hashes {
+                        let dominated = match existing.get(&chunk_offset) {
+                            Some(&existing_hash) => existing_hash == hash,
+                            None => hash == zero_hash,
+                        };
+                        if dominated {
+                            total_stats.blocks_cross_deduped += 1;
+                            packed_indices.push(block_index);
+                            continue;
+                        }
                     }
 
                     let compressed = if hash == zero_hash {
