@@ -91,6 +91,22 @@ impl ObjectStore for CrashingObjectStore {
                 )),
             });
         }
+        // Count pack uploads (single PUT path) toward the crash counter,
+        // same as multipart. Small packs now use put_opts instead of
+        // multipart — the crash simulation must cover both paths.
+        if location.as_ref().contains("chunks/") {
+            let count = self.put_count.fetch_add(1, Ordering::SeqCst);
+            if count >= self.puts_before_crash.load(Ordering::SeqCst) {
+                self.crashed.store(true, Ordering::SeqCst);
+                return Err(object_store::Error::Generic {
+                    store: "CrashingObjectStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "host crashed during pack upload",
+                    )),
+                });
+            }
+        }
         self.inner.put_opts(location, payload, opts).await
     }
 

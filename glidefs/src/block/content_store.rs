@@ -530,6 +530,31 @@ impl ContentStore {
         Ok(names)
     }
 
+    /// Check if a chunk pack exists in S3 (HEAD request, no data transfer).
+    ///
+    /// Used by cross-export dedup: if a content-addressed pack already exists
+    /// (uploaded by another export sharing the same prefix), skip the upload.
+    #[instrument(skip(self), fields(chunk_idx, pack_id))]
+    pub async fn head_chunk_pack(
+        &self,
+        chunk_idx: u32,
+        pack_id: super::pack::PackId,
+    ) -> Result<bool, ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!(
+            "{}/chunks/{:04}/{:016x}.pack",
+            self.base_path, chunk_idx, pack_id
+        );
+        let path = ObjectPath::from(key);
+        let result = self.object_store.head(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Upload a chunk pack to S3 (non-streaming, used by tests and GC).
     ///
     /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`
@@ -559,11 +584,19 @@ impl ContentStore {
         Ok(())
     }
 
-    /// Stream a chunk pack to S3 via multipart upload.
+    /// Multipart upload cutoff: packs smaller than this use a single PUT
+    /// (1 S3 request) instead of multipart (3 requests). S3's minimum part
+    /// size for multipart is 5 MB, so anything below that gains nothing
+    /// from multipart and just wastes requests.
+    const MULTIPART_CUTOFF: usize = 5 * 1024 * 1024;
+
+    /// Upload a chunk pack to S3.
     ///
-    /// Blocks are written to the `WriteMultipart` as they're produced — each
-    /// compressed block `Vec<u8>` is freed immediately after `writer.put()`.
-    /// Only ~5MB (one multipart part) is buffered at a time.
+    /// Small packs (< 5 MB) use a single PUT with `PutMode::Create` for
+    /// content-addressed dedup: if the pack already exists (same content →
+    /// same pack_id → same S3 key), the PUT is skipped (returns Ok).
+    ///
+    /// Large packs use multipart upload for streaming.
     ///
     /// Returns the index entries for inserting into `PackIndexCache`.
     #[instrument(skip(self, blocks), fields(chunk_idx, pack_id, block_count = blocks.len()))]
@@ -574,8 +607,6 @@ impl ContentStore {
         blocks: Vec<(super::block_map::Blake3Hash, u32, bytes::Bytes)>,
         chunk_size: u32,
     ) -> Result<Vec<super::pack::PackIndexEntry>, ContentStoreError> {
-        use super::pack::stream_pack_to_writer;
-
         self.check_circuit()?;
         let _permit = match &self.upload_semaphore {
             Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
@@ -586,26 +617,74 @@ impl ContentStore {
             self.base_path, chunk_idx, pack_id
         );
         let path = ObjectPath::from(key);
-        let upload = self
-            .object_store
-            .put_multipart_opts(&path, PutMultipartOptions::default())
-            .await;
-        self.record_s3_result(&upload);
-        let upload = upload?;
 
-        let mut writer = WriteMultipart::new(upload);
-        let entries = stream_pack_to_writer(blocks, chunk_size, &mut writer).map_err(|e| {
-            ContentStoreError::ObjectStore(object_store::Error::Generic {
-                store: "pack-stream",
-                source: Box::new(e),
-            })
-        })?;
+        // Estimate pack size: header + compressed data + index + trailer.
+        let data_bytes: usize = blocks.iter().map(|(_, _, c)| c.len()).sum();
+        let estimated_size = super::pack::PACK_HEADER_SIZE
+            + data_bytes
+            + blocks.len() * super::pack::PACK_INDEX_ENTRY_SIZE
+            + super::pack::TRAILER_SIZE;
 
-        let finish_result = writer.finish().await;
-        self.record_s3_result(&finish_result);
-        finish_result?;
-        debug!("streamed chunk pack");
-        Ok(entries)
+        if estimated_size < Self::MULTIPART_CUTOFF {
+            // Small pack: assemble in memory, single PUT with PutMode::Create.
+            let owned_blocks: Vec<(super::block_map::Blake3Hash, u32, Vec<u8>)> = blocks
+                .into_iter()
+                .map(|(h, co, b)| (h, co, b.to_vec()))
+                .collect();
+            let (pack_bytes, entries) =
+                super::pack::assemble_pack(owned_blocks, chunk_size).map_err(|e| {
+                    ContentStoreError::ObjectStore(object_store::Error::Generic {
+                        store: "pack-assemble",
+                        source: Box::new(e),
+                    })
+                })?;
+            let payload = PutPayload::from(pack_bytes);
+            let opts = PutOptions::from(PutMode::Create);
+            let result = self.object_store.put_opts(&path, payload, opts).await;
+            match &result {
+                Ok(_) => {
+                    self.record_s3_result(&result);
+                    debug!("uploaded chunk pack (single PUT)");
+                }
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    // Content-addressed dedup: identical pack already in S3.
+                    debug!("chunk pack already exists (dedup hit)");
+                    if let Some(cb) = &self.circuit_breaker {
+                        cb.record_success();
+                    }
+                }
+                Err(_) => {
+                    self.record_s3_result(&result);
+                    result?;
+                }
+            }
+            Ok(entries)
+        } else {
+            // Large pack: stream via multipart upload.
+            use super::pack::stream_pack_to_writer;
+
+            let upload = self
+                .object_store
+                .put_multipart_opts(&path, PutMultipartOptions::default())
+                .await;
+            self.record_s3_result(&upload);
+            let upload = upload?;
+
+            let mut writer = WriteMultipart::new(upload);
+            let entries =
+                stream_pack_to_writer(blocks, chunk_size, &mut writer).map_err(|e| {
+                    ContentStoreError::ObjectStore(object_store::Error::Generic {
+                        store: "pack-stream",
+                        source: Box::new(e),
+                    })
+                })?;
+
+            let finish_result = writer.finish().await;
+            self.record_s3_result(&finish_result);
+            finish_result?;
+            debug!("streamed chunk pack (multipart)");
+            Ok(entries)
+        }
     }
 
     /// Fetch a single compressed block from a chunk pack via S3 range request.

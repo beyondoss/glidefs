@@ -76,10 +76,12 @@ async fn flush_and_sync(
 
             let mut manifest_synced = false;
             let mut manifest_conflict = false;
-            if stats.packs_uploaded > 0 {
+            if stats.packs_uploaded > 0 || stats.packs_skipped > 0 {
                 info!(
                     packs = stats.packs_uploaded,
+                    packs_skipped = stats.packs_skipped,
                     blocks = stats.blocks_claimed,
+                    blocks_cross_deduped = stats.blocks_cross_deduped,
                     bytes = stats.bytes_uploaded,
                     "flushed packs"
                 );
@@ -537,14 +539,25 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> ObjectStoreResult<PutResult> {
-            if self.fail_puts.load(Ordering::SeqCst)
-                || self.fail_single_puts.load(Ordering::SeqCst)
-            {
+            if self.fail_puts.load(Ordering::SeqCst) {
                 return Err(object_store::Error::Generic {
                     store: "FailingObjectStore",
                     source: Box::new(std::io::Error::new(
                         std::io::ErrorKind::ConnectionRefused,
                         "Simulated S3 failure",
+                    )),
+                });
+            }
+            // fail_single_puts: only fail manifest paths, not pack uploads.
+            // Pack uploads now use single PUT for small packs (content-addressed).
+            if self.fail_single_puts.load(Ordering::SeqCst)
+                && location.as_ref().contains("manifests/")
+            {
+                return Err(object_store::Error::Generic {
+                    store: "FailingObjectStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Simulated manifest PUT failure",
                     )),
                 });
             }

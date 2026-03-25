@@ -747,12 +747,15 @@ async fn test_compaction_old_packs_gc_respects_snapshots() {
     // Delete the snapshot
     cs.delete_snapshot("vm1", snap.sequence).await.unwrap();
 
-    // GC again: now A and B are truly dead (no manifest references them)
+    // GC again: now old packs are dead (no manifest references them).
+    // With content-addressed pack IDs, compacting [A, B] where B has the
+    // latest data for all blocks produces pack C with the same pack_id as B.
+    // So only pack A becomes dead after snapshot deletion (B == C is still live).
     let report2 = reconcile_prefix_for_test(&cs, &mut gc_state, Duration::ZERO, 1000, false)
         .await
         .unwrap();
     assert!(
-        report2.dead_found() >= 2,
+        report2.dead_found() >= 1,
         "old packs should be dead after snapshot deletion, got {} dead",
         report2.dead_found()
     );
@@ -1279,22 +1282,25 @@ async fn test_compaction_cas_failure_orphan_cleaned_by_gc() {
         "compaction with stale pack list should fail (CAS mismatch)"
     );
 
-    // Orphaned base pack from failed compaction #2 is now on S3.
-    // GC should find it along with A and B (no longer in live manifest).
+    // Orphaned base pack from failed compaction #2 would be on S3, but with
+    // content-addressed pack IDs, compacting [A, B] where B has latest data
+    // produces C with the same pack_id as B. The second compaction produces D
+    // with the same content as C (== B), so the upload is a dedup hit (no new
+    // S3 object). Only pack A is truly dead (B == C is still live in manifest).
     let mut gc_state = new_gc_state_for_test();
     let report = reconcile_prefix_for_test(&cs, &mut gc_state, Duration::ZERO, 1000, false)
         .await
         .unwrap();
 
-    // Dead packs: A, B (pre-compaction), D (orphan from failed compaction #2)
+    // Dead packs: at least A (pre-compaction, replaced by C which has same id as B)
     assert!(
-        report.dead_found() >= 3,
-        "should find at least 3 dead packs (A, B, and orphan D), got {}",
+        report.dead_found() >= 1,
+        "should find at least 1 dead pack (A), got {}",
         report.dead_found()
     );
     assert!(
-        report.packs_deleted() >= 3,
-        "should delete at least 3 dead packs with grace_period=0, got {}",
+        report.packs_deleted() >= 1,
+        "should delete at least 1 dead pack with grace_period=0, got {}",
         report.packs_deleted()
     );
 

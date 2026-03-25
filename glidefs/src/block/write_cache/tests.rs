@@ -2821,3 +2821,222 @@ async fn test_stranded_syncing_blocks_become_not_present() {
     assert!(cache.inner.flushing_file.lock().is_none());
     assert!(!config.flushing_path().exists());
 }
+
+// ====================================================================
+// Cross-flush dedup tests
+// ====================================================================
+
+/// Same content at same offset → cross-deduped, no pack created.
+#[tokio::test]
+async fn test_cross_flush_dedup_same_offset_same_content() {
+    let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+
+    // Write block 0, flush.
+    h.cache.write(0, &vec![0xAA; 128 * 1024]).unwrap();
+    let stats1 = h.flush().await;
+    assert!(stats1.packs_uploaded > 0, "first flush must upload");
+
+    // Write identical content to block 0 again, flush.
+    h.cache.write(0, &vec![0xAA; 128 * 1024]).unwrap();
+    let stats2 = h.flush().await;
+    assert_eq!(stats2.blocks_cross_deduped, 1, "same content at same offset");
+    assert_eq!(stats2.packs_uploaded, 0, "no pack needed");
+
+    // Read returns correct data.
+    let data = h.read(0, 128 * 1024).await;
+    assert!(data.iter().all(|&b| b == 0xAA), "read must return written data");
+}
+
+/// Same offset, different content → NOT deduped, new pack created.
+#[tokio::test]
+async fn test_cross_flush_dedup_same_offset_different_content() {
+    let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+
+    h.cache.write(0, &vec![0xAA; 128 * 1024]).unwrap();
+    let stats1 = h.flush().await;
+    assert!(stats1.packs_uploaded > 0);
+
+    // Write DIFFERENT content to block 0.
+    h.cache.write(0, &vec![0xBB; 128 * 1024]).unwrap();
+    let stats2 = h.flush().await;
+    assert_eq!(stats2.blocks_cross_deduped, 0, "different content must not dedup");
+    assert!(stats2.packs_uploaded > 0, "new content needs a pack");
+
+    let data = h.read(0, 128 * 1024).await;
+    assert!(data.iter().all(|&b| b == 0xBB), "read must return newest data");
+}
+
+/// Zero block at offset with no prior entry → cross-deduped (reads return
+/// zeros by default for unwritten offsets).
+#[tokio::test]
+async fn test_cross_flush_dedup_zero_no_prior_entry() {
+    let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+
+    // Write zeros to block 0 (no prior pack exists for this chunk).
+    h.cache.write(0, &vec![0u8; 128 * 1024]).unwrap();
+    let stats = h.flush().await;
+    assert_eq!(stats.blocks_cross_deduped, 1, "zero block with no prior entry");
+    assert_eq!(stats.packs_uploaded, 0, "no pack needed for redundant zeros");
+
+    // Read returns zeros.
+    let data = h.read(0, 128 * 1024).await;
+    assert!(data.iter().all(|&b| b == 0), "read must return zeros");
+}
+
+/// Zero block at offset WITH prior non-zero entry → NOT deduped,
+/// tombstone must be uploaded to override base data.
+#[tokio::test]
+async fn test_cross_flush_dedup_zero_overrides_nonzero() {
+    let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+
+    // Write non-zero to block 0, flush.
+    h.cache.write(0, &vec![0xCC; 128 * 1024]).unwrap();
+    let stats1 = h.flush().await;
+    assert!(stats1.packs_uploaded > 0);
+
+    // Write zeros to block 0 — must create tombstone.
+    h.cache.write(0, &vec![0u8; 128 * 1024]).unwrap();
+    let stats2 = h.flush().await;
+    assert_eq!(stats2.blocks_cross_deduped, 0, "zero over non-zero must not dedup");
+    assert!(stats2.packs_uploaded > 0, "tombstone pack needed");
+
+    // Read returns zeros (tombstone overrides prior data).
+    let data = h.read(0, 128 * 1024).await;
+    assert!(data.iter().all(|&b| b == 0), "read must return zeros after tombstone");
+}
+
+/// Mixed: some blocks deduped, some not → only new blocks in pack.
+#[tokio::test]
+async fn test_cross_flush_dedup_partial() {
+    let h = V2Harness::with_config(128 * 1024 * 8, 128 * 1024).await;
+
+    // Write blocks 0-2 with unique data, flush.
+    for i in 0u8..3 {
+        h.cache.write(i as u64 * 128 * 1024, &vec![i + 1; 128 * 1024]).unwrap();
+    }
+    let stats1 = h.flush().await;
+    assert_eq!(stats1.blocks_claimed, 3);
+    assert!(stats1.packs_uploaded > 0);
+
+    // Rewrite: block 0 same content, block 1 different, block 2 same.
+    h.cache.write(0, &vec![1u8; 128 * 1024]).unwrap();       // same → dedup
+    h.cache.write(128 * 1024, &vec![99u8; 128 * 1024]).unwrap(); // different → upload
+    h.cache.write(2 * 128 * 1024, &vec![3u8; 128 * 1024]).unwrap(); // same → dedup
+    let stats2 = h.flush().await;
+    assert_eq!(stats2.blocks_cross_deduped, 2, "blocks 0 and 2 deduped");
+    assert!(stats2.packs_uploaded > 0, "block 1 needs a pack");
+
+    // Verify all reads return correct data.
+    let d0 = h.read(0, 128 * 1024).await;
+    assert!(d0.iter().all(|&b| b == 1), "block 0: original data");
+    let d1 = h.read(128 * 1024, 128 * 1024).await;
+    assert!(d1.iter().all(|&b| b == 99), "block 1: new data");
+    let d2 = h.read(2 * 128 * 1024, 128 * 1024).await;
+    assert!(d2.iter().all(|&b| b == 3), "block 2: original data");
+}
+
+/// Content-addressed pack_id: re-flushing identical content produces
+/// same pack_id → per-export manifest dedup skips upload.
+#[tokio::test]
+async fn test_content_addressed_pack_id_dedup() {
+    let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+
+    h.cache.write(0, &vec![0xDD; 128 * 1024]).unwrap();
+    let stats1 = h.flush().await;
+    assert!(stats1.packs_uploaded > 0);
+
+    // Same content, same offset → cross-dedup at block level.
+    h.cache.write(0, &vec![0xDD; 128 * 1024]).unwrap();
+    let stats2 = h.flush().await;
+    assert_eq!(stats2.blocks_cross_deduped, 1);
+    assert_eq!(stats2.packs_uploaded, 0);
+    assert_eq!(stats2.packs_skipped, 0, "no pack built → nothing to skip at pack level");
+}
+
+/// Three sequential flushes: verify dedup state propagates across
+/// flush cycles as the manifest grows.
+#[tokio::test]
+async fn test_cross_flush_dedup_three_sequential_flushes() {
+    let h = V2Harness::with_config(128 * 1024 * 8, 128 * 1024).await;
+
+    // Flush 1: write blocks 0 and 1.
+    h.cache.write(0, &vec![0xAA; 128 * 1024]).unwrap();
+    h.cache.write(128 * 1024, &vec![0xBB; 128 * 1024]).unwrap();
+    let s1 = h.flush().await;
+    assert!(s1.packs_uploaded > 0);
+    assert_eq!(s1.blocks_cross_deduped, 0);
+
+    // Flush 2: write block 2 (new) + rewrite block 0 (same content).
+    h.cache.write(2 * 128 * 1024, &vec![0xCC; 128 * 1024]).unwrap();
+    h.cache.write(0, &vec![0xAA; 128 * 1024]).unwrap(); // same as flush 1
+    let s2 = h.flush().await;
+    assert_eq!(s2.blocks_cross_deduped, 1, "block 0 deduped against flush 1");
+    assert!(s2.packs_uploaded > 0, "block 2 is new");
+
+    // Flush 3: rewrite blocks 1 and 2 with same content.
+    h.cache.write(128 * 1024, &vec![0xBB; 128 * 1024]).unwrap(); // same as flush 1
+    h.cache.write(2 * 128 * 1024, &vec![0xCC; 128 * 1024]).unwrap(); // same as flush 2
+    let s3 = h.flush().await;
+    assert_eq!(s3.blocks_cross_deduped, 2, "both deduped against prior flushes");
+    assert_eq!(s3.packs_uploaded, 0, "no new content");
+
+    // All reads correct.
+    let d0 = h.read(0, 128 * 1024).await;
+    assert!(d0.iter().all(|&b| b == 0xAA));
+    let d1 = h.read(128 * 1024, 128 * 1024).await;
+    assert!(d1.iter().all(|&b| b == 0xBB));
+    let d2 = h.read(2 * 128 * 1024, 128 * 1024).await;
+    assert!(d2.iter().all(|&b| b == 0xCC));
+}
+
+/// Zero tombstone lifecycle: non-zero → flush → zero → flush (tombstone)
+/// → zero again → flush (dedup against tombstone) → read.
+#[tokio::test]
+async fn test_cross_flush_dedup_tombstone_lifecycle() {
+    let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+
+    // Flush 1: non-zero data.
+    h.cache.write(0, &vec![0xEE; 128 * 1024]).unwrap();
+    let s1 = h.flush().await;
+    assert!(s1.packs_uploaded > 0);
+
+    // Flush 2: zero → tombstone (different hash from prior entry).
+    h.cache.write(0, &vec![0u8; 128 * 1024]).unwrap();
+    let s2 = h.flush().await;
+    assert_eq!(s2.blocks_cross_deduped, 0, "zero over non-zero needs tombstone");
+    assert!(s2.packs_uploaded > 0, "tombstone pack uploaded");
+    let d = h.read(0, 128 * 1024).await;
+    assert!(d.iter().all(|&b| b == 0), "reads zeros after tombstone");
+
+    // Flush 3: zero again → should dedup against the tombstone.
+    h.cache.write(0, &vec![0u8; 128 * 1024]).unwrap();
+    let s3 = h.flush().await;
+    assert_eq!(s3.blocks_cross_deduped, 1, "zero deduped against existing tombstone");
+    assert_eq!(s3.packs_uploaded, 0, "no pack needed");
+    let d = h.read(0, 128 * 1024).await;
+    assert!(d.iter().all(|&b| b == 0), "still reads zeros");
+}
+
+/// Verify reads go through S3 (not SSD cache) after flush + evict
+/// for cross-deduped blocks. Write A, flush, rewrite A (deduped),
+/// flush, then read — the block must be resolvable from S3 packs.
+#[tokio::test]
+async fn test_cross_flush_dedup_cold_read_from_s3() {
+    let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+
+    // Write and flush — creates pack in S3.
+    h.cache.write(0, &vec![0x42; 128 * 1024]).unwrap();
+    let s1 = h.flush().await;
+    assert!(s1.packs_uploaded > 0);
+
+    // Rewrite same content — deduped, no new pack.
+    h.cache.write(0, &vec![0x42; 128 * 1024]).unwrap();
+    let s2 = h.flush().await;
+    assert_eq!(s2.blocks_cross_deduped, 1);
+    assert_eq!(s2.packs_uploaded, 0);
+
+    // Block is now NOT_PRESENT (evicted after flush).
+    // Read must resolve through pack index → S3.
+    let data = h.read(0, 128 * 1024).await;
+    assert!(data.iter().all(|&b| b == 0x42), "cold read from S3 after dedup must return correct data");
+}

@@ -270,7 +270,9 @@ pub async fn compact_chunk(
     }
 
     // 4. Stream new GLPK v3 base pack to S3
-    let base_pack_id = new_pack_id();
+    // Sort by chunk_offset for deterministic content-addressed pack ID.
+    blocks_for_pack.sort_by_key(|&(_, co, _)| co);
+    let base_pack_id = crate::block::pack::content_pack_id(&blocks_for_pack);
     let index_entries = content_store
         .stream_chunk_pack(chunk_idx, base_pack_id, blocks_for_pack, blocks_per_chunk)
         .await?;

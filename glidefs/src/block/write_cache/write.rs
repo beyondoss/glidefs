@@ -34,6 +34,16 @@ impl WriteCache<Active> {
             }
         }
 
+        // Transition to Dirty before WAL append. Checkpoint persists the
+        // state map then truncates the WAL — if it ran between append and
+        // dirty, it would persist Clean and discard the WAL entry, losing
+        // the write on crash. Reordering ensures checkpoint always sees
+        // Dirty. The WAL append after is the crash-recovery backstop for
+        // "dirty in memory but not yet persisted to metadata".
+        for idx in &to_dirty {
+            self.inner.transition_to_dirty(*idx);
+        }
+
         if !batch.is_empty() {
             self.inner.wal.append_batch(&batch)?;
             if self.inner.config.wal_sync {
@@ -42,10 +52,6 @@ impl WriteCache<Active> {
             } else {
                 self.inner.wal.flush()?;
             }
-        }
-
-        for idx in to_dirty {
-            self.inner.transition_to_dirty(idx);
         }
 
         Ok(())

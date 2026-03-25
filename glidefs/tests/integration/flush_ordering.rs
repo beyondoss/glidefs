@@ -401,6 +401,22 @@ async fn test_manifest_consistency_after_partial_drain() {
                     )),
                 });
             }
+            // Small packs (< 5 MB) go through put_opts instead of
+            // put_multipart_opts. Apply the same crash counter for
+            // chunk pack uploads so failure injection works for both paths.
+            if location.as_ref().contains("chunks/") {
+                let count = self.put_count.fetch_add(1, Ordering::SeqCst);
+                if count >= self.puts_before_crash.load(Ordering::SeqCst) {
+                    self.crashed.store(true, Ordering::SeqCst);
+                    return Err(object_store::Error::Generic {
+                        store: "CrashingObjectStore",
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            "host is dead",
+                        )),
+                    });
+                }
+            }
             self.inner.put_opts(location, payload, opts).await
         }
 

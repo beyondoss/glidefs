@@ -202,6 +202,18 @@ impl ObjectStore for FinishFailingObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
+        // Small packs (< 5 MB) go through put_opts instead of
+        // put_multipart_opts. Fail chunk pack uploads when fail_finish
+        // is set so failure injection works for both paths.
+        if self.fail_finish.load(Ordering::SeqCst) && location.as_ref().contains("chunks/") {
+            return Err(object_store::Error::Generic {
+                store: "FinishFailingObjectStore",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "Simulated single PUT pack upload failure",
+                )),
+            });
+        }
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -748,7 +760,9 @@ async fn test_concurrent_compaction_and_flush() {
     // Write and flush enough times to accumulate >16 packs in chunk 0.
     // Each flush creates one pack per dirty chunk.
     // We write to block 0 each time with different data to create 17 packs.
-    for i in 0..17u8 {
+    // Start from 1 to avoid all-zeros (zero blocks with no prior entry are
+    // skipped by cross-flush dedup since reads return zeros by default).
+    for i in 1..=17u8 {
         let data = vec![i; BLOCK_SIZE];
         cache.write(0, &data).unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
@@ -1015,8 +1029,10 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     let (cache, cs, pic, vm, cc, _m) =
         create_cache_with_store(&dir, "orphan-gc", Arc::clone(&s3)).await;
 
-    // Write and flush multiple times to create packs in chunk 0
-    for i in 0..4u8 {
+    // Write and flush multiple times to create packs in chunk 0.
+    // Start from 1 to avoid all-zeros (zero blocks with no prior entry are
+    // skipped by cross-flush dedup since reads return zeros by default).
+    for i in 1..=4u8 {
         let data = vec![i; BLOCK_SIZE];
         cache.write(0, &data).unwrap();
         cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
@@ -1071,7 +1087,7 @@ async fn test_compaction_abort_leaves_orphan_gc_identifies() {
     let (reader, reader_cs, reader_pic, reader_vm, reader_cc, reader_m) =
         create_reader(&reader_dir, "orphan-gc", Arc::clone(&s3)).await;
 
-    let expected = vec![3u8; BLOCK_SIZE]; // last flush wrote seed=3
+    let expected = vec![4u8; BLOCK_SIZE]; // last flush wrote seed=4
     let result = reader
         .read(
             0,
@@ -1814,10 +1830,13 @@ async fn test_compaction_dedup_correctness() {
 
     let _packs_before_compact = vm.read().chunk_pack_ids(0).unwrap().len();
 
-    // Write the same data again (to force a second pack) and flush
+    // Write DIFFERENT data (to force a second pack with a different pack_id)
+    // and flush. Using the same data would produce the same content-addressed
+    // pack_id, causing per-export manifest dedup to skip the upload.
+    let dedup_data2 = vec![0xEE; BLOCK_SIZE];
     for i in 0..100u64 {
         cache
-            .write(i * BLOCK_SIZE as u64, &dedup_data)
+            .write(i * BLOCK_SIZE as u64, &dedup_data2)
             .unwrap();
     }
     cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
@@ -1869,8 +1888,8 @@ async fn test_compaction_dedup_correctness() {
             .unwrap();
         assert_eq!(
             data.as_ref(),
-            &dedup_data[..],
-            "block {} should have dedup data (0xDD) after compaction",
+            &dedup_data2[..],
+            "block {} should have latest data (0xEE) after compaction",
             i
         );
     }
