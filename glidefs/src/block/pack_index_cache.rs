@@ -169,6 +169,27 @@ impl PackIndexCache {
         }
         hashes
     }
+
+    /// Build a merged (chunk_offset → hash) map across multiple packs.
+    ///
+    /// Packs are iterated in order (oldest → newest, matching
+    /// `VolumeManifest::chunk_pack_ids` ordering). Later entries overwrite
+    /// earlier ones (newest wins). Used for cross-flush dedup: if a block's
+    /// (chunk_offset, hash) matches the map, it's already in S3.
+    pub async fn existing_block_hashes(
+        &self,
+        pack_ids: &[PackId],
+    ) -> std::collections::HashMap<u32, Blake3Hash> {
+        let mut map = std::collections::HashMap::new();
+        for &pack_id in pack_ids {
+            if let Some(entries) = self.get_entries(pack_id).await {
+                for entry in entries.iter() {
+                    map.insert(entry.chunk_offset, entry.hash);
+                }
+            }
+        }
+        map
+    }
 }
 
 // ============================================================================

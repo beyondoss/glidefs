@@ -530,6 +530,31 @@ impl ContentStore {
         Ok(names)
     }
 
+    /// Check if a chunk pack exists in S3 (HEAD request, no data transfer).
+    ///
+    /// Used by cross-export dedup: if a content-addressed pack already exists
+    /// (uploaded by another export sharing the same prefix), skip the upload.
+    #[instrument(skip(self), fields(chunk_idx, pack_id))]
+    pub async fn head_chunk_pack(
+        &self,
+        chunk_idx: u32,
+        pack_id: super::pack::PackId,
+    ) -> Result<bool, ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!(
+            "{}/chunks/{:04}/{:016x}.pack",
+            self.base_path, chunk_idx, pack_id
+        );
+        let path = ObjectPath::from(key);
+        let result = self.object_store.head(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Upload a chunk pack to S3 (non-streaming, used by tests and GC).
     ///
     /// S3 key: `{base_path}/chunks/{chunk_idx:04}/{pack_id:016x}.pack`

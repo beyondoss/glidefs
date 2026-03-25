@@ -51,15 +51,37 @@ pub const TRAILER_MAGIC: &[u8; 4] = b"GLIX";
 /// Trailer size: block_count (2) + reserved (2) + magic (4).
 pub const TRAILER_SIZE: usize = 8;
 
-/// 8-byte random pack identifier.
+/// 8-byte pack identifier, derived from content hash.
 ///
+/// Content-addressed: identical blocks at identical offsets produce the
+/// same PackId, enabling cross-export dedup on shared S3 prefixes.
 /// Collision-safe per chunk (birthday bound ~4.3 billion).
 /// Hex representation distributes uniformly for S3 prefix sharding.
 pub type PackId = u64;
 
-/// Generate a random pack ID.
+/// Generate a random pack ID (used only by tests that don't care about content addressing).
 pub fn new_pack_id() -> PackId {
     rand::random::<u64>()
+}
+
+/// Compute a content-addressed pack ID from sorted blocks.
+///
+/// BLAKE3 hash over `(chunk_offset, block_hash, comp_length, compressed_data)`
+/// for each block, truncated to u64. Deterministic: same blocks in the same
+/// order always produce the same ID.
+///
+/// Blocks must be sorted by chunk_offset before calling (the flush and
+/// compaction paths already ensure this).
+pub fn content_pack_id(blocks: &[(super::block_map::Blake3Hash, u32, bytes::Bytes)]) -> PackId {
+    let mut hasher = blake3::Hasher::new();
+    for (hash, chunk_offset, compressed) in blocks {
+        hasher.update(&chunk_offset.to_le_bytes());
+        hasher.update(hash.as_bytes());
+        hasher.update(&(compressed.len() as u32).to_le_bytes());
+        hasher.update(compressed);
+    }
+    let hash = hasher.finalize();
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
 }
 
 // ============================================================================
@@ -595,5 +617,48 @@ mod tests {
         let garbage = vec![0xFF, 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00];
         let result = lz4_decompress(&garbage);
         assert!(result.is_err(), "invalid LZ4 data should return Err");
+    }
+
+    #[test]
+    fn test_content_pack_id_deterministic() {
+        let block_data = test_block_data(0, 128 * 1024);
+        let hash = blake3_128(&block_data);
+        let compressed = bytes::Bytes::from(lz4_compress(&block_data));
+
+        let blocks = vec![(hash, 0u32, compressed.clone())];
+
+        let id1 = content_pack_id(&blocks);
+        let id2 = content_pack_id(&blocks);
+        assert_eq!(id1, id2, "same blocks must produce same ID");
+    }
+
+    #[test]
+    fn test_content_pack_id_differs_on_content() {
+        let data_a = test_block_data(0, 128 * 1024);
+        let data_b = test_block_data(1, 128 * 1024);
+        let blocks_a = vec![(blake3_128(&data_a), 0u32, bytes::Bytes::from(lz4_compress(&data_a)))];
+        let blocks_b = vec![(blake3_128(&data_b), 0u32, bytes::Bytes::from(lz4_compress(&data_b)))];
+
+        assert_ne!(
+            content_pack_id(&blocks_a),
+            content_pack_id(&blocks_b),
+            "different content must produce different IDs"
+        );
+    }
+
+    #[test]
+    fn test_content_pack_id_differs_on_offset() {
+        let data = test_block_data(0, 128 * 1024);
+        let hash = blake3_128(&data);
+        let compressed = bytes::Bytes::from(lz4_compress(&data));
+
+        let blocks_at_0 = vec![(hash, 0u32, compressed.clone())];
+        let blocks_at_1 = vec![(hash, 1u32, compressed)];
+
+        assert_ne!(
+            content_pack_id(&blocks_at_0),
+            content_pack_id(&blocks_at_1),
+            "same content at different offsets must produce different IDs"
+        );
     }
 }

@@ -75,8 +75,13 @@ pub struct FlushStats {
     /// Unique blocks with CRC data after dedup (queue entries collapsed to
     /// one entry per page). Ratio of drained/unique = duplication factor.
     pub crc_unique_blocks: usize,
+    /// Blocks skipped by cross-flush dedup: an existing pack for the same
+    /// chunk already has an entry at the same chunk_offset with the same hash.
+    pub blocks_cross_deduped: usize,
     /// Number of pack objects uploaded.
     pub packs_uploaded: usize,
+    /// Number of pack uploads skipped (content-addressed pack already exists).
+    pub packs_skipped: usize,
     /// Total bytes uploaded to S3.
     pub bytes_uploaded: u64,
 }

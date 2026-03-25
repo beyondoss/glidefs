@@ -876,7 +876,7 @@ impl WriteCache<Active> {
         use futures::FutureExt;
 
         type UploadResult = Result<
-            (u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>, Vec<usize>),
+            (u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>),
             CacheError,
         >;
         let mut in_flight: FuturesUnordered<std::pin::Pin<Box<dyn std::future::Future<Output = UploadResult> + Send + '_>>> =
@@ -956,6 +956,17 @@ impl WriteCache<Active> {
             let hash_to_compressed: HashMap<Blake3Hash, Bytes> =
                 std::mem::take(&mut batch.to_upload).into_iter().collect();
 
+            // Cross-flush dedup: build merged view of existing blocks for this
+            // chunk. Pack indices are already warmed (above), so get_entries
+            // hits the in-memory cache (~100ns per pack).
+            let existing_hashes = {
+                let pack_ids = volume_manifest.read()
+                    .chunk_pack_ids(chunk_idx)
+                    .map(|ids| ids.to_vec())
+                    .unwrap_or_default();
+                pack_index_cache.existing_block_hashes(&pack_ids).await
+            };
+
             // Build one pack entry per dirty block, each at its actual
             // chunk_offset. Two blocks with the same hash but different chunk_offsets
             // both get entries (clone of compressed bytes), ensuring both are
@@ -966,12 +977,27 @@ impl WriteCache<Active> {
             // semantic is preserved across forks/migrations: without a tombstone,
             // a block overwritten with zeros would resolve to its previous non-zero
             // pack entry on a fork (where the local SSD is empty).
+            //
+            // Cross-flush dedup: skip blocks whose (chunk_offset, hash) already
+            // exists in a prior pack. The read path will find the existing entry.
             let zero_hash = self.inner.zero_block_hash;
             let mut blocks_for_pack: Vec<(Blake3Hash, u32, Bytes)> = Vec::new();
             let mut packed_indices: Vec<usize> = Vec::new();
             {
                 let vm = volume_manifest.read();
                 for &(block_index, hash) in &batch.computed {
+                    let chunk_offset = vm.block_offset_in_chunk(block_index as u64);
+
+                    // Cross-flush dedup: skip if existing pack has same
+                    // content at this offset.
+                    if let Some(&existing_hash) = existing_hashes.get(&chunk_offset) {
+                        if existing_hash == hash {
+                            total_stats.blocks_cross_deduped += 1;
+                            packed_indices.push(block_index);
+                            continue;
+                        }
+                    }
+
                     let compressed = if hash == zero_hash {
                         Bytes::new() // zero block tombstone: comp_length = 0
                     } else {
@@ -992,32 +1018,80 @@ impl WriteCache<Active> {
                             }
                         }
                     };
-                    let chunk_offset = vm.block_offset_in_chunk(block_index as u64);
                     blocks_for_pack.push((hash, chunk_offset, compressed));
                     packed_indices.push(block_index);
                 }
             }
 
+            // All computed blocks (including cross-deduped) need SYNCING→NP.
+            flushed_blocks.extend(&packed_indices);
+
             if blocks_for_pack.is_empty() {
-                // All blocks in this chunk were skipped (CRC mismatch, concurrent
-                // re-dirty, or invariant violation). Nothing to upload — skipped
-                // blocks were already transitioned back to DIRTY above.
+                // All blocks cross-deduped or skipped. No pack needed.
                 continue;
             }
 
+            // Content-addressed pack ID: deterministic from block content.
+            let pack_id = crate::block::pack::content_pack_id(&blocks_for_pack);
+
+            // Per-export dedup: if this exact pack is already in the manifest
+            // (same content → same pack_id), skip upload entirely.
+            {
+                let vm = volume_manifest.read();
+                if let Some(pack_ids) = vm.chunk_pack_ids(chunk_idx) {
+                    if pack_ids.contains(&pack_id) {
+                        total_stats.packs_skipped += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Cross-export dedup: check if another export already uploaded
+            // this pack to S3 (same content → same S3 key).
+            match content_store.head_chunk_pack(chunk_idx, pack_id).await {
+                Ok(true) => {
+                    // Pack exists in S3 but not in our manifest. Add reference
+                    // without re-uploading. Load index into cache.
+                    match content_store.get_pack_index(chunk_idx, pack_id).await {
+                        Ok(entries) => {
+                            pack_index_cache.insert_entries(pack_id, &entries);
+                            staged_appends.push((chunk_idx, pack_id));
+                            total_stats.packs_skipped += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            // Can't read the index — fall through to upload.
+                            warn!(
+                                chunk_idx, pack_id,
+                                error = %e,
+                                "HEAD found pack but index read failed, re-uploading"
+                            );
+                        }
+                    }
+                }
+                Ok(false) => {} // Not in S3, upload below
+                Err(e) => {
+                    // HEAD failed — upload anyway (safe, idempotent).
+                    warn!(
+                        chunk_idx, pack_id,
+                        error = %e,
+                        "HEAD check failed, uploading pack"
+                    );
+                }
+            }
+
             // Push upload future — runs concurrently with next chunk's compute.
-            let pack_id = new_pack_id();
             let cs = &content_store;
             in_flight.push(Box::pin(async move {
                 let entries = cs
                     .stream_chunk_pack(chunk_idx, pack_id, blocks_for_pack, blocks_per_chunk)
                     .await?;
-                Ok((chunk_idx, pack_id, entries, packed_indices))
+                Ok((chunk_idx, pack_id, entries))
             }));
 
             // Drain completed uploads to bound memory (don't block compute).
             while let Some(result) = in_flight.next().now_or_never().flatten() {
-                let (ci, pid, index_entries, pi): (u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>, Vec<usize>) = result?;
+                let (ci, pid, index_entries): (u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>) = result?;
                 total_stats.packs_uploaded += 1;
                 total_stats.bytes_uploaded += index_entries
                     .iter()
@@ -1025,13 +1099,12 @@ impl WriteCache<Active> {
                     .sum::<u64>();
                 pack_index_cache.insert_entries(pid, &index_entries);
                 staged_appends.push((ci, pid));
-                flushed_blocks.extend(pi);
             }
         }
 
         // Wait for remaining in-flight uploads.
         while let Some(result) = in_flight.next().await {
-            let (chunk_idx, pack_id, index_entries, packed_indices) = result?;
+            let (chunk_idx, pack_id, index_entries) = result?;
             total_stats.packs_uploaded += 1;
             total_stats.bytes_uploaded += index_entries
                 .iter()
@@ -1039,7 +1112,6 @@ impl WriteCache<Active> {
                 .sum::<u64>();
             pack_index_cache.insert_entries(pack_id, &index_entries);
             staged_appends.push((chunk_idx, pack_id));
-            flushed_blocks.extend(packed_indices);
         }
 
         // Apply all staged manifest appends atomically.
@@ -1095,9 +1167,11 @@ impl WriteCache<Active> {
         info!(
             blocks_claimed = total_stats.blocks_claimed,
             blocks_deduped = total_stats.blocks_deduped,
+            blocks_cross_deduped = total_stats.blocks_cross_deduped,
             blocks_cas_failed = total_stats.blocks_cas_failed,
             blocks_crc_mismatched = total_stats.blocks_crc_mismatched,
             packs_uploaded = total_stats.packs_uploaded,
+            packs_skipped = total_stats.packs_skipped,
             bytes_uploaded = total_stats.bytes_uploaded,
             "flush complete"
         );
