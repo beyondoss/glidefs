@@ -531,10 +531,14 @@ async fn test_concurrent_writes_no_crash() {
 
 /// Test: Zero blocks produce tombstone entries in packs.
 ///
-/// Writing all-zero blocks produces pack entries with comp_length = 0
-/// (tombstones). This ensures "newest wins" semantics are preserved
-/// across forks/migrations: a block overwritten with zeros must be
-/// distinguishable from "never written" by the read path.
+/// Writing all-zero blocks over existing non-zero data produces pack entries
+/// with comp_length = 0 (tombstones). This ensures "newest wins" semantics
+/// are preserved across forks/migrations: a block overwritten with zeros must
+/// be distinguishable from "never written" by the read path.
+///
+/// Note: writing zeros to a block with NO prior pack entry is skipped by
+/// cross-flush dedup (reads return zeros by default). Tombstones are only
+/// needed when overriding prior non-zero data.
 #[tokio::test]
 async fn test_zero_blocks_produce_tombstones() {
     let s3 = Arc::new(FailingObjectStore::new());
@@ -542,7 +546,19 @@ async fn test_zero_blocks_produce_tombstones() {
     let (cache, content_store, pack_index_cache, volume_manifest, _clean_cache, _metrics) =
         create_test_cache(&temp_dir, "vol1", Arc::clone(&s3)).await;
 
-    // Write zero blocks
+    // First, write non-zero data so that subsequent zero writes need tombstones.
+    let nonzero = vec![0xAA; BLOCK_SIZE];
+    for i in 0..10 {
+        cache
+            .write(i as u64 * BLOCK_SIZE as u64, &nonzero)
+            .unwrap();
+    }
+    cache
+        .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+        .await
+        .unwrap();
+
+    // Now overwrite with zero blocks
     let zeros = vec![0u8; BLOCK_SIZE];
     for i in 0..10 {
         cache

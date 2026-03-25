@@ -1000,6 +1000,11 @@ impl WriteCache<Active> {
                         };
                         if dominated {
                             total_stats.blocks_cross_deduped += 1;
+                            // Add to packed_indices so the block gets evicted
+                            // SYNCING→NP at the same time as uploaded blocks
+                            // (after all uploads complete). Same crash-safety
+                            // as uploaded blocks: flushing file is the safety
+                            // net until checkpoint.
                             packed_indices.push(block_index);
                             continue;
                         }

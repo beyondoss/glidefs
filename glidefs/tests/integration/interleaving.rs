@@ -1718,6 +1718,17 @@ async fn wf9_flush_s3_failure_recovers_blocks() {
     #[async_trait]
     impl ObjectStore for FailMultipart {
         async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+            // Small packs (< 5 MB) go through put_opts instead of
+            // put_multipart_opts. Fail chunk pack uploads when
+            // fail_multipart is set so failure injection works for both paths.
+            if self.fail_multipart.load(std::sync::atomic::Ordering::SeqCst)
+                && location.as_ref().contains("chunks/")
+            {
+                return Err(object_store::Error::Generic {
+                    store: "FailMultipart",
+                    source: "simulated single PUT pack failure".into(),
+                });
+            }
             self.inner.put_opts(location, payload, opts).await
         }
         async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
