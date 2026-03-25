@@ -868,15 +868,19 @@ impl WriteCache<Active> {
         let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
         let crcs = Arc::new(crcs);
 
-        // Phase 1: Compute all batches sequentially (needs flushing file + shared state).
-        // Collect packs ready for upload.
-        struct PackUpload {
-            chunk_idx: u32,
-            pack_id: crate::block::pack::PackId,
-            blocks: Vec<(Blake3Hash, u32, Bytes)>,
-            packed_indices: Vec<usize>,
-        }
-        let mut uploads: Vec<PackUpload> = Vec::new();
+        // Pipelined flush: compute batches sequentially (needs flushing file),
+        // upload packs concurrently via FuturesUnordered. Each chunk's upload
+        // starts as soon as its compute finishes — overlapping S3 I/O with
+        // the next chunk's compute. Memory bounded to in-flight uploads only.
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use futures::FutureExt;
+
+        type UploadResult = Result<
+            (u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>, Vec<usize>),
+            CacheError,
+        >;
+        let mut in_flight: FuturesUnordered<std::pin::Pin<Box<dyn std::future::Future<Output = UploadResult> + Send + '_>>> =
+            FuturesUnordered::new();
 
         for (chunk_idx, chunk_blocks) in per_chunk {
             // Compute batch (pread + CRC32 + BLAKE3 + LZ4)
@@ -1026,51 +1030,41 @@ impl WriteCache<Active> {
                 }
             }
 
-            uploads.push(PackUpload {
-                chunk_idx,
-                pack_id: new_pack_id(),
-                blocks: blocks_for_pack,
-                packed_indices,
-            });
-        }
+            // Push upload future — runs concurrently with next chunk's compute.
+            let pack_id = new_pack_id();
+            let cs = &content_store;
+            in_flight.push(Box::pin(async move {
+                let entries = cs
+                    .stream_chunk_pack(chunk_idx, pack_id, blocks_for_pack, blocks_per_chunk)
+                    .await?;
+                Ok((chunk_idx, pack_id, entries, packed_indices))
+            }));
 
-        // Phase 2: Upload all packs to S3 concurrently.
-        // The upload semaphore in ContentStore bounds actual S3 concurrency.
-        {
-            use futures::stream::{self, StreamExt};
-
-            let results: Vec<Result<(u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>, Vec<usize>), CacheError>> =
-                stream::iter(uploads)
-                    .map(|upload| {
-                        let cs = &content_store;
-                        async move {
-                            let entries = cs
-                                .stream_chunk_pack(upload.chunk_idx, upload.pack_id, upload.blocks, blocks_per_chunk)
-                                .await?;
-                            Ok((upload.chunk_idx, upload.pack_id, entries, upload.packed_indices))
-                        }
-                    })
-                    .buffer_unordered(64)
-                    .collect()
-                    .await;
-
-            for result in results {
-                let (chunk_idx, pack_id, index_entries, packed_indices) = result?;
-
+            // Drain completed uploads to bound memory (don't block compute).
+            while let Some(result) = in_flight.next().now_or_never().flatten() {
+                let (ci, pid, index_entries, pi): (u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>, Vec<usize>) = result?;
                 total_stats.packs_uploaded += 1;
                 total_stats.bytes_uploaded += index_entries
                     .iter()
                     .map(|e| e.comp_length as u64)
                     .sum::<u64>();
-
-                // Update PackIndexCache with new entries
-                pack_index_cache.insert_entries(pack_id, &index_entries);
-
-                // Stage manifest append (applied after all chunk uploads succeed).
-                staged_appends.push((chunk_idx, pack_id));
-
-                flushed_blocks.extend(packed_indices);
+                pack_index_cache.insert_entries(pid, &index_entries);
+                staged_appends.push((ci, pid));
+                flushed_blocks.extend(pi);
             }
+        }
+
+        // Wait for remaining in-flight uploads.
+        while let Some(result) = in_flight.next().await {
+            let (chunk_idx, pack_id, index_entries, packed_indices) = result?;
+            total_stats.packs_uploaded += 1;
+            total_stats.bytes_uploaded += index_entries
+                .iter()
+                .map(|e| e.comp_length as u64)
+                .sum::<u64>();
+            pack_index_cache.insert_entries(pack_id, &index_entries);
+            staged_appends.push((chunk_idx, pack_id));
+            flushed_blocks.extend(packed_indices);
         }
 
         // Apply all staged manifest appends atomically.
