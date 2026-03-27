@@ -72,6 +72,8 @@ Every test follows the same pattern:
 | `unaligned_cross_boundary_read` | Reads at arbitrary byte offsets spanning block boundaries from S3 | 8 MB |
 | `promote_integrity` | Fork readonly → promote → write → drain → cold restart → verify | 8 MB |
 | `resize_integrity` | Write → drain → resize (grow) → cold restart → verify original + zeros | 16 MB |
+| `bless_fork_block_integrity` | Bless ext4 → fork → cold restart → BLAKE3 verify every block from S3 | 16 MB |
+| `bless_fork_write_integrity` | Bless → fork → overwrite 25% → cold restart → verify inherited + new | 16 MB |
 
 ### What each test catches
 
@@ -192,6 +194,23 @@ offset calculation bugs in the read path's block-slicing logic that aligned read
 wouldn't exercise — the non-aligned path has separate math for computing the
 start offset within the first block and the end offset within the last block.
 
+**bless_fork_block_integrity** — Builds a deterministic ext4 image with known files
+(ELF binaries, config files, directories), blesses it into S3 using the same
+zero-skip + pack assembly pipeline as `cli::bless::run_bless`, forks from the
+blessed base, and verifies every block via BLAKE3 — first as a hot read (pack
+index resolved from S3), then after a cold restart (fresh server, no local cache).
+Catches: zero-block false positives during bless (non-zero data skipped and returned
+as zeros on read), missing pack index entries after manifest round-trip, and the
+`locate_block` fallthrough to `BlockLocation::Zero` for blocks absent from the
+manifest.
+
+**bless_fork_write_integrity** — Same blessed base setup, then overwrites ~25% of
+blocks with new data on the forked child, drains to S3, cold restarts, and verifies
+that both inherited (base image) and overwritten (child) blocks are byte-correct.
+Catches: post-fork writes corrupting inherited base data, cross-flush dedup
+incorrectly eliding blocks during multi-iteration drain, and "newest wins" pack
+resolution bugs where stale base data shows through after a child write.
+
 ## Data path coverage
 
 The suite exercises every stage of the GlideFS data pipeline:
@@ -226,3 +245,6 @@ The suite exercises every stage of the GlideFS data pipeline:
 | Unaligned cross-boundary reads | `unaligned_cross_boundary_read` |
 | Promote readonly → readwrite | `promote_integrity` |
 | Resize (grow) data preservation | `resize_integrity` |
+| Bless zero-skip pipeline | `bless_fork_block_integrity` (ext4 image → bless → fork → S3 verify) |
+| Bless → fork → cold read | `bless_fork_block_integrity`, `bless_fork_write_integrity` |
+| Post-fork inherited + new data | `bless_fork_write_integrity` (overwrite 25% → cold verify both) |
