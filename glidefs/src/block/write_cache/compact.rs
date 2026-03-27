@@ -17,9 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
-use crate::block::pack::{
-    PackId, PackIndexEntry, new_pack_id,
-};
+use crate::block::pack::{PackId, PackIndexEntry};
 use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::volume_manifest::VolumeManifest;
 use crate::block::block_map::Blake3Hash;

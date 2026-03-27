@@ -5,7 +5,7 @@ use crate::block::content_store::ContentStore;
 use crate::block::handler::BlockHandler;
 use crate::block::manifest::serialize_hot_set;
 use crate::block::metrics::ExportMetrics;
-use crate::block::pack::{new_pack_id, PackId, DEFAULT_FLUSH_THRESHOLD};
+use crate::block::pack::{content_pack_id, PackId, DEFAULT_FLUSH_THRESHOLD};
 use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -16,7 +16,7 @@ use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use ext4::writer::WriterOption;
 use oci_registry::{Credentials, RegistryClient};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -340,15 +340,24 @@ pub async fn run_bless_oci(
     // --- Drain to S3 ---
     info!("draining to S3");
 
-    for i in 0..100 {
+    let max_drain_iterations = 100;
+    let mut drained = false;
+    for i in 0..max_drain_iterations {
         let stats = cache
             .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
             .await
             .map_err(|e| anyhow::anyhow!("flush failed: {e}"))?;
         if stats.blocks_claimed == 0 {
             info!(iterations = i + 1, "drain complete");
+            drained = true;
             break;
         }
+    }
+    if !drained {
+        anyhow::bail!(
+            "drain did not converge after {max_drain_iterations} iterations — \
+             cache still has dirty blocks, refusing to upload incomplete manifest"
+        );
     }
 
     // --- Generate hot set from VolumeManifest ---
@@ -368,10 +377,15 @@ pub async fn run_bless_oci(
         let mut indices: Vec<u64> = Vec::new();
         for (chunk_idx, packs) in &chunk_packs {
             for &pack_id in packs {
-                if let Some(entries) = pack_index_cache.get_entries(pack_id).await {
-                    for e in entries.iter() {
-                        let global_block = *chunk_idx as u64 * blocks_per_chunk + e.chunk_offset as u64;
-                        indices.push(global_block);
+                match pack_index_cache.get_entries(pack_id).await {
+                    Some(entries) => {
+                        for e in entries.iter() {
+                            let global_block = *chunk_idx as u64 * blocks_per_chunk + e.chunk_offset as u64;
+                            indices.push(global_block);
+                        }
+                    }
+                    None => {
+                        tracing::warn!(pack_id, chunk_idx, "pack index missing from cache, hot set may be incomplete");
                     }
                 }
             }
@@ -444,14 +458,19 @@ async fn start_chunk_upload(
     chunk_idx: u32,
     blocks: Vec<BlockInfo>,
 ) -> Result<Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>> {
-    // CPU: dedup + assemble pack
-    let mut seen: HashSet<Blake3Hash> = HashSet::new();
+    // Share compressed Bytes across duplicate hashes (avoids redundant allocations)
+    // but keep every block offset in the pack index. Two blocks with the same
+    // hash but different chunk_offsets both need entries — otherwise the read
+    // path can't find the second block and returns zeros (BlockLocation::Zero).
+    let mut first_seen: HashMap<Blake3Hash, Bytes> = HashMap::new();
     let mut pack_blocks: Vec<(Blake3Hash, u32, Bytes)> = Vec::new();
 
     for block in blocks {
-        if seen.insert(block.hash) {
-            pack_blocks.push((block.hash, block.block_offset, block.compressed));
-        }
+        let compressed = first_seen
+            .entry(block.hash)
+            .or_insert_with(|| block.compressed.clone())
+            .clone();
+        pack_blocks.push((block.hash, block.block_offset, compressed));
     }
 
     if pack_blocks.is_empty() {
@@ -461,7 +480,10 @@ async fn start_chunk_upload(
         return Ok(None);
     }
 
-    let pack_id = new_pack_id();
+    // Sort by chunk_offset for canonical ordering before computing the
+    // content-addressed pack ID (same as flush and compaction paths).
+    pack_blocks.sort_by_key(|(_, co, _)| *co);
+    let pack_id = content_pack_id(&pack_blocks);
 
     // Join previous upload before spawning next (keeps at most 1 in flight).
     join_upload(volume_manifest, stats, prev_in_flight).await?;
@@ -808,8 +830,9 @@ mod tests {
         assert_eq!(stats.unique_blocks, 4);
         assert_eq!(stats.packs_uploaded, 1);
 
-        // The pack should contain only 3 entries (blocks 0 and 2 share a hash,
-        // so only the first occurrence is stored)
+        // The pack must contain 4 entries — one per block offset — even though
+        // blocks 0 and 2 share a hash. Every block offset needs a pack index
+        // entry so the read path can resolve it; missing entries return zeros.
         let (manifest_data, _) = cs
             .get_manifest("bases/dedup-test")
             .await
@@ -822,9 +845,19 @@ mod tests {
         let entries = fetch_pack_index(&store, "test", 0, pack_ids[0]).await;
         assert_eq!(
             entries.len(),
-            3,
-            "within-batch dedup should store 3 unique blocks"
+            4,
+            "every block offset must have a pack index entry, even with duplicate hashes"
         );
+
+        // Verify all 4 offsets are present
+        let offsets: Vec<u32> = entries.iter().map(|e| e.chunk_offset).collect();
+        for expected in 0..4u32 {
+            assert!(
+                offsets.contains(&expected),
+                "missing pack index entry for chunk_offset {}",
+                expected,
+            );
+        }
     }
 
     #[tokio::test]
