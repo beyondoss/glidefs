@@ -804,8 +804,6 @@ impl WriteCache<Active> {
         clean_cache: Option<&Arc<dyn BlockCache>>,
         crcs: HashMap<usize, Box<[u32]>>,
     ) -> Result<FlushStats, CacheError> {
-        use crate::block::pack::new_pack_id;
-
         // Partition dirty blocks by chunk
         let mut per_chunk: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
         {

@@ -60,6 +60,7 @@ pub const TRAILER_SIZE: usize = 8;
 pub type PackId = u64;
 
 /// Generate a random pack ID (used only by tests that don't care about content addressing).
+#[cfg(test)]
 pub fn new_pack_id() -> PackId {
     rand::random::<u64>()
 }
