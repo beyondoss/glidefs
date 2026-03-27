@@ -516,3 +516,113 @@ async fn bless_fork_write_integrity() {
         inherited_errors, overwritten_errors,
     );
 }
+
+/// Bless a raw image containing duplicate 128KB blocks within the same chunk,
+/// fork, cold restart, verify that BOTH copies resolve correctly from S3.
+///
+/// Regression test for the bless within-chunk dedup bug: if two blocks have
+/// identical content (same BLAKE3-128 hash), both must get pack index entries.
+/// The old code only stored the first occurrence, causing the duplicate to
+/// return zeros on read.
+#[tokio::test]
+#[ignore] // requires Docker (MinIO)
+async fn bless_duplicate_block_integrity() {
+    let t0 = Instant::now();
+    let ctx = TestContext::new().await;
+    let db_path = "bless-dedup";
+    let base_name = "dedup-image";
+    let base_prefix = format!("bases/{}", base_name);
+    let transport = crate::Transport::Nbd;
+
+    // Build a raw image with intentional duplicate blocks.
+    // 16 blocks x 128KB = 2 MB. Blocks 0,4,8,12 all have identical content.
+    let total_blocks = 16;
+    let device_size = total_blocks * BLOCK_SIZE;
+    let mut image = vec![0u8; device_size];
+
+    let duplicate_pattern = {
+        let mut rng = StdRng::seed_from_u64(0xD0D0D0D0);
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        rng.fill(&mut buf[..]);
+        buf
+    };
+
+    for i in 0..total_blocks {
+        let start = i * BLOCK_SIZE;
+        if i % 4 == 0 {
+            // Duplicate: same content at offsets 0, 4, 8, 12
+            image[start..start + BLOCK_SIZE].copy_from_slice(&duplicate_pattern);
+        } else {
+            // Unique block
+            let mut rng = StdRng::seed_from_u64(0xBEEF0000 + i as u64);
+            rng.fill(&mut image[start..start + BLOCK_SIZE]);
+        }
+    }
+
+    // Pre-compute expected hashes
+    let expected_hashes: Vec<[u8; 32]> = (0..total_blocks)
+        .map(|i| blake3_hash(&image[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE]))
+        .collect();
+
+    // Bless
+    let content_store = ContentStore::new(
+        Arc::clone(&ctx.object_store),
+        &format!("{}/exports/{}", db_path, base_prefix),
+    );
+    let (nonzero, _) = bless_image_to_s3(&content_store, base_name, &image).await;
+    eprintln!(
+        "[bless_duplicate_block_integrity] blessed {} non-zero blocks ({} total, 4 duplicates)",
+        nonzero, total_blocks,
+    );
+
+    // Fork, cold restart, verify
+    let server =
+        TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    let size_gb = device_size as f64 / (1024.0 * 1024.0 * 1024.0);
+    server.fork_export("child", &base_prefix, size_gb).await;
+
+    server.drain_all().await;
+    server.shutdown().await;
+
+    let server2 =
+        TestServer::start(Arc::clone(&ctx.object_store), db_path, transport).await;
+    server2
+        .restore_forked_export("child", &base_prefix, size_gb)
+        .await;
+
+    let mut client = server2.connect("child").await;
+
+    let mut errors = 0u64;
+    for i in 0..total_blocks {
+        let data = client
+            .read((i * BLOCK_SIZE) as u64, BLOCK_SIZE as u32)
+            .await
+            .unwrap();
+        let actual = blake3_hash(&data);
+        if actual != expected_hashes[i] {
+            let is_zero = data.iter().all(|&b| b == 0);
+            let is_dup = i % 4 == 0;
+            eprintln!(
+                "  MISMATCH block {} ({}): got {}",
+                i,
+                if is_dup { "DUPLICATE" } else { "unique" },
+                if is_zero { "ALL ZEROS" } else { "wrong data" },
+            );
+            errors += 1;
+        }
+    }
+
+    client.disconnect().await.unwrap();
+    server2.shutdown().await;
+
+    eprintln!(
+        "[bless_duplicate_block_integrity] verified in {:.1}s — errors={}",
+        t0.elapsed().as_secs_f64(),
+        errors,
+    );
+    assert_eq!(
+        errors, 0,
+        "duplicate block integrity failed: {} blocks returned wrong data",
+        errors,
+    );
+}

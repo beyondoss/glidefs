@@ -16,7 +16,7 @@ use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use ext4::writer::WriterOption;
 use oci_registry::{Credentials, RegistryClient};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -444,14 +444,19 @@ async fn start_chunk_upload(
     chunk_idx: u32,
     blocks: Vec<BlockInfo>,
 ) -> Result<Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>> {
-    // CPU: dedup + assemble pack
-    let mut seen: HashSet<Blake3Hash> = HashSet::new();
+    // Dedup compressed data but keep every block offset in the pack index.
+    // Two blocks with the same hash but different chunk_offsets both need
+    // entries — otherwise the read path can't find the second block and
+    // returns zeros (BlockLocation::Zero).
+    let mut first_seen: HashMap<Blake3Hash, Bytes> = HashMap::new();
     let mut pack_blocks: Vec<(Blake3Hash, u32, Bytes)> = Vec::new();
 
     for block in blocks {
-        if seen.insert(block.hash) {
-            pack_blocks.push((block.hash, block.block_offset, block.compressed));
-        }
+        let compressed = first_seen
+            .entry(block.hash)
+            .or_insert_with(|| block.compressed.clone())
+            .clone();
+        pack_blocks.push((block.hash, block.block_offset, compressed));
     }
 
     if pack_blocks.is_empty() {
@@ -808,8 +813,9 @@ mod tests {
         assert_eq!(stats.unique_blocks, 4);
         assert_eq!(stats.packs_uploaded, 1);
 
-        // The pack should contain only 3 entries (blocks 0 and 2 share a hash,
-        // so only the first occurrence is stored)
+        // The pack must contain 4 entries — one per block offset — even though
+        // blocks 0 and 2 share a hash. Every block offset needs a pack index
+        // entry so the read path can resolve it; missing entries return zeros.
         let (manifest_data, _) = cs
             .get_manifest("bases/dedup-test")
             .await
@@ -822,9 +828,19 @@ mod tests {
         let entries = fetch_pack_index(&store, "test", 0, pack_ids[0]).await;
         assert_eq!(
             entries.len(),
-            3,
-            "within-batch dedup should store 3 unique blocks"
+            4,
+            "every block offset must have a pack index entry, even with duplicate hashes"
         );
+
+        // Verify all 4 offsets are present
+        let offsets: Vec<u32> = entries.iter().map(|e| e.chunk_offset).collect();
+        for expected in 0..4u32 {
+            assert!(
+                offsets.contains(&expected),
+                "missing pack index entry for chunk_offset {}",
+                expected,
+            );
+        }
     }
 
     #[tokio::test]
