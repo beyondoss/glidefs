@@ -244,7 +244,8 @@ pub struct ExportRouter {
 
     /// Bounded cache for boot hot sets (immutable, paired with base manifests).
     /// Key: "{s3_prefix}:{hot_set_name}" → parsed block indices.
-    hot_set_cache: parking_lot::Mutex<HashMap<String, Arc<Vec<u64>>>>,
+    /// Arc-wrapped so it can be shared with background prefetch tasks.
+    hot_set_cache: Arc<parking_lot::Mutex<HashMap<String, Arc<Vec<u64>>>>>,
 }
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
@@ -344,7 +345,7 @@ impl ExportRouter {
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             ublk_server,
             base_manifest_cache: parking_lot::Mutex::new(HashMap::new()),
-            hot_set_cache: parking_lot::Mutex::new(HashMap::new()),
+            hot_set_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         })
     }
 
@@ -958,14 +959,14 @@ impl ExportRouter {
             }
         }
 
-        // Boot hot set prefetch: warm the clean cache before the VM reads
+        // Boot hot set prefetch: warm the clean cache before the VM reads.
+        // On cache hit, spawn prefetch immediately. On cache miss, the S3
+        // fetch is done inside the spawned task so it doesn't block fork creation.
         if let Some(manifest_name) = manifest_name {
-            // Extract base name from manifest_name (e.g., "bases/ubuntu-22.04" → "ubuntu-22.04")
             let hot_set_name = manifest_name
                 .strip_prefix("bases/")
                 .unwrap_or(manifest_name);
 
-            // Try hot set cache first (bases/* hot sets are immutable)
             let is_base = manifest_name.starts_with("bases/");
             let hot_cache_key = format!("{}:{}", s3_prefix, hot_set_name);
 
@@ -975,49 +976,57 @@ impl ExportRouter {
                 None
             };
 
-            let chunks = if let Some(chunks) = cached_hot_set {
-                debug!(hot_set = %hot_set_name, "hot set cache hit");
-                Some(chunks)
-            } else {
-                match content_store.get_hot_set(hot_set_name).await {
-                    Ok(Some(hot_set_data)) => match deserialize_hot_set(&hot_set_data) {
-                        Ok(chunks) => {
-                            let chunks = Arc::new(chunks);
-                            if is_base {
-                                let mut cache_map = self.hot_set_cache.lock();
-                                if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
-                                    cache_map.insert(hot_cache_key, Arc::clone(&chunks));
-                                }
-                            }
-                            Some(chunks)
-                        }
-                        Err(e) => {
-                            warn!("failed to deserialize hot set: {}", e);
-                            None
-                        }
-                    },
-                    Ok(None) => {
-                        debug!("no hot set found for '{}'", hot_set_name);
-                        None
-                    }
-                    Err(e) => {
-                        warn!("failed to fetch hot set: {}", e);
-                        None
-                    }
-                }
-            };
+            let cache_clone = Arc::clone(&cache);
+            let cmc = Arc::clone(&pack_index_cache);
+            let vm = Arc::clone(&volume_manifest);
+            let cs = Arc::clone(&content_store);
 
-            if let Some(chunks) = chunks {
+            if let Some(chunks) = cached_hot_set {
+                debug!(hot_set = %hot_set_name, "hot set cache hit");
                 info!(chunks = chunks.len(), "prefetching boot hot set");
-                let cache_clone = Arc::clone(&cache);
-                let cmc = Arc::clone(&pack_index_cache);
-                let vm = Arc::clone(&volume_manifest);
-                let cs = Arc::clone(&content_store);
                 spawn_named("hot-set-prefetch", async move {
                     cache_clone
                         .prefetch_chunks(&chunks, &cmc, &vm, &cs)
                         .await;
                     info!("boot hot set prefetch complete");
+                });
+            } else {
+                let hot_set_name = hot_set_name.to_string();
+                let hot_set_cache = Arc::clone(&self.hot_set_cache);
+                spawn_named("hot-set-prefetch", async move {
+                    let chunks = match cs.get_hot_set(&hot_set_name).await {
+                        Ok(Some(data)) => match deserialize_hot_set(&data) {
+                            Ok(chunks) => {
+                                let chunks = Arc::new(chunks);
+                                if is_base {
+                                    let mut cache_map = hot_set_cache.lock();
+                                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
+                                        cache_map.insert(hot_cache_key, Arc::clone(&chunks));
+                                    }
+                                }
+                                Some(chunks)
+                            }
+                            Err(e) => {
+                                warn!("failed to deserialize hot set: {}", e);
+                                None
+                            }
+                        },
+                        Ok(None) => {
+                            debug!("no hot set found for '{}'", hot_set_name);
+                            None
+                        }
+                        Err(e) => {
+                            warn!("failed to fetch hot set: {}", e);
+                            None
+                        }
+                    };
+                    if let Some(chunks) = chunks {
+                        info!(chunks = chunks.len(), "prefetching boot hot set");
+                        cache_clone
+                            .prefetch_chunks(&chunks, &cmc, &vm, &cs)
+                            .await;
+                        info!("boot hot set prefetch complete");
+                    }
                 });
             }
         }
