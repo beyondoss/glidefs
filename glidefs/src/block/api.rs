@@ -316,12 +316,8 @@ where
                 ));
             }
 
-            // Check if export already exists
-            let existing = router
-                .list_exports()
-                .await
-                .into_iter()
-                .find(|e| e.name == *name);
+            // Check if export already exists (direct lookup, not a full scan)
+            let existing = router.get_export_info(name).await;
 
             match existing {
                 Some(export) => {
@@ -381,7 +377,17 @@ where
                         .await
                     {
                         Ok(()) => {
-                            if let Err(e) = router.save_export(&config).await {
+                            // Run S3 persist and device registration concurrently.
+                            // save_export must succeed; register_device is best-effort.
+                            #[cfg(target_os = "linux")]
+                            let (save_result, register_result) = tokio::join!(
+                                router.save_export(&config),
+                                router.register_device(name, &transport),
+                            );
+                            #[cfg(not(target_os = "linux"))]
+                            let save_result = router.save_export(&config).await;
+
+                            if let Err(e) = save_result {
                                 // Export is functional locally but won't survive a restart.
                                 // Return 503 so the orchestrator can retry (create_export is idempotent).
                                 return Ok(error_response(
@@ -390,11 +396,9 @@ where
                                 ));
                             }
 
-                            // Register kernel block device on Linux.
                             #[cfg(target_os = "linux")]
-                            if let Err(e) = router.register_device(name, &transport).await {
+                            if let Err(e) = register_result {
                                 warn!(export = %name, error = %e, "device registration failed");
-                                // Export still works via NBD protocol, just no /dev/ device.
                             }
                             let _ = transport; // suppress unused warning on non-Linux
 
