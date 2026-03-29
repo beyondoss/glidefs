@@ -68,8 +68,8 @@ pub(crate) struct KernelFeatures {
 pub(crate) fn detect_features() -> KernelFeatures {
     let raw = UblkCtrl::get_features().unwrap_or(0);
     let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
-    let zero_copy = (raw & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
-        && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
+    // TODO: zero-copy disabled pending 6.17 AUTO_BUF_REG investigation
+    let zero_copy = false;
     let ioctl_encode = (raw & sys::UBLK_F_CMD_IOCTL_ENCODE as u64) != 0;
 
     tracing::info!(
