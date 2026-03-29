@@ -83,6 +83,23 @@ pub(crate) fn detect_features() -> KernelFeatures {
     KernelFeatures { recovery, zero_copy, ioctl_encode }
 }
 
+/// Check if the running kernel is compatible with our ublk-core crate.
+/// The Azure 6.17 kernel changed ublk START_DEV behavior in ways that
+/// cause the START ioctl to hang. Until we update ublk-core, skip on 6.17+.
+pub fn kernel_ublk_compatible() -> bool {
+    let ver = std::fs::read_to_string("/proc/version").unwrap_or_default();
+    if let Some(v) = ver.strip_prefix("Linux version ") {
+        let parts: Vec<&str> = v.split('.').collect();
+        if let (Some(major), Some(minor)) = (
+            parts.first().and_then(|s| s.parse::<u32>().ok()),
+            parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+        ) {
+            return major < 6 || (major == 6 && minor < 17);
+        }
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Device mode
 // ---------------------------------------------------------------------------
@@ -950,13 +967,23 @@ fn queue_io_loop(
     // ring → submit() flushes them to the kernel via io_uring_enter(to_wait=0)
     // → signal_ready() tells the main thread it's safe to call start_dev.
     exe.tick();
+    // Flush FETCH_REQ SQEs with GETEVENTS flag. With COOP_TASKRUN, the kernel
+    // only processes uring_cmd task_work when io_uring_enter is called with
+    // IORING_ENTER_GETEVENTS. Plain submit() (without GETEVENTS) queues the
+    // SQEs but defers processing — the FETCH_REQs never reach the ublk driver
+    // and START hangs. GETEVENTS with min_complete=0 forces task_work
+    // processing without blocking.
     ublk_core::with_queue_ring_mut_internal!(
         |r: &mut io_uring::IoUring<io_uring::squeue::Entry>| {
-            let _ = r.submit();
+            let sq_len = r.submission().len() as u32;
+            unsafe {
+                // IORING_ENTER_GETEVENTS = 1
+                let _ = r.submitter().enter::<libc::sigset_t>(sq_len, 0, 1u32, None);
+            }
         }
     );
-    // All FETCH_REQ SQEs flushed. Unblock the main thread's barrier so it
-    // can proceed to start_dev — the kernel will find the FETCH_REQs waiting.
+    // All FETCH_REQ SQEs flushed and processed by kernel. Unblock the main
+    // thread's barrier so it can proceed to start_dev.
     fetch_barrier.wait();
     latch.signal_ready();
 

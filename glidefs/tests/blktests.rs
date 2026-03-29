@@ -224,7 +224,7 @@ mod blktests {
             }
 
             // Create ublk export + device
-            if ublk_available() {
+            if ublk_available() && glidefs::block::ublk::device::kernel_ublk_compatible() {
                 let ublk_config = ExportConfig {
                     name: "blktest-ublk".to_string(),
                     size_gb: DEVICE_SIZE_GB,

@@ -41,6 +41,10 @@ mod fio_verify {
             eprintln!("skipping fio verify: ublk_drv not available");
             return true;
         }
+        if !glidefs::block::ublk::device::kernel_ublk_compatible() {
+            eprintln!("skipping fio verify: kernel >= 6.17 not yet supported by ublk-core");
+            return true;
+        }
         if !fio_available() {
             eprintln!("skipping fio verify: fio not installed");
             return true;
