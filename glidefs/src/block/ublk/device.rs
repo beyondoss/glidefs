@@ -178,14 +178,19 @@ impl UblkDevice {
 
         let dev_path = PathBuf::from(dev_path_str);
 
-        // Disable the kernel's write-back throttle (wbt). The default target latency
-        // of 2ms is far too aggressive for a userspace block device — ublk I/O
-        // round-trips through io_uring and will regularly exceed that under load,
-        // causing wbt to progressively choke writes down to zero.
+        // Tune kernel block queue for a userspace device:
+        // - wbt (write-back throttle): default 2ms target is too aggressive for ublk —
+        //   I/O round-trips through io_uring and will exceed that under load, causing
+        //   wbt to progressively choke writes down to zero.
+        // - scheduler: mq-deadline adds sorting/merging overhead that's pointless here
+        //   since we handle our own I/O ordering in userspace.
         if let Some(dev_name) = dev_path.file_name().and_then(|n| n.to_str()) {
-            let wbt_path = format!("/sys/block/{dev_name}/queue/wbt_lat_usec");
-            if let Err(e) = std::fs::write(&wbt_path, b"0") {
-                tracing::warn!(path = %wbt_path, error = %e, "failed to disable wbt");
+            let queue = format!("/sys/block/{dev_name}/queue");
+            for (param, value) in [("wbt_lat_usec", "0"), ("scheduler", "none")] {
+                let path = format!("{queue}/{param}");
+                if let Err(e) = std::fs::write(&path, value) {
+                    tracing::warn!(path = %path, error = %e, "failed to set block queue param");
+                }
             }
         }
 
