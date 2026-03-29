@@ -177,6 +177,18 @@ impl UblkDevice {
             .map_err(|_| anyhow::anyhow!("ublk worker thread failed during setup"))??;
 
         let dev_path = PathBuf::from(dev_path_str);
+
+        // Disable the kernel's write-back throttle (wbt). The default target latency
+        // of 2ms is far too aggressive for a userspace block device — ublk I/O
+        // round-trips through io_uring and will regularly exceed that under load,
+        // causing wbt to progressively choke writes down to zero.
+        if let Some(dev_name) = dev_path.file_name().and_then(|n| n.to_str()) {
+            let wbt_path = format!("/sys/block/{dev_name}/queue/wbt_lat_usec");
+            if let Err(e) = std::fs::write(&wbt_path, b"0") {
+                tracing::warn!(path = %wbt_path, error = %e, "failed to disable wbt");
+            }
+        }
+
         tracing::info!(dev_id, path = %dev_path.display(), "ublk device registered");
 
         Ok(Self {
