@@ -152,6 +152,29 @@ jobs:
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+      - name: ublk debug (kernel 6.17 START_DEV)
+        timeout-minutes: 3
+        run: |
+          cat /boot/config-$(uname -r) | grep -i "UBLK\|LEGACY_OPCODE" || echo "no ublk config"
+          # Minimal ublk device test using ublksrv tooling
+          sudo modprobe ublk_drv
+          # Check if the upstream ublk null target works
+          which ublk 2>/dev/null && sudo ublk add -t null --queues 1 --depth 128 && echo "ublk null device created" && sudo ublk del -a || echo "no ublk CLI"
+          # Try with our binary but just the device creation part
+          sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture 2>&1 &
+          PID=$!
+          sleep 30
+          echo "=== After 30s ==="
+          sudo dmesg | grep -i "ublk\|segfault" | tail -20
+          if [ -d "/proc/$PID" ]; then
+            echo "=== Process still running, getting thread stacks ==="
+            ls /proc/$PID/task/ | while read tid; do
+              echo "--- Thread $tid ---"
+              cat /proc/$PID/task/$tid/wchan 2>/dev/null
+              cat /proc/$PID/task/$tid/syscall 2>/dev/null | head -1
+            done
+          fi
+          kill $PID 2>/dev/null; wait $PID 2>/dev/null || true
       - name: fio benchmark (ublk)
         timeout-minutes: 5
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
