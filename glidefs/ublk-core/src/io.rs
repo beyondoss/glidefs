@@ -956,10 +956,7 @@ impl UblkDev {
 
     /// Wait for all queues to complete buffer registration
     pub fn wait_for_buffer_registration(&self, nr_hw_queues: usize) -> Result<(), UblkError> {
-        if (self.dev_info.flags
-            & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64)
-            != 0
-        {
+        if (self.dev_info.flags & crate::sys::UBLK_F_USER_COPY as u64) != 0 {
             return Ok(());
         }
 
@@ -1825,6 +1822,7 @@ impl UblkQueue<'_> {
             }
         }
 
+        let is_auto_reg = matches!(&buf_desc, BufDesc::AutoReg(_));
         let f = self.submit_io_cmd_unified(tag, crate::sys::UBLK_U_IO_FETCH_REQ, buf_desc, result);
         // Register the IoBuf if provided and acquire permit
         if let Some(buf) = io_buf {
@@ -1832,6 +1830,14 @@ impl UblkQueue<'_> {
             // Wait for all buffer registrations to complete before submitting prep commands
             // This ensures that the effect is similar to submit_fetch_commands_unified()
             self.wait_for_all_buffer_registrations().await;
+        } else if is_auto_reg {
+            // Zero-copy: count FETCH_REQ submissions so start_dev()
+            // waits for all tags before issuing START_DEV.
+            let mut counter = self.buf_reg_counter.borrow_mut();
+            *counter += 1;
+            if *counter >= self.q_depth {
+                self.dev.notify_buffer_registration_complete(false);
+            }
         }
 
         // Check if mlock failed and fail immediately if so, but only for FETCH_REQ operations
