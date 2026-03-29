@@ -69,7 +69,8 @@ pub(crate) fn detect_features() -> KernelFeatures {
     let raw = UblkCtrl::get_features().unwrap_or(0);
     let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
     let zero_copy = (raw & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
-        && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
+        && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
+        && kernel_auto_buf_reg_safe();
     let ioctl_encode = (raw & sys::UBLK_F_CMD_IOCTL_ENCODE as u64) != 0;
 
     tracing::info!(
@@ -81,6 +82,30 @@ pub(crate) fn detect_features() -> KernelFeatures {
     );
 
     KernelFeatures { recovery, zero_copy, ioctl_encode }
+}
+
+/// Check if the running kernel's UBLK_F_AUTO_BUF_REG implementation is safe.
+///
+/// The Azure 6.17 kernel advertises AUTO_BUF_REG in GET_FEATURES but doesn't
+/// implement it — the kernel treats sqe->addr as a raw buffer pointer instead
+/// of decoding the packed ublk_auto_buf_reg struct. This causes io_uring_enter
+/// to hang during FETCH_REQ submission and segfaults when I/O is dispatched
+/// (writes to the packed index|flags value, e.g. address 0x10000 for tag 0).
+///
+/// AUTO_BUF_REG was merged in mainline 6.16. Require >= 6.18 to avoid broken
+/// early implementations; refine as we validate more kernels.
+fn kernel_auto_buf_reg_safe() -> bool {
+    let ver = std::fs::read_to_string("/proc/version").unwrap_or_default();
+    if let Some(rest) = ver.strip_prefix("Linux version ") {
+        let parts: Vec<&str> = rest.split(|c: char| !c.is_ascii_digit()).collect();
+        if let (Some(major), Some(minor)) = (
+            parts.first().and_then(|s| s.parse::<u32>().ok()),
+            parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+        ) {
+            return major > 6 || (major == 6 && minor >= 18);
+        }
+    }
+    false // unknown kernel — don't risk it
 }
 
 // ---------------------------------------------------------------------------
