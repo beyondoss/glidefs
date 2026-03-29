@@ -872,6 +872,7 @@ fn queue_io_loop(
 
     latch.signal_ready();
     let zero_copy = q_rc.support_auto_buf_zc();
+    eprintln!("[ublk] q{qid}: zero_copy={zero_copy} depth={}", dev.dev_info.queue_depth);
     let mut exe = QueueExecutor::new(efd_fd);
 
     // Enter the tokio runtime context once for the entire queue thread.
@@ -923,8 +924,16 @@ fn queue_io_loop(
 
     // Drive the QueueExecutor via ublk_core's io_uring event loop.
     let q = q_rc.clone();
+    let loop_count = std::cell::Cell::new(0u32);
     block_on(async {
-        let run_tasks = || exe.tick();
+        let run_tasks = || {
+            exe.tick();
+            let n = loop_count.get();
+            if n < 3 {
+                loop_count.set(n + 1);
+                eprintln!("[ublk] q{qid} loop#{n}");
+            }
+        };
         let all_done = || exe.all_done();
         if let Err(e) =
             ublk_core::wait_and_handle_io_events(&q, Some(URING_IDLE_SECS), run_tasks, all_done).await
