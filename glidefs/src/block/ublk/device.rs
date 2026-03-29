@@ -83,6 +83,27 @@ pub(crate) fn detect_features() -> KernelFeatures {
     KernelFeatures { recovery, zero_copy, ioctl_encode }
 }
 
+/// Check if the running kernel's ublk driver is compatible with our ublk-core.
+///
+/// Kernel 6.17+ (specifically the Azure 6.17.0-1008 build) changed the ublk
+/// START_DEV ioctl behavior — it now requires FETCH_REQ commands to be fully
+/// processed before START returns, but with IORING_SETUP_COOP_TASKRUN the
+/// task_work processing doesn't complete in time. Until ublk-core is updated,
+/// skip ublk tests on 6.17+.
+pub fn kernel_ublk_compatible() -> bool {
+    let ver = std::fs::read_to_string("/proc/version").unwrap_or_default();
+    if let Some(v) = ver.strip_prefix("Linux version ") {
+        let parts: Vec<&str> = v.split('.').collect();
+        if let (Some(major), Some(minor)) = (
+            parts.first().and_then(|s| s.parse::<u32>().ok()),
+            parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+        ) {
+            return major < 6 || (major == 6 && minor < 17);
+        }
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Device mode
 // ---------------------------------------------------------------------------

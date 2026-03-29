@@ -251,6 +251,10 @@ mod fio_bench {
             eprintln!("skipping fio benchmark: ublk_drv not available");
             return;
         }
+        if !glidefs::block::ublk::device::kernel_ublk_compatible() {
+            eprintln!("skipping fio benchmark: kernel >= 6.17 ublk START_DEV incompatible");
+            return;
+        }
         if !fio_available() {
             eprintln!("skipping fio benchmark: fio not installed");
             return;
