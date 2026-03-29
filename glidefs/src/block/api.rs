@@ -73,6 +73,9 @@ pub struct ExportInfoResponse {
     pub transport: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// S3 prefix for pack/manifest storage (None = export name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_prefix: Option<String>,
     /// Unflushed bytes waiting to be synced to S3.
     pub dirty_bytes: u64,
     /// Total logical bytes stored in S3.
@@ -87,6 +90,7 @@ impl From<ExportInfo> for ExportInfoResponse {
             readonly: e.readonly,
             transport: e.transport,
             device: e.device.map(|p| p.to_string_lossy().into_owned()),
+            s3_prefix: e.s3_prefix,
             dirty_bytes: e.dirty_bytes,
             s3_bytes: e.s3_bytes,
         }

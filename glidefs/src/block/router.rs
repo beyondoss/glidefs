@@ -102,6 +102,8 @@ pub struct ExportInfo {
     pub readonly: bool,
     pub transport: String,
     pub device: Option<PathBuf>,
+    /// S3 prefix for pack/manifest storage (None = export name).
+    pub s3_prefix: Option<String>,
     /// Unflushed bytes waiting to be synced to S3.
     pub dirty_bytes: u64,
     /// Total logical bytes stored in S3 (chunks × chunk_size).
@@ -1281,6 +1283,7 @@ impl ExportRouter {
                 readonly: state.readonly,
                 transport: state.transport.clone(),
                 device: None,
+                s3_prefix: state.s3_prefix.clone(),
                 dirty_bytes: state.cache.dirty_block_count() * block_size,
                 s3_bytes,
             }
@@ -1316,6 +1319,7 @@ impl ExportRouter {
                     readonly: state.readonly,
                     transport: state.transport.clone(),
                     device: None,
+                    s3_prefix: state.s3_prefix.clone(),
                     dirty_bytes: state.cache.dirty_block_count() * block_size,
                     s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
                 }
