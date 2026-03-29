@@ -56,6 +56,9 @@ pub(crate) struct KernelFeatures {
     /// `UBLK_F_SUPPORT_ZERO_COPY` + `UBLK_F_AUTO_BUF_REG` — DMA-mapped buffers,
     /// no kernel↔userspace memcpy.
     pub zero_copy: bool,
+    /// `UBLK_F_CMD_IOCTL_ENCODE` — uring commands use ioctl encoding.
+    /// Required on kernels built without `CONFIG_BLKDEV_UBLK_LEGACY_OPCODES`.
+    pub ioctl_encode: bool,
 }
 
 /// Probe the running kernel for supported ublk feature flags.
@@ -67,13 +70,17 @@ pub(crate) fn detect_features() -> KernelFeatures {
     let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
     let zero_copy = (raw & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
         && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
+    let ioctl_encode = (raw & sys::UBLK_F_CMD_IOCTL_ENCODE as u64) != 0;
 
-    eprintln!(
-        "[ublk] detect_features: raw=0x{:x} recovery={} zero_copy={}",
-        raw, recovery, zero_copy,
+    tracing::info!(
+        recovery,
+        zero_copy,
+        ioctl_encode,
+        raw_features = format_args!("0x{:x}", raw),
+        "ublk kernel feature detection"
     );
 
-    KernelFeatures { recovery, zero_copy }
+    KernelFeatures { recovery, zero_copy, ioctl_encode }
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +665,9 @@ fn run_device(
     if features.zero_copy {
         ctrl_flags |=
             sys::UBLK_F_SUPPORT_ZERO_COPY as u64 | sys::UBLK_F_AUTO_BUF_REG as u64;
+    }
+    if features.ioctl_encode {
+        ctrl_flags |= sys::UBLK_F_CMD_IOCTL_ENCODE as u64;
     }
 
     eprintln!("[ublk] run_device: building ctrl (dev_flags={dev_flags:?}, ctrl_flags=0x{ctrl_flags:x})");
