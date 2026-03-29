@@ -83,23 +83,6 @@ pub(crate) fn detect_features() -> KernelFeatures {
     KernelFeatures { recovery, zero_copy, ioctl_encode }
 }
 
-/// Check if the running kernel is compatible with our ublk-core crate.
-/// The Azure 6.17 kernel changed ublk START_DEV behavior in ways that
-/// cause the START ioctl to hang. Until we update ublk-core, skip on 6.17+.
-pub fn kernel_ublk_compatible() -> bool {
-    let ver = std::fs::read_to_string("/proc/version").unwrap_or_default();
-    if let Some(v) = ver.strip_prefix("Linux version ") {
-        let parts: Vec<&str> = v.split('.').collect();
-        if let (Some(major), Some(minor)) = (
-            parts.first().and_then(|s| s.parse::<u32>().ok()),
-            parts.get(1).and_then(|s| s.parse::<u32>().ok()),
-        ) {
-            return major < 6 || (major == 6 && minor < 17);
-        }
-    }
-    true
-}
-
 // ---------------------------------------------------------------------------
 // Device mode
 // ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@
 //! - Native multi-queue (per-CPU io_uring instances)
 //! - Batched commit+fetch eliminates round-trips
 
-pub mod device;
+mod device;
 
 use crate::block::handler::BlockHandler;
 use device::KernelFeatures;
