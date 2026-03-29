@@ -160,7 +160,25 @@ jobs:
           ls -la /dev/ublk-control 2>/dev/null || echo "no ublk-control"
       - name: fio benchmark (ublk)
         timeout-minutes: 5
-        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
+        run: |
+          # Enable core dumps for segfault diagnosis
+          ulimit -c unlimited
+          sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p
+          sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture || true
+          # If core dump exists, get a backtrace
+          for core in /tmp/core.*; do
+            if [ -f "$core" ]; then
+              echo "=== CORE DUMP BACKTRACE ==="
+              binary=$(find target/release/deps -name 'fio_bench-*' -executable | head -1)
+              if [ -n "$binary" ]; then
+                sudo apt-get install -y -qq gdb > /dev/null 2>&1
+                gdb -batch -ex "thread apply all bt full" "$binary" "$core" 2>&1 | head -100
+              fi
+            fi
+          done
+          # Check dmesg for crash info
+          echo "=== DMESG (last 20 lines) ==="
+          sudo dmesg | tail -20
       - name: fio verify (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
       - name: Test (ublk)
