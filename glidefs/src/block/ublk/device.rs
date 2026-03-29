@@ -770,20 +770,12 @@ fn run_device(
     // Queue latch: tracks per-queue initialization for fail-fast.
     let latch = Arc::new(QueueLatch::new(nr_queues));
 
-    // Barrier: queue threads flush FETCH_REQ SQEs, then wait here.
-    // The main thread (in on_started, called after start_dev) also waits.
-    // This ensures FETCH_REQs reach the kernel BEFORE start_dev is called.
-    //
-    // +1 for the main thread participant.
-    let fetch_barrier = Arc::new(std::sync::Barrier::new(nr_queues as usize + 1));
-
     // Per-queue I/O handler — runs on a dedicated thread per queue.
     // Cloned once per queue by run_target().
     let q_handler = {
         let latch = Arc::clone(&latch);
-        let fetch_barrier = Arc::clone(&fetch_barrier);
         move |qid: u16, dev: &UblkDev| {
-            queue_io_loop(qid, dev, &handler, &tokio_handle, &latch, &fetch_barrier);
+            queue_io_loop(qid, dev, &handler, &tokio_handle, &latch);
         }
     };
 
@@ -837,7 +829,7 @@ fn run_device(
         }
     };
 
-    ctrl.run_target_with_barrier(tgt_init, q_handler, on_started, Some(&fetch_barrier))
+    ctrl.run_target(tgt_init, q_handler, on_started)
         .map_err(|e| anyhow::anyhow!("ublk run_target failed: {}", e))?;
 
     Ok(())
@@ -856,7 +848,6 @@ fn queue_io_loop(
     handler: &Arc<BlockHandler>,
     tokio_handle: &tokio::runtime::Handle,
     latch: &QueueLatch,
-    fetch_barrier: &std::sync::Barrier,
 ) {
     // Install SIGSEGV handler to abort the process immediately (produces core
     // dump) instead of letting the thread die silently while the main thread hangs.
@@ -884,7 +875,7 @@ fn queue_io_loop(
     }) {
         tracing::error!(qid, error = ?e, "failed to init io_uring for ublk queue");
         latch.signal_failed();
-        fetch_barrier.wait();
+
         return;
     }
 
@@ -893,7 +884,7 @@ fn queue_io_loop(
         Err(e) => {
             tracing::error!(qid, error = ?e, "failed to create ublk queue");
             latch.signal_failed();
-            fetch_barrier.wait();
+    
             return;
         }
     };
@@ -904,7 +895,7 @@ fn queue_io_loop(
         Err(e) => {
             tracing::error!(qid, error = ?e, "failed to create eventfd");
             latch.signal_failed();
-            fetch_barrier.wait();
+    
             return;
         }
     };
@@ -960,35 +951,6 @@ fn queue_io_loop(
         });
     }
 
-    // Flush initial FETCH_REQ SQEs to the kernel BEFORE signaling ready.
-    //
-    // The kernel's START ioctl (on the main thread) blocks until every queue
-    // tag has submitted a FETCH_REQ. If we signal ready before flushing, the
-    // main thread may call start_dev while our SQEs are still in the local SQ
-    // ring — START hangs waiting for FETCH_REQs that haven't reached the kernel.
-    //
-    // Sequence: tick() polls all io_tasks which push FETCH_REQ SQEs to the SQ
-    // ring → submit() flushes them to the kernel via io_uring_enter(to_wait=0)
-    // → signal_ready() tells the main thread it's safe to call start_dev.
-    exe.tick();
-    // Flush FETCH_REQ SQEs with GETEVENTS flag. With COOP_TASKRUN, the kernel
-    // only processes uring_cmd task_work when io_uring_enter is called with
-    // IORING_ENTER_GETEVENTS. Plain submit() (without GETEVENTS) queues the
-    // SQEs but defers processing — the FETCH_REQs never reach the ublk driver
-    // and START hangs. GETEVENTS with min_complete=0 forces task_work
-    // processing without blocking.
-    ublk_core::with_queue_ring_mut_internal!(
-        |r: &mut io_uring::IoUring<io_uring::squeue::Entry>| {
-            let sq_len = r.submission().len() as u32;
-            unsafe {
-                // IORING_ENTER_GETEVENTS = 1
-                let _ = r.submitter().enter::<libc::sigset_t>(sq_len, 0, 1u32, None);
-            }
-        }
-    );
-    // All FETCH_REQ SQEs flushed and processed by kernel. Unblock the main
-    // thread's barrier so it can proceed to start_dev.
-    fetch_barrier.wait();
     latch.signal_ready();
 
     // Drive the QueueExecutor via ublk_core's io_uring event loop.
