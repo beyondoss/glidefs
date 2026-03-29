@@ -837,6 +837,13 @@ fn queue_io_loop(
     latch: &QueueLatch,
     fetch_barrier: &std::sync::Barrier,
 ) {
+    // Install SIGSEGV handler to abort the process immediately (produces core
+    // dump) instead of letting the thread die silently while the main thread hangs.
+    unsafe {
+        libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+        libc::prctl(libc::PR_SET_DUMPABLE, 1);
+    }
+
     // Initialize the thread-local io_uring before UblkQueue::new() so we can
     // set SINGLE_ISSUER — each queue thread is the sole submitter to its ring.
     let sq_depth = dev.tgt.sq_depth as u32;

@@ -161,30 +161,40 @@ jobs:
       - name: fio benchmark (ublk)
         timeout-minutes: 5
         run: |
-          # Build with debug info for symbolization
-          sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench --no-run 2>&1 | tail -5
+          export RUSTFLAGS="-C force-frame-pointers=yes"
+          sudo -E env "PATH=$PATH" RUSTFLAGS="$RUSTFLAGS" cargo test -p glidefs --release --features fio-bench --test fio_bench --no-run 2>&1 | tail -5
           binary=$(find target/release/deps -name 'fio_bench-*' -executable | head -1)
           echo "binary: $binary"
-          # Run with core dumps enabled
           sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p
-          sudo bash -c "ulimit -c unlimited; exec env PATH=$PATH RUST_BACKTRACE=full $binary --nocapture" || true
-          # Decode crash from dmesg
-          echo "=== CRASH INFO ==="
-          segfault_line=$(sudo dmesg | grep "segfault" | tail -1)
-          echo "$segfault_line"
-          if [ -n "$segfault_line" ] && [ -n "$binary" ]; then
-            crash_ip=$(echo "$segfault_line" | grep -oP 'ip \K[0-9a-f]+')
-            # Get binary base from /proc maps (process is dead, use objdump)
-            echo "crash IP: 0x$crash_ip"
-            # Try core dump
-            sudo apt-get install -y -qq gdb > /dev/null 2>&1
+          sudo bash -c "ulimit -c unlimited; exec env PATH=$PATH RUST_BACKTRACE=full $binary --nocapture" &
+          PID=$!
+          # Wait up to 4 minutes, then collect diagnostics
+          sleep 240 || true
+          # Process should have either finished or segfaulted by now
+          sudo apt-get install -y -qq gdb > /dev/null 2>&1
+          echo "=== DMESG ==="
+          sudo dmesg | grep -i "segfault\|ublk\|uring" | tail -20
+          for core in /tmp/core.*; do
+            if [ -f "$core" ]; then
+              echo "=== CORE BACKTRACE ==="
+              gdb -batch -ex "thread apply all bt" "$binary" "$core" 2>&1 | head -200
+            fi
+          done
+          # If no core, try /proc maps of the running process
+          if [ -d "/proc/$PID" ]; then
+            echo "=== PROCESS STILL RUNNING (pid=$PID) ==="
+            cat /proc/$PID/maps | grep -i "ublk\|fio_bench\|libc" | head -20
+            # Send SIGSEGV to trigger core dump
+            sudo kill -ABRT $PID 2>/dev/null || true
+            sleep 2
             for core in /tmp/core.*; do
               if [ -f "$core" ]; then
-                echo "=== BACKTRACE ==="
+                echo "=== CORE BACKTRACE (after SIGABRT) ==="
                 gdb -batch -ex "thread apply all bt" "$binary" "$core" 2>&1 | head -200
               fi
             done
           fi
+          kill $PID 2>/dev/null || true
       - name: fio verify (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
       - name: Test (ublk)
