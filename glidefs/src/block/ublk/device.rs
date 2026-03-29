@@ -834,9 +834,16 @@ fn queue_io_loop(
     let cq_depth = dev.tgt.cq_depth as u32;
     if let Err(e) = ublk_core::ublk_init_task_ring(|cell| {
         if cell.get().is_none() {
+            // NOTE: COOP_TASKRUN intentionally omitted. With COOP_TASKRUN,
+            // io_uring defers uring_cmd task_work to io_uring_enter. But
+            // the ublk kernel driver's ublk_fetch() acquires ub->mutex,
+            // which START_DEV also holds. If FETCH_REQ processing runs
+            // inside io_uring_enter (COOP_TASKRUN), it deadlocks with
+            // START on the mutex. Without COOP_TASKRUN, the kernel
+            // processes FETCH_REQs asynchronously via interrupt-driven
+            // task_work, avoiding the mutex contention.
             let ring = io_uring::IoUring::builder()
                 .setup_cqsize(cq_depth)
-                .setup_coop_taskrun()
                 .setup_single_issuer()
                 .build(sq_depth)
                 .map_err(ublk_core::UblkError::IOError)?;
