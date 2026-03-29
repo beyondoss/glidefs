@@ -845,6 +845,7 @@ fn queue_io_loop(
         if cell.get().is_none() {
             let ring = io_uring::IoUring::builder()
                 .setup_cqsize(cq_depth)
+                .setup_coop_taskrun()
                 .setup_single_issuer()
                 .build(sq_depth)
                 .map_err(ublk_core::UblkError::IOError)?;

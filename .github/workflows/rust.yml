@@ -152,7 +152,14 @@ jobs:
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+      - name: Kernel ublk config
+        run: |
+          uname -r
+          cat /boot/config-$(uname -r) | grep -i ublk || echo "no ublk config found"
+          cat /boot/config-$(uname -r) | grep -i "LEGACY_OPCODE" || echo "no LEGACY_OPCODE config"
+          ls -la /dev/ublk-control 2>/dev/null || echo "no ublk-control"
       - name: fio benchmark (ublk)
+        timeout-minutes: 5
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
       - name: fio verify (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
@@ -162,8 +169,8 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose
       - name: Filesystem crash recovery (nbd + ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --verbose fs_crash -- --nocapture
-      - name: Kernel logs (on failure)
-        if: failure()
+      - name: Kernel logs
+        if: always()
         run: sudo dmesg --color=never | tail -200
 
   fuzz:
