@@ -172,7 +172,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 // Thread-local queue ring using OnceCell for conditional initialization
 std::thread_local! {
-    pub(crate) static QUEUE_RING: OnceCell<RefCell<IoUring<squeue::Entry>>> =
+    pub static QUEUE_RING: OnceCell<RefCell<IoUring<squeue::Entry>>> =
         OnceCell::new();
 }
 

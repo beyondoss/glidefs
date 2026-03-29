@@ -929,23 +929,12 @@ fn queue_io_loop(
     // FETCH_REQs reach the kernel, START sees them and completes, then CQEs
     // arrive and the event loop proceeds.
     exe.tick(); // poll io_tasks → push FETCH_REQ SQEs to SQ ring
-    // Flush SQEs to the kernel without waiting for CQEs. submit_and_wait(0)
-    // calls io_uring_enter with to_submit=pending, to_wait=0.
-    {
-        use std::os::unix::io::AsRawFd;
-        let ring_fd = q_rc.as_raw_fd();
-        // SAFETY: io_uring_enter with to_wait=0 just flushes the SQ ring.
-        unsafe {
-            libc::syscall(
-                libc::SYS_io_uring_enter,
-                ring_fd as libc::c_uint,
-                dev.dev_info.queue_depth as libc::c_uint, // to_submit
-                0 as libc::c_uint,                         // to_wait = 0
-                std::ptr::null::<libc::c_void>(),          // sig
-                0 as libc::size_t,                         // sig_sz
-            );
+    // Flush SQEs to the kernel without waiting for CQEs.
+    ublk_core::with_queue_ring_mut_internal!(
+        |r: &mut io_uring::IoUring<io_uring::squeue::Entry>| {
+            let _ = r.submit();
         }
-    }
+    );
 
     // Drive the QueueExecutor via ublk_core's io_uring event loop.
     let q = q_rc.clone();
