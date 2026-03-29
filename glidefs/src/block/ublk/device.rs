@@ -68,11 +68,9 @@ pub(crate) fn detect_features() -> KernelFeatures {
     let zero_copy = (raw & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
         && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
 
-    tracing::info!(
-        recovery,
-        zero_copy,
-        raw_features = raw,
-        "ublk kernel feature detection"
+    eprintln!(
+        "[ublk] detect_features: raw=0x{:x} recovery={} zero_copy={}",
+        raw, recovery, zero_copy,
     );
 
     KernelFeatures { recovery, zero_copy }
@@ -662,6 +660,7 @@ fn run_device(
             sys::UBLK_F_SUPPORT_ZERO_COPY as u64 | sys::UBLK_F_AUTO_BUF_REG as u64;
     }
 
+    eprintln!("[ublk] run_device: building ctrl (dev_flags={dev_flags:?}, ctrl_flags=0x{ctrl_flags:x})");
     let ctrl = match UblkCtrlBuilder::default()
         .name("glidefs")
         .id(dev_id)
@@ -679,6 +678,7 @@ fn run_device(
             return Err(err);
         }
     };
+    eprintln!("[ublk] run_device: ctrl built, calling run_target");
 
     // Extract data file fd for io_uring zero-copy registration.
     let data_file_fd = if features.zero_copy {
@@ -752,6 +752,7 @@ fn run_device(
 
     // Called after the device is started and serving I/O.
     let on_started = move |ctrl: &UblkCtrl| {
+        eprintln!("[ublk] on_started: device started, waiting for queue latch");
         // Wait for all queue threads to report initialization status.
         if !latch.wait_all(Duration::from_secs(5)) {
             let (reported, failed) = latch.counts();
@@ -800,6 +801,7 @@ fn run_device(
         }
     };
 
+    eprintln!("[ublk] run_device: entering run_target (blocks until kill_dev)");
     ctrl.run_target(tgt_init, q_handler, on_started)
         .map_err(|e| anyhow::anyhow!("ublk run_target failed: {}", e))?;
 
@@ -822,6 +824,7 @@ fn queue_io_loop(
 ) {
     // Initialize the thread-local io_uring before UblkQueue::new() so we can
     // set SINGLE_ISSUER — each queue thread is the sole submitter to its ring.
+    eprintln!("[ublk] queue {qid}: init io_uring");
     let sq_depth = dev.tgt.sq_depth as u32;
     let cq_depth = dev.tgt.cq_depth as u32;
     if let Err(e) = ublk_core::ublk_init_task_ring(|cell| {
@@ -842,6 +845,7 @@ fn queue_io_loop(
         return;
     }
 
+    eprintln!("[ublk] queue {qid}: creating UblkQueue");
     let q_rc = match UblkQueue::new(qid, dev) {
         Ok(q) => Rc::new(q),
         Err(e) => {
@@ -850,6 +854,7 @@ fn queue_io_loop(
             return;
         }
     };
+    eprintln!("[ublk] queue {qid}: UblkQueue created");
 
     // Create eventfd for cross-thread wakeup signaling.
     let efd = match EventFd::new() {
@@ -862,6 +867,7 @@ fn queue_io_loop(
     };
     let efd_fd = efd.fd();
 
+    eprintln!("[ublk] queue {qid}: signaling ready");
     latch.signal_ready();
     let zero_copy = q_rc.support_auto_buf_zc();
     let mut exe = QueueExecutor::new(efd_fd);

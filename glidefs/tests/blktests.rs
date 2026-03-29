@@ -283,6 +283,9 @@ mod blktests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn blktests_block_and_nbd() {
+        let kver = std::fs::read_to_string("/proc/version").unwrap_or_default();
+        eprintln!("kernel: {}", kver.trim());
+
         if !is_root() {
             eprintln!("skipping blktests: must run as root");
             return;

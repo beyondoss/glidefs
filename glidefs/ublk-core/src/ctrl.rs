@@ -1781,13 +1781,17 @@ impl UblkCtrlInner {
     }
 
     fn prep_start_dev(&mut self, dev: &UblkDev) -> Result<i32, UblkError> {
+        eprintln!("[ublk-core] prep_start_dev: read_dev_info");
         self.read_dev_info()?;
+        eprintln!("[ublk-core] prep_start_dev: state={}", self.dev_info.state);
         if self.dev_info.state == sys::UBLK_S_DEV_LIVE as u16 {
             return Ok(0);
         }
 
         if self.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+            eprintln!("[ublk-core] prep_start_dev: set_params (len={})", core::mem::size_of::<sys::ublk_params>());
             self.set_params(&dev.tgt.params)?;
+            eprintln!("[ublk-core] prep_start_dev: set_params done, flush_json");
             self.flush_json()?;
         } else if self.for_recover_dev() {
             self.flush_json()?;
@@ -2411,13 +2415,18 @@ impl UblkCtrl {
     ///
     pub fn start_dev(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
+        eprintln!("[ublk-core] start_dev: prep_start_dev");
         ctrl.prep_start_dev(dev)?;
+        eprintln!("[ublk-core] start_dev: prep done, waiting for buffer registration");
 
         // Wait for all queue buffer registrations to complete
         dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
+        eprintln!("[ublk-core] start_dev: buffer registration done, sending START ioctl");
 
         if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
-            ctrl.start(unsafe { libc::getpid() as i32 })
+            let r = ctrl.start(unsafe { libc::getpid() as i32 });
+            eprintln!("[ublk-core] start_dev: START ioctl returned {:?}", r);
+            r
         } else if ctrl.for_recover_dev() {
             ctrl.end_user_recover(unsafe { libc::getpid() as i32 })
         } else {

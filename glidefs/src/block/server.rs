@@ -554,6 +554,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
         handler: Arc<BlockHandler>,
     ) -> Result<()> {
         let export_name = String::from_utf8_lossy(&device.name).to_string();
+        eprintln!("[nbd] handle_transmission started for '{export_name}'");
 
         // Destructure self to split reader and writer
         let NBDSession { mut reader, writer, router, shutdown, .. } = self;
@@ -603,6 +604,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
     ) -> Result<()> {
         // Reusable buffer for draining oversized write payloads (allocated on first use).
         let mut drain_buf: Option<Vec<u8>> = None;
+        let mut request_count: u64 = 0;
 
         loop {
             let mut request_buf = [0u8; NBD_REQUEST_HEADER_SIZE];
@@ -632,6 +634,14 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
             let request = NBDRequest::from_bytes((&request_buf, 0))
                 .map_err(|e| NBDError::Protocol(format!("Invalid request: {e}")))?
                 .1;
+
+            request_count += 1;
+            if request_count <= 3 || request_count % 1000 == 0 {
+                eprintln!(
+                    "[nbd] {export_name}: request #{request_count} cmd={:?} offset={} len={}",
+                    request.cmd_type, request.offset, request.length
+                );
+            }
 
             debug!(
                 "NBD command: {:?}, offset={}, length={}",
