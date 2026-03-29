@@ -153,11 +153,7 @@ jobs:
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
       - name: fio benchmark (ublk)
-        timeout-minutes: 5
-        run: |
-          timeout 120 sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture 2>&1 || true
-          echo "=== DMESG ==="
-          sudo dmesg | grep -i "segfault\|ublk" | tail -10
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
       - name: fio verify (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
       - name: Test (ublk)
@@ -166,7 +162,7 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose
       - name: Filesystem crash recovery (nbd + ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --verbose fs_crash -- --nocapture
-      - name: Kernel logs
+      - name: Kernel logs (on failure)
         if: failure()
         run: sudo dmesg --color=never | tail -200
 
