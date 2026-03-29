@@ -68,8 +68,8 @@ pub(crate) struct KernelFeatures {
 pub(crate) fn detect_features() -> KernelFeatures {
     let raw = UblkCtrl::get_features().unwrap_or(0);
     let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
-    // TODO: zero-copy disabled pending 6.17 AUTO_BUF_REG investigation
-    let zero_copy = false;
+    let zero_copy = (raw & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
+        && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
     let ioctl_encode = (raw & sys::UBLK_F_CMD_IOCTL_ENCODE as u64) != 0;
 
     tracing::info!(
@@ -81,27 +81,6 @@ pub(crate) fn detect_features() -> KernelFeatures {
     );
 
     KernelFeatures { recovery, zero_copy, ioctl_encode }
-}
-
-/// Check if the running kernel's ublk driver is compatible with our ublk-core.
-///
-/// Kernel 6.17+ (specifically the Azure 6.17.0-1008 build) changed the ublk
-/// START_DEV ioctl behavior — it now requires FETCH_REQ commands to be fully
-/// processed before START returns, but with IORING_SETUP_COOP_TASKRUN the
-/// task_work processing doesn't complete in time. Until ublk-core is updated,
-/// skip ublk tests on 6.17+.
-pub fn kernel_ublk_compatible() -> bool {
-    let ver = std::fs::read_to_string("/proc/version").unwrap_or_default();
-    if let Some(v) = ver.strip_prefix("Linux version ") {
-        let parts: Vec<&str> = v.split('.').collect();
-        if let (Some(major), Some(minor)) = (
-            parts.first().and_then(|s| s.parse::<u32>().ok()),
-            parts.get(1).and_then(|s| s.parse::<u32>().ok()),
-        ) {
-            return major < 6 || (major == 6 && minor < 17);
-        }
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -849,13 +828,6 @@ fn queue_io_loop(
     tokio_handle: &tokio::runtime::Handle,
     latch: &QueueLatch,
 ) {
-    // Install SIGSEGV handler to abort the process immediately (produces core
-    // dump) instead of letting the thread die silently while the main thread hangs.
-    unsafe {
-        libc::signal(libc::SIGSEGV, libc::SIG_DFL);
-        libc::prctl(libc::PR_SET_DUMPABLE, 1);
-    }
-
     // Initialize the thread-local io_uring before UblkQueue::new() so we can
     // set SINGLE_ISSUER — each queue thread is the sole submitter to its ring.
     let sq_depth = dev.tgt.sq_depth as u32;
@@ -875,7 +847,6 @@ fn queue_io_loop(
     }) {
         tracing::error!(qid, error = ?e, "failed to init io_uring for ublk queue");
         latch.signal_failed();
-
         return;
     }
 
@@ -884,7 +855,6 @@ fn queue_io_loop(
         Err(e) => {
             tracing::error!(qid, error = ?e, "failed to create ublk queue");
             latch.signal_failed();
-    
             return;
         }
     };
@@ -895,12 +865,12 @@ fn queue_io_loop(
         Err(e) => {
             tracing::error!(qid, error = ?e, "failed to create eventfd");
             latch.signal_failed();
-    
             return;
         }
     };
     let efd_fd = efd.fd();
 
+    latch.signal_ready();
     let zero_copy = q_rc.support_auto_buf_zc();
     let mut exe = QueueExecutor::new(efd_fd);
 
@@ -950,8 +920,6 @@ fn queue_io_loop(
             }
         });
     }
-
-    latch.signal_ready();
 
     // Drive the QueueExecutor via ublk_core's io_uring event loop.
     let q = q_rc.clone();

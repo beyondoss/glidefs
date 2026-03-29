@@ -2630,35 +2630,8 @@ impl UblkCtrl {
         Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
         W: FnOnce(&UblkCtrl) + Send + Sync + 'static,
     {
-        self.run_target_with_barrier(tgt_fn, q_fn, device_fn, None)
-    }
-
-    /// Like `run_target` but accepts an optional barrier that the main thread
-    /// waits on before calling `start_dev`. Queue threads should wait on the
-    /// same barrier after flushing their initial FETCH_REQ io_uring SQEs.
-    ///
-    /// This ensures FETCH_REQs reach the kernel before the START ioctl, which
-    /// is required on kernels that don't process FETCH_REQs concurrently with
-    /// START (e.g., Linux 6.17+).
-    pub fn run_target_with_barrier<T, Q, W>(
-        &self,
-        tgt_fn: T,
-        q_fn: Q,
-        device_fn: W,
-        pre_start_barrier: Option<&std::sync::Barrier>,
-    ) -> Result<i32, UblkError>
-    where
-        T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
-        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
-        W: FnOnce(&UblkCtrl) + Send + Sync + 'static,
-    {
         let dev = &Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);
         let handles = self.create_queue_handlers(dev, q_fn);
-
-        // Wait for queue threads to flush FETCH_REQ SQEs before START.
-        if let Some(barrier) = pre_start_barrier {
-            barrier.wait();
-        }
 
         self.start_dev(dev)?;
 
