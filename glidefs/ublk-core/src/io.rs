@@ -1202,25 +1202,20 @@ impl UblkQueue<'_> {
         let max_cmd_buf_sz = UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH) as libc::off_t;
 
         // Register files and buffers with the thread-local ring
-        eprintln!("[ublk-core] UblkQueue::new q{q_id}: register_files (nr_fds={})", tgt.nr_fds);
         with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
             ring.submitter()
                 .register_files(&tgt.fds[0..tgt.nr_fds as usize])
                 .map_err(UblkError::IOError)
         })?;
-        eprintln!("[ublk-core] UblkQueue::new q{q_id}: register_files done");
 
         if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
-            eprintln!("[ublk-core] UblkQueue::new q{q_id}: register_buffers_sparse(depth={depth})");
             with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
                 ring.submitter()
                     .register_buffers_sparse(depth)
                     .map_err(UblkError::IOError)
             })?;
-            eprintln!("[ublk-core] UblkQueue::new q{q_id}: register_buffers_sparse done");
         }
 
-        eprintln!("[ublk-core] UblkQueue::new q{q_id}: mmap cmd_buf");
         let off =
             sys::UBLKSRV_CMD_BUF_OFFSET as libc::off_t + (q_id as libc::off_t) * max_cmd_buf_sz;
         let io_cmd_buf = unsafe {

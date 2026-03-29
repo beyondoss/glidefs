@@ -670,7 +670,6 @@ fn run_device(
         ctrl_flags |= sys::UBLK_F_CMD_IOCTL_ENCODE as u64;
     }
 
-    eprintln!("[ublk] run_device: building ctrl (dev_flags={dev_flags:?}, ctrl_flags=0x{ctrl_flags:x})");
     let ctrl = match UblkCtrlBuilder::default()
         .name("glidefs")
         .id(dev_id)
@@ -688,7 +687,6 @@ fn run_device(
             return Err(err);
         }
     };
-    eprintln!("[ublk] run_device: ctrl built, calling run_target");
 
     // Extract data file fd for io_uring zero-copy registration.
     let data_file_fd = if features.zero_copy {
@@ -762,7 +760,6 @@ fn run_device(
 
     // Called after the device is started and serving I/O.
     let on_started = move |ctrl: &UblkCtrl| {
-        eprintln!("[ublk] on_started: device started, waiting for queue latch");
         // Wait for all queue threads to report initialization status.
         if !latch.wait_all(Duration::from_secs(5)) {
             let (reported, failed) = latch.counts();
@@ -811,7 +808,6 @@ fn run_device(
         }
     };
 
-    eprintln!("[ublk] run_device: entering run_target (blocks until kill_dev)");
     ctrl.run_target(tgt_init, q_handler, on_started)
         .map_err(|e| anyhow::anyhow!("ublk run_target failed: {}", e))?;
 
@@ -834,7 +830,6 @@ fn queue_io_loop(
 ) {
     // Initialize the thread-local io_uring before UblkQueue::new() so we can
     // set SINGLE_ISSUER — each queue thread is the sole submitter to its ring.
-    eprintln!("[ublk] queue {qid}: init io_uring");
     let sq_depth = dev.tgt.sq_depth as u32;
     let cq_depth = dev.tgt.cq_depth as u32;
     if let Err(e) = ublk_core::ublk_init_task_ring(|cell| {
@@ -855,7 +850,6 @@ fn queue_io_loop(
         return;
     }
 
-    eprintln!("[ublk] queue {qid}: creating UblkQueue");
     let q_rc = match UblkQueue::new(qid, dev) {
         Ok(q) => Rc::new(q),
         Err(e) => {
@@ -864,7 +858,6 @@ fn queue_io_loop(
             return;
         }
     };
-    eprintln!("[ublk] queue {qid}: UblkQueue created");
 
     // Create eventfd for cross-thread wakeup signaling.
     let efd = match EventFd::new() {
@@ -877,7 +870,6 @@ fn queue_io_loop(
     };
     let efd_fd = efd.fd();
 
-    eprintln!("[ublk] queue {qid}: signaling ready");
     latch.signal_ready();
     let zero_copy = q_rc.support_auto_buf_zc();
     let mut exe = QueueExecutor::new(efd_fd);
@@ -927,6 +919,32 @@ fn queue_io_loop(
                 }
             }
         });
+    }
+
+    // Flush initial FETCH_REQ SQEs to the kernel before entering the event
+    // loop. The kernel's START ioctl blocks until every queue tag has submitted
+    // a FETCH_REQ. Our event loop submits SQEs and then waits for CQEs in a
+    // single io_uring_enter(to_wait=1), but the kernel may not produce CQEs
+    // until START completes — deadlock. Flush-then-signal breaks the cycle:
+    // FETCH_REQs reach the kernel, START sees them and completes, then CQEs
+    // arrive and the event loop proceeds.
+    exe.tick(); // poll io_tasks → push FETCH_REQ SQEs to SQ ring
+    // Flush SQEs to the kernel without waiting for CQEs. submit_and_wait(0)
+    // calls io_uring_enter with to_submit=pending, to_wait=0.
+    {
+        use std::os::unix::io::AsRawFd;
+        let ring_fd = q_rc.as_raw_fd();
+        // SAFETY: io_uring_enter with to_wait=0 just flushes the SQ ring.
+        unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_enter,
+                ring_fd as libc::c_uint,
+                dev.dev_info.queue_depth as libc::c_uint, // to_submit
+                0 as libc::c_uint,                         // to_wait = 0
+                std::ptr::null::<libc::c_void>(),          // sig
+                0 as libc::size_t,                         // sig_sz
+            );
+        }
     }
 
     // Drive the QueueExecutor via ublk_core's io_uring event loop.

@@ -247,9 +247,6 @@ mod fio_bench {
 
     #[tokio::test]
     async fn fio_benchmark() {
-        let kver = std::fs::read_to_string("/proc/version").unwrap_or_default();
-        eprintln!("kernel: {}", kver.trim());
-
         if !ublk_available() {
             eprintln!("skipping fio benchmark: ublk_drv not available");
             return;
