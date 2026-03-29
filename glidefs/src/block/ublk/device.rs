@@ -56,6 +56,9 @@ pub(crate) struct KernelFeatures {
     /// `UBLK_F_SUPPORT_ZERO_COPY` + `UBLK_F_AUTO_BUF_REG` — DMA-mapped buffers,
     /// no kernel↔userspace memcpy.
     pub zero_copy: bool,
+    /// `UBLK_F_CMD_IOCTL_ENCODE` — uring commands use ioctl encoding.
+    /// Required on kernels built without `CONFIG_BLKDEV_UBLK_LEGACY_OPCODES`.
+    pub ioctl_encode: bool,
 }
 
 /// Probe the running kernel for supported ublk feature flags.
@@ -66,16 +69,43 @@ pub(crate) fn detect_features() -> KernelFeatures {
     let raw = UblkCtrl::get_features().unwrap_or(0);
     let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
     let zero_copy = (raw & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
-        && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
+        && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
+        && kernel_auto_buf_reg_safe();
+    let ioctl_encode = (raw & sys::UBLK_F_CMD_IOCTL_ENCODE as u64) != 0;
 
     tracing::info!(
         recovery,
         zero_copy,
-        raw_features = raw,
+        ioctl_encode,
+        raw_features = format_args!("0x{:x}", raw),
         "ublk kernel feature detection"
     );
 
-    KernelFeatures { recovery, zero_copy }
+    KernelFeatures { recovery, zero_copy, ioctl_encode }
+}
+
+/// Check if the running kernel's UBLK_F_AUTO_BUF_REG implementation is safe.
+///
+/// The Azure 6.17 kernel advertises AUTO_BUF_REG in GET_FEATURES but doesn't
+/// implement it — the kernel treats sqe->addr as a raw buffer pointer instead
+/// of decoding the packed ublk_auto_buf_reg struct. This causes io_uring_enter
+/// to hang during FETCH_REQ submission and segfaults when I/O is dispatched
+/// (writes to the packed index|flags value, e.g. address 0x10000 for tag 0).
+///
+/// AUTO_BUF_REG was merged in mainline 6.16. Require >= 6.18 to avoid broken
+/// early implementations; refine as we validate more kernels.
+fn kernel_auto_buf_reg_safe() -> bool {
+    let ver = std::fs::read_to_string("/proc/version").unwrap_or_default();
+    if let Some(rest) = ver.strip_prefix("Linux version ") {
+        let parts: Vec<&str> = rest.split(|c: char| !c.is_ascii_digit()).collect();
+        if let (Some(major), Some(minor)) = (
+            parts.first().and_then(|s| s.parse::<u32>().ok()),
+            parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+        ) {
+            return major > 6 || (major == 6 && minor >= 18);
+        }
+    }
+    false // unknown kernel — don't risk it
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +207,23 @@ impl UblkDevice {
             .map_err(|_| anyhow::anyhow!("ublk worker thread failed during setup"))??;
 
         let dev_path = PathBuf::from(dev_path_str);
+
+        // Tune kernel block queue for a userspace device:
+        // - wbt (write-back throttle): default 2ms target is too aggressive for ublk —
+        //   I/O round-trips through io_uring and will exceed that under load, causing
+        //   wbt to progressively choke writes down to zero.
+        // - scheduler: mq-deadline adds sorting/merging overhead that's pointless here
+        //   since we handle our own I/O ordering in userspace.
+        if let Some(dev_name) = dev_path.file_name().and_then(|n| n.to_str()) {
+            let queue = format!("/sys/block/{dev_name}/queue");
+            for (param, value) in [("wbt_lat_usec", "0"), ("scheduler", "none")] {
+                let path = format!("{queue}/{param}");
+                if let Err(e) = std::fs::write(&path, value) {
+                    tracing::warn!(path = %path, error = %e, "failed to set block queue param");
+                }
+            }
+        }
+
         tracing::info!(dev_id, path = %dev_path.display(), "ublk device registered");
 
         Ok(Self {
@@ -644,6 +691,9 @@ fn run_device(
         ctrl_flags |=
             sys::UBLK_F_SUPPORT_ZERO_COPY as u64 | sys::UBLK_F_AUTO_BUF_REG as u64;
     }
+    if features.ioctl_encode {
+        ctrl_flags |= sys::UBLK_F_CMD_IOCTL_ENCODE as u64;
+    }
 
     let ctrl = match UblkCtrlBuilder::default()
         .name("glidefs")
@@ -809,9 +859,16 @@ fn queue_io_loop(
     let cq_depth = dev.tgt.cq_depth as u32;
     if let Err(e) = ublk_core::ublk_init_task_ring(|cell| {
         if cell.get().is_none() {
+            // NOTE: COOP_TASKRUN intentionally omitted. With COOP_TASKRUN,
+            // io_uring defers uring_cmd task_work to io_uring_enter. But
+            // the ublk kernel driver's ublk_fetch() acquires ub->mutex,
+            // which START_DEV also holds. If FETCH_REQ processing runs
+            // inside io_uring_enter (COOP_TASKRUN), it deadlocks with
+            // START on the mutex. Without COOP_TASKRUN, the kernel
+            // processes FETCH_REQs asynchronously via interrupt-driven
+            // task_work, avoiding the mutex contention.
             let ring = io_uring::IoUring::builder()
                 .setup_cqsize(cq_depth)
-                .setup_coop_taskrun()
                 .setup_single_issuer()
                 .build(sq_depth)
                 .map_err(ublk_core::UblkError::IOError)?;

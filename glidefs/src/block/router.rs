@@ -102,6 +102,8 @@ pub struct ExportInfo {
     pub readonly: bool,
     pub transport: String,
     pub device: Option<PathBuf>,
+    /// S3 prefix for pack/manifest storage (None = export name).
+    pub s3_prefix: Option<String>,
     /// Unflushed bytes waiting to be synced to S3.
     pub dirty_bytes: u64,
     /// Total logical bytes stored in S3 (chunks × chunk_size).
@@ -144,6 +146,9 @@ pub struct ExportState {
     pub transport: String,
     flush_shutdown_tx: watch::Sender<bool>,
     flush_handle: JoinHandle<()>,
+    /// Background hot-set prefetch task (if spawned). Aborted on teardown
+    /// to release Arc references to cache/content_store/etc.
+    prefetch_handle: Option<JoinHandle<()>>,
 }
 
 /// Maximum drain iterations before giving up. Prevents infinite loops when
@@ -962,7 +967,9 @@ impl ExportRouter {
         // Boot hot set prefetch: warm the clean cache before the VM reads.
         // On cache hit, spawn prefetch immediately. On cache miss, the S3
         // fetch is done inside the spawned task so it doesn't block fork creation.
-        if let Some(manifest_name) = manifest_name {
+        // The JoinHandle is stored in ExportState so teardown can abort it,
+        // releasing Arc references to cache/content_store/etc.
+        let prefetch_handle = if let Some(manifest_name) = manifest_name {
             let hot_set_name = manifest_name
                 .strip_prefix("bases/")
                 .unwrap_or(manifest_name);
@@ -984,16 +991,16 @@ impl ExportRouter {
             if let Some(chunks) = cached_hot_set {
                 debug!(hot_set = %hot_set_name, "hot set cache hit");
                 info!(chunks = chunks.len(), "prefetching boot hot set");
-                spawn_named("hot-set-prefetch", async move {
+                Some(spawn_named("hot-set-prefetch", async move {
                     cache_clone
                         .prefetch_chunks(&chunks, &cmc, &vm, &cs)
                         .await;
                     info!("boot hot set prefetch complete");
-                });
+                }))
             } else {
                 let hot_set_name = hot_set_name.to_string();
                 let hot_set_cache = Arc::clone(&self.hot_set_cache);
-                spawn_named("hot-set-prefetch", async move {
+                Some(spawn_named("hot-set-prefetch", async move {
                     let chunks = match cs.get_hot_set(&hot_set_name).await {
                         Ok(Some(data)) => match deserialize_hot_set(&data) {
                             Ok(chunks) => {
@@ -1027,9 +1034,11 @@ impl ExportRouter {
                             .await;
                         info!("boot hot set prefetch complete");
                     }
-                });
+                }))
             }
-        }
+        } else {
+            None
+        };
 
         // Resolve per-export flush_threshold: export config > global default.
         // 0 = manual mode (no auto-flush).
@@ -1094,6 +1103,7 @@ impl ExportRouter {
             transport: transport.clone(),
             flush_shutdown_tx,
             flush_handle,
+            prefetch_handle,
         };
 
         let mut exports = self.exports.write().await;
@@ -1273,6 +1283,7 @@ impl ExportRouter {
                 readonly: state.readonly,
                 transport: state.transport.clone(),
                 device: None,
+                s3_prefix: state.s3_prefix.clone(),
                 dirty_bytes: state.cache.dirty_block_count() * block_size,
                 s3_bytes,
             }
@@ -1308,6 +1319,7 @@ impl ExportRouter {
                     readonly: state.readonly,
                     transport: state.transport.clone(),
                     device: None,
+                    s3_prefix: state.s3_prefix.clone(),
                     dirty_bytes: state.cache.dirty_block_count() * block_size,
                     s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
                 }
@@ -1919,6 +1931,10 @@ impl ExportRouter {
         drop(exports);
 
         for (name, state) in export_list {
+            if let Some(handle) = state.prefetch_handle {
+                handle.abort();
+                let _ = handle.await;
+            }
             let _ = state.flush_shutdown_tx.send(true);
             if let Err(e) = state.flush_handle.await {
                 tracing::warn!("Flush scheduler for '{}' panicked: {}", name, e);
@@ -1945,8 +1961,15 @@ impl ExportRouter {
             metrics,
             flush_shutdown_tx,
             flush_handle,
+            prefetch_handle,
             ..
         } = state;
+
+        // 0. Abort the hot-set prefetch task (if running) to release Arc clones.
+        if let Some(handle) = prefetch_handle {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         // 1. Signal flush scheduler to stop
         let _ = flush_shutdown_tx.send(true);

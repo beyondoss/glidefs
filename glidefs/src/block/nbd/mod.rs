@@ -328,6 +328,19 @@ impl NbdDeviceManager {
         // through the new NBD session, causing cumulative corruption.
         flush_block_device_buffers(&dev_path);
 
+        // Tune kernel block queue — same rationale as ublk: wbt's default 2ms
+        // target is too aggressive for a userspace block device, and mq-deadline
+        // adds overhead we don't need since we handle I/O ordering ourselves.
+        if let Some(dev_name) = dev_path.file_name().and_then(|n| n.to_str()) {
+            let queue = format!("/sys/block/{dev_name}/queue");
+            for (param, value) in [("wbt_lat_usec", "0"), ("scheduler", "none")] {
+                let path = format!("{queue}/{param}");
+                if let Err(e) = std::fs::write(&path, value) {
+                    warn!(path = %path, error = %e, "failed to set block queue param");
+                }
+            }
+        }
+
         info!(
             export = %export_name,
             path = %dev_path.display(),
