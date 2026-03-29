@@ -152,32 +152,53 @@ jobs:
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
-      - name: ublk debug (kernel 6.17 START_DEV)
-        timeout-minutes: 3
-        run: |
-          cat /boot/config-$(uname -r) | grep -i "UBLK\|LEGACY_OPCODE" || echo "no ublk config"
-          # Minimal ublk device test using ublksrv tooling
-          sudo modprobe ublk_drv
-          # Check if the upstream ublk null target works
-          which ublk 2>/dev/null && sudo ublk add -t null --queues 1 --depth 128 && echo "ublk null device created" && sudo ublk del -a || echo "no ublk CLI"
-          # Try with our binary but just the device creation part
-          sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture 2>&1 &
-          PID=$!
-          sleep 30
-          echo "=== After 30s ==="
-          sudo dmesg | grep -i "ublk\|segfault" | tail -20
-          if [ -d "/proc/$PID" ]; then
-            echo "=== Process still running, getting thread stacks ==="
-            ls /proc/$PID/task/ | while read tid; do
-              echo "--- Thread $tid ---"
-              cat /proc/$PID/task/$tid/wchan 2>/dev/null
-              cat /proc/$PID/task/$tid/syscall 2>/dev/null | head -1
-            done
-          fi
-          kill $PID 2>/dev/null; wait $PID 2>/dev/null || true
       - name: fio benchmark (ublk)
         timeout-minutes: 5
-        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
+        run: |
+          # Build with debug info so we can decode the crash
+          export CARGO_PROFILE_RELEASE_DEBUG=2
+          sudo -E env "PATH=$PATH" CARGO_PROFILE_RELEASE_DEBUG=2 \
+            cargo test -p glidefs --release --features fio-bench --test fio_bench --no-run 2>&1 | tail -3
+          binary=$(find target/release/deps -name 'fio_bench-*' -executable | head -1)
+          # Enable core dumps
+          sudo sysctl -w kernel.core_pattern=/tmp/core.%e.%p
+          # Run directly (not through cargo test) so core dump works with sudo
+          sudo bash -c "ulimit -c unlimited; exec $binary --nocapture" &
+          PID=$!
+          # Wait for completion or crash (max 4 min)
+          for i in $(seq 1 240); do
+            if ! kill -0 $PID 2>/dev/null; then break; fi
+            sleep 1
+          done
+          # Collect crash info
+          echo "=== DMESG ==="
+          sudo dmesg | grep -i "segfault\|ublk" | tail -10
+          # Decode crash with addr2line
+          segline=$(sudo dmesg | grep "segfault" | tail -1)
+          crash_ip=$(echo "$segline" | grep -oP 'ip \K[0-9a-f]+')
+          if [ -n "$crash_ip" ] && [ -n "$binary" ]; then
+            echo "=== CRASH DECODE ==="
+            # Get binary load address from maps (before process dies)
+            sudo apt-get install -y -qq binutils gdb > /dev/null 2>&1
+            # The IP is absolute. Get text base from the binary.
+            text_vaddr=$(readelf -l "$binary" 2>/dev/null | grep LOAD | head -1 | awk '{print $3}')
+            echo "crash_ip=0x$crash_ip text_base=$text_vaddr"
+            # addr2line on the binary directly (PIE binary, so subtract load address)
+            addr2line -e "$binary" -f -C "0x$crash_ip" 2>/dev/null || echo "addr2line failed"
+            # Also try with objdump
+            echo "=== NEARBY CODE ==="
+            objdump -d -l --start-address=0x$crash_ip "$binary" 2>/dev/null | head -30
+          fi
+          # Try core dump
+          for core in /tmp/core.*; do
+            if [ -f "$core" ]; then
+              echo "=== CORE BACKTRACE ==="
+              gdb -batch -ex "thread apply all bt" "$binary" "$core" 2>&1 | head -150
+            fi
+          done
+          kill $PID 2>/dev/null; wait $PID 2>/dev/null || true
+          # Fail if there was a segfault
+          [ -z "$crash_ip" ] || exit 1
       - name: fio verify (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
       - name: Test (ublk)
