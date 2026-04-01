@@ -29,7 +29,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Notify, RwLock, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Maximum number of entries in the base manifest / hot set caches.
 /// Bases are immutable after bless, so eviction policy doesn't matter —
@@ -108,6 +108,8 @@ pub struct ExportInfo {
     pub dirty_bytes: u64,
     /// Total logical bytes stored in S3 (chunks × chunk_size).
     pub s3_bytes: u64,
+    /// Filesystem used bytes from ext4 superblock (None if not ext4 or read failed).
+    pub fs_used_bytes: Option<u64>,
 }
 
 /// Readiness check result for health endpoint.
@@ -154,6 +156,38 @@ pub struct ExportState {
 /// Maximum drain iterations before giving up. Prevents infinite loops when
 /// concurrent writes keep producing new dirty blocks faster than we flush.
 const MAX_DRAIN_ITERATIONS: usize = 100;
+
+/// Superblock offset in bytes (always 1024 for ext4).
+const EXT4_SUPERBLOCK_OFFSET: u64 = 1024;
+
+/// Superblock size in bytes.
+const EXT4_SUPERBLOCK_SIZE: u32 = 1024;
+
+/// Read filesystem used bytes from ext4 superblock.
+///
+/// Returns `None` if the read fails or the data isn't a valid ext4 superblock.
+/// This is a best-effort operation - failures are logged but don't propagate.
+async fn read_fs_used_bytes(handler: &BlockHandler) -> Option<u64> {
+    // Read superblock (at offset 1024, size 1024 bytes).
+    let data = match handler.read(EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE).await {
+        Ok(d) => d,
+        Err(e) => {
+            trace!(error = %e, "failed to read superblock for fs_used_bytes");
+            return None;
+        }
+    };
+
+    // Parse superblock.
+    let sb = match ext4::format::SuperBlock::read_from(&data) {
+        Ok(sb) => sb,
+        Err(e) => {
+            trace!(error = %e, "failed to parse ext4 superblock");
+            return None;
+        }
+    };
+
+    Some(sb.used_bytes())
+}
 
 /// Configuration for the export router.
 pub struct RouterConfig {
@@ -1270,14 +1304,14 @@ impl ExportRouter {
 
     /// Get info for a single export.
     pub async fn get_export_info(&self, name: &str) -> Option<ExportInfo> {
-        let mut info = {
+        let (mut info, handler) = {
             let exports = self.exports.read().await;
             let state = exports.get(name)?;
             let block_size = state.cache.block_size() as u64;
             let manifest = state.volume_manifest.read();
             let s3_bytes = manifest.chunks.len() as u64 * manifest.chunk_size;
             drop(manifest);
-            ExportInfo {
+            let info = ExportInfo {
                 name: name.to_string(),
                 size: state.handler.device_size(),
                 readonly: state.readonly,
@@ -1286,9 +1320,12 @@ impl ExportRouter {
                 s3_prefix: state.s3_prefix.clone(),
                 dirty_bytes: state.cache.dirty_block_count() * block_size,
                 s3_bytes,
-            }
+                fs_used_bytes: None,
+            };
+            (info, Arc::clone(&state.handler))
         };
         info.device = self.get_device_path(name).await;
+        info.fs_used_bytes = read_fs_used_bytes(&handler).await;
         Some(info)
     }
 
@@ -1307,29 +1344,34 @@ impl ExportRouter {
 
     /// List all exports.
     pub async fn list_exports(&self) -> Vec<ExportInfo> {
-        let exports = self.exports.read().await;
-        let mut result: Vec<ExportInfo> = exports
-            .iter()
-            .map(|(name, state)| {
-                let block_size = state.cache.block_size() as u64;
-                let manifest = state.volume_manifest.read();
-                ExportInfo {
-                    name: name.clone(),
-                    size: state.handler.device_size(),
-                    readonly: state.readonly,
-                    transport: state.transport.clone(),
-                    device: None,
-                    s3_prefix: state.s3_prefix.clone(),
-                    dirty_bytes: state.cache.dirty_block_count() * block_size,
-                    s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
-                }
-            })
-            .collect();
-        drop(exports);
+        // First pass: collect basic info and handlers.
+        let (mut result, handlers): (Vec<ExportInfo>, Vec<Arc<BlockHandler>>) = {
+            let exports = self.exports.read().await;
+            exports
+                .iter()
+                .map(|(name, state)| {
+                    let block_size = state.cache.block_size() as u64;
+                    let manifest = state.volume_manifest.read();
+                    let info = ExportInfo {
+                        name: name.clone(),
+                        size: state.handler.device_size(),
+                        readonly: state.readonly,
+                        transport: state.transport.clone(),
+                        device: None,
+                        s3_prefix: state.s3_prefix.clone(),
+                        dirty_bytes: state.cache.dirty_block_count() * block_size,
+                        s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
+                        fs_used_bytes: None,
+                    };
+                    (info, Arc::clone(&state.handler))
+                })
+                .unzip()
+        };
 
-        // Populate device paths from device managers.
-        for info in &mut result {
+        // Second pass: populate device paths and fs_used_bytes.
+        for (info, handler) in result.iter_mut().zip(handlers.iter()) {
             info.device = self.get_device_path(&info.name).await;
+            info.fs_used_bytes = read_fs_used_bytes(handler).await;
         }
 
         result
