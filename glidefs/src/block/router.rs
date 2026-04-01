@@ -172,7 +172,7 @@ async fn read_fs_used_bytes(handler: &BlockHandler) -> Option<u64> {
     let data = match handler.read(EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE).await {
         Ok(d) => d,
         Err(e) => {
-            trace!(error = %e, "failed to read superblock for fs_used_bytes");
+            trace!(error = ?e, "failed to read superblock for fs_used_bytes");
             return None;
         }
     };
