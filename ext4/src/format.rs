@@ -734,10 +734,42 @@ impl SuperBlock {
             desc_size: le_u16(buf, 254),
             journal_blocks,
             blocks_count_high: le_u32(buf, 336),
+            r_blocks_count_high: le_u32(buf, 340),
+            free_blocks_count_high: le_u32(buf, 344),
             log_groups_per_flex: buf[372],
             lpf_inode: le_u32(buf, 616),
             ..Default::default()
         })
+    }
+
+    /// Calculate the filesystem block size in bytes.
+    pub fn block_size(&self) -> u64 {
+        1024u64 << self.log_block_size
+    }
+
+    /// Calculate total block count (combining low and high 32-bit parts).
+    pub fn total_blocks(&self) -> u64 {
+        (self.blocks_count_low as u64) | ((self.blocks_count_high as u64) << 32)
+    }
+
+    /// Calculate free block count (combining low and high 32-bit parts).
+    pub fn free_blocks(&self) -> u64 {
+        (self.free_blocks_count_low as u64) | ((self.free_blocks_count_high as u64) << 32)
+    }
+
+    /// Calculate used blocks.
+    pub fn used_blocks(&self) -> u64 {
+        self.total_blocks().saturating_sub(self.free_blocks())
+    }
+
+    /// Calculate filesystem used bytes from superblock counters.
+    ///
+    /// Returns the number of bytes used by the filesystem, computed as:
+    /// `(total_blocks - free_blocks) * block_size`
+    ///
+    /// This matches what `dumpe2fs` reports as block-level usage.
+    pub fn used_bytes(&self) -> u64 {
+        self.used_blocks() * self.block_size()
     }
 }
 
@@ -1053,5 +1085,110 @@ pub fn get_xattrs(buf: &[u8], xattrs: &mut BTreeMap<String, Vec<u8>>, offset_del
         xattrs.insert(full_name, value);
         let entry_len = ((name_len + 3) & !3usize) + 16;
         pos += entry_len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a minimal valid superblock buffer for testing.
+    fn make_test_superblock(
+        blocks_count_low: u32,
+        blocks_count_high: u32,
+        free_blocks_count_low: u32,
+        free_blocks_count_high: u32,
+        log_block_size: u32,
+    ) -> [u8; 1024] {
+        let mut buf = [0u8; 1024];
+        // blocks_count_low at offset 4
+        buf[4..8].copy_from_slice(&blocks_count_low.to_le_bytes());
+        // free_blocks_count_low at offset 12
+        buf[12..16].copy_from_slice(&free_blocks_count_low.to_le_bytes());
+        // log_block_size at offset 24
+        buf[24..28].copy_from_slice(&log_block_size.to_le_bytes());
+        // magic at offset 56
+        buf[56..58].copy_from_slice(&SUPER_BLOCK_MAGIC.to_le_bytes());
+        // blocks_count_high at offset 336
+        buf[336..340].copy_from_slice(&blocks_count_high.to_le_bytes());
+        // free_blocks_count_high at offset 344
+        buf[344..348].copy_from_slice(&free_blocks_count_high.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_superblock_block_size() {
+        // log_block_size = 0 means 1024 << 0 = 1024 bytes
+        let buf = make_test_superblock(1000, 0, 500, 0, 0);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.block_size(), 1024);
+
+        // log_block_size = 2 means 1024 << 2 = 4096 bytes
+        let buf = make_test_superblock(1000, 0, 500, 0, 2);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.block_size(), 4096);
+    }
+
+    #[test]
+    fn test_superblock_total_blocks_32bit() {
+        let buf = make_test_superblock(1_000_000, 0, 500_000, 0, 0);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.total_blocks(), 1_000_000);
+    }
+
+    #[test]
+    fn test_superblock_total_blocks_64bit() {
+        // Test with high bits set (large filesystem)
+        let buf = make_test_superblock(0, 1, 0, 0, 0);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.total_blocks(), 1u64 << 32);
+
+        // Combined: low = 100, high = 2 => 2 * 2^32 + 100
+        let buf = make_test_superblock(100, 2, 0, 0, 0);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.total_blocks(), (2u64 << 32) + 100);
+    }
+
+    #[test]
+    fn test_superblock_free_blocks_64bit() {
+        // Test with high bits set
+        let buf = make_test_superblock(0, 0, 500, 1, 0);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.free_blocks(), (1u64 << 32) + 500);
+    }
+
+    #[test]
+    fn test_superblock_used_blocks() {
+        let buf = make_test_superblock(1_000_000, 0, 400_000, 0, 0);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.used_blocks(), 600_000);
+    }
+
+    #[test]
+    fn test_superblock_used_bytes() {
+        // 1000 total blocks, 400 free, 600 used, 4096 byte blocks
+        // used_bytes = 600 * 4096 = 2,457,600
+        let buf = make_test_superblock(1000, 0, 400, 0, 2);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.used_bytes(), 600 * 4096);
+    }
+
+    #[test]
+    fn test_superblock_used_bytes_large_fs() {
+        // Simulate a ~4TB filesystem with 4KB blocks
+        // total = 1 billion blocks, free = 200 million, used = 800 million
+        // This fits in 32-bit, but tests the calculation at scale
+        let buf = make_test_superblock(1_000_000_000, 0, 200_000_000, 0, 2);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.used_blocks(), 800_000_000);
+        assert_eq!(sb.used_bytes(), 800_000_000u64 * 4096);
+    }
+
+    #[test]
+    fn test_superblock_used_bytes_saturating() {
+        // Edge case: free > total (shouldn't happen, but test saturating_sub)
+        let buf = make_test_superblock(100, 0, 200, 0, 0);
+        let sb = SuperBlock::read_from(&buf).unwrap();
+        assert_eq!(sb.used_blocks(), 0); // saturating_sub prevents underflow
     }
 }
