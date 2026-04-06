@@ -665,6 +665,12 @@ where
             json_response(code, &status)
         }
 
+        // GET /api/stats - aggregate stats for host pressure monitoring
+        (Method::GET, ["api", "stats"]) => {
+            let stats = router.aggregate_stats().await;
+            json_response(StatusCode::OK, &stats)
+        }
+
         // GET /metrics - Prometheus metrics for all exports
         (Method::GET, ["metrics"]) => {
             let mut output = String::from(prometheus_header());

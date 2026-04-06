@@ -121,6 +121,17 @@ pub struct ReadinessStatus {
     pub s3_reachable: bool,
 }
 
+/// Aggregate stats across all exports for host-level pressure monitoring.
+#[derive(Debug, Serialize)]
+pub struct AggregateStats {
+    pub ssd_utilization: f64,
+    pub s3_circuit_state: u8,
+    pub total_cache_hits: u64,
+    pub total_cache_misses: u64,
+    pub total_dirty_bytes: u64,
+    pub exports_count: usize,
+}
+
 /// Response from a snapshot operation.
 #[derive(Debug, Serialize)]
 pub struct SnapshotResponse {
@@ -1582,6 +1593,40 @@ impl ExportRouter {
     }
 
     /// Snapshot metrics for all exports under a single lock acquisition.
+    /// Aggregate stats across all exports for host-level pressure monitoring.
+    /// Cheap — reads in-memory atomics only, no I/O.
+    pub async fn aggregate_stats(&self) -> AggregateStats {
+        use crate::circuit_breaker::CircuitState;
+        use std::sync::atomic::Ordering;
+
+        let exports = self.exports.read().await;
+        let mut total_cache_hits: u64 = 0;
+        let mut total_cache_misses: u64 = 0;
+        let mut total_dirty_bytes: u64 = 0;
+
+        for state in exports.values() {
+            total_cache_hits += state.metrics.cache_hits.load(Ordering::Relaxed);
+            total_cache_misses += state.metrics.cache_misses.load(Ordering::Relaxed);
+            let block_size = state.cache.block_size() as u64;
+            total_dirty_bytes += state.cache.dirty_block_count() * block_size;
+        }
+
+        let s3_circuit_state = match self.s3_circuit_state() {
+            CircuitState::Closed { .. } => 0,
+            CircuitState::Open => 1,
+            CircuitState::HalfOpen { .. } => 2,
+        };
+
+        AggregateStats {
+            ssd_utilization: self.ssd_utilization(),
+            s3_circuit_state,
+            total_cache_hits,
+            total_cache_misses,
+            total_dirty_bytes,
+            exports_count: exports.len(),
+        }
+    }
+
     pub async fn all_export_metrics(&self) -> Vec<(String, MetricsSnapshot)> {
         let exports = self.exports.read().await;
         exports
