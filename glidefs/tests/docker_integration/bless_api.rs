@@ -292,11 +292,17 @@ async fn poll_bless_complete(router: &Arc<ExportRouter>, s3_prefix: &str, name: 
         }
 
         assert_eq!(status, StatusCode::OK, "unexpected status during poll");
-        let status: BlessStatus = serde_json::from_slice(&body).unwrap();
+        let poll_status: BlessStatus = serde_json::from_slice(&body).unwrap();
+
+        // Task may complete between iterations — GET falls back to S3 and returns "complete".
+        if poll_status.state == "complete" {
+            return;
+        }
+
         assert!(
-            status.state == "pulling" || status.state == "draining",
+            poll_status.state == "pulling" || poll_status.state == "draining",
             "unexpected state during poll: {}",
-            status.state
+            poll_status.state
         );
     }
     panic!("bless did not complete within 60s");
