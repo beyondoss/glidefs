@@ -29,7 +29,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{Notify, RwLock, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, trace, warn};
+use serde::Deserialize;
+use tracing::{debug, error, info, trace, warn};
 
 /// Maximum number of entries in the base manifest / hot set caches.
 /// Bases are immutable after bless, so eviction policy doesn't matter —
@@ -92,6 +93,16 @@ pub enum RouterError {
         incomplete_count: usize,
         details: String,
     },
+
+    #[error("OCI pull error: {0}")]
+    OciPull(String),
+}
+
+/// Status of an in-flight OCI bless operation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlessStatus {
+    pub state: String,
+    pub oci_image: String,
 }
 
 /// Information about an export.
@@ -296,6 +307,10 @@ pub struct ExportRouter {
     /// Key: "{s3_prefix}:{hot_set_name}" → parsed block indices.
     /// Arc-wrapped so it can be shared with background prefetch tasks.
     hot_set_cache: Arc<parking_lot::Mutex<HashMap<String, Arc<Vec<u64>>>>>,
+
+    /// In-flight OCI bless tasks: "{s3_prefix}/{name}" → status.
+    /// Entries exist only while in-flight. Removed on completion or failure.
+    bless_tasks: RwLock<HashMap<String, BlessStatus>>,
 }
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
@@ -396,6 +411,7 @@ impl ExportRouter {
             ublk_server,
             base_manifest_cache: parking_lot::Mutex::new(HashMap::new()),
             hot_set_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            bless_tasks: RwLock::new(HashMap::new()),
         })
     }
 
@@ -1276,6 +1292,299 @@ impl ExportRouter {
         cs.head_manifest(manifest_name)
             .await
             .map_err(RouterError::ContentStore)
+    }
+
+    /// Get the status of an in-flight bless task.
+    pub async fn get_bless_status(&self, key: &str) -> Option<BlessStatus> {
+        self.bless_tasks.read().await.get(key).cloned()
+    }
+
+    /// Start an OCI image bless operation.
+    ///
+    /// Returns immediately with the current status:
+    /// - If the manifest already exists in S3, returns `{ state: "complete" }`.
+    /// - If a bless is already in-flight for this key, returns the current status.
+    /// - Otherwise, spawns a background task and returns `{ state: "pulling" }`.
+    ///
+    /// The spawned task adapts the CLI bless flow (`cli/bless.rs:run_bless_oci`)
+    /// to reuse the running router's shared S3/cache infrastructure.
+    pub async fn bless_oci_image(
+        self: &Arc<Self>,
+        s3_prefix: &str,
+        name: &str,
+        oci_image: &str,
+        credentials: oci_registry::Credentials,
+    ) -> Result<BlessStatus, RouterError> {
+        let key = format!("{s3_prefix}/{name}");
+
+        // Check if already in-flight.
+        {
+            let tasks = self.bless_tasks.read().await;
+            if let Some(status) = tasks.get(&key) {
+                return Ok(status.clone());
+            }
+        }
+
+        // Check if manifest already exists in S3.
+        let manifest_name = format!("bases/{}", name);
+        if self.head_manifest(s3_prefix, &manifest_name).await? {
+            return Ok(BlessStatus {
+                state: "complete".to_string(),
+                oci_image: oci_image.to_string(),
+            });
+        }
+
+        // Double-check under write lock and insert.
+        let status = BlessStatus {
+            state: "pulling".to_string(),
+            oci_image: oci_image.to_string(),
+        };
+        {
+            let mut tasks = self.bless_tasks.write().await;
+            if let Some(existing) = tasks.get(&key) {
+                return Ok(existing.clone());
+            }
+            tasks.insert(key.clone(), status.clone());
+        }
+
+        // Spawn the background ingest task.
+        let router = Arc::clone(self);
+        let s3_prefix = s3_prefix.to_string();
+        let name = name.to_string();
+        let oci_image = oci_image.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = router
+                .run_bless_oci_task(&s3_prefix, &name, &oci_image, credentials)
+                .await
+            {
+                error!(
+                    s3_prefix = %s3_prefix,
+                    name = %name,
+                    oci_image = %oci_image,
+                    error = %e,
+                    "bless OCI task failed"
+                );
+            }
+            // Remove task entry on both success and failure.
+            router.bless_tasks.write().await.remove(&format!("{s3_prefix}/{name}"));
+        });
+
+        Ok(status)
+    }
+
+    /// Background bless task body. Adapted from `cli/bless.rs:run_bless_oci`.
+    async fn run_bless_oci_task(
+        &self,
+        s3_prefix: &str,
+        name: &str,
+        oci_image: &str,
+        credentials: oci_registry::Credentials,
+    ) -> Result<(), RouterError> {
+        use crate::block::handler::BlockHandler;
+        use crate::block::manifest::serialize_hot_set;
+        use crate::block::metrics::ExportMetrics;
+        use crate::block::pack::DEFAULT_FLUSH_THRESHOLD;
+        use crate::block::write_cache::{WriteCache, WriteCacheConfig};
+        use crate::oci::ingest::IngestOptions;
+        use crate::oci::pull::pull_image;
+        use ext4::writer::WriterOption;
+        use oci_registry::RegistryClient;
+
+        let start = std::time::Instant::now();
+
+        // --- Resolve OCI image ---
+        let registry_client = RegistryClient::new();
+        let image: oci_registry::Reference = oci_image
+            .parse()
+            .map_err(|e| RouterError::OciPull(format!("invalid image reference: {e}")))?;
+
+        info!(image = %oci_image, name = %name, s3_prefix = %s3_prefix, "resolving OCI image");
+
+        let resolved = registry_client
+            .resolve(&image, &credentials)
+            .await
+            .map_err(|e| RouterError::OciPull(format!("failed to resolve image: {e}")))?;
+
+        // Estimate device size: compressed × 3, next power-of-2, min 64 MiB.
+        let total_compressed: u64 = resolved.layers.iter().map(|l| l.size as u64).sum();
+        let estimated = (total_compressed * 3).max(64 * 1024 * 1024);
+        let device_size = estimated.next_power_of_two();
+
+        info!(
+            layers = resolved.layers.len(),
+            total_compressed,
+            device_size,
+            "estimated device size"
+        );
+
+        // --- Temporary infrastructure ---
+        let temp_dir = tempfile::TempDir::new().map_err(RouterError::Io)?;
+        let cache = Arc::new(WriteCache::open_fresh_active(WriteCacheConfig {
+            cache_dir: temp_dir.path().to_path_buf(),
+            device_name: format!("bless-oci-{}", name),
+            device_size,
+            block_size: self.block_size,
+            wal_sync: false,
+        })?);
+
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            device_size,
+            self.block_size as u32,
+        )));
+
+        // Build ContentStore reusing router's shared infra.
+        let s3_base = format!("{}/exports/{}", self.db_path, s3_prefix);
+        let mut cs = ContentStore::new(Arc::clone(&self.object_store), &s3_base)
+            .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker));
+        if let Some(sem) = &self.upload_semaphore {
+            cs = cs.with_upload_semaphore(Arc::clone(sem));
+        }
+        if let Some(sem) = &self.download_semaphore {
+            cs = cs.with_download_semaphore(Arc::clone(sem));
+        }
+        let content_store = Arc::new(cs);
+
+        let metrics = Arc::new(ExportMetrics::new());
+        let flush_notify = Arc::new(Notify::const_new());
+
+        let handler = Arc::new(BlockHandler::new(
+            Arc::clone(&cache),
+            Arc::clone(&content_store),
+            Arc::clone(&self.clean_cache),
+            Arc::clone(&self.pack_index_cache),
+            Arc::clone(&volume_manifest),
+            device_size,
+            false,
+            metrics,
+            Arc::new(AtomicU64::new(0f64.to_bits())),
+            flush_notify,
+            DEFAULT_FLUSH_THRESHOLD,
+            None,
+        ));
+
+        // --- Pull + ingest OCI image ---
+        let uuid: [u8; 16] = rand::random();
+        let ingest_opts = IngestOptions {
+            writer_options: vec![
+                WriterOption::MaximumDiskSize(device_size as i64),
+                WriterOption::Uuid(uuid),
+                WriterOption::Journal(1024), // 4 MiB journal
+            ],
+        };
+
+        info!("pulling and ingesting layers");
+
+        pull_image(
+            &registry_client,
+            &image,
+            &credentials,
+            Arc::clone(&handler),
+            ingest_opts,
+        )
+        .await
+        .map_err(|e| RouterError::OciPull(format!("pull failed: {e}")))?;
+
+        // --- Update status to draining ---
+        {
+            let key = format!("{s3_prefix}/{name}");
+            let mut tasks = self.bless_tasks.write().await;
+            if let Some(status) = tasks.get_mut(&key) {
+                status.state = "draining".to_string();
+            }
+        }
+
+        // --- Drain to S3 ---
+        info!("draining to S3");
+
+        let max_drain_iterations = 100;
+        let mut drained = false;
+        for i in 0..max_drain_iterations {
+            let stats = cache
+                .flush_to_s3(&content_store, &self.pack_index_cache, &volume_manifest)
+                .await?;
+            if stats.blocks_claimed == 0 {
+                info!(iterations = i + 1, "drain complete");
+                drained = true;
+                break;
+            }
+        }
+        if !drained {
+            return Err(RouterError::DrainIncomplete {
+                name: name.to_string(),
+                remaining: cache.dirty_block_count(),
+                iterations: max_drain_iterations,
+            });
+        }
+
+        // --- Generate hot set ---
+        let hot_set = {
+            let (blocks_per_chunk, chunk_packs): (u64, Vec<(u32, Vec<u64>)>) = {
+                let vm = volume_manifest.read();
+                let bpc = vm.blocks_per_chunk() as u64;
+                let cp = vm
+                    .chunks
+                    .iter()
+                    .map(|(&idx, entry)| (idx, entry.packs.clone()))
+                    .collect();
+                (bpc, cp)
+            };
+
+            let mut indices: Vec<u64> = Vec::new();
+            for (chunk_idx, packs) in &chunk_packs {
+                for &pack_id in packs {
+                    match self.pack_index_cache.get_entries(pack_id).await {
+                        Some(entries) => {
+                            for e in entries.iter() {
+                                let global_block =
+                                    *chunk_idx as u64 * blocks_per_chunk + e.chunk_offset as u64;
+                                indices.push(global_block);
+                            }
+                        }
+                        None => {
+                            warn!(
+                                pack_id,
+                                chunk_idx,
+                                "pack index missing from cache, hot set may be incomplete"
+                            );
+                        }
+                    }
+                }
+            }
+
+            indices.sort_unstable();
+            indices.dedup();
+            indices
+        };
+
+        let hot_set_data = serialize_hot_set(&hot_set);
+        content_store
+            .put_hot_set(name, hot_set_data)
+            .await
+            .map_err(RouterError::ContentStore)?;
+
+        // --- Save manifest ---
+        let manifest_key = format!("bases/{}", name);
+        let manifest_data = volume_manifest
+            .read()
+            .serialize()
+            .map_err(|e| RouterError::Manifest(e.to_string()))?;
+        content_store
+            .put_manifest(&manifest_key, manifest_data, None)
+            .await
+            .map_err(RouterError::ContentStore)?;
+
+        let elapsed = start.elapsed();
+        info!(
+            name = %name,
+            s3_prefix = %s3_prefix,
+            layers = resolved.layers.len(),
+            device_size,
+            hot_set_blocks = hot_set.len(),
+            elapsed_secs = elapsed.as_secs_f64(),
+            "bless OCI complete"
+        );
+
+        Ok(())
     }
 
     /// List snapshot sequence numbers for an export.
