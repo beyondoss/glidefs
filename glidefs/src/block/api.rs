@@ -115,6 +115,9 @@ pub struct BlessRequest {
     pub username: Option<String>,
     #[serde(default)]
     pub password: Option<String>,
+    /// Use plain HTTP instead of HTTPS for the registry connection.
+    #[serde(default)]
+    pub insecure: bool,
 }
 
 /// Generic API response.
@@ -725,7 +728,7 @@ where
                 _ => oci_registry::Credentials::Anonymous,
             };
 
-            match router.bless_oci_image(s3_prefix, name, &bless_req.oci_image, credentials).await
+            match router.bless_oci_image(s3_prefix, name, &bless_req.oci_image, credentials, bless_req.insecure).await
             {
                 Ok(status) => {
                     let code = if status.state == "complete" {

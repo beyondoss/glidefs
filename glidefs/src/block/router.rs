@@ -1314,6 +1314,7 @@ impl ExportRouter {
         name: &str,
         oci_image: &str,
         credentials: oci_registry::Credentials,
+        insecure: bool,
     ) -> Result<BlessStatus, RouterError> {
         let key = format!("{s3_prefix}/{name}");
 
@@ -1354,7 +1355,7 @@ impl ExportRouter {
         let oci_image = oci_image.to_string();
         tokio::spawn(async move {
             if let Err(e) = router
-                .run_bless_oci_task(&s3_prefix, &name, &oci_image, credentials)
+                .run_bless_oci_task(&s3_prefix, &name, &oci_image, credentials, insecure)
                 .await
             {
                 error!(
@@ -1379,6 +1380,7 @@ impl ExportRouter {
         name: &str,
         oci_image: &str,
         credentials: oci_registry::Credentials,
+        insecure: bool,
     ) -> Result<(), RouterError> {
         use crate::block::handler::BlockHandler;
         use crate::block::manifest::serialize_hot_set;
@@ -1393,7 +1395,14 @@ impl ExportRouter {
         let start = std::time::Instant::now();
 
         // --- Resolve OCI image ---
-        let registry_client = RegistryClient::new();
+        let registry_client = if insecure {
+            RegistryClient::with_config(oci_registry::ClientConfig {
+                protocol: oci_registry::ClientProtocol::Http,
+                ..Default::default()
+            })
+        } else {
+            RegistryClient::new()
+        };
         let image: oci_registry::Reference = oci_image
             .parse()
             .map_err(|e| RouterError::OciPull(format!("invalid image reference: {e}")))?;

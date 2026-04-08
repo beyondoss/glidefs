@@ -331,7 +331,7 @@ async fn test_bless_api_full_flow() {
     let (router, _dir) = create_test_router(Arc::clone(&s3)).await;
 
     // --- Step 1: POST to start bless ---
-    let body = serde_json::json!({ "oci_image": image_ref }).to_string();
+    let body = serde_json::json!({ "oci_image": image_ref, "insecure": true }).to_string();
     let (status, resp_body) =
         api_request(&router, Method::POST, "/api/bless/myprefix/myimage", &body).await;
     assert_eq!(
@@ -355,7 +355,7 @@ async fn test_bless_api_full_flow() {
     assert_eq!(bless_status.state, "complete");
 
     // --- Step 4: Idempotent re-POST returns 200 ---
-    let body = serde_json::json!({ "oci_image": image_ref }).to_string();
+    let body = serde_json::json!({ "oci_image": image_ref, "insecure": true }).to_string();
     let (status, resp_body) =
         api_request(&router, Method::POST, "/api/bless/myprefix/myimage", &body).await;
     assert_eq!(
@@ -443,7 +443,7 @@ async fn test_bless_api_concurrent_post() {
     let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let (router, _dir) = create_test_router(Arc::clone(&s3)).await;
 
-    let body = serde_json::json!({ "oci_image": image_ref }).to_string();
+    let body = serde_json::json!({ "oci_image": image_ref, "insecure": true }).to_string();
 
     // Fire two POSTs concurrently.
     let (r1, r2) = tokio::join!(
@@ -501,6 +501,6 @@ async fn test_bless_api_path_traversal() {
 
     let body = r#"{"oci_image": "docker.io/library/nginx:latest"}"#;
     let (status, _) =
-        api_request(&router, Method::POST, "/api/bless/../etc/img", body).await;
+        api_request(&router, Method::POST, "/api/bless/foo..bar/img", body).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
