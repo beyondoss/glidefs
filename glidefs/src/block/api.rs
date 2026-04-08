@@ -107,6 +107,19 @@ pub struct ListExportsResponse {
     pub exports: Vec<ExportInfoResponse>,
 }
 
+/// Request to bless an OCI image (POST /api/bless/{s3_prefix}/{name}).
+#[derive(Debug, Deserialize)]
+pub struct BlessRequest {
+    pub oci_image: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Use plain HTTP instead of HTTPS for the registry connection.
+    #[serde(default)]
+    pub insecure: bool,
+}
+
 /// Generic API response.
 #[derive(Debug, Serialize)]
 pub struct ApiResponse {
@@ -646,6 +659,114 @@ where
                 Ok(true) => empty_response(StatusCode::OK),
                 Ok(false) => empty_response(StatusCode::NOT_FOUND),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // HEAD /api/manifests/{s3_prefix}/bases/{name} - Check base manifest existence
+        (Method::HEAD, ["api", "manifests", s3_prefix, "bases", name]) => {
+            if s3_prefix.contains("..") || name.contains("..") {
+                return Ok(error_response(StatusCode::BAD_REQUEST, "Invalid path"));
+            }
+            let manifest_name = format!("bases/{}", name);
+            match router.head_manifest(s3_prefix, &manifest_name).await {
+                Ok(true) => empty_response(StatusCode::OK),
+                Ok(false) => empty_response(StatusCode::NOT_FOUND),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // POST /api/bless/{s3_prefix}/{name} - Start OCI image bless
+        (Method::POST, ["api", "bless", s3_prefix, name]) => {
+            if s3_prefix.contains("..") || name.contains("..") {
+                return Ok(error_response(StatusCode::BAD_REQUEST, "Invalid path"));
+            }
+            if !is_valid_export_name(name) {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid name '{}'", name),
+                ));
+            }
+
+            let body = match req.collect().await {
+                Ok(b) => {
+                    let bytes = b.to_bytes();
+                    if bytes.len() > 65_536 {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            "Request body too large (max 64KB)",
+                        ));
+                    }
+                    bytes
+                }
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+
+            let bless_req: BlessRequest = match serde_json::from_slice(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid JSON: {}", e),
+                    ));
+                }
+            };
+
+            if bless_req.oci_image.is_empty() {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "oci_image is required",
+                ));
+            }
+
+            let credentials = match (bless_req.username, bless_req.password) {
+                (Some(u), Some(p)) => {
+                    oci_registry::Credentials::UsernamePassword {
+                        username: u,
+                        password: p,
+                    }
+                }
+                _ => oci_registry::Credentials::Anonymous,
+            };
+
+            match router.bless_oci_image(s3_prefix, name, &bless_req.oci_image, credentials, bless_req.insecure).await
+            {
+                Ok(status) => {
+                    let code = if status.state == "complete" {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::ACCEPTED
+                    };
+                    json_response(code, &status)
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/bless/{s3_prefix}/{name} - Poll bless status
+        (Method::GET, ["api", "bless", s3_prefix, name]) => {
+            if s3_prefix.contains("..") || name.contains("..") {
+                return Ok(error_response(StatusCode::BAD_REQUEST, "Invalid path"));
+            }
+
+            let key = format!("{s3_prefix}/{name}");
+            if let Some(status) = router.get_bless_status(&key).await {
+                json_response(StatusCode::OK, &status)
+            } else {
+                // No in-flight task — check S3 for completed manifest.
+                let manifest_name = format!("bases/{}", name);
+                match router.head_manifest(s3_prefix, &manifest_name).await {
+                    Ok(true) => json_response(
+                        StatusCode::OK,
+                        &crate::block::router::BlessStatus {
+                            state: "complete".to_string(),
+                            oci_image: String::new(),
+                        },
+                    ),
+                    Ok(false) => empty_response(StatusCode::NOT_FOUND),
+                    Err(e) => {
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                    }
+                }
             }
         }
 
