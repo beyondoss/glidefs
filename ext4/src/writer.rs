@@ -1379,14 +1379,14 @@ impl<W: Read + Write + Seek> Writer<W> {
             first_inode: INODE_FIRST,
             lpf_inode: INODE_LOST_AND_FOUND,
             inode_size: INODE_SIZE as u16,
-            feature_compat: format::CompatFeature::SPARSE_SUPER2
-                | format::CompatFeature::EXT_ATTR
+            feature_compat: format::CompatFeature::EXT_ATTR
                 | if self.journal_blocks > 0 { format::CompatFeature::HAS_JOURNAL } else { format::CompatFeature::empty() },
             feature_incompat: format::IncompatFeature::FILETYPE
                 | format::IncompatFeature::EXTENTS
                 | format::IncompatFeature::FLEX_BG
                 | if self.support_inline_data { format::IncompatFeature::INLINE_DATA } else { format::IncompatFeature::empty() },
-            feature_ro_compat: format::RoCompatFeature::LARGE_FILE
+            feature_ro_compat: format::RoCompatFeature::SPARSE_SUPER
+                | format::RoCompatFeature::LARGE_FILE
                 | format::RoCompatFeature::HUGE_FILE
                 | format::RoCompatFeature::EXTRA_ISIZE,
             uuid: self.uuid,
