@@ -1388,8 +1388,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                 | if self.support_inline_data { format::IncompatFeature::INLINE_DATA } else { format::IncompatFeature::empty() },
             feature_ro_compat: format::RoCompatFeature::LARGE_FILE
                 | format::RoCompatFeature::HUGE_FILE
-                | format::RoCompatFeature::EXTRA_ISIZE
-                | format::RoCompatFeature::READONLY,
+                | format::RoCompatFeature::EXTRA_ISIZE,
             uuid: self.uuid,
             journal_uuid: self.uuid,
             journal_inum: if self.journal_blocks > 0 { format::INODE_JOURNAL } else { 0 },
