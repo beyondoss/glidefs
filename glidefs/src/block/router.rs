@@ -2166,9 +2166,11 @@ impl ExportRouter {
                     if purge {
                         // Clean local cache files
                         let cache_file = self.cache_dir.join(format!("{}.cache", name));
+                        let flushing_file = self.cache_dir.join(format!("{}.flushing", name));
                         let meta_file = self.cache_dir.join(format!("{}.meta", name));
                         let wal_file = self.cache_dir.join(format!("{}.wal", name));
                         remove_file_if_exists(&cache_file);
+                        remove_file_if_exists(&flushing_file);
                         remove_file_if_exists(&meta_file);
                         remove_file_if_exists(&wal_file);
 
@@ -2237,9 +2239,11 @@ impl ExportRouter {
 
         if purge {
             let cache_file = self.cache_dir.join(format!("{}.cache", name));
+            let flushing_file = self.cache_dir.join(format!("{}.flushing", name));
             let meta_file = self.cache_dir.join(format!("{}.meta", name));
             let wal_file = self.cache_dir.join(format!("{}.wal", name));
             remove_file_if_exists(&cache_file);
+            remove_file_if_exists(&flushing_file);
             remove_file_if_exists(&meta_file);
             remove_file_if_exists(&wal_file);
             info!("Purged cache files for export '{}'", name);
