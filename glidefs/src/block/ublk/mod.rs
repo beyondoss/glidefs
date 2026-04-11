@@ -176,7 +176,32 @@ impl UblkServer {
     pub async fn remove_device(&mut self, export_name: &str) -> anyhow::Result<()> {
         if let Some(device) = self.devices.remove(export_name) {
             tracing::info!(export = %export_name, "removing ublk device");
-            device.unregister().await?;
+            if let Err(e) = device.unregister().await {
+                // Unregister failed (e.g., worker thread stuck). Force-kill the kernel
+                // device so add_device can reuse the dev_id without hitting EBUSY.
+                let dev_id = device.dev_id();
+                tracing::warn!(
+                    export = %export_name,
+                    dev_id,
+                    error = %e,
+                    "ublk unregister failed — force-killing kernel device"
+                );
+                if let Err(kill_err) = tokio::task::spawn_blocking(move || {
+                    let ctrl = ublk_core::UblkCtrl::new_simple(dev_id)?;
+                    ctrl.kill_dev()?;
+                    // Give kernel a moment to release the device
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await?
+                {
+                    tracing::warn!(
+                        dev_id,
+                        error = %kill_err,
+                        "force kill also failed — device may be leaked"
+                    );
+                }
+            }
             self.persist_devices();
         } else {
             tracing::debug!(export = %export_name, "no ublk device registered, nothing to remove");
