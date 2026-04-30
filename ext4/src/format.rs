@@ -980,7 +980,7 @@ impl DirEntry {
             return None;
         }
 
-        let name = String::from_utf8_lossy(&buf[DIR_ENTRY_HEADER_SIZE..end]).to_string();
+        let name = String::from_utf8(buf[DIR_ENTRY_HEADER_SIZE..end].to_vec()).ok()?;
         let file_type = match file_type_raw {
             1 => FileType::Regular,
             2 => FileType::Directory,
@@ -1079,7 +1079,10 @@ pub fn get_xattrs(buf: &[u8], xattrs: &mut BTreeMap<String, Vec<u8>>, offset_del
         if offset_usize.saturating_add(value_len) > buf.len() {
             break;
         }
-        let name = std::str::from_utf8(&buf[pos + 16..pos + 16 + name_len]).unwrap_or("");
+        let Ok(name) = std::str::from_utf8(&buf[pos + 16..pos + 16 + name_len]) else {
+            pos += ((name_len + 3) & !3usize) + 16;
+            continue;
+        };
         let full_name = decompress_xattr_name(index, name);
         let value = buf[offset_usize..offset_usize + value_len].to_vec();
         xattrs.insert(full_name, value);

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
 use crate::block::cache::BlockCache;
@@ -493,7 +493,19 @@ impl WriteCache<Active> {
                 // still holds the old fd (same inode), so I/O continues
                 // against whatever path the inode lives at. Restoring the
                 // original path keeps the on-disk state consistent.
-                let _ = std::fs::rename(&flushing_path, &active_path);
+                if let Err(undo_err) = std::fs::rename(&flushing_path, &active_path) {
+                    // Both the new-active creation and the rollback rename failed.
+                    // active_path no longer exists on disk; the export is in an
+                    // unrecoverable state until it is removed and re-added.
+                    error!(
+                        original_error = %e,
+                        undo_error = %undo_err,
+                        "FATAL: rotation rollback rename failed — active cache file is gone, export must be removed and re-added"
+                    );
+                    self.inner.flushing_active.store(false, Ordering::Release);
+                    self.inner.rotation_seq.store(0, Ordering::Release);
+                    return Err(CacheError::Io(undo_err));
+                }
                 self.inner.flushing_active.store(false, Ordering::Release);
                 self.inner.rotation_seq.store(0, Ordering::Release);
                 return Err(CacheError::Io(e));
@@ -644,8 +656,10 @@ impl WriteCache<Active> {
             self.inner.rotation_seq.store(0, Ordering::Release);
             drop(self.inner.flushing_file.lock().take());
             let flushing_path = self.inner.config.flushing_path();
-            if flushing_path.exists() {
-                let _ = std::fs::remove_file(&flushing_path);
+            match std::fs::remove_file(&flushing_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!(error = %e, "failed to remove empty flushing file"),
             }
             return Ok((FlushStats::default(), seq_cutpoint));
         }
