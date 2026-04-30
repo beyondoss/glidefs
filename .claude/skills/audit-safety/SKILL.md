@@ -142,6 +142,7 @@ A comprehensive checklist for auditing Rust codebases, focused on patterns that 
 - [ ] No `#[allow(unused_must_use)]` without justification
 - [ ] `.ok()` on a `Result` — confirm the error case is truly irrelevant
 - [ ] `catch_unwind` — panics are being caught, not silenced. Logged? Propagated?
+- [ ] Batch operations (loops over files, retries, fan-outs) track and propagate the **worst** outcome, not just the last `Result` — a single failure mid-loop shouldn't report success
 
 ### Error type design
 
@@ -228,6 +229,47 @@ A comprehensive checklist for auditing Rust codebases, focused on patterns that 
 
 ---
 
+## 10. Filesystem and System Boundary Safety
+
+These bugs live at syscall and OS boundaries — Rust's type system cannot prevent them.
+
+### TOCTOU (Time-of-Check-Time-of-Use)
+
+- [ ] No check-then-act on filesystem paths (e.g., `metadata()` then `open()`, `remove_file()` then `File::create()`)
+- [ ] Use `OpenOptions::create_new(true)` to atomically create-or-fail without a race window
+- [ ] Prefer file-descriptor-anchored operations over re-resolved path strings where possible
+- [ ] Grep: `rg 'fs::remove_file|fs::rename|fs::metadata' --type rust` — look for a paired `create`/`open` call nearby
+
+### Insecure Permission Windows
+
+- [ ] Files and directories are not created with default permissions and then hardened via `set_permissions()` afterward — there is a window between creation and hardening
+- [ ] Use `OpenOptions::mode()` (Unix) or `DirBuilder::mode()` to set permissions atomically at creation time
+- [ ] Grep: `rg 'set_permissions' --type rust` — check for a preceding `create` or `create_dir` on the same path
+
+### Path Identity vs. String Equality
+
+- [ ] Paths guarding security decisions are not compared as raw strings — `/../`, `/./`, symlinks, and relative forms can alias the same inode while comparing unequal
+- [ ] Use `fs::canonicalize()` before comparing paths used for access control
+- [ ] Grep: `rg 'path ==' --type rust` — flag any equality check on `Path`/`PathBuf`/`str` used for authorization
+
+### Trust Boundary Code Loading
+
+- [ ] No library calls that load dynamic modules (NSS lookups, PAM, `dlopen`) *after* crossing a privilege or chroot boundary — an attacker controls the chroot tree and can supply malicious modules
+- [ ] Resolve usernames, group memberships, and hostnames *before* calling `chroot()`, dropping privileges, or entering a sandbox
+- [ ] Grep: `rg 'chroot|setuid|setgid' --type rust` — verify all NSS/resolver calls (`get_user_by_name`, `getaddrinfo`, etc.) precede the boundary crossing
+
+---
+
+## 11. Binary Data and Encoding Assumptions
+
+- [ ] Stream data, file content, and filenames are handled as `&[u8]` / `Vec<u8>` / `OsStr` — not converted to `String` unless the encoding is guaranteed by the source
+- [ ] No `String::from_utf8_lossy()` on data that must round-trip without corruption — it silently replaces invalid bytes with `U+FFFD`, causing data loss
+- [ ] `from_utf8()` failures on filenames or path arguments are surfaced as errors, not silently skipped or unwrapped
+- [ ] Binary output uses `Write::write_all()` rather than `print!` / `println!`, which assume UTF-8 and may panic or corrupt on non-UTF-8 bytes
+- [ ] Grep: `rg 'from_utf8_lossy|String::from_utf8\b' --type rust` — verify each call site is intentional and won't corrupt data
+
+---
+
 ## Quick Grep Commands
 
 ```bash
@@ -255,6 +297,21 @@ rg 'process::abort|process::exit' --type rust
 
 # Unchecked operations
 rg '_unchecked\(' --type rust
+
+# TOCTOU / filesystem races
+rg 'fs::remove_file|fs::rename|fs::metadata' --type rust
+
+# Insecure permission windows
+rg 'set_permissions' --type rust
+
+# Path string equality (potential identity confusion)
+rg 'path ==' --type rust
+
+# Trust boundary crossings
+rg 'chroot|setuid|setgid' --type rust
+
+# UTF-8 / binary data assumptions
+rg 'from_utf8_lossy|String::from_utf8\b' --type rust
 ```
 
 ## Output Format
