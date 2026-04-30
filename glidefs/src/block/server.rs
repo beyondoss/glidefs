@@ -353,7 +353,8 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         let mut name_buf = vec![0u8; length as usize];
         self.reader.read_exact(&mut name_buf).await?;
 
-        let export_name = String::from_utf8_lossy(&name_buf).to_string();
+        let export_name = String::from_utf8(name_buf.clone())
+            .map_err(|_| NBDError::Protocol("export name is not valid UTF-8".into()))?;
         debug!(
             "Client requested export: '{}' (length: {})",
             export_name, length
@@ -404,7 +405,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
             return Ok(());
         }
 
-        let export_name = String::from_utf8_lossy(&data[4..4 + name_len]).to_string();
+        let export_name = match String::from_utf8(data[4..4 + name_len].to_vec()) {
+            Ok(n) => n,
+            Err(_) => {
+                self.send_option_reply(NBD_OPT_INFO, NBD_REP_ERR_INVALID, &[]).await?;
+                self.writer.flush().await?;
+                return Ok(());
+            }
+        };
 
         // Look up handler
         let handler = match self.router.get_handler(&export_name).await {
@@ -456,7 +464,14 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> NBDSession<R, W> {
         }
 
         let name_bytes = &data[4..4 + name_len];
-        let export_name = String::from_utf8_lossy(name_bytes).to_string();
+        let export_name = match String::from_utf8(name_bytes.to_vec()) {
+            Ok(n) => n,
+            Err(_) => {
+                self.send_option_reply(NBD_OPT_GO, NBD_REP_ERR_INVALID, &[]).await?;
+                self.writer.flush().await?;
+                return Err(NBDError::Protocol("export name is not valid UTF-8".into()));
+            }
+        };
 
         debug!("GO option for export: '{}'", export_name);
 
@@ -553,7 +568,10 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
         device: BlockDevice,
         handler: Arc<BlockHandler>,
     ) -> Result<()> {
-        let export_name = String::from_utf8_lossy(&device.name).to_string();
+        let export_name = match String::from_utf8(device.name.clone()) {
+            Ok(n) => n,
+            Err(_) => return Err(NBDError::Protocol("export name is not valid UTF-8".into())),
+        };
 
         // Destructure self to split reader and writer
         let NBDSession { mut reader, writer, router, shutdown, .. } = self;

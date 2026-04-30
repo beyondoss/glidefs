@@ -14,6 +14,7 @@ use std::{
     io::{Read, Write},
     path::Path,
 };
+use std::os::unix::fs::OpenOptionsExt as _;
 
 const CTRL_PATH: &str = "/dev/ublk-control";
 
@@ -545,17 +546,20 @@ impl UblkJsonManager {
         let json_path = Path::new(&run_path);
 
         if let Some(parent_dir) = json_path.parent() {
-            if !parent_dir.exists() {
-                std::fs::create_dir_all(parent_dir)?;
-                // Set directory permissions to 777 for exported running json
-                Self::set_path_permission(parent_dir, 0o777)?;
-            }
+            std::fs::create_dir_all(parent_dir)?;
+            // Chmod after create: 0o777 is intentional (world-accessible device
+            // metadata directory) and must bypass the process umask.
+            Self::set_path_permission(parent_dir, 0o777)?;
         }
 
-        let mut run_file = fs::File::create(json_path)?;
-
-        // Each exported json file is only visible for the device owner
-        Self::set_path_permission(json_path, 0o700)?;
+        // Open with mode 0o700 at creation time so the file is never
+        // world-readable, even briefly.
+        let mut run_file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o700)
+            .open(json_path)?;
 
         run_file.write_all(self.json.to_string().as_bytes())?;
         Ok(0)
