@@ -21,7 +21,7 @@ Users who know Docker have to learn an entirely new workflow to run VMs.
 
 This eliminates that. OCI images become the universal format for both:
 
-- **Users `docker push` to boot a VM.** Push a container image to Paraglide's
+- **Users `docker push` to boot a VM.** Push a container image to Beyond's
   registry, and it becomes a bootable VM volume. No image conversion step,
   no new tooling to learn.
 
@@ -201,7 +201,7 @@ thoroughly documented.
 
 - **Boot requirements**: VMs need a kernel, initramfs, bootloader — things OCI
   images don't include. Likely handled by a base template or boot layer that
-  Paraglide provides.
+  Beyond provides.
 
 - **Non-ext4**: Same pattern works for any filesystem with a documented on-disk
   format. ext4 is the obvious first target.

@@ -2,7 +2,7 @@
 
 Block device server that turns S3 into fast local storage. Writes hit local SSD in 5 microseconds. Background sync uploads to S3 as content-addressed packs.
 
-Built for microVM storage at [Paraglide](https://paraglide.sh).
+Built for microVM storage at [Beyond](https://beyond.dev).
 
 ## How It Works
 
