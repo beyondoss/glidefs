@@ -1,4 +1,4 @@
-# Paraglide Verbal Identity
+# Beyond Verbal Identity
 
 ## Core Belief
 
@@ -27,7 +27,7 @@ We removed it. The fog cleared. You're above it now.
 - **2009**: Self-taught. No CS degree. WordPress plugins, raw PHP, SFTP straight into production. No git, no version control, no ceremony. Carried the chip of "not a real engineer" ever since.
 - **2014**: First exit: $4.5M. Built and sold using the "wrong" methods. The industry said you needed CI/CD, staging environments, approval workflows. The market said move faster. The market was right.
 - **2020–25**: Paperspace. DigitalOcean. Railway. Watched platforms add layers instead of removing them. Deploy times got slower as infrastructure got "better." Infuriating.
-- **2026**: Paraglide. Agents code faster than we review. Deploys should be faster than code. Rollbacks faster than fixes. The layers were never load-bearing. We removed them.
+- **2026**: Beyond. Agents code faster than we review. Deploys should be faster than code. Rollbacks faster than fixes. The layers were never load-bearing. We removed them.
 
 ---
 
@@ -51,12 +51,12 @@ Agents write code. Deploys are instant. Rollbacks are faster than fixes. The cer
 2. **Ceremony is debt** — Every gate, every config file, every "best practice" that doesn't move code — cut it.
 3. **Speed compounds** — The gap between idea and feedback is where startups die. It's gone.
 4. **Agents deserve production** — Your agent writes code. It should test against production. Not a simulation. Production.
-5. **The platform should be invisible** — If you're thinking about us, we failed. The highest praise isn't "Paraglide is great." It's "I forgot Paraglide was there."
+5. **The platform should be invisible** — If you're thinking about us, we failed. The highest praise isn't "Beyond is great." It's "I forgot Beyond was there."
 6. **We sell compute** — Not seats. Not tokens. Not plans. Compute.
 
 ---
 
-## Who Paraglide Is For
+## Who Beyond Is For
 
 You trust yourself to deploy. You fix forward. You don't wait for permission.
 
@@ -70,7 +70,7 @@ You trust yourself to deploy. You fix forward. You don't wait for permission.
 | Fly.io        | "Check Em Out!" / "No Dockerfile? No problem"       | Chose personality. The brand is the show.                                   |
 | Vercel        | "The AI Cloud" / "Framework-Defined Infrastructure" | Chose abstraction. A term for reading your config file.                     |
 | Render        | "Your fastest path to production"                   | Chose safety. The path _to_ production. Production is still somewhere else. |
-| **Paraglide** | "Prompt straight into production."                  | Says what it does. No metaphor. No comfort. No cleverness.                  |
+| **Beyond** | "Prompt straight into production."                  | Says what it does. No metaphor. No comfort. No cleverness.                  |
 
 ---
 
@@ -263,7 +263,7 @@ $0.04/vCPU-hour. No seats. No tokens. No surprises.
 - Am I showing what happens or just claiming value?
 - Would a senior engineer roll their eyes at this?
 - Does this respect the reader's intelligence?
-- Is this something only Paraglide would say?
+- Is this something only Beyond would say?
 - Am I coddling or giving power?
 
 ---
