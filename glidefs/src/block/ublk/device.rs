@@ -388,10 +388,10 @@ impl QueueLatch {
 // the eventfd signal is baked into every waker by construction.
 
 /// Wrapper around Linux `eventfd(2)` for cross-thread signaling.
-struct EventFd(RawFd);
+pub(super) struct EventFd(RawFd);
 
 impl EventFd {
-    fn new() -> std::io::Result<Self> {
+    pub(super) fn new() -> std::io::Result<Self> {
         // SAFETY: eventfd is a well-defined Linux syscall.
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if fd < 0 {
@@ -400,7 +400,7 @@ impl EventFd {
         Ok(Self(fd))
     }
 
-    fn fd(&self) -> RawFd {
+    pub(super) fn fd(&self) -> RawFd {
         self.0
     }
 }
@@ -419,14 +419,14 @@ impl Drop for EventFd {
 /// non-blocking (`EFD_NONBLOCK`); failure is silently ignored since it
 /// only means the eventfd counter is already at u64::MAX (practically
 /// impossible).
-fn signal_eventfd(fd: RawFd) {
+pub(super) fn signal_eventfd(fd: RawFd) {
     let val: u64 = 1;
     let ret = unsafe { libc::write(fd, &val as *const u64 as *const libc::c_void, 8) };
     debug_assert!(ret == 8 || ret == -1, "eventfd write returned unexpected {ret}");
 }
 
 /// Drain accumulated eventfd signals (non-blocking read).
-fn drain_eventfd(fd: RawFd) {
+pub(super) fn drain_eventfd(fd: RawFd) {
     let mut val: u64 = 0;
     let ret = unsafe { libc::read(fd, &mut val as *mut u64 as *mut libc::c_void, 8) };
     // EAGAIN is expected when no signals are pending (EFD_NONBLOCK).
@@ -448,13 +448,13 @@ fn drain_eventfd(fd: RawFd) {
 /// Duplicate wakeups collapse naturally (OR is idempotent).
 /// `drain_with()` swaps each word atomically and yields each set bit's index
 /// to the caller — no allocation.
-struct WakeupBits {
+pub(super) struct WakeupBits {
     words: Box<[AtomicU64]>,
     efd: RawFd,
 }
 
 impl WakeupBits {
-    fn new(num_words: usize, efd: RawFd) -> Self {
+    pub(super) fn new(num_words: usize, efd: RawFd) -> Self {
         assert!(num_words > 0, "WakeupBits needs at least one word");
         let words: Vec<AtomicU64> = (0..num_words).map(|_| AtomicU64::new(0)).collect();
         Self { words: words.into_boxed_slice(), efd }
@@ -462,13 +462,13 @@ impl WakeupBits {
 
     /// Total task index capacity (number of bits).
     #[inline]
-    fn capacity(&self) -> usize {
+    pub(super) fn capacity(&self) -> usize {
         self.words.len() * 64
     }
 
     /// Mark a task as needing a poll + signal the eventfd.
     #[inline]
-    fn wake(&self, idx: usize) {
+    pub(super) fn wake(&self, idx: usize) {
         self.words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
         signal_eventfd(self.efd);
     }
@@ -476,7 +476,7 @@ impl WakeupBits {
     /// Atomically drain all pending wakeup bits, yielding each task index to
     /// `f`. Bits that arrive between word swaps are deferred to the next
     /// drain (the eventfd signal ensures prompt re-entry to the event loop).
-    fn drain_with(&self, mut f: impl FnMut(usize)) {
+    pub(super) fn drain_with(&self, mut f: impl FnMut(usize)) {
         for (word_idx, word_atomic) in self.words.iter().enumerate() {
             let mut word = word_atomic.swap(0, Ordering::Acquire);
             while word != 0 {
@@ -520,7 +520,7 @@ impl Wake for TaskWaker {
 /// - Waker clone: one atomic increment (`Arc::clone`)
 /// - Duplicate wakeups collapse (OR is idempotent → one poll per tick)
 /// - `all_done()`: O(1) counter check
-struct QueueExecutor<'a> {
+pub(super) struct QueueExecutor<'a> {
     /// Task futures. `UnsafeCell` for interior mutability (single-threaded).
     tasks: Vec<UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + 'a>>>>>,
     /// Pre-allocated wakers, one per task. Passed by reference in `tick()` —
@@ -538,7 +538,7 @@ struct QueueExecutor<'a> {
 
 impl<'a> QueueExecutor<'a> {
     /// Construct an executor with `num_words × 64` task index slots.
-    fn new(num_words: usize, efd: RawFd) -> Self {
+    pub(super) fn new(num_words: usize, efd: RawFd) -> Self {
         Self {
             tasks: Vec::new(),
             wakers: Vec::new(),
@@ -553,7 +553,7 @@ impl<'a> QueueExecutor<'a> {
     /// Must be called before any `spawn()` calls. Used for helper tasks
     /// (e.g., the eventfd PollAdd watcher) whose lifetime should not gate
     /// the event loop exit.
-    fn spawn_daemon(&mut self, future: impl Future<Output = ()> + 'a) {
+    pub(super) fn spawn_daemon(&mut self, future: impl Future<Output = ()> + 'a) {
         debug_assert_eq!(
             self.alive.get(), 0,
             "spawn_daemon must be called before spawn"
@@ -574,7 +574,7 @@ impl<'a> QueueExecutor<'a> {
     }
 
     /// Spawn an I/O task that counts toward `all_done()`.
-    fn spawn(&mut self, future: impl Future<Output = ()> + 'a) {
+    pub(super) fn spawn(&mut self, future: impl Future<Output = ()> + 'a) {
         let idx = self.tasks.len();
         assert!(
             idx < self.bits.capacity(),
@@ -601,7 +601,7 @@ impl<'a> QueueExecutor<'a> {
     /// to the worker thread — co-tenant tasks keep running. Required for the
     /// multi-tenant worker-pool model where one device's bug must not take
     /// down the whole worker.
-    fn tick(&self) {
+    pub(super) fn tick(&self) {
         self.bits.drain_with(|idx| {
             if idx >= self.tasks.len() {
                 return;
@@ -634,7 +634,7 @@ impl<'a> QueueExecutor<'a> {
     }
 
     /// Check if all I/O tasks have completed (daemons excluded).
-    fn all_done(&self) -> bool {
+    pub(super) fn all_done(&self) -> bool {
         self.alive.get() == 0
     }
 }

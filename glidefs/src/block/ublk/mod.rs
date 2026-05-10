@@ -19,6 +19,7 @@
 //! - Batched commit+fetch eliminates round-trips
 
 pub mod device;
+mod worker_pool;
 
 use crate::block::handler::BlockHandler;
 use device::KernelFeatures;
