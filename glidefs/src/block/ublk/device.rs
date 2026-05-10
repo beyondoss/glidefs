@@ -881,36 +881,32 @@ fn queue_io_loop(
     tokio_handle: &tokio::runtime::Handle,
     latch: &QueueLatch,
 ) {
-    // Initialize the thread-local io_uring before UblkQueue::new() so we can
-    // set SINGLE_ISSUER — each queue thread is the sole submitter to its ring.
+    // Build this queue thread's io_uring with SINGLE_ISSUER so the kernel
+    // can apply submission-side optimizations (we are the sole submitter).
+    //
+    // NOTE: COOP_TASKRUN intentionally omitted. With COOP_TASKRUN, io_uring
+    // defers uring_cmd task_work to io_uring_enter. But the ublk kernel
+    // driver's ublk_fetch() acquires ub->mutex, which START_DEV also holds.
+    // If FETCH_REQ processing runs inside io_uring_enter (COOP_TASKRUN), it
+    // deadlocks with START on the mutex. Without COOP_TASKRUN, the kernel
+    // processes FETCH_REQs asynchronously via interrupt-driven task_work,
+    // avoiding the mutex contention.
     let sq_depth = dev.tgt.sq_depth as u32;
     let cq_depth = dev.tgt.cq_depth as u32;
-    if let Err(e) = ublk_core::ublk_init_task_ring(|cell| {
-        if cell.get().is_none() {
-            // NOTE: COOP_TASKRUN intentionally omitted. With COOP_TASKRUN,
-            // io_uring defers uring_cmd task_work to io_uring_enter. But
-            // the ublk kernel driver's ublk_fetch() acquires ub->mutex,
-            // which START_DEV also holds. If FETCH_REQ processing runs
-            // inside io_uring_enter (COOP_TASKRUN), it deadlocks with
-            // START on the mutex. Without COOP_TASKRUN, the kernel
-            // processes FETCH_REQs asynchronously via interrupt-driven
-            // task_work, avoiding the mutex contention.
-            let ring = io_uring::IoUring::builder()
-                .setup_cqsize(cq_depth)
-                .setup_single_issuer()
-                .build(sq_depth)
-                .map_err(ublk_core::UblkError::IOError)?;
-            cell.set(std::cell::RefCell::new(ring))
-                .map_err(|_| ublk_core::UblkError::OtherError(-libc::EEXIST))?;
+    let ring = match io_uring::IoUring::builder()
+        .setup_cqsize(cq_depth)
+        .setup_single_issuer()
+        .build(sq_depth)
+    {
+        Ok(r) => ublk_core::WorkerRing::from_io_uring(r),
+        Err(e) => {
+            tracing::error!(qid, error = ?e, "failed to init io_uring for ublk queue");
+            latch.signal_failed();
+            return;
         }
-        Ok(())
-    }) {
-        tracing::error!(qid, error = ?e, "failed to init io_uring for ublk queue");
-        latch.signal_failed();
-        return;
-    }
+    };
 
-    let q_rc = match UblkQueue::new(qid, dev) {
+    let q_rc = match UblkQueue::new(qid, dev, &ring) {
         Ok(q) => Rc::new(q),
         Err(e) => {
             tracing::error!(qid, error = ?e, "failed to create ublk queue");

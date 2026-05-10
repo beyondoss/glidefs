@@ -41,57 +41,31 @@
 //! ```
 //!
 //!
-//! ## Ring Initialization Examples
+//! ## Ring Initialization
 //!
-//! ### Basic Custom Initialization
+//! Each worker thread builds one `WorkerRing` and hands a reference to every
+//! `UblkQueue` constructed on that thread. The ring is `!Send` (it wraps an
+//! `Rc`), so the single-issuer constraint is enforced structurally — only
+//! the worker thread that owns the ring can submit through it.
+//!
 //! ```no_run
-//! use libublk::ublk_init_task_ring;
+//! use libublk::WorkerRing;
 //! use io_uring::IoUring;
-//! use std::cell::RefCell;
 //!
 //! fn example() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Custom initialization before creating UblkQueue
-//!     ublk_init_task_ring(|cell| {
-//!         if cell.get().is_none() {
-//!             let ring = IoUring::builder()
-//!                 .setup_cqsize(256)  // Custom completion queue size
-//!                 .setup_coop_taskrun()  // Enable cooperative task running
-//!                 .build(128)?;  // Custom submission queue size
-//!             cell.set(RefCell::new(ring))
-//!                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
-//!         }
-//!         Ok(())
-//!     })?;
-//!     
-//!     // Now create UblkQueue - it will use the pre-initialized ring
-//!     println!("Ring initialized! Create UblkQueue to use it.");
+//!     // Custom initialization (e.g., SINGLE_ISSUER) before creating UblkQueue
+//!     let ring = IoUring::builder()
+//!         .setup_cqsize(256)
+//!         .setup_single_issuer()
+//!         .build(128)?;
+//!     let worker_ring = WorkerRing::from_io_uring(ring);
+//!     // Pass `&worker_ring` to UblkQueue::new(qid, &dev, &worker_ring)
 //!     Ok(())
 //! }
 //! ```
 //!
-//! ### Advanced Initialization with Custom Flags
-//! ```no_run
-//! use libublk::ublk_init_task_ring;
-//! use io_uring::IoUring;
-//! use std::cell::RefCell;
-//!
-//! fn advanced_example() -> Result<(), Box<dyn std::error::Error>> {
-//!     ublk_init_task_ring(|cell| {
-//!         if cell.get().is_none() {
-//!             let ring = IoUring::builder()
-//!                 .setup_cqsize(512)
-//!                 .setup_sqpoll(1000)  // Enable SQPOLL mode
-//!                 .setup_iopoll()      // Enable IOPOLL for high performance
-//!                 .build(256)?;
-//!             cell.set(RefCell::new(ring))
-//!                 .map_err(|_| libublk::UblkError::OtherError(-libc::EEXIST))?;
-//!         }
-//!         Ok(())
-//!     })?;
-//!     println!("Advanced ring initialized!");
-//!     Ok(())
-//! }
-//! ```
+//! For ublk-friendly defaults (`coop_taskrun`, no SINGLE_ISSUER) call
+//! `WorkerRing::new(sq_depth, cq_depth)`.
 //!
 //! ## Unified Buffer API Examples
 //!
@@ -163,189 +137,77 @@ use crate::UblkUringData;
 use async_lock::Semaphore;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use serde::{Deserialize, Serialize};
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::fs;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 
-// Unified thread-local io_uring for all queue operations
+// ---------------------------------------------------------------------------
+// WorkerRing — explicit io_uring handle, replacing the prior thread_local
+// ---------------------------------------------------------------------------
+//
+// Each worker thread owns one `IoUring`. Many `UblkQueue` instances on that
+// thread share it via `Rc::clone` of the inner `RefCell<IoUring>`. The
+// single-issuer constraint is enforced by the `Rc` (not `Send`) and by the
+// fact that submission is only ever invoked synchronously inside the
+// worker's executor — there is no path by which two threads can race on the
+// same ring.
+//
+// Replaces the old `QUEUE_RING` thread_local that hard-wired
+// "one queue per OS thread"; the multiplex worker pool needs many queues
+// per thread.
 
-// Thread-local queue ring using OnceCell for conditional initialization
-std::thread_local! {
-    pub(crate) static QUEUE_RING: OnceCell<RefCell<IoUring<squeue::Entry>>> =
-        OnceCell::new();
+/// A queue-thread io_uring ring shared across the queues hosted on one worker.
+///
+/// Cheap to clone (one `Rc` increment). Mutation goes through `with_mut`
+/// which does a single `RefCell::borrow_mut` — uncontended in the normal
+/// case because the executor polls tasks one at a time on the owning thread.
+#[derive(Clone)]
+pub struct WorkerRing {
+    inner: Rc<RefCell<IoUring<squeue::Entry>>>,
 }
 
-// Internal macro versions for backwards compatibility within the crate
-#[macro_export]
-macro_rules! with_queue_ring_internal {
-    ($closure:expr) => {
-        $crate::io::QUEUE_RING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
-                let ring = ring_cell.borrow();
-                $closure(&*ring)
-            } else {
-                panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
-            }
-        })
-    };
-}
+impl WorkerRing {
+    /// Build a fresh ring with default ublk-friendly options
+    /// (`coop_taskrun`, no SINGLE_ISSUER — callers wanting that should use
+    /// `from_io_uring` after building their own).
+    pub fn new(sq_depth: u32, cq_depth: u32) -> Result<Self, UblkError> {
+        let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
+            .setup_cqsize(cq_depth)
+            .setup_coop_taskrun()
+            .build(sq_depth)
+            .map_err(UblkError::IOError)?;
+        Ok(Self::from_io_uring(ring))
+    }
 
-#[macro_export]
-macro_rules! with_queue_ring_mut_internal {
-    ($closure:expr) => {
-        $crate::io::QUEUE_RING.with(|cell| {
-            if let Some(ring_cell) = cell.get() {
-                let mut ring = ring_cell.borrow_mut();
-                $closure(&mut *ring)
-            } else {
-                panic!("Queue ring not initialized. Call ublk_init_task_ring() first or create a UblkQueue.")
-            }
-        })
-    };
-}
+    /// Wrap a caller-built `IoUring` (e.g., one with `setup_single_issuer`).
+    pub fn from_io_uring(ring: IoUring<squeue::Entry>) -> Self {
+        Self { inner: Rc::new(RefCell::new(ring)) }
+    }
 
-// Make internal macros available within the crate
-pub(crate) use with_queue_ring_internal;
-pub(crate) use with_queue_ring_mut_internal;
+    /// Access the ring with an immutable borrow.
+    #[inline]
+    pub fn with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&IoUring<squeue::Entry>) -> R,
+    {
+        f(&self.inner.borrow())
+    }
 
-/// Access the thread-local queue ring with immutable reference
-///
-/// # Arguments
-/// * `_queue` - Reference to UblkQueue (used to ensure queue context)
-/// * `f` - Closure that receives immutable reference to the IoUring
-///
-/// # Example
-/// ```no_run
-/// # use libublk::io::UblkQueue;
-/// # fn example(queue: &UblkQueue) -> Result<(), Box<dyn std::error::Error>> {
-/// libublk::io::with_queue_ring(queue, |ring| {
-///     println!("SQ entries: {}", ring.params().sq_entries());
-/// });
-/// # Ok(())
-/// # }
-/// ```
-#[deprecated(
-    since = "0.5.0",
-    note = "use with_task_io_ring() instead - the UblkQueue parameter is unnecessary"
-)]
-pub fn with_queue_ring<F, R>(_queue: &UblkQueue, f: F) -> R
-where
-    F: FnOnce(&IoUring<squeue::Entry>) -> R,
-{
-    with_queue_ring_internal!(f)
-}
+    /// Access the ring with a mutable borrow.
+    #[inline]
+    pub fn with_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut IoUring<squeue::Entry>) -> R,
+    {
+        f(&mut self.inner.borrow_mut())
+    }
 
-/// Access the thread-local queue ring with mutable reference
-///
-/// # Arguments
-/// * `_queue` - Reference to UblkQueue (used to ensure queue context)
-/// * `f` - Closure that receives mutable reference to the IoUring
-///
-/// # Example
-/// ```no_run
-/// # use libublk::io::UblkQueue;
-/// # fn example(queue: &UblkQueue) -> Result<(), Box<dyn std::error::Error>> {
-/// libublk::io::with_queue_ring_mut(queue, |ring| {
-///     ring.submit_and_wait(1)
-/// })?;
-/// # Ok(())
-/// # }
-/// ```
-#[deprecated(
-    since = "0.5.0",
-    note = "use with_task_io_ring_mut() instead - the UblkQueue parameter is unnecessary"
-)]
-pub fn with_queue_ring_mut<F, R>(_queue: &UblkQueue, f: F) -> R
-where
-    F: FnOnce(&mut IoUring<squeue::Entry>) -> R,
-{
-    with_queue_ring_mut_internal!(f)
-}
-
-/// Access the thread-local queue ring with immutable reference
-///
-/// This function provides direct access to the thread-local IO ring without
-/// requiring a UblkQueue parameter, making it more convenient for use cases
-/// where the queue reference is not readily available.
-///
-/// # Arguments
-/// * `f` - Closure that receives immutable reference to the IoUring
-///
-/// # Example
-/// ```no_run
-/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// libublk::io::with_task_io_ring(|ring| {
-///     println!("SQ entries: {}", ring.params().sq_entries());
-/// });
-/// # Ok(())
-/// # }
-/// ```
-pub fn with_task_io_ring<F, R>(f: F) -> R
-where
-    F: FnOnce(&IoUring<squeue::Entry>) -> R,
-{
-    with_queue_ring_internal!(f)
-}
-
-/// Access the thread-local queue ring with mutable reference
-///
-/// This function provides direct access to the thread-local IO ring without
-/// requiring a UblkQueue parameter, making it more convenient for use cases
-/// where the queue reference is not readily available.
-///
-/// # Arguments
-/// * `f` - Closure that receives mutable reference to the IoUring
-///
-/// # Example
-/// ```no_run
-/// # fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// libublk::io::with_task_io_ring_mut(|ring| {
-///     ring.submit_and_wait(1)
-/// })?;
-/// # Ok(())
-/// # }
-/// ```
-pub fn with_task_io_ring_mut<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut IoUring<squeue::Entry>) -> R,
-{
-    with_queue_ring_mut_internal!(f)
-}
-
-/// Initialize the thread-local queue ring using a custom closure
-///
-/// This API allows users to customize the io_uring initialization before creating UblkQueue.
-/// The closure receives the OnceCell and can conditionally initialize it if not already set.
-/// If the thread-local variable is already initialized, the closure does nothing.
-///
-/// # Arguments
-/// * `init_fn` - Closure that receives OnceCell<RefCell<IoUring<squeue::Entry>>> and returns
-///               Result<(), UblkError>. Should call `cell.set()` to initialize if needed.
-///
-/// For detailed examples of basic and advanced initialization patterns, see the module-level documentation.
-pub fn ublk_init_task_ring<F>(init_fn: F) -> Result<(), UblkError>
-where
-    F: FnOnce(&OnceCell<RefCell<IoUring<squeue::Entry>>>) -> Result<(), UblkError>,
-{
-    QUEUE_RING.with(|cell| init_fn(cell))
-}
-
-/// Internal function to initialize the queue ring with default parameters
-pub(crate) fn init_task_ring_default(sq_depth: u32, cq_depth: u32) -> Result<(), UblkError> {
-    ublk_init_task_ring(|cell| {
-        if cell.get().is_none() {
-            let ring = IoUring::<squeue::Entry, cqueue::Entry>::builder()
-                .setup_cqsize(cq_depth)
-                .setup_coop_taskrun()
-                .build(sq_depth)
-                .map_err(UblkError::IOError)?;
-
-            cell.set(RefCell::new(ring))
-                .map_err(|_| UblkError::OtherError(-libc::EEXIST))?;
-        }
-        Ok(())
-    })
+    /// Underlying io_uring fd, for `PollAdd` targets and similar.
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.inner.borrow().as_raw_fd()
+    }
 }
 
 /// Unified buffer descriptor supporting both copy and zero-copy operations
@@ -1103,11 +965,14 @@ pub struct UblkQueue<'a> {
     buf_reg_semaphore: Semaphore,
     /// Counter tracking number of registered buffers for optimization
     buf_reg_counter: RefCell<u32>,
+    /// The io_uring this queue submits to. `Rc`-cloned from the worker that
+    /// hosts this queue; many queues on one worker share one ring.
+    pub(crate) ring: WorkerRing,
 }
 
 impl AsRawFd for UblkQueue<'_> {
     fn as_raw_fd(&self) -> RawFd {
-        with_queue_ring_internal!(|ring: &IoUring<squeue::Entry>| ring.as_raw_fd())
+        self.ring.as_raw_fd()
     }
 }
 
@@ -1116,19 +981,13 @@ impl Drop for UblkQueue<'_> {
         let dev = self.dev;
         log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
 
-        if let Err(r) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
-            .submitter()
-            .unregister_files())
-        {
+        if let Err(r) = self.ring.with_mut(|r| r.submitter().unregister_files()) {
             log::error!("unregister fixed files failed {}", r);
         }
 
         // Unregister sparse buffer table if auto buffer registration was enabled
         if self.support_auto_buf_zc() {
-            if let Err(r) = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
-                .submitter()
-                .unregister_buffers())
-            {
+            if let Err(r) = self.ring.with_mut(|r| r.submitter().unregister_buffers()) {
                 log::error!("unregister sparse buffers failed {}", r);
             }
         }
@@ -1177,14 +1036,18 @@ impl UblkQueue<'_> {
     ///
     /// * `q_id`: queue id, [0, nr_queues)
     /// * `dev`: ublk device reference
+    /// * `ring`: the worker's io_uring this queue will submit to. The ring
+    ///   reference is cloned (cheap `Rc::clone`) into the returned queue.
+    ///   Multiple queues on the same worker share one ring; the M2 path
+    ///   constructs one queue per ring (per worker thread), and M4 will
+    ///   relax that to many queues per ring.
     ///
-    ///ublk queue is handling IO from driver, so far we use dedicated
-    ///io_uring for handling both IO command and IO
+    /// **Single-issuer invariant**: the ring must only ever be submitted to
+    /// from one thread (the worker thread that owns it). This is enforced
+    /// structurally by `WorkerRing` being `!Send` (it wraps an `Rc`).
     #[allow(clippy::uninit_vec)]
-    pub fn new(q_id: u16, dev: &UblkDev) -> Result<UblkQueue<'_>, UblkError> {
+    pub fn new<'a>(q_id: u16, dev: &'a UblkDev, ring: &WorkerRing) -> Result<UblkQueue<'a>, UblkError> {
         let tgt = &dev.tgt;
-        let sq_depth = tgt.sq_depth;
-        let cq_depth = tgt.cq_depth;
 
         if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
             && (dev.dev_info.flags & sys::UBLK_F_USER_COPY as u64) != 0
@@ -1192,25 +1055,28 @@ impl UblkQueue<'_> {
             return Err(UblkError::InvalidVal);
         }
 
-        // Initialize the thread-local queue ring with default parameters
-        // Users can call init_task_ring() before UblkQueue::new() to customize initialization
-        init_task_ring_default(sq_depth as u32, cq_depth as u32)?;
-
         let depth = dev.dev_info.queue_depth as u32;
         let cdev_fd = dev.cdev_file.as_raw_fd();
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
         let max_cmd_buf_sz = UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH) as libc::off_t;
 
-        // Register files and buffers with the thread-local ring
-        with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
-            ring.submitter()
+        // Register fixed files into this worker's ring.
+        //
+        // M2: one queue per ring, so this is the only registration on the
+        // ring and `register_files` is correct.
+        //
+        // TODO(M4): when many queues share one ring, switch to
+        // `register_files_update` to add this queue's cdev fd into a slot
+        // without disturbing other queues' registrations.
+        ring.with_mut(|r| {
+            r.submitter()
                 .register_files(&tgt.fds[0..tgt.nr_fds as usize])
                 .map_err(UblkError::IOError)
         })?;
 
         if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
-            with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
-                ring.submitter()
+            ring.with_mut(|r| {
+                r.submitter()
                     .register_buffers_sparse(depth)
                     .map_err(UblkError::IOError)
             })?;
@@ -1268,6 +1134,7 @@ impl UblkQueue<'_> {
             bufs: RefCell::new(bufs),
             buf_reg_semaphore: Semaphore::new(0),
             buf_reg_counter: RefCell::new(0),
+            ring: ring.clone(),
         };
 
         log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
@@ -1289,28 +1156,13 @@ impl UblkQueue<'_> {
         self.state.borrow().is_stopping()
     }
 
-    /// Manipulate immutable queue uring
-    #[deprecated(
-        since = "0.5.0",
-        note = "removed in 0.6.0 - use with_queue_ring() instead"
-    )]
-    pub fn uring_op<R, H>(&self, op_handler: H) -> Result<R, UblkError>
-    where
-        H: Fn(&IoUring<squeue::Entry>) -> Result<R, UblkError>,
-    {
-        with_queue_ring_internal!(|uring: &IoUring<squeue::Entry>| op_handler(uring))
-    }
-
-    /// Manipulate mutable queue uring
-    #[deprecated(
-        since = "0.5.0",
-        note = "removed in 0.6.0 - use with_queue_ring_mut() instead"
-    )]
-    pub fn uring_op_mut<R, H>(&self, op_handler: H) -> Result<R, UblkError>
-    where
-        H: Fn(&mut IoUring<squeue::Entry>) -> Result<R, UblkError>,
-    {
-        with_queue_ring_mut_internal!(|uring: &mut IoUring<squeue::Entry>| op_handler(uring))
+    /// Access this queue's io_uring directly. Cheap (`Rc::clone` semantics).
+    /// Use this if you need to issue raw SQEs that aren't covered by the
+    /// `submit_*` helpers. The single-issuer invariant still applies — only
+    /// the worker thread that owns this queue may submit.
+    #[inline]
+    pub fn ring(&self) -> &WorkerRing {
+        &self.ring
     }
 
     /// Return queue depth
@@ -1652,7 +1504,7 @@ impl UblkQueue<'_> {
     ) -> UblkUringOpFuture {
         let f = UblkUringOpFuture::new(0);
         let user_data = f.user_data | (tag as u64);
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        self.ring.with_mut(|r: &mut IoUring<squeue::Entry>| {
             self.__queue_io_cmd(r, tag, cmd_op, buf_addr as u64, None, user_data, result)
         });
 
@@ -1682,7 +1534,7 @@ impl UblkQueue<'_> {
 
         let f = UblkUringOpFuture::new(0);
         let user_data = f.user_data | (tag as u64);
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        self.ring.with_mut(|r: &mut IoUring<squeue::Entry>| {
             self.__queue_io_cmd(r, tag, cmd_op, 0, auto_buf_addr, user_data, result)
         });
 
@@ -1911,13 +1763,14 @@ impl UblkQueue<'_> {
     }
 
     pub fn ublk_submit_sqe(&self, sqe: io_uring::squeue::Entry) -> UblkUringOpFuture {
-        crate::uring_async::__ublk_submit_sqe_async(sqe, UblkUringData::Target as u64).unwrap()
+        crate::uring_async::__ublk_submit_sqe_async(&self.ring, sqe, UblkUringData::Target as u64)
+            .unwrap()
     }
 
     #[inline]
     pub fn ublk_submit_sqe_sync(&self, sqe: io_uring::squeue::Entry) -> Result<(), UblkError> {
         loop {
-            let res = with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| unsafe {
+            let res = self.ring.with_mut(|ring: &mut IoUring<squeue::Entry>| unsafe {
                 ring.submission().push(&sqe)
             });
 
@@ -1925,7 +1778,7 @@ impl UblkQueue<'_> {
                 Ok(_) => break,
                 Err(_) => {
                     log::debug!("ublk_submit_sqe: flush and retry");
-                    with_queue_ring_internal!(
+                    self.ring.with(
                         |ring: &IoUring<squeue::Entry>| ring.submit_and_wait(0)
                     )?;
                 }
@@ -1957,7 +1810,7 @@ impl UblkQueue<'_> {
             .build()
             .user_data(user_data);
 
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        self.ring.with_mut(|r: &mut IoUring<squeue::Entry>| {
             loop {
                 let res = unsafe { r.submission().push(&sqe) };
                 match res {
@@ -2014,7 +1867,7 @@ impl UblkQueue<'_> {
             assert!(
                 ((self.dev_flags & (crate::sys::UBLK_F_USER_COPY as u64)) != 0) == bufs.is_none()
             );
-            with_queue_ring_mut_internal!(|ring| {
+            self.ring.with_mut(|ring| {
                 self.queue_io_cmd(
                     ring,
                     i as u16,
@@ -2062,7 +1915,7 @@ impl UblkQueue<'_> {
             let auto_buf_addr = bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data);
             let data = UblkIOCtx::build_user_data(i as u16, sys::UBLK_U_IO_FETCH_REQ, 0, false);
 
-            with_queue_ring_mut_internal!(|ring| {
+            self.ring.with_mut(|ring| {
                 self.__queue_io_cmd(
                     ring,
                     i as u16,
@@ -2151,7 +2004,7 @@ impl UblkQueue<'_> {
     fn __submit_fetch_commands(&self) {
         for i in 0..self.q_depth {
             let buf_addr = self.get_io_buf_addr(i as u16) as u64;
-            with_queue_ring_mut_internal!(|ring| {
+            self.ring.with_mut(|ring| {
                 self.queue_io_cmd(ring, i as u16, sys::UBLK_U_IO_FETCH_REQ, buf_addr, -1)
             });
         }
@@ -2166,15 +2019,15 @@ impl UblkQueue<'_> {
     /// * `tag`: io command tag
     /// * `res`: io command result
     ///
-    /// When calling this API, target code has to make sure that thread-local QUEUE_RING
-    /// won't be borrowed.
+    /// When calling this API, target code has to make sure that the queue's
+    /// `WorkerRing` is not currently borrowed.
     #[deprecated(
         since = "0.5.0",
         note = "Use `complete_io_cmd_unified` instead, removed in 0.6"
     )]
     #[inline]
     pub fn complete_io_cmd(&self, tag: u16, buf_addr: *mut u8, res: Result<UblkIORes, UblkError>) {
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        self.ring.with_mut(|r: &mut IoUring<squeue::Entry>| {
             match res {
                 Ok(UblkIORes::Result(res))
                 | Err(UblkError::OtherError(res))
@@ -2245,7 +2098,7 @@ impl UblkQueue<'_> {
         buf_reg_data: &sys::ublk_auto_buf_reg,
         res: Result<UblkIORes, UblkError>,
     ) {
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        self.ring.with_mut(|r: &mut IoUring<squeue::Entry>| {
             match res {
                 Ok(UblkIORes::Result(res))
                 | Err(UblkError::OtherError(res))
@@ -2507,7 +2360,7 @@ impl UblkQueue<'_> {
 
         #[allow(clippy::collapsible_if)]
         if state.queue_is_done() {
-            if with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| ring
+            if self.ring.with_mut(|ring: &mut IoUring<squeue::Entry>| ring
                 .submission()
                 .is_empty())
             {
@@ -2515,7 +2368,7 @@ impl UblkQueue<'_> {
             }
         }
 
-        with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+        self.ring.with_mut(|r: &mut IoUring<squeue::Entry>| {
             let ret = r.submitter().submit_with_args(to_wait, &args);
             match ret {
                 Err(ref err) if err.raw_os_error() == Some(libc::ETIME) => {
@@ -2546,7 +2399,7 @@ impl UblkQueue<'_> {
                 Ok(nr_cqes)
             }
             Err(UblkError::UringTimeout) => {
-                with_queue_ring_mut_internal!(|r: &mut IoUring<io_uring::squeue::Entry>| {
+                self.ring.with_mut(|r: &mut IoUring<io_uring::squeue::Entry>| {
                     if r.submission().is_empty() {
                         self.enter_queue_idle();
                     }
@@ -2671,7 +2524,7 @@ impl UblkQueue<'_> {
 
                 for i in 0..done {
                     let cqe = {
-                        match with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+                        match self.ring.with_mut(|ring: &mut IoUring<squeue::Entry>| {
                             ring.completion().next()
                         }) {
                             None => {

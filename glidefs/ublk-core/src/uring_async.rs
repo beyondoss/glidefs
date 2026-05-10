@@ -1,6 +1,4 @@
-use crate::io::UblkQueue;
-use crate::with_queue_ring_internal;
-use crate::with_queue_ring_mut_internal;
+use crate::io::{UblkQueue, WorkerRing};
 use crate::UblkError;
 use io_uring::{cqueue, squeue, types, IoUring};
 use slab::Slab;
@@ -178,7 +176,7 @@ pub fn ublk_reap_io_events_with_update_queue<F>(
 where
     F: FnMut(&io_uring::cqueue::Entry),
 {
-    crate::io::with_queue_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry>| {
+    q.ring().with_mut(|ring| {
         let mut cmd_cnt = 0u32;
         let mut aborted = false;
         let mut has_timeout = poll_timeout;
@@ -277,7 +275,7 @@ pub fn uring_poll_io_fn<T>(
 where
     T: io_uring::squeue::EntryMarker,
 {
-    crate::io::with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| {
+    q.ring().with_mut(|r| {
         let stopping = q.is_stopping();
         let res = uring_poll_fn(r, timeout, if stopping { 0 } else { to_wait });
         if stopping {
@@ -290,6 +288,7 @@ where
 
 #[inline]
 pub(crate) fn __ublk_submit_sqe_async(
+    ring: &WorkerRing,
     sqe: io_uring::squeue::Entry,
     user_data: u64,
 ) -> Result<UblkUringOpFuture, UblkError> {
@@ -297,15 +296,13 @@ pub(crate) fn __ublk_submit_sqe_async(
     let sqe = sqe.user_data(f.user_data);
 
     loop {
-        let res = with_queue_ring_mut_internal!(|r: &mut IoUring<squeue::Entry>| unsafe {
-            r.submission().push(&sqe)
-        });
+        let res = ring.with_mut(|r| unsafe { r.submission().push(&sqe) });
 
         let _ = match res {
             Ok(_) => break,
             Err(_) => {
                 log::debug!("ublk_submit_sqe: flush and retry");
-                with_queue_ring_internal!(|r: &IoUring<squeue::Entry>| r.submit_and_wait(0))
+                ring.with(|r| r.submit_and_wait(0))
             }
         };
     }
@@ -313,14 +310,16 @@ pub(crate) fn __ublk_submit_sqe_async(
     Ok(f)
 }
 
-/// Submit an io_uring SQE asynchronously.
+/// Submit an io_uring SQE asynchronously on the given ring.
 ///
-/// Returns a future that resolves to the CQE result.
+/// Returns a future that resolves to the CQE result. The ring must be the
+/// one owned by the worker thread invoking this — single-issuer applies.
 pub async fn ublk_submit_sqe_async(
+    ring: &WorkerRing,
     sqe: io_uring::squeue::Entry,
     user_data: u64,
 ) -> Result<i32, UblkError> {
-    let f = __ublk_submit_sqe_async(sqe, user_data)?;
+    let f = __ublk_submit_sqe_async(ring, sqe, user_data)?;
 
     Ok(f.await)
 }
