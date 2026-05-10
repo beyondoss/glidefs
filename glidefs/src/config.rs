@@ -26,6 +26,32 @@ pub struct Settings {
     pub gcp: Option<GcsConfig>,
 }
 
+impl Settings {
+    /// Resolve the ublk `nr_queues` setting from either canonical
+    /// location:
+    /// 1. `[servers.ublk] nr_queues` — preferred (matches `glidefs.toml`)
+    /// 2. legacy `[servers.nbd] ublk_nr_queues` — back-compat for older
+    ///    deployments where the field lived under `nbd`
+    /// 3. fallback to 1
+    ///
+    /// Necessary because the original `NbdConfig::ublk_nr_queues()` only
+    /// looked at #2, silently ignoring `[servers.ublk]`. The bench at
+    /// M4 surfaced this — the daemon registered every ublk export with
+    /// `queues=1` despite `glidefs.toml` declaring `nr_queues = 4`.
+    pub fn ublk_nr_queues(&self) -> u16 {
+        if let Some(ublk_cfg) = self.servers.ublk.as_ref() {
+            if let Some(n) = ublk_cfg.nr_queues {
+                return n;
+            }
+        }
+        self.servers
+            .nbd
+            .as_ref()
+            .map(|n| n.ublk_nr_queues())
+            .unwrap_or(1)
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
@@ -315,7 +341,10 @@ impl NbdConfig {
             .unwrap_or(crate::block::pack::DEFAULT_FLUSH_THRESHOLD)
     }
 
-    /// Number of ublk I/O queues (default: 1).
+    /// Number of ublk I/O queues — legacy NBD-config-only field. The
+    /// canonical setting is `[servers.ublk] nr_queues`; callers that
+    /// have access to the top-level `Settings` should prefer
+    /// `Settings::ublk_nr_queues()` which checks both locations.
     pub fn ublk_nr_queues(&self) -> u16 {
         self.ublk_nr_queues.unwrap_or(1)
     }

@@ -105,7 +105,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             max_s3_uploads: nbd_config.max_s3_uploads(),
             max_s3_downloads: nbd_config.max_s3_downloads(),
             default_flush_threshold: nbd_config.flush_threshold(),
-            ublk_nr_queues: nbd_config.ublk_nr_queues(),
+            ublk_nr_queues: settings.ublk_nr_queues(),
             nbd_dead_conn_timeout: nbd_config.nbd_dead_conn_timeout(),
         })
         .await
