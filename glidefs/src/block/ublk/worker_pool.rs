@@ -187,15 +187,23 @@ impl WorkerPool {
     /// Pick the worker that should host this `(export_name, qid)`.
     /// Hash by name then xor-rotate by qid so a device's `nr_queues`
     /// queues spread across distinct workers (assuming `K ≥ nr_queues`).
+    ///
+    /// Uses inline FNV-1a rather than `DefaultHasher` because the std
+    /// hasher's algorithm is explicitly not stable across Rust versions —
+    /// keeping this deterministic means a `(export_name, qid)` pair always
+    /// lands on the same worker index given the same `K`, which makes
+    /// placement reproducible in tests and across deployments.
     pub(super) fn worker_for(&self, export_name: &str, qid: u16) -> &WorkerHandle {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        export_name.hash(&mut h);
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64-bit offset basis
+        for &b in export_name.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
         // Mix qid in via a multiplier large enough to distribute across
         // the low bits regardless of name-hash; doesn't need to be a
         // cryptographic PRP, just a permutation.
         let qid_seed: u64 = (qid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let bucket = (h.finish() ^ qid_seed) as usize % self.workers.len();
+        let bucket = (h ^ qid_seed) as usize % self.workers.len();
         &self.workers[bucket]
     }
 
@@ -209,8 +217,17 @@ impl WorkerPool {
             done_rxs.push((w.idx, done_rx));
         }
         for (idx, rx) in done_rxs {
-            let _ = rx.await;
-            tracing::debug!(worker = idx, "worker shutdown ack");
+            match rx.await {
+                Ok(()) => tracing::debug!(worker = idx, "worker shutdown ack"),
+                // Sender dropped without ack — worker exited unexpectedly
+                // (panic, channel-close path, etc.). The thread join below
+                // will surface the panic itself; this just makes the early
+                // exit visible in the shutdown trace.
+                Err(_) => tracing::warn!(
+                    worker = idx,
+                    "worker exited without sending shutdown ack"
+                ),
+            }
         }
         for w in &mut self.workers {
             if let Some(join) = w.join.take() {
@@ -272,6 +289,58 @@ fn worker_thread_main(
     tokio_handle: tokio::runtime::Handle,
     eventfd: Arc<EventFd>,
 ) {
+    // M5: Pin this worker thread to one CPU. With K = num_cpus capped
+    // at 32, each worker gets a dedicated CPU on a single-socket box;
+    // io_uring submission and CQ processing then stay on-core, the
+    // executor's task storage hits L1 cache instead of bouncing
+    // between CPUs, and the kernel scheduler stops migrating us.
+    //
+    // Best-effort: a failure here just means the kernel's default
+    // load-balancer continues to manage placement — degraded but
+    // correct. Logged as a warning so it's visible.
+    //
+    // TODO multi-NUMA: on a multi-socket box (`/sys/devices/system/node/online`
+    // shows N > 1), partition workers per node by NVMe NUMA node and
+    // hash devices to a worker WITHIN their node. For now this lazy
+    // round-robin is correct on single-socket and degrades gracefully
+    // on multi-socket (~5-10% NVMe-cross-node latency, no correctness
+    // hit).
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let cpu = idx % num_cpus;
+    // SAFETY:
+    // - `cpu_set_t` is a plain C struct with no invalid bit patterns; zero is
+    //   the correct initial state and CPU_ZERO is functionally a memset(0).
+    // - `set` is stack-allocated, properly aligned, and outlives the
+    //   `sched_setaffinity` call (we don't return the address).
+    // - `gettid()` always succeeds and returns the current thread's tid, which
+    //   is a valid target for the calling process's `sched_setaffinity`.
+    // - `size_of::<cpu_set_t>()` matches the kernel's expected mask size on
+    //   the libc-supported architectures (x86-64, aarch64).
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        let tid = libc::gettid();
+        let ret = libc::sched_setaffinity(
+            tid,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set,
+        );
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                worker = idx,
+                cpu,
+                error = %err,
+                "sched_setaffinity failed; worker will run with default scheduling"
+            );
+        } else {
+            tracing::debug!(worker = idx, cpu, "worker pinned to CPU");
+        }
+    }
+
     // Build the per-thread io_uring with SINGLE_ISSUER. coop_taskrun is
     // intentionally OMITTED — see device.rs::queue_io_loop for the
     // FETCH_REQ/START mutex deadlock rationale that applies here too.
@@ -361,8 +430,6 @@ async fn run_worker_loop(
     state: &mut WorkerState<'_>,
     rx: &mut mpsc::Receiver<WorkerMsg>,
 ) {
-    let _ = eventfd; // captured for lifetime; signaling goes via WorkerHandle::send.
-
     loop {
         // Drain inbox non-blockingly. Multiple messages can arrive between
         // ticks (especially during a multi-queue device add).
@@ -396,10 +463,23 @@ async fn run_worker_loop(
         // promptly noticed.
         let to_wait = if state.executor.all_done() { 0 } else { 1 };
         let ts = io_uring::types::Timespec::new().nsec(WORKER_IDLE_NSEC);
-        let _submit = ring.with_mut(|r| {
+        let submit_result = ring.with_mut(|r| {
             let args = io_uring::types::SubmitArgs::new().timespec(&ts);
             r.submitter().submit_with_args(to_wait, &args)
         });
+        // ETIME is the expected wakeup path when nothing else completed within
+        // WORKER_IDLE_NSEC; any other error means the ring is in a degraded
+        // state (EAGAIN/EBUSY/EINVAL...) and silently swallowing it would mask
+        // a stuck worker behind apparent normal ticking.
+        if let Err(e) = submit_result
+            && e.raw_os_error() != Some(libc::ETIME)
+        {
+            tracing::warn!(
+                worker = idx,
+                error = %e,
+                "io_uring submit_with_args failed"
+            );
+        }
 
         // Reap CQEs and route to futures via slab.
         ring.with_mut(|r| {
