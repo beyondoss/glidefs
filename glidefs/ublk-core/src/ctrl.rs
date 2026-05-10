@@ -2564,7 +2564,7 @@ impl UblkCtrl {
         q_fn: Q,
     ) -> Vec<std::thread::JoinHandle<()>>
     where
-        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+        Q: FnOnce(u16, Arc<UblkDev>) + Send + Sync + Clone + 'static,
     {
         use std::sync::mpsc;
 
@@ -2584,7 +2584,7 @@ impl UblkCtrl {
                     eprintln!("Warning: Failed to send queue thread info: {}", e);
                     return;
                 }
-                _q_fn(q, &_dev);
+                _q_fn(q, _dev);
             }));
         }
 
@@ -2627,7 +2627,7 @@ impl UblkCtrl {
     pub fn run_target<T, Q, W>(&self, tgt_fn: T, q_fn: Q, device_fn: W) -> Result<i32, UblkError>
     where
         T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
-        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+        Q: FnOnce(u16, Arc<UblkDev>) + Send + Sync + Clone + 'static,
         W: FnOnce(&UblkCtrl) + Send + Sync + 'static,
     {
         let dev = &Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);

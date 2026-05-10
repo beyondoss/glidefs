@@ -168,7 +168,7 @@ where
 
 /// Reap completion queue entries with queue state update and idle management.
 pub fn ublk_reap_io_events_with_update_queue<F>(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     poll_timeout: bool,
     timeout_data: Option<u64>,
     mut waker_ops: F,
@@ -222,7 +222,7 @@ where
 ///
 /// High-level convenience wrapper around `run_uring_tasks`.
 pub async fn wait_and_handle_io_events<R, I>(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     idle_secs: Option<u64>,
     run_ops: R,
     is_done: I,

@@ -37,6 +37,7 @@
 // real callers appear.
 #![allow(dead_code)]
 
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 
@@ -107,14 +108,35 @@ pub(super) struct WorkerPool {
 impl WorkerPool {
     /// Spawn `num_workers` worker threads, each with its own ring + executor.
     /// Workers idle until `shutdown` is called.
+    ///
+    /// If a spawn fails partway through, any already-spawned workers are
+    /// joined before this returns — `Drop` runs on the partial `Self` left
+    /// behind by the early return.
     pub(super) fn new(num_workers: usize) -> std::io::Result<Self> {
-        assert!(num_workers > 0, "WorkerPool needs at least one worker");
-        let mut workers = Vec::with_capacity(num_workers);
+        if num_workers == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "WorkerPool needs at least one worker",
+            ));
+        }
+        let mut pool = Self { workers: Vec::with_capacity(num_workers) };
         for i in 0..num_workers {
-            workers.push(WorkerHandle::spawn(i)?);
+            match WorkerHandle::spawn(i) {
+                Ok(h) => pool.workers.push(h),
+                Err(e) => {
+                    tracing::error!(
+                        worker = i,
+                        error = %e,
+                        spawned = pool.workers.len(),
+                        "failed to spawn worker; aborting pool init"
+                    );
+                    // `pool` drops here: Drop joins the partial set.
+                    return Err(e);
+                }
+            }
         }
         tracing::info!(count = num_workers, "ublk worker pool spawned");
-        Ok(Self { workers })
+        Ok(pool)
     }
 
     pub(super) fn num_workers(&self) -> usize {
@@ -165,6 +187,36 @@ impl WorkerPool {
     }
 }
 
+impl Drop for WorkerPool {
+    /// Final safety net: drops every inbox sender (so each worker's
+    /// `rx.blocking_recv()` returns `None` and the loop exits) and joins the
+    /// thread. Runs on three paths:
+    ///
+    /// 1. After the async [`shutdown`] completes — join handles are already
+    ///    `None`, so this is a no-op besides dropping the `WorkerHandle`s.
+    /// 2. The caller dropped the pool without ever calling `shutdown` (e.g.
+    ///    panic between `new` and `shutdown`).
+    /// 3. Partial-spawn cleanup inside [`Self::new`] when one worker fails
+    ///    to spawn after others have already started.
+    ///
+    /// [`shutdown`]: WorkerPool::shutdown
+    fn drop(&mut self) {
+        // Two-phase: take all join handles out (and drop the WorkerHandles —
+        // which drops the inbox senders, signaling each worker to exit), then
+        // join the threads.
+        let joins: Vec<(usize, JoinHandle<()>)> = self
+            .workers
+            .drain(..)
+            .filter_map(|mut w| w.join.take().map(|j| (w.idx, j)))
+            .collect();
+        for (idx, j) in joins {
+            if let Err(e) = j.join() {
+                tracing::error!(worker = idx, ?e, "worker thread panicked during pool drop");
+            }
+        }
+    }
+}
+
 /// Worker thread main loop.
 ///
 /// M3: build the long-lived per-thread resources, then wait on the inbox
@@ -192,16 +244,19 @@ fn worker_thread_main(idx: usize, mut rx: mpsc::Receiver<WorkerMsg>) {
     };
 
     // 2) Build the eventfd + executor. The executor is sized for many
-    //    queues × tags + a few daemon slots.
+    //    queues × tags + a few daemon slots. The eventfd is wrapped in `Arc`
+    //    so the executor's wakers (which hold an `Arc<EventFd>` via
+    //    `WakeupBits`) keep the fd alive past any drop-order edge case.
     let eventfd = match EventFd::new() {
-        Ok(e) => e,
+        Ok(e) => Arc::new(e),
         Err(e) => {
             tracing::error!(worker = idx, error = %e, "failed to init worker eventfd");
             drain_until_shutdown(&mut rx);
             return;
         }
     };
-    let _executor: QueueExecutor<'static> = QueueExecutor::new(WORKER_WAKEUP_WORDS, eventfd.fd());
+    let executor: QueueExecutor<'static> =
+        QueueExecutor::new(WORKER_WAKEUP_WORDS, Arc::clone(&eventfd));
 
     // 3) M3 idle loop: just wait for Shutdown. M4 replaces this with the
     //    real io_uring_enter event loop that drains rx between ticks.
@@ -219,11 +274,14 @@ fn worker_thread_main(idx: usize, mut rx: mpsc::Receiver<WorkerMsg>) {
         }
     }
 
-    // Resources drop here: ring (closes io_uring fd), eventfd (closes its
-    // fd), executor (drops any tasks — none in M3).
-    drop(_executor);
-    drop(ring);
+    // Resources drop in reverse declaration order: executor (drops any
+    // tasks — none in M3 — and its `Arc<EventFd>` reference), then
+    // eventfd (drops the last `Arc` reference, closing the fd), then ring
+    // (closes io_uring fd). The executor's `Arc<EventFd>` keeps the fd
+    // alive even if a refactor reorders these locals.
+    drop(executor);
     drop(eventfd);
+    drop(ring);
     tracing::debug!(worker = idx, "worker thread exited");
 }
 

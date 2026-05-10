@@ -949,13 +949,16 @@ impl UblkQueueState {
 ///
 /// So far, each queue is handled by one its own io_uring.
 ///
-pub struct UblkQueue<'a> {
+pub struct UblkQueue {
     flags: UblkFlags,
     q_id: u16,
     q_depth: u32,
     io_cmd_buf: u64,
-    //ops: Box<dyn UblkQueueImpl>,
-    pub dev: &'a UblkDev,
+    /// Owned reference to the parent device. The `Arc` keeps the device
+    /// alive for the queue's lifetime; multiple queues (different qids of
+    /// the same device, different devices on the same worker) each hold
+    /// their own clone.
+    pub dev: Arc<UblkDev>,
     /// Cached device flags from dev.dev_info.flags for performance optimization
     dev_flags: u64,
     bufs: RefCell<Vec<*mut u8>>,
@@ -970,15 +973,15 @@ pub struct UblkQueue<'a> {
     pub(crate) ring: WorkerRing,
 }
 
-impl AsRawFd for UblkQueue<'_> {
+impl AsRawFd for UblkQueue {
     fn as_raw_fd(&self) -> RawFd {
         self.ring.as_raw_fd()
     }
 }
 
-impl Drop for UblkQueue<'_> {
+impl Drop for UblkQueue {
     fn drop(&mut self) {
-        let dev = self.dev;
+        let dev = &self.dev;
         log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
 
         if let Err(r) = self.ring.with_mut(|r| r.submitter().unregister_files()) {
@@ -1007,7 +1010,7 @@ fn round_up(val: u32, rnd: u32) -> u32 {
     (val + rnd - 1) & !(rnd - 1)
 }
 
-impl UblkQueue<'_> {
+impl UblkQueue {
     const UBLK_QUEUE_IDLE_SECS: u32 = 20;
     const UBLK_QUEUE_IOCTL_ENCODE: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_0;
     const UBLK_QUEUE_AUTO_BUF_REG: UblkFlags = UblkFlags::UBLK_DEV_F_INTERNAL_1;
@@ -1035,18 +1038,17 @@ impl UblkQueue<'_> {
     /// # Arguments:
     ///
     /// * `q_id`: queue id, [0, nr_queues)
-    /// * `dev`: ublk device reference
+    /// * `dev`: parent device. Owned (`Arc`); the queue holds a clone for
+    ///   its lifetime. Many queues on one worker can each hold their own
+    ///   `Arc` clone of different devices.
     /// * `ring`: the worker's io_uring this queue will submit to. The ring
     ///   reference is cloned (cheap `Rc::clone`) into the returned queue.
-    ///   Multiple queues on the same worker share one ring; the M2 path
-    ///   constructs one queue per ring (per worker thread), and M4 will
-    ///   relax that to many queues per ring.
     ///
     /// **Single-issuer invariant**: the ring must only ever be submitted to
     /// from one thread (the worker thread that owns it). This is enforced
     /// structurally by `WorkerRing` being `!Send` (it wraps an `Rc`).
     #[allow(clippy::uninit_vec)]
-    pub fn new<'a>(q_id: u16, dev: &'a UblkDev, ring: &WorkerRing) -> Result<UblkQueue<'a>, UblkError> {
+    pub fn new(q_id: u16, dev: Arc<UblkDev>, ring: &WorkerRing) -> Result<UblkQueue, UblkError> {
         let tgt = &dev.tgt;
 
         if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
@@ -1110,14 +1112,19 @@ impl UblkQueue<'_> {
 
         assert!(!dev.flags.intersects(Self::UBLK_QUEUE_IOCTL_ENCODE));
 
+        // Capture device fields before `dev` is moved into the struct.
+        let dev_info_flags = dev.dev_info.flags;
+        let dev_flags_native = dev.flags;
+        let dev_id_for_log = dev.dev_info.dev_id;
+
         let q = UblkQueue {
-            flags: dev.flags
-                | if (dev.dev_info.flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0 {
+            flags: dev_flags_native
+                | if (dev_info_flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0 {
                     Self::UBLK_QUEUE_IOCTL_ENCODE
                 } else {
                     UblkFlags::empty()
                 }
-                | if (dev.dev_info.flags & (sys::UBLK_F_AUTO_BUF_REG as u64)) != 0 {
+                | if (dev_info_flags & (sys::UBLK_F_AUTO_BUF_REG as u64)) != 0 {
                     Self::UBLK_QUEUE_AUTO_BUF_REG
                 } else {
                     UblkFlags::empty()
@@ -1126,7 +1133,7 @@ impl UblkQueue<'_> {
             q_depth: depth,
             io_cmd_buf: io_cmd_buf as u64,
             dev,
-            dev_flags: dev.dev_info.flags,
+            dev_flags: dev_info_flags,
             state: RefCell::new(UblkQueueState {
                 cmd_inflight: 0,
                 state: 0,
@@ -1137,7 +1144,7 @@ impl UblkQueue<'_> {
             ring: ring.clone(),
         };
 
-        log::info!("dev {} queue {} started", dev.dev_info.dev_id, q_id);
+        log::info!("dev {} queue {} started", dev_id_for_log, q_id);
 
         Ok(q)
     }

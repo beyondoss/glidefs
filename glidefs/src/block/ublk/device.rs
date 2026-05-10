@@ -450,11 +450,15 @@ pub(super) fn drain_eventfd(fd: RawFd) {
 /// to the caller — no allocation.
 pub(super) struct WakeupBits {
     words: Box<[AtomicU64]>,
-    efd: RawFd,
+    /// Owns a reference to the eventfd. Holding the `Arc` here (cloned into
+    /// every `TaskWaker` via `WakeupBits` itself) guarantees the fd cannot
+    /// close while any waker is still live — no use-after-close possible
+    /// from a stray `wake()` after the executor's owner drops the eventfd.
+    efd: Arc<EventFd>,
 }
 
 impl WakeupBits {
-    pub(super) fn new(num_words: usize, efd: RawFd) -> Self {
+    pub(super) fn new(num_words: usize, efd: Arc<EventFd>) -> Self {
         assert!(num_words > 0, "WakeupBits needs at least one word");
         let words: Vec<AtomicU64> = (0..num_words).map(|_| AtomicU64::new(0)).collect();
         Self { words: words.into_boxed_slice(), efd }
@@ -470,7 +474,7 @@ impl WakeupBits {
     #[inline]
     pub(super) fn wake(&self, idx: usize) {
         self.words[idx / 64].fetch_or(1u64 << (idx % 64), Ordering::Release);
-        signal_eventfd(self.efd);
+        signal_eventfd(self.efd.fd());
     }
 
     /// Atomically drain all pending wakeup bits, yielding each task index to
@@ -538,7 +542,11 @@ pub(super) struct QueueExecutor<'a> {
 
 impl<'a> QueueExecutor<'a> {
     /// Construct an executor with `num_words × 64` task index slots.
-    pub(super) fn new(num_words: usize, efd: RawFd) -> Self {
+    ///
+    /// Takes an `Arc<EventFd>` so the eventfd outlives any `TaskWaker`
+    /// reachable through `Arc<WakeupBits>` — preventing use-after-close from
+    /// late `wake()` calls.
+    pub(super) fn new(num_words: usize, efd: Arc<EventFd>) -> Self {
         Self {
             tasks: Vec::new(),
             wakers: Vec::new(),
@@ -806,7 +814,7 @@ fn run_device(
     // Cloned once per queue by run_target().
     let q_handler = {
         let latch = Arc::clone(&latch);
-        move |qid: u16, dev: &UblkDev| {
+        move |qid: u16, dev: Arc<UblkDev>| {
             queue_io_loop(qid, dev, &handler, &tokio_handle, &latch);
         }
     };
@@ -876,7 +884,7 @@ fn run_device(
 /// returns whenever a task is woken from any thread (tokio, io_uring, etc.).
 fn queue_io_loop(
     qid: u16,
-    dev: &UblkDev,
+    dev: Arc<UblkDev>,
     handler: &Arc<BlockHandler>,
     tokio_handle: &tokio::runtime::Handle,
     latch: &QueueLatch,
@@ -893,6 +901,8 @@ fn queue_io_loop(
     // avoiding the mutex contention.
     let sq_depth = dev.tgt.sq_depth as u32;
     let cq_depth = dev.tgt.cq_depth as u32;
+    // Capture queue_depth from dev before it's moved into UblkQueue::new below.
+    let queue_depth = dev.dev_info.queue_depth;
     let ring = match io_uring::IoUring::builder()
         .setup_cqsize(cq_depth)
         .setup_single_issuer()
@@ -906,6 +916,7 @@ fn queue_io_loop(
         }
     };
 
+    // dev is now Arc<UblkDev>, moved into UblkQueue (which holds an Arc clone).
     let q_rc = match UblkQueue::new(qid, dev, &ring) {
         Ok(q) => Rc::new(q),
         Err(e) => {
@@ -915,9 +926,10 @@ fn queue_io_loop(
         }
     };
 
-    // Create eventfd for cross-thread wakeup signaling.
+    // Create eventfd for cross-thread wakeup signaling. Wrapped in `Arc`
+    // so the fd is kept alive as long as any waker can reach it.
     let efd = match EventFd::new() {
-        Ok(e) => e,
+        Ok(e) => Arc::new(e),
         Err(e) => {
             tracing::error!(qid, error = ?e, "failed to create eventfd");
             latch.signal_failed();
@@ -930,7 +942,7 @@ fn queue_io_loop(
     let zero_copy = q_rc.support_auto_buf_zc();
     // 3 words = 192 task slots: QUEUE_DEPTH (64) + eventfd daemon + slack to spare.
     // Sized for one queue per executor (per-device thread model).
-    let mut exe = QueueExecutor::new(3, efd_fd);
+    let mut exe = QueueExecutor::new(3, Arc::clone(&efd));
 
     // Enter the tokio runtime context once for the entire queue thread.
     // This must NOT be done per-task because the QueueExecutor polls multiple
@@ -960,7 +972,7 @@ fn queue_io_loop(
     }
 
     // Spawn per-tag I/O tasks.
-    for tag in 0..dev.dev_info.queue_depth {
+    for tag in 0..queue_depth {
         let q = q_rc.clone();
         let handler = Arc::clone(handler);
 
@@ -1000,7 +1012,7 @@ fn queue_io_loop(
 /// Allocates a per-tag `IoBuf` for kernel↔userspace data transfer.
 /// The kernel copies data into/out of this buffer on each I/O.
 async fn io_task(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     handler: &BlockHandler,
 ) -> Result<(), UblkError> {
@@ -1040,7 +1052,7 @@ async fn io_task(
 /// For chunks served from clean cache or S3, we fall back to
 /// `ptr::copy_nonoverlapping` into the bio pages (one unavoidable copy).
 async fn io_task_zc(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     tag: u16,
     handler: &BlockHandler,
 ) -> Result<(), UblkError> {
@@ -1110,7 +1122,7 @@ async fn io_task_zc(
 /// If the pwrite fails, only phase 1 has run — blocks are marked
 /// present (not dirty) with cleared CRCs. Recovery handles this safely.
 async fn handle_write_zc(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     offset: u64,
     length: u32,
     fua: bool,
@@ -1149,7 +1161,7 @@ async fn handle_write_zc(
 /// - `InMemory`: ptr::copy_nonoverlapping from clean cache / S3 data (one copy)
 /// - `Zero`: ptr::write_bytes
 async fn handle_read_zc(
-    q: &UblkQueue<'_>,
+    q: &UblkQueue,
     offset: u64,
     length: u32,
     addr: u64,
@@ -1491,14 +1503,14 @@ mod tests {
     // ---- WakeupBits / QueueExecutor tests --------------------------------
 
     /// A throwaway eventfd for tests where we don't actually wait on it.
-    fn test_efd() -> EventFd {
-        EventFd::new().expect("eventfd")
+    fn test_efd() -> Arc<EventFd> {
+        Arc::new(EventFd::new().expect("eventfd"))
     }
 
     #[test]
     fn wakeup_bits_capacity_matches_word_count() {
         let efd = test_efd();
-        let bits = WakeupBits::new(5, efd.fd());
+        let bits = WakeupBits::new(5, efd);
         assert_eq!(bits.capacity(), 320);
     }
 
@@ -1506,7 +1518,7 @@ mod tests {
     fn wakeup_bits_roundtrip_with_runtime_size() {
         // Pick indices that span multiple words (across the boundary at 64).
         let efd = test_efd();
-        let bits = WakeupBits::new(4, efd.fd()); // 256 bits
+        let bits = WakeupBits::new(4, efd); // 256 bits
         bits.wake(3);
         bits.wake(63);
         bits.wake(64);
@@ -1524,7 +1536,7 @@ mod tests {
     #[test]
     fn wakeup_bits_idempotent_double_wake() {
         let efd = test_efd();
-        let bits = WakeupBits::new(2, efd.fd());
+        let bits = WakeupBits::new(2, efd);
         bits.wake(7);
         bits.wake(7);
         bits.wake(7);
@@ -1541,7 +1553,7 @@ mod tests {
         use std::rc::Rc;
 
         let efd = test_efd();
-        let mut exe = QueueExecutor::new(2, efd.fd());
+        let mut exe = QueueExecutor::new(2, efd);
 
         let healthy_polled = Rc::new(RefCell::new(0u32));
         let healthy_polled_c = Rc::clone(&healthy_polled);
@@ -1567,7 +1579,7 @@ mod tests {
     fn executor_capacity_assert_runtime() {
         // Spawn until capacity is reached, then verify the next spawn panics.
         let efd = test_efd();
-        let mut exe = QueueExecutor::new(1, efd.fd()); // 64 slots
+        let mut exe = QueueExecutor::new(1, efd); // 64 slots
         for _ in 0..64 {
             exe.spawn(async {});
         }
