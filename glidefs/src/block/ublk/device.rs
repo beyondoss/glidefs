@@ -25,7 +25,13 @@ use std::time::{Duration, Instant};
 use crate::block::write_cache::ChunkSource;
 
 /// Per-queue I/O depth (max inflight commands per queue).
-const QUEUE_DEPTH: u16 = 128;
+///
+/// Empirically (see plan: we-do-not-need-dazzling-dewdrop) depth=64 captures
+/// 98% of the read-path peak (452k → 444k IOPS on local cache hits) and 100% of
+/// the write-path peak. Going higher inflates IoBuf virtual memory without
+/// material throughput. Going lower starts to leave IOPS on the table at
+/// jobs ≥ 4.
+const QUEUE_DEPTH: u16 = 64;
 
 /// Max I/O buffer size per tag. 512KB covers our 128KB block size with room for large I/Os.
 const IO_BUF_BYTES: u32 = 512 * 1024;
@@ -65,48 +71,30 @@ pub(crate) struct KernelFeatures {
 ///
 /// Returns conservative defaults (all false) on pre-6.5 kernels where
 /// `get_features()` is unavailable.
+///
+/// `UBLK_F_SUPPORT_ZERO_COPY` is permanently disabled regardless of kernel
+/// support — production validation found ZC unreliable across kernel
+/// versions, and the multiplex worker pool (M2-M7) does not depend on it.
+/// The ZC code paths (`io_task_zc`, `handle_read_zc`, `handle_write_zc`) are
+/// retained pending deletion in M7.
 pub(crate) fn detect_features() -> KernelFeatures {
     let raw = UblkCtrl::get_features().unwrap_or(0);
     let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
-    let zero_copy = (raw & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) != 0
-        && (raw & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
-        && kernel_auto_buf_reg_safe();
     let ioctl_encode = (raw & sys::UBLK_F_CMD_IOCTL_ENCODE as u64) != 0;
 
     tracing::info!(
         recovery,
-        zero_copy,
+        zero_copy = false,
         ioctl_encode,
         raw_features = format_args!("0x{:x}", raw),
-        "ublk kernel feature detection"
+        "ublk kernel feature detection (zero_copy permanently off)"
     );
 
-    KernelFeatures { recovery, zero_copy, ioctl_encode }
+    KernelFeatures { recovery, zero_copy: false, ioctl_encode }
 }
 
-/// Check if the running kernel's UBLK_F_AUTO_BUF_REG implementation is safe.
-///
-/// The Azure 6.17 kernel advertises AUTO_BUF_REG in GET_FEATURES but doesn't
-/// implement it — the kernel treats sqe->addr as a raw buffer pointer instead
-/// of decoding the packed ublk_auto_buf_reg struct. This causes io_uring_enter
-/// to hang during FETCH_REQ submission and segfaults when I/O is dispatched
-/// (writes to the packed index|flags value, e.g. address 0x10000 for tag 0).
-///
-/// AUTO_BUF_REG was merged in mainline 6.16. Require >= 6.18 to avoid broken
-/// early implementations; refine as we validate more kernels.
-fn kernel_auto_buf_reg_safe() -> bool {
-    let ver = std::fs::read_to_string("/proc/version").unwrap_or_default();
-    if let Some(rest) = ver.strip_prefix("Linux version ") {
-        let parts: Vec<&str> = rest.split(|c: char| !c.is_ascii_digit()).collect();
-        if let (Some(major), Some(minor)) = (
-            parts.first().and_then(|s| s.parse::<u32>().ok()),
-            parts.get(1).and_then(|s| s.parse::<u32>().ok()),
-        ) {
-            return major > 6 || (major == 6 && minor >= 18);
-        }
-    }
-    false // unknown kernel — don't risk it
-}
+// kernel_auto_buf_reg_safe() removed: ZC is permanently disabled in
+// detect_features. The M7 cleanup pass deletes io_task_zc and friends.
 
 // ---------------------------------------------------------------------------
 // Device mode
@@ -451,23 +439,31 @@ fn drain_eventfd(fd: RawFd) {
 
 /// Atomic bitmask for task wakeups.
 ///
-/// 3 × `AtomicU64` = 192 bits — enough for `QUEUE_DEPTH` (128) + overhead
-/// tasks (eventfd watcher, etc.).
+/// Runtime-sized — capacity (in 64-bit words) is fixed at construction. The
+/// per-device executor passes 3 (192 bits = `QUEUE_DEPTH` + eventfd daemon +
+/// slack). The worker-pool executor will pass enough to fit Σ-tasks across
+/// all hosted queues + daemons.
 ///
 /// `wake()` sets one bit with a single `fetch_or` + signals the eventfd.
 /// Duplicate wakeups collapse naturally (OR is idempotent).
-/// `drain()` atomically grabs all pending bits in three swaps.
+/// `drain_with()` swaps each word atomically and yields each set bit's index
+/// to the caller — no allocation.
 struct WakeupBits {
-    words: [AtomicU64; 3],
+    words: Box<[AtomicU64]>,
     efd: RawFd,
 }
 
 impl WakeupBits {
-    fn new(efd: RawFd) -> Self {
-        Self {
-            words: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
-            efd,
-        }
+    fn new(num_words: usize, efd: RawFd) -> Self {
+        assert!(num_words > 0, "WakeupBits needs at least one word");
+        let words: Vec<AtomicU64> = (0..num_words).map(|_| AtomicU64::new(0)).collect();
+        Self { words: words.into_boxed_slice(), efd }
+    }
+
+    /// Total task index capacity (number of bits).
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.words.len() * 64
     }
 
     /// Mark a task as needing a poll + signal the eventfd.
@@ -477,16 +473,18 @@ impl WakeupBits {
         signal_eventfd(self.efd);
     }
 
-    /// Atomically drain all pending wakeup bits.
-    ///
-    /// Bits that arrive between word swaps are deferred to the next drain
-    /// (the eventfd signal ensures prompt re-entry to the event loop).
-    fn drain(&self) -> [u64; 3] {
-        [
-            self.words[0].swap(0, Ordering::Acquire),
-            self.words[1].swap(0, Ordering::Acquire),
-            self.words[2].swap(0, Ordering::Acquire),
-        ]
+    /// Atomically drain all pending wakeup bits, yielding each task index to
+    /// `f`. Bits that arrive between word swaps are deferred to the next
+    /// drain (the eventfd signal ensures prompt re-entry to the event loop).
+    fn drain_with(&self, mut f: impl FnMut(usize)) {
+        for (word_idx, word_atomic) in self.words.iter().enumerate() {
+            let mut word = word_atomic.swap(0, Ordering::Acquire);
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                f(word_idx * 64 + bit);
+            }
+        }
     }
 }
 
@@ -539,11 +537,12 @@ struct QueueExecutor<'a> {
 }
 
 impl<'a> QueueExecutor<'a> {
-    fn new(efd: RawFd) -> Self {
+    /// Construct an executor with `num_words × 64` task index slots.
+    fn new(num_words: usize, efd: RawFd) -> Self {
         Self {
             tasks: Vec::new(),
             wakers: Vec::new(),
-            bits: Arc::new(WakeupBits::new(efd)),
+            bits: Arc::new(WakeupBits::new(num_words, efd)),
             alive: Cell::new(0),
             num_daemons: 0,
         }
@@ -560,7 +559,10 @@ impl<'a> QueueExecutor<'a> {
             "spawn_daemon must be called before spawn"
         );
         let idx = self.tasks.len();
-        assert!(idx < 192, "QueueExecutor supports at most 192 tasks");
+        assert!(
+            idx < self.bits.capacity(),
+            "QueueExecutor capacity {} exceeded by spawn_daemon", self.bits.capacity()
+        );
         self.tasks.push(UnsafeCell::new(Some(Box::pin(future))));
         self.wakers.push(Waker::from(Arc::new(TaskWaker {
             bits: Arc::clone(&self.bits),
@@ -574,7 +576,10 @@ impl<'a> QueueExecutor<'a> {
     /// Spawn an I/O task that counts toward `all_done()`.
     fn spawn(&mut self, future: impl Future<Output = ()> + 'a) {
         let idx = self.tasks.len();
-        assert!(idx < 192, "QueueExecutor supports at most 192 tasks");
+        assert!(
+            idx < self.bits.capacity(),
+            "QueueExecutor capacity {} exceeded by spawn", self.bits.capacity()
+        );
         self.tasks.push(UnsafeCell::new(Some(Box::pin(future))));
         self.wakers.push(Waker::from(Arc::new(TaskWaker {
             bits: Arc::clone(&self.bits),
@@ -590,35 +595,58 @@ impl<'a> QueueExecutor<'a> {
     /// Drains the atomic bitmask in one shot, then iterates set bits.
     /// Tasks woken during this call are deferred to the next `tick()`
     /// (the eventfd signal ensures prompt re-entry to the event loop).
+    ///
+    /// A panic from a task's `poll` is caught: the task is dropped and (if
+    /// it's an I/O task) `alive` is decremented. The panic does not propagate
+    /// to the worker thread — co-tenant tasks keep running. Required for the
+    /// multi-tenant worker-pool model where one device's bug must not take
+    /// down the whole worker.
     fn tick(&self) {
-        let words = self.bits.drain();
-        for (word_idx, mut word) in words.into_iter().enumerate() {
-            while word != 0 {
-                let bit = word.trailing_zeros() as usize;
-                word &= word - 1; // clear lowest set bit
-                let idx = word_idx * 64 + bit;
-                if idx >= self.tasks.len() {
-                    continue;
-                }
-                // SAFETY: single-threaded — only this thread accesses the tasks vec.
-                // Wakers only touch the atomic WakeupBits, never the task storage.
-                let slot = unsafe { &mut *self.tasks[idx].get() };
-                if let Some(task) = slot {
-                    let mut cx = TaskContext::from_waker(&self.wakers[idx]);
-                    if task.as_mut().poll(&mut cx).is_ready() {
-                        *slot = None;
-                        if idx >= self.num_daemons {
-                            self.alive.set(self.alive.get() - 1);
-                        }
+        self.bits.drain_with(|idx| {
+            if idx >= self.tasks.len() {
+                return;
+            }
+            // SAFETY: single-threaded — only this thread accesses the tasks vec.
+            // Wakers only touch the atomic WakeupBits, never the task storage.
+            let slot = unsafe { &mut *self.tasks[idx].get() };
+            if let Some(task) = slot {
+                let mut cx = TaskContext::from_waker(&self.wakers[idx]);
+                let outcome = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| task.as_mut().poll(&mut cx)),
+                );
+                let done = match outcome {
+                    Ok(Poll::Ready(())) => true,
+                    Ok(Poll::Pending) => false,
+                    Err(payload) => {
+                        let msg = panic_payload_to_str(&payload);
+                        tracing::error!(task_idx = idx, panic = %msg, "ublk task panicked; dropping");
+                        true
+                    }
+                };
+                if done {
+                    *slot = None;
+                    if idx >= self.num_daemons {
+                        self.alive.set(self.alive.get() - 1);
                     }
                 }
             }
-        }
+        });
     }
 
     /// Check if all I/O tasks have completed (daemons excluded).
     fn all_done(&self) -> bool {
         self.alive.get() == 0
+    }
+}
+
+/// Best-effort decode of a panic payload for logging.
+fn panic_payload_to_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic>"
     }
 }
 
@@ -904,7 +932,9 @@ fn queue_io_loop(
 
     latch.signal_ready();
     let zero_copy = q_rc.support_auto_buf_zc();
-    let mut exe = QueueExecutor::new(efd_fd);
+    // 3 words = 192 task slots: QUEUE_DEPTH (64) + eventfd daemon + slack to spare.
+    // Sized for one queue per executor (per-device thread model).
+    let mut exe = QueueExecutor::new(3, efd_fd);
 
     // Enter the tokio runtime context once for the entire queue thread.
     // This must NOT be done per-task because the QueueExecutor polls multiple
@@ -1460,5 +1490,94 @@ mod tests {
         let (reported, failed) = latch.counts();
         assert_eq!(reported, 4);
         assert_eq!(failed, 1);
+    }
+
+    // ---- WakeupBits / QueueExecutor tests --------------------------------
+
+    /// A throwaway eventfd for tests where we don't actually wait on it.
+    fn test_efd() -> EventFd {
+        EventFd::new().expect("eventfd")
+    }
+
+    #[test]
+    fn wakeup_bits_capacity_matches_word_count() {
+        let efd = test_efd();
+        let bits = WakeupBits::new(5, efd.fd());
+        assert_eq!(bits.capacity(), 320);
+    }
+
+    #[test]
+    fn wakeup_bits_roundtrip_with_runtime_size() {
+        // Pick indices that span multiple words (across the boundary at 64).
+        let efd = test_efd();
+        let bits = WakeupBits::new(4, efd.fd()); // 256 bits
+        bits.wake(3);
+        bits.wake(63);
+        bits.wake(64);
+        bits.wake(200);
+        let mut seen: Vec<usize> = Vec::new();
+        bits.drain_with(|i| seen.push(i));
+        seen.sort_unstable();
+        assert_eq!(seen, vec![3, 63, 64, 200]);
+        // After drain, all bits cleared.
+        let mut second: Vec<usize> = Vec::new();
+        bits.drain_with(|i| second.push(i));
+        assert!(second.is_empty(), "second drain should be empty");
+    }
+
+    #[test]
+    fn wakeup_bits_idempotent_double_wake() {
+        let efd = test_efd();
+        let bits = WakeupBits::new(2, efd.fd());
+        bits.wake(7);
+        bits.wake(7);
+        bits.wake(7);
+        let mut count = 0;
+        bits.drain_with(|_| count += 1);
+        assert_eq!(count, 1, "duplicate wakes must collapse");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executor_catches_panic_in_task() {
+        // A task that panics once should be dropped; another task on the same
+        // executor must keep running. This is the M1 isolation guarantee.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let efd = test_efd();
+        let mut exe = QueueExecutor::new(2, efd.fd());
+
+        let healthy_polled = Rc::new(RefCell::new(0u32));
+        let healthy_polled_c = Rc::clone(&healthy_polled);
+
+        // Panicking task: panics on first poll.
+        exe.spawn(async {
+            panic!("intentional test panic");
+        });
+
+        // Healthy task: increments a counter then returns Ready.
+        exe.spawn(async move {
+            *healthy_polled_c.borrow_mut() += 1;
+        });
+
+        exe.tick();
+        // Both tasks should have completed (the panicking one via drop, the
+        // healthy one via Ready). Executor must report all_done.
+        assert!(exe.all_done(), "panicking task must not block all_done");
+        assert_eq!(*healthy_polled.borrow(), 1, "healthy co-tenant must run");
+    }
+
+    #[test]
+    fn executor_capacity_assert_runtime() {
+        // Spawn until capacity is reached, then verify the next spawn panics.
+        let efd = test_efd();
+        let mut exe = QueueExecutor::new(1, efd.fd()); // 64 slots
+        for _ in 0..64 {
+            exe.spawn(async {});
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exe.spawn(async {});
+        }));
+        assert!(result.is_err(), "spawn beyond capacity must panic");
     }
 }
