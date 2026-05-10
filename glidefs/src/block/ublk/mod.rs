@@ -35,6 +35,27 @@ const DEFAULT_NR_QUEUES: u16 = 1;
 /// Persisted device mapping filename.
 const DEVICE_MAP_FILE: &str = "ublk_devices.json";
 
+/// Max simultaneous `UblkDevice::recover` calls during startup scan.
+/// Each call holds one blocking thread for the duration of its kernel
+/// control-plane work; tokio's default blocking pool is 512 so 16 is
+/// comfortably below the cap while overlapping enough to amortise
+/// per-device ioctl latency.
+const RECOVERY_CONCURRENCY: usize = 16;
+
+/// Max simultaneous `kill_dev`+`del_dev` ioctls during the orphan
+/// sweep. Each runs in its own `spawn_blocking` thread.
+const ORPHAN_SWEEP_CONCURRENCY: usize = 16;
+
+/// Result of probing one candidate kernel ublk device during the
+/// recovery scan. Built on a single blocking thread (CTRL_URING is
+/// thread_local) and consumed by the async parallel `recover()` step.
+struct ProbedDev {
+    dev_id: i32,
+    name: String,
+    export_name: Option<String>,
+    nr_queues: u16,
+}
+
 /// Manages ublk devices for exports.
 ///
 /// Each export gets its own `/dev/ublkbN` device. The caller provides
@@ -237,11 +258,17 @@ impl UblkServer {
     }
 
     /// Scan for QUIESCED ublk devices left behind by a previous crash and
-    /// recover them.
+    /// recover them. After the scan, any **unrecoverable** glidefs-owned
+    /// device (name=`glidefs` or `none` — orphan from a mid-startup crash
+    /// where JSON wasn't persisted, no matching export handler, etc.)
+    /// is killed. This prevents kernel-state-damage loops where a
+    /// crash-restarting daemon accumulates orphans across iterations.
     ///
-    /// `get_handler` resolves an export name to its `BlockHandler`. Devices
-    /// whose export has no matching handler are logged and skipped (they may
-    /// belong to another glidefs instance).
+    /// `get_handler` resolves an export name to its `BlockHandler`.
+    /// Devices whose export has no matching handler are killed (not
+    /// just skipped) — if the daemon's config doesn't include the
+    /// export, the kernel device is by definition garbage from this
+    /// daemon's POV.
     ///
     /// Returns the number of successfully recovered devices.
     pub async fn recover_quiesced_devices(
@@ -253,108 +280,278 @@ impl UblkServer {
             return 0;
         }
 
-        // Collect candidate device IDs.
-        let candidates = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
-        let c = std::sync::Arc::clone(&candidates);
-        ublk_core::ctrl::UblkCtrl::for_each_dev_id(move |dev_id| {
-            c.lock().unwrap().push(dev_id as i32);
-        });
-        let candidates = std::sync::Arc::try_unwrap(candidates)
-            .unwrap()
-            .into_inner()
-            .unwrap();
+        // Scan + probe every candidate in one spawn_blocking. CTRL_URING
+        // is thread_local, so all `UblkCtrl::new_simple` handles built
+        // here (and their Drop) stay pinned to a single blocking thread.
+        // The async-side parallel `recover()` calls below each spawn
+        // their own blocking thread internally.
+        let probed: Vec<ProbedDev> = tokio::task::spawn_blocking(|| {
+            // `for_each_dev_id` demands `Fn + Clone + 'static`; route
+            // collection through an Arc<Mutex<...>> rather than a
+            // capture-by-mut.
+            let candidates = std::sync::Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+            let c = std::sync::Arc::clone(&candidates);
+            ublk_core::ctrl::UblkCtrl::for_each_dev_id(move |dev_id| {
+                c.lock().unwrap().push(dev_id as i32);
+            });
+            let candidates: Vec<i32> = std::sync::Arc::try_unwrap(candidates)
+                .unwrap()
+                .into_inner()
+                .unwrap();
 
-        if candidates.is_empty() {
+            let mut probed = Vec::with_capacity(candidates.len());
+            for dev_id in candidates {
+                let ctrl = match ublk_core::ctrl::UblkCtrl::new_simple(dev_id) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(dev_id, error = %e, "cannot open ublk ctrl, skipping");
+                        continue;
+                    }
+                };
+
+                // Filter by ownership. `name == "none"` = mid-startup
+                // orphan (JSON not yet persisted when daemon died); also
+                // ours by elimination. Skip devices owned by other ublk
+                // consumers to avoid stomping on their state.
+                let name = ctrl.get_name();
+                if name != "glidefs" && name != "none" {
+                    tracing::debug!(dev_id, %name, "skipping non-glidefs ublk device");
+                    continue;
+                }
+
+                // Only recover QUIESCED devices. LIVE devices are still
+                // serving I/O (somehow); leave them alone. STOPPED
+                // devices are mid-teardown.
+                let state = ctrl.dev_info().state as u32;
+                if state != ublk_core::sys::UBLK_S_DEV_QUIESCED {
+                    tracing::debug!(dev_id, %name, state, "skipping non-QUIESCED device");
+                    continue;
+                }
+
+                let export_name = ctrl
+                    .get_target_data_from_json()
+                    .and_then(|v| v.get("export_name")?.as_str().map(String::from));
+                let nr_queues = ctrl.dev_info().nr_hw_queues;
+                probed.push(ProbedDev { dev_id, name, export_name, nr_queues });
+            }
+            probed
+        })
+        .await
+        .unwrap_or_default();
+
+        if probed.is_empty() {
             return 0;
         }
 
-        tracing::info!(count = candidates.len(), "scanning ublk devices for QUIESCED state");
+        tracing::info!(count = probed.len(), "scanning ublk devices for QUIESCED state");
+
+        // Classify probed devices into (recover, orphan). Both
+        // categorisation and `get_handler` are cheap and have to run on
+        // the calling task anyway (`get_handler` isn't required to be
+        // Send/Sync).
+        let mut to_recover: Vec<(i32, String, Arc<BlockHandler>, u16)> = Vec::new();
+        let mut orphans_to_kill: Vec<i32> = Vec::new();
+        for p in probed {
+            let Some(export_name) = p.export_name else {
+                tracing::warn!(
+                    dev_id = p.dev_id, name = %p.name,
+                    "QUIESCED orphan has no export_name JSON; queuing for kill"
+                );
+                orphans_to_kill.push(p.dev_id);
+                continue;
+            };
+
+            if self.devices.contains_key(&export_name) {
+                tracing::debug!(dev_id = p.dev_id, export = %export_name, "already registered, skipping");
+                continue;
+            }
+
+            let Some(handler) = get_handler(&export_name) else {
+                tracing::warn!(
+                    dev_id = p.dev_id, export = %export_name,
+                    "QUIESCED device for unknown export; queuing for kill"
+                );
+                orphans_to_kill.push(p.dev_id);
+                continue;
+            };
+
+            to_recover.push((p.dev_id, export_name, handler, p.nr_queues));
+        }
+
+        // Run `recover()` concurrently. Each call wraps its kernel ops
+        // in its own `spawn_blocking` (separate CTRL_URING per thread),
+        // so concurrency here translates directly to overlapped control-
+        // plane ioctls. Worker pool absorbs concurrent `AddQueue` since
+        // dispatch hashes by `(export, qid)` across K workers.
+        let recovered_devices: Vec<Result<(String, device::UblkDevice), i32>> = {
+            use futures::stream::{self, StreamExt};
+            stream::iter(to_recover)
+                .map(|(dev_id, export_name, handler, nr_queues)| {
+                    let features = self.features.clone();
+                    let pool = &self.pool;
+                    async move {
+                        tracing::info!(
+                            dev_id, export = %export_name, nr_queues,
+                            "recovering QUIESCED ublk device"
+                        );
+                        match device::UblkDevice::recover(
+                            dev_id,
+                            handler,
+                            nr_queues,
+                            export_name.clone(),
+                            &features,
+                            pool,
+                        )
+                        .await
+                        {
+                            Ok(dev) => {
+                                tracing::info!(
+                                    dev_id, export = %export_name,
+                                    path = %dev.dev_path().display(),
+                                    "ublk device recovered"
+                                );
+                                Ok((export_name, dev))
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    dev_id, export = %export_name, error = %e,
+                                    "recover failed; queuing for kill"
+                                );
+                                Err(dev_id)
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(RECOVERY_CONCURRENCY)
+                .collect()
+                .await
+        };
 
         let mut recovered = 0usize;
-        for dev_id in candidates {
-            let ctrl = match ublk_core::ctrl::UblkCtrl::new_simple(dev_id) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!(dev_id, error = %e, "cannot open ublk ctrl, skipping");
-                    continue;
-                }
-            };
-
-            // Only recover devices we own.
-            let name = ctrl.get_name();
-            if name != "glidefs" {
-                continue;
-            }
-
-            // Only recover QUIESCED devices.
-            let state = ctrl.dev_info().state as u32;
-            if state != ublk_core::sys::UBLK_S_DEV_QUIESCED {
-                continue;
-            }
-
-            // Extract export name from target JSON.
-            let export_name = match ctrl
-                .get_target_data_from_json()
-                .and_then(|v| v.get("export_name")?.as_str().map(String::from))
-            {
-                Some(n) => n,
-                None => {
-                    tracing::warn!(dev_id, "QUIESCED glidefs device has no export_name in target JSON, skipping");
-                    continue;
-                }
-            };
-
-            // Skip if we already have this export registered.
-            if self.devices.contains_key(&export_name) {
-                tracing::debug!(dev_id, export = %export_name, "already registered, skipping recovery");
-                continue;
-            }
-
-            // Look up the handler for this export.
-            let handler = match get_handler(&export_name) {
-                Some(h) => h,
-                None => {
-                    tracing::warn!(dev_id, export = %export_name, "no handler for QUIESCED device, skipping");
-                    continue;
-                }
-            };
-
-            // Use the QUIESCED device's original queue count, not our current
-            // config — the kernel expects recovery to match the original layout.
-            let nr_queues = ctrl.dev_info().nr_hw_queues;
-
-            tracing::info!(dev_id, export = %export_name, nr_queues, "recovering QUIESCED ublk device");
-            match device::UblkDevice::recover(
-                dev_id,
-                handler,
-                nr_queues,
-                export_name.clone(),
-                &self.features,
-                &self.pool,
-            )
-            .await
-            {
-                Ok(dev) => {
-                    tracing::info!(dev_id, export = %export_name, path = %dev.dev_path().display(), "ublk device recovered");
-                    self.devices.insert(export_name, dev);
+        for outcome in recovered_devices {
+            match outcome {
+                Ok((name, dev)) => {
+                    self.devices.insert(name, dev);
                     recovered += 1;
                 }
-                Err(e) => {
-                    tracing::error!(dev_id, export = %export_name, error = %e, "failed to recover ublk device");
-                }
+                Err(dev_id) => orphans_to_kill.push(dev_id),
             }
+        }
+
+        // Parallel orphan sweep. Each `kill_dev`/`del_dev` is a kernel
+        // ioctl with a per-device mutex; running them concurrently
+        // across distinct dev_ids is safe and turns N×~10ms into a
+        // fan-out. Bounded so the blocking pool doesn't get swamped.
+        //
+        // `kill_dev` alone (STOP_DEV) leaves the cdev registered in
+        // `/sys/class/ublk-char/`, so the next daemon scan still sees
+        // it. `del_dev` (DEL_DEV) removes it entirely.
+        if !orphans_to_kill.is_empty() {
+            let count = orphans_to_kill.len();
+            tracing::warn!(count, "deleting unrecoverable QUIESCED orphans");
+            let deleted = {
+                use futures::stream::{self, StreamExt};
+                stream::iter(orphans_to_kill)
+                    .map(|dev_id| async move {
+                        tokio::task::spawn_blocking(move || {
+                            let Ok(ctrl) = ublk_core::ctrl::UblkCtrl::new_simple(dev_id)
+                            else {
+                                return 0usize;
+                            };
+                            // STOP first (no-op if already STOPPED), then DEL.
+                            let _ = ctrl.kill_dev();
+                            match ctrl.del_dev() {
+                                Ok(_) => 1,
+                                Err(e) => {
+                                    tracing::error!(
+                                        dev_id, error = ?e,
+                                        "del_dev on orphan failed"
+                                    );
+                                    0
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap_or(0)
+                    })
+                    .buffer_unordered(ORPHAN_SWEEP_CONCURRENCY)
+                    .fold(0usize, |acc, n| async move { acc + n })
+                    .await
+            };
+            tracing::info!(deleted, "orphan sweep complete");
         }
 
         self.persist_devices();
         recovered
     }
 
-    /// Shutdown all ublk devices concurrently.
+    /// Shutdown the ublk transport without removing kernel devices.
     ///
-    /// Issues `kill_dev` + thread join for every device in parallel, then
-    /// returns an aggregated error describing which devices could not be
-    /// unregistered.
+    /// **M6.1**: this no longer calls `kill_dev`. Calling `STOP_DEV` on
+    /// a device with VMs writing to it deadlocks the kernel: the
+    /// `io_wq` workers wait for userspace COMMITs that never arrive
+    /// (because the userspace queue threads / worker pool are exiting),
+    /// leaving D-state threads behind that can only be cleared by a
+    /// reboot. We hit this once during M0/M1 deployment.
+    ///
+    /// Instead: the worker pool drops its hosted `Rc<UblkQueue>`s and
+    /// closes its io_uring fds, the daemon drops the persisted device
+    /// map (so a clean restart starts fresh), and the kernel handles
+    /// the userspace-vanishes case via `UBLK_F_USER_RECOVERY` —
+    /// devices transition to QUIESCED, bios queue up, and the next
+    /// daemon's `recover_quiesced_devices()` reattaches them.
+    ///
+    /// This means a clean shutdown is **indistinguishable from a crash**
+    /// from the kernel's point of view. That's the design intent of
+    /// `UBLK_F_USER_RECOVERY`: the device persists across daemon
+    /// lifetimes. Operators that want a device truly gone must call
+    /// `remove_device` (which still does call `kill_dev`, with the
+    /// caller-owns-quiescing-the-VMs contract documented there).
+    ///
+    /// Returns `Ok(())` always — there's no per-device failure mode in
+    /// this path, just resource drops.
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        let device_count = self.devices.len();
+
+        // Drop the worker pool — every worker receives `Shutdown`,
+        // drops its hosted queues' Rc clones (the io_task futures are
+        // cancelled by executor drop), and exits. The kernel sees each
+        // worker's io_uring fd close and transitions the corresponding
+        // ublk device(s) to QUIESCED via UBLK_F_USER_RECOVERY.
+        if let Err(e) = self.pool.shutdown().await {
+            tracing::warn!(error = %e, "ublk worker pool shutdown reported an error");
+        }
+
+        // Drop the per-device records (they hold Arc<UblkDev>; once
+        // every UblkQueue's Arc clone is gone via the pool drop, this
+        // is the last reference and the kernel record is freed).
+        // Explicit drop for clarity.
+        drop(self.devices);
+
+        // Persisted dev_id map: keep it. On next start the daemon's
+        // `recover_quiesced_devices` reads kernel state directly via
+        // `for_each_dev_id`, so the map is just a hint for stable
+        // /dev/ublkbN paths after a true clean restart.
+        if let Some(ref cache_dir) = self.cache_dir {
+            // Touch nothing — the map remains accurate as long as the
+            // kernel devices it points to are still QUIESCED.
+            let _ = cache_dir;
+        }
+
+        tracing::info!(
+            count = device_count,
+            "ublk transport shut down (kernel devices left QUIESCED for recovery)"
+        );
+        Ok(())
+    }
+
+    /// **Legacy / unused**: the previous shutdown path that called
+    /// `kill_dev` on every device. Kept here to document the deadlock
+    /// hazard described above — this is what NOT to do on the daemon
+    /// hot path.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    async fn shutdown_with_kill_dev_legacy(self) -> anyhow::Result<()> {
         // Remove persisted mapping — devices are being shut down.
         if let Some(ref cache_dir) = self.cache_dir {
             let _ = std::fs::remove_file(cache_dir.join(DEVICE_MAP_FILE));

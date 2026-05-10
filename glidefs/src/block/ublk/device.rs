@@ -337,13 +337,25 @@ impl UblkDevice {
                     super::device::signal_eventfd(snap.eventfd.fd());
                     readys.push((*worker_idx, ready_rx));
                 }
-                for (worker_idx, ready_rx) in readys {
+                for (qid_, (worker_idx, ready_rx)) in readys.into_iter().enumerate() {
                     let result = ready_rx.blocking_recv().map_err(|_| {
                         anyhow::anyhow!("worker {worker_idx} dropped ready sender")
                     })?;
                     result.map_err(|s| {
                         anyhow::anyhow!("worker {worker_idx} AddQueue failed: {s}")
                     })?;
+                    // `configure_queue` records the queue's owner thread
+                    // tid and, on the last queue, calls `build_json` —
+                    // which is what populates `/run/ublksrvd/{dev_id}.json`
+                    // with `target_data.export_name`. Without it the next
+                    // daemon's recover_quiesced_devices can't identify
+                    // which export each kernel device belongs to.
+                    //
+                    // We pass `0` as the tid because under the worker-
+                    // pool model many queues share one worker thread —
+                    // there's no meaningful 1:1 mapping. The tid is only
+                    // used for diagnostics; recovery doesn't depend on it.
+                    let _ = ctrl.configure_queue(&dev, qid_ as u16, 0);
                 }
 
                 // All queues attached. Issue START_DEV (or
@@ -437,13 +449,18 @@ impl UblkDevice {
         tracing::info!(dev_id = self.dev_id, "unregistering ublk device");
 
         let dev_id = self.dev_id;
-        let kill_result = tokio::task::spawn_blocking(move || -> Result<(), UblkError> {
+        // STOP_DEV (kill_dev) transitions the kernel device LIVE → STOPPED;
+        // io_task futures see QueueIsDown and exit. DEL_DEV removes the
+        // cdev entry from `/sys/class/ublk-char/`. Without DEL the cdev
+        // lingers and accumulates across remove-and-re-add cycles.
+        let result = tokio::task::spawn_blocking(move || -> Result<(), UblkError> {
             let ctrl = UblkCtrl::new_simple(dev_id)?;
             ctrl.kill_dev()?;
+            ctrl.del_dev()?;
             Ok(())
         })
         .await?;
-        kill_result.map_err(|e| anyhow::anyhow!("ublk kill_dev failed: {}", e))?;
+        result.map_err(|e| anyhow::anyhow!("ublk stop+del failed: {}", e))?;
 
         // Drop the device's Arc<UblkDev> — last reference goes away
         // once worker io_task futures all exit (which they do shortly
@@ -477,31 +494,29 @@ impl UblkDevice {
 }
 
 impl Drop for UblkDevice {
+    /// **M6.1**: Drop does NOT call `kill_dev`. Letting the kernel
+    /// device persist (transitioning to QUIESCED via
+    /// `UBLK_F_USER_RECOVERY` when worker pool fds close) is the
+    /// safe default — `kill_dev` deadlocks if VMs are still writing
+    /// (see `UblkServer::shutdown` doc).
+    ///
+    /// Three Drop paths:
+    /// - **Daemon shutdown** (intended): worker pool dropped first,
+    ///   then this Drop runs. Kernel device stays QUIESCED for the
+    ///   next daemon to recover.
+    /// - **`remove_device`** (operator): `unregister()` already ran
+    ///   and called `kill_dev` explicitly. Drop here is a no-op.
+    /// - **Panic / error path** (unintended): we leak the kernel
+    ///   device into QUIESCED. The next daemon's
+    ///   `recover_quiesced_devices` will reattach it (or
+    ///   operator can clean up via `kill_dev` from a fresh
+    ///   `UblkCtrl::new_simple`).
     fn drop(&mut self) {
-        // Best-effort kill_dev so the kernel device doesn't zombie if
-        // the caller skipped `unregister()`. The worker pool's hosted
-        // queues see QueueIsDown and exit, then drop their queue Rc;
-        // when the last io_task finishes, the dev Arc held by this
-        // Self drops too (as Drop runs and `_dev` field drops).
-        tracing::warn!(
+        tracing::trace!(
             dev_id = self.dev_id,
             path = %self.dev_path.display(),
-            "UblkDevice dropped without unregister — issuing best-effort kill_dev"
+            "UblkDevice dropped (kernel device stays QUIESCED until next recover or explicit kill)"
         );
-        match UblkCtrl::new_simple(self.dev_id) {
-            Ok(ctrl) => {
-                if let Err(e) = ctrl.kill_dev() {
-                    tracing::error!(dev_id = self.dev_id, error = ?e, "kill_dev in Drop failed");
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    dev_id = self.dev_id,
-                    error = ?e,
-                    "UblkCtrl::new_simple in Drop failed"
-                );
-            }
-        }
     }
 }
 

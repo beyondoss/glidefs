@@ -207,7 +207,9 @@ impl WorkerPool {
         &self.workers[bucket]
     }
 
-    /// Send `Shutdown` to every worker and join the threads.
+    /// Send `Shutdown` to every worker and join the threads. Acks and
+    /// thread joins run concurrently so total shutdown latency is
+    /// bounded by the slowest single worker, not by N×latency.
     pub(super) async fn shutdown(mut self) -> std::io::Result<()> {
         let mut done_rxs: Vec<(usize, oneshot::Receiver<()>)> =
             Vec::with_capacity(self.workers.len());
@@ -216,7 +218,9 @@ impl WorkerPool {
             let _ = w.send(WorkerMsg::Shutdown { done: done_tx }).await;
             done_rxs.push((w.idx, done_rx));
         }
-        for (idx, rx) in done_rxs {
+
+        // Await every ack in parallel.
+        let ack_futs = done_rxs.into_iter().map(|(idx, rx)| async move {
             match rx.await {
                 Ok(()) => tracing::debug!(worker = idx, "worker shutdown ack"),
                 // Sender dropped without ack — worker exited unexpectedly
@@ -228,19 +232,26 @@ impl WorkerPool {
                     "worker exited without sending shutdown ack"
                 ),
             }
-        }
-        for w in &mut self.workers {
-            if let Some(join) = w.join.take() {
-                let idx = w.idx;
+        });
+        futures::future::join_all(ack_futs).await;
+
+        // Join every thread in parallel. `JoinHandle::join` blocks, so
+        // each goes through its own `spawn_blocking` and we wait for
+        // the set with `join_all`.
+        let join_futs: Vec<_> = self
+            .workers
+            .iter_mut()
+            .filter_map(|w| w.join.take().map(|j| (w.idx, j)))
+            .map(|(idx, join)| {
                 tokio::task::spawn_blocking(move || {
                     if let Err(e) = join.join() {
                         tracing::error!(worker = idx, ?e, "worker thread panicked");
                     }
                 })
-                .await
-                .ok();
-            }
-        }
+            })
+            .collect();
+        futures::future::join_all(join_futs).await;
+
         tracing::info!(count = self.workers.len(), "ublk worker pool shut down");
         Ok(())
     }
