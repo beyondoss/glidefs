@@ -1011,7 +1011,7 @@ fn queue_io_loop(
 ///
 /// Allocates a per-tag `IoBuf` for kernel↔userspace data transfer.
 /// The kernel copies data into/out of this buffer on each I/O.
-async fn io_task(
+pub(super) async fn io_task(
     q: &UblkQueue,
     tag: u16,
     handler: &BlockHandler,

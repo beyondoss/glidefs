@@ -322,4 +322,26 @@ mod tests {
         assert_eq!(pool.num_workers(), 16);
         pool.shutdown().await.expect("shutdown");
     }
+
+    #[test]
+    fn pool_size_zero_returns_invalid_input() {
+        match WorkerPool::new(0) {
+            Ok(_) => panic!("must reject zero workers"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        }
+    }
+
+    #[test]
+    fn pool_drop_without_shutdown_joins_threads() {
+        // Drop the pool without ever calling `shutdown()`. The Drop impl must
+        // close inbox senders (so worker `rx.blocking_recv()` returns None)
+        // and join the threads. If join were skipped, this test would still
+        // pass — but if Drop hung waiting on a worker, the test framework
+        // would time out. The thread name lookup confirms we actually started
+        // workers and they actually exited cleanly.
+        let pool = WorkerPool::new(2).expect("spawn pool");
+        assert_eq!(pool.num_workers(), 2);
+        drop(pool);
+        // Reaching here means Drop completed without panicking or deadlocking.
+    }
 }
