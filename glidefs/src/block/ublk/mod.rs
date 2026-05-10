@@ -21,6 +21,8 @@
 pub mod device;
 mod worker_pool;
 
+use worker_pool::WorkerPool;
+
 use crate::block::handler::BlockHandler;
 use device::KernelFeatures;
 use std::collections::HashMap;
@@ -44,9 +46,17 @@ pub struct UblkServer {
     devices: HashMap<String, device::UblkDevice>,
     /// Directory for persisting device ID mapping (enables stable device paths).
     cache_dir: Option<PathBuf>,
+    /// The worker pool that hosts every queue's `io_task` futures.
+    /// Sized at construction (default = `min(num_cpus, 32)`); each
+    /// worker owns one io_uring + executor and may host queues from
+    /// many devices.
+    pool: WorkerPool,
 }
 
 impl Default for UblkServer {
+    /// Equivalent to `Self::new()`. Used by `std::mem::take` in the
+    /// router's shutdown path; spawns a fresh worker pool that's then
+    /// immediately dropped — wasteful but correct.
     fn default() -> Self {
         Self::new()
     }
@@ -55,15 +65,24 @@ impl Default for UblkServer {
 impl UblkServer {
     /// Create a new ublk server.
     ///
-    /// Probes the running kernel for supported ublk features (recovery,
-    /// zero-copy). Falls back to conservative defaults on older kernels.
+    /// Probes the running kernel for supported ublk features and spawns
+    /// a worker pool sized at `min(num_cpus, 32)` workers. Must be
+    /// called inside a tokio runtime context — workers re-enter the
+    /// runtime to run handler futures (S3 fetches, etc.).
     pub fn new() -> Self {
         let features = device::detect_features();
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(32);
+        let pool = WorkerPool::new(num_workers)
+            .expect("failed to spawn ublk worker pool");
         Self {
             nr_queues: DEFAULT_NR_QUEUES,
             features,
             devices: HashMap::new(),
             cache_dir: None,
+            pool,
         }
     }
 
@@ -144,8 +163,15 @@ impl UblkServer {
 
         let name = export_name.to_string();
         let device =
-            device::UblkDevice::register(handler, self.nr_queues, name.clone(), &self.features, preferred_id)
-                .await?;
+            device::UblkDevice::register(
+                handler,
+                self.nr_queues,
+                name.clone(),
+                &self.features,
+                preferred_id,
+                &self.pool,
+            )
+            .await?;
         let path = device.dev_path().to_path_buf();
         self.devices.insert(name, device);
         self.persist_devices();
@@ -304,6 +330,7 @@ impl UblkServer {
                 nr_queues,
                 export_name.clone(),
                 &self.features,
+                &self.pool,
             )
             .await
             {

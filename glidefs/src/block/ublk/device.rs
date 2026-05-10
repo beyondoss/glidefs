@@ -111,97 +111,278 @@ pub(crate) enum DeviceMode {
 
 /// A registered ublk block device.
 ///
-/// Owns the worker thread running `ctrl.run_target()`. The device appears
-/// at `/dev/ublkbN` once `register()` returns, and disappears when
-/// `unregister()` completes.
+/// **M4 model**: queues are hosted in the [`WorkerPool`]; this struct just
+/// keeps the device record alive and tracks which workers host it. There
+/// is no per-device OS thread anymore — `nr_queues` independent worker
+/// threads (chosen by hash) drive this device's queues alongside queues
+/// from many other devices.
+///
+/// Drop ordering: the device's `Arc<UblkDev>` is held here AND in each
+/// hosted [`UblkQueue`] in the workers. Even if `unregister` is skipped
+/// (Drop path), the workers' `Rc<UblkQueue>` keeps the device alive
+/// until `kill_dev` triggers `UBLK_IO_RES_ABORT` and io_task futures
+/// return.
+///
+/// [`WorkerPool`]: super::worker_pool::WorkerPool
 #[must_use = "call .unregister() to cleanly shut down the device"]
 pub struct UblkDevice {
     dev_id: i32,
     dev_path: PathBuf,
-    worker: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
+    nr_queues: u16,
+    /// Lookup key used by the worker pool to pick a worker for each
+    /// queue. Same key passed to `pool.worker_for(name, qid)` at
+    /// register-time so removal hits the same worker.
+    export_name: String,
+    /// The owning Arc of the kernel device record. Held to keep the
+    /// underlying mmaps + control fd alive while workers' UblkQueues
+    /// reference it. Dropped in `unregister`/`Drop`.
+    _dev: Arc<UblkDev>,
 }
 
 impl UblkDevice {
     /// Register a new ublk device backed by the given handler.
     ///
-    /// Allocates a device ID, sets parameters, spawns per-queue I/O threads,
-    /// and waits for the kernel to confirm the device is serving I/O.
-    /// Returns once `/dev/ublkbN` is ready.
+    /// Builds a fresh `UblkCtrl` + `UblkDev`, dispatches one `AddQueue`
+    /// per qid to the appropriate worker (via
+    /// [`WorkerPool::worker_for`]), waits for all queues to come up,
+    /// then issues `START_DEV`. Returns once `/dev/ublkbN` is serving
+    /// I/O.
     ///
-    /// `preferred_id`: request a specific device ID to reclaim a device path
-    /// after a crash. `None` = auto-assign.
+    /// `preferred_id`: request a specific device ID to reclaim a device
+    /// path after a crash. `None` = auto-assign.
+    ///
+    /// [`WorkerPool::worker_for`]: super::worker_pool::WorkerPool::worker_for
     pub async fn register(
         handler: Arc<BlockHandler>,
         nr_queues: u16,
         export_name: String,
         features: &KernelFeatures,
         preferred_id: Option<i32>,
+        pool: &super::worker_pool::WorkerPool,
     ) -> anyhow::Result<Self> {
-        Self::start_worker(handler, nr_queues, export_name, DeviceMode::Add, features, preferred_id).await
+        Self::register_inner(
+            handler,
+            nr_queues,
+            export_name,
+            DeviceMode::Add,
+            features,
+            preferred_id,
+            pool,
+        )
+        .await
     }
 
     /// Recover a QUIESCED ublk device after a daemon crash.
     ///
-    /// Sends `START_USER_RECOVERY`, then re-runs the I/O loop with
-    /// `UBLK_DEV_F_RECOVER_DEV`. The kernel replays in-flight I/Os via
-    /// `UBLK_F_USER_RECOVERY_REISSUE` (safe — our write cache is idempotent).
+    /// Sends `START_USER_RECOVERY`, then re-attaches via the worker pool
+    /// using `UBLK_DEV_F_RECOVER_DEV`. The kernel replays in-flight I/Os
+    /// via `UBLK_F_USER_RECOVERY_REISSUE` (safe — our write cache is
+    /// idempotent).
     pub async fn recover(
         dev_id: i32,
         handler: Arc<BlockHandler>,
         nr_queues: u16,
         export_name: String,
         features: &KernelFeatures,
+        pool: &super::worker_pool::WorkerPool,
     ) -> anyhow::Result<Self> {
-        // Control-plane: tell the kernel we're taking over.
+        // Control-plane: tell the kernel we're taking over. This is
+        // synchronous w.r.t. the kernel mutex, so we go through
+        // spawn_blocking to keep the async runtime responsive.
+        let dev_id_for_recover = dev_id;
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let ctrl = UblkCtrl::new_simple(dev_id)
-                .map_err(|e| anyhow::anyhow!("UblkCtrl::new_simple({dev_id}) failed: {e}"))?;
+            let ctrl = UblkCtrl::new_simple(dev_id_for_recover)
+                .map_err(|e| anyhow::anyhow!("UblkCtrl::new_simple({dev_id_for_recover}) failed: {e}"))?;
             ctrl.start_user_recover()
-                .map_err(|e| anyhow::anyhow!("start_user_recover({dev_id}) failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("start_user_recover({dev_id_for_recover}) failed: {e}"))?;
             Ok(())
         })
         .await??;
 
-        Self::start_worker(handler, nr_queues, export_name, DeviceMode::Recover { dev_id }, features, None).await
+        Self::register_inner(
+            handler,
+            nr_queues,
+            export_name,
+            DeviceMode::Recover { dev_id },
+            features,
+            None,
+            pool,
+        )
+        .await
     }
 
-    /// Shared helper: spawn the worker thread running `run_device`.
-    async fn start_worker(
+    /// Shared body for `register` and `recover`. Builds the kernel
+    /// device, hands queues to workers, starts the device. **All
+    /// control-plane work happens on a single `spawn_blocking` thread**
+    /// because `ublk-core`'s `CTRL_URING` is `thread_local!` and the
+    /// `UblkCtrl` handle is bound to its building thread for the life
+    /// of any control op (including `Drop`). Worker AddQueue dispatch
+    /// uses `mpsc::Sender::blocking_send` + `oneshot::Receiver::blocking_recv`
+    /// to talk to the async-side workers without needing to leave
+    /// the blocking thread.
+    async fn register_inner(
         handler: Arc<BlockHandler>,
         nr_queues: u16,
         export_name: String,
         mode: DeviceMode,
         features: &KernelFeatures,
         preferred_id: Option<i32>,
+        pool: &super::worker_pool::WorkerPool,
     ) -> anyhow::Result<Self> {
         let dev_size = handler.device_size();
-        let tokio_handle = tokio::runtime::Handle::current();
-        let features = features.clone();
+        let bs_shift = handler.block_size().trailing_zeros() as u8;
 
-        // The worker thread signals back the dev_id + path once the device is started,
-        // or an error if setup fails.
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<anyhow::Result<(i32, String)>>();
+        let dev_flags = match mode {
+            DeviceMode::Add => UblkFlags::UBLK_DEV_F_ADD_DEV,
+            DeviceMode::Recover { .. } => UblkFlags::UBLK_DEV_F_RECOVER_DEV,
+        };
+        let preferred_dev_id: i32 = match mode {
+            DeviceMode::Add => preferred_id.unwrap_or(-1),
+            DeviceMode::Recover { dev_id } => dev_id,
+        };
 
-        let thread_name = format!("ublk-{export_name}");
-        let worker = std::thread::Builder::new()
-            .name(thread_name)
-            .spawn(move || {
-                run_device(dev_size, nr_queues, handler, tokio_handle, ready_tx, export_name, mode, &features, preferred_id)
-            })?;
+        let mut ctrl_flags: u64 = 0;
+        if features.recovery {
+            ctrl_flags |=
+                sys::UBLK_F_USER_RECOVERY as u64 | sys::UBLK_F_USER_RECOVERY_REISSUE as u64;
+        }
+        if features.ioctl_encode {
+            ctrl_flags |= sys::UBLK_F_CMD_IOCTL_ENCODE as u64;
+        }
+        // ZC permanently disabled — features.zero_copy is hardcoded
+        // false in detect_features(), so no UBLK_F_SUPPORT_ZERO_COPY.
 
-        // Wait for device to be ready (or error during setup).
-        let (dev_id, dev_path_str) = ready_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("ublk worker thread failed during setup"))??;
+        // Snapshot per-worker handles so the spawn_blocking closure can
+        // reach them without borrowing `pool`. Each entry is a Send
+        // tuple (`mpsc::Sender` + `Arc<EventFd>` are both Send).
+        let nr_queues_max = nr_queues;
+        let mut worker_dispatch: Vec<(usize, super::worker_pool::WorkerHandleSnapshot)> =
+            Vec::with_capacity(nr_queues_max as usize);
+        for qid in 0..nr_queues_max {
+            worker_dispatch.push((qid as usize, pool.worker_snapshot(&export_name, qid)));
+        }
 
-        let dev_path = PathBuf::from(dev_path_str);
+        let export_for_json = export_name.clone();
+        let handler_for_workers = Arc::clone(&handler);
+
+        // All control-plane ops in one blocking task — same thread for
+        // build, UblkDev::new, start_dev, and the original ctrl's Drop.
+        // CTRL_URING is initialized once (during build) and used for
+        // every subsequent op including Drop.
+        let outcome: anyhow::Result<(i32, PathBuf, Arc<UblkDev>, u16)> =
+            tokio::task::spawn_blocking(move || {
+                let ctrl = UblkCtrlBuilder::default()
+                    .name("glidefs")
+                    .id(preferred_dev_id)
+                    .nr_queues(nr_queues_max)
+                    .depth(QUEUE_DEPTH)
+                    .io_buf_bytes(IO_BUF_BYTES)
+                    .dev_flags(dev_flags)
+                    .ctrl_flags(ctrl_flags)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("ublk ctrl build failed: {e:?}"))?;
+
+                let tgt_init = move |d: &mut UblkDev| {
+                    d.tgt.dev_size = dev_size;
+                    d.set_target_json(
+                        serde_json::json!({ "export_name": export_for_json }),
+                    );
+                    d.tgt.params = sys::ublk_params {
+                        types: sys::UBLK_PARAM_TYPE_BASIC | sys::UBLK_PARAM_TYPE_DISCARD,
+                        basic: sys::ublk_param_basic {
+                            attrs: sys::UBLK_ATTR_VOLATILE_CACHE | sys::UBLK_ATTR_FUA,
+                            logical_bs_shift: 9,
+                            physical_bs_shift: bs_shift,
+                            io_opt_shift: bs_shift,
+                            io_min_shift: 9,
+                            max_sectors: d.dev_info.max_io_buf_bytes >> 9,
+                            dev_sectors: dev_size >> 9,
+                            ..Default::default()
+                        },
+                        discard: sys::ublk_param_discard {
+                            discard_alignment: 0,
+                            discard_granularity: 4096,
+                            max_discard_sectors: 0,
+                            max_write_zeroes_sectors: 1 << 15,
+                            max_discard_segments: 0,
+                            reserved0: 0,
+                        },
+                        ..Default::default()
+                    };
+                    Ok(())
+                };
+                let dev = Arc::new(
+                    UblkDev::new(ctrl.get_name(), tgt_init, &ctrl)
+                        .map_err(|e| anyhow::anyhow!("UblkDev::new failed: {e:?}"))?,
+                );
+
+                let actual_nr_queues = dev.dev_info.nr_hw_queues;
+
+                // AddQueue dispatch via blocking sends. Each worker's
+                // mpsc::Sender accepts blocking_send from a sync ctx.
+                let mut readys = Vec::with_capacity(actual_nr_queues as usize);
+                for qid in 0..actual_nr_queues {
+                    let (worker_idx, snap) = &worker_dispatch[qid as usize];
+                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                    snap.inbox
+                        .blocking_send(super::worker_pool::WorkerMsg::AddQueue {
+                            dev: Arc::clone(&dev),
+                            handler: Arc::clone(&handler_for_workers),
+                            qid,
+                            ready: ready_tx,
+                        })
+                        .map_err(|_| {
+                            anyhow::anyhow!("worker {worker_idx} channel closed")
+                        })?;
+                    super::device::signal_eventfd(snap.eventfd.fd());
+                    readys.push((*worker_idx, ready_rx));
+                }
+                for (worker_idx, ready_rx) in readys {
+                    let result = ready_rx.blocking_recv().map_err(|_| {
+                        anyhow::anyhow!("worker {worker_idx} dropped ready sender")
+                    })?;
+                    result.map_err(|s| {
+                        anyhow::anyhow!("worker {worker_idx} AddQueue failed: {s}")
+                    })?;
+                }
+
+                // All queues attached. Issue START_DEV (or
+                // END_USER_RECOVERY for the recovery path; ublk-core's
+                // start_dev() picks based on device state).
+                ctrl.start_dev(&dev).map_err(|e| {
+                    anyhow::anyhow!("start_dev failed: {e:?}")
+                })?;
+
+                let dev_id = i32::try_from(ctrl.dev_info().dev_id)
+                    .map_err(|_| anyhow::anyhow!("dev_id overflows i32"))?;
+                let dev_path = PathBuf::from(ctrl.get_bdev_path());
+
+                // Disarm the ctrl's destructive Drop. Its kernel device
+                // is now LIVE and owned by the worker pool's queues;
+                // when the caller wants removal, they go through
+                // `unregister` (which builds a fresh `new_simple` ctrl
+                // and calls kill_dev). The original ctrl drops cleanly
+                // on this thread when the closure returns.
+                ctrl.disarm_drop();
+
+                Ok((dev_id, dev_path, dev, actual_nr_queues))
+            })
+            .await?;
+
+        let (dev_id_assigned, dev_path, dev, actual_nr_queues) = outcome?;
+        if actual_nr_queues != nr_queues {
+            tracing::warn!(
+                requested = nr_queues,
+                actual = actual_nr_queues,
+                "ublk allocated different nr_queues than requested"
+            );
+        }
 
         // Tune kernel block queue for a userspace device:
-        // - wbt (write-back throttle): default 2ms target is too aggressive for ublk —
-        //   I/O round-trips through io_uring and will exceed that under load, causing
-        //   wbt to progressively choke writes down to zero.
-        // - scheduler: mq-deadline adds sorting/merging overhead that's pointless here
-        //   since we handle our own I/O ordering in userspace.
+        // - wbt (write-back throttle): default 2ms target is too
+        //   aggressive for ublk under load; disable.
+        // - scheduler: mq-deadline adds pointless overhead — userspace
+        //   handles I/O ordering.
         if let Some(dev_name) = dev_path.file_name().and_then(|n| n.to_str()) {
             let queue = format!("/sys/block/{dev_name}/queue");
             for (param, value) in [("wbt_lat_usec", "0"), ("scheduler", "none")] {
@@ -212,12 +393,19 @@ impl UblkDevice {
             }
         }
 
-        tracing::info!(dev_id, path = %dev_path.display(), "ublk device registered");
+        tracing::info!(
+            dev_id = dev_id_assigned,
+            path = %dev_path.display(),
+            queues = actual_nr_queues,
+            "ublk device registered (worker-pool hosted)"
+        );
 
         Ok(Self {
-            dev_id,
+            dev_id: dev_id_assigned,
             dev_path,
-            worker: Some(worker),
+            nr_queues: actual_nr_queues,
+            export_name,
+            _dev: dev,
         })
     }
 
@@ -233,10 +421,19 @@ impl UblkDevice {
 
     /// Stop and unregister this ublk device.
     ///
-    /// Sends `UBLK_CMD_STOP_DEV` + `UBLK_CMD_DEL_DEV` to the kernel.
-    /// Queue I/O loops receive `QueueIsDown` and exit. The worker thread
-    /// is joined with a timeout to avoid hanging indefinitely.
-    pub async fn unregister(mut self) -> anyhow::Result<()> {
+    /// Sends `kill_dev` (STOP_DEV + DEL_DEV) — io_task futures see
+    /// `QueueIsDown` and exit. Then sends `RemoveQueue` to each hosting
+    /// worker so they drop their `Rc<UblkQueue>` reference. The
+    /// device's `Arc<UblkDev>` drops at the end of this function;
+    /// the kernel device disappears once the last reference to its
+    /// underlying mmaps/fds is gone.
+    ///
+    /// **NOTE (M6 future fix)**: `kill_dev` will deadlock the kernel
+    /// if VMs have inflight bios at the moment of call (see plan,
+    /// M6.1). For M4 we accept this hazard — production removal goes
+    /// through `box-manager` which quiesces VMs first. M6 replaces
+    /// `kill_dev`-on-shutdown with `UBLK_F_USER_RECOVERY` auto-quiesce.
+    pub async fn unregister(self) -> anyhow::Result<()> {
         tracing::info!(dev_id = self.dev_id, "unregistering ublk device");
 
         let dev_id = self.dev_id;
@@ -246,49 +443,46 @@ impl UblkDevice {
             Ok(())
         })
         .await?;
-
-        // If kill_dev failed, don't try to join — the worker may not exit.
-        // Drop will retry kill_dev as a safety net.
         kill_result.map_err(|e| anyhow::anyhow!("ublk kill_dev failed: {}", e))?;
 
-        // Join the worker with a timeout. The io_uring idle timeout bounds
-        // worst-case exit latency, so we allow slightly more than that.
-        if let Some(worker) = self.worker.take() {
-            let join_timeout = std::time::Duration::from_secs(URING_IDLE_SECS + 5);
-            let join_task = tokio::task::spawn_blocking(move || worker.join());
+        // Drop the device's Arc<UblkDev> — last reference goes away
+        // once worker io_task futures all exit (which they do shortly
+        // after kill_dev).
+        Ok(())
+    }
 
-            let thread_result = tokio::time::timeout(join_timeout, join_task)
+    /// Drain this device's queues from the worker pool without sending
+    /// `kill_dev`. Caller still owns the kernel device. Useful for
+    /// tests and for the M6 shutdown path.
+    pub async fn drain_queues(
+        &self,
+        pool: &super::worker_pool::WorkerPool,
+    ) -> anyhow::Result<()> {
+        for qid in 0..self.nr_queues {
+            let worker = pool.worker_for(&self.export_name, qid);
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            worker
+                .send(super::worker_pool::WorkerMsg::RemoveQueue {
+                    key: super::worker_pool::QueueKey { dev_id: self.dev_id, qid },
+                    done: done_tx,
+                })
                 .await
-                .map_err(|_elapsed| {
-                    tracing::warn!(
-                        dev_id,
-                        timeout_secs = join_timeout.as_secs(),
-                        "ublk worker thread did not exit in time; detaching"
-                    );
-                    anyhow::anyhow!(
-                        "ublk worker thread for dev_id {dev_id} did not exit within {}s",
-                        join_timeout.as_secs()
-                    )
-                })?
-                .map_err(|e| anyhow::anyhow!("join task failed: {}", e))?
-                .map_err(|_panic| anyhow::anyhow!("ublk worker thread panicked"))?;
-
-            thread_result.context("ublk worker thread exited with error")?;
+                .map_err(|_| anyhow::anyhow!("worker {} channel closed", worker.idx))?;
+            // RemoveQueue is best-effort; we don't gate on the ack.
+            // The Rc<UblkQueue> drop happens in the worker thread.
+            let _ = done_rx.await;
         }
-
         Ok(())
     }
 }
 
 impl Drop for UblkDevice {
     fn drop(&mut self) {
-        if self.worker.is_none() {
-            return; // unregister() already ran
-        }
-        // Worker still running — unregister() was not called (or panicked).
-        // Best-effort kill_dev so the kernel device doesn't become a zombie.
-        // We cannot join the thread in Drop, but kill_dev triggers QueueIsDown
-        // which causes the worker to exit within URING_IDLE_SECS.
+        // Best-effort kill_dev so the kernel device doesn't zombie if
+        // the caller skipped `unregister()`. The worker pool's hosted
+        // queues see QueueIsDown and exit, then drop their queue Rc;
+        // when the last io_task finishes, the dev Arc held by this
+        // Self drops too (as Drop runs and `_dev` field drops).
         tracing::warn!(
             dev_id = self.dev_id,
             path = %self.dev_path.display(),
@@ -301,10 +495,13 @@ impl Drop for UblkDevice {
                 }
             }
             Err(e) => {
-                tracing::error!(dev_id = self.dev_id, error = ?e, "UblkCtrl::new_simple in Drop failed");
+                tracing::error!(
+                    dev_id = self.dev_id,
+                    error = ?e,
+                    "UblkCtrl::new_simple in Drop failed"
+                );
             }
         }
-        // JoinHandle is dropped here → thread detaches. It will exit on its own.
     }
 }
 
@@ -907,8 +1104,10 @@ fn queue_io_loop(
         .setup_cqsize(cq_depth)
         .setup_single_issuer()
         .build(sq_depth)
+        .map_err(ublk_core::UblkError::IOError)
+        .and_then(ublk_core::WorkerRing::from_io_uring)
     {
-        Ok(r) => ublk_core::WorkerRing::from_io_uring(r),
+        Ok(r) => r,
         Err(e) => {
             tracing::error!(qid, error = ?e, "failed to init io_uring for ublk queue");
             latch.signal_failed();

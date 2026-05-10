@@ -158,14 +158,34 @@ use std::sync::{Arc, Condvar, Mutex};
 // "one queue per OS thread"; the multiplex worker pool needs many queues
 // per thread.
 
+/// Maximum cdev fixed-file slots a single `WorkerRing` can host. With
+/// glidefs's `nr_queues=1` default and a worker-per-CPU pool sized at
+/// 32, ~125 devices/worker would fit; bump to 4096 to leave headroom
+/// for nr_queues>1 deployments hosting hundreds of queues per worker.
+/// Memory cost: io_uring's fixed-file table is `8 * MAX_FIXED_FILES`
+/// bytes, plus a sparse-table struct in the kernel — ~32 KiB per ring.
+const MAX_FIXED_FILES: u32 = 4096;
+
 /// A queue-thread io_uring ring shared across the queues hosted on one worker.
 ///
 /// Cheap to clone (one `Rc` increment). Mutation goes through `with_mut`
 /// which does a single `RefCell::borrow_mut` — uncontended in the normal
 /// case because the executor polls tasks one at a time on the owning thread.
+///
+/// **Fixed-file slot allocation**: at construction the ring registers a
+/// sparse fixed-file table of [`MAX_FIXED_FILES`] empty slots. Each
+/// hosted queue allocates one slot for its cdev fd via
+/// [`Self::alloc_cdev_slot`] and writes the fd via
+/// `register_files_update`. Slots are released on queue Drop and reused
+/// (FIFO via a free-list). This replaces the legacy
+/// "single-queue-per-ring `register_files`" pattern that errored EBUSY
+/// on the second call.
 #[derive(Clone)]
 pub struct WorkerRing {
     inner: Rc<RefCell<IoUring<squeue::Entry>>>,
+    /// Free list of fixed-file slots. Initially populated with
+    /// `0..MAX_FIXED_FILES`. Allocator pops; queue Drop pushes back.
+    free_slots: Rc<RefCell<Vec<u32>>>,
 }
 
 impl WorkerRing {
@@ -178,12 +198,44 @@ impl WorkerRing {
             .setup_coop_taskrun()
             .build(sq_depth)
             .map_err(UblkError::IOError)?;
-        Ok(Self::from_io_uring(ring))
+        Self::from_io_uring(ring)
     }
 
-    /// Wrap a caller-built `IoUring` (e.g., one with `setup_single_issuer`).
-    pub fn from_io_uring(ring: IoUring<squeue::Entry>) -> Self {
-        Self { inner: Rc::new(RefCell::new(ring)) }
+    /// Wrap a caller-built `IoUring` (e.g., one with `setup_single_issuer`)
+    /// and pre-register a sparse fixed-file table.
+    pub fn from_io_uring(ring: IoUring<squeue::Entry>) -> Result<Self, UblkError> {
+        // Sparse registration: every slot starts at -1 (unused). Each
+        // hosted queue fills its slot via `register_files_update`. This
+        // is the multi-queue-per-ring enabler: re-calling
+        // `register_files` returns EBUSY, but `register_files_update`
+        // works on a sparse table that's already registered.
+        ring.submitter()
+            .register_files_sparse(MAX_FIXED_FILES)
+            .map_err(UblkError::IOError)?;
+
+        // Free list, highest slot first so allocations come out as 0,1,2,...
+        let free_slots: Vec<u32> = (0..MAX_FIXED_FILES).rev().collect();
+
+        Ok(Self {
+            inner: Rc::new(RefCell::new(ring)),
+            free_slots: Rc::new(RefCell::new(free_slots)),
+        })
+    }
+
+    /// Allocate one fixed-file slot for a new hosted queue's cdev fd.
+    /// Returns the slot index, or `Err(ENOSPC)` if the table is full.
+    pub fn alloc_cdev_slot(&self) -> Result<u32, UblkError> {
+        self.free_slots
+            .borrow_mut()
+            .pop()
+            .ok_or(UblkError::OtherError(-libc::ENOSPC))
+    }
+
+    /// Release a slot back to the free list. Idempotent at the API
+    /// level — caller is responsible for not reusing the slot after
+    /// release.
+    pub fn release_cdev_slot(&self, slot: u32) {
+        self.free_slots.borrow_mut().push(slot);
     }
 
     /// Access the ring with an immutable borrow.
@@ -971,6 +1023,12 @@ pub struct UblkQueue {
     /// The io_uring this queue submits to. `Rc`-cloned from the worker that
     /// hosts this queue; many queues on one worker share one ring.
     pub(crate) ring: WorkerRing,
+    /// Fixed-file slot index into the worker's sparse fixed-file table
+    /// where this queue's cdev fd is registered. Used in every FETCH /
+    /// COMMIT SQE via `types::Fixed(cdev_slot)` so each queue's
+    /// commands target its own cdev. Replaces the legacy hardcoded
+    /// `Fixed(0)`. Released back to the worker's free list on Drop.
+    cdev_slot: u32,
 }
 
 impl AsRawFd for UblkQueue {
@@ -984,9 +1042,20 @@ impl Drop for UblkQueue {
         let dev = &self.dev;
         log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
 
-        if let Err(r) = self.ring.with_mut(|r| r.submitter().unregister_files()) {
-            log::error!("unregister fixed files failed {}", r);
+        // Release the cdev fixed-file slot back to the ring's free
+        // list. We also clear the slot's contents via
+        // `register_files_update` with -1 so a stale CQE can't hit the
+        // wrong fd if a slot is reused before the kernel drains
+        // pending commands.
+        let cdev_slot = self.cdev_slot;
+        let unregister_result = self.ring.with_mut(|r| {
+            r.submitter()
+                .register_files_update(cdev_slot, &[-1i32])
+        });
+        if let Err(r) = unregister_result {
+            log::error!("clear cdev slot {} failed: {}", cdev_slot, r);
         }
+        self.ring.release_cdev_slot(cdev_slot);
 
         // Unregister sparse buffer table if auto buffer registration was enabled
         if self.support_auto_buf_zc() {
@@ -1062,26 +1131,31 @@ impl UblkQueue {
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
         let max_cmd_buf_sz = UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH) as libc::off_t;
 
-        // Register fixed files into this worker's ring.
-        //
-        // M2: one queue per ring, so this is the only registration on the
-        // ring and `register_files` is correct.
-        //
-        // TODO(M4): when many queues share one ring, switch to
-        // `register_files_update` to add this queue's cdev fd into a slot
-        // without disturbing other queues' registrations.
+        // Allocate one slot in the worker ring's sparse fixed-file
+        // table, then write this queue's cdev fd there. The ring's
+        // table was pre-registered as sparse at WorkerRing construction
+        // (`register_files_sparse(MAX_FIXED_FILES)`); each queue uses
+        // `register_files_update` to fill its slot — this is the
+        // multi-queue-per-ring pattern that `register_files` (one-shot)
+        // can't support.
+        let cdev_slot = ring.alloc_cdev_slot()?;
         ring.with_mut(|r| {
             r.submitter()
-                .register_files(&tgt.fds[0..tgt.nr_fds as usize])
+                .register_files_update(cdev_slot, &[tgt.fds[0]])
+                .map(|_| ())
                 .map_err(UblkError::IOError)
         })?;
 
+        // ZC's auto-buf-reg sparse buffer table is per-ring, not
+        // per-queue. With many queues sharing a ring, only the first
+        // queue should register; subsequent queues skip. ublk's
+        // production path has ZC permanently disabled, so this branch
+        // is dead — just log and skip if it ever triggers.
         if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
-            ring.with_mut(|r| {
-                r.submitter()
-                    .register_buffers_sparse(depth)
-                    .map_err(UblkError::IOError)
-            })?;
+            log::warn!(
+                "UBLK_F_AUTO_BUF_REG set but multi-queue rings don't \
+                 yet share buffer tables; skipping register_buffers_sparse"
+            );
         }
 
         let off =
@@ -1142,6 +1216,7 @@ impl UblkQueue {
             buf_reg_semaphore: Semaphore::new(0),
             buf_reg_counter: RefCell::new(0),
             ring: ring.clone(),
+            cdev_slot,
         };
 
         log::info!("dev {} queue {} started", dev_id_for_log, q_id);
@@ -1387,7 +1462,7 @@ impl UblkQueue {
             cmd_op
         };
 
-        let mut sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
+        let mut sqe = opcode::UringCmd16::new(types::Fixed(self.cdev_slot), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
@@ -1812,7 +1887,7 @@ impl UblkQueue {
             op
         };
 
-        let sqe = opcode::UringCmd16::new(types::Fixed(0), cmd_op)
+        let sqe = opcode::UringCmd16::new(types::Fixed(self.cdev_slot), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
