@@ -202,6 +202,23 @@ impl UblkServer {
     ///
     /// Returns an error if a device is already registered for this export.
     /// Call `remove_device` first to replace an existing device.
+    ///
+    /// **M6.1 crash-recovery semantics**: if the persisted device-id map
+    /// names a kernel device that's still around in `UBLK_S_DEV_QUIESCED`
+    /// (the state the kernel parks devices in when their userspace
+    /// daemon vanishes, courtesy of `UBLK_F_USER_RECOVERY`), this call
+    /// recovers that device in place instead of trying to add a new
+    /// one. Without this, `UBLK_CMD_ADD_DEV` would fail with `-EEXIST`
+    /// (the requested dev_id is taken), and our libublk ctrl-cmd retry
+    /// would then re-issue the request with the legacy opcode, which
+    /// returns `-EOPNOTSUPP` on kernels built without
+    /// `CONFIG_BLKDEV_UBLK_LEGACY_OPCODES` (default off on Ubuntu 24.04
+    /// CI runners and any 6.8+ distro kernel).
+    ///
+    /// Production flow already calls [`Self::recover_quiesced_devices`]
+    /// at startup before `add_device`, so this branch is a defensive
+    /// fallback for paths that bypass the orchestrated recovery scan
+    /// (tests, single-export reattach, etc.).
     pub async fn add_device(
         &mut self,
         export_name: &str,
@@ -218,8 +235,33 @@ impl UblkServer {
             .get(export_name).copied();
         let preferred_node = self.preferred_node();
 
+        // Probe the kernel for a QUIESCED glidefs-owned device at our
+        // preferred dev_id. Cheap (single ctrl cmd) and only runs when
+        // we actually have a persisted id.
+        let quiesced_nr_queues = match preferred_id {
+            Some(dev_id) => probe_quiesced_glidefs(dev_id).await,
+            None => None,
+        };
+
         let name = export_name.to_string();
-        let device =
+        let device = if let (Some(dev_id), Some(nr_queues)) =
+            (preferred_id, quiesced_nr_queues)
+        {
+            tracing::info!(
+                export = %export_name, dev_id, nr_queues,
+                "preferred dev_id is QUIESCED glidefs device — recovering in place"
+            );
+            device::UblkDevice::recover(
+                dev_id,
+                handler,
+                nr_queues,
+                name.clone(),
+                &self.features,
+                preferred_node,
+                &self.pool,
+            )
+            .await?
+        } else {
             device::UblkDevice::register(
                 handler,
                 self.nr_queues,
@@ -229,7 +271,8 @@ impl UblkServer {
                 preferred_node,
                 &self.pool,
             )
-            .await?;
+            .await?
+        };
         let path = device.dev_path().to_path_buf();
         self.devices.insert(name, device);
         self.persist_devices();
@@ -323,6 +366,35 @@ impl UblkServer {
         self.persist_devices();
         Some(device)
     }
+}
+
+/// Probe a kernel ublk device by id. Returns `Some(nr_hw_queues)` iff
+/// the device exists, is owned by us (name `"glidefs"` or `"none"` — the
+/// latter being a mid-startup orphan whose json wasn't persisted before
+/// the previous daemon died), and is currently in `UBLK_S_DEV_QUIESCED`
+/// state. Returns `None` for anything else (missing, LIVE, STOPPED, or
+/// owned by a different ublk consumer).
+///
+/// Used by `add_device` to detect "the dev_id we want is parked from a
+/// previous run" and switch to the recover path instead of letting
+/// `UBLK_CMD_ADD_DEV` fail with `-EEXIST`.
+async fn probe_quiesced_glidefs(dev_id: i32) -> Option<u16> {
+    tokio::task::spawn_blocking(move || -> Option<u16> {
+        let ctrl = ublk_core::ctrl::UblkCtrl::new_simple(dev_id).ok()?;
+        let name = ctrl.get_name();
+        if name != "glidefs" && name != "none" {
+            return None;
+        }
+        if (ctrl.dev_info().state as u32)
+            != ublk_core::sys::UBLK_S_DEV_QUIESCED
+        {
+            return None;
+        }
+        Some(ctrl.dev_info().nr_hw_queues)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Phase 2 of two-phase removal. Drives the kernel-side teardown
