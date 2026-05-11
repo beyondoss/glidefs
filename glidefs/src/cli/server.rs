@@ -227,20 +227,46 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     // Register kernel block devices for exports that don't already have one.
     // Recovered ublk devices are already registered, so they'll be skipped.
+    // Parallel so 1000-device cold-start doesn't serialize behind ublk control
+    // ioctls — each registration is independent.
     #[cfg(target_os = "linux")]
     {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        const REGISTER_CONCURRENCY: usize = 16;
+
+        let mut to_register = Vec::new();
         for export in router.list_exports().await {
             if router.get_device_path(&export.name).await.is_some() {
-                continue; // already has a device (recovered or previously registered)
+                continue;
             }
-            if let Err(e) = router
-                .register_device(&export.name, &export.transport)
-                .await
-            {
-                warn!(
-                    "Failed to register device for '{}': {}",
-                    export.name, e
-                );
+            to_register.push((export.name, export.transport));
+        }
+
+        let router_clone = Arc::clone(&router);
+        let register_one = move |name: String, transport: String| {
+            let router = Arc::clone(&router_clone);
+            Box::pin(async move {
+                let res = router.register_device(&name, &transport).await;
+                (name, res)
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = (String, Result<(), _>)> + Send>,
+                >
+        };
+
+        let mut pending = FuturesUnordered::new();
+        let mut iter = to_register.into_iter();
+        for _ in 0..REGISTER_CONCURRENCY {
+            if let Some((name, transport)) = iter.next() {
+                pending.push(register_one(name, transport));
+            }
+        }
+        while let Some((name, res)) = pending.next().await {
+            if let Err(e) = res {
+                warn!("Failed to register device for '{}': {}", name, e);
+            }
+            if let Some((next_name, next_transport)) = iter.next() {
+                pending.push(register_one(next_name, next_transport));
             }
         }
     }

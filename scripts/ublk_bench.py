@@ -60,7 +60,7 @@ def _api(method: str, url: str, body: Optional[dict] = None) -> tuple[int, Any]:
     if body is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=300) as r:
             payload = r.read()
             return r.status, json.loads(payload) if payload else None
     except urllib.error.HTTPError as e:
@@ -89,19 +89,22 @@ def create_export(api: str, name: str, transport: str, size_gb: int) -> dict:
 
 
 def delete_export(api: str, name: str) -> None:
-    code, _ = _api("DELETE", f"{api}/api/exports/{name}")
+    # `purge=true` skips the write-cache drain (no synchronous S3 PUTs)
+    # and cleans up S3 manifest/snapshots/export-definition. Correct for
+    # bench/test exports — never use against production data.
+    code, _ = _api("DELETE", f"{api}/api/exports/{name}?purge=true")
     if code not in (200, 204, 404):
         raise RuntimeError(f"DELETE export {name} failed: {code}")
 
 
-def teardown_prefix(api: str, prefix: str) -> int:
+def teardown_prefix(api: str, prefix: str, concurrency: int = 4) -> int:
     """Delete every export whose name starts with `prefix`. Returns count."""
-    n = 0
-    for e in list_exports(api):
-        if e["name"].startswith(prefix):
-            delete_export(api, e["name"])
-            n += 1
-    return n
+    targets = [e["name"] for e in list_exports(api) if e["name"].startswith(prefix)]
+    if not targets:
+        return 0
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        list(pool.map(lambda n: delete_export(api, n), targets))
+    return len(targets)
 
 
 def setup_n(api: str, n: int, prefix: str, transport: str, size_gb: int) -> list[dict]:

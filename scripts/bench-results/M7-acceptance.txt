@@ -1,0 +1,99 @@
+M7 multiplex ublk transport — acceptance bench
+Run: 2026-05-10, host paraglide (16-core, single-NUMA, NVMe)
+Daemon: jared/multiplex-ublk @ <commit pending>
+Kernel: 6.12.74+deb13+1-amd64
+
+Architecture: worker pool of K=16 threads, each owning one io_uring + executor,
+hosting many ublk queues from many devices. Queues distributed by
+hash(export_name) XOR qid_seed(qid) mod K. Slab/freelist executor for
+churn-safe slot reuse.
+
+==============================================================================
+Acceptance criteria from plan: we-do-not-need-dazzling-dewdrop
+==============================================================================
+
+1. Per-device IOPS (single fio, 4k randwrite, depth=64, numjobs=4): >= 350k
+2. 8-device aggregate IOPS:                                          >= 1.4M
+3. At 1000 active exports, threads added by the pool:                <= 32
+4. Hot-restart: all 1000 devices recovered to original paths:        <= 5s
+
+==============================================================================
+Results
+==============================================================================
+
+1. Single-device IOPS (m7-0000 @ /dev/ublkb264, freshly-created export)
+   -------------------------------------------------------------------
+   rw=randwrite bs=4k depth=64 jobs=4 runtime=12s
+   IOPS:                       915,095  (2.6x target)
+   bandwidth:                  3.75 GB/s
+   lat mean:                   277.6 us
+   lat p99:                    493.6 us
+   lat p999:                   765.9 us
+
+   Compared to M1 baseline (per-device-thread, same hardware):
+       452k IOPS  →  915k IOPS   +103%
+
+2. 8-device parallel aggregate (m7-0000..m7-0007)
+   -------------------------------------------------------------------
+   8 fio processes in parallel, rw=randwrite bs=4k depth=32 jobs=1 runtime=12s
+   per device range:           164k - 260k IOPS
+   AGGREGATE IOPS:             1,485,197  (1.06x target)
+   AGGREGATE bandwidth:        6.08 GB/s  (~NVMe saturation)
+
+3. Thread count at 258 ublk exports (production data, single daemon)
+   -------------------------------------------------------------------
+   pid:                        876586
+   total threads:              60
+   ublk-worker threads:        16   <-- added by the pool
+   tokio runtime workers:      29   <-- baseline, not added by pool
+   iou-wrk kernel threads:     14   <-- kernel-side, not added by pool
+   num_cpus:                   16
+   threads added by pool:      16   (PASSES <=32 target)
+
+   Per-worker slot utilization (capacity 65536 each):
+       worker  used  hosted_queues
+       0       4033  62
+       1       3457  53
+       2       4737  73
+       3       4161  64
+       4       3457  53
+       5       4033  62
+       6       4161  64
+       7       4737  73
+       8       4737  73
+       9       4161  64
+       10      4033  62
+       11      3457  53
+       12      4161  64
+       13      4737  73
+       (...balanced; spread = 37% of mean = healthy hash distribution)
+
+4. Hot-restart recovery time
+   -------------------------------------------------------------------
+   272 ublk devices QUIESCED, kill -9 daemon, systemctl start.
+
+   First "recovering QUIESCED ublk device" log:  T+0.000
+   "Recovered 272 QUIESCED ublk device(s)" log:   T+15.412s
+
+   Per-device cost: 56 ms
+
+   AT TARGET DENSITY (1000 devices): extrapolated 55 seconds.
+
+   Target of 5s/1000 not met. Bumping RECOVERY_CONCURRENCY from 16 to 64 had
+   no effect — bottleneck is per-AddQueue kernel ioctl + worker UblkQueue::new
+   serialization on the worker thread, not async-side parallelism. A future
+   optimization could batch register_files_update across many AddQueues
+   targeting the same worker.
+
+==============================================================================
+Known issues (filed for follow-up)
+==============================================================================
+
+- DELETE export at 1000-device density: ~10 min/device (vs 71 ms when daemon
+  is stopped). Caused by glidefs's own flush schedulers saturating the SSD
+  such that kernel `ublk_ctrl_del_dev`'s internal `wait_event` (likely
+  `ublk_wait_tagset_rqs_idle`) sees no progress. See investigation prompt
+  for the next engineer.
+
+- 5s/1000 hot-restart target not met. 55s extrapolated. Architecturally
+  fine; needs batched AddQueue/register_files for the speedup.

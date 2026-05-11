@@ -40,7 +40,15 @@ const DEVICE_MAP_FILE: &str = "ublk_devices.json";
 /// control-plane work; tokio's default blocking pool is 512 so 16 is
 /// comfortably below the cap while overlapping enough to amortise
 /// per-device ioctl latency.
-const RECOVERY_CONCURRENCY: usize = 16;
+/// Concurrency cap for the recovery sweep. Each in-flight recovery
+/// does one `UblkCtrl::new_simple` + `START_USER_RECOVERY` (kernel
+/// ioctls on a spawn_blocking thread) plus a few `AddQueue` round-trips
+/// to the worker pool. Each in-flight unit holds ~1 blocking thread
+/// plus nr_queues mpsc messages — both cheap, so we lean on
+/// parallelism to hit the 5s-for-1000-devices target. 64 = 64 ×
+/// nr_queues=4 = 256 AddQueue in flight, well below the workers'
+/// inbox capacity.
+const RECOVERY_CONCURRENCY: usize = 64;
 
 /// Max simultaneous `kill_dev`+`del_dev` ioctls during the orphan
 /// sweep. Each runs in its own `spawn_blocking` thread.
@@ -196,6 +204,30 @@ impl UblkServer {
         let path = device.dev_path().to_path_buf();
         self.devices.insert(name, device);
         self.persist_devices();
+
+        // Surface worker headroom on every add so hot-spotting shows up
+        // in logs before it becomes an AddQueue failure. Logs the most
+        // and least loaded workers — the spread reveals hash imbalance
+        // long before any individual worker reaches AtCapacity.
+        let snap = self.pool.capacity_snapshot();
+        if let (Some(min), Some(max)) = (
+            snap.iter().min_by_key(|(_, u, _, _)| *u),
+            snap.iter().max_by_key(|(_, u, _, _)| *u),
+        ) {
+            tracing::info!(
+                export = %export_name,
+                devices = self.devices.len(),
+                workers = snap.len(),
+                hottest_worker = max.0,
+                hottest_used = max.1,
+                hottest_hosted_queues = max.3,
+                coldest_worker = min.0,
+                coldest_used = min.1,
+                worker_capacity = max.2,
+                "ublk device added — worker headroom snapshot"
+            );
+        }
+
         Ok(path)
     }
 
@@ -218,44 +250,92 @@ impl UblkServer {
         Ok(())
     }
 
-    /// Remove a ublk device for an export.
+    /// Remove a ublk device for an export — *legacy combined API*.
+    ///
+    /// **Production callers should use the two-phase
+    /// [`Self::take_device`] + [`Self::persist_now`] instead.** This
+    /// method holds the caller-side mutex (the router's
+    /// `tokio::Mutex<UblkServer>`) across the entire `kill_dev` ioctl,
+    /// which serializes every concurrent DELETE behind one device's
+    /// `STOP_DEV` drain. At fleet scale that turns a 1000-export
+    /// teardown into a single-threaded multi-hour operation.
+    ///
+    /// The two-phase variant lets the router release the mutex between
+    /// "remove from map" (microseconds) and "kill_dev" (seconds), so
+    /// deletes parallelize across whatever concurrency the API
+    /// receives. We keep this method only for `crash_remove`-style
+    /// internal callers that already hold a tight scope on the lock.
     ///
     /// Idempotent: returns `Ok(())` if no device is registered for this export.
     pub async fn remove_device(&mut self, export_name: &str) -> anyhow::Result<()> {
-        if let Some(device) = self.devices.remove(export_name) {
-            tracing::info!(export = %export_name, "removing ublk device");
-            let dev_id = device.dev_id();
-            if let Err(e) = device.unregister().await {
-                // Unregister failed (e.g., worker thread stuck). Force-kill the kernel
-                // device so add_device can reuse the dev_id without hitting EBUSY.
-                tracing::warn!(
-                    export = %export_name,
-                    dev_id,
-                    error = %e,
-                    "ublk unregister failed — force-killing kernel device"
-                );
-                if let Err(kill_err) = tokio::task::spawn_blocking(move || {
-                    let ctrl = ublk_core::ctrl::UblkCtrl::new_simple(dev_id)?;
-                    ctrl.kill_dev()?;
-                    // Give kernel a moment to release the device
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    Ok::<_, anyhow::Error>(())
-                })
-                .await?
-                {
-                    tracing::warn!(
-                        dev_id,
-                        error = %kill_err,
-                        "force kill also failed — device may be leaked"
-                    );
-                }
-            }
-            self.persist_devices();
-        } else {
+        let Some(device) = self.devices.remove(export_name) else {
             tracing::debug!(export = %export_name, "no ublk device registered, nothing to remove");
-        }
-        Ok(())
+            return Ok(());
+        };
+        // Persist while we still hold the lock. The slow `unregister`
+        // call follows but doesn't need lock-protected state.
+        self.persist_devices();
+        unregister_device(export_name, device).await
     }
+
+    /// Phase 1 of two-phase removal: take ownership of the named
+    /// device's record without dropping it. Cheap — does a single
+    /// HashMap remove + a `persist_devices` (JSON write to local disk).
+    /// The returned `UblkDevice` can then have `unregister()` called on
+    /// it *outside* the `UblkServer` mutex, freeing concurrent calls to
+    /// proceed.
+    ///
+    /// Returns `None` if no device is registered for this export
+    /// (idempotent removal).
+    pub fn take_device(&mut self, export_name: &str) -> Option<device::UblkDevice> {
+        let device = self.devices.remove(export_name)?;
+        // Persist the now-shrunk device map while we still own the lock
+        // so a concurrent restart sees this device as already-gone.
+        self.persist_devices();
+        Some(device)
+    }
+}
+
+/// Phase 2 of two-phase removal. Drives the kernel-side teardown
+/// (`STOP_DEV` + `DEL_DEV` + cdev-fd close) on an already-owned
+/// `UblkDevice`. Does **not** require any `UblkServer` mutex. Idempotent.
+/// Lifted out of `impl UblkServer` so the router can call it without any
+/// lock held.
+pub async fn unregister_device(
+    export_name: &str,
+    device: device::UblkDevice,
+) -> anyhow::Result<()> {
+    tracing::info!(export = %export_name, "removing ublk device");
+    let dev_id = device.dev_id();
+    if let Err(e) = device.unregister().await {
+        // Unregister failed (e.g., worker thread stuck). Force-kill the kernel
+        // device so add_device can reuse the dev_id without hitting EBUSY.
+        tracing::warn!(
+            export = %export_name,
+            dev_id,
+            error = %e,
+            "ublk unregister failed — force-killing kernel device"
+        );
+        if let Err(kill_err) = tokio::task::spawn_blocking(move || {
+            let ctrl = ublk_core::ctrl::UblkCtrl::new_simple(dev_id)?;
+            ctrl.kill_dev()?;
+            // Give kernel a moment to release the device
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+        {
+            tracing::warn!(
+                dev_id,
+                error = %kill_err,
+                "force kill also failed — device may be leaked"
+            );
+        }
+    }
+    Ok(())
+}
+
+impl UblkServer {
 
     /// Scan for QUIESCED ublk devices left behind by a previous crash and
     /// recover them. After the scan, any **unrecoverable** glidefs-owned
@@ -438,20 +518,37 @@ impl UblkServer {
             }
         }
 
-        // Parallel orphan sweep. Each `kill_dev`/`del_dev` is a kernel
-        // ioctl with a per-device mutex; running them concurrently
-        // across distinct dev_ids is safe and turns N×~10ms into a
-        // fan-out. Bounded so the blocking pool doesn't get swamped.
+        // Detach the orphan sweep into a background task so daemon
+        // startup isn't blocked on it.
         //
-        // `kill_dev` alone (STOP_DEV) leaves the cdev registered in
-        // `/sys/class/ublk-char/`, so the next daemon scan still sees
-        // it. `del_dev` (DEL_DEV) removes it entirely.
+        // Each `del_dev` ioctl waits inside the kernel for the per-device
+        // tag set to fully idle (`ublk_wait_tagset_rqs_idle` and friends
+        // at `ublk_ctrl_del_dev+0x116`). When the host already has many
+        // active devices contending for the block layer, that wait can
+        // run for minutes per orphan — measured up to 10 min/device at
+        // 1000-device density. Awaiting the sweep inline turns a
+        // 740-orphan recovery into a multi-hour boot; the daemon's
+        // `/health/ready` endpoint would stay down the entire time,
+        // systemd's `TimeoutStartSec` would expire, the restart loop
+        // would kick in, and the host would be effectively offline.
+        //
+        // Correctness argument for backgrounding: orphans by definition
+        // have no matching export in the daemon's config. They serve no
+        // live I/O. While they sit unreaped, they consume kernel state
+        // (a `ublk_device` struct + cdev fd) but nothing serves data
+        // through them — recovery already classified them as orphan
+        // precisely because no handler exists. The async sweep cleans
+        // them up over the next few minutes/hours without blocking the
+        // legit recovered devices from serving I/O.
         if !orphans_to_kill.is_empty() {
             let count = orphans_to_kill.len();
-            tracing::warn!(count, "deleting unrecoverable QUIESCED orphans");
-            let deleted = {
+            tracing::warn!(
+                count,
+                "spawning background orphan sweep — daemon ready before completion"
+            );
+            tokio::task::spawn(async move {
                 use futures::stream::{self, StreamExt};
-                stream::iter(orphans_to_kill)
+                let deleted = stream::iter(orphans_to_kill)
                     .map(|dev_id| async move {
                         tokio::task::spawn_blocking(move || {
                             let Ok(ctrl) = ublk_core::ctrl::UblkCtrl::new_simple(dev_id)
@@ -476,9 +573,9 @@ impl UblkServer {
                     })
                     .buffer_unordered(ORPHAN_SWEEP_CONCURRENCY)
                     .fold(0usize, |acc, n| async move { acc + n })
-                    .await
-            };
-            tracing::info!(deleted, "orphan sweep complete");
+                    .await;
+                tracing::info!(deleted, "background orphan sweep complete");
+            });
         }
 
         self.persist_devices();
@@ -508,6 +605,16 @@ impl UblkServer {
     /// `remove_device` (which still does call `kill_dev`, with the
     /// caller-owns-quiescing-the-VMs contract documented there).
     ///
+    /// Snapshot per-worker capacity and utilization. Cheap (relaxed
+    /// atomic loads, no lock or message roundtrip to the worker threads).
+    /// Returned tuples are `(worker_idx, used_slots, capacity_slots,
+    /// hosted_queues)` — used by the `/metrics` endpoint and a debug
+    /// log line on every `add_device` so we see drift toward hot-spotting
+    /// before it becomes an AddQueue failure.
+    pub fn worker_capacity_snapshot(&self) -> Vec<(usize, usize, usize, usize)> {
+        self.pool.capacity_snapshot()
+    }
+
     /// Returns `Ok(())` always — there's no per-device failure mode in
     /// this path, just resource drops.
     pub async fn shutdown(self) -> anyhow::Result<()> {

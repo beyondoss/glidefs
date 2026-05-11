@@ -19,8 +19,9 @@
 //! one wake hop, not by the submit timeout.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 
@@ -34,9 +35,17 @@ use super::device::{drain_eventfd, io_task, signal_eventfd, EventFd, QueueExecut
 /// traffic we expect (one device add ≈ `nr_queues` messages).
 const WORKER_INBOX_CAPACITY: usize = 64;
 
-/// `WakeupBits` capacity in 64-bit words. 8192 bits = 128 words covers
-/// `~256 queues × depth=64 tags + slack for daemons`.
-const WORKER_WAKEUP_WORDS: usize = 128;
+/// `WakeupBits` capacity in 64-bit words. 1024 words = 65 536 bits =
+/// ~1024 queues × depth=64 tags + slack for daemons. At 16 workers and
+/// `nr_queues=4` this supports up to ~4096 devices. Memory cost per
+/// worker is ~8 KiB of atomic state — negligible.
+///
+/// Originally 128 words (8192 bits, ~128 queues/worker). At 1000 devices
+/// × 4 queues hashed across 16 workers (~250 queues/worker average) this
+/// overflowed and `QueueExecutor::spawn`'s capacity assert panicked,
+/// killing the worker thread mid-`AddQueue`. Surfaced during M7 scale
+/// bring-up.
+const WORKER_WAKEUP_WORDS: usize = 1024;
 
 /// Worker io_uring SQ/CQ depth. Sized so many queues' tags can submit
 /// concurrently without spilling. Worker SQs need to fit
@@ -84,6 +93,32 @@ pub(super) enum WorkerMsg {
     },
 }
 
+/// Lock-free per-worker counters published by the worker thread after
+/// every AddQueue / RemoveQueue / tick that frees a slot. Read by anyone
+/// (HTTP `/metrics`, debug-log emitters, scheduling heuristics).
+///
+/// All reads use `Ordering::Relaxed`; these are observability counters,
+/// not synchronization. Inconsistent snapshots (e.g., `used` momentarily
+/// higher than `hosted * queue_depth`) are acceptable.
+pub(super) struct WorkerStats {
+    /// Task slots currently holding a future (live io_tasks + daemons).
+    pub used: AtomicUsize,
+    /// `WakeupBits` total slot capacity — constant after worker startup.
+    pub capacity: AtomicUsize,
+    /// Number of ublk queues hosted on this worker (= `hosted.len()`).
+    pub hosted_queues: AtomicUsize,
+}
+
+impl WorkerStats {
+    fn new() -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            capacity: AtomicUsize::new(0),
+            hosted_queues: AtomicUsize::new(0),
+        }
+    }
+}
+
 /// Async-side handle to one worker. `Send`.
 pub(super) struct WorkerHandle {
     inbox: mpsc::Sender<WorkerMsg>,
@@ -92,6 +127,9 @@ pub(super) struct WorkerHandle {
     /// which immediately unblocks `io_uring_enter`. Without this, msgs
     /// would sit in the inbox until the next ~250ms timeout fires.
     eventfd: Arc<EventFd>,
+    /// Live stats published by the worker thread. Cloned into the
+    /// worker so updates and reads share the same Arc'd counters.
+    stats: Arc<WorkerStats>,
     join: Option<JoinHandle<()>>,
     pub(super) idx: usize,
 }
@@ -118,10 +156,20 @@ impl WorkerHandle {
         // (for the executor wakers + PollAdd watcher).
         let eventfd = Arc::new(EventFd::new()?);
         let efd_for_thread = Arc::clone(&eventfd);
+        let stats = Arc::new(WorkerStats::new());
+        let stats_for_thread = Arc::clone(&stats);
         let join = std::thread::Builder::new()
             .name(format!("ublk-worker-{idx}"))
-            .spawn(move || worker_thread_main(idx, rx, tokio_handle, efd_for_thread))?;
-        Ok(Self { inbox: tx, eventfd, join: Some(join), idx })
+            .spawn(move || {
+                worker_thread_main(idx, rx, tokio_handle, efd_for_thread, stats_for_thread)
+            })?;
+        Ok(Self { inbox: tx, eventfd, stats, join: Some(join), idx })
+    }
+
+    /// Borrow the live `WorkerStats` for read-only observation.
+    #[allow(dead_code)] // wired through pool below
+    pub(super) fn stats(&self) -> &Arc<WorkerStats> {
+        &self.stats
     }
 
     /// Send a message and wake the worker's `io_uring_enter`. Returns
@@ -134,6 +182,16 @@ impl WorkerHandle {
 }
 
 /// Pool of K worker threads, fixed-size.
+///
+/// # Shutdown
+///
+/// Prefer `shutdown().await` over relying on `Drop`. The `Drop` impl is a
+/// safety net only: it drops the inbox senders so workers exit on
+/// `Disconnected`, but it does **not** join the threads — joining would
+/// block the caller (and a tokio runtime thread, if dropped from async)
+/// for up to `WORKER_IDLE_NSEC × num_workers` while workers wait out
+/// their `io_uring_enter` timeouts. Use `shutdown()` for a clean,
+/// non-blocking join via `spawn_blocking`.
 pub(super) struct WorkerPool {
     workers: Vec<WorkerHandle>,
 }
@@ -171,6 +229,25 @@ impl WorkerPool {
 
     pub(super) fn num_workers(&self) -> usize {
         self.workers.len()
+    }
+
+    /// Snapshot per-worker capacity / utilization for observability.
+    /// Cheap (relaxed atomic loads, no roundtrip to the worker thread).
+    /// Returns one `(idx, used, capacity, hosted_queues)` tuple per worker.
+    #[allow(dead_code)] // exposed for /metrics + debug logging
+    pub(super) fn capacity_snapshot(&self) -> Vec<(usize, usize, usize, usize)> {
+        self.workers
+            .iter()
+            .map(|w| {
+                let s = w.stats();
+                (
+                    w.idx,
+                    s.used.load(Ordering::Relaxed),
+                    s.capacity.load(Ordering::Relaxed),
+                    s.hosted_queues.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
     }
 
     /// Send-able snapshot of `worker_for(export_name, qid)`'s send
@@ -259,25 +336,51 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     /// Final safety net: dropping the pool drops every inbox sender (so
-    /// each worker's `rx.recv()` returns `None` and the loop exits) and
-    /// joins the thread.
+    /// each worker's `rx.try_recv()` returns `Disconnected` and the loop
+    /// exits). We deliberately do **not** `JoinHandle::join` here —
+    /// joining would block the caller for up to
+    /// `WORKER_IDLE_NSEC × num_workers` while workers wait out their
+    /// `io_uring_enter` timeouts, which is unacceptable if `drop()` runs
+    /// on a tokio runtime thread. Callers that need a clean join must
+    /// call `shutdown().await` before dropping.
     fn drop(&mut self) {
-        let joins: Vec<(usize, JoinHandle<()>)> = self
+        let leftover: Vec<usize> = self
             .workers
-            .drain(..)
-            .filter_map(|mut w| w.join.take().map(|j| (w.idx, j)))
+            .iter()
+            .filter(|w| w.join.is_some())
+            .map(|w| w.idx)
             .collect();
-        for (idx, j) in joins {
-            if let Err(e) = j.join() {
-                tracing::error!(worker = idx, ?e, "worker thread panicked during pool drop");
-            }
+        if !leftover.is_empty() {
+            tracing::warn!(
+                workers = ?leftover,
+                "WorkerPool dropped without shutdown(); threads will exit on \
+                 channel-disconnect but are not joined here to avoid blocking"
+            );
         }
+        // Senders drop with `self.workers`; JoinHandles drop unjoined.
     }
 }
 
 // ---------------------------------------------------------------------------
 // Worker thread
 // ---------------------------------------------------------------------------
+
+/// A RemoveQueue that has dropped its `hosted` entry but is still
+/// waiting for the io_task futures to drop their `Rc<UblkQueue>`
+/// clones. We `weak.upgrade().is_none()` after each executor tick to
+/// detect when the last clone has been dropped — at which point
+/// `UblkQueue::Drop` has *just run* on this thread (it runs wherever
+/// the last `Rc` lives, which is the worker thread because the io_task
+/// futures and their `Rc` clones never leave it). Drop unmaps the
+/// cdev's `io_cmd_buf` and releases the io_uring fixed-file slot —
+/// both of which the kernel `UBLK_CMD_DEL_DEV` blocks on. So acking
+/// `done` here gates the caller's `del_dev` ioctl on the actual mmap
+/// release, not just on the bookkeeping removal.
+struct PendingRemove {
+    key: QueueKey,
+    weak: Weak<UblkQueue>,
+    done: Option<oneshot::Sender<()>>,
+}
 
 /// Per-worker state hosted on the worker thread. `!Send` (holds `Rc`).
 struct WorkerState<'a> {
@@ -289,9 +392,18 @@ struct WorkerState<'a> {
     /// queue is dropped only when both this map's entry is removed AND
     /// every io_task referencing it has exited.
     hosted: HashMap<QueueKey, Rc<UblkQueue>>,
+    /// RemoveQueue requests that have dropped their `hosted` entry but
+    /// are waiting for io_tasks to release their `Rc<UblkQueue>` clones.
+    /// Drained after each `tick()`: entries whose `weak.upgrade()`
+    /// returns `None` are acked and removed. See `PendingRemove`.
+    pending_removes: Vec<PendingRemove>,
     /// Set when a `WorkerMsg::Shutdown` arrives. The main loop exits as
     /// soon as the inbox is fully drained for this iteration.
     shutdown_done: Option<oneshot::Sender<()>>,
+    /// Live counters this worker publishes to anyone reading via
+    /// `WorkerHandle::stats()`. Updated after AddQueue / RemoveQueue /
+    /// every `tick()` so used/hosted_queues reflect the latest state.
+    stats: Arc<WorkerStats>,
 }
 
 fn worker_thread_main(
@@ -299,6 +411,7 @@ fn worker_thread_main(
     mut rx: mpsc::Receiver<WorkerMsg>,
     tokio_handle: tokio::runtime::Handle,
     eventfd: Arc<EventFd>,
+    stats: Arc<WorkerStats>,
 ) {
     // M5: Pin this worker thread to one CPU. With K = num_cpus capped
     // at 32, each worker gets a dedicated CPU on a single-socket box;
@@ -329,6 +442,10 @@ fn worker_thread_main(
     //   is a valid target for the calling process's `sched_setaffinity`.
     // - `size_of::<cpu_set_t>()` matches the kernel's expected mask size on
     //   the libc-supported architectures (x86-64, aarch64).
+    // - `cpu < CPU_SETSIZE` invariant for `CPU_SET`: `cpu = idx % num_cpus`
+    //   where `num_cpus = available_parallelism()` is bounded by the kernel's
+    //   NR_CPUS, which is ≤ CPU_SETSIZE (1024) on all libc-supported archs.
+    //   `CPU_SET` writes one bit; out-of-range would be OOB.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
@@ -375,8 +492,13 @@ fn worker_thread_main(
         eventfd: Arc::clone(&eventfd),
         executor: QueueExecutor::new(WORKER_WAKEUP_WORDS, Arc::clone(&eventfd)),
         hosted: HashMap::new(),
+        pending_removes: Vec::new(),
         shutdown_done: None,
+        stats: Arc::clone(&stats),
     };
+    // Publish the fixed slot capacity once so readers see a sensible
+    // value before the first AddQueue.
+    state.stats.capacity.store(state.executor.capacity(), Ordering::Relaxed);
 
     // Tokio handlers (S3 fetches, write_cache flush, etc.) call
     // `tokio::spawn`, `Notify`, etc. The runtime context must be set
@@ -454,11 +576,42 @@ async fn run_worker_loop(
                 }
                 Ok(WorkerMsg::AddQueue { dev, handler, qid, ready }) => {
                     handle_add_queue(idx, ring, state, dev, handler, qid, ready);
+                    publish_stats(state);
                 }
                 Ok(WorkerMsg::RemoveQueue { key, done }) => {
-                    state.hosted.remove(&key);
-                    let _ = done.send(());
-                    tracing::debug!(worker = idx, ?key, "queue removed (Rc dropped)");
+                    // Drop the `hosted` map's `Rc<UblkQueue>` clone. The
+                    // io_task futures still hold their own clones — they
+                    // get dropped only after `kill_dev` fires abort CQEs
+                    // and the io_tasks see `QueueIsDown`. Park the ack
+                    // in `pending_removes` and gate it on `Weak::upgrade
+                    // ().is_none()` after each tick, which is the moment
+                    // `UblkQueue::Drop` has run on this thread (it
+                    // munmaps `io_cmd_buf` and clears the io_uring
+                    // fixed-file slot — both required for `del_dev` to
+                    // unblock on the caller side).
+                    if let Some(queue_rc) = state.hosted.remove(&key) {
+                        let weak = Rc::downgrade(&queue_rc);
+                        drop(queue_rc);
+                        if weak.upgrade().is_none() {
+                            // Already fully gone (no io_tasks captured a
+                            // clone — possible after AddQueue failure).
+                            let _ = done.send(());
+                        } else {
+                            state.pending_removes.push(PendingRemove {
+                                key,
+                                weak,
+                                done: Some(done),
+                            });
+                            tracing::debug!(
+                                worker = idx, ?key,
+                                "queue removal pending io_task drain"
+                            );
+                        }
+                    } else {
+                        // Not hosted — idempotent ack.
+                        let _ = done.send(());
+                    }
+                    publish_stats(state);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -508,7 +661,53 @@ async fn run_worker_loop(
 
         // Run the executor.
         state.executor.tick();
+
+        // Tick may have caused io_tasks to complete (`kill_dev` abort
+        // CQEs, normal completion, panic). Their captured `Rc<UblkQueue>`
+        // clones dropped along with the task slots. For any RemoveQueue
+        // that's waiting on its queue to fully die, check whether the
+        // last clone is now gone — if so, `UblkQueue::Drop` just ran on
+        // this thread (munmapping `io_cmd_buf` and clearing the cdev
+        // fixed-file slot), and we can ack the caller. They'll then
+        // safely run `del_dev`, which kernel-blocks on exactly those
+        // two cleanups.
+        state.pending_removes.retain_mut(|pending| {
+            if pending.weak.upgrade().is_none() {
+                if let Some(done) = pending.done.take() {
+                    tracing::debug!(
+                        worker = idx,
+                        key = ?pending.key,
+                        "queue fully drained — acking RemoveQueue"
+                    );
+                    let _ = done.send(());
+                }
+                false
+            } else {
+                true
+            }
+        });
+
+        // Tick may have freed slots (task completion / panic / shutdown).
+        // Refresh `used` so observability reflects the latest state and
+        // future preflight `available()` checks see the right headroom
+        // through the published counter (handle_add_queue uses the live
+        // executor directly, but external readers see this counter).
+        publish_stats(state);
     }
+}
+
+/// Update the worker's published `WorkerStats` snapshot. Cheap (two
+/// relaxed atomic stores). Called after every state-changing event so
+/// readers see fresh counters without an extra round-trip to the worker.
+///
+/// `capacity` is intentionally NOT republished here: the executor's slot
+/// capacity (`WORKER_WAKEUP_WORDS × 64`) is fixed at construction and
+/// cannot change for the worker's lifetime — it's stored once at startup
+/// (see `worker_thread_main`). If executor capacity ever becomes mutable
+/// (e.g. dynamic `WakeupBits` resize), update this function to match.
+fn publish_stats(state: &WorkerState<'_>) {
+    state.stats.used.store(state.executor.used(), Ordering::Relaxed);
+    state.stats.hosted_queues.store(state.hosted.len(), Ordering::Relaxed);
 }
 
 fn handle_add_queue(
@@ -529,6 +728,30 @@ fn handle_add_queue(
         return;
     }
 
+    // Preflight: reserve `queue_depth` slots in the executor before we
+    // construct UblkQueue. If we can't fit all tags, fail the AddQueue
+    // cleanly without leaving the kernel device half-attached. The
+    // executor's `available()` returns `free_list.len() + (capacity -
+    // high_water_mark)` — the count of slots we can spawn into without
+    // hitting AtCapacity. Because the worker is single-threaded, this
+    // count is stable between here and the final spawn below.
+    let needed = queue_depth as usize;
+    let avail = state.executor.available();
+    if avail < needed {
+        tracing::error!(
+            worker = worker_idx, ?key,
+            needed,
+            available = avail,
+            capacity = state.executor.capacity(),
+            "AddQueue refused — executor cannot fit queue_depth tags"
+        );
+        let _ = ready.send(Err(format!(
+            "worker {worker_idx} at capacity (need {needed} slots, {avail} available of {})",
+            state.executor.capacity()
+        )));
+        return;
+    }
+
     let q = match UblkQueue::new(qid, Arc::clone(&dev), ring) {
         Ok(q) => Rc::new(q),
         Err(e) => {
@@ -539,7 +762,19 @@ fn handle_add_queue(
 
     // Spawn one io_task per tag. Each future captures `Rc<UblkQueue>`
     // by value, so the queue stays alive as long as any tag's task is
-    // pending.
+    // pending. The preflight above guarantees every spawn succeeds —
+    // an Err here would be a freelist/capacity-accounting bug.
+    //
+    // Failure mode if the preflight invariant *does* break: the panic
+    // propagates up through `block_on` and kills this worker thread.
+    // Tasks for tags 0..panic-point are live in the executor holding
+    // `Rc<UblkQueue>` clones; they're dropped when the executor is
+    // dropped on thread exit, freeing the queue. The kernel device is
+    // left half-attached (this worker hosted some of its queues, none
+    // of which can now process IO) — the device add as a whole fails
+    // because `ready` below never fires. All other queues hosted on
+    // this worker are also lost. This is a "should be unreachable"
+    // path; if it ever fires, it's a bug in `QueueExecutor::available`.
     for tag in 0..queue_depth {
         let q_for_task = q.clone();
         let h_for_task = Arc::clone(&handler);
@@ -553,7 +788,7 @@ fn handle_add_queue(
                     tracing::error!(qid, tag, error = ?e, "ublk io_task failed");
                 }
             }
-        });
+        }).expect("preflight reserved queue_depth slots; spawn must not fail");
     }
 
     state.hosted.insert(key, q);
@@ -647,10 +882,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn pool_drop_without_shutdown_joins_threads() {
+    async fn pool_drop_without_shutdown_does_not_block() {
+        // Drop must NOT join — joining would block the caller (a tokio
+        // thread, here) for up to WORKER_IDLE_NSEC per worker. With 2
+        // workers at 250ms each, a blocking drop would take ~500ms;
+        // we require it to return in well under that.
         let pool = WorkerPool::new(2).expect("spawn pool");
         assert_eq!(pool.num_workers(), 2);
+        let start = std::time::Instant::now();
         drop(pool);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "Drop blocked for {elapsed:?}; should be non-blocking"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
