@@ -1145,6 +1145,7 @@ impl ExportRouter {
                 flush_shutdown_rx,
                 flush_metrics,
                 flush_sem,
+                flush_threshold,
             )
             .await;
             info!("Flush scheduler for export '{}' stopped", export_name);
