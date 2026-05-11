@@ -1023,12 +1023,11 @@ pub struct UblkQueue {
     /// The io_uring this queue submits to. `Rc`-cloned from the worker that
     /// hosts this queue; many queues on one worker share one ring.
     pub(crate) ring: WorkerRing,
-    /// Fixed-file slot index into the worker's sparse fixed-file table
-    /// where this queue's cdev fd is registered. Used in every FETCH /
-    /// COMMIT SQE via `types::Fixed(cdev_slot)` so each queue's
-    /// commands target its own cdev. Replaces the legacy hardcoded
-    /// `Fixed(0)`. Released back to the worker's free list on Drop.
-    cdev_slot: u32,
+    /// Raw cdev fd, used as `types::Fd(cdev_fd)` in every FETCH / COMMIT
+    /// SQE. **Not** registered in the ring's fixed-file table — see the
+    /// `UblkQueue::new` comment block for why on kernels < 6.13 we
+    /// deliberately bypass the fixed-file path.
+    cdev_fd: RawFd,
 }
 
 impl AsRawFd for UblkQueue {
@@ -1042,20 +1041,9 @@ impl Drop for UblkQueue {
         let dev = &self.dev;
         log::trace!("dev {} queue {} dropped", dev.dev_info.dev_id, self.q_id);
 
-        // Release the cdev fixed-file slot back to the ring's free
-        // list. We also clear the slot's contents via
-        // `register_files_update` with -1 so a stale CQE can't hit the
-        // wrong fd if a slot is reused before the kernel drains
-        // pending commands.
-        let cdev_slot = self.cdev_slot;
-        let unregister_result = self.ring.with_mut(|r| {
-            r.submitter()
-                .register_files_update(cdev_slot, &[-1i32])
-        });
-        if let Err(r) = unregister_result {
-            log::error!("clear cdev slot {} failed: {}", cdev_slot, r);
-        }
-        self.ring.release_cdev_slot(cdev_slot);
+        // No fixed-file slot to release — we submit SQEs against the
+        // raw cdev fd (see UblkQueue::new). Closing the fd is the
+        // daemon's responsibility (UblkDev owns the `cdev_file`).
 
         // Unregister sparse buffer table if auto buffer registration was enabled
         if self.support_auto_buf_zc() {
@@ -1131,20 +1119,36 @@ impl UblkQueue {
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
         let max_cmd_buf_sz = UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH) as libc::off_t;
 
-        // Allocate one slot in the worker ring's sparse fixed-file
-        // table, then write this queue's cdev fd there. The ring's
-        // table was pre-registered as sparse at WorkerRing construction
-        // (`register_files_sparse(MAX_FIXED_FILES)`); each queue uses
-        // `register_files_update` to fill its slot — this is the
-        // multi-queue-per-ring pattern that `register_files` (one-shot)
-        // can't support.
-        let cdev_slot = ring.alloc_cdev_slot()?;
-        ring.with_mut(|r| {
-            r.submitter()
-                .register_files_update(cdev_slot, &[tgt.fds[0]])
-                .map(|_| ())
-                .map_err(UblkError::IOError)
-        })?;
+        // We deliberately do NOT register the cdev fd into the worker
+        // ring's fixed-file table. SQEs use `types::Fd(cdev_fd)` and pay
+        // an `fget`/`fput` per submission/completion.
+        //
+        // Why: on kernels prior to v6.13 (we run 6.12.74), every
+        // fixed-file SQE charges the ring's single `ctx->rsrc_node`. A
+        // later `register_files_update(slot, [-1])` rotates that node
+        // and queues the removed file's `fput` into a per-ring FIFO,
+        // gated on the node's refs hitting zero AND reaching the head
+        // of the list. Long-lived in-flight SQEs from CO-TENANT queues
+        // on the same ring keep the node's refs > 0 indefinitely, so
+        // the removed file's `fput` never fires. ublk_drv's DEL_DEV
+        // then waits forever in
+        // `wait_event_interruptible(ublk_idr_wq, ublk_idr_freed(idx))`
+        // because the cdev kobject's refcount only drops via that
+        // fput.
+        //
+        // Fixed upstream by Jens Axboe in
+        //   commit 3f1a546444738b21a8c312a4b49dc168b65c8706
+        //   ("io_uring/rsrc: get rid of per-ring io_rsrc_node list",
+        //    2024-10-26, landed in v6.13)
+        // which moves to per-slot rsrc_nodes, decoupling slot-N's
+        // file lifecycle from unrelated in-flight SQEs.
+        //
+        // When the production kernel reaches v6.13+, this branch can
+        // be reverted to the fixed-file path (re-add the
+        // `alloc_cdev_slot` + `register_files_update` block, switch the
+        // two `types::Fd` sites back to `types::Fixed`, and reinstate
+        // the slot release in `Drop`). The sparse-table machinery in
+        // `WorkerRing` is intentionally left in place for that future.
 
         // ZC's auto-buf-reg sparse buffer table is per-ring, not
         // per-queue. With many queues sharing a ring, only the first
@@ -1216,7 +1220,7 @@ impl UblkQueue {
             buf_reg_semaphore: Semaphore::new(0),
             buf_reg_counter: RefCell::new(0),
             ring: ring.clone(),
-            cdev_slot,
+            cdev_fd,
         };
 
         log::info!("dev {} queue {} started", dev_id_for_log, q_id);
@@ -1462,7 +1466,7 @@ impl UblkQueue {
             cmd_op
         };
 
-        let mut sqe = opcode::UringCmd16::new(types::Fixed(self.cdev_slot), cmd_op)
+        let mut sqe = opcode::UringCmd16::new(types::Fd(self.cdev_fd), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
@@ -1887,7 +1891,7 @@ impl UblkQueue {
             op
         };
 
-        let sqe = opcode::UringCmd16::new(types::Fixed(self.cdev_slot), cmd_op)
+        let sqe = opcode::UringCmd16::new(types::Fd(self.cdev_fd), cmd_op)
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
