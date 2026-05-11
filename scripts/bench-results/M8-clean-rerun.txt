@@ -1,0 +1,38 @@
+transport=ublk kernel=6.12.74+deb13+1-amd64 cpus=16
+daemon: pid=2354280 threads 58 → 57, RSS 768372kB → 1908168kB, VSZ 47016064kB → 47014128kB
+
+=== single_depth_curve_randread ===
+    randread bs=4k d=  1 j= 1 | iops=     85k  bw=   349MB/s  lat_mean=    9.8us  p99=   12.1us
+    randread bs=4k d=  4 j= 1 | iops=    258k  bw=  1059MB/s  lat_mean=   13.9us  p99=   18.0us
+    randread bs=4k d= 16 j= 1 | iops=    420k  bw=  1720MB/s  lat_mean=   36.5us  p99=   60.2us
+    randread bs=4k d= 64 j= 1 | iops=    500k  bw=  2046MB/s  lat_mean=  126.5us  p99=  199.7us
+    randread bs=4k d=128 j= 1 | iops=    555k  bw=  2273MB/s  lat_mean=  228.9us  p99=  354.3us
+
+=== single_depth_curve_randwrite ===
+   randwrite bs=4k d=  1 j= 1 | iops=     79k  bw=   323MB/s  lat_mean=   10.7us  p99=   14.1us
+   randwrite bs=4k d=  4 j= 1 | iops=    209k  bw=   855MB/s  lat_mean=   17.4us  p99=   22.4us
+   randwrite bs=4k d= 16 j= 1 | iops=    312k  bw=  1280MB/s  lat_mean=   49.5us  p99=   68.1us
+   randwrite bs=4k d= 64 j= 1 | iops=    356k  bw=  1457MB/s  lat_mean=  178.1us  p99=  313.3us
+   randwrite bs=4k d=128 j= 1 | iops=    507k  bw=  2078MB/s  lat_mean=  250.4us  p99=  415.7us
+
+=== single_multijob_randwrite_d32 ===
+   randwrite bs=4k d= 32 j= 1 | iops=    342k  bw=  1402MB/s  lat_mean=   91.8us  p99=  156.7us
+   randwrite bs=4k d= 32 j= 2 | iops=    591k  bw=  2419MB/s  lat_mean=  106.6us  p99=  207.9us
+   randwrite bs=4k d= 32 j= 4 | iops=    842k  bw=  3449MB/s  lat_mean=  150.1us  p99=  321.5us
+   randwrite bs=4k d= 32 j= 8 | iops=    868k  bw=  3556MB/s  lat_mean=  292.5us  p99=  577.5us
+
+=== single_fua_randwrite ===
+   randwrite bs=4k d=  1 j= 1 | iops=      3k  bw=    12MB/s  lat_mean=   32.6us  p99=   50.4us
+   randwrite bs=4k d= 16 j= 1 | iops=     18k  bw=    76MB/s  lat_mean=  299.8us  p99=  921.6us
+   randwrite bs=4k d= 64 j= 1 | iops=     48k  bw=   197MB/s  lat_mean=  442.7us  p99= 1237.0us
+
+=== parallel_randwrite_d32_x8 ===
+  aggregate iops=   1.47M  bw=  6033MB/s  lat_mean_avg=  174.9us
+        /dev/ublkb3: iops=    170k lat_mean=  186.5us
+       /dev/ublkb16: iops=    168k lat_mean=  187.7us
+       /dev/ublkb34: iops=    164k lat_mean=  193.1us
+       /dev/ublkb60: iops=    188k lat_mean=  167.8us
+       /dev/ublkb79: iops=    182k lat_mean=  173.8us
+       /dev/ublkb97: iops=    255k lat_mean=  123.5us
+      /dev/ublkb100: iops=    185k lat_mean=  170.6us
+      /dev/ublkb140: iops=    161k lat_mean=  196.3us

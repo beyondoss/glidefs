@@ -24,6 +24,50 @@ Examples:
   ./scripts/ublk_bench.py single --transport ublk --rw randwrite --depth 64 --jobs 4
   ./scripts/ublk_bench.py parallel --transport ublk --devices 8 --rw randwrite --depth 32
   ./scripts/ublk_bench.py teardown --prefix bench-
+
+==============================================================================
+Benchmark methodology (READ ME if numbers look weird)
+==============================================================================
+
+For numbers to be apples-to-apples with milestone baselines (M1, M4d, M5, ...):
+
+1. The DAEMON must run the binary you intend to measure. The systemd unit
+   runs `/usr/local/bin/glidefs`; `cargo build` deposits to
+   `target/release/glidefs`. They are NOT the same file until you install:
+
+     cargo build --release --features ublk -p glidefs --bin glidefs
+     sudo cp target/release/glidefs /usr/local/bin/glidefs       # keep .pre-X backup
+     sudo systemctl reset-failed glidefs   # unit has StartLimitBurst=1
+     sudo systemctl restart glidefs
+     until curl -sf http://127.0.0.1:9113/health/ready; do sleep 1; done
+
+2. Bench exports MUST be created with `flush_mode: "manual"` (this script
+   does so in `create_export`). Without it:
+     - the flush_scheduler turns each bench's accumulated dirty blocks into
+       a multipart-PUT storm to real S3 mid-test (contends with bench writes
+       for SSD AND tokio runtime AND outbound network);
+     - if anything goes wrong with S3 (transient timeout, throttling), the
+       per-export 30s circuit-breaker backoff leaves stuck retries that
+       contaminate every subsequent bench you run that day (we lived this
+       on 2026-05-11: 17 dirty exports × failed multipart PUTs = invented
+       a 50% "write regression" out of thin air).
+   With flush_mode=manual + `?purge=true` teardown, the bench is fully
+   local: WriteCache + ext4 cache file only, zero S3 PUTs.
+
+3. ALWAYS run `baseline` against fresh exports created by this script's
+   `setup_n`. Do not run against pre-existing, long-lived exports — their
+   WriteCache state is unpredictable (evicted blocks may need S3 GETs;
+   leftover dirty blocks bias write latency).
+
+4. Confirm the daemon has no other dirty exports racing for SSD/network:
+     curl -s http://127.0.0.1:9113/api/exports | jq '[.[]|select(.dirty_bytes>0)]|length'
+   If it's >0 and they're yours, purge them first:
+     curl -X DELETE 'http://127.0.0.1:9113/api/exports/NAME?purge=true'
+
+5. Co-tenancy load matters. M5/M4d ran against a daemon with ~0 hosted
+   exports; "production density" benches will show lower per-device peak
+   because the worker pool is sharing 16 io_urings across thousands of
+   queues. Note exports_count in /health/ready when recording numbers.
 """
 
 from __future__ import annotations
@@ -78,10 +122,15 @@ def list_exports(api: str) -> list[dict]:
 
 
 def create_export(api: str, name: str, transport: str, size_gb: int) -> dict:
+    # flush_mode=manual: the bench writes never trigger background S3 PUTs.
+    # Dirty blocks accumulate in WriteCache, get discarded at purge teardown.
+    # Without this, the flush_scheduler races the bench and either contends
+    # for SSD/network or — if S3 is degraded — opens the circuit breaker and
+    # leaves stuck dirty data behind. See router.rs flush_threshold_or().
     code, body = _api(
         "PUT",
         f"{api}/api/exports/{name}",
-        {"size_gb": size_gb, "transport": transport},
+        {"size_gb": size_gb, "transport": transport, "flush_mode": "manual"},
     )
     if code not in (200, 201):
         raise RuntimeError(f"PUT export {name} failed: {code} {body}")
