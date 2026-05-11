@@ -1145,6 +1145,7 @@ impl ExportRouter {
                 flush_shutdown_rx,
                 flush_metrics,
                 flush_sem,
+                flush_threshold,
             )
             .await;
             info!("Flush scheduler for export '{}' stopped", export_name);
@@ -1757,6 +1758,12 @@ impl ExportRouter {
     }
 
     /// Remove a kernel block device for an export (idempotent).
+    ///
+    /// For ublk this is a *two-phase* operation so the global
+    /// `UblkServer` mutex is held only for the cheap map-removal step
+    /// — the slow `kill_dev` ioctl + worker drain runs outside any
+    /// lock, letting concurrent DELETEs proceed in parallel instead of
+    /// queuing one-by-one behind the mutex.
     #[cfg(target_os = "linux")]
     async fn remove_device(&self, name: &str, transport: &str) -> Result<(), RouterError> {
         match transport {
@@ -1768,10 +1775,22 @@ impl ExportRouter {
             }
             #[cfg(feature = "ublk")]
             "ublk" => {
-                let mut ublk = self.ublk_server.lock().await;
-                ublk.remove_device(name)
-                    .await
-                    .map_err(|e| RouterError::Io(std::io::Error::other(e)))
+                // Phase 1: take the device under the lock (microseconds).
+                let device = {
+                    let mut ublk = self.ublk_server.lock().await;
+                    ublk.take_device(name)
+                };
+                // Phase 2: kill_dev outside the lock (seconds). Other
+                // concurrent DELETEs reach this point in parallel and
+                // each waits on its own device's STOP_DEV drain rather
+                // than serializing on the UblkServer mutex.
+                if let Some(device) = device {
+                    crate::block::ublk::unregister_device(name, device)
+                        .await
+                        .map_err(|e| RouterError::Io(std::io::Error::other(e)))
+                } else {
+                    Ok(())
+                }
             }
             _ => Ok(()),
         }
@@ -1858,6 +1877,16 @@ impl ExportRouter {
         let mut ublk = self.ublk_server.lock().await;
         ublk.recover_quiesced_devices(|name| handlers.get(name).cloned())
             .await
+    }
+
+    /// Snapshot ublk worker pool capacity and utilization. Forwarded
+    /// from `UblkServer::worker_capacity_snapshot`. Returns one tuple per
+    /// worker: `(worker_idx, used_slots, capacity_slots, hosted_queues)`.
+    /// Cheap (relaxed atomic loads); briefly holds the `ublk_server`
+    /// mutex but does not block the worker threads.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub async fn ublk_worker_capacity(&self) -> Vec<(usize, usize, usize, usize)> {
+        self.ublk_server.lock().await.worker_capacity_snapshot()
     }
 
     /// Check if a transport is available on this build/platform.
@@ -2383,9 +2412,46 @@ impl ExportRouter {
         // 1. Signal flush scheduler to stop
         let _ = flush_shutdown_tx.send(true);
 
-        // 2. Wait for flush scheduler to exit (releases its Arc clone)
-        if let Err(e) = flush_handle.await {
-            warn!("Flush scheduler for '{}' panicked: {}", name, e);
+        // 2. Wait for the flush scheduler to exit (releases its Arc clone).
+        //
+        // The scheduler only checks `shutdown` between iterations of its
+        // outer `select!`; once it has committed to a `flush_and_sync`
+        // cycle, it runs that cycle to completion. That latency is bounded
+        // by the in-flight S3 work (single-pack PUT or multipart upload —
+        // typically seconds, occasionally tens of seconds for large packs).
+        //
+        // For **purge** teardown we abort instead of waiting. The flush is
+        // structurally cancellation-safe at the on-disk layer (init.rs
+        // recovery converts orphaned SYNCING blocks back to DIRTY whether
+        // or not a `.flushing` file is present), and the *in-memory*
+        // state inconsistency that would otherwise be observed by the
+        // drain loop below is moot here: purge skips the drain and then
+        // deletes the cache + WAL + `.flushing` file in the same
+        // teardown, so no observer ever sees the partial state. Aborting
+        // turns "wait minutes on the current S3 PUT" into an immediate
+        // task drop — the correct behavior when the user is throwing
+        // away the data.
+        //
+        // For **non-purge** teardown (and SIGTERM, which routes through
+        // `router.shutdown()` with `skip_drain=false`) we must wait. The
+        // drain loop below calls `flush_to_s3`, which internally checks
+        // for an existing `.flushing` file and returns
+        // `FlushStats::default()` ("no dirty blocks") if one is present —
+        // meaning if we aborted mid-rotation we'd silently lose the
+        // SYNCING blocks' data instead of flushing them. Waiting for the
+        // scheduler's current cycle to finish ensures the `.flushing`
+        // file is cleaned up before drain runs.
+        if skip_drain {
+            flush_handle.abort();
+        }
+        match flush_handle.await {
+            Ok(()) => {}
+            Err(e) if e.is_cancelled() => {
+                debug!("Flush scheduler for '{}' aborted (purge)", name);
+            }
+            Err(e) => {
+                warn!("Flush scheduler for '{}' panicked: {}", name, e);
+            }
         }
 
         let remaining = if skip_drain {

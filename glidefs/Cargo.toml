@@ -130,6 +130,11 @@ required-features = ["test-utils"]
 name = "alloc_pattern"
 harness = false
 
+[[bench]]
+name = "gc"
+harness = false
+required-features = ["test-utils"]
+
 [[bin]]
 name = "dedup_measure"
 path = "src/bin/dedup_measure.rs"
@@ -137,6 +142,11 @@ path = "src/bin/dedup_measure.rs"
 [[bin]]
 name = "pack_size_measure"
 path = "src/bin/pack_size_measure.rs"
+
+[[bin]]
+name = "ublk_cleanup"
+path = "src/bin/ublk_cleanup.rs"
+required-features = ["ublk"]
 
 [[test]]
 name = "integration"

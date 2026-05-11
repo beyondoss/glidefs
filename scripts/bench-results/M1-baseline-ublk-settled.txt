@@ -1,0 +1,38 @@
+transport=ublk kernel=6.12.74+deb13+1-amd64 cpus=16
+daemon: pid=30001 threads 1086 → 1108, RSS 922744kB → 1683560kB, VSZ 24044044kB → 24965512kB
+
+=== single_depth_curve_randread ===
+    randread bs=4k d=  1 j= 1 | iops=     93k  bw=   380MB/s  lat_mean=    8.8us  p99=   11.6us
+    randread bs=4k d=  4 j= 1 | iops=    263k  bw=  1075MB/s  lat_mean=   13.6us  p99=   17.8us
+    randread bs=4k d= 16 j= 1 | iops=    334k  bw=  1368MB/s  lat_mean=   46.3us  p99=   63.2us
+    randread bs=4k d= 64 j= 1 | iops=    355k  bw=  1455MB/s  lat_mean=  178.6us  p99=  272.4us
+    randread bs=4k d=128 j= 1 | iops=    316k  bw=  1296MB/s  lat_mean=  402.4us  p99= 1384.4us
+
+=== single_depth_curve_randwrite ===
+   randwrite bs=4k d=  1 j= 1 | iops=     93k  bw=   379MB/s  lat_mean=    8.7us  p99=   11.5us
+   randwrite bs=4k d=  4 j= 1 | iops=    249k  bw=  1022MB/s  lat_mean=   14.3us  p99=   17.8us
+   randwrite bs=4k d= 16 j= 1 | iops=    353k  bw=  1446MB/s  lat_mean=   43.7us  p99=   62.7us
+   randwrite bs=4k d= 64 j= 1 | iops=    374k  bw=  1533MB/s  lat_mean=  169.3us  p99=  272.4us
+   randwrite bs=4k d=128 j= 1 | iops=    334k  bw=  1368MB/s  lat_mean=  380.9us  p99=  978.9us
+
+=== single_multijob_randwrite_d32 ===
+   randwrite bs=4k d= 32 j= 1 | iops=    361k  bw=  1480MB/s  lat_mean=   86.8us  p99=  136.2us
+   randwrite bs=4k d= 32 j= 2 | iops=    427k  bw=  1747MB/s  lat_mean=  148.3us  p99=  218.1us
+   randwrite bs=4k d= 32 j= 4 | iops=    298k  bw=  1219MB/s  lat_mean=  427.4us  p99= 2277.4us
+   randwrite bs=4k d= 32 j= 8 | iops=    275k  bw=  1125MB/s  lat_mean=  929.2us  p99= 8585.2us
+
+=== single_fua_randwrite ===
+   randwrite bs=4k d=  1 j= 1 | iops=      2k  bw=    10MB/s  lat_mean=   17.3us  p99=   34.6us
+   randwrite bs=4k d= 16 j= 1 | iops=      7k  bw=    28MB/s  lat_mean= 1007.2us  p99=11075.6us
+   randwrite bs=4k d= 64 j= 1 | iops=     19k  bw=    77MB/s  lat_mean= 1387.4us  p99=11730.9us
+
+=== parallel_randwrite_d32_x8 ===
+  aggregate iops=   1.93M  bw=  7908MB/s  lat_mean_avg=  130.2us
+     /dev/ublkb1524: iops=    243k lat_mean=  129.4us
+     /dev/ublkb1527: iops=    239k lat_mean=  131.3us
+     /dev/ublkb1563: iops=    241k lat_mean=  130.4us
+     /dev/ublkb1612: iops=    241k lat_mean=  130.3us
+     /dev/ublkb1630: iops=    242k lat_mean=  129.8us
+     /dev/ublkb1667: iops=    242k lat_mean=  129.6us
+     /dev/ublkb1671: iops=    240k lat_mean=  130.9us
+     /dev/ublkb1688: iops=    242k lat_mean=  130.0us

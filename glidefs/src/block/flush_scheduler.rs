@@ -166,6 +166,7 @@ pub async fn flush_scheduler(
     mut shutdown: watch::Receiver<bool>,
     metrics: Arc<ExportMetrics>,
     flush_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    flush_threshold: usize,
 ) {
     info!("flush scheduler started");
 
@@ -209,9 +210,27 @@ pub async fn flush_scheduler(
     }
 
     // If WAL recovery left dirty blocks, activate the timer immediately so
-    // they get checkpointed and eventually flushed to S3.
+    // they get checkpointed AND fire `flush_notify` so the event-driven
+    // branch actually attempts an S3 flush.
+    //
+    // Without the `notify_one()`: the checkpoint-timer branch only retries
+    // S3 when `flush_backoff > 0 && last_flush_failure.is_some()` (the
+    // `should_retry` gate at the timer branch). Both are local state,
+    // reset to zero/None at scheduler startup. So a freshly-spawned
+    // scheduler with recovered-dirty blocks would do local checkpoints
+    // every 5s forever without ever uploading to S3, until a *new*
+    // pwrite happened to cross the flush_threshold. That stuck state
+    // (observed 2026-05-11: 7 exports with 7 GB of dirty data accruing
+    // for hours post-restart) is the bug this branch fixes.
     if cache.dirty_block_count() > 0 {
         activate_checkpoint!(checkpoint_timer, checkpoint_active);
+        // Only fire flush_notify when this export auto-flushes. Manual mode
+        // (`flush_threshold == 0`) means the operator drives drains explicitly
+        // and would be surprised by a startup auto-flush — see the regression
+        // test `test_manual_mode_export_no_auto_flush`.
+        if flush_threshold > 0 {
+            flush_notify.notify_one();
+        }
     }
 
     loop {
@@ -750,6 +769,7 @@ mod tests {
                 shutdown_rx,
                 metrics,
                 None,
+                0, // flush_threshold (manual-mode-equivalent for tests that fire their own notify)
             )
             .await;
         });
@@ -805,6 +825,7 @@ mod tests {
                 shutdown_rx,
                 metrics,
                 None,
+                0, // flush_threshold (manual-mode-equivalent for tests that fire their own notify)
             )
             .await;
         });
@@ -828,6 +849,153 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Regression test: scheduler must flush blocks left dirty by WAL recovery,
+    /// even when no `flush_notify` event comes from outside.
+    ///
+    /// Production scenario (2026-05-11 incident): daemon restarts with 7 exports
+    /// holding ~7GB of dirty data recovered from disk. VMs were idle, so no
+    /// pwrite ever crossed the flush_threshold to fire `flush_notify`. The
+    /// checkpoint-timer branch's `should_retry` gate requires
+    /// `flush_backoff > 0 && last_flush_failure.is_some()` — both reset to
+    /// zero/None at scheduler startup, so the timer only did local checkpoints,
+    /// never S3 uploads. Result: dirty blocks pinned to disk forever.
+    ///
+    /// Fix: scheduler fires `flush_notify.notify_one()` at startup if
+    /// `dirty_block_count() > 0`.
+    #[tokio::test]
+    async fn test_recovery_dirty_blocks_flushed_without_external_notify() {
+        let (
+            cache,
+            content_store,
+            pack_index_cache,
+            volume_manifest,
+            flush_notify,
+            shutdown_rx,
+            shutdown_tx,
+            metrics,
+            clean_cache,
+            _temp,
+        ) = test_scheduler_components().await;
+
+        let cache_check = Arc::clone(&cache);
+
+        // Simulate WAL recovery: pre-populate the cache with dirty blocks
+        // BEFORE spawning the scheduler. No external party will call
+        // flush_notify.notify_one() — the scheduler must self-trigger.
+        for i in 0..DEFAULT_FLUSH_THRESHOLD {
+            let offset = i as u64 * 128 * 1024;
+            cache
+                .write(offset, &[0xCC; 128 * 1024])
+                .unwrap();
+        }
+        assert_eq!(
+            cache_check.dirty_block_count(),
+            DEFAULT_FLUSH_THRESHOLD as u64,
+            "precondition: cache should have dirty blocks from simulated recovery"
+        );
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache,
+                content_store,
+                pack_index_cache,
+                volume_manifest,
+                clean_cache,
+                flush_notify,
+                shutdown_rx,
+                metrics,
+                None,
+                DEFAULT_FLUSH_THRESHOLD, // auto-flush mode — startup must self-trigger
+            )
+            .await;
+        });
+
+        // Wait up to 5s for the scheduler to self-trigger and drain.
+        // Pre-fix this loop times out; post-fix it drains in <1s.
+        let drained = {
+            let mut drained = false;
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if cache_check.dirty_block_count() == 0 {
+                    drained = true;
+                    break;
+                }
+            }
+            drained
+        };
+
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert!(
+            drained,
+            "scheduler must flush recovery-dirty blocks without an external \
+             flush_notify; remaining dirty_block_count = {}",
+            cache_check.dirty_block_count()
+        );
+    }
+
+    /// Companion to the above: in manual mode (`flush_threshold == 0`), the
+    /// scheduler must NOT auto-flush recovery-dirty blocks at startup. The
+    /// operator drives drains explicitly via `drain_export`.
+    #[tokio::test]
+    async fn test_manual_mode_recovery_does_not_auto_flush() {
+        let (
+            cache,
+            content_store,
+            pack_index_cache,
+            volume_manifest,
+            flush_notify,
+            shutdown_rx,
+            shutdown_tx,
+            metrics,
+            clean_cache,
+            _temp,
+        ) = test_scheduler_components().await;
+
+        let cache_check = Arc::clone(&cache);
+
+        // Pre-populate dirty blocks just like the auto-flush regression test.
+        for i in 0..DEFAULT_FLUSH_THRESHOLD {
+            let offset = i as u64 * 128 * 1024;
+            cache
+                .write(offset, &[0xDD; 128 * 1024])
+                .unwrap();
+        }
+        let expected_dirty = DEFAULT_FLUSH_THRESHOLD as u64;
+        assert_eq!(cache_check.dirty_block_count(), expected_dirty);
+
+        let handle = tokio::spawn(async move {
+            flush_scheduler(
+                cache,
+                content_store,
+                pack_index_cache,
+                volume_manifest,
+                clean_cache,
+                flush_notify,
+                shutdown_rx,
+                metrics,
+                None,
+                0, // manual mode — scheduler must NOT auto-fire flush_notify
+            )
+            .await;
+        });
+
+        // Generous wait: if the scheduler were going to leak an auto-flush, it
+        // would have happened well before this.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let remaining = cache_check.dirty_block_count();
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert_eq!(
+            remaining, expected_dirty,
+            "manual-mode scheduler must not flush recovery-dirty blocks; \
+             expected {expected_dirty} to remain, found {remaining}"
+        );
     }
 
     /// Test that the scheduler backs off exponentially when flush fails.
@@ -871,6 +1039,7 @@ mod tests {
                 shutdown_rx,
                 metrics,
                 None,
+                0, // flush_threshold (manual-mode-equivalent for tests that fire their own notify)
             )
             .await;
         });
@@ -959,6 +1128,7 @@ mod tests {
                 shutdown_rx,
                 metrics,
                 None,
+                0, // flush_threshold (manual-mode-equivalent for tests that fire their own notify)
             )
             .await;
         });
@@ -1043,6 +1213,7 @@ mod tests {
                 shutdown_rx,
                 metrics,
                 None,
+                0, // flush_threshold (manual-mode-equivalent for tests that fire their own notify)
             )
             .await;
         });
@@ -1115,6 +1286,7 @@ mod tests {
                 shutdown_rx,
                 metrics,
                 None,
+                0, // flush_threshold (manual-mode-equivalent for tests that fire their own notify)
             )
             .await;
         });
@@ -1205,6 +1377,7 @@ mod tests {
                 shutdown_rx,
                 metrics,
                 Some(sem),
+                0, // flush_threshold (manual-mode-equivalent for tests that fire their own notify)
             )
             .await;
         });

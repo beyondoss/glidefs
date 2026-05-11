@@ -105,7 +105,7 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             max_s3_uploads: nbd_config.max_s3_uploads(),
             max_s3_downloads: nbd_config.max_s3_downloads(),
             default_flush_threshold: nbd_config.flush_threshold(),
-            ublk_nr_queues: nbd_config.ublk_nr_queues(),
+            ublk_nr_queues: settings.ublk_nr_queues(),
             nbd_dead_conn_timeout: nbd_config.nbd_dead_conn_timeout(),
         })
         .await
@@ -227,20 +227,46 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 
     // Register kernel block devices for exports that don't already have one.
     // Recovered ublk devices are already registered, so they'll be skipped.
+    // Parallel so 1000-device cold-start doesn't serialize behind ublk control
+    // ioctls — each registration is independent.
     #[cfg(target_os = "linux")]
     {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        const REGISTER_CONCURRENCY: usize = 16;
+
+        let mut to_register = Vec::new();
         for export in router.list_exports().await {
             if router.get_device_path(&export.name).await.is_some() {
-                continue; // already has a device (recovered or previously registered)
+                continue;
             }
-            if let Err(e) = router
-                .register_device(&export.name, &export.transport)
-                .await
-            {
-                warn!(
-                    "Failed to register device for '{}': {}",
-                    export.name, e
-                );
+            to_register.push((export.name, export.transport));
+        }
+
+        let router_clone = Arc::clone(&router);
+        let register_one = move |name: String, transport: String| {
+            let router = Arc::clone(&router_clone);
+            Box::pin(async move {
+                let res = router.register_device(&name, &transport).await;
+                (name, res)
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = (String, Result<(), _>)> + Send>,
+                >
+        };
+
+        let mut pending = FuturesUnordered::new();
+        let mut iter = to_register.into_iter();
+        for _ in 0..REGISTER_CONCURRENCY {
+            if let Some((name, transport)) = iter.next() {
+                pending.push(register_one(name, transport));
+            }
+        }
+        while let Some((name, res)) = pending.next().await {
+            if let Err(e) = res {
+                warn!("Failed to register device for '{}': {}", name, e);
+            }
+            if let Some((next_name, next_transport)) = iter.next() {
+                pending.push(register_one(next_name, next_transport));
             }
         }
     }
@@ -348,17 +374,28 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             device_info,
         );
     }
-    info!("Send SIGUSR1 to drain all exports to S3 (for node maintenance)");
+    info!("Send SIGUSR1 to drain all exports to S3 (without exiting)");
+    info!("Send SIGTERM to drain + exit (kernel ublk devices stay QUIESCED for next daemon)");
 
-    // Set up signal handlers
+    // Set up signal handlers.
+    //
+    // **M6.2 (post-incident fix)**: SIGTERM now always drains to S3
+    // before exiting — the previous "SIGUSR1 required for clean
+    // drain, SIGTERM alone = destructive teardown" pattern was the
+    // root cause of the M0/M1 deploy deadlock (`systemctl restart`
+    // delivers SIGTERM directly, the daemon's destructive path called
+    // `kill_dev` while VMs were writing, kernel deadlocked).
+    //
+    // SIGUSR1 still exists as a "drain-without-exit" signal for
+    // operator-driven flushes during node maintenance.
+    //
+    // Both signals are now safe-by-default: even if a destructive
+    // path slipped through, the M6.1 ublk shutdown no longer calls
+    // `kill_dev` on the hot path — the kernel auto-quiesces via
+    // `UBLK_F_USER_RECOVERY` and the next daemon recovers.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigusr1 =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
-
-    // Track whether SIGUSR1 was received before shutdown.
-    // SIGUSR1 → SIGTERM = hot reload (keep NBD devices alive for NBD_CMD_RECONFIGURE).
-    // SIGTERM alone = full shutdown (disconnect all devices).
-    let mut hot_reload = false;
 
     loop {
         tokio::select! {
@@ -367,19 +404,14 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
                 break;
             }
             _ = sigterm.recv() => {
-                if hot_reload {
-                    info!("Received SIGTERM after SIGUSR1, hot reload shutdown (NBD devices stay alive)...");
-                } else {
-                    info!("Received SIGTERM, initiating full shutdown...");
-                }
+                info!("Received SIGTERM, initiating graceful shutdown...");
                 break;
             }
             _ = sigusr1.recv() => {
-                info!("Received SIGUSR1, draining all exports to S3 (preparing for hot reload)...");
-                hot_reload = true;
+                info!("Received SIGUSR1, draining all exports to S3 (no exit)...");
                 let failed = router.drain_all().await;
                 if failed.is_empty() {
-                    info!("Drain complete - all exports synced to S3. Send SIGTERM to restart.");
+                    info!("Drain complete — all exports synced to S3.");
                 } else {
                     tracing::error!(failed = ?failed, "Drain incomplete - {} export(s) failed", failed.len());
                 }
@@ -397,15 +429,11 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             let _ = handle.await;
         }
 
-        // Full shutdown: disconnect kernel devices.
-        // Hot reload: leave NBD devices alive for NBD_CMD_RECONFIGURE.
-        if !hot_reload {
-            info!("Disconnecting kernel devices...");
-            if let Err(e) = router.shutdown_devices().await {
-                warn!("device shutdown failed: {}", e);
-            }
-        }
-
+        // M6.1: do NOT call `router.shutdown_devices()` (kill_dev on
+        // every device). The ublk path leaves devices QUIESCED for
+        // the next daemon to recover; NBD's `dead_conn_timeout`
+        // covers its hot-reload case. `router.shutdown` below drains
+        // dirty write_caches to S3 cleanly.
         info!("Final drain before shutdown...");
         router.shutdown().await
     })

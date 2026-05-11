@@ -14,12 +14,12 @@ pub mod io;
 pub mod sys;
 pub mod uring_async;
 
-// Re-export important types for unified buffer management
-#[allow(deprecated)]
-pub use io::{
-    ublk_init_task_ring, with_queue_ring, with_queue_ring_mut, with_task_io_ring,
-    with_task_io_ring_mut, BufDesc, BufDescList,
-};
+// Re-export important types for unified buffer management.
+//
+// The old thread-local-backed APIs (`ublk_init_task_ring`, `with_queue_ring`,
+// `with_task_io_ring`, etc.) are gone — the worker pool needs many queues
+// per thread, so each `UblkQueue` carries its own `WorkerRing` reference.
+pub use io::{BufDesc, BufDescList, WorkerRing};
 
 // Re-export control ring initialization and access
 pub use ctrl::{ublk_init_ctrl_task_ring, with_ctrl_ring, with_ctrl_ring_mut};

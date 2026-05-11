@@ -2094,6 +2094,30 @@ impl UblkCtrlInner {
 }
 
 impl UblkCtrl {
+    /// Suppress the destructive `Drop` path of this control handle.
+    ///
+    /// Normally a `UblkCtrl` built with `UBLK_DEV_F_ADD_DEV` calls
+    /// `del()` (which uses the **thread-local** CTRL_URING) when
+    /// dropped, removing the kernel device. That makes the handle
+    /// effectively `!Send` for cleanup purposes — moving it to a
+    /// thread without an initialized CTRL_URING and dropping there
+    /// will panic.
+    ///
+    /// Call this after the device is started and the kernel-side
+    /// state has been handed off to long-lived owners (UblkDev held
+    /// by worker queues). The caller takes responsibility for
+    /// eventual cleanup via an explicit `kill_dev()` on a fresh
+    /// `UblkCtrl::new_simple(dev_id)`.
+    ///
+    /// Used by glidefs's worker-pool transport: control-plane
+    /// operations happen inside `spawn_blocking` (which can be on any
+    /// blocking-pool thread), and the original ctrl needs to be
+    /// disposable from anywhere.
+    pub fn disarm_drop(&self) {
+        let mut inner = self.get_inner_mut();
+        inner.dev_flags.remove(UblkFlags::UBLK_DEV_F_ADD_DEV);
+    }
+
     fn get_inner(&self) -> std::sync::RwLockReadGuard<'_, UblkCtrlInner> {
         self.inner.read().unwrap_or_else(|poisoned| {
             eprintln!("Warning: RwLock poisoned, recovering");
@@ -2568,7 +2592,7 @@ impl UblkCtrl {
         q_fn: Q,
     ) -> Vec<std::thread::JoinHandle<()>>
     where
-        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+        Q: FnOnce(u16, Arc<UblkDev>) + Send + Sync + Clone + 'static,
     {
         use std::sync::mpsc;
 
@@ -2588,7 +2612,7 @@ impl UblkCtrl {
                     eprintln!("Warning: Failed to send queue thread info: {}", e);
                     return;
                 }
-                _q_fn(q, &_dev);
+                _q_fn(q, _dev);
             }));
         }
 
@@ -2631,7 +2655,7 @@ impl UblkCtrl {
     pub fn run_target<T, Q, W>(&self, tgt_fn: T, q_fn: Q, device_fn: W) -> Result<i32, UblkError>
     where
         T: FnOnce(&mut UblkDev) -> Result<(), UblkError>,
-        Q: FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static,
+        Q: FnOnce(u16, Arc<UblkDev>) + Send + Sync + Clone + 'static,
         W: FnOnce(&UblkCtrl) + Send + Sync + 'static,
     {
         let dev = &Arc::new(UblkDev::new(self.get_name(), tgt_fn, self)?);

@@ -844,6 +844,49 @@ where
                 let _ = writeln!(output, "# TYPE glidefs_ssd_utilization_ratio gauge");
                 let _ = writeln!(output, "glidefs_ssd_utilization_ratio {utilization:.6}");
             }
+            // ublk worker pool capacity — per-worker slot occupancy and
+            // hosted queue counts. Lets ops see hot-spotting (one worker
+            // approaching capacity while others idle) before an AddQueue
+            // returns AtCapacity to a user-facing API call. Cheap (a few
+            // relaxed atomic loads per worker, no message roundtrip).
+            #[cfg(all(target_os = "linux", feature = "ublk"))]
+            {
+                use std::fmt::Write;
+                let snap = router.ublk_worker_capacity().await;
+                let _ = writeln!(
+                    output,
+                    "# HELP glidefs_ublk_worker_slots_used Currently-occupied executor task slots per ublk worker"
+                );
+                let _ = writeln!(output, "# TYPE glidefs_ublk_worker_slots_used gauge");
+                for (idx, used, _cap, _hq) in &snap {
+                    let _ = writeln!(
+                        output,
+                        "glidefs_ublk_worker_slots_used{{worker=\"{idx}\"}} {used}"
+                    );
+                }
+                let _ = writeln!(
+                    output,
+                    "# HELP glidefs_ublk_worker_slots_capacity Maximum executor task slots per ublk worker"
+                );
+                let _ = writeln!(output, "# TYPE glidefs_ublk_worker_slots_capacity gauge");
+                for (idx, _used, cap, _hq) in &snap {
+                    let _ = writeln!(
+                        output,
+                        "glidefs_ublk_worker_slots_capacity{{worker=\"{idx}\"}} {cap}"
+                    );
+                }
+                let _ = writeln!(
+                    output,
+                    "# HELP glidefs_ublk_worker_hosted_queues Number of ublk queues hosted on each worker"
+                );
+                let _ = writeln!(output, "# TYPE glidefs_ublk_worker_hosted_queues gauge");
+                for (idx, _used, _cap, hq) in &snap {
+                    let _ = writeln!(
+                        output,
+                        "glidefs_ublk_worker_hosted_queues{{worker=\"{idx}\"}} {hq}"
+                    );
+                }
+            }
             Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

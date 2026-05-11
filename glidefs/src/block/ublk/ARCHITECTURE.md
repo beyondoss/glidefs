@@ -2,6 +2,8 @@
 
 Takes I/O commands from the Linux ublk kernel driver over io_uring, dispatches them to a `BlockHandler`, and commits results back to the kernel — exposing a `/dev/ublkbN` block device for each named export.
 
+The userspace side is a fixed-size **worker pool**: queues from thousands of devices are multiplexed across `K = min(num_cpus, 32)` worker threads, each owning one io_uring and one async executor. There is no per-device thread.
+
 ## Data Flow
 
 ```
@@ -10,274 +12,292 @@ Takes I/O commands from the Linux ublk kernel driver over io_uring, dispatches t
                         │                                         │
                         │  /dev/ublkbN ──► io_uring SQE (cmd) ──► │
                         │               ◄── io_uring CQE (result)─│
-                        └────────────────────────┬────────────────┘
-                                                 │ ublk cdev fd (fd[0])
-                                    ┌────────────▼────────────┐
-                                    │   queue_io_loop (thread)│
-                                    │   ───────────────────   │
-                                    │   QueueExecutor::tick() │
-                                    │    ├─ io_task(tag0)     │
-                                    │    ├─ io_task(tag1)     │
-                                    │    └─ io_task(tagN)     │
-                                    │   [QUEUE_DEPTH = 128]   │
-                                    └────────────┬────────────┘
-                                                 │ async dispatch
-                                    ┌────────────▼────────────┐
-                                    │     BlockHandler        │
-                                    │ (WriteCache/S3/local    │
-                                    │  SSD read/write/flush)  │
-                                    └─────────────────────────┘
-
-Wakeup path (cross-thread):
-  tokio worker ──► TaskWaker::wake()
-               ──► WakeupBits::set(idx)    [fetch_or on AtomicU64]
-               ──► write(efd, 1)           [eventfd signal]
-               ──► io_uring PollAdd CQE    [unblocks io_uring_enter]
-               ──► QueueExecutor::tick()   [polls all set bits]
+                        └─────────────────────────┬───────────────┘
+                                                  │  cdev fd per device
+                                                  │  (registered as fixed file)
+                ┌─────────────────────────────────┴──────────────────────────────┐
+                │                                                                │
+   ┌────────────▼────────────┐                                     ┌─────────────▼─────────┐
+   │     Worker thread 0     │   ...    K − 1 more like this  ...  │   Worker thread K−1   │
+   │  ┌───────────────────┐  │                                     │  ┌─────────────────┐  │
+   │  │ io_uring (shared) │  │                                     │  │   io_uring      │  │
+   │  │  fixed-file table │  │                                     │  │  (independent)  │  │
+   │  │  (sparse, 4096)   │  │                                     │  └─────────────────┘  │
+   │  └───────────────────┘  │                                     │                       │
+   │  ┌───────────────────┐  │                                     │   QueueExecutor       │
+   │  │  QueueExecutor    │  │                                     │   65 536 task slots   │
+   │  │   ├─ io_task(D0,Q1,T0)                                     │   (bitmap-driven)     │
+   │  │   ├─ io_task(D0,Q1,T1)         each task slot belongs      │                       │
+   │  │   ├─ io_task(D1,Q2,T0)         to one (device, queue, tag) │                       │
+   │  │   └─ … hosted queues for many devices                      │                       │
+   │  └───────────────────┘  │                                     │                       │
+   └────────────┬────────────┘                                     └─────────────┬─────────┘
+                │ async dispatch (futures suspend on tokio work)                 │
+                └─────────────────────────┬──────────────────────────────────────┘
+                                          ▼
+                              ┌─────────────────────────┐
+                              │     BlockHandler        │
+                              │ (WriteCache / S3 /      │
+                              │  local-SSD read/write)  │
+                              └─────────────────────────┘
 ```
 
-**Zero-copy path** (when `UBLK_F_SUPPORT_ZERO_COPY` is available):
+Cross-thread wakeup (per worker):
 
 ```
-Kernel bio pages ──► auto-registered fixed-buf ──► handler reads/writes directly
-                     (no userspace bounce buffer)
+tokio runtime ──► TaskWaker::wake()
+              ──► WakeupBits::set(idx)    [fetch_or on AtomicU64]
+              ──► write(efd, 1)           [worker's eventfd]
+              ──► io_uring PollAdd CQE    [unblocks io_uring_enter on the worker]
+              ──► QueueExecutor::tick()   [polls all set bits]
 ```
 
-**Error paths:**
+Error paths:
 
 ```
-Queue thread init fail ──► latch.signal_failed() ──► on_started kills device ──► register() returns Err
-I/O dispatch error     ──► negative errno to kernel ──► caller sees EIO/EINVAL/etc.
-Device crash           ──► QUIESCED state ──► recover_quiesced_devices() reattaches
+AddQueue fails        ──► ready oneshot returns Err ──► add_device returns Err
+I/O dispatch error    ──► negative errno to kernel ──► caller sees EIO/EINVAL/etc.
+Daemon crash          ──► kernel transitions devices to QUIESCED
+                       ──► next daemon recover_quiesced_devices() reattaches
+Worker pool drop      ──► all io_uring fds close ──► kernel quiesces all attached devices
 ```
 
 ## Concepts & Terminology
 
 | Term | What It Controls | NOT |
-|------|-----------------|-----|
-| `UblkServer` | Lifecycle of all devices (add, recover, shutdown); persists export→ID mapping | Does not handle I/O — only device management |
-| `UblkDevice` | One device's worker thread + join handle | Not a queue — just the outer lifecycle |
-| `QueueExecutor` | Single-threaded async executor for one io_uring queue; polls futures when woken | Not tokio — fully custom, no thread pool |
-| `WakeupBits` | 192-bit atomic bitmask tracking which tasks have pending wakeups | Not a queue — duplicates collapse (OR is idempotent) |
-| `QueueLatch` | Barrier to wait for all queue threads to signal ready or failed before device is live | Not a shutdown barrier |
-| `KernelFeatures` | Probed once at startup: which ublk kernel features are available | Not per-device — shared across all devices |
-| `QUEUE_DEPTH` | 128 — max inflight I/Os per queue, also number of per-tag tasks | Not configurable at runtime |
-| `IO_BUF_BYTES` | 512 KB — per-tag bounce buffer size for non-zero-copy path | Not the block size |
-| `DeviceMode` | Whether to create a fresh device (`Add`) or reattach to a QUIESCED device (`Recover`) | |
-| daemon task | eventfd watcher task in QueueExecutor; does not gate shutdown | Not an I/O task — purely internal signaling |
+|------|------------------|-----|
+| `UblkServer` | Lifecycle of all devices (add, recover, remove); owns the `WorkerPool`; persists export→ID mapping | Does not handle I/O — only control plane |
+| `WorkerPool` | A fixed set of `K` worker threads; routes per-queue messages to a worker | Not a thread-per-device pool — worker count is decoupled from device count |
+| `Worker` | One OS thread, one io_uring, one `QueueExecutor`, one `EventFd`; hosts many queues from many devices | Not pinned to a device — it serves any queue routed to it |
+| `WorkerRing` | `Rc<RefCell<IoUring<…>>>` shared inside one worker; sparse fixed-file table holds all hosted cdev fds | Not `Send` — pinned to its worker thread |
+| `UblkDevice` | A data record of `{dev_id, dev_path, hosted_queues}`; lives in `UblkServer` | Not a thread — has none |
+| `HostedQueue` | A single ublk queue (one `(dev, qid)`) installed inside a worker; owns its task-slot range | Not aware of other queues on the same worker |
+| `QueueExecutor` | Single-threaded async executor inside a worker; polls futures when their bit is set | Not tokio — fully custom, no work stealing |
+| `WakeupBits` | Runtime-sized atomic bitmask (`Box<[AtomicU64]>`); one bit per task slot | Not a queue — duplicates collapse (OR is idempotent) |
+| `TaskWaker` | A worker-scoped waker carrying `(bits, idx, eventfd)`; wakes a single task slot | Not device-scoped — `idx` is global within the worker |
+| `KernelFeatures` | Probed once at `UblkServer::new`: which ublk kernel features are available | Not per-device |
+| `QUEUE_DEPTH` | 64 — max inflight I/Os per queue; also number of per-tag tasks | Not configurable at runtime |
+| `IO_BUF_BYTES` | 512 KB — per-tag bounce buffer | Not the block size |
+| `DeviceMode` | Whether to `Add` a fresh device or `Recover` an already-QUIESCED one | |
 
 ## Core Mechanism
 
-### Queue Executor
+### Worker pool
 
-Each queue runs on a dedicated OS thread. The thread owns:
+`K = min(num_cpus, 32)` worker threads are spawned at `UblkServer` construction, **partitioned across NUMA nodes**. Each worker:
 
-1. An `io_uring` ring (`SQPOLL` disabled; `SINGLE_ISSUER` for kernel-side optimization)
-2. A `QueueExecutor` with `QUEUE_DEPTH + overhead` task slots
-3. One `EventFd` used as a cross-thread wakeup signal
+1. Builds its own `io_uring` ring (`SINGLE_ISSUER`, sparse fixed-file table of `MAX_FIXED_FILES = 4096` slots).
+2. Builds a `QueueExecutor` with a runtime-sized `WakeupBits` (`WORKER_WAKEUP_WORDS = 1024` → 65 536 task slots).
+3. Owns one `EventFd` registered with the ring via `PollAdd`.
+4. Is pinned to a CPU within its owning NUMA node via `sched_setaffinity`.
+5. Sits in an event loop: drain the `mpsc::Receiver<WorkerMsg>` between executor ticks, then `io_uring_enter` until the next CQE or eventfd wake.
 
-The executor is not tokio. It is a minimal custom async executor:
+### NUMA partitioning
+
+`SysfsTopology` probes `/sys/devices/system/node/online` + each node's `cpulist` once at startup. The pool divides workers as `per_node = max(1, K / num_nodes)` and spawns each node's slice pinned to that node's CPUs. On a single-socket host (the common dev case) this collapses to one node holding all workers — behavior identical to the pre-NUMA pool. On 2-socket AWS bare metal (i3.metal, i4i.metal, m6id.metal, etc.) each socket gets its own slice, and every worker's `io_uring` lives on the same socket as its CPU.
+
+`UblkServer` resolves `cache_dir`'s backing NVMe NUMA node once via `numa::numa_node_for_path` (stat → `st_dev` → walk `/sys/dev/block/<major>:<minor>` for `device/numa_node`) and passes it as `preferred_node` on every `add_device` / `recover`. The pool's `worker_for(name, qid, preferred_node)`:
+
+- If `preferred_node = Some(n)` and the topology knows node `n`: hash within that node's worker slice. Every io_uring submission stays socket-local to the NVMe.
+- If `preferred_node = None` (single-node host, `numa_node = -1`, ZFS pool across sockets): hash across all workers globally — matches pre-NUMA behavior.
 
 ```
+worker_idx = (FNV1a(export_name) ^ qid_seed(qid)) mod  workers_in_preferred_node
+                                              (or)    total_workers
+```
+
+The `qid_seed` ensures a device's `nr_queues` queues land on distinct workers (so per-device parallelism is preserved) within whichever bucket is being indexed.
+
+### Adding a queue (control plane → worker)
+
+`UblkServer::add_device` does the entire control-plane sequence on one `spawn_blocking` thread (control-plane uring is thread-local), then for each `qid in 0..nr_queues`:
+
+1. Allocate a contiguous task-slot range of size `QUEUE_DEPTH` in the chosen worker's `QueueExecutor`.
+2. Send `WorkerMsg::AddQueue { dev, qid, handler, slot_base, ready }` over the mpsc channel.
+3. The worker registers the device's cdev fd into the next free slot of its sparse fixed-file table (via `register_files_update`), constructs a `UblkQueue::new(qid, &dev, &worker_ring)`, calls `ctrl.configure_queue`, then spawns `QUEUE_DEPTH` `io_task(q, tag)` futures, each carrying a `TaskWaker { bits, idx: slot_base + tag, efd }`.
+4. The worker replies via the `ready` oneshot. If the executor is at capacity (`SpawnError::AtCapacity`) the worker fails soft — no panic, the error is propagated back to the API caller.
+
+### Per-tag I/O task
+
+Each tag's persistent future loops until shutdown:
+
+```
+submit_io_prep_cmd(tag)        // tell kernel we're ready
 loop {
-    io_uring_enter(URING_IDLE_SECS)   // block until CQE or timeout
-    exe.tick()                         // poll all tasks whose bit is set in WakeupBits
-    if exe.all_done() { break }        // shutdown: all I/O tasks returned
+    get_iod(tag)               // read command descriptor
+    dispatch_io(op, ...)       // async: may suspend on tokio (S3, write cache)
+    submit_io_commit_cmd(tag)  // commit result + fetch next (combined SQE)
 }
 ```
 
-`tick()` drains the bitmask atomically (swap with 0), then polls each set bit's future. No allocation, no VecDeque, no lock.
+`submit_io_commit_cmd` combines result commit and next-command fetch into one kernel round-trip.
 
-### Wakeup Path
+When a future suspends on tokio work, its `TaskWaker` will be invoked from a tokio worker thread; that wake flips a bit in the worker's `WakeupBits` and writes the worker's eventfd, which unblocks the worker's `io_uring_enter`.
 
-When a tokio future (S3 read, write cache flush) completes on a tokio worker thread, it calls `wake()` on a `TaskWaker`. `TaskWaker::wake()`:
+### Wakeup path
 
-1. Sets bit `idx` in `WakeupBits` with `fetch_or` (lock-free, O(1))
-2. Writes `1` to the eventfd
+Single mechanism — every waker always signals the eventfd by construction:
 
-The eventfd is registered with io_uring via `PollAdd`. The write generates a CQE, which unblocks `io_uring_enter()`. This is the _only_ wakeup mechanism — every waker always signals the eventfd by construction. No conditional logic, no missed wakeups.
+1. `TaskWaker::wake()` sets bit `idx` in the worker's `WakeupBits` via `fetch_or` (lock-free, O(1)).
+2. Writes `1` to the worker's eventfd.
 
-Duplicate wakeups (two tokio futures completing before `tick()` runs) safely coalesce: `fetch_or` on the same bit is idempotent, and the eventfd counter just increments — both are drained in one `tick()` pass.
+The eventfd is registered with the worker's io_uring via `PollAdd`. The write produces a CQE, which unblocks `io_uring_enter`. Duplicate wakes safely coalesce: `fetch_or` is idempotent, the eventfd counter just increments, and `tick()` drains everything in one pass via atomic swap-with-zero.
 
-### Per-Tag I/O Task
+### Panic isolation
 
-Each of the 128 tags runs a persistent future (`io_task` or `io_task_zc`) that loops forever until shutdown:
+`QueueExecutor::tick` polls each task inside `catch_unwind`. A panic in one device's task is reported and the task is dropped; co-tenants on the same worker keep running. This is essential at the worker-pool topology: a bug serving one export must not take out every export hosted on that worker.
 
-```
-submit_io_prep_cmd(tag)       // tell kernel we're ready for next command
-loop {
-    get_iod(tag)              // read command descriptor from kernel
-    dispatch_io(op, ...)      // async: may suspend waiting for S3/SSD
-    submit_io_commit_cmd(tag) // commit result + fetch next (combined SQE)
-}
-```
+### Sparse fixed-file table
 
-The `submit_io_commit_cmd` SQE combines result commit and next-command fetch into one kernel round-trip.
+A worker's io_uring registers a sparse fixed-file table of `MAX_FIXED_FILES` slots. Each `UblkQueue` allocates exactly one slot for its cdev fd via `register_files_update`. SQEs use `types::Fixed(cdev_slot)` so the kernel reads/writes the right device. When a queue is removed, its slot is released (via `release_cdev_slot`) and may be reused. This is what lets a single shared ring serve many devices without conflict.
 
-### Zero-Copy Path
+### Device persistence
 
-When `UBLK_F_SUPPORT_ZERO_COPY + UBLK_F_AUTO_BUF_REG` are available:
-
-- Kernel auto-registers bio pages into io_uring fixed-buffer slots
-- `handler.resolve_read()` returns a `ReadPlan` describing data sources per block
-- For each `ReadPlan` entry:
-  - `Zero` → `ptr::write_bytes()` (no copy)
-  - `InMemory` → `ptr::copy_nonoverlapping()` (copy from write cache into kernel bio page)
-  - `LocalSsd` → io_uring Read directly into fixed buf (zero kernel↔userspace copy)
-
-### Three-Phase Write (zero-copy)
-
-To maintain recoverability if a write is interrupted:
-
-```
-pre_write:   mark blocks present, clear CRCs
-             [crash here → blocks neither present nor dirty → safe to retry]
-pwrite:      write data to local SSD via RwLock'd fd (not io_uring fixed fd)
-             [crash here → blocks present but not dirty → recoverable]
-post_write:  mark blocks dirty, append WAL
-```
-
-The `pwrite` uses the `RwLock`-guarded `data_file` rather than the io_uring-registered fd because the active data file may be swapped during flush rotation (old inode renamed, new fd registered). The io_uring fixed fd would stale; the lock always has the current fd.
-
-### Device Persistence
-
-`UblkServer` stores an `export_name → device_id` map to `ublk_devices.json` in `cache_dir`. On restart, the preferred device ID is passed to the kernel so `/dev/ublkb0` stays stable across daemon restarts. Stale IDs in the map are harmless — the kernel auto-assigns a new ID if the preferred one is taken.
+`UblkServer` stores an `export_name → device_id` map to `ublk_devices.json` in `cache_dir`. On restart, the preferred device ID is passed to the kernel so `/dev/ublkbN` stays stable across daemon restarts. Stale IDs in the map are harmless — the kernel auto-assigns a new ID if the preferred one is taken.
 
 ## State Machines
 
-### Device Lifecycle
+### Device add lifecycle
 
 ```
-[add_device called]
+add_device(name, handler)
         │
         ▼
-  spawn worker thread
+spawn_blocking {                       // control-plane uring is thread-local
+        UblkCtrlBuilder.build()        // /dev/ublkbN allocated
+        UblkDev::new(...)              // shared device record (Arc)
+        for qid in 0..nr_queues:
+                send AddQueue → worker_for(name, qid)   // mpsc::blocking_send
+                await ready oneshot                      // recv_blocking
+                if Err(SpawnError::AtCapacity):
+                        abort_device()                   // STOP+DEL, ready oneshots all fail
+                        return Err
+        ctrl.start_dev()
+        ctrl.disarm_drop()             // ownership transferred; don't STOP+DEL on Drop
+}
         │
         ▼
-  run_device(DeviceMode::Add)
-        │ UblkCtrlBuilder.build() → /dev/ublkbN allocated
-        │ per-queue threads spawned
-        │ QueueLatch::wait_all(5s)
-        ├──────── queue thread: latch.signal_failed() ──────────► [device dies, Err returned]
-        │
-        ▼ all queues signaled ready
-  on_started: send (dev_id, path) via oneshot
-        │
-        ▼
-  UblkDevice { dev_id, dev_path, worker }
-  add_device returns PathBuf (/dev/ublkbN)
-        │
-        ▼
-  [serving I/O]
-        │
-  unregister() / shutdown()
-        │ kill_dev() → SIGKILL equivalent to ublk cdev
-        │ queue threads detect shutdown → all_done() → exit loop
-        │ worker thread join with timeout
-        ▼
-  [device removed]
+UblkDevice { dev_id, dev_path, hosted_queues } registered in UblkServer
+add_device returns PathBuf (/dev/ublkbN)
 ```
 
-### Recovery Lifecycle (crash/restart)
+### Recovery lifecycle (crash/restart)
 
 ```
-[server restarts, quiesced devices found]
+[daemon restarts; some ublk devices are in QUIESCED state]
         │
         ▼
-  recover_quiesced_devices(get_handler)
-        │ scan kernel for ublk devices
-        │ filter: name="glidefs" AND state=QUIESCED AND has_handler
+recover_quiesced_devices(get_handler)
+        │ scan /sys/class/ublk-char/ for ublk devices owned by "glidefs"
+        │ probe each in parallel (buffer_unordered(RECOVERY_CONCURRENCY))
+        │ filter: state == QUIESCED && has matching handler
         │
         ▼
-  device::UblkDevice::recover(dev_id, handler, ...)
-        │ run_device(DeviceMode::Recover { dev_id })
-        │ reattach to existing kernel device (no new /dev/ublkbN allocated)
-        │ queue threads resume serving I/O
+for each match (in parallel):
+        spawn_blocking {
+                START_USER_RECOVERY(dev_id)
+                for qid in 0..nr_queues:
+                        send AddQueue → worker_for(name, qid)
+                END_USER_RECOVERY(dev_id)
+        }
+persist_devices()
+returns recovered_count
+
+[orphan sweep]
+        │
         ▼
-  persist_devices()
-  returns recovered_count
+for each ublk-char device NOT recovered and NOT in API exports:
+        kill_dev(dev_id) + del_dev(dev_id)  (parallel, ORPHAN_SWEEP_CONCURRENCY)
 ```
 
-### Queue Thread Lifecycle
+### Worker lifecycle
 
 ```
-queue_io_loop() start
-        │ ublk_init_task_ring() ──────────────────────► [fail → signal_failed()]
-        │ UblkQueue::new()      ──────────────────────► [fail → signal_failed()]
-        │ EventFd::new()        ──────────────────────► [fail → signal_failed()]
-        │
-        ▼
-  latch.signal_ready()
-        │
-        ▼
-  spawn daemon task (eventfd PollAdd watcher)
-  spawn QUEUE_DEPTH io_task futures
-        │
-        ▼
-  [I/O loop: io_uring_enter → tick() → io_uring_enter → ...]
-        │
-  kill_dev() received
-        │ io_task loops see shutdown condition → return
-        │ alive count → 0 (daemons excluded)
-        │ exe.all_done() → true
-        ▼
-  queue thread exits
+WorkerPool::new(K, topology) → for each NUMA node, spawn (K / num_nodes) threads:
+
+        bind CPU affinity (one CPU from this node's cpulist)
+        build io_uring + sparse fixed-file table
+        build QueueExecutor + WakeupBits
+        register EventFd via PollAdd
+        loop {
+                drain mpsc::Receiver<WorkerMsg>:
+                        AddQueue { ... }     → install queue, reply ready
+                        RemoveQueue { ... }  → drain inflight, deregister cdev slot
+                        Shutdown             → break
+                exe.tick()
+                if no hosted queues and no Shutdown:
+                        io_uring_enter(URING_IDLE_SECS)   // block until next signal
+                else:
+                        io_uring_enter(0)                 // poll
+        }
+        all io_uring fds close → kernel quiesces all attached devices
 ```
 
 ## Why It Behaves This Way
 
-### Why a custom executor instead of spawning tokio tasks
+### Why a worker pool instead of one thread per device
 
-The ublk protocol requires one io_uring per queue thread — the io_uring ring is `SINGLE_ISSUER`, meaning only the owning thread may submit. Tokio's work-stealing scheduler would move futures across threads, breaking this invariant. The custom `QueueExecutor` pins all futures to one thread, keeping the io_uring single-issuer constraint satisfied without synchronization overhead.
+Per-device threading is `O(N)` in OS threads, io_urings, and registered virtual memory. At 1000 devices × 4 queues × 64 tags × 512 KB = 128 GB of virtual address space and ~5000 threads. The worker pool collapses this to `K` threads and `K` rings — the io_uring fixed-file table is sized for the device count, but everything else is `O(K)`.
+
+### Why a custom executor instead of tokio for the I/O tasks
+
+The ublk protocol pins one io_uring per submitter (`SINGLE_ISSUER`). Tokio's work-stealing scheduler would move futures across threads, breaking that invariant. `QueueExecutor` pins all futures to one thread and uses `Rc<RefCell<…>>` for the ring, making the single-issuer constraint a type-system property.
 
 ### Why the eventfd is in every waker
 
-The alternative — a condvar or parking_lot::Condvar — would require the queue thread to check a flag after every `io_uring_enter` timeout. With eventfd-in-every-waker, any tokio future completing immediately unblocks `io_uring_enter`, keeping latency low. The eventfd is a kernel primitive; the write from the tokio worker thread races safely against the queue thread's PollAdd — the kernel handles it.
+The alternative — a condvar — would require the worker thread to check a flag after every `io_uring_enter` timeout. With eventfd-in-every-waker, any tokio future completing immediately unblocks `io_uring_enter`, keeping latency low. The kernel handles the race between the tokio thread's `write` and the worker thread's `PollAdd` safely.
 
-### Why WakeupBits uses 3 × AtomicU64 instead of a Vec
+### Why hash queues across workers instead of binding a device to one worker
 
-Three words covers 192 bits: QUEUE_DEPTH (128 I/O tasks) + 1 daemon + slack. Fixed-size avoids heap allocation on the hot wakeup path. `drain()` is three atomic swaps; no lock, no CAS loop. For a system where wake() is called tens of thousands of times per second, allocation-free matters.
+A device's queues need to run concurrently to use its full `nr_queues × queue_depth` parallelism. Pinning a device to one worker would cap single-device throughput at one CPU. The XOR-with-qid distribution ensures the 4 queues of a single device land on 4 distinct workers (when `K ≥ 4`), preserving per-device parallelism while still multiplexing many devices into `K` worker threads.
 
-### Why nr_queues defaults to 1
+### Why NUMA-aware placement
 
-One queue per export is sufficient for most workloads: the bottleneck is S3 latency (100–200 ms), not io_uring dispatch throughput. Multiple queues add per-CPU parallelism but also increase contention on shared structures (write cache lock, S3 semaphore). The default is conservative; operators can raise it for SSD-heavy local workloads.
+AWS bare metal (and most multi-socket servers) wires each NVMe to one socket's PCIe root complex. Without NUMA awareness ~half of all io_uring submissions cross the inter-socket interconnect (UPI on Intel, Infinity Fabric on AMD), adding latency to every submission/completion pair. Confining each device's queues to workers on its NVMe's socket eliminates that cross-socket traffic.
 
-### Why pwrite uses the RwLock'd fd instead of the io_uring fixed fd
+On hardware where the kernel can't identify the backing device's node (single-socket boxes, virtualized storage, ZFS pools spanning sockets — `numa_node = -1`) the pool falls back to a global hash, which is identical to the pre-NUMA layout. The code path is the same either way; only the modulus differs.
 
-During flush rotation the active data file is renamed and a new file opened. The io_uring-registered fd (slot `DATA_FILE_FD_INDEX`) still refers to the old inode. Writes through the fixed fd would go to the old file. The `RwLock<File>` is swapped atomically during rotation, so pwrite via the lock always hits the current file.
+### Why `spawn` returns `Result<(), SpawnError>` instead of panicking
 
-### Why preferred_id is passed for recovery but not required
+`WORKER_WAKEUP_WORDS = 1024` → 65 536 task slots per worker. With 4 queues × 64 tags per device, that allows ~256 devices on a single worker before saturation. If the hash distribution piles devices onto one worker faster than expected, the API should return an error to the caller (`add_device` → 500) rather than panic the worker thread, which would take out every co-tenant queue.
 
-The kernel may reject a preferred ID (taken by another process, or driver reloaded). The preferred ID is a hint for stable `/dev/ublkbN` paths, not a requirement. Stale entries in `ublk_devices.json` are silently ignored.
+### Why shutdown does not call kill_dev
+
+`kill_dev` (UBLK_CMD_STOP_DEV) blocks until inflight bios drain, which requires the userspace COMMIT loop. Calling it while VM writers hold dirty bios deadlocks: the bios won't drain because the userspace daemon is exiting and can't COMMIT. With `UBLK_F_USER_RECOVERY` (always on), simply dropping the worker pool — closing all io_uring fds — causes the kernel to transition each device to QUIESCED. The next daemon recovers them in seconds. `kill_dev` is reserved for explicit `remove_device` (operator removed an export), where the caller is responsible for ensuring nothing is using it.
 
 ## Package Structure
 
 | File | What It Does |
 |------|-------------|
-| `mod.rs` | `UblkServer`: add/remove/recover/shutdown devices; persists export→device-ID map to `ublk_devices.json`; probes `KernelFeatures` at startup |
-| `device.rs` | `UblkDevice`: worker thread lifecycle; `QueueExecutor` + `WakeupBits` custom executor; per-tag `io_task` / `io_task_zc` I/O loops; zero-copy and buffered read/write dispatch |
+| `mod.rs` | `UblkServer`: add/remove/recover devices; owns the `WorkerPool`; persists export→device-ID map to `ublk_devices.json`; probes `KernelFeatures` at startup; orphan sweep on recovery |
+| `worker_pool.rs` | `WorkerPool` + `Worker` + `WorkerMsg`: fixed-size thread pool, mpsc message routing, CPU affinity, runtime-sized `WakeupBits`, hash-based queue assignment |
+| `device.rs` | `UblkDevice` record + `QueueExecutor` + `WakeupBits` + `TaskWaker` + per-tag `io_task` I/O loop + `dispatch_io` / `handle_io` |
 
 ## Configuration
 
 | Constant / Option | Default | What It Controls at Runtime |
 |------------------|---------|----------------------------|
-| `QUEUE_DEPTH` | 128 | Inflight I/O capacity per queue; also the number of per-tag tasks spawned |
-| `IO_BUF_BYTES` | 512 KB | Per-tag bounce buffer for non-zero-copy path; must fit largest supported block |
-| `URING_IDLE_SECS` | 2 s | `io_uring_enter` timeout; bounds shutdown latency (queue thread wakes within this interval on kill) |
-| `DATA_FILE_FD_INDEX` | 1 | Fixed-file slot index for data file in io_uring; slot 0 is the ublk cdev |
-| `UblkServer::nr_queues` | 1 | Per-device queue count; more queues = per-CPU parallelism at cost of increased contention |
-| `UblkServer::cache_dir` | None | Directory for `ublk_devices.json`; if unset, device IDs are ephemeral (new IDs on restart) |
+| `K` (workers) | `min(num_cpus, 32)` | Number of worker threads; each owns one io_uring |
+| `WORKER_WAKEUP_WORDS` | 1024 | `WakeupBits` size per worker → 65 536 task slots per worker |
+| `MAX_FIXED_FILES` | 4096 | io_uring sparse fixed-file slots per worker (one slot per hosted cdev fd) |
+| `QUEUE_DEPTH` | 64 | Inflight I/O capacity per queue; also the per-tag task count |
+| `IO_BUF_BYTES` | 512 KB | Per-tag bounce buffer |
+| `URING_IDLE_SECS` | 2 s | `io_uring_enter` timeout when a worker has no hosted queues |
+| `RECOVERY_CONCURRENCY` | 16 | Parallel reattaches at startup |
+| `ORPHAN_SWEEP_CONCURRENCY` | 16 | Parallel kill+del for unowned ublk-char devices |
+| `UblkServer::nr_queues` | from `[servers.ublk].nr_queues` (config) | Per-device queue count |
+| `UblkServer::cache_dir` | None | Directory for `ublk_devices.json`; if unset, device IDs are ephemeral |
 
 ## Failure Modes
 
 | Failure | What Actually Happens | Recovery |
 |---------|----------------------|---------|
-| Queue thread fails to init (ring, queue, eventfd) | `latch.signal_failed()` → `on_started` sees failure → `kill_dev()` → `register()` returns `Err` | Caller retries `add_device()` |
+| `register_files_update` fails on AddQueue | `ready` oneshot returns `Err`; `add_device` rolls back the device | Caller retries; no leaked kernel device |
+| `QueueExecutor::spawn` at capacity | `SpawnError::AtCapacity` returned via `ready` oneshot; `add_device` aborts | Caller sees 500; operator distributes load or raises `WORKER_WAKEUP_WORDS` |
+| A task panics inside `tick()` | `catch_unwind` captures it; task is dropped; co-tenants keep running | The kernel sees no COMMIT for that tag and may eventually timeout the I/O |
 | I/O dispatch error (handler returns `Err`) | Negative errno sent to kernel; kernel propagates to application | Application retries; no device state corruption |
-| `pwrite` fails mid-write | Blocks are marked present but not dirty (phase 2 of 3-phase write) | Next read sees stale data; WAL replay corrects on recovery |
-| `pre_write` fails | Blocks are neither present nor dirty | Safe to retry entire write |
-| Worker thread doesn't exit within timeout | `unregister()` returns `Err` after `URING_IDLE_SECS + 5s` | Device may leak; operator must check `lsblk` |
-| Daemon crash (server killed) | Kernel transitions device to `QUIESCED` state; I/O queued by kernel | `recover_quiesced_devices()` reattaches within seconds of restart |
-| Preferred device ID already taken | Kernel auto-assigns a new ID; `/dev/ublkbN` path changes | `persist_devices()` updates map; callers re-resolve path |
-| `persist_devices()` write fails | Warning logged; operation succeeds; device IDs will change on next restart | On restart, new IDs assigned; exports still functional |
-| `kill_dev()` fails during drop | Warning logged; best-effort cleanup; device may remain registered | Operator must manually remove via `ublk del -n <id>` |
+| Daemon crash (`kill -9`) | All io_uring fds close → kernel quiesces every attached device | `recover_quiesced_devices()` reattaches all devices within seconds of next start |
+| Daemon graceful exit (SIGTERM) | Worker pool dropped; same path as crash. **`kill_dev` is intentionally not called.** | Same as crash |
+| Worker thread panics outside `tick()` | Worker join handle reports the error on shutdown | Pool exits; daemon restarts via systemd; recovery reattaches devices |
+| `kill_dev()` fails during explicit `remove_device` | Warning logged; best-effort cleanup; export is removed from the API | Orphan sweep on the next daemon start kills the leftover kernel device |
+| `persist_devices()` write fails | Warning logged; operation succeeds; device IDs may change on next restart | New IDs on restart; exports still functional |
