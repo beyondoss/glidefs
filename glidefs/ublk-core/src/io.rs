@@ -201,19 +201,30 @@ impl WorkerRing {
         Self::from_io_uring(ring)
     }
 
-    /// Wrap a caller-built `IoUring` (e.g., one with `setup_single_issuer`)
-    /// and pre-register a sparse fixed-file table.
+    /// Wrap a caller-built `IoUring` (e.g., one with `setup_single_issuer`).
+    ///
+    /// **Sparse fixed-file table is intentionally NOT registered** while
+    /// `UblkQueue` submits via `types::Fd(cdev_fd)` (see the comment block
+    /// in `UblkQueue::new` for the kernel < 6.13 workaround rationale).
+    /// Registering a sparse table of `MAX_FIXED_FILES` slots would (a) be
+    /// dead allocation since nothing populates the slots, and (b) fail
+    /// outright with EMFILE on hosts whose RLIMIT_NOFILE soft limit is
+    /// lower than `MAX_FIXED_FILES` — including default Ubuntu 24.04 CI
+    /// runners at 1024.
+    ///
+    /// When the production kernel reaches v6.13+ and we revert
+    /// `UblkQueue` to the fixed-file path, re-add:
+    ///
+    /// ```ignore
+    /// ring.submitter()
+    ///     .register_files_sparse(MAX_FIXED_FILES)
+    ///     .map_err(UblkError::IOError)?;
+    /// ```
     pub fn from_io_uring(ring: IoUring<squeue::Entry>) -> Result<Self, UblkError> {
-        // Sparse registration: every slot starts at -1 (unused). Each
-        // hosted queue fills its slot via `register_files_update`. This
-        // is the multi-queue-per-ring enabler: re-calling
-        // `register_files` returns EBUSY, but `register_files_update`
-        // works on a sparse table that's already registered.
-        ring.submitter()
-            .register_files_sparse(MAX_FIXED_FILES)
-            .map_err(UblkError::IOError)?;
-
-        // Free list, highest slot first so allocations come out as 0,1,2,...
+        // Free list still populated for the eventual revert — it's a
+        // cheap `Vec<u32>` and gives `alloc_cdev_slot` a working
+        // implementation if any caller still reaches it (no caller in
+        // this codebase does).
         let free_slots: Vec<u32> = (0..MAX_FIXED_FILES).rev().collect();
 
         Ok(Self {

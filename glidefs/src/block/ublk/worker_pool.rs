@@ -578,8 +578,15 @@ fn worker_thread_main(
     {
         Ok(r) => r,
         Err(e) => {
+            // Without a tracing subscriber (e.g. integration tests run
+            // by `cargo test`), the structured log below disappears.
+            // Mirror to stderr so the actual io_uring error reaches the
+            // user instead of the opaque "worker startup failed" string
+            // that `drain_until_shutdown` reports via AddQueue's reply.
+            let err_str = format!("io_uring init failed: {e:?}");
+            eprintln!("ublk-worker-{idx}: {err_str}");
             tracing::error!(worker = idx, error = ?e, "failed to init worker io_uring");
-            drain_until_shutdown(&mut rx);
+            drain_until_shutdown(&mut rx, &err_str);
             return;
         }
     };
@@ -899,8 +906,11 @@ fn handle_add_queue(
 }
 
 /// Drain the inbox after a startup failure, sending acks where requested
-/// so async-side callers don't hang forever.
-fn drain_until_shutdown(rx: &mut mpsc::Receiver<WorkerMsg>) {
+/// so async-side callers don't hang forever. `reason` is propagated into
+/// every AddQueue reply so the device-add path surfaces the actual
+/// startup error (e.g. the underlying io_uring init failure) rather than
+/// the opaque "worker startup failed" message it used to return.
+fn drain_until_shutdown(rx: &mut mpsc::Receiver<WorkerMsg>, reason: &str) {
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             WorkerMsg::Shutdown { done } => {
@@ -908,7 +918,7 @@ fn drain_until_shutdown(rx: &mut mpsc::Receiver<WorkerMsg>) {
                 break;
             }
             WorkerMsg::AddQueue { ready, .. } => {
-                let _ = ready.send(Err("worker startup failed".into()));
+                let _ = ready.send(Err(reason.to_string()));
             }
             WorkerMsg::RemoveQueue { done, .. } => {
                 let _ = done.send(());
