@@ -163,6 +163,7 @@ impl UblkDevice {
         export_name: String,
         features: &KernelFeatures,
         preferred_id: Option<i32>,
+        preferred_node: Option<usize>,
         pool: &super::worker_pool::WorkerPool,
     ) -> anyhow::Result<Self> {
         Self::register_inner(
@@ -172,6 +173,7 @@ impl UblkDevice {
             DeviceMode::Add,
             features,
             preferred_id,
+            preferred_node,
             pool,
         )
         .await
@@ -189,6 +191,7 @@ impl UblkDevice {
         nr_queues: u16,
         export_name: String,
         features: &KernelFeatures,
+        preferred_node: Option<usize>,
         pool: &super::worker_pool::WorkerPool,
     ) -> anyhow::Result<Self> {
         // Control-plane: tell the kernel we're taking over. This is
@@ -211,6 +214,7 @@ impl UblkDevice {
             DeviceMode::Recover { dev_id },
             features,
             None,
+            preferred_node,
             pool,
         )
         .await
@@ -232,6 +236,7 @@ impl UblkDevice {
         mode: DeviceMode,
         features: &KernelFeatures,
         preferred_id: Option<i32>,
+        preferred_node: Option<usize>,
         pool: &super::worker_pool::WorkerPool,
     ) -> anyhow::Result<Self> {
         let dev_size = handler.device_size();
@@ -262,7 +267,10 @@ impl UblkDevice {
         let mut worker_dispatch: Vec<(usize, super::worker_pool::WorkerHandleSnapshot)> =
             Vec::with_capacity(nr_queues_max as usize);
         for qid in 0..nr_queues_max {
-            worker_dispatch.push((qid as usize, pool.worker_snapshot(&export_name, qid)));
+            worker_dispatch.push((
+                qid as usize,
+                pool.worker_snapshot(&export_name, qid, preferred_node),
+            ));
         }
 
         let export_for_json = export_name.clone();
@@ -421,7 +429,7 @@ impl UblkDevice {
         // is `kill_dev` which we drive outside the lock).
         let worker_handles: Vec<super::worker_pool::WorkerHandleSnapshot> =
             (0..actual_nr_queues)
-                .map(|qid| pool.worker_snapshot(&export_name, qid))
+                .map(|qid| pool.worker_snapshot(&export_name, qid, preferred_node))
                 .collect();
 
         Ok(Self {
@@ -597,22 +605,27 @@ impl UblkDevice {
     /// Drain this device's queues from the worker pool without sending
     /// `kill_dev`. Caller still owns the kernel device. Useful for
     /// tests and for the M6 shutdown path.
-    pub async fn drain_queues(
-        &self,
-        pool: &super::worker_pool::WorkerPool,
-    ) -> anyhow::Result<()> {
-        for qid in 0..self.nr_queues {
-            let worker = pool.worker_for(&self.export_name, qid);
+    ///
+    /// Uses the `worker_handles` snapshots cached at register time so
+    /// routing stays consistent regardless of pool hash topology.
+    pub async fn drain_queues(&self) -> anyhow::Result<()> {
+        for (qid, handle) in self.worker_handles.iter().enumerate() {
+            let key = super::worker_pool::QueueKey {
+                dev_id: self.dev_id,
+                qid: qid as u16,
+            };
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-            worker
+            handle
+                .inbox
                 .send(super::worker_pool::WorkerMsg::RemoveQueue {
-                    key: super::worker_pool::QueueKey { dev_id: self.dev_id, qid },
+                    key,
                     done: done_tx,
                 })
                 .await
-                .map_err(|_| anyhow::anyhow!("worker {} channel closed", worker.idx))?;
-            // RemoveQueue is best-effort; we don't gate on the ack.
-            // The Rc<UblkQueue> drop happens in the worker thread.
+                .map_err(|_| anyhow::anyhow!("worker channel closed for qid {qid}"))?;
+            super::device::signal_eventfd(handle.eventfd.fd());
+            // Best-effort; the Rc<UblkQueue> drop happens in the
+            // worker thread.
             let _ = done_rx.await;
         }
         Ok(())

@@ -19,6 +19,7 @@
 //! - Batched commit+fetch eliminates round-trips
 
 pub mod device;
+pub mod numa;
 mod worker_pool;
 
 use worker_pool::WorkerPool;
@@ -75,6 +76,12 @@ pub struct UblkServer {
     devices: HashMap<String, device::UblkDevice>,
     /// Directory for persisting device ID mapping (enables stable device paths).
     cache_dir: Option<PathBuf>,
+    /// Cached NUMA node of `cache_dir`'s backing block device, resolved
+    /// once on first `add_device` / `recover`. `Some(None)` = resolved
+    /// and the device reports `numa_node = -1` (single-node host,
+    /// virtualized storage, ZFS pool across nodes); `Some(Some(n))` =
+    /// keep queues on node `n`; `None` = not yet resolved.
+    cache_dir_numa_node: std::sync::OnceLock<Option<usize>>,
     /// The worker pool that hosts every queue's `io_task` futures.
     /// Sized at construction (default = `min(num_cpus, 32)`); each
     /// worker owns one io_uring + executor and may host queues from
@@ -104,15 +111,35 @@ impl UblkServer {
             .map(|n| n.get())
             .unwrap_or(4)
             .min(32);
-        let pool = WorkerPool::new(num_workers)
+        let topology: Arc<dyn numa::NodeTopology> =
+            Arc::new(numa::SysfsTopology::detect());
+        let pool = WorkerPool::new(num_workers, topology)
             .expect("failed to spawn ublk worker pool");
         Self {
             nr_queues: DEFAULT_NR_QUEUES,
             features,
             devices: HashMap::new(),
             cache_dir: None,
+            cache_dir_numa_node: std::sync::OnceLock::new(),
             pool,
         }
+    }
+
+    /// Resolve `cache_dir`'s NUMA node lazily. Cached for the server's
+    /// lifetime — the underlying block device doesn't migrate. Returns
+    /// `None` if `cache_dir` is unset, the path doesn't resolve, or
+    /// the device reports `numa_node = -1` (no preference).
+    fn preferred_node(&self) -> Option<usize> {
+        *self.cache_dir_numa_node.get_or_init(|| {
+            let dir = self.cache_dir.as_deref()?;
+            let node = numa::numa_node_for_path(dir);
+            tracing::info!(
+                cache_dir = %dir.display(),
+                preferred_node = ?node,
+                "resolved cache_dir NUMA preference"
+            );
+            node
+        })
     }
 
     /// Set the number of I/O queues per device (default: 1).
@@ -189,6 +216,7 @@ impl UblkServer {
 
         let preferred_id = self.load_persisted_indices()
             .get(export_name).copied();
+        let preferred_node = self.preferred_node();
 
         let name = export_name.to_string();
         let device =
@@ -198,6 +226,7 @@ impl UblkServer {
                 name.clone(),
                 &self.features,
                 preferred_id,
+                preferred_node,
                 &self.pool,
             )
             .await?;
@@ -463,6 +492,7 @@ impl UblkServer {
         // so concurrency here translates directly to overlapped control-
         // plane ioctls. Worker pool absorbs concurrent `AddQueue` since
         // dispatch hashes by `(export, qid)` across K workers.
+        let preferred_node = self.preferred_node();
         let recovered_devices: Vec<Result<(String, device::UblkDevice), i32>> = {
             use futures::stream::{self, StreamExt};
             stream::iter(to_recover)
@@ -480,6 +510,7 @@ impl UblkServer {
                             nr_queues,
                             export_name.clone(),
                             &features,
+                            preferred_node,
                             pool,
                         )
                         .await

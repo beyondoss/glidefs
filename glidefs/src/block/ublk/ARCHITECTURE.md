@@ -84,22 +84,29 @@ Worker pool drop      ──► all io_uring fds close ──► kernel quiesces
 
 ### Worker pool
 
-`K = min(num_cpus, 32)` worker threads are spawned at `UblkServer` construction.
-Each worker:
+`K = min(num_cpus, 32)` worker threads are spawned at `UblkServer` construction, **partitioned across NUMA nodes**. Each worker:
 
 1. Builds its own `io_uring` ring (`SINGLE_ISSUER`, sparse fixed-file table of `MAX_FIXED_FILES = 4096` slots).
 2. Builds a `QueueExecutor` with a runtime-sized `WakeupBits` (`WORKER_WAKEUP_WORDS = 1024` → 65 536 task slots).
 3. Owns one `EventFd` registered with the ring via `PollAdd`.
-4. Is pinned to CPU `i % num_cpus` via `sched_setaffinity` (single-NUMA; multi-NUMA partitioning is left as a TODO).
+4. Is pinned to a CPU within its owning NUMA node via `sched_setaffinity`.
 5. Sits in an event loop: drain the `mpsc::Receiver<WorkerMsg>` between executor ticks, then `io_uring_enter` until the next CQE or eventfd wake.
 
-Queues are assigned to workers by a hash:
+### NUMA partitioning
+
+`SysfsTopology` probes `/sys/devices/system/node/online` + each node's `cpulist` once at startup. The pool divides workers as `per_node = max(1, K / num_nodes)` and spawns each node's slice pinned to that node's CPUs. On a single-socket host (the common dev case) this collapses to one node holding all workers — behavior identical to the pre-NUMA pool. On 2-socket AWS bare metal (i3.metal, i4i.metal, m6id.metal, etc.) each socket gets its own slice, and every worker's `io_uring` lives on the same socket as its CPU.
+
+`UblkServer` resolves `cache_dir`'s backing NVMe NUMA node once via `numa::numa_node_for_path` (stat → `st_dev` → walk `/sys/dev/block/<major>:<minor>` for `device/numa_node`) and passes it as `preferred_node` on every `add_device` / `recover`. The pool's `worker_for(name, qid, preferred_node)`:
+
+- If `preferred_node = Some(n)` and the topology knows node `n`: hash within that node's worker slice. Every io_uring submission stays socket-local to the NVMe.
+- If `preferred_node = None` (single-node host, `numa_node = -1`, ZFS pool across sockets): hash across all workers globally — matches pre-NUMA behavior.
 
 ```
-worker_idx = (hash(export_name) ^ qid_seed(qid)) mod K
+worker_idx = (FNV1a(export_name) ^ qid_seed(qid)) mod  workers_in_preferred_node
+                                              (or)    total_workers
 ```
 
-The `qid_seed` ensures a device's `nr_queues` queues land on distinct workers so per-device parallelism is preserved when `K ≥ nr_queues`.
+The `qid_seed` ensures a device's `nr_queues` queues land on distinct workers (so per-device parallelism is preserved) within whichever bucket is being indexed.
 
 ### Adding a queue (control plane → worker)
 
@@ -206,9 +213,9 @@ for each ublk-char device NOT recovered and NOT in API exports:
 ### Worker lifecycle
 
 ```
-WorkerPool::new(K) → spawns K threads:
+WorkerPool::new(K, topology) → for each NUMA node, spawn (K / num_nodes) threads:
 
-        bind CPU affinity (i % num_cpus)
+        bind CPU affinity (one CPU from this node's cpulist)
         build io_uring + sparse fixed-file table
         build QueueExecutor + WakeupBits
         register EventFd via PollAdd
@@ -243,6 +250,12 @@ The alternative — a condvar — would require the worker thread to check a fla
 ### Why hash queues across workers instead of binding a device to one worker
 
 A device's queues need to run concurrently to use its full `nr_queues × queue_depth` parallelism. Pinning a device to one worker would cap single-device throughput at one CPU. The XOR-with-qid distribution ensures the 4 queues of a single device land on 4 distinct workers (when `K ≥ 4`), preserving per-device parallelism while still multiplexing many devices into `K` worker threads.
+
+### Why NUMA-aware placement
+
+AWS bare metal (and most multi-socket servers) wires each NVMe to one socket's PCIe root complex. Without NUMA awareness ~half of all io_uring submissions cross the inter-socket interconnect (UPI on Intel, Infinity Fabric on AMD), adding latency to every submission/completion pair. Confining each device's queues to workers on its NVMe's socket eliminates that cross-socket traffic.
+
+On hardware where the kernel can't identify the backing device's node (single-socket boxes, virtualized storage, ZFS pools spanning sockets — `numa_node = -1`) the pool falls back to a global hash, which is identical to the pre-NUMA layout. The code path is the same either way; only the modulus differs.
 
 ### Why `spawn` returns `Result<(), SpawnError>` instead of panicking
 

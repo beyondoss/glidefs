@@ -30,6 +30,7 @@ use ublk_core::io::{UblkDev, UblkQueue, WorkerRing};
 use ublk_core::UblkUringData;
 
 use super::device::{drain_eventfd, io_task, signal_eventfd, EventFd, QueueExecutor};
+use super::numa::NodeTopology;
 
 /// Bounded inbox capacity. 64 is comfortable for the AddQueue/RemoveQueue
 /// traffic we expect (one device add ≈ `nr_queues` messages).
@@ -148,6 +149,7 @@ pub(super) struct WorkerHandleSnapshot {
 impl WorkerHandle {
     fn spawn(
         idx: usize,
+        cpu: usize,
         tokio_handle: tokio::runtime::Handle,
     ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel(WORKER_INBOX_CAPACITY);
@@ -161,7 +163,7 @@ impl WorkerHandle {
         let join = std::thread::Builder::new()
             .name(format!("ublk-worker-{idx}"))
             .spawn(move || {
-                worker_thread_main(idx, rx, tokio_handle, efd_for_thread, stats_for_thread)
+                worker_thread_main(idx, cpu, rx, tokio_handle, efd_for_thread, stats_for_thread)
             })?;
         Ok(Self { inbox: tx, eventfd, stats, join: Some(join), idx })
     }
@@ -181,7 +183,21 @@ impl WorkerHandle {
     }
 }
 
-/// Pool of K worker threads, fixed-size.
+/// Pool of K worker threads, partitioned across NUMA nodes.
+///
+/// # Layout
+///
+/// Workers are grouped per NUMA node. On a single-socket box the
+/// topology probe returns one node, so this collapses to a flat list —
+/// identical behavior to the pre-NUMA pool. On a 2-socket AWS metal
+/// box the probe returns two nodes, each containing half the workers,
+/// each pinned to a CPU on its own node.
+///
+/// Placement (`worker_for`) hashes within the device's preferred node
+/// when one is known (resolved from the data file's backing NVMe via
+/// [`super::numa::numa_node_for_path`]), or round-robins across all
+/// workers when not. Both paths use the same FNV-1a + qid_seed hash
+/// the pre-NUMA pool used, just with a different modulus.
 ///
 /// # Shutdown
 ///
@@ -193,42 +209,92 @@ impl WorkerHandle {
 /// their `io_uring_enter` timeouts. Use `shutdown()` for a clean,
 /// non-blocking join via `spawn_blocking`.
 pub(super) struct WorkerPool {
-    workers: Vec<WorkerHandle>,
+    /// Workers grouped by NUMA-node index (matches the order of
+    /// `topology.nodes()`). Each inner Vec is non-empty: every probed
+    /// node gets at least one worker, even if `total_workers <
+    /// num_nodes`.
+    nodes: Vec<Vec<WorkerHandle>>,
+    topology: Arc<dyn NodeTopology>,
 }
 
 impl WorkerPool {
-    /// Spawn `num_workers` threads. Caller must be inside a tokio runtime
-    /// context (`tokio::runtime::Handle::current()` succeeds) so workers
-    /// can re-enter it for `tokio::spawn`-using handler futures.
-    pub(super) fn new(num_workers: usize) -> std::io::Result<Self> {
-        if num_workers == 0 {
+    /// Spawn workers, partitioned across the topology's NUMA nodes.
+    ///
+    /// `total_workers` is a target; the actual count is `num_nodes ×
+    /// max(1, total_workers / num_nodes)`. On a single-node host this
+    /// equals `total_workers`. On a 2-node host with `total_workers =
+    /// 16` it equals 16 (8 per node). On `total_workers = 1` with two
+    /// nodes the result is 2 (one per node) — we never leave a node
+    /// without a worker, because a device pinned to that node would
+    /// otherwise be unplaceable.
+    ///
+    /// Caller must be inside a tokio runtime context
+    /// (`tokio::runtime::Handle::current()` succeeds) so workers can
+    /// re-enter it for `tokio::spawn`-using handler futures.
+    pub(super) fn new(
+        total_workers: usize,
+        topology: Arc<dyn NodeTopology>,
+    ) -> std::io::Result<Self> {
+        if total_workers == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "WorkerPool needs at least one worker",
             ));
         }
-        let handle = tokio::runtime::Handle::current();
-        let mut pool = Self { workers: Vec::with_capacity(num_workers) };
-        for i in 0..num_workers {
-            match WorkerHandle::spawn(i, handle.clone()) {
-                Ok(h) => pool.workers.push(h),
-                Err(e) => {
-                    tracing::error!(
-                        worker = i,
-                        error = %e,
-                        spawned = pool.workers.len(),
-                        "failed to spawn worker; aborting pool init"
-                    );
-                    return Err(e);
-                }
-            }
+        let nodes_topo = topology.nodes();
+        if nodes_topo.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "NodeTopology returned zero nodes",
+            ));
         }
-        tracing::info!(count = num_workers, "ublk worker pool spawned");
-        Ok(pool)
+        let num_nodes = nodes_topo.len();
+        let per_node = (total_workers / num_nodes).max(1);
+
+        let handle = tokio::runtime::Handle::current();
+        let mut nodes: Vec<Vec<WorkerHandle>> = Vec::with_capacity(num_nodes);
+        let mut next_idx = 0usize;
+        for node in nodes_topo {
+            let mut node_workers = Vec::with_capacity(per_node);
+            for slot in 0..per_node {
+                // Round-robin within the node's CPU list so workers
+                // 0..per_node pin to distinct CPUs when there are
+                // enough; otherwise they share.
+                let cpu = node.cpus[slot % node.cpus.len()];
+                match WorkerHandle::spawn(next_idx, cpu, handle.clone()) {
+                    Ok(h) => node_workers.push(h),
+                    Err(e) => {
+                        tracing::error!(
+                            worker = next_idx,
+                            node = node.id,
+                            cpu,
+                            error = %e,
+                            spawned = next_idx,
+                            "failed to spawn worker; aborting pool init"
+                        );
+                        return Err(e);
+                    }
+                }
+                next_idx += 1;
+            }
+            nodes.push(node_workers);
+        }
+        tracing::info!(
+            total = next_idx,
+            nodes = num_nodes,
+            per_node,
+            "ublk worker pool spawned"
+        );
+        Ok(Self { nodes, topology })
     }
 
     pub(super) fn num_workers(&self) -> usize {
-        self.workers.len()
+        self.nodes.iter().map(|n| n.len()).sum()
+    }
+
+    #[cfg(test)]
+    pub(super) fn num_nodes(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Snapshot per-worker capacity / utilization for observability.
@@ -236,8 +302,9 @@ impl WorkerPool {
     /// Returns one `(idx, used, capacity, hosted_queues)` tuple per worker.
     #[allow(dead_code)] // exposed for /metrics + debug logging
     pub(super) fn capacity_snapshot(&self) -> Vec<(usize, usize, usize, usize)> {
-        self.workers
+        self.nodes
             .iter()
+            .flat_map(|n| n.iter())
             .map(|w| {
                 let s = w.stats();
                 (
@@ -250,11 +317,16 @@ impl WorkerPool {
             .collect()
     }
 
-    /// Send-able snapshot of `worker_for(export_name, qid)`'s send
-    /// side. Used from `spawn_blocking` callers that can't hold a
-    /// `&WorkerPool` borrow across the closure.
-    pub(super) fn worker_snapshot(&self, export_name: &str, qid: u16) -> WorkerHandleSnapshot {
-        let w = self.worker_for(export_name, qid);
+    /// Send-able snapshot of `worker_for(export_name, qid,
+    /// preferred_node)`'s send side. Used from `spawn_blocking` callers
+    /// that can't hold a `&WorkerPool` borrow across the closure.
+    pub(super) fn worker_snapshot(
+        &self,
+        export_name: &str,
+        qid: u16,
+        preferred_node: Option<usize>,
+    ) -> WorkerHandleSnapshot {
+        let w = self.worker_for(export_name, qid, preferred_node);
         WorkerHandleSnapshot {
             inbox: w.inbox.clone(),
             eventfd: Arc::clone(&w.eventfd),
@@ -262,15 +334,24 @@ impl WorkerPool {
     }
 
     /// Pick the worker that should host this `(export_name, qid)`.
-    /// Hash by name then xor-rotate by qid so a device's `nr_queues`
-    /// queues spread across distinct workers (assuming `K ≥ nr_queues`).
     ///
-    /// Uses inline FNV-1a rather than `DefaultHasher` because the std
-    /// hasher's algorithm is explicitly not stable across Rust versions —
-    /// keeping this deterministic means a `(export_name, qid)` pair always
-    /// lands on the same worker index given the same `K`, which makes
-    /// placement reproducible in tests and across deployments.
-    pub(super) fn worker_for(&self, export_name: &str, qid: u16) -> &WorkerHandle {
+    /// If `preferred_node` is `Some(id)` and the topology knows that
+    /// node, the hash distributes within that node's workers — keeping
+    /// io_uring submission and NVMe completion on the same socket. If
+    /// `preferred_node` is `None` (data file's backing device reported
+    /// `numa_node = -1`, ZFS-on-multiple-NVMe, single-node host, etc.)
+    /// the hash distributes across all workers globally — matches
+    /// pre-NUMA behavior.
+    ///
+    /// Hash uses inline FNV-1a + a `qid_seed` permutation. Deterministic
+    /// across runs given the same pool size, which makes placement
+    /// reproducible in tests.
+    pub(super) fn worker_for(
+        &self,
+        export_name: &str,
+        qid: u16,
+        preferred_node: Option<usize>,
+    ) -> &WorkerHandle {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64-bit offset basis
         for &b in export_name.as_bytes() {
             h ^= b as u64;
@@ -280,17 +361,39 @@ impl WorkerPool {
         // the low bits regardless of name-hash; doesn't need to be a
         // cryptographic PRP, just a permutation.
         let qid_seed: u64 = (qid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let bucket = (h ^ qid_seed) as usize % self.workers.len();
-        &self.workers[bucket]
+        let mixed = h ^ qid_seed;
+
+        // Resolve a per-node bucket when the device has a preference
+        // we can honor; otherwise spread across every worker.
+        if let Some(node_id) = preferred_node
+            && let Some(node_idx) = self.topology.index_of(node_id)
+            && let Some(workers) = self.nodes.get(node_idx)
+            && !workers.is_empty()
+        {
+            let bucket = mixed as usize % workers.len();
+            return &workers[bucket];
+        }
+        let total = self.num_workers();
+        debug_assert!(total > 0, "pool constructed with at least one worker");
+        let bucket = mixed as usize % total;
+        // Walk node-by-node to flatten the global bucket index.
+        let mut cursor = bucket;
+        for node_workers in &self.nodes {
+            if cursor < node_workers.len() {
+                return &node_workers[cursor];
+            }
+            cursor -= node_workers.len();
+        }
+        unreachable!("bucket modulo num_workers is always within range")
     }
 
     /// Send `Shutdown` to every worker and join the threads. Acks and
     /// thread joins run concurrently so total shutdown latency is
     /// bounded by the slowest single worker, not by N×latency.
     pub(super) async fn shutdown(mut self) -> std::io::Result<()> {
-        let mut done_rxs: Vec<(usize, oneshot::Receiver<()>)> =
-            Vec::with_capacity(self.workers.len());
-        for w in &self.workers {
+        let total = self.num_workers();
+        let mut done_rxs: Vec<(usize, oneshot::Receiver<()>)> = Vec::with_capacity(total);
+        for w in self.nodes.iter().flat_map(|n| n.iter()) {
             let (done_tx, done_rx) = oneshot::channel();
             let _ = w.send(WorkerMsg::Shutdown { done: done_tx }).await;
             done_rxs.push((w.idx, done_rx));
@@ -316,8 +419,9 @@ impl WorkerPool {
         // each goes through its own `spawn_blocking` and we wait for
         // the set with `join_all`.
         let join_futs: Vec<_> = self
-            .workers
+            .nodes
             .iter_mut()
+            .flat_map(|n| n.iter_mut())
             .filter_map(|w| w.join.take().map(|j| (w.idx, j)))
             .map(|(idx, join)| {
                 tokio::task::spawn_blocking(move || {
@@ -329,7 +433,7 @@ impl WorkerPool {
             .collect();
         futures::future::join_all(join_futs).await;
 
-        tracing::info!(count = self.workers.len(), "ublk worker pool shut down");
+        tracing::info!(count = total, "ublk worker pool shut down");
         Ok(())
     }
 }
@@ -345,8 +449,9 @@ impl Drop for WorkerPool {
     /// call `shutdown().await` before dropping.
     fn drop(&mut self) {
         let leftover: Vec<usize> = self
-            .workers
+            .nodes
             .iter()
+            .flat_map(|n| n.iter())
             .filter(|w| w.join.is_some())
             .map(|w| w.idx)
             .collect();
@@ -357,7 +462,7 @@ impl Drop for WorkerPool {
                  channel-disconnect but are not joined here to avoid blocking"
             );
         }
-        // Senders drop with `self.workers`; JoinHandles drop unjoined.
+        // Senders drop with `self.nodes`; JoinHandles drop unjoined.
     }
 }
 
@@ -408,31 +513,22 @@ struct WorkerState<'a> {
 
 fn worker_thread_main(
     idx: usize,
+    cpu: usize,
     mut rx: mpsc::Receiver<WorkerMsg>,
     tokio_handle: tokio::runtime::Handle,
     eventfd: Arc<EventFd>,
     stats: Arc<WorkerStats>,
 ) {
-    // M5: Pin this worker thread to one CPU. With K = num_cpus capped
-    // at 32, each worker gets a dedicated CPU on a single-socket box;
-    // io_uring submission and CQ processing then stay on-core, the
-    // executor's task storage hits L1 cache instead of bouncing
-    // between CPUs, and the kernel scheduler stops migrating us.
+    // Pin this worker thread to its assigned CPU. The CPU is chosen by
+    // `WorkerPool::new` from the worker's owning NUMA node's `cpulist`,
+    // so on a 2-socket box workers assigned to node 0 land on socket 0
+    // CPUs and node 1's workers land on socket 1 CPUs. io_uring SQ/CQ
+    // processing stays on-core, the executor's task storage hits L1,
+    // and the kernel scheduler stops migrating us.
     //
     // Best-effort: a failure here just means the kernel's default
     // load-balancer continues to manage placement — degraded but
     // correct. Logged as a warning so it's visible.
-    //
-    // TODO multi-NUMA: on a multi-socket box (`/sys/devices/system/node/online`
-    // shows N > 1), partition workers per node by NVMe NUMA node and
-    // hash devices to a worker WITHIN their node. For now this lazy
-    // round-robin is correct on single-socket and degrades gracefully
-    // on multi-socket (~5-10% NVMe-cross-node latency, no correctness
-    // hit).
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let cpu = idx % num_cpus;
     // SAFETY:
     // - `cpu_set_t` is a plain C struct with no invalid bit patterns; zero is
     //   the correct initial state and CPU_ZERO is functionally a memset(0).
@@ -442,10 +538,11 @@ fn worker_thread_main(
     //   is a valid target for the calling process's `sched_setaffinity`.
     // - `size_of::<cpu_set_t>()` matches the kernel's expected mask size on
     //   the libc-supported architectures (x86-64, aarch64).
-    // - `cpu < CPU_SETSIZE` invariant for `CPU_SET`: `cpu = idx % num_cpus`
-    //   where `num_cpus = available_parallelism()` is bounded by the kernel's
-    //   NR_CPUS, which is ≤ CPU_SETSIZE (1024) on all libc-supported archs.
-    //   `CPU_SET` writes one bit; out-of-range would be OOB.
+    // - `cpu < CPU_SETSIZE` invariant for `CPU_SET`: the topology's `cpulist`
+    //   is sourced from `/sys/devices/system/node/nodeN/cpulist`, which the
+    //   kernel guarantees is ≤ NR_CPUS, which is ≤ CPU_SETSIZE (1024) on all
+    //   libc-supported archs. `CPU_SET` writes one bit; out-of-range would
+    //   be OOB.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);
@@ -852,30 +949,39 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::ublk::numa::FakeTopology;
+
+    /// Build a single-node FakeTopology with enough CPUs for any test
+    /// pool size we use. The pool's sched_setaffinity calls will hit
+    /// real CPUs on the test box, but the topology view drives the
+    /// partitioning logic.
+    fn single_node_topo() -> Arc<dyn NodeTopology> {
+        Arc::new(FakeTopology::single_node(64))
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn pool_spawns_and_shuts_down() {
-        let pool = WorkerPool::new(4).expect("spawn pool");
+        let pool = WorkerPool::new(4, single_node_topo()).expect("spawn pool");
         assert_eq!(pool.num_workers(), 4);
         pool.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn pool_size_one_works() {
-        let pool = WorkerPool::new(1).expect("spawn pool");
+        let pool = WorkerPool::new(1, single_node_topo()).expect("spawn pool");
         pool.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pool_size_sixteen_works() {
-        let pool = WorkerPool::new(16).expect("spawn pool");
+        let pool = WorkerPool::new(16, single_node_topo()).expect("spawn pool");
         assert_eq!(pool.num_workers(), 16);
         pool.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn pool_size_zero_returns_invalid_input() {
-        match WorkerPool::new(0) {
+        match WorkerPool::new(0, single_node_topo()) {
             Ok(_) => panic!("must reject zero workers"),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
         }
@@ -887,7 +993,7 @@ mod tests {
         // thread, here) for up to WORKER_IDLE_NSEC per worker. With 2
         // workers at 250ms each, a blocking drop would take ~500ms;
         // we require it to return in well under that.
-        let pool = WorkerPool::new(2).expect("spawn pool");
+        let pool = WorkerPool::new(2, single_node_topo()).expect("spawn pool");
         assert_eq!(pool.num_workers(), 2);
         let start = std::time::Instant::now();
         drop(pool);
@@ -900,17 +1006,90 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn worker_for_spreads_qids_across_workers() {
-        let pool = WorkerPool::new(4).expect("spawn pool");
+        let pool = WorkerPool::new(4, single_node_topo()).expect("spawn pool");
         // For nr_queues=4 we expect distinct workers per qid for the
         // same export name (assuming the qid_seed actually distributes).
         let mut seen = std::collections::HashSet::new();
         for qid in 0..4u16 {
-            seen.insert(pool.worker_for("test-export", qid).idx);
+            seen.insert(pool.worker_for("test-export", qid, None).idx);
         }
         // Best-effort: ≥ 2 distinct workers across 4 qids. (4/4 distinct
         // is not guaranteed for arbitrary inputs but the seed is chosen
         // to be a permutation; if this fails we want to know.)
         assert!(seen.len() >= 2, "qid_seed didn't spread: only {} workers", seen.len());
+        pool.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_partitions_workers_across_two_nodes() {
+        // 4 total workers, 2 nodes → 2 per node.
+        let topo: Arc<dyn NodeTopology> = Arc::new(FakeTopology::two_node(2, 2));
+        let pool = WorkerPool::new(4, topo).expect("spawn pool");
+        assert_eq!(pool.num_workers(), 4);
+        assert_eq!(pool.num_nodes(), 2);
+        pool.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_gives_each_node_a_worker_even_when_undersized() {
+        // 1 total requested, 2 nodes → must still get 1 per node so
+        // a device pinned to either node is placeable.
+        let topo: Arc<dyn NodeTopology> = Arc::new(FakeTopology::two_node(2, 2));
+        let pool = WorkerPool::new(1, topo).expect("spawn pool");
+        assert_eq!(pool.num_workers(), 2);
+        assert_eq!(pool.num_nodes(), 2);
+        pool.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_for_with_preferred_node_stays_in_node() {
+        // 8 total, 2 nodes → 4 per node. Workers 0..4 belong to node 0,
+        // 4..8 to node 1.
+        let topo: Arc<dyn NodeTopology> = Arc::new(FakeTopology::two_node(4, 4));
+        let pool = WorkerPool::new(8, topo).expect("spawn pool");
+        for qid in 0..16u16 {
+            let w = pool.worker_for("any-export", qid, Some(0));
+            assert!(w.idx < 4, "preferred node 0 must land in 0..4, got {}", w.idx);
+        }
+        for qid in 0..16u16 {
+            let w = pool.worker_for("any-export", qid, Some(1));
+            assert!(
+                w.idx >= 4 && w.idx < 8,
+                "preferred node 1 must land in 4..8, got {}", w.idx
+            );
+        }
+        pool.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_for_spreads_qids_across_nodes_when_no_preference() {
+        // Without a preferred node we should still see both nodes
+        // hosting at least one qid for a typical 4-queue device.
+        let topo: Arc<dyn NodeTopology> = Arc::new(FakeTopology::two_node(2, 2));
+        let pool = WorkerPool::new(4, topo).expect("spawn pool");
+        let mut seen_workers = std::collections::HashSet::new();
+        for qid in 0..8u16 {
+            seen_workers.insert(pool.worker_for("export-name", qid, None).idx);
+        }
+        assert!(
+            seen_workers.len() >= 2,
+            "round-robin fallback didn't spread across workers: {seen_workers:?}"
+        );
+        pool.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_for_unknown_node_falls_back_to_global() {
+        // FakeTopology has nodes 0..1; asking for node 7 should fall
+        // back to the global round-robin rather than panicking.
+        let topo: Arc<dyn NodeTopology> = Arc::new(FakeTopology::two_node(2, 2));
+        let pool = WorkerPool::new(4, topo).expect("spawn pool");
+        // Just exercise it across a range of qids; we only care that
+        // it doesn't panic and lands somewhere valid.
+        for qid in 0..8u16 {
+            let w = pool.worker_for("x", qid, Some(7));
+            assert!(w.idx < 4);
+        }
         pool.shutdown().await.expect("shutdown");
     }
 }
