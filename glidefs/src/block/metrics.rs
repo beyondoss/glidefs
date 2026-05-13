@@ -107,6 +107,11 @@ pub struct ExportMetrics {
     file_read_latencies: SampledHistogram,
     file_write_latencies: SampledHistogram,
     s3_put_latencies: SampledHistogram,
+
+    /// Per-op size histograms. Drives sizing decisions for `IO_BUF_BYTES` and
+    /// the per-worker bounce pool. Lock-free.
+    pub read_io_sizes: IoSizeHistogram,
+    pub write_io_sizes: IoSizeHistogram,
 }
 
 /// Simple histogram for latency tracking.
@@ -216,6 +221,90 @@ impl LatencyHistogram {
     }
 }
 
+/// Lock-free histogram of I/O sizes (bytes per guest read or write).
+///
+/// Buckets are powers-of-two up to `IO_BUF_BYTES` (128 KB). Pure atomic adds —
+/// no mutex — because all we record per op is a bucket index and a running sum.
+/// This is in the per-I/O hot path; it must stay cheap.
+#[derive(Debug)]
+pub struct IoSizeHistogram {
+    /// [<4K, <8K, <16K, <32K, <64K, <128K, >=128K]
+    buckets: [AtomicU64; 7],
+    sum_bytes: AtomicU64,
+}
+
+impl IoSizeHistogram {
+    pub fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            sum_bytes: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub fn record(&self, bytes: u64) {
+        let idx = if bytes < 4096 { 0 }
+            else if bytes < 8192 { 1 }
+            else if bytes < 16384 { 2 }
+            else if bytes < 32768 { 3 }
+            else if bytes < 65536 { 4 }
+            else if bytes < 131072 { 5 }
+            else { 6 };
+        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
+        self.sum_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> IoSizeSnapshot {
+        let mut buckets = [0u64; 7];
+        for (i, b) in self.buckets.iter().enumerate() {
+            buckets[i] = b.load(Ordering::Relaxed);
+        }
+        let count = buckets.iter().sum();
+        IoSizeSnapshot {
+            count,
+            sum_bytes: self.sum_bytes.load(Ordering::Relaxed),
+            buckets,
+        }
+    }
+}
+
+impl Default for IoSizeHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Snapshot of an `IoSizeHistogram`. Prometheus-emittable as a histogram with
+/// `le` boundaries at 4K, 8K, 16K, 32K, 64K, 128K.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct IoSizeSnapshot {
+    pub count: u64,
+    pub sum_bytes: u64,
+    /// [<4K, <8K, <16K, <32K, <64K, <128K, >=128K]
+    pub buckets: [u64; 7],
+}
+
+impl IoSizeSnapshot {
+    /// `metric_name` should be like `glidefs_read_io_size_bytes`; `label` is the
+    /// pre-formatted label string (e.g. `export="vol1"`).
+    pub fn write_prometheus(&self, out: &mut String, metric_name: &str, label: &str) {
+        use std::fmt::Write;
+        if self.count == 0 {
+            return;
+        }
+        const LE: [&str; 6] = ["4096", "8192", "16384", "32768", "65536", "131072"];
+        let mut cumulative = 0u64;
+        for (i, le) in LE.iter().enumerate() {
+            cumulative += self.buckets[i];
+            let _ = writeln!(out, "{metric_name}_bucket{{{label},le=\"{le}\"}} {cumulative}");
+        }
+        cumulative += self.buckets[6];
+        let _ = writeln!(out, "{metric_name}_bucket{{{label},le=\"+Inf\"}} {cumulative}");
+        let _ = writeln!(out, "{metric_name}_sum{{{label}}} {}", self.sum_bytes);
+        let _ = writeln!(out, "{metric_name}_count{{{label}}} {}", self.count);
+    }
+}
+
 /// Snapshot of latency histogram data.
 #[derive(Debug, Clone, Serialize)]
 pub struct LatencySnapshot {
@@ -300,6 +389,8 @@ impl Default for ExportMetrics {
             file_read_latencies: SampledHistogram::new(),
             file_write_latencies: SampledHistogram::new(),
             s3_put_latencies: SampledHistogram::new(),
+            read_io_sizes: IoSizeHistogram::new(),
+            write_io_sizes: IoSizeHistogram::new(),
         }
     }
 }
@@ -347,6 +438,7 @@ impl ExportMetrics {
     pub fn record_guest_write(&self, bytes: u64) {
         self.guest_bytes_written.fetch_add(bytes, Ordering::Relaxed);
         self.guest_write_ops.fetch_add(1, Ordering::Relaxed);
+        self.write_io_sizes.record(bytes);
     }
 
     /// Record a guest read operation.
@@ -354,6 +446,7 @@ impl ExportMetrics {
     pub fn record_guest_read(&self, bytes: u64) {
         self.guest_bytes_read.fetch_add(bytes, Ordering::Relaxed);
         self.guest_read_ops.fetch_add(1, Ordering::Relaxed);
+        self.read_io_sizes.record(bytes);
     }
 
     /// Record an S3 batch write operation.
@@ -503,6 +596,9 @@ impl ExportMetrics {
         let file_write_latency = Some(self.file_write_latencies.snapshot());
         let s3_put_latency = Some(self.s3_put_latencies.snapshot());
 
+        let read_io_size = self.read_io_sizes.snapshot();
+        let write_io_size = self.write_io_sizes.snapshot();
+
         MetricsSnapshot {
             guest_bytes_written,
             guest_write_ops,
@@ -540,6 +636,8 @@ impl ExportMetrics {
             file_read_latency,
             file_write_latency,
             s3_put_latency,
+            read_io_size,
+            write_io_size,
         }
     }
 }
@@ -628,6 +726,17 @@ pub struct MetricsSnapshot {
     /// S3 PUT latencies
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s3_put_latency: Option<LatencySnapshot>,
+
+    /// Distribution of guest read sizes (bytes)
+    #[serde(skip_serializing_if = "io_size_is_empty")]
+    pub read_io_size: IoSizeSnapshot,
+    /// Distribution of guest write sizes (bytes)
+    #[serde(skip_serializing_if = "io_size_is_empty")]
+    pub write_io_size: IoSizeSnapshot,
+}
+
+fn io_size_is_empty(s: &IoSizeSnapshot) -> bool {
+    s.count == 0
 }
 
 impl MetricsSnapshot {
@@ -723,6 +832,12 @@ impl MetricsSnapshot {
         if let Some(ref lat) = self.s3_put_latency {
             lat.write_prometheus(&mut out, "glidefs_s3_put_latency_seconds", &label);
         }
+
+        // I/O size histograms (Prometheus histogram, le boundaries in bytes)
+        self.read_io_size
+            .write_prometheus(&mut out, "glidefs_read_io_size_bytes", &label);
+        self.write_io_size
+            .write_prometheus(&mut out, "glidefs_write_io_size_bytes", &label);
 
         out
     }
@@ -885,5 +1000,63 @@ mod tests {
 
         let snapshot = metrics.snapshot();
         assert!((snapshot.cache_hit_rate - 0.75).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_io_size_histogram_buckets() {
+        let h = IoSizeHistogram::new();
+        // One into each bucket boundary
+        h.record(512);       // <4K  -> bucket 0
+        h.record(4096);      // <8K  -> bucket 1
+        h.record(12000);     // <16K -> bucket 2
+        h.record(20000);     // <32K -> bucket 3
+        h.record(50000);     // <64K -> bucket 4
+        h.record(100_000);   // <128K -> bucket 5
+        h.record(131_072);   // >=128K -> bucket 6
+        h.record(1_000_000); // >=128K -> bucket 6
+
+        let s = h.snapshot();
+        assert_eq!(s.count, 8);
+        assert_eq!(s.buckets, [1, 1, 1, 1, 1, 1, 2]);
+        assert_eq!(s.sum_bytes, 512 + 4096 + 12000 + 20000 + 50000 + 100_000 + 131_072 + 1_000_000);
+    }
+
+    #[test]
+    fn test_io_size_recorded_on_guest_ops() {
+        let m = ExportMetrics::new();
+        m.record_guest_write(4096);
+        m.record_guest_write(131_072);
+        m.record_guest_read(4096);
+
+        let s = m.snapshot();
+        assert_eq!(s.write_io_size.count, 2);
+        assert_eq!(s.write_io_size.buckets[1], 1); // 4096 -> <8K
+        assert_eq!(s.write_io_size.buckets[6], 1); // 131072 -> >=128K
+        assert_eq!(s.read_io_size.count, 1);
+        assert_eq!(s.read_io_size.buckets[1], 1); // 4096 -> <8K
+    }
+
+    #[test]
+    fn test_io_size_prometheus_emission() {
+        let m = ExportMetrics::new();
+        m.record_guest_read(4096);
+        m.record_guest_read(8192);
+        m.record_guest_read(131_072);
+
+        let s = m.snapshot();
+        let mut out = String::new();
+        s.read_io_size
+            .write_prometheus(&mut out, "glidefs_read_io_size_bytes", "export=\"vol1\"");
+        // Bucket assignment: bytes < 8192 → bucket "<8K"; bytes < 16384 → "<16K"; bytes >= 131072 → ">=128K".
+        // So 4096 lands in <8K, 8192 in <16K, 131072 in >=128K.
+        // Cumulative le buckets: le=4096 (0), le=8192 (1: just 4096), le=16384 (2: +8192),
+        // le=131072 (2: 131072 is the ">=128K" bucket), +Inf (3).
+        assert!(out.contains("le=\"4096\"} 0"), "got:\n{}", out);
+        assert!(out.contains("le=\"8192\"} 1"), "got:\n{}", out);
+        assert!(out.contains("le=\"16384\"} 2"), "got:\n{}", out);
+        assert!(out.contains("le=\"131072\"} 2"), "got:\n{}", out);
+        assert!(out.contains("le=\"+Inf\"} 3"), "got:\n{}", out);
+        assert!(out.contains("_count{export=\"vol1\"} 3"), "got:\n{}", out);
+        assert!(out.contains("_sum{export=\"vol1\"} 143360"), "got:\n{}", out);
     }
 }

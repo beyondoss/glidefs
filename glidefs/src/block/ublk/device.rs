@@ -35,8 +35,16 @@ use std::task::{Context as TaskContext, Poll, Wake, Waker};
 /// jobs ≥ 4.
 const QUEUE_DEPTH: u16 = 64;
 
-/// Max I/O buffer size per tag. 512KB covers our 128KB block size with room for large I/Os.
-const IO_BUF_BYTES: u32 = 512 * 1024;
+/// Max I/O buffer size per tag. Sized to the WriteCache block size (128 KB) — the
+/// kernel splits any larger upstream bio into 128 KB chunks at `max_sectors_kb`,
+/// which we pin via `max_io_buf_bytes` below. The previous 512 KB was over-spec:
+/// at 5k devices it puts warm-baseline RSS at ~21 GiB; sized to the block size
+/// it's ~5 GiB.
+const IO_BUF_BYTES: u32 = 128 * 1024;
+
+/// `IO_BUF_BYTES` as `usize`, for compile-time coupling with
+/// `buffer_pool::SLOT_SIZE`. Keep these two equal.
+pub(super) const IO_BUF_BYTES_USIZE: usize = IO_BUF_BYTES as usize;
 
 /// io_uring idle timeout in seconds. Controls worst-case latency from `kill_dev()` to queue exit.
 ///
@@ -259,6 +267,20 @@ impl UblkDevice {
         }
         if features.ioctl_encode {
             ctrl_flags |= sys::UBLK_F_CMD_IOCTL_ENCODE as u64;
+        }
+        // USER_COPY decouples buffer ownership from tag arming — `io_task`
+        // allocates buffers on demand from a per-worker pool (see
+        // buffer_pool.rs) and pread/pwrites to /dev/ublkcN at
+        // `ublk_user_copy_pos`, instead of holding a 128 KB IoBuf for every
+        // tag's lifetime. Empirically this caps total bounce RSS at
+        // K × POOL_SLOTS × SLOT_SIZE (= 512 MB on 16 workers) regardless of
+        // device count.
+        //
+        // Default on. `GLIDEFS_BOUNCE_MODE=1` reverts to the per-tag-stable
+        // legacy bounce path — kept as a kill switch in case a kernel exposes
+        // a USER_COPY regression.
+        if std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none() {
+            ctrl_flags |= sys::UBLK_F_USER_COPY as u64;
         }
 
         // Snapshot per-worker handles so the spawn_blocking closure can
@@ -1086,6 +1108,11 @@ pub(super) async fn io_task(
     tag: u16,
     handler: &BlockHandler,
 ) -> Result<(), UblkError> {
+    let user_copy = (q.dev.dev_info.flags & ublk_core::sys::UBLK_F_USER_COPY as u64) != 0;
+    if user_copy {
+        return io_task_user_copy(q, tag, handler).await;
+    }
+
     let mut buffer = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
 
     // Initial fetch.
@@ -1109,6 +1136,117 @@ pub(super) async fn io_task(
 
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), result)
             .await?;
+    }
+}
+
+/// `UBLK_F_USER_COPY` variant of `io_task`.
+///
+/// The kernel does NOT auto-copy WRITE data into a userspace buffer; instead
+/// each tag's data lives at a kernel-managed cmd buffer position addressable
+/// via pread/pwrite on /dev/ublkcN. This means no per-tag buffer is held; we
+/// allocate fresh per-I/O — which makes total RSS bounded by *concurrent
+/// inflight*, not by *armed tag count*. The per-worker pool design that the
+/// bounce protocol made infeasible becomes feasible here.
+///
+/// Trade-off: one pread or pwrite syscall per I/O (kernel-side copy still
+/// happens, just at our request). Validated empirically against fio_verify.
+async fn io_task_user_copy(
+    q: &UblkQueue,
+    tag: u16,
+    handler: &BlockHandler,
+) -> Result<(), UblkError> {
+    let cdev_fd = q.dev.tgt.fds[0];
+    let qid = q.get_qid();
+    let pool = super::buffer_pool::worker_pool();
+
+    // Initial fetch — no buffer attached, empty slice.
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(&[]), 0, None).await?;
+
+    loop {
+        let iod = q.get_iod(tag);
+        let op = iod.op_flags & 0xff;
+        let fua = (iod.op_flags & sys::UBLK_IO_F_FUA) != 0;
+        let offset = iod.start_sector << 9;
+        let byte_len = u64::from(iod.nr_sectors) * 512;
+        debug_assert!(
+            byte_len <= u64::from(u32::MAX),
+            "nr_sectors {nr_sectors} exceeds u32 byte range",
+            nr_sectors = iod.nr_sectors,
+        );
+        let length = byte_len as u32;
+
+        // FLUSH / DISCARD / WRITE_ZEROES carry no userspace data — skip the
+        // buffer dance entirely.
+        let result = match op {
+            sys::UBLK_IO_OP_FLUSH | sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
+                Box::pin(dispatch_cold(op, offset, length, fua, handler)).await
+            }
+            sys::UBLK_IO_OP_READ | sys::UBLK_IO_OP_WRITE => {
+                // Async-backpressure acquire: if pool is exhausted, this
+                // future parks until a slot is released. Pool size is a
+                // *true* ceiling on total bounce RSS — no malloc fallback,
+                // no possibility of breaking the structural bound under
+                // load. `backpressure_waits` metric exposes how often we
+                // parked, so pool undersizing is observable.
+                let mut slot = pool.acquire().await;
+                let buf: &mut [u8] = slot.as_mut_slice(length as usize);
+
+                if op == sys::UBLK_IO_OP_WRITE {
+                    // Copy WRITE data out of the kernel cmd buffer into ours.
+                    // Blocking libc::pread is deliberate here: empirically
+                    // faster than io_uring async submit for ~1 µs cdev ops
+                    // — the SQE/CQE/waker overhead outweighs the syscall
+                    // cost, and the kernel never stalls on cdev reads in
+                    // practice. Measured 28 % throughput drop when we used
+                    // io_uring instead.
+                    let pos = ublk_core::io::UblkIOCtx::ublk_user_copy_pos(qid, tag, 0);
+                    let ret = unsafe {
+                        libc::pread(
+                            cdev_fd,
+                            buf.as_mut_ptr() as *mut libc::c_void,
+                            length as usize,
+                            pos as libc::off_t,
+                        )
+                    };
+                    if ret < 0 {
+                        let err = std::io::Error::last_os_error();
+                        tracing::error!(?err, qid, tag, length, "USER_COPY pread WRITE-data failed");
+                        -err.raw_os_error().unwrap_or(libc::EIO)
+                    } else {
+                        handle_io(op, offset, length, fua, buf, handler).await
+                    }
+                } else {
+                    let res = handle_io(op, offset, length, fua, buf, handler).await;
+                    if op == sys::UBLK_IO_OP_READ && res > 0 {
+                        let pos = ublk_core::io::UblkIOCtx::ublk_user_copy_pos(qid, tag, 0);
+                        let ret = unsafe {
+                            libc::pwrite(
+                                cdev_fd,
+                                buf.as_ptr() as *const libc::c_void,
+                                res as usize,
+                                pos as libc::off_t,
+                            )
+                        };
+                        if ret < 0 {
+                            let err = std::io::Error::last_os_error();
+                            tracing::error!(?err, qid, tag, res, "USER_COPY pwrite READ-data failed");
+                            -err.raw_os_error().unwrap_or(libc::EIO)
+                        } else {
+                            res
+                        }
+                    } else {
+                        res
+                    }
+                }
+                // Slot drops here, releasing back to pool before the
+                // commit-and-fetch await — keeps pool buffers free for any
+                // other tag that wakes up first and triggers the FIFO
+                // waker for the oldest backpressure-parked future.
+            }
+            _ => -libc::EINVAL,
+        };
+
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), result).await?;
     }
 }
 

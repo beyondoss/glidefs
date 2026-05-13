@@ -1,0 +1,110 @@
+USER_COPY + per-worker pool — empirical validation
+Run: 2026-05-12, host paraglide (16-core, single-NUMA, NVMe), 32 GB RAM
+Kernel: 6.12.74+deb13+1-amd64
+Branch: jared/moar-fix
+Pool: 16 workers × 256 slots × 128 KB = 512 MB hard cap
+Activation: GLIDEFS_USERCOPY=1 env var (opt-in, default off)
+
+==============================================================================
+Correctness
+==============================================================================
+
+fio_verify (5/5 cases pass under USER_COPY+pool; full 6/6 already passed
+under naive USER_COPY without pool):
+  - fio_verify_sequential          PASS
+  - fio_verify_random              PASS
+  - fio_verify_mixed               PASS
+  - fio_verify_after_cold_wake     PASS
+  - fio_verify_random_cold_wake    PASS
+
+==============================================================================
+Memory at N=1025 (25 prod + 1000 stress exports, cold; nr_queues=4)
+==============================================================================
+
+                            VmRSS      VmSize     VmData     ΔRSS/exp   ΔVmSize/exp
+Bounce (today)              4.38 GB    44.23 GB   39.28 GB    4.0 MB     35.5 MB
+USER_COPY naive (no pool)   7.40 GB    46.42 GB   41.14 GB    7.0 MB     ~36 MB
+USER_COPY + pool            1.71 GB     8.34 GB    4.90 GB    1.4 MB      1.2 MB
+                            -----      ------     ------     -----      -----
+Pool vs bounce              -61%       -81%       -88%       -65%       -97%
+
+The VmSize win is the structural finding: 30× less virtual memory per
+export. The per-tag-stable bounce protocol pre-reserved 256 × 128 KB =
+32 MB of bounce VAS per export; USER_COPY uses no per-tag buffer at all,
+so per-export VmSize = cdev fd + io_cmd_buf (4 queues × 16 KB) + tokio
+task state + metadata ≈ 1.2 MB.
+
+==============================================================================
+Throughput at N=1025, 32-device randrw bs=4k depth=16 jobs=1, 30 s
+==============================================================================
+
+                            IOPS         Δ
+Bounce                      612,364      baseline
+USER_COPY naive             774,541      +27%
+USER_COPY + pool            655,330       +7%
+
+USER_COPY+pool is no slower than bounce at this density (within noise).
+The pool's bounded size keeps RSS predictable; the syscall cost of
+pread/pwrite to /dev/ublkcN is masked by the high concurrency.
+
+==============================================================================
+5k device projection
+==============================================================================
+
+                            VmSize        VmRSS (cold)    Fits in 16 GB?
+Bounce                      ~178 GB       ~20 GB          NO
+USER_COPY + pool            ~  6 GB       ~ 7.5 GB        YES
+
+The pool's hard cap (512 MB system-wide) plus ~1.2 MB per-export overhead
+projects to 5k devices comfortably on a 16 GB host. Bounce at the same
+density requires a 32+ GB host just for buffer pre-allocation.
+
+==============================================================================
+What the pool gave us beyond naive USER_COPY
+==============================================================================
+
+Naive USER_COPY (vec![0u8; length] per I/O) does not deliver the structural
+win because jemalloc's elastic thread-local caches let RSS expand under
+setup-time allocation bursts and never fully contract. The pool delivers
+because:
+
+1. Fixed mmap-backed allocation. Hard cap = SLOT_SIZE × POOL_SLOTS ×
+   K_workers regardless of activity bursts. Cannot grow under load.
+2. LIFO free-list. Recently-released slots stay hot in L1/L2; cache
+   locality compounds the syscall savings.
+3. Pre-fault on init. One-time 32 MB memset per worker pays page faults
+   up front. First I/O per tag does not pay a fault.
+4. Fallback path. On pool exhaustion (sustained concurrent S3 awaits),
+   io_task falls back to malloc. Counters expose this so saturation is
+   observable.
+
+==============================================================================
+Configuration knobs (glidefs/src/block/ublk/buffer_pool.rs)
+==============================================================================
+
+  POOL_SLOTS = 256       # concurrent buffer-holding futures per worker
+  SLOT_SIZE  = 128 KB    # must match IO_BUF_BYTES
+
+Total pool RSS = K_workers × POOL_SLOTS × SLOT_SIZE
+              = 16 × 256 × 128 KB
+              = 512 MB
+
+To tune for hosts with different K_workers or higher concurrent S3-await
+expectation, raise POOL_SLOTS. Each +64 slots adds 8 MB per worker.
+
+==============================================================================
+What's still TBD before turning this on by default
+==============================================================================
+
+1. Run scripts/ublk_bench.py baseline against USER_COPY+pool and compare
+   to M7-acceptance.txt; if single-device IOPS and 8-device aggregate
+   both hold within 5%, default the env var on.
+
+2. Optimize the per-I/O pread/pwrite via io_uring (currently blocking
+   libc::pread / libc::pwrite). The blocking syscall cost is the main
+   throughput delta vs bounce; io_uring would close most of it.
+
+3. Cold-recovery stress: validate USER_COPY through a recover() cycle
+   (kill -9 daemon, restart, devices come back QUIESCED → recovered).
+   The protocol is the same shape so this should just work, but worth
+   checking explicitly.
