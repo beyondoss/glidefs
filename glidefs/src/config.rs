@@ -217,12 +217,14 @@ pub struct NbdConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_connections: Option<usize>,
 
-    /// Maximum total exports the router will host (default: 256).
+    /// Maximum total exports the router will host (default: 20_000).
     /// `POST /api/exports` past this cap returns 409 Conflict. Each export
     /// holds a write_cache file, per-export caches, ublk worker queues
     /// (for ublk transport), and 2 background tasks; without a cap a
     /// tenant can exhaust file descriptors and memory by creating
-    /// thousands of exports.
+    /// thousands of exports. Measured per-export RSS at warm baseline is
+    /// ~5 MB (with `IO_BUF_BYTES=128K`), so 20k caps the worst case
+    /// around 100 GB — operators on smaller instances should lower this.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub max_exports: Option<usize>,
 
@@ -376,7 +378,12 @@ impl NbdConfig {
     }
 
     pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
-    pub const DEFAULT_MAX_EXPORTS: usize = 256;
+    /// Cap on total exports the router will host. Sized for ~5k production
+    /// density with 4× headroom. At 5k devices each export costs ~5 MB RSS
+    /// (measured), so 20k is the operational ceiling, not the expected
+    /// steady-state. Operators should still tune this via
+    /// `[servers.nbd] max_exports` for smaller instances.
+    pub const DEFAULT_MAX_EXPORTS: usize = 20_000;
     pub const DEFAULT_API_MAX_CONNECTIONS: usize = 256;
 
     /// Cap on concurrent NBD client connections (TCP + Unix).

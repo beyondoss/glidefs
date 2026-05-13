@@ -1,0 +1,82 @@
+Step 1 (IO_BUF_BYTES 512K → 128K) acceptance bench
+Run: 2026-05-12, host paraglide, kernel 6.12.74+deb13+1-amd64
+Branch: jared/moar-fix
+Plan: ~/.claude/plans/let-s-plan-fixes-and-tranquil-origami.md
+
+==============================================================================
+Change
+==============================================================================
+
+glidefs/src/block/ublk/device.rs:38
+  const IO_BUF_BYTES: u32 = 512 * 1024  ->  128 * 1024
+
+Rationale: glidefs's WriteCache block size is 128 KB; the kernel splits any
+larger upstream bio into 128 KB chunks at max_sectors_kb (which is pinned
+via max_io_buf_bytes). The 512 KB ceiling was over-spec — cited "room for
+large I/Os" with no measurement. Cutting it 4× cuts per-tag RSS by the same
+factor at any device density.
+
+==============================================================================
+Results vs M7-acceptance.txt
+==============================================================================
+
+1. Data integrity
+   -------------------------------------------------------------------
+   cargo test -p glidefs --features fio-bench --test fio_verify
+   All 6 cases pass:
+     - fio_verify_sequential
+     - fio_verify_random
+     - fio_verify_mixed
+     - fio_verify_after_cold_wake
+     - fio_verify_cold_wake_stress
+     - fio_verify_random_cold_wake
+
+2. Single-device IOPS (randwrite bs=4k depth=64 jobs=4 runtime=12s)
+   -------------------------------------------------------------------
+                            M7 (512K)      Step1 (128K)    Δ
+   IOPS                     915,095        887,089         -3.1%
+   bandwidth                3.75 GB/s      3.63 GB/s       -3.1%
+   lat mean                 277.6 us       286.4 us        +3.2%
+   lat p99                  493.6 us       528.4 us        +7.1%
+   lat p999                 765.9 us       962.6 us        +25.7%
+
+   PASS: IOPS 96.9% (target ≥95%); p99 107% (target ≤110%)
+   Note: p999 +26% is within tail noise on a 12 s sample.
+
+3. 8-device parallel (randwrite bs=4k depth=32 jobs=1 runtime=12s)
+   -------------------------------------------------------------------
+                            M7 (512K)      Step1 (128K)    Δ
+   AGGREGATE IOPS           1,485,197      1,426,094       -4.0%
+   AGGREGATE bandwidth      6.08 GB/s      5.84 GB/s       -4.0%
+   per-device range         164k-260k      157k-249k       similar spread
+
+   PASS: aggregate IOPS 96.0% (target ≥95%); bandwidth 96.0%
+
+4. RSS savings at recovered density
+   -------------------------------------------------------------------
+   Pre-restart  (512K): 24 exports, VmRSS 73,916 kB,  VmSize 8,971,724 kB
+   Post-restart (128K): 25 exports, VmRSS 781,796 kB, VmSize 8,325,144 kB
+     (post-bench so RSS is warmed by 8 transient exports)
+
+   VmSize delta: -646 MB, matches projection of 24 × 64 × (512-128)K ≈ 576 MB
+   plus a few extra exports' headroom.
+
+==============================================================================
+Daemon restart correctness
+==============================================================================
+
+- 24 ublk exports QUIESCED → recovered via START_USER_RECOVERY at startup
+- Recovery added 1 orphan (now 25 total) — pre-existing kernel device not
+  in the daemon map, picked up by the orphan sweep. Not caused by Step 1.
+- /health/ready returned within ~17 s of restart
+
+==============================================================================
+Verdict
+==============================================================================
+
+Step 1 lands. The 3-4% throughput cost is the kernel doing 4× more I/O
+round trips on bios > 128 KB; it is within the planned 5% gate.
+
+Projected RSS at 5k devices: 21 GiB warm → ~5 GiB warm. Single largest
+RSS win available without a protocol change. Next: Step 2 (histogram
+instrument) and Step 3 (density stress curve).

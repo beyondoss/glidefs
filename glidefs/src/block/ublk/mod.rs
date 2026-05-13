@@ -18,6 +18,7 @@
 //! - Native multi-queue (per-CPU io_uring instances)
 //! - Batched commit+fetch eliminates round-trips
 
+pub mod buffer_pool;
 pub mod device;
 mod ffi_layout;
 pub mod numa;

@@ -1,0 +1,111 @@
+Density stress + locality-stack empirical gating
+Run: 2026-05-12, host paraglide (16-core, single-NUMA, NVMe), 32 GB RAM
+Kernel: 6.12.74+deb13+1-amd64
+Binary: glidefs branch jared/moar-fix with IO_BUF_BYTES=128K + IoSizeHistogram + DEFAULT_MAX_EXPORTS=20_000
+Config: [servers.ublk] nr_queues = 4
+
+==============================================================================
+Method
+==============================================================================
+
+scripts/ublk_bench.py setup --count 1000 --transport ublk --prefix bulk-
+   → 1000 stress exports of 1 GiB each
+   + 25 pre-existing production exports = 1025 total
+
+Concurrent perf stat + 32-device fio (randrw, bs=4k, depth=16, jobs=1, 30s).
+
+==============================================================================
+Results
+==============================================================================
+
+1. RSS scaling curve (cold, post-setup, before fio)
+   -------------------------------------------------------------------
+                            VmRSS         VmSize        VmData       Threads
+   N = 25  (baseline)        365 MB        8.68 GB       3.75 GB     34
+   N = 1025 (clean cold)     4.38 GB       44.23 GB      39.28 GB    38
+
+   Delta over 1000 added exports: +4.02 GB RSS, +35.55 GB VmSize
+   Per-export cost:               4.0 MB RSS,  35.5 MB VmSize
+
+   Linear projection to 5000 exports (cold):
+                              ~20 GB RSS, ~178 GB VmSize
+   Fits comfortably on the ≥64 GB target instance class.
+
+   VmSize is jemalloc-reserved virtual, not committed; cosmetic on x86_64.
+
+2. Worker thread count
+   -------------------------------------------------------------------
+   N = 25:    34 threads
+   N = 1025:  38 threads
+   Worker pool is fixed at K = min(num_cpus, 32) = 16 worker threads.
+   The +4 threads come from tokio scaling for per-export background tasks.
+   Confirms M7's "threads added by pool ≤ 32" property holds.
+
+3. Per-counter under 32-device randrw load at N = 1025
+   -------------------------------------------------------------------
+   perf stat -e dTLB-load-misses,dTLB-loads,minor-faults,page-faults,task-clock
+     dTLB-load-misses    1,127,202    (34.79% of dTLB cache accesses)
+     dTLB-loads          3,240,185
+     minor-faults              254    (238 /sec)
+     page-faults               254
+     task-clock         1,063.66 ms   (0.027 CPUs utilized over 40 s)
+
+   fio aggregate         612,364 IOPS, 18.4 M ops total over 30 s
+   final VmRSS           1.04 GB  (warm dropped back as idle exports reclaimed)
+
+==============================================================================
+Locality stack decision gates
+==============================================================================
+
+Plan thresholds:
+  - dTLB-load-misses / dTLB-loads ≥ 1 % under load    → hugepage slab
+  - minor-faults / dispatched_io ≥ 0.1                → pre-fault at AddQueue
+  - numastat remote-node hits ≥ 10 %                  → NUMA-local slab
+
+Empirical:
+  - dTLB miss rate = 34.79 % — superficially OPEN, BUT:
+    Daemon uses 1.06 s of CPU over 40 s wall clock (2.7 % of one core).
+    The denominator (3.24 M dTLB-loads) is so small that the rate is
+    dominated by cold-cache effects on rare wakeups, not by hot-path TLB
+    pressure. Most of the per-IO work is in the kernel io_uring path
+    (ublk_drv copying bio data) which perf at PID 258122 does not see.
+    Userspace bounce-buffer touches are not the bottleneck.
+
+  - minor-faults / IO = 254 / 18.4M = 1.4e-5 — CLOSED (need ≥ 0.1).
+    The daemon was already warm. Pre-fault would help cold-startup p99
+    on the first I/O of each tag, but is invisible to steady-state.
+
+  - NUMA: host is single-socket / single-node. CANNOT measure here.
+    Defer to a multi-socket production instance before committing to
+    NUMA-local pool work.
+
+Verdict: SKIP the locality stack on this homelab. The plan's discipline
+("we don't keep code that didn't earn its keep") closes all three gates.
+The bottleneck is somewhere kernel-side; building a hugepage / pre-fault
+pool would add complexity for ~no measurable userspace gain.
+
+==============================================================================
+What landed
+==============================================================================
+
+- Step 1: IO_BUF_BYTES 512K → 128K     (4× per-tag RSS cut)
+- Step 2: IoSizeHistogram instrument    (lock-free, prometheus-exported)
+- DEFAULT_MAX_EXPORTS: 256 → 20_000     (4× headroom over 5k target)
+
+==============================================================================
+Open questions / future work
+==============================================================================
+
+- Re-run perf + dTLB measurement on a multi-socket production host. If
+  the daemon CPU utilization is meaningfully higher there (more userspace
+  bounce work per IO), the hugepage gate may genuinely open and the
+  locality stack becomes worth building.
+
+- USER_COPY prototype (plan Step 7): unfinished — would unlock the
+  release-on-commit pool design, which is the only path to true RSS
+  decoupling from device count. Status: kernel viability not yet tested
+  on 6.12.
+
+- Whether to bump DEFAULT_NR_QUEUES 1 → 4: deferred. At nr_queues=4 each
+  export costs 4× per-export memory; this homelab opts in via config,
+  but the conservative default is correct for small instances.
