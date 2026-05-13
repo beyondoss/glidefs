@@ -896,10 +896,10 @@ where
                 // RSS bound is being broken via the malloc fallback path.
                 use std::sync::atomic::Ordering;
                 use crate::block::ublk::buffer_pool::{
-                    GLOBAL_ACQUIRES, GLOBAL_EXHAUST_FALLBACKS, GLOBAL_POOLS_INITIALIZED,
+                    GLOBAL_ACQUIRES, GLOBAL_BACKPRESSURE_WAITS, GLOBAL_POOLS_INITIALIZED,
                 };
                 let acq = GLOBAL_ACQUIRES.load(Ordering::Relaxed);
-                let exh = GLOBAL_EXHAUST_FALLBACKS.load(Ordering::Relaxed);
+                let waits = GLOBAL_BACKPRESSURE_WAITS.load(Ordering::Relaxed);
                 let pools = GLOBAL_POOLS_INITIALIZED.load(Ordering::Relaxed);
                 let _ = writeln!(
                     output,
@@ -909,13 +909,13 @@ where
                 let _ = writeln!(output, "glidefs_ublk_buffer_pool_acquires_total {acq}");
                 let _ = writeln!(
                     output,
-                    "# HELP glidefs_ublk_buffer_pool_exhaust_fallbacks_total USER_COPY bounce-buffer acquires that fell back to heap because the per-worker pool was full. Sustained non-zero means the structural RSS bound is being broken — raise POOL_SLOTS."
+                    "# HELP glidefs_ublk_buffer_pool_backpressure_waits_total USER_COPY bounce-buffer acquires that had to park because the per-worker pool was full. Throughput drops gracefully; RSS stays bounded. Sustained non-zero means the pool is undersized for the workload — raise POOL_SLOTS."
                 );
                 let _ = writeln!(
                     output,
-                    "# TYPE glidefs_ublk_buffer_pool_exhaust_fallbacks_total counter"
+                    "# TYPE glidefs_ublk_buffer_pool_backpressure_waits_total counter"
                 );
-                let _ = writeln!(output, "glidefs_ublk_buffer_pool_exhaust_fallbacks_total {exh}");
+                let _ = writeln!(output, "glidefs_ublk_buffer_pool_backpressure_waits_total {waits}");
                 let _ = writeln!(
                     output,
                     "# HELP glidefs_ublk_buffer_pool_workers_initialized Number of ublk worker threads that have allocated their per-thread buffer pool"

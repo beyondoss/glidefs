@@ -1182,17 +1182,14 @@ async fn io_task_user_copy(
                 Box::pin(dispatch_cold(op, offset, length, fua, handler)).await
             }
             sys::UBLK_IO_OP_READ | sys::UBLK_IO_OP_WRITE => {
-                // Try pool first; fall back to heap if exhausted (rare; the
-                // pool is sized for realistic concurrent bursts).
-                let mut slot_opt = pool.acquire();
-                let mut fallback: Vec<u8> = Vec::new();
-                let buf: &mut [u8] = match slot_opt.as_mut() {
-                    Some(slot) => slot.as_mut_slice(length as usize),
-                    None => {
-                        fallback.resize(length as usize, 0);
-                        &mut fallback[..]
-                    }
-                };
+                // Async-backpressure acquire: if pool is exhausted, this
+                // future parks until a slot is released. Pool size is a
+                // *true* ceiling on total bounce RSS — no malloc fallback,
+                // no possibility of breaking the structural bound under
+                // load. `backpressure_waits` metric exposes how often we
+                // parked, so pool undersizing is observable.
+                let mut slot = pool.acquire().await;
+                let buf: &mut [u8] = slot.as_mut_slice(length as usize);
 
                 if op == sys::UBLK_IO_OP_WRITE {
                     // Copy WRITE data out of the kernel cmd buffer into ours.
@@ -1241,9 +1238,10 @@ async fn io_task_user_copy(
                         res
                     }
                 }
-                // Slot (or fallback Vec) drops here, releasing back to pool
-                // before the commit-and-fetch await — keeping pool buffers
-                // free for any other tag that wakes up first.
+                // Slot drops here, releasing back to pool before the
+                // commit-and-fetch await — keeps pool buffers free for any
+                // other tag that wakes up first and triggers the FIFO
+                // waker for the oldest backpressure-parked future.
             }
             _ => -libc::EINVAL,
         };
