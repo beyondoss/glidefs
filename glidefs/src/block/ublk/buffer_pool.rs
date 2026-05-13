@@ -38,17 +38,11 @@ pub static GLOBAL_POOLS_INITIALIZED: AtomicU64 = AtomicU64::new(0);
 /// Slots per worker. 256 × 128 KB = 32 MB per worker.
 const POOL_SLOTS: usize = 256;
 
-/// Slot size in bytes. Must match `device::IO_BUF_BYTES` — enforced at
-/// build time via the `const _: () = assert!(...)` below.
-pub const SLOT_SIZE: usize = 128 * 1024;
-
-// Compile-time coupling: slot size must equal the daemon's max I/O buffer.
-// If you bump `IO_BUF_BYTES` without updating `SLOT_SIZE`, the build fails
-// here rather than in production with truncated I/Os.
-const _: () = assert!(
-    SLOT_SIZE == super::device::IO_BUF_BYTES_USIZE,
-    "buffer_pool::SLOT_SIZE must equal device::IO_BUF_BYTES — they are coupled by design"
-);
+/// Slot size in bytes. Single source of truth is `device::IO_BUF_BYTES`;
+/// the pool re-exports it under this name for readability inside this
+/// module. Changing the daemon's max I/O buffer size touches exactly one
+/// constant, not two.
+pub const SLOT_SIZE: usize = super::device::IO_BUF_BYTES_USIZE;
 
 pub struct WorkerBufferPool {
     region: *mut u8,
