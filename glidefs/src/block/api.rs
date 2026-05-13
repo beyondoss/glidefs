@@ -924,8 +924,9 @@ pub struct ApiServer {
 
 impl ApiServer {
     /// Create a new API server with an unlimited connection budget. Test
-    /// only — production callers use `new_with_limiter`.
-    #[cfg(test)]
+    /// only — production callers use `new_with_limiter`. Available under
+    /// `cfg(test)` or the `test-utils` feature.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn new(router: Arc<ExportRouter>, addr: SocketAddr) -> Self {
         Self::new_with_limiter(router, addr, Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)))
     }

@@ -194,8 +194,10 @@ pub struct NBDServer {
 impl NBDServer {
     /// Create a TCP NBD server with an unlimited connection budget.
     /// Test/benchmark only — production callers use
-    /// `new_tcp_with_limiter`.
-    #[cfg(test)]
+    /// `new_tcp_with_limiter`. Available to both this crate's `cfg(test)`
+    /// and external test crates that depend on the `test-utils` feature
+    /// (e.g. `docker_integration`).
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn new_tcp(router: Arc<ExportRouter>, socket: SocketAddr) -> Self {
         Self::new_tcp_with_limiter(router, socket, Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)))
     }
@@ -217,7 +219,8 @@ impl NBDServer {
     }
 
     /// Create a Unix socket NBD server with an unlimited connection budget.
-    #[cfg(test)]
+    /// Available under `cfg(test)` or the `test-utils` feature.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn new_unix(router: Arc<ExportRouter>, socket_path: impl Into<std::path::PathBuf>) -> Self {
         Self::new_unix_with_limiter(
             router,
