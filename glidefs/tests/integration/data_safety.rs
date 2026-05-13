@@ -2223,6 +2223,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
                 default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
             })
             .await
             .unwrap(),
@@ -2288,6 +2289,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
                 default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
             })
             .await
             .unwrap(),
@@ -2581,6 +2583,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
                 default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
             })
             .await
             .unwrap(),
@@ -2634,6 +2637,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
                 default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 4,
                 nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
             })
             .await
             .unwrap(),

@@ -79,6 +79,25 @@ pub struct ExportMetrics {
     /// Recovery issues (WAL replay failure, block map load failure)
     pub recovery_warnings: AtomicU64,
 
+    /// Lifetime count of times the per-export flush task has panicked and
+    /// been auto-restarted by the supervisor. Non-zero = something is
+    /// reliably broken in this export's flush path; investigate logs.
+    pub flush_task_panics: AtomicU64,
+
+    /// 1 if the per-export flush supervisor has given up auto-restarting
+    /// (consecutive_panics exceeded the cap). 0 otherwise. While set,
+    /// dirty blocks accumulate in the write_cache and will eventually
+    /// trigger SSD-pressure rejection of new writes. Operator must
+    /// investigate and restart the daemon.
+    pub flush_degraded: AtomicU64,
+
+    /// 1 if a mutating handler (write/trim/write_zeroes/flush) panicked
+    /// while holding `WriteCache` state mid-mutation, leaving shared
+    /// state potentially poisoned. While set, every op against the
+    /// affected handler returns EIO. Daemon restart is required to
+    /// re-establish a known-good state via WAL replay + S3 recovery.
+    pub write_cache_degraded: AtomicU64,
+
     // Latency tracking for diagnosing performance issues (sampled 1:64).
     // Each histogram has its own sample counter so high-frequency operation types
     // (e.g. reads) don't starve low-frequency ones (e.g. S3 PUTs).
@@ -272,6 +291,9 @@ impl Default for ExportMetrics {
             manifest_pending: AtomicU64::new(0),
             manifest_last_sync_epoch: AtomicU64::new(0),
             recovery_warnings: AtomicU64::new(0),
+            flush_task_panics: AtomicU64::new(0),
+            flush_degraded: AtomicU64::new(0),
+            write_cache_degraded: AtomicU64::new(0),
             read_latencies: SampledHistogram::new(),
             write_latencies: SampledHistogram::new(),
             s3_fetch_latencies: SampledHistogram::new(),
@@ -502,6 +524,9 @@ impl ExportMetrics {
             manifest_pending: self.manifest_pending.load(Ordering::Relaxed) != 0,
             manifest_last_sync_epoch: self.manifest_last_sync_epoch.load(Ordering::Relaxed),
             recovery_warnings: self.recovery_warnings.load(Ordering::Relaxed),
+            flush_task_panics: self.flush_task_panics.load(Ordering::Relaxed),
+            flush_degraded: self.flush_degraded.load(Ordering::Relaxed) != 0,
+            write_cache_degraded: self.write_cache_degraded.load(Ordering::Relaxed) != 0,
             dirty_blocks: None,
             syncing_blocks: None,
             dirty_bytes: None,
@@ -545,6 +570,15 @@ pub struct MetricsSnapshot {
     /// Epoch seconds of the last successful manifest sync (0 = never synced)
     pub manifest_last_sync_epoch: u64,
     pub recovery_warnings: u64,
+    /// Lifetime count of per-export flush-task panics caught + auto-restarted.
+    pub flush_task_panics: u64,
+    /// True if the per-export flush supervisor gave up auto-restarting.
+    /// While true, dirty blocks accumulate and SSD pressure will eventually
+    /// reject new writes for this export.
+    pub flush_degraded: bool,
+    /// True if a mutating handler panicked and left write_cache state
+    /// potentially poisoned. While true, all ops on this export return EIO.
+    pub write_cache_degraded: bool,
 
     // Cache state (populated by router)
     /// Number of dirty blocks waiting to be synced to S3
@@ -647,6 +681,9 @@ impl MetricsSnapshot {
         let _ = writeln!(out, "glidefs_manifest_pending{{{label}}} {}", u64::from(self.manifest_pending));
         let _ = writeln!(out, "glidefs_manifest_last_sync_epoch{{{label}}} {}", self.manifest_last_sync_epoch);
         let _ = writeln!(out, "glidefs_recovery_warnings_total{{{label}}} {}", self.recovery_warnings);
+        let _ = writeln!(out, "glidefs_flush_task_panics_total{{{label}}} {}", self.flush_task_panics);
+        let _ = writeln!(out, "glidefs_flush_degraded{{{label}}} {}", u64::from(self.flush_degraded));
+        let _ = writeln!(out, "glidefs_write_cache_degraded{{{label}}} {}", u64::from(self.write_cache_degraded));
 
         // Cache state (gauges)
         if let Some(dirty) = self.dirty_blocks {
@@ -784,6 +821,12 @@ pub fn prometheus_header() -> &'static str {
 # TYPE glidefs_manifest_last_sync_epoch gauge
 # HELP glidefs_recovery_warnings_total Recovery issues (WAL replay failure, block map load failure)
 # TYPE glidefs_recovery_warnings_total counter
+# HELP glidefs_flush_task_panics_total Per-export flush-task panics caught and auto-restarted
+# TYPE glidefs_flush_task_panics_total counter
+# HELP glidefs_flush_degraded 1 if the flush supervisor gave up auto-restarting (dirty blocks accumulating)
+# TYPE glidefs_flush_degraded gauge
+# HELP glidefs_write_cache_degraded 1 if a mutating handler panicked and the write_cache is potentially poisoned (all ops return EIO until daemon restart)
+# TYPE glidefs_write_cache_degraded gauge
 # HELP glidefs_read_latency_seconds NBD read operation latency
 # TYPE glidefs_read_latency_seconds histogram
 # HELP glidefs_write_latency_seconds NBD write operation latency

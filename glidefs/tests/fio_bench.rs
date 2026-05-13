@@ -56,6 +56,7 @@ mod fio_bench {
                     default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
                     ublk_nr_queues: 4,
                     nbd_dead_conn_timeout: 0,
+                    max_exports: 10_000,
                 })
                 .await
                 .expect("failed to create router"),

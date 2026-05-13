@@ -8,6 +8,7 @@ use crate::task::spawn_named;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -107,9 +108,23 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             default_flush_threshold: nbd_config.flush_threshold(),
             ublk_nr_queues: settings.ublk_nr_queues(),
             nbd_dead_conn_timeout: nbd_config.nbd_dead_conn_timeout(),
+            max_exports: nbd_config.max_exports(),
         })
         .await
         .context("Failed to initialize export router")?,
+    );
+
+    // Shared connection budgets. NBD TCP + Unix listeners share a single
+    // semaphore so the total client count stays bounded regardless of how
+    // they connect. The HTTP API gets its own budget — control-plane and
+    // data-plane connections shouldn't compete.
+    let nbd_connection_limiter = Arc::new(Semaphore::new(nbd_config.max_connections()));
+    let api_connection_limiter = Arc::new(Semaphore::new(nbd_config.api_max_connections()));
+    info!(
+        "Connection budgets: NBD={}, API={}, exports max={}",
+        nbd_config.max_connections(),
+        nbd_config.api_max_connections(),
+        nbd_config.max_exports(),
     );
 
     // Discover exports from S3 (recovers exports created via API).
@@ -317,7 +332,11 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     if let Some(addresses) = &nbd_config.addresses {
         for addr in addresses {
             info!("Starting NBD server on {}", addr);
-            let nbd_server = NBDServer::new_tcp(Arc::clone(&router), *addr);
+            let nbd_server = NBDServer::new_tcp_with_limiter(
+                Arc::clone(&router),
+                *addr,
+                Arc::clone(&nbd_connection_limiter),
+            );
             let shutdown_clone = shutdown.clone();
             handles.push(spawn_named("nbd-tcp", async move {
                 nbd_server.start(shutdown_clone).await
@@ -331,7 +350,11 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
             "Starting NBD server on Unix socket {}",
             socket_path.display()
         );
-        let nbd_server = NBDServer::new_unix(Arc::clone(&router), socket_path);
+        let nbd_server = NBDServer::new_unix_with_limiter(
+            Arc::clone(&router),
+            socket_path,
+            Arc::clone(&nbd_connection_limiter),
+        );
         let shutdown_clone = shutdown.clone();
         handles.push(spawn_named("nbd-unix", async move {
             nbd_server.start(shutdown_clone).await
@@ -341,7 +364,11 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     // Start HTTP API server
     if let Some(api_addr) = nbd_config.api_address {
         info!("Starting HTTP API server on {}", api_addr);
-        let api_server = ApiServer::new(Arc::clone(&router), api_addr);
+        let api_server = ApiServer::new_with_limiter(
+            Arc::clone(&router),
+            api_addr,
+            Arc::clone(&api_connection_limiter),
+        );
         let shutdown_clone = shutdown.clone();
         handles.push(spawn_named("http-api", async move {
             api_server.start(shutdown_clone).await

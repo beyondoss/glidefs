@@ -210,6 +210,27 @@ pub struct NbdConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ublk_nr_queues: Option<u16>,
 
+    /// Maximum concurrent NBD client connections (TCP + Unix combined,
+    /// default: 1024). Past this cap, accept loops drop new connections
+    /// to prevent a tenant from OOM-killing the daemon by opening
+    /// thousands of sockets (each costs ~50–200KB of task + buffer state).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_connections: Option<usize>,
+
+    /// Maximum total exports the router will host (default: 256).
+    /// `POST /api/exports` past this cap returns 409 Conflict. Each export
+    /// holds a write_cache file, per-export caches, ublk worker queues
+    /// (for ublk transport), and 2 background tasks; without a cap a
+    /// tenant can exhaust file descriptors and memory by creating
+    /// thousands of exports.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_exports: Option<usize>,
+
+    /// Maximum concurrent HTTP API connections (default: 256).
+    /// Same OOM-protection rationale as `max_connections`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub api_max_connections: Option<usize>,
+
     /// NBD kernel device dead connection timeout in seconds (default: 30).
     /// Controls how long the kernel queues I/O when the socket disconnects
     /// (e.g., during a binary upgrade). Set to 0 to disable.
@@ -352,6 +373,27 @@ impl NbdConfig {
     /// NBD kernel device dead connection timeout in seconds (default: 30).
     pub fn nbd_dead_conn_timeout(&self) -> u32 {
         self.nbd_dead_conn_timeout.unwrap_or(30)
+    }
+
+    pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+    pub const DEFAULT_MAX_EXPORTS: usize = 256;
+    pub const DEFAULT_API_MAX_CONNECTIONS: usize = 256;
+
+    /// Cap on concurrent NBD client connections (TCP + Unix).
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+            .unwrap_or(Self::DEFAULT_MAX_CONNECTIONS)
+    }
+
+    /// Cap on total exports the router will host.
+    pub fn max_exports(&self) -> usize {
+        self.max_exports.unwrap_or(Self::DEFAULT_MAX_EXPORTS)
+    }
+
+    /// Cap on concurrent HTTP API connections.
+    pub fn api_max_connections(&self) -> usize {
+        self.api_max_connections
+            .unwrap_or(Self::DEFAULT_API_MAX_CONNECTIONS)
     }
 
     /// Get the list of exports, handling legacy single-device config.
@@ -697,6 +739,9 @@ impl Settings {
                     max_s3_downloads: None,
                     ublk_nr_queues: None,
                     nbd_dead_conn_timeout: None,
+                    max_connections: None,
+                    max_exports: None,
+                    api_max_connections: None,
                 }),
                 ublk: None,
             },

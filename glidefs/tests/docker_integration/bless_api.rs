@@ -236,6 +236,7 @@ async fn create_test_router(
             default_flush_threshold: 500,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .unwrap(),

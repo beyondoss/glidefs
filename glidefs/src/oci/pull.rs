@@ -3,16 +3,27 @@
 /// Pulls image layers from an OCI registry and merges them into a single ext4
 /// filesystem on GlideFS blocks. Layers are downloaded to temp files, then
 /// merged respecting OCI whiteout semantics (`.wh.*` and opaque whiteouts).
-use std::io::{self, Seek, Write};
+use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
 
 use flate2::read::GzDecoder;
 use oci_registry::{Credentials, OciDescriptor, Reference, ResolvedImage};
 use tokio_util::io::StreamReader;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::block::handler::BlockHandler;
 use crate::oci::ingest::IngestOptions;
+
+/// Hard cap on decompressed bytes per OCI layer. A malicious image can pack
+/// a multi-GB stream of zeros into a few-byte gzip blob; without a cap,
+/// `io::copy(GzDecoder, tmpfile)` writes all of it to disk and either fills
+/// the volume or OOMs the daemon. 16 GiB is generous enough for legitimate
+/// container layers (real images rarely exceed 1–2 GB per layer) while
+/// keeping a malicious blob from being able to wedge the host.
+///
+/// Note: this caps the *decompressed* size, not the network transfer. The
+/// registry client also enforces its own connect/read timeouts.
+pub const DEFAULT_MAX_LAYER_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 /// Pull an OCI image from a registry and ingest its layers into GlideFS blocks.
 ///
@@ -77,12 +88,17 @@ async fn pull_layer_to_tempfile(
 ) -> Result<std::fs::File, PullError> {
     let stream = client.pull_layer(image, layer, auth).await?;
     let async_reader = StreamReader::new(stream);
+    let layer_digest = layer.digest.clone();
 
     let file = tokio::task::spawn_blocking(move || {
         let sync_reader = tokio_util::io::SyncIoBridge::new(async_reader);
-        let mut decompressed = GzDecoder::new(sync_reader);
         let mut tmpfile = tempfile::tempfile()?;
-        io::copy(&mut decompressed, &mut tmpfile)?;
+        bounded_gz_copy(
+            sync_reader,
+            &mut tmpfile,
+            DEFAULT_MAX_LAYER_DECOMPRESSED_BYTES,
+            &layer_digest,
+        )?;
         tmpfile.seek(io::SeekFrom::Start(0))?;
         Ok::<_, io::Error>(tmpfile)
     })
@@ -92,6 +108,35 @@ async fn pull_layer_to_tempfile(
     Ok(file?)
 }
 
+/// Stream gzip data from `src` into `dst`, capped at `cap` decompressed bytes.
+///
+/// Uses `Read::take(cap + 1)` so we can distinguish "source ended at or under
+/// the cap" from "source had more bytes but we stopped" — the latter is the
+/// bomb signal. `layer_label` is included in the error / log for diagnostics.
+fn bounded_gz_copy<R: Read, W: Write>(
+    src: R,
+    dst: &mut W,
+    cap: u64,
+    layer_label: &str,
+) -> io::Result<u64> {
+    let mut bounded = GzDecoder::new(src).take(cap.saturating_add(1));
+    let written = io::copy(&mut bounded, dst)?;
+    if written > cap {
+        warn!(
+            layer = %layer_label,
+            cap_bytes = cap,
+            "layer decompression hit the cap — refusing as possible decompression bomb",
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "layer {layer_label}: decompressed size exceeds {cap}-byte cap (possible decompression bomb)",
+            ),
+        ));
+    }
+    Ok(written)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PullError {
     #[error("registry: {0}")]
@@ -99,4 +144,64 @@ pub enum PullError {
 
     #[error("io: {0}")]
     Io(#[from] io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    /// Build a gzip blob whose decompressed output is `decompressed_size`
+    /// bytes of zeros — i.e. a minimal decompression bomb.
+    fn make_zero_gz(decompressed_size: usize) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::best());
+        let chunk = [0u8; 64 * 1024];
+        let mut remaining = decompressed_size;
+        while remaining > 0 {
+            let n = remaining.min(chunk.len());
+            enc.write_all(&chunk[..n]).unwrap();
+            remaining -= n;
+        }
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn bounded_gz_copy_accepts_layer_under_cap() {
+        // 1 MB of zeros, cap at 4 MB — should pass.
+        let gz = make_zero_gz(1024 * 1024);
+        let mut dst = Vec::new();
+        let written =
+            bounded_gz_copy(&gz[..], &mut dst, 4 * 1024 * 1024, "test-ok").expect("under cap");
+        assert_eq!(written, 1024 * 1024);
+        assert_eq!(dst.len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn bounded_gz_copy_rejects_bomb_over_cap() {
+        // 2 MB of zeros compresses to a few KB; cap at 1 MB → bomb.
+        let gz = make_zero_gz(2 * 1024 * 1024);
+        let mut dst = Vec::new();
+        let err = bounded_gz_copy(&gz[..], &mut dst, 1024 * 1024, "test-bomb")
+            .expect_err("bomb must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("possible decompression bomb"),
+            "error message should flag bomb, got: {err}",
+        );
+        // dst received up to cap+1 bytes before the error fired.
+        assert!(dst.len() >= 1024 * 1024);
+        assert!(dst.len() <= 1024 * 1024 + 1);
+    }
+
+    #[test]
+    fn bounded_gz_copy_propagates_io_error_for_corrupt_gzip() {
+        // Random bytes that aren't valid gzip → decoder errors.
+        let garbage = vec![0xDEu8; 1024];
+        let mut dst = Vec::new();
+        let err = bounded_gz_copy(&garbage[..], &mut dst, 1024 * 1024, "test-corrupt")
+            .expect_err("corrupt gzip should error");
+        // Not our bomb error — should be an underlying decode error.
+        assert!(!err.to_string().contains("possible decompression bomb"));
+    }
 }

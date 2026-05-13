@@ -12,6 +12,7 @@
 //!   executor via `WorkerMsg::AddQueue`.
 
 use crate::block::handler::BlockHandler;
+use crate::task;
 use ublk_core::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use ublk_core::helpers::IoBuf;
 use ublk_core::io::{UblkDev, UblkQueue};
@@ -1111,6 +1112,63 @@ pub(super) async fn io_task(
     }
 }
 
+/// Run a mutating ublk handler call with panic isolation.
+///
+/// Mirrors the NBD-side `run_mutating_request` contract: a panic in
+/// `BlockHandler::write/trim/write_zeroes/flush` would otherwise leave
+/// `WriteCache` state poisoned (set_present called before pwrite + WAL
+/// append). Catching the panic here, marking the export degraded, and
+/// returning -EIO ensures peer ublk queues (or a re-attached device after
+/// next-daemon recovery) can't observe the poisoned state — every
+/// subsequent op short-circuits via `BlockHandler::check_not_degraded`.
+///
+/// `name` is the static op label used in logs/metrics (e.g. "ublk-write").
+async fn run_mutating<F, Fut>(name: &'static str, handler: &BlockHandler, op: F) -> i32
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), crate::block::error::CommandError>>,
+{
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+    match AssertUnwindSafe(op()).catch_unwind().await {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) => -e.to_linux_errno(),
+        Err(payload) => {
+            task::record_panic();
+            tracing::error!(
+                task = name,
+                "ublk mutating handler panicked: {}",
+                task::panic_message(payload.as_ref()),
+            );
+            handler.mark_degraded(name);
+            -libc::EIO
+        }
+    }
+}
+
+/// Synchronous variant for `BlockHandler::flush`. Same contract; uses
+/// `std::panic::catch_unwind` instead of the async `.catch_unwind()`.
+fn run_mutating_sync<F>(name: &'static str, handler: &BlockHandler, op: F) -> i32
+where
+    F: FnOnce() -> Result<(), crate::block::error::CommandError>,
+{
+    use std::panic::AssertUnwindSafe;
+    match std::panic::catch_unwind(AssertUnwindSafe(op)) {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) => -e.to_linux_errno(),
+        Err(payload) => {
+            task::record_panic();
+            tracing::error!(
+                task = name,
+                "ublk mutating handler panicked: {}",
+                task::panic_message(payload.as_ref()),
+            );
+            handler.mark_degraded(name);
+            -libc::EIO
+        }
+    }
+}
+
 /// Handle cold I/O ops (FLUSH, DISCARD, WRITE_ZEROES).
 ///
 /// Called via `Box::pin` from the I/O loop so these large async state machines
@@ -1123,18 +1181,16 @@ async fn dispatch_cold(
     handler: &BlockHandler,
 ) -> i32 {
     match op {
-        sys::UBLK_IO_OP_FLUSH => match handler.flush() {
-            Ok(()) => 0,
-            Err(e) => -e.to_linux_errno(),
-        },
-        sys::UBLK_IO_OP_DISCARD => match handler.trim(offset, length, fua).await {
-            Ok(()) => 0,
-            Err(e) => -e.to_linux_errno(),
-        },
-        sys::UBLK_IO_OP_WRITE_ZEROES => match handler.write_zeroes(offset, length, fua).await {
-            Ok(()) => 0,
-            Err(e) => -e.to_linux_errno(),
-        },
+        sys::UBLK_IO_OP_FLUSH => run_mutating_sync("ublk-flush", handler, || handler.flush()),
+        sys::UBLK_IO_OP_DISCARD => {
+            run_mutating("ublk-trim", handler, || handler.trim(offset, length, fua)).await
+        }
+        sys::UBLK_IO_OP_WRITE_ZEROES => {
+            run_mutating("ublk-write-zeroes", handler, || {
+                handler.write_zeroes(offset, length, fua)
+            })
+            .await
+        }
         _ => -libc::EINVAL,
     }
 }
@@ -1164,9 +1220,14 @@ async fn handle_io(
         }
         sys::UBLK_IO_OP_WRITE => {
             debug_assert_eq!(buf.len(), length as usize, "write buf/length mismatch");
-            match handler.write(offset, buf, fua).await {
-                Ok(()) => i32::try_from(length).unwrap_or(-libc::EIO),
-                Err(e) => -e.to_linux_errno(),
+            // Run through the panic-isolating wrapper so a write_cache
+            // panic marks the export degraded instead of poisoning peer
+            // queues (parallel to NBD's run_mutating_request).
+            let result = run_mutating("ublk-write", handler, || handler.write(offset, buf, fua)).await;
+            if result == 0 {
+                i32::try_from(length).unwrap_or(-libc::EIO)
+            } else {
+                result
             }
         }
         _ => Box::pin(dispatch_cold(op, offset, length, fua, handler)).await,
@@ -1312,6 +1373,47 @@ mod tests {
         let (handler, _dir) = make_handler(false).await;
         let result = handle_io(0xFF, 0, 0, false, &mut [], &handler).await;
         assert_eq!(result, -libc::EINVAL);
+    }
+
+    #[tokio::test]
+    async fn run_mutating_catches_panic_and_marks_degraded() {
+        // Exercises the wrapper directly with an injected panic — verifies
+        // that a panic in a mutating ublk op (a) doesn't escape, (b) returns
+        // -EIO so the kernel sees a clean error, and (c) marks the export
+        // degraded so peer queues short-circuit on the next op.
+        let (handler, _dir) = make_handler(false).await;
+        assert!(!handler.is_degraded());
+
+        let result = run_mutating("ublk-test-panic", &handler, || async {
+            panic!("simulated ublk handler panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await;
+
+        assert_eq!(result, -libc::EIO);
+        assert!(handler.is_degraded(), "panic must mark export degraded");
+
+        // Next mutating op short-circuits via check_not_degraded inside
+        // BlockHandler — confirms the protection actually fires for ublk
+        // requests, not just NBD.
+        let mut buf = vec![0x42u8; BLOCK_SIZE];
+        let next =
+            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+        assert_eq!(next, -libc::EIO);
+    }
+
+    #[tokio::test]
+    async fn run_mutating_sync_catches_panic_and_marks_degraded() {
+        let (handler, _dir) = make_handler(false).await;
+        assert!(!handler.is_degraded());
+
+        let result = run_mutating_sync("ublk-test-panic-sync", &handler, || {
+            panic!("simulated sync flush panic");
+        });
+
+        assert_eq!(result, -libc::EIO);
+        assert!(handler.is_degraded());
     }
 
     #[tokio::test]

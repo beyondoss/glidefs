@@ -25,3 +25,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3.21"
 anyhow = "1.0"
 parking_lot = "0.12"
+
+[lints]
+workspace = true

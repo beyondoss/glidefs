@@ -14,8 +14,49 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+/// Install a process-wide panic hook that records every panic before chaining
+/// to the default Rust hook. The hook fires for *all* panics — including those
+/// in `std::thread`-spawned ublk worker threads and in code reached before
+/// `tracing-subscriber` is initialized — so we always increment the counter
+/// and always emit a structured stderr line, even if `tracing::error!` is a
+/// no-op (no subscriber yet).
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        task::record_panic();
+        let message: String = if let Some(s) = info.payload().downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        let location: String = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        // Tracing path — useful once a subscriber is installed.
+        tracing::error!(
+            panic.message = %message,
+            panic.location = %location,
+            thread = thread_name,
+            "process-wide panic hook fired",
+        );
+        // Stderr fallback — covers panics that fire before tracing-subscriber
+        // is initialized in `cli::server::run_server`.
+        eprintln!(
+            "PANIC: {} at {} (thread '{}')",
+            message, location, thread_name
+        );
+        prev(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_panic_hook();
     let cli = cli::Cli::parse_args();
 
     match cli.command {
