@@ -163,7 +163,39 @@ impl WorkerHandle {
         let join = std::thread::Builder::new()
             .name(format!("ublk-worker-{idx}"))
             .spawn(move || {
-                worker_thread_main(idx, cpu, rx, tokio_handle, efd_for_thread, stats_for_thread)
+                // Catch panics at the worker boundary. A panic here would
+                // otherwise terminate the OS thread silently, orphaning
+                // every queue assigned to this worker (kernel devices
+                // remain in QUIESCED state until next-daemon recovery).
+                // Unwind drops the worker's UblkQueue/UblkDev locals via
+                // RAII, releasing the io_uring fixed-file slot and mmap
+                // before catch_unwind observes the panic.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_thread_main(
+                        idx,
+                        cpu,
+                        rx,
+                        tokio_handle,
+                        efd_for_thread,
+                        stats_for_thread,
+                    )
+                }));
+                if let Err(payload) = result {
+                    crate::task::record_panic();
+                    let msg = crate::task::panic_message(payload.as_ref());
+                    tracing::error!(
+                        worker = idx,
+                        cpu,
+                        "ublk worker thread panicked: {}",
+                        msg,
+                    );
+                    // Pool detects worker death lazily: subsequent
+                    // WorkerHandle::send to this worker fails with
+                    // SendError (channel disconnected because rx was
+                    // dropped during the unwind). That propagates as
+                    // an AddQueue/RemoveQueue failure to the caller,
+                    // which surfaces it via the existing error path.
+                }
             })?;
         Ok(Self { inbox: tx, eventfd, stats, join: Some(join), idx })
     }

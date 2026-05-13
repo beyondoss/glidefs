@@ -3,13 +3,60 @@ members = ["glidefs", "ext4", "oci-registry", "oci-distribution"]
 exclude = ["bench", "glidefs/loom-tests"]
 resolver = "2"
 
+[workspace.dependencies]
+static_assertions = "1.1"
+
 [profile.release]
 lto = true
 opt-level = 3
 codegen-units = 1
 strip = true
+# Catch silent integer overflows in production. The dangerous sites we know about
+# (pack_index_cache pack_offset arithmetic, volume_manifest size math) would
+# otherwise wrap and silently return wrong block contents to tenants. Hot paths
+# are I/O-bound; CPU work lives in 3p crates so cost is negligible in practice.
+overflow-checks = true
 
 [profile.ci]
 inherits = "release"
 lto = false
 codegen-units = 16
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
+# Workspace-wide lints. Restriction-level rules below are intentionally `warn`,
+# not `deny` — the goal in this wave is visibility. Each tenant-touching module
+# is expected to drive its own count to zero in Wave 3 (parser hardening) and
+# graduate to `deny` per-module afterwards.
+#
+# Note: vendored crates (ublk-core, ublk-sys) opt out by NOT setting
+# `[lints] workspace = true`; they keep their own `[lints]` blocks.
+[workspace.lints.clippy]
+# Real bugs — deny everywhere.
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+# Style/pedantic — warn locally, don't block CI.
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+# Restriction lints picked for crash-mode reduction (Wave 0).
+#
+# Three high-volume lints (`unwrap_used`, `arithmetic_side_effects`,
+# `indexing_slicing`) were dropped after producing ~4400 warnings of which
+# the vast majority were test-code unwraps and safe-in-context indexing.
+# The remaining lints below are smaller-volume and higher-signal. Real bugs
+# in the dropped categories are caught surgically during Wave 3 parser
+# hardening (e.g. checked_add for pack_index_cache pack_offset).
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+cast_lossless = "warn"
+expect_used = "warn"
+panic = "warn"
+unreachable = "warn"
+todo = "warn"
+unimplemented = "warn"
+string_slice = "warn"
+mutex_atomic = "warn"

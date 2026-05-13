@@ -75,6 +75,7 @@ zstd = "0.13"
 loom = { version = "0.7", optional = true }
 sha2 = "0.10"
 crc-fast = "1.10.0"
+static_assertions = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ublk-core = { path = "ublk-core", optional = true }
@@ -89,18 +90,8 @@ paste = "1"
 testcontainers = "0.26"
 testcontainers-modules = { version = "0.14", features = ["minio"] }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
-
-[lints.clippy]
-# Real bugs — deny in CI
-correctness = { level = "deny", priority = -1 }
-suspicious = { level = "deny", priority = -1 }
-# Style/pedantic — warn locally, don't block CI
-style = { level = "warn", priority = -1 }
-complexity = { level = "warn", priority = -1 }
-perf = { level = "warn", priority = -1 }
-pedantic = { level = "allow", priority = -1 }
+[lints]
+workspace = true
 
 [[example]]
 name = "measure_footprint"

@@ -19,6 +19,7 @@
 //! - Batched commit+fetch eliminates round-trips
 
 pub mod device;
+mod ffi_layout;
 pub mod numa;
 mod worker_pool;
 

@@ -7,6 +7,7 @@
 use super::cache::BlockCache;
 use super::content_store::ContentStore;
 use super::error::{CommandError, CommandResult};
+use crate::task;
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 use super::write_cache::CacheError;
 use super::metrics::ExportMetrics;
@@ -151,6 +152,21 @@ pub struct BlockHandler {
     /// Uses AtomicBool so promote_export can change it safely
     readonly: AtomicBool,
 
+    /// Set when a mutating handler (write/trim/write_zeroes/flush) panicked
+    /// while holding `WriteCache` state mid-mutation. The mutation order is
+    /// `set_present → pwrite → capture_page_crcs → transition_to_dirty →
+    /// wal_append`; a panic anywhere in that sequence leaves shared state
+    /// poisoned (e.g. blocks marked PRESENT with stale data, no WAL entry).
+    /// While set, all subsequent read/write/trim/write_zeroes/cache/flush
+    /// ops on this handler return `IoError` immediately so neither the
+    /// panicking client nor any peer connection on the same export can
+    /// observe the poisoned state.
+    ///
+    /// Intentionally has no clear-path: an operator restart of the daemon
+    /// triggers WAL replay + flush recovery from S3, which is the only
+    /// safe way back to a known-good state.
+    degraded: AtomicBool,
+
     /// I/O metrics for this export
     metrics: Arc<ExportMetrics>,
 
@@ -207,6 +223,7 @@ impl BlockHandler {
             volume_manifest,
             device_size: AtomicU64::new(device_size),
             readonly: AtomicBool::new(readonly),
+            degraded: AtomicBool::new(false),
             metrics,
             readahead: Mutex::new(SequentialDetector::new()),
             ssd_utilization,
@@ -234,6 +251,43 @@ impl BlockHandler {
     /// Used by promote_export to allow writes after migration.
     pub fn set_readonly(&self, readonly: bool) {
         self.readonly.store(readonly, Ordering::Relaxed);
+    }
+
+    /// True iff a mutating handler previously panicked. While set, every
+    /// op short-circuits to `CommandError::IoError`. See the field doc on
+    /// `degraded` for the safety rationale.
+    #[inline]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Mark this export as degraded after a panic in a mutating handler.
+    /// Idempotent. Logs + bumps the per-export metric on the first transition.
+    pub fn mark_degraded(&self, source: &str) {
+        if !self.degraded.swap(true, Ordering::AcqRel) {
+            // First-to-set wins the log + metric increment. This avoids
+            // log storms if many concurrent in-flight mutating ops panic
+            // in quick succession against the same handler.
+            self.metrics
+                .write_cache_degraded
+                .store(1, Ordering::Relaxed);
+            tracing::error!(
+                source,
+                "export marked degraded after mutating-handler panic; \
+                 all subsequent operations will return EIO until daemon restart",
+            );
+        }
+    }
+
+    /// Helper for the public ops: short-circuit to `IoError` if degraded.
+    /// Inlined so the happy path is a single atomic load.
+    #[inline]
+    fn check_not_degraded(&self) -> CommandResult<()> {
+        if self.degraded.load(Ordering::Relaxed) {
+            Err(CommandError::IoError)
+        } else {
+            Ok(())
+        }
     }
 
     /// Get the device size.
@@ -614,6 +668,7 @@ impl BlockHandler {
     /// Uses read-through caching: blocks not present locally are fetched from S3.
     pub async fn read(&self, offset: u64, length: u32) -> CommandResult<Bytes> {
         let start = Instant::now();
+        self.check_not_degraded()?;
 
         if offset >= self.device_size() {
             // Entirely beyond the device — return zeros. The kernel NBD
@@ -743,6 +798,7 @@ impl BlockHandler {
     /// the write touches blocks not yet present on SSD.
     pub async fn write(&self, offset: u64, data: &[u8], fua: bool) -> CommandResult<()> {
         let start = Instant::now();
+        self.check_not_degraded()?;
 
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
@@ -800,6 +856,7 @@ impl BlockHandler {
     /// methods (fallocate on Linux, static buffer fallback elsewhere).
     /// Returns error if the export is readonly.
     pub async fn trim(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
+        self.check_not_degraded()?;
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
         }
@@ -835,6 +892,7 @@ impl BlockHandler {
     ///
     /// Returns error if the export is readonly.
     pub async fn write_zeroes(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
+        self.check_not_degraded()?;
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
         }
@@ -868,6 +926,7 @@ impl BlockHandler {
 
     /// Cache hint - no-op for our implementation.
     pub fn cache(&self, offset: u64, length: u32) -> CommandResult<()> {
+        self.check_not_degraded()?;
         if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
@@ -882,6 +941,7 @@ impl BlockHandler {
     ///
     /// S3 sync happens asynchronously in the background via the sync worker.
     pub fn flush(&self) -> CommandResult<()> {
+        self.check_not_degraded()?;
         self.cache.flush().map_err(CommandError::from)
     }
 
@@ -1052,7 +1112,10 @@ impl BlockHandler {
             let pack_index_cache = Arc::clone(&self.pack_index_cache);
             let volume_manifest = Arc::clone(&self.volume_manifest);
             let content_store = Arc::clone(&self.content_store);
-            tokio::spawn(async move {
+            // Supervised: fire-and-forget readahead. A panic during
+            // prefetch (e.g. corrupt pack index) must not propagate;
+            // we just log + count and continue.
+            let _handle = task::spawn_supervised("readahead-prefetch", async move {
                 let _ = cache
                     .prefetch_chunk(
                         chunk_idx,
@@ -1206,6 +1269,52 @@ mod tests {
 
         // Now writes work
         assert!(handler.write(0, &data, false).await.is_ok());
+    }
+
+    // -- degraded-after-mutating-panic tests --------------------------------
+
+    #[tokio::test]
+    async fn degraded_short_circuits_all_ops_with_io_error() {
+        let (handler, _temp) = test_handler().await;
+        // Sanity: a read works pre-degradation.
+        handler.read(0, 1024).await.expect("baseline read should succeed");
+        let data = vec![1u8; 4096];
+        handler.write(0, &data, false).await.expect("baseline write should succeed");
+
+        // Simulate the panic-catcher's mark_degraded call.
+        handler.mark_degraded("test");
+        assert!(handler.is_degraded());
+
+        // Every op now returns IoError.
+        assert!(matches!(handler.read(0, 1024).await, Err(CommandError::IoError)));
+        assert!(matches!(handler.write(0, &data, false).await, Err(CommandError::IoError)));
+        assert!(matches!(handler.trim(0, 4096, false).await, Err(CommandError::IoError)));
+        assert!(matches!(handler.write_zeroes(0, 4096, false).await, Err(CommandError::IoError)));
+        assert!(matches!(handler.cache(0, 4096), Err(CommandError::IoError)));
+        assert!(matches!(handler.flush(), Err(CommandError::IoError)));
+    }
+
+    #[tokio::test]
+    async fn mark_degraded_is_idempotent_and_logs_once() {
+        let (handler, _temp) = test_handler().await;
+        let metrics = Arc::clone(&handler.metrics);
+        assert_eq!(metrics.write_cache_degraded.load(Ordering::Relaxed), 0);
+
+        handler.mark_degraded("first");
+        assert_eq!(metrics.write_cache_degraded.load(Ordering::Relaxed), 1);
+        assert!(handler.is_degraded());
+
+        // Second call is a no-op for the metric (still 1, not 2 — it's a
+        // gauge, not a counter, and the AcqRel swap returns the prior value).
+        handler.mark_degraded("second");
+        assert_eq!(metrics.write_cache_degraded.load(Ordering::Relaxed), 1);
+        assert!(handler.is_degraded());
+    }
+
+    #[tokio::test]
+    async fn fresh_handler_is_not_degraded() {
+        let (handler, _temp) = test_handler().await;
+        assert!(!handler.is_degraded());
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 use crate::block::metrics::prometheus_header;
 use crate::block::router::{ExportInfo, ExportRouter, RouterError};
 use crate::config::ExportConfig;
+use crate::task;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
@@ -938,7 +939,10 @@ impl ApiServer {
                             let router = Arc::clone(&self.router);
                             let io = TokioIo::new(stream);
 
-                            tokio::spawn(async move {
+                            // Supervised: a panic in one HTTP handler must
+                            // not bring down the API for other clients. The
+                            // connection's hyper service drops on unwind.
+                            let _handle = task::spawn_supervised("http-conn", async move {
                                 let service = service_fn(move |req| {
                                     let router = Arc::clone(&router);
                                     handle_request(router, req)

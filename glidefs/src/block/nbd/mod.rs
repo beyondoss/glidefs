@@ -22,6 +22,7 @@ pub(crate) mod netlink;
 use crate::block::protocol::TRANSMISSION_FLAGS;
 use crate::block::router::ExportRouter;
 use crate::block::server::handle_client_stream;
+use crate::task;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
@@ -57,7 +58,7 @@ pub struct NbdDeviceManager {
 struct NbdDevice {
     dev_index: i32,
     dev_path: PathBuf,
-    session_handle: JoinHandle<()>,
+    session_handle: JoinHandle<Result<(), task::Panicked>>,
     shutdown: CancellationToken,
 }
 
@@ -163,11 +164,15 @@ impl NbdDeviceManager {
         // one end for the kernel (via netlink).
         let (server_stream, client_stream) = UnixStream::pair()?;
 
-        // Spawn the server-side NBD session handler.
+        // Spawn the server-side NBD session handler. Supervised: a
+        // panic in the session must not propagate to the device-setup
+        // path. The session's CancellationToken is fired by the
+        // CancelOnDrop guard inside handle_client_stream's response
+        // writer, so dependent tasks tear down cleanly even on panic.
         let shutdown = CancellationToken::new();
         let session_shutdown = shutdown.clone();
         let session_export = export_name.to_string();
-        let session_handle = tokio::spawn(async move {
+        let session_handle = task::spawn_supervised("nbd-kernel-session", async move {
             if let Err(e) =
                 handle_client_stream(server_stream, router, session_shutdown).await
             {

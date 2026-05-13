@@ -15,9 +15,13 @@ use super::error::{NBDError, Result};
 use super::handler::{BlockHandler, BlockDevice};
 use super::protocol::*;
 use super::router::ExportRouter;
+use crate::task;
 use bytes::{Bytes, BytesMut};
 use deku::prelude::*;
+use futures::FutureExt;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
@@ -25,6 +29,106 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// RAII guard that cancels a `CancellationToken` on drop. Used to make sure a
+/// connection's reader loop wakes up if its response-writer task exits or
+/// panics — without it, the reader sits in `read_exact` forever while the
+/// writer is gone and the client times out.
+struct CancelOnDrop(CancellationToken);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Run a per-NBD-request handler future with panic isolation.
+///
+/// On normal completion the handler's `Response` is forwarded. On panic the
+/// helper synthesizes a `Response::Simple { error: NBD_EIO }` so the wire
+/// stays framed (the client demuxes on `cookie`) and optionally fires the
+/// connection's `CancellationToken` to tear the session down.
+///
+/// For mutating handlers (write/trim/write_zeroes/flush) prefer
+/// `run_mutating_request` — it additionally marks the export degraded so
+/// peer connections (multi-conn clients) can't observe the poisoned state.
+async fn run_request<F>(
+    name: &'static str,
+    cookie: u64,
+    response_tx: mpsc::Sender<Response>,
+    shutdown: CancellationToken,
+    error_payload_len: u32,
+    cancel_on_panic: bool,
+    f: F,
+) where
+    F: Future<Output = Response> + Send + 'static,
+{
+    match AssertUnwindSafe(f).catch_unwind().await {
+        Ok(resp) => {
+            let _ = response_tx.send(resp).await;
+        }
+        Err(payload) => {
+            task::record_panic();
+            let msg = task::panic_message(payload.as_ref());
+            error!(cookie, task = name, "NBD request handler panicked: {}", msg);
+            let data = if error_payload_len > 0 {
+                Bytes::from(vec![0u8; error_payload_len as usize])
+            } else {
+                Bytes::new()
+            };
+            let _ = response_tx
+                .send(Response::Simple {
+                    cookie,
+                    error: NBD_EIO,
+                    data,
+                })
+                .await;
+            if cancel_on_panic {
+                shutdown.cancel();
+            }
+        }
+    }
+}
+
+/// Run a per-NBD-request handler future for a *mutating* op (write/trim/
+/// write_zeroes). Same panic-to-EIO + cancel-connection contract as
+/// `run_request`, with one extra step: on panic, the export is marked
+/// **degraded** via `BlockHandler::mark_degraded`. While the mark is set,
+/// every subsequent op against the handler returns EIO immediately —
+/// including ops from peer connections that share the export — so no one
+/// can observe the poisoned `WriteCache` state. Daemon restart clears the
+/// mark via WAL replay + S3 recovery.
+async fn run_mutating_request<F>(
+    name: &'static str,
+    cookie: u64,
+    response_tx: mpsc::Sender<Response>,
+    shutdown: CancellationToken,
+    handler: Arc<BlockHandler>,
+    f: F,
+) where
+    F: Future<Output = Response> + Send + 'static,
+{
+    match AssertUnwindSafe(f).catch_unwind().await {
+        Ok(resp) => {
+            let _ = response_tx.send(resp).await;
+        }
+        Err(payload) => {
+            task::record_panic();
+            let msg = task::panic_message(payload.as_ref());
+            error!(cookie, task = name, "NBD mutating handler panicked: {}", msg);
+            // Bound the cross-connection blast radius: peer conns on this
+            // export will see EIO from this point, until daemon restart.
+            handler.mark_degraded(name);
+            let _ = response_tx
+                .send(Response::Simple {
+                    cookie,
+                    error: NBD_EIO,
+                    data: Bytes::new(),
+                })
+                .await;
+            shutdown.cancel();
+        }
+    }
+}
 
 /// Maximum number of in-flight requests before backpressure kicks in.
 /// This limits memory usage while allowing high concurrency.
@@ -104,7 +208,11 @@ impl NBDServer {
         let router = Arc::clone(&self.router);
         let client_shutdown = shutdown.child_token();
 
-        tokio::spawn(async move {
+        // Supervised: a panic inside one client's handler must not propagate
+        // out and take down peer connections or the accept loop. The
+        // CancellationToken is a child of the server token; on unwind the
+        // socket and child token drop and tear down dependent tasks.
+        let _handle = task::spawn_supervised("nbd-client", async move {
             if let Err(e) = handle_client_stream(stream, router, client_shutdown).await {
                 error!("Error handling NBD client {}: {}", client_name, e);
             }
@@ -579,8 +687,17 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
         // Channel for sending responses from handler tasks to writer task
         let (response_tx, response_rx) = mpsc::channel::<Response>(MAX_INFLIGHT_REQUESTS);
 
-        // Spawn writer task that serializes responses to the socket
-        let writer_handle = tokio::spawn(Self::response_writer(writer, response_rx, Arc::clone(&router)));
+        // Spawn writer task that serializes responses to the socket. The
+        // CancelOnDrop guard guarantees that if the writer task exits or
+        // panics for any reason, the connection's shutdown token is fired
+        // — without that, a writer panic leaves the reader loop blocked
+        // in `read_exact` indefinitely (no socket EOF, no cancellation).
+        let writer_router = Arc::clone(&router);
+        let writer_shutdown = shutdown.clone();
+        let writer_handle = task::spawn_supervised("nbd-response-writer", async move {
+            let _guard = CancelOnDrop(writer_shutdown);
+            Self::response_writer(writer, response_rx, writer_router).await
+        });
 
         // JoinSet to track all spawned request handler tasks
         let mut tasks: JoinSet<()> = JoinSet::new();
@@ -602,9 +719,17 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
         // Now drop the sender to signal writer task to finish
         drop(response_tx);
 
-        // Wait for writer to finish
-        if let Err(e) = writer_handle.await {
-            warn!("Writer task panicked: {:?}", e);
+        // Wait for writer to finish. spawn_supervised already logged any
+        // panic; we surface it here as an extra warning and rely on the
+        // CancelOnDrop guard above to have torn down the connection.
+        match writer_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(panicked)) => {
+                error!("nbd response writer panicked: {}", panicked.message);
+            }
+            Err(join_err) => {
+                error!("nbd response writer join error: {:?}", join_err);
+            }
         }
 
         result
@@ -693,28 +818,36 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
 
             match request.cmd_type {
                 NBDCommand::Read => {
-                    // Spawn task to handle read concurrently
+                    // Read is non-mutating; on panic, ack with EIO + zero
+                    // payload (NBD reply must include `length` bytes even
+                    // on error — many clients require it) and keep the
+                    // connection alive.
                     let h = Arc::clone(&handler);
                     let tx = response_tx.clone();
                     let offset = request.offset;
                     let length = request.length;
                     let cookie = request.cookie;
+                    let sd = shutdown.clone();
 
-                    tasks.spawn(async move {
-                        let result = h.read(offset, length).await;
-                        let response = match result {
-                            Ok(data) => Response::Simple { cookie, error: NBD_SUCCESS, data },
-                            Err(ref e) => {
-                                error!(offset, length, error = ?e, "NBD read failed");
-                                // Send zeros on read error — many NBD clients (including
-                                // the Linux kernel module) expect `length` bytes of data
-                                // in every read reply, even on error.
-                                let zeros = Bytes::from(vec![0u8; length as usize]);
-                                Response::Simple { cookie, error: e.to_nbd_errno(), data: zeros }
+                    tasks.spawn(run_request(
+                        "nbd-read",
+                        cookie,
+                        tx,
+                        sd,
+                        length,
+                        false,
+                        async move {
+                            let result = h.read(offset, length).await;
+                            match result {
+                                Ok(data) => Response::Simple { cookie, error: NBD_SUCCESS, data },
+                                Err(ref e) => {
+                                    error!(offset, length, error = ?e, "NBD read failed");
+                                    let zeros = Bytes::from(vec![0u8; length as usize]);
+                                    Response::Simple { cookie, error: e.to_nbd_errno(), data: zeros }
+                                }
                             }
-                        };
-                        let _ = tx.send(response).await;
-                    });
+                        },
+                    ));
                 }
                 NBDCommand::Write => {
                     // Must read write data from socket before spawning task
@@ -724,18 +857,30 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let tx = response_tx.clone();
                     let offset = request.offset;
                     let cookie = request.cookie;
+                    // Mutating handler — write_cache::write_inner is NOT
+                    // rollback-safe. run_mutating_request marks the
+                    // export degraded on panic so peer connections see
+                    // EIO too (not just this one's client).
+                    let sd = shutdown.clone();
+                    let mark_handler = Arc::clone(&h);
 
-                    tasks.spawn(async move {
-                        let result = match write_data {
-                            Ok(data) => h.write(offset, &data, fua).await,
-                            Err(e) => Err(e),
-                        };
-                        let response = match result {
-                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
-                        };
-                        let _ = tx.send(response).await;
-                    });
+                    tasks.spawn(run_mutating_request(
+                        "nbd-write",
+                        cookie,
+                        tx,
+                        sd,
+                        mark_handler,
+                        async move {
+                            let result = match write_data {
+                                Ok(data) => h.write(offset, &data, fua).await,
+                                Err(e) => Err(e),
+                            };
+                            match result {
+                                Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                                Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
+                            }
+                        },
+                    ));
                 }
                 NBDCommand::Disconnect => {
                     // Wait for all in-flight writes to complete before
@@ -753,10 +898,25 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     // so their pwrite()s complete, then fdatasync.
                     while tasks.join_next().await.is_some() {}
 
-                    let result = handler.flush();
-                    let response = match result {
-                        Ok(()) => Response::Simple { cookie: request.cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                        Err(e) => Response::Simple { cookie: request.cookie, error: e.to_nbd_errno(), data: Bytes::new() },
+                    // Synchronous handler.flush() runs in the reader loop
+                    // body, not a spawned task. A panic here would unwind
+                    // the entire reader loop and silently kill the
+                    // connection. Catch it explicitly: mark export
+                    // degraded, ack EIO, and tear down (flush panic
+                    // implies WAL or fsync poisoning; this and peer
+                    // connections cannot continue safely).
+                    let cookie = request.cookie;
+                    let response = match std::panic::catch_unwind(AssertUnwindSafe(|| handler.flush())) {
+                        Ok(Ok(())) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                        Ok(Err(e)) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
+                        Err(payload) => {
+                            task::record_panic();
+                            let msg = task::panic_message(payload.as_ref());
+                            error!(cookie, "NBD flush handler panicked: {}", msg);
+                            handler.mark_degraded("nbd-flush");
+                            shutdown.cancel();
+                            Response::Simple { cookie, error: NBD_EIO, data: Bytes::new() }
+                        }
                     };
                     let _ = response_tx.send(response).await;
                 }
@@ -766,15 +926,24 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let offset = request.offset;
                     let length = request.length;
                     let cookie = request.cookie;
+                    // Mutating handler (zero_range sets-present-before-fallocate).
+                    let sd = shutdown.clone();
+                    let mark_handler = Arc::clone(&h);
 
-                    tasks.spawn(async move {
-                        let result = h.trim(offset, length, fua).await;
-                        let response = match result {
-                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
-                        };
-                        let _ = tx.send(response).await;
-                    });
+                    tasks.spawn(run_mutating_request(
+                        "nbd-trim",
+                        cookie,
+                        tx,
+                        sd,
+                        mark_handler,
+                        async move {
+                            let result = h.trim(offset, length, fua).await;
+                            match result {
+                                Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                                Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
+                            }
+                        },
+                    ));
                 }
                 NBDCommand::WriteZeroes => {
                     let h = Arc::clone(&handler);
@@ -782,15 +951,24 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let offset = request.offset;
                     let length = request.length;
                     let cookie = request.cookie;
+                    // Mutating handler (same code path as Trim).
+                    let sd = shutdown.clone();
+                    let mark_handler = Arc::clone(&h);
 
-                    tasks.spawn(async move {
-                        let result = h.write_zeroes(offset, length, fua).await;
-                        let response = match result {
-                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
-                        };
-                        let _ = tx.send(response).await;
-                    });
+                    tasks.spawn(run_mutating_request(
+                        "nbd-write-zeroes",
+                        cookie,
+                        tx,
+                        sd,
+                        mark_handler,
+                        async move {
+                            let result = h.write_zeroes(offset, length, fua).await;
+                            match result {
+                                Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                                Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
+                            }
+                        },
+                    ));
                 }
                 NBDCommand::Cache => {
                     let h = Arc::clone(&handler);
@@ -798,15 +976,25 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                     let offset = request.offset;
                     let length = request.length;
                     let cookie = request.cookie;
+                    // Pure validation no-op; no shared mutation, no need
+                    // to tear down the connection on panic.
+                    let sd = shutdown.clone();
 
-                    tasks.spawn(async move {
-                        let result = h.cache(offset, length);
-                        let response = match result {
-                            Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
-                            Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
-                        };
-                        let _ = tx.send(response).await;
-                    });
+                    tasks.spawn(run_request(
+                        "nbd-cache",
+                        cookie,
+                        tx,
+                        sd,
+                        0,
+                        false,
+                        async move {
+                            let result = h.cache(offset, length);
+                            match result {
+                                Ok(()) => Response::Simple { cookie, error: NBD_SUCCESS, data: Bytes::new() },
+                                Err(e) => Response::Simple { cookie, error: e.to_nbd_errno(), data: Bytes::new() },
+                            }
+                        },
+                    ));
                 }
                 NBDCommand::Unknown(cmd) => {
                     warn!(
@@ -1232,5 +1420,165 @@ mod tests {
 
         let unix = Transport::Unix("/tmp/test.sock".into());
         assert!(matches!(unix, Transport::Unix(_)));
+    }
+
+    // -- run_request panic-isolation tests ----------------------------------
+
+    /// Helper: drain one Response from the channel under a short timeout.
+    async fn recv_one(rx: &mut mpsc::Receiver<Response>) -> Response {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for response")
+            .expect("channel closed before response")
+    }
+
+    #[tokio::test]
+    async fn run_request_happy_path_forwards_response() {
+        let (tx, mut rx) = mpsc::channel::<Response>(4);
+        let shutdown = CancellationToken::new();
+        let cookie = 0xdeadbeef_u64;
+
+        run_request(
+            "test-ok",
+            cookie,
+            tx,
+            shutdown.clone(),
+            0,
+            true, // cancel_on_panic is irrelevant on happy path
+            async move {
+                Response::Simple {
+                    cookie,
+                    error: NBD_SUCCESS,
+                    data: Bytes::from_static(b"ok"),
+                }
+            },
+        )
+        .await;
+
+        let resp = recv_one(&mut rx).await;
+        match resp {
+            Response::Simple { cookie: c, error, data } => {
+                assert_eq!(c, cookie);
+                assert_eq!(error, NBD_SUCCESS);
+                assert_eq!(&data[..], b"ok");
+            }
+            other => panic!("expected Response::Simple, got {:?}", other),
+        }
+        assert!(!shutdown.is_cancelled(), "happy path must not cancel");
+    }
+
+    #[tokio::test]
+    async fn run_request_panic_no_cancel_sends_eio() {
+        let (tx, mut rx) = mpsc::channel::<Response>(4);
+        let shutdown = CancellationToken::new();
+        let cookie = 7_u64;
+        let panic_before = task::panic_count();
+
+        run_request(
+            "test-panic-no-cancel",
+            cookie,
+            tx,
+            shutdown.clone(),
+            0,
+            false, // cache-shape: don't tear down connection
+            async move {
+                panic!("simulated handler panic");
+                #[allow(unreachable_code)]
+                Response::Simple {
+                    cookie,
+                    error: NBD_SUCCESS,
+                    data: Bytes::new(),
+                }
+            },
+        )
+        .await;
+
+        let resp = recv_one(&mut rx).await;
+        match resp {
+            Response::Simple { cookie: c, error, data } => {
+                assert_eq!(c, cookie, "EIO must carry original cookie for client demux");
+                assert_eq!(error, NBD_EIO);
+                assert!(data.is_empty(), "non-read EIO carries empty payload");
+            }
+            other => panic!("expected Response::Simple, got {:?}", other),
+        }
+        assert!(!shutdown.is_cancelled(), "cancel_on_panic=false must not fire token");
+        assert!(task::panic_count() > panic_before, "panic counter must increment");
+    }
+
+    #[tokio::test]
+    async fn run_request_panic_with_cancel_fires_token() {
+        let (tx, mut rx) = mpsc::channel::<Response>(4);
+        let shutdown = CancellationToken::new();
+        let cookie = 11_u64;
+
+        run_request(
+            "test-panic-cancel",
+            cookie,
+            tx,
+            shutdown.clone(),
+            0,
+            true, // write-shape: tear down connection
+            async move {
+                panic!("write handler poison");
+                #[allow(unreachable_code)]
+                Response::Simple {
+                    cookie,
+                    error: NBD_SUCCESS,
+                    data: Bytes::new(),
+                }
+            },
+        )
+        .await;
+
+        // EIO response was sent BEFORE cancellation fires (writer needs it
+        // to keep the wire framed).
+        let resp = recv_one(&mut rx).await;
+        match resp {
+            Response::Simple { error, .. } => assert_eq!(error, NBD_EIO),
+            other => panic!("expected Response::Simple, got {:?}", other),
+        }
+        assert!(shutdown.is_cancelled(), "cancel_on_panic=true must fire token");
+    }
+
+    #[tokio::test]
+    async fn run_request_panic_read_shape_zero_pads_payload() {
+        let (tx, mut rx) = mpsc::channel::<Response>(4);
+        let shutdown = CancellationToken::new();
+        let cookie = 99_u64;
+        let read_length: u32 = 4096;
+
+        run_request(
+            "test-panic-read",
+            cookie,
+            tx,
+            shutdown.clone(),
+            read_length,
+            false, // read is non-mutating
+            async move {
+                panic!("read handler boom");
+                #[allow(unreachable_code)]
+                Response::Simple {
+                    cookie,
+                    error: NBD_SUCCESS,
+                    data: Bytes::new(),
+                }
+            },
+        )
+        .await;
+
+        let resp = recv_one(&mut rx).await;
+        match resp {
+            Response::Simple { error, data, .. } => {
+                assert_eq!(error, NBD_EIO);
+                assert_eq!(
+                    data.len(),
+                    read_length as usize,
+                    "read replies must include `length` bytes even on error",
+                );
+                assert!(data.iter().all(|b| *b == 0), "payload must be zero-filled");
+            }
+            other => panic!("expected Response::Simple, got {:?}", other),
+        }
     }
 }
