@@ -24,13 +24,27 @@ use std::cell::{OnceCell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Global aggregates across all per-worker pools. `Send`-safe so the
+// /metrics endpoint (which runs on an arbitrary tokio worker, not a
+// ublk worker) can read them. Per-pool atomics remain for diagnostics.
+pub static GLOBAL_ACQUIRES: AtomicU64 = AtomicU64::new(0);
+pub static GLOBAL_EXHAUST_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+pub static GLOBAL_POOLS_INITIALIZED: AtomicU64 = AtomicU64::new(0);
+
 /// Slots per worker. 256 × 128 KB = 32 MB per worker.
 const POOL_SLOTS: usize = 256;
 
-/// Slot size in bytes. Matches `IO_BUF_BYTES` in `device.rs`. If
-/// `IO_BUF_BYTES` ever exceeds this, raise both — the pool is sized at
-/// build time, not runtime, by design.
+/// Slot size in bytes. Must match `device::IO_BUF_BYTES` — enforced at
+/// build time via the `const _: () = assert!(...)` below.
 pub const SLOT_SIZE: usize = 128 * 1024;
+
+// Compile-time coupling: slot size must equal the daemon's max I/O buffer.
+// If you bump `IO_BUF_BYTES` without updating `SLOT_SIZE`, the build fails
+// here rather than in production with truncated I/Os.
+const _: () = assert!(
+    SLOT_SIZE == super::device::IO_BUF_BYTES_USIZE,
+    "buffer_pool::SLOT_SIZE must equal device::IO_BUF_BYTES — they are coupled by design"
+);
 
 pub struct WorkerBufferPool {
     region: *mut u8,
@@ -92,10 +106,12 @@ impl WorkerBufferPool {
             Some(i) => i,
             None => {
                 self.exhaust_fallbacks.fetch_add(1, Ordering::Relaxed);
+                GLOBAL_EXHAUST_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         };
         self.acquires.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_ACQUIRES.fetch_add(1, Ordering::Relaxed);
         let offset = (idx as usize) * SLOT_SIZE;
         let ptr = unsafe { self.region.add(offset) };
         Some(PoolSlot {
@@ -157,10 +173,12 @@ thread_local! {
 pub fn worker_pool() -> Rc<WorkerBufferPool> {
     WORKER_POOL.with(|cell| {
         cell.get_or_init(|| {
-            Rc::new(
+            let pool = Rc::new(
                 WorkerBufferPool::new()
                     .expect("worker buffer pool mmap failed — OOM at init"),
-            )
+            );
+            GLOBAL_POOLS_INITIALIZED.fetch_add(1, Ordering::Relaxed);
+            pool
         })
         .clone()
     })

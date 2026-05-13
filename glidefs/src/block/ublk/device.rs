@@ -42,6 +42,10 @@ const QUEUE_DEPTH: u16 = 64;
 /// it's ~5 GiB.
 const IO_BUF_BYTES: u32 = 128 * 1024;
 
+/// `IO_BUF_BYTES` as `usize`, for compile-time coupling with
+/// `buffer_pool::SLOT_SIZE`. Keep these two equal.
+pub(super) const IO_BUF_BYTES_USIZE: usize = IO_BUF_BYTES as usize;
+
 /// io_uring idle timeout in seconds. Controls worst-case latency from `kill_dev()` to queue exit.
 ///
 /// When a queue has no inflight I/O, the thread blocks in `io_uring_enter()` for up to this
@@ -1192,6 +1196,12 @@ async fn io_task_user_copy(
 
                 if op == sys::UBLK_IO_OP_WRITE {
                     // Copy WRITE data out of the kernel cmd buffer into ours.
+                    // Blocking libc::pread is deliberate here: empirically
+                    // faster than io_uring async submit for ~1 µs cdev ops
+                    // — the SQE/CQE/waker overhead outweighs the syscall
+                    // cost, and the kernel never stalls on cdev reads in
+                    // practice. Measured 28 % throughput drop when we used
+                    // io_uring instead.
                     let pos = ublk_core::io::UblkIOCtx::ublk_user_copy_pos(qid, tag, 0);
                     let ret = unsafe {
                         libc::pread(

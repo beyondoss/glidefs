@@ -888,6 +888,40 @@ where
                         "glidefs_ublk_worker_hosted_queues{{worker=\"{idx}\"}} {hq}"
                     );
                 }
+
+                // USER_COPY bounce pool: total acquires, fallbacks, and how
+                // many worker pools have been initialized. `exhaust_fallbacks`
+                // > 0 sustained means the pool is undersized for this
+                // workload's concurrent S3-await pattern and the structural
+                // RSS bound is being broken via the malloc fallback path.
+                use std::sync::atomic::Ordering;
+                use crate::block::ublk::buffer_pool::{
+                    GLOBAL_ACQUIRES, GLOBAL_EXHAUST_FALLBACKS, GLOBAL_POOLS_INITIALIZED,
+                };
+                let acq = GLOBAL_ACQUIRES.load(Ordering::Relaxed);
+                let exh = GLOBAL_EXHAUST_FALLBACKS.load(Ordering::Relaxed);
+                let pools = GLOBAL_POOLS_INITIALIZED.load(Ordering::Relaxed);
+                let _ = writeln!(
+                    output,
+                    "# HELP glidefs_ublk_buffer_pool_acquires_total USER_COPY bounce buffers acquired from per-worker pool"
+                );
+                let _ = writeln!(output, "# TYPE glidefs_ublk_buffer_pool_acquires_total counter");
+                let _ = writeln!(output, "glidefs_ublk_buffer_pool_acquires_total {acq}");
+                let _ = writeln!(
+                    output,
+                    "# HELP glidefs_ublk_buffer_pool_exhaust_fallbacks_total USER_COPY bounce-buffer acquires that fell back to heap because the per-worker pool was full. Sustained non-zero means the structural RSS bound is being broken — raise POOL_SLOTS."
+                );
+                let _ = writeln!(
+                    output,
+                    "# TYPE glidefs_ublk_buffer_pool_exhaust_fallbacks_total counter"
+                );
+                let _ = writeln!(output, "glidefs_ublk_buffer_pool_exhaust_fallbacks_total {exh}");
+                let _ = writeln!(
+                    output,
+                    "# HELP glidefs_ublk_buffer_pool_workers_initialized Number of ublk worker threads that have allocated their per-thread buffer pool"
+                );
+                let _ = writeln!(output, "# TYPE glidefs_ublk_buffer_pool_workers_initialized gauge");
+                let _ = writeln!(output, "glidefs_ublk_buffer_pool_workers_initialized {pools}");
             }
             Response::builder()
                 .status(StatusCode::OK)
