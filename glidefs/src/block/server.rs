@@ -25,7 +25,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -182,27 +182,70 @@ pub enum Transport {
 pub struct NBDServer {
     router: Arc<ExportRouter>,
     transport: Transport,
+    /// Cap on concurrent client connections (TCP + Unix combined). One
+    /// `Arc<Semaphore>` is shared across all `NBDServer` instances created
+    /// with `new_tcp_with_limiter`/`new_unix_with_limiter` so a single
+    /// budget covers all listeners. Each accepted connection holds an
+    /// `OwnedSemaphorePermit` for its lifetime; the permit drops with
+    /// the client task.
+    connection_limiter: Arc<Semaphore>,
 }
 
 impl NBDServer {
-    /// Create a TCP NBD server.
+    /// Create a TCP NBD server with an unlimited connection budget.
+    /// Test/benchmark only — production callers use
+    /// `new_tcp_with_limiter`.
+    #[cfg(test)]
     pub fn new_tcp(router: Arc<ExportRouter>, socket: SocketAddr) -> Self {
+        Self::new_tcp_with_limiter(router, socket, Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)))
+    }
+
+    /// Create a TCP NBD server. The limiter caps concurrent connections
+    /// across this server and any peer servers sharing the same limiter
+    /// (e.g. multiple TCP listeners + a Unix socket listener all sharing
+    /// one budget from `nbd.max_connections`).
+    pub fn new_tcp_with_limiter(
+        router: Arc<ExportRouter>,
+        socket: SocketAddr,
+        connection_limiter: Arc<Semaphore>,
+    ) -> Self {
         Self {
             router,
             transport: Transport::Tcp(socket),
+            connection_limiter,
         }
     }
 
-    /// Create a Unix socket NBD server.
+    /// Create a Unix socket NBD server with an unlimited connection budget.
+    #[cfg(test)]
     pub fn new_unix(router: Arc<ExportRouter>, socket_path: impl Into<std::path::PathBuf>) -> Self {
+        Self::new_unix_with_limiter(
+            router,
+            socket_path,
+            Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
+        )
+    }
+
+    /// Create a Unix socket NBD server with a shared connection limiter.
+    pub fn new_unix_with_limiter(
+        router: Arc<ExportRouter>,
+        socket_path: impl Into<std::path::PathBuf>,
+        connection_limiter: Arc<Semaphore>,
+    ) -> Self {
         Self {
             router,
             transport: Transport::Unix(socket_path.into()),
+            connection_limiter,
         }
     }
 
-    fn spawn_client_handler<S>(&self, stream: S, shutdown: &CancellationToken, client_name: String)
-    where
+    fn spawn_client_handler<S>(
+        &self,
+        stream: S,
+        shutdown: &CancellationToken,
+        client_name: String,
+        permit: OwnedSemaphorePermit,
+    ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
     {
         let router = Arc::clone(&self.router);
@@ -212,7 +255,10 @@ impl NBDServer {
         // out and take down peer connections or the accept loop. The
         // CancellationToken is a child of the server token; on unwind the
         // socket and child token drop and tear down dependent tasks.
+        // The permit is moved into the task and drops on completion (or
+        // panic), releasing the connection budget back to the semaphore.
         let _handle = task::spawn_supervised("nbd-client", async move {
+            let _permit = permit; // hold for the lifetime of the connection
             if let Err(e) = handle_client_stream(stream, router, client_shutdown).await {
                 error!("Error handling NBD client {}: {}", client_name, e);
             }
@@ -237,9 +283,26 @@ impl NBDServer {
                         }
                         result = listener.accept() => {
                             let (stream, addr) = result?;
+                            // Acquire a connection permit. If the limiter is at
+                            // capacity, drop the new socket immediately rather than
+                            // queueing it — slow-accepting connections waste kernel
+                            // backlog and let one tenant pin the budget. The client
+                            // sees a connection-reset and can retry.
+                            let permit = match Arc::clone(&self.connection_limiter).try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    warn!(
+                                        addr = %addr,
+                                        cap = self.connection_limiter.available_permits(),
+                                        "NBD connection budget exhausted; rejecting client",
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             info!("NBD client connected from {}", addr);
                             stream.set_nodelay(true)?;
-                            self.spawn_client_handler(stream, &shutdown, addr.to_string());
+                            self.spawn_client_handler(stream, &shutdown, addr.to_string(), permit);
                         }
                     }
                 }
@@ -267,8 +330,19 @@ impl NBDServer {
                         }
                         result = listener.accept() => {
                             let (stream, _) = result?;
+                            let permit = match Arc::clone(&self.connection_limiter).try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    warn!(
+                                        cap = self.connection_limiter.available_permits(),
+                                        "NBD connection budget exhausted; rejecting Unix client",
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             info!("NBD client connected via Unix socket");
-                            self.spawn_client_handler(stream, &shutdown, "unix".to_string());
+                            self.spawn_client_handler(stream, &shutdown, "unix".to_string(), permit);
                         }
                     }
                 }

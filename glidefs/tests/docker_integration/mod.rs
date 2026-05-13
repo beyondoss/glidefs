@@ -388,6 +388,7 @@ impl TestServer {
                 default_flush_threshold: glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
             })
             .await
             .expect("failed to create test router"),
@@ -479,6 +480,7 @@ impl TestServer {
                 default_flush_threshold: glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
             })
             .await
             .expect("failed to create test router"),

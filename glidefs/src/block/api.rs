@@ -18,6 +18,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use url::form_urlencoded;
@@ -914,12 +915,32 @@ where
 pub struct ApiServer {
     router: Arc<ExportRouter>,
     addr: SocketAddr,
+    /// Cap on concurrent HTTP connections. Each accepted connection holds
+    /// an `OwnedSemaphorePermit` until its task ends. Past the cap, new
+    /// connections are dropped immediately to prevent OOM from connection
+    /// flooding.
+    connection_limiter: Arc<Semaphore>,
 }
 
 impl ApiServer {
-    /// Create a new API server.
+    /// Create a new API server with an unlimited connection budget. Test
+    /// only — production callers use `new_with_limiter`.
+    #[cfg(test)]
     pub fn new(router: Arc<ExportRouter>, addr: SocketAddr) -> Self {
-        Self { router, addr }
+        Self::new_with_limiter(router, addr, Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)))
+    }
+
+    /// Create a new API server bounded by `connection_limiter`.
+    pub fn new_with_limiter(
+        router: Arc<ExportRouter>,
+        addr: SocketAddr,
+        connection_limiter: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            router,
+            addr,
+            connection_limiter,
+        }
     }
 
     /// Start the API server.
@@ -936,13 +957,27 @@ impl ApiServer {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, _addr)) => {
+                            let permit = match Arc::clone(&self.connection_limiter).try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    warn!(
+                                        cap = self.connection_limiter.available_permits(),
+                                        "HTTP API connection budget exhausted; rejecting client",
+                                    );
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             let router = Arc::clone(&self.router);
                             let io = TokioIo::new(stream);
 
                             // Supervised: a panic in one HTTP handler must
                             // not bring down the API for other clients. The
                             // connection's hyper service drops on unwind.
+                            // The permit is moved into the task and drops
+                            // on completion (or panic), releasing budget.
                             let _handle = task::spawn_supervised("http-conn", async move {
+                                let _permit = permit;
                                 let service = service_fn(move |req| {
                                     let router = Arc::clone(&router);
                                     handle_request(router, req)
@@ -991,6 +1026,7 @@ mod tests {
                 default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
             })
             .await
             .expect("failed to create test router"),

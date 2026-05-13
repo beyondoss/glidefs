@@ -15,7 +15,7 @@ use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::{CacheError, SnapshotResult, WriteCache, WriteCacheConfig};
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
 use crate::config::ExportConfig;
-use crate::task::{self, spawn_named, spawn_supervised};
+use crate::task::{self, spawn_supervised};
 use std::time::Instant;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
+use dashmap::DashMap;
 use tokio::sync::{Notify, RwLock, watch};
 use tokio::task::JoinHandle;
 use serde::Deserialize;
@@ -97,6 +98,15 @@ pub enum RouterError {
 
     #[error("OCI pull error: {0}")]
     OciPull(String),
+
+    #[error(
+        "Export limit reached: cannot create export '{name}' (router holds {current} of max {max})"
+    )]
+    ExportLimitReached {
+        name: String,
+        current: usize,
+        max: usize,
+    },
 }
 
 /// Status of an in-flight OCI bless operation.
@@ -242,14 +252,25 @@ pub struct RouterConfig {
     /// Enables kernel-side I/O queueing during restarts. 0 = disabled.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub nbd_dead_conn_timeout: u32,
+    /// Maximum total exports the router will host. `create_export` past
+    /// this cap returns `RouterError::ExportLimitReached`. Caps the cost
+    /// of a tenant repeatedly POSTing /api/exports.
+    pub max_exports: usize,
 }
 
 /// Multi-tenant export router.
 ///
 /// Manages multiple NBD exports, each with independent storage and caching.
 pub struct ExportRouter {
-    /// Active exports: name → state
-    exports: RwLock<HashMap<String, ExportState>>,
+    /// Active exports: name → state. Sharded `DashMap` so per-export
+    /// lookups don't contend with each other or with create/remove.
+    /// Previously a `tokio::sync::RwLock<HashMap<...>>` which serialized
+    /// all readers behind any writer — and writers held the lock across
+    /// `.await` on slow S3 ops, freezing every other tenant's I/O.
+    exports: DashMap<String, ExportState>,
+
+    /// Cap on `exports.len()`. See `RouterConfig::max_exports`.
+    max_exports: usize,
 
     /// Shared object store (S3/MinIO/etc)
     object_store: Arc<dyn ObjectStore>,
@@ -578,7 +599,8 @@ impl ExportRouter {
         );
 
         Ok(Self {
-            exports: RwLock::new(HashMap::new()),
+            exports: DashMap::new(),
+            max_exports: config.max_exports,
             object_store: config.object_store,
             db_path: config.db_path,
             cache_dir: config.cache_dir,
@@ -734,10 +756,9 @@ impl ExportRouter {
         // Group (chunk_idx → pack_ids) directly under the manifest lock,
         // avoiding an intermediate Vec of all pairs.
         let packs_by_chunk: HashMap<u32, Vec<crate::block::pack::PackId>> = {
-            let exports = self.exports.read().await;
             let mut map: HashMap<u32, Vec<crate::block::pack::PackId>> = HashMap::new();
-            for state in exports.values() {
-                let vm = state.volume_manifest.read();
+            for entry in self.exports.iter() {
+                let vm = entry.value().volume_manifest.read();
                 for (chunk_idx, pack_id) in vm.all_pack_ids() {
                     map.entry(chunk_idx).or_default().push(pack_id);
                 }
@@ -766,11 +787,10 @@ impl ExportRouter {
 
         // Collect all (chunk_idx, pack_id, content_store) triples under lock.
         let to_fetch: Vec<(u32, crate::block::pack::PackId, Arc<ContentStore>)> = {
-            let exports = self.exports.read().await;
             let mut triples = Vec::new();
-            for state in exports.values() {
-                let cs = Arc::clone(&state.content_store);
-                let vm = state.volume_manifest.read();
+            for entry in self.exports.iter() {
+                let cs = Arc::clone(&entry.value().content_store);
+                let vm = entry.value().volume_manifest.read();
                 for (chunk_idx, pack_id) in vm.all_pack_ids() {
                     triples.push((chunk_idx, pack_id, Arc::clone(&cs)));
                 }
@@ -848,23 +868,22 @@ impl ExportRouter {
     pub async fn pressure_flush(&self) {
         // Clone Arc'd components under read lock, then release it so we don't
         // block export lifecycle operations (create/remove/shutdown) during flush.
-        let mut targets: Vec<_> = {
-            let exports = self.exports.read().await;
-            exports
-                .iter()
-                .filter(|(_, s)| s.cache.dirty_block_count() > 0)
-                .map(|(name, s)| {
-                    (
-                        name.clone(),
-                        s.cache.dirty_block_count(),
-                        Arc::clone(&s.cache),
-                        Arc::clone(&s.content_store),
-                        Arc::clone(&s.pack_index_cache),
-                        Arc::clone(&s.volume_manifest),
-                    )
-                })
-                .collect()
-        };
+        let mut targets: Vec<_> = self
+            .exports
+            .iter()
+            .filter(|e| e.value().cache.dirty_block_count() > 0)
+            .map(|e| {
+                let s = e.value();
+                (
+                    e.key().clone(),
+                    s.cache.dirty_block_count(),
+                    Arc::clone(&s.cache),
+                    Arc::clone(&s.content_store),
+                    Arc::clone(&s.pack_index_cache),
+                    Arc::clone(&s.volume_manifest),
+                )
+            })
+            .collect();
         targets.sort_by(|a, b| b.1.cmp(&a.1));
         for (name, _, cache, cs, cmc, vm) in targets.iter().take(8) {
             // Skip exports already being flushed (drain, snapshot, scheduler).
@@ -1004,13 +1023,23 @@ impl ExportRouter {
         let orig_s3_prefix = config.s3_prefix.clone();
         validate_export_name(&name)?;
 
-        // Check if export already exists - idempotent: return success if already exists
-        {
-            let exports = self.exports.read().await;
-            if exports.contains_key(&name) {
-                info!("Export '{}' already exists, skipping creation", name);
-                return Ok(());
-            }
+        // Check if export already exists - idempotent: return success if already exists.
+        // Also enforce the export-count cap here so a tenant flooding
+        // POST /api/exports can't race past the limit. Note: with DashMap
+        // there's still a small TOCTOU window between this check and the
+        // insert below; under heavy concurrent create-storms a few extra
+        // exports above the cap can briefly land. The cap is a safety
+        // bound, not a hard regulator — acceptable.
+        if self.exports.contains_key(&name) {
+            info!("Export '{}' already exists, skipping creation", name);
+            return Ok(());
+        }
+        if self.exports.len() >= self.max_exports {
+            return Err(RouterError::ExportLimitReached {
+                name: name.clone(),
+                current: self.exports.len(),
+                max: self.max_exports,
+            });
         }
 
         info!(
@@ -1361,21 +1390,23 @@ impl ExportRouter {
             prefetch_handle,
         };
 
-        let mut exports = self.exports.write().await;
-        // Re-check under write lock to prevent TOCTOU race: a concurrent
-        // create_export could have inserted between our read lock check and
-        // this write lock acquisition.
-        if exports.contains_key(&name) {
-            info!(
-                "Export '{}' already exists (concurrent create), cleaning up",
-                name
-            );
-            // Abort the flush scheduler task we just spawned to avoid leaking it.
-            state.flush_handle.abort();
-            return Ok(());
+        // DashMap entry-API: claim the slot atomically. If a concurrent
+        // create_export got here first, we yield and clean up our spawned
+        // flush task to avoid leaking it.
+        use dashmap::mapref::entry::Entry;
+        match self.exports.entry(name.clone()) {
+            Entry::Occupied(_) => {
+                info!(
+                    "Export '{}' already exists (concurrent create), cleaning up",
+                    name
+                );
+                state.flush_handle.abort();
+                return Ok(());
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(state);
+            }
         }
-        exports.insert(name.clone(), state);
-        drop(exports); // Release write lock before device registration
 
         info!(
             "Export '{}' created successfully (readonly={})",
@@ -1400,18 +1431,19 @@ impl ExportRouter {
             validate_export_name(t)?;
         }
 
-        // Clone Arc'd components under read lock, then release it so we don't
-        // block export lifecycle operations (create/remove/shutdown) during flush.
+        // Clone Arc'd components from the per-shard guard, then drop the
+        // guard so we don't hold it across .await on the snapshot below.
         let (cache, content_store, pack_index_cache, volume_manifest) = {
-            let exports = self.exports.read().await;
-            let state = exports
+            let entry = self
+                .exports
                 .get(name)
                 .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            let s = entry.value();
             (
-                Arc::clone(&state.cache),
-                Arc::clone(&state.content_store),
-                Arc::clone(&state.pack_index_cache),
-                Arc::clone(&state.volume_manifest),
+                Arc::clone(&s.cache),
+                Arc::clone(&s.content_store),
+                Arc::clone(&s.pack_index_cache),
+                Arc::clone(&s.volume_manifest),
             )
         };
 
@@ -1453,17 +1485,22 @@ impl ExportRouter {
     pub async fn tag_export(&self, name: &str, tag: &str) -> Result<(), RouterError> {
         validate_export_name(name)?;
         validate_export_name(tag)?;
-        let exports = self.exports.read().await;
-        let state = exports
-            .get(name)
-            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
-        let manifest_bytes = state
-            .volume_manifest
-            .read()
-            .serialize()
-            .map_err(|e| RouterError::Manifest(e.to_string()))?;
-        state
-            .content_store
+        // Clone the Arc'd content_store + serialize manifest under the
+        // shard guard; drop the guard before the .await on put_manifest.
+        let (manifest_bytes, content_store) = {
+            let entry = self
+                .exports
+                .get(name)
+                .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            let s = entry.value();
+            let manifest_bytes = s
+                .volume_manifest
+                .read()
+                .serialize()
+                .map_err(|e| RouterError::Manifest(e.to_string()))?;
+            (manifest_bytes, Arc::clone(&s.content_store))
+        };
+        content_store
             .put_manifest(tag, manifest_bytes, None)
             .await
             .map_err(RouterError::ContentStore)?;
@@ -1825,13 +1862,14 @@ impl ExportRouter {
         name: &str,
     ) -> Result<Vec<u64>, RouterError> {
         validate_export_name(name)?;
-        let exports = self.exports.read().await;
-        let state = exports
-            .get(name)
-            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
-        state
-            .content_store
-            .list_snapshots(name)
+        let cs = {
+            let entry = self
+                .exports
+                .get(name)
+                .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            Arc::clone(&entry.value().content_store)
+        };
+        cs.list_snapshots(name)
             .await
             .map_err(RouterError::ContentStore)
     }
@@ -1843,13 +1881,14 @@ impl ExportRouter {
         sequence: u64,
     ) -> Result<(), RouterError> {
         validate_export_name(name)?;
-        let exports = self.exports.read().await;
-        let state = exports
-            .get(name)
-            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
-        state
-            .content_store
-            .delete_snapshot(name, sequence)
+        let cs = {
+            let entry = self
+                .exports
+                .get(name)
+                .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            Arc::clone(&entry.value().content_store)
+        };
+        cs.delete_snapshot(name, sequence)
             .await
             .map_err(RouterError::ContentStore)
     }
@@ -1857,8 +1896,8 @@ impl ExportRouter {
     /// Get info for a single export.
     pub async fn get_export_info(&self, name: &str) -> Option<ExportInfo> {
         let (mut info, handler) = {
-            let exports = self.exports.read().await;
-            let state = exports.get(name)?;
+            let entry = self.exports.get(name)?;
+            let state = entry.value();
             let block_size = state.cache.block_size() as u64;
             let manifest = state.volume_manifest.read();
             let s3_bytes = manifest.chunks.len() as u64 * manifest.chunk_size;
@@ -1883,44 +1922,43 @@ impl ExportRouter {
 
     /// Get handler for an export (used during NBD negotiation).
     pub async fn get_handler(&self, name: &str) -> Option<Arc<BlockHandler>> {
-        let exports = self.exports.read().await;
-        exports.get(name).map(|s| Arc::clone(&s.handler))
+        self.exports.get(name).map(|e| Arc::clone(&e.value().handler))
     }
 
     /// Check if an export is readonly.
     #[allow(dead_code)]
     pub async fn is_readonly(&self, name: &str) -> Option<bool> {
-        let exports = self.exports.read().await;
-        exports.get(name).map(|s| s.readonly)
+        self.exports.get(name).map(|e| e.value().readonly)
     }
 
     /// List all exports.
     pub async fn list_exports(&self) -> Vec<ExportInfo> {
-        // First pass: collect basic info and handlers.
-        let (mut result, handlers): (Vec<ExportInfo>, Vec<Arc<BlockHandler>>) = {
-            let exports = self.exports.read().await;
-            exports
-                .iter()
-                .map(|(name, state)| {
-                    let block_size = state.cache.block_size() as u64;
-                    let manifest = state.volume_manifest.read();
-                    let info = ExportInfo {
-                        name: name.clone(),
-                        size: state.handler.device_size(),
-                        readonly: state.readonly,
-                        transport: state.transport.clone(),
-                        device: None,
-                        s3_prefix: state.s3_prefix.clone(),
-                        dirty_bytes: state.cache.dirty_block_count() * block_size,
-                        s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
-                        fs_used_bytes: None,
-                    };
-                    (info, Arc::clone(&state.handler))
-                })
-                .unzip()
-        };
+        // First pass: collect basic info and handlers, dropping each
+        // shard guard immediately as we walk.
+        let (mut result, handlers): (Vec<ExportInfo>, Vec<Arc<BlockHandler>>) = self
+            .exports
+            .iter()
+            .map(|entry| {
+                let state = entry.value();
+                let block_size = state.cache.block_size() as u64;
+                let manifest = state.volume_manifest.read();
+                let info = ExportInfo {
+                    name: entry.key().clone(),
+                    size: state.handler.device_size(),
+                    readonly: state.readonly,
+                    transport: state.transport.clone(),
+                    device: None,
+                    s3_prefix: state.s3_prefix.clone(),
+                    dirty_bytes: state.cache.dirty_block_count() * block_size,
+                    s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
+                    fs_used_bytes: None,
+                };
+                (info, Arc::clone(&state.handler))
+            })
+            .unzip();
 
-        // Second pass: populate device paths and fs_used_bytes.
+        // Second pass: populate device paths and fs_used_bytes (async,
+        // outside any shard guard).
         for (info, handler) in result.iter_mut().zip(handlers.iter()) {
             info.device = self.get_device_path(&info.name).await;
             info.fs_used_bytes = read_fs_used_bytes(handler).await;
@@ -1931,8 +1969,7 @@ impl ExportRouter {
 
     /// Get export names.
     pub async fn list_export_names(&self) -> Vec<String> {
-        let exports = self.exports.read().await;
-        exports.keys().cloned().collect()
+        self.exports.iter().map(|e| e.key().clone()).collect()
     }
 
     // --- Device management (unified across transports) ---
@@ -2085,16 +2122,14 @@ impl ExportRouter {
     /// handlers exist for matching.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     pub async fn recover_ublk_devices(&self) -> usize {
-        // Snapshot ublk-transport handlers. Release exports read lock before
-        // taking the ublk mutex to avoid lock ordering issues.
-        let handlers: HashMap<String, Arc<BlockHandler>> = {
-            let exports = self.exports.read().await;
-            exports
-                .iter()
-                .filter(|(_, s)| s.transport == "ublk")
-                .map(|(name, s)| (name.clone(), Arc::clone(&s.handler)))
-                .collect()
-        };
+        // Snapshot ublk-transport handlers. With DashMap, we never hold a
+        // shard guard across the ublk-mutex acquisition below.
+        let handlers: HashMap<String, Arc<BlockHandler>> = self
+            .exports
+            .iter()
+            .filter(|e| e.value().transport == "ublk")
+            .map(|e| (e.key().clone(), Arc::clone(&e.value().handler)))
+            .collect();
 
         let mut ublk = self.ublk_server.lock().await;
         ublk.recover_quiesced_devices(|name| handlers.get(name).cloned())
@@ -2124,12 +2159,7 @@ impl ExportRouter {
 
     /// Check readiness: exports exist, cache writable, and S3 reachable.
     pub async fn readiness_check(&self) -> ReadinessStatus {
-        let exports_count = {
-            let exports = self.exports.read().await;
-            exports.len()
-        };
-        // Lock released — I/O probes below can take seconds and must not
-        // hold the read lock (it blocks create/remove/shutdown write locks).
+        let exports_count = self.exports.len();
 
         let cache_writable = {
             let probe = self.cache_dir.join(".health-probe");
@@ -2157,8 +2187,7 @@ impl ExportRouter {
 
     /// Get metrics snapshot for an export.
     pub async fn get_export_metrics(&self, name: &str) -> Option<MetricsSnapshot> {
-        let exports = self.exports.read().await;
-        exports.get(name).map(|s| Self::snapshot_export_metrics(s))
+        self.exports.get(name).map(|e| Self::snapshot_export_metrics(e.value()))
     }
 
     /// Snapshot metrics for all exports under a single lock acquisition.
@@ -2168,12 +2197,12 @@ impl ExportRouter {
         use crate::circuit_breaker::CircuitState;
         use std::sync::atomic::Ordering;
 
-        let exports = self.exports.read().await;
         let mut total_cache_hits: u64 = 0;
         let mut total_cache_misses: u64 = 0;
         let mut total_dirty_bytes: u64 = 0;
 
-        for state in exports.values() {
+        for entry in self.exports.iter() {
+            let state = entry.value();
             total_cache_hits += state.metrics.cache_hits.load(Ordering::Relaxed);
             total_cache_misses += state.metrics.cache_misses.load(Ordering::Relaxed);
             let block_size = state.cache.block_size() as u64;
@@ -2192,15 +2221,14 @@ impl ExportRouter {
             total_cache_hits,
             total_cache_misses,
             total_dirty_bytes,
-            exports_count: exports.len(),
+            exports_count: self.exports.len(),
         }
     }
 
     pub async fn all_export_metrics(&self) -> Vec<(String, MetricsSnapshot)> {
-        let exports = self.exports.read().await;
-        exports
+        self.exports
             .iter()
-            .map(|(name, s)| (name.clone(), Self::snapshot_export_metrics(s)))
+            .map(|e| (e.key().clone(), Self::snapshot_export_metrics(e.value())))
             .collect()
     }
 
@@ -2220,19 +2248,19 @@ impl ExportRouter {
     pub async fn drain_export(&self, name: &str) -> Result<(), RouterError> {
         validate_export_name(name)?;
 
-        // Clone Arc'd components under read lock, then release it so we don't
-        // block export lifecycle operations (create/remove/shutdown) during
-        // the potentially long-running drain.
+        // Clone Arc'd components from the per-shard guard, then drop it
+        // so we don't hold the lock across the long-running drain.
         let (cache, content_store, pack_index_cache, volume_manifest) = {
-            let exports = self.exports.read().await;
-            let state = exports
+            let entry = self
+                .exports
                 .get(name)
                 .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            let s = entry.value();
             (
-                Arc::clone(&state.cache),
-                Arc::clone(&state.content_store),
-                Arc::clone(&state.pack_index_cache),
-                Arc::clone(&state.volume_manifest),
+                Arc::clone(&s.cache),
+                Arc::clone(&s.content_store),
+                Arc::clone(&s.pack_index_cache),
+                Arc::clone(&s.volume_manifest),
             )
         };
 
@@ -2273,9 +2301,8 @@ impl ExportRouter {
     /// Best-effort: silently does nothing if the export doesn't exist
     /// (it may have been removed between the drain attempt and this call).
     pub async fn record_drain_error(&self, name: &str) {
-        let exports = self.exports.read().await;
-        if let Some(state) = exports.get(name) {
-            state.metrics.record_flush_error();
+        if let Some(entry) = self.exports.get(name) {
+            entry.value().metrics.record_flush_error();
         }
     }
 
@@ -2307,10 +2334,11 @@ impl ExportRouter {
     /// Promote a readonly export to read-write.
     pub async fn promote_export(&self, name: &str) -> Result<(), RouterError> {
         validate_export_name(name)?;
-        let mut exports = self.exports.write().await;
-        let state = exports
+        let mut entry = self
+            .exports
             .get_mut(name)
             .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+        let state = entry.value_mut();
 
         if !state.readonly {
             info!("Export '{}' is already read-write", name);
@@ -2334,18 +2362,20 @@ impl ExportRouter {
     /// Note: NBD client must reconnect to see the new size.
     pub async fn resize_export(&self, name: &str, new_size_gb: f64) -> Result<(), RouterError> {
         validate_export_name(name)?;
-        // Get current export info
+        // Get current export info from the per-shard guard.
         let (current_size, readonly, block_size, orig_s3_prefix, transport) = {
-            let exports = self.exports.read().await;
-            let state = exports
+            let entry = self
+                .exports
                 .get(name)
                 .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
-            let current_size = state.handler.device_size();
-            let readonly = state.readonly;
-            let block_size = state.cache.block_size();
-            let s3_prefix = state.s3_prefix.clone();
-            let transport = state.transport.clone();
-            (current_size, readonly, block_size, s3_prefix, transport)
+            let state = entry.value();
+            (
+                state.handler.device_size(),
+                state.readonly,
+                state.cache.block_size(),
+                state.s3_prefix.clone(),
+                state.transport.clone(),
+            )
         };
 
         let new_size_bytes = (new_size_gb * 1_073_741_824.0) as u64;
@@ -2409,9 +2439,8 @@ impl ExportRouter {
     pub async fn remove_export(&self, name: &str, purge: bool) -> Result<(), RouterError> {
         validate_export_name(name)?;
         let state = {
-            let mut exports = self.exports.write().await;
-            match exports.remove(name) {
-                Some(state) => state,
+            match self.exports.remove(name) {
+                Some((_k, state)) => state,
                 None => {
                     info!("Export '{}' doesn't exist, nothing to remove", name);
                     if purge {
@@ -2541,10 +2570,15 @@ impl ExportRouter {
         // NBD devices must stay alive so the new process can reconfigure them.
         // Caller is responsible for shutdown_devices() when full teardown is needed.
 
-        // Take ownership of all exports
-        let mut exports = self.exports.write().await;
-        let export_list: Vec<_> = exports.drain().collect();
-        drop(exports); // Release the lock
+        // Take ownership of all exports. DashMap has no `drain` API
+        // — collect names first, then remove each entry. Each remove
+        // takes the entry's shard lock briefly; concurrent ops on
+        // unrelated keys aren't blocked.
+        let names: Vec<String> = self.exports.iter().map(|e| e.key().clone()).collect();
+        let export_list: Vec<(String, ExportState)> = names
+            .into_iter()
+            .filter_map(|name| self.exports.remove(&name).map(|(k, v)| (k, v)))
+            .collect();
 
         use futures::stream::{self, StreamExt};
 
@@ -2586,9 +2620,11 @@ impl ExportRouter {
     /// next server opens the same files.
     #[cfg(feature = "test-utils")]
     pub async fn stop_flush_schedulers(&self) {
-        let mut exports = self.exports.write().await;
-        let export_list: Vec<_> = exports.drain().collect();
-        drop(exports);
+        let names: Vec<String> = self.exports.iter().map(|e| e.key().clone()).collect();
+        let export_list: Vec<(String, ExportState)> = names
+            .into_iter()
+            .filter_map(|name| self.exports.remove(&name).map(|(k, v)| (k, v)))
+            .collect();
 
         for (name, state) in export_list {
             if let Some(handle) = state.prefetch_handle {
@@ -2786,6 +2822,7 @@ impl ExportRouter {
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .expect("failed to create test router")
@@ -2934,6 +2971,54 @@ mod tests {
         assert_eq!(metrics.flush_degraded.load(Ordering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn create_export_returns_error_when_at_max() {
+        let temp = TempDir::new().unwrap();
+        // Build a router with max_exports=2 by going through RouterConfig
+        // (the test helper above hardcodes 10_000 for normal tests).
+        let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let router = ExportRouter::new(RouterConfig {
+            object_store: s3,
+            db_path: "test".to_string(),
+            cache_dir: temp.path().to_path_buf(),
+            block_size: 128 * 1024,
+            clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+            wal_sync: false,
+            max_s3_uploads: 0,
+            max_s3_downloads: 0,
+            default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+            max_exports: 2,
+        })
+        .await
+        .unwrap();
+
+        let make = |name: &str| ExportConfig {
+            name: name.to_string(),
+            size_gb: 0.001,
+            s3_prefix: None,
+            block_size: None,
+            flush_threshold: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router.create_export(make("a"), false, None, None).await.unwrap();
+        router.create_export(make("b"), false, None, None).await.unwrap();
+        let err = router
+            .create_export(make("c"), false, None, None)
+            .await
+            .expect_err("third export must be rejected");
+        assert!(
+            matches!(err, RouterError::ExportLimitReached { current: 2, max: 2, .. }),
+            "expected ExportLimitReached, got {:?}",
+            err,
+        );
+
+        // Idempotent re-create of an existing name still succeeds.
+        router.create_export(make("a"), false, None, None).await.unwrap();
+    }
+
     /// Aborting the supervisor's outer task aborts the in-flight inner via
     /// the `AbortOnDrop` guard.
     #[tokio::test]
@@ -2986,6 +3071,7 @@ mod tests {
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .expect("failed to create test router")
@@ -4500,6 +4586,7 @@ mod tests {
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .unwrap();
@@ -4536,6 +4623,7 @@ mod tests {
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .unwrap();
@@ -4583,6 +4671,7 @@ mod tests {
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .unwrap();
@@ -4612,6 +4701,7 @@ mod tests {
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .unwrap();
@@ -4717,6 +4807,7 @@ mod tests {
             default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .unwrap();

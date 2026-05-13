@@ -133,6 +133,7 @@ fn create_router_config(s3: Arc<dyn ObjectStore>, dir: &TempDir) -> RouterConfig
         default_flush_threshold: 500,
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
+        max_exports: 10_000,
     }
 }
 
@@ -1002,6 +1003,7 @@ async fn test_readahead_prefetches_next_pack_index() {
             default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .unwrap(),
@@ -1058,6 +1060,7 @@ async fn test_readahead_prefetches_next_pack_index() {
             default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
+            max_exports: 10_000,
         })
         .await
         .unwrap(),
