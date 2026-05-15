@@ -62,7 +62,12 @@ struct TestProfile {
 const PR_PROFILE: TestProfile = TestProfile {
     name: "per-pr",
     device_count: 1,
-    device_size_gb: 4,
+    // 1GB device + the 8GB SSD cache in `write_test_config` gives 8x
+    // cache headroom — fio can write the entire device 8x over before
+    // the capacity_monitor's NoSpace threshold kicks in. With a 4GB
+    // device and a 2GB SSD cache, the fault-injection grid's repeated
+    // workloads filled the cache and post-fio hung on backpressure.
+    device_size_gb: 1,
     workload_runtime: Duration::from_secs(30),
     handoff_count: 1,
     // fio with --verify=crc32c + numjobs>1 warns "multiple writers may
@@ -243,6 +248,22 @@ struct OracleScan {
 // Test config writer
 // =============================================================================
 
+/// Deterministic per-test-run unique suffix. PID + nanosecond
+/// timestamp is enough entropy to avoid collisions across concurrent
+/// test runs and across re-runs of the same test on the same host.
+/// Used to namespace export names so we don't conflict with orphan
+/// QUIESCED ublk devices from prior tests, AND so we don't ever
+/// match production exports by accident.
+#[allow(dead_code)]
+fn unique_run_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}_{ns}", std::process::id())
+}
+
 #[allow(dead_code)]
 fn write_test_config(
     config_path: &Path,
@@ -250,6 +271,7 @@ fn write_test_config(
     storage_dir: &Path,
     profile: &TestProfile,
     api_port: u16,
+    run_id: &str,
 ) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -258,7 +280,7 @@ fn write_test_config(
         exports_toml.push_str(&format!(
             r#"
 [[servers.nbd.exports]]
-name = "handoff_test_{i}"
+name = "handoff_test_{run_id}_{i}"
 size_gb = {size}
 transport = "ublk"
 "#,
@@ -270,13 +292,19 @@ transport = "ublk"
     // the successor must be able to read what the predecessor wrote.
     let storage_url = format!("file://{}", storage_dir.display());
 
+    // Cache sized generously vs. device size — fault-injection grid runs
+    // multiple workload cycles back-to-back, each writing GB-scale data
+    // into the cache before the flush_scheduler can drain it (file://
+    // backend flushes are slow and the manifest sync circuit-breaks).
+    // Without headroom, post-fio hangs on capacity_monitor's NoSpace
+    // backpressure.
     let toml = format!(
         r#"
 [cache]
 dir = "{cache_dir}"
-disk_size_gb = 8.0
-memory_size_gb = 0.5
-ssd_cache_size_gb = 2.0
+disk_size_gb = 32.0
+memory_size_gb = 1.0
+ssd_cache_size_gb = 16.0
 
 [storage]
 url = "{storage_url}"
@@ -362,7 +390,8 @@ impl DaemonHandle {
         drop(api_listener); // glidefs will rebind
         let api_addr = std::net::SocketAddr::new("127.0.0.1".parse()?, api_port);
 
-        write_test_config(&config_path, &cache_dir, &storage_dir, profile, api_port)?;
+        let run_id = unique_run_id();
+        write_test_config(&config_path, &cache_dir, &storage_dir, profile, api_port, &run_id)?;
 
         let mut cmd = tokio::process::Command::new(&binary);
         cmd.arg("run")
@@ -838,14 +867,19 @@ fn nix_root() -> bool {
 // Failure-injection grid
 // =============================================================================
 
+/// Fault-injection points that test the **successor-crash** failure
+/// modes. After each, the predecessor must revive cleanly via
+/// `revive_after_failed_handoff` and continue serving I/O without
+/// errors or data loss.
+///
+/// Predecessor-crash variants are a distinct scenario (= "daemon
+/// died") and don't test handoff revival — they're covered by the
+/// existing crash-recovery paths in `recover_quiesced_devices()`.
 #[allow(dead_code)]
-const FAULT_INJECTION_POINTS: &[&str] = &[
+const FAULT_INJECTION_POINTS_S_CRASH: &[&str] = &[
     "s_crash_after_warming",
     "s_crash_after_ready",
     "s_crash_after_cutover",
-    "p_crash_after_hello_ack",
-    "p_crash_during_freeze",
-    "p_crash_after_cutover",
 ];
 
 #[allow(dead_code)]
@@ -853,15 +887,100 @@ async fn run_fault_injection_grid(
     profile: TestProfile,
     strategy: StrategyKind,
 ) -> anyhow::Result<()> {
-    for point in FAULT_INJECTION_POINTS {
+    for point in FAULT_INJECTION_POINTS_S_CRASH {
         println!("=== fault-injection: {point}");
+        // Set env BEFORE the test spawns its daemon — env propagates
+        // to forked successor processes via the predecessor's spawn.
         unsafe { std::env::set_var("GLIDEFS_INJECT_FAILURE", point) };
-        let r = run_handoff_durability_test(profile, strategy)
+
+        // The handoff itself will FAIL (successor exits via inject).
+        // Predecessor's revival path catches it. After revival, the
+        // test asserts: predecessor is still alive serving the device,
+        // fio reports zero errors, oracle scan finds no corruption.
+        run_fault_injection_single(profile, strategy, point)
             .await
             .map_err(|e| anyhow::anyhow!("at fault-injection point '{point}': {e:#}"))?;
-        let _ = r;
+
+        unsafe { std::env::remove_var("GLIDEFS_INJECT_FAILURE") };
     }
-    unsafe { std::env::remove_var("GLIDEFS_INJECT_FAILURE") };
+    Ok(())
+}
+
+/// One fault-injection iteration. Variant from
+/// [`FAULT_INJECTION_POINTS_S_CRASH`]. Asserts post-revival the
+/// predecessor still serves with zero corruption.
+#[allow(dead_code)]
+async fn run_fault_injection_single(
+    profile: TestProfile,
+    _strategy: StrategyKind,
+    inject_point: &str,
+) -> anyhow::Result<()> {
+    if !pretest_ready() {
+        return Ok(());
+    }
+
+    let scratch = tempfile::tempdir()?;
+    let mut p = DaemonHandle::spawn(&profile, scratch.path()).await?;
+    let device_path = p.discover_device_path().await?;
+    let oracle = Arc::new(Oracle::new(4096));
+
+    // Run a brief workload to populate the device with fio data.
+    let warmup = FioJob {
+        device_path: device_path.clone(),
+        runtime: Duration::from_secs(5),
+        jobs: 1,
+        iodepth: profile.fio_iodepth,
+    };
+    let _ = warmup.run().await?;
+
+    // Trigger handoff. Successor will exit via inject hook.
+    p.trigger_handoff()?;
+
+    // Wait briefly for the handoff to fail. The predecessor either
+    // stays SERVING (warming/ready inject) or revives
+    // (cutover inject). Either way `p.pid` doesn't change.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Predecessor must still be alive — failure injection must not
+    // kill the predecessor.
+    if unsafe { libc::kill(p.pid as i32, 0) } != 0 {
+        anyhow::bail!(
+            "predecessor pid {} died during fault-injection {inject_point} \
+             (revival path failed?)",
+            p.pid
+        );
+    }
+
+    // Run another fio cycle against the revived predecessor.
+    let post = FioJob {
+        device_path: device_path.clone(),
+        runtime: Duration::from_secs(10),
+        jobs: 1,
+        iodepth: profile.fio_iodepth,
+    };
+    let result = post.run().await?;
+    if result.errors > 0 {
+        anyhow::bail!(
+            "fio observed {} errors after fault-injection {inject_point}",
+            result.errors
+        );
+    }
+    if !result.verify_ok {
+        anyhow::bail!("fio verify failed after fault-injection {inject_point}");
+    }
+
+    let scan = oracle.scan(&device_path)?;
+    if scan.corrupt > 0 {
+        anyhow::bail!(
+            "oracle found {} corrupt blocks after fault-injection {inject_point}",
+            scan.corrupt
+        );
+    }
+
+    println!(
+        "  fault-injection {inject_point}: PASSED (post-fio iops={}, oracle={}/{}/{} w/n/c)",
+        result.iops, scan.written_by_fio, scan.never_written, scan.corrupt
+    );
     Ok(())
 }
 
@@ -875,6 +994,42 @@ async fn handoff_durability_crh_per_pr() {
     run_handoff_durability_test(PR_PROFILE, StrategyKind::Crh)
         .await
         .expect("handoff_durability_crh_per_pr failed");
+}
+
+/// Failure-injection grid — exercises every documented successor-crash
+/// point and confirms the predecessor's revival path keeps serving
+/// without errors or data loss. Runs in CI alongside the per-PR test.
+#[tokio::test]
+#[ignore = "requires sudo + ublk_drv + fio + test-fault-injection feature"]
+async fn handoff_fault_injection_grid_crh() {
+    run_fault_injection_grid(PR_PROFILE, StrategyKind::Crh)
+        .await
+        .expect("handoff_fault_injection_grid_crh failed");
+}
+
+/// Sequential-handoff stress: 50 handoffs back-to-back with fio
+/// running continuously and verify=crc32c. Catches any state-
+/// accumulation bug across many handoffs (WAL truncation drift,
+/// sequence number issues, foyer cache corruption, kernel orphan
+/// device leaks).
+const SEQUENTIAL_PROFILE: TestProfile = TestProfile {
+    name: "sequential",
+    device_count: 1,
+    device_size_gb: 4,
+    workload_runtime: Duration::from_secs(600), // 10 min runtime cap
+    handoff_count: 50,
+    fio_jobs: 1,
+    fio_iodepth: 32,
+    p99_stall_ms: 100,
+    p999_stall_ms: 500,
+};
+
+#[tokio::test]
+#[ignore = "requires sudo + ublk_drv + fio; ~5min runtime"]
+async fn handoff_sequential_50_crh() {
+    run_handoff_durability_test(SEQUENTIAL_PROFILE, StrategyKind::Crh)
+        .await
+        .expect("handoff_sequential_50_crh failed");
 }
 
 #[tokio::test]
