@@ -25,6 +25,22 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// multiple daemons share a host.
 pub const DEFAULT_HANDOFF_SOCKET: &str = "/run/glidefs/handoff.sock";
 
+/// Wire protocol bytes for the handoff *control* socket
+/// (`/run/glidefs/handoff.ctl.sock`). One byte each way:
+/// - Request: REQUEST_HANDOFF or REQUEST_HANDOFF_DRY_RUN.
+/// - Response: RESPONSE_ACCEPTED / BUSY / UNSUPPORTED.
+///
+/// Used by the `glidefs handoff` CLI, the `POST /admin/handoff` HTTP
+/// API endpoint, and any orchestrator that wants to trigger a handoff
+/// without sending SIGHUP.
+pub mod ctl_wire {
+    pub const REQUEST_HANDOFF: u8 = b'H';
+    pub const REQUEST_HANDOFF_DRY_RUN: u8 = b'D';
+    pub const RESPONSE_ACCEPTED: u8 = b'A';
+    pub const RESPONSE_BUSY: u8 = b'B';
+    pub const RESPONSE_UNSUPPORTED: u8 = b'U';
+}
+
 /// Capability bits negotiated in HELLO. Both sides advertise their
 /// supported strategies; the cutover uses the highest-priority strategy
 /// supported by both.

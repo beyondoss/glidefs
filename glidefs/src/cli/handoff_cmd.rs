@@ -14,12 +14,16 @@ use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-/// Wire protocol for the control socket. One byte each way.
-const CONTROL_REQUEST_HANDOFF: u8 = b'H';
-const CONTROL_REQUEST_HANDOFF_DRY_RUN: u8 = b'D';
-const CONTROL_RESPONSE_ACCEPTED: u8 = b'A';
-const CONTROL_RESPONSE_BUSY: u8 = b'B';
-const CONTROL_RESPONSE_UNSUPPORTED: u8 = b'U';
+// Wire protocol bytes are defined in `crate::handoff::protocol::ctl_wire`
+// so they can be shared by the CLI, the HTTP API endpoint, and the
+// daemon's control-socket listener.
+use crate::handoff::protocol::ctl_wire::{
+    REQUEST_HANDOFF as CONTROL_REQUEST_HANDOFF,
+    REQUEST_HANDOFF_DRY_RUN as CONTROL_REQUEST_HANDOFF_DRY_RUN,
+    RESPONSE_ACCEPTED as CONTROL_RESPONSE_ACCEPTED,
+    RESPONSE_BUSY as CONTROL_RESPONSE_BUSY,
+    RESPONSE_UNSUPPORTED as CONTROL_RESPONSE_UNSUPPORTED,
+};
 
 pub async fn run(socket: PathBuf, dry_run: bool) -> Result<()> {
     let mut stream = UnixStream::connect(&socket)
@@ -65,11 +69,9 @@ pub async fn run(socket: PathBuf, dry_run: bool) -> Result<()> {
     }
 }
 
-/// Constants re-exported for the server-side socket handler.
+/// Re-export of the canonical wire constants for the server-side
+/// control-socket handler. New code should reference
+/// `crate::handoff::protocol::ctl_wire` directly.
 pub mod wire {
-    pub const REQUEST_HANDOFF: u8 = super::CONTROL_REQUEST_HANDOFF;
-    pub const REQUEST_HANDOFF_DRY_RUN: u8 = super::CONTROL_REQUEST_HANDOFF_DRY_RUN;
-    pub const RESPONSE_ACCEPTED: u8 = super::CONTROL_RESPONSE_ACCEPTED;
-    pub const RESPONSE_BUSY: u8 = super::CONTROL_RESPONSE_BUSY;
-    pub const RESPONSE_UNSUPPORTED: u8 = super::CONTROL_RESPONSE_UNSUPPORTED;
+    pub use crate::handoff::protocol::ctl_wire::*;
 }

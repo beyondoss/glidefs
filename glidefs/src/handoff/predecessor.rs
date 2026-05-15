@@ -79,6 +79,17 @@ pub async fn run_predecessor(
 
     tracing::info!(socket = %socket_path.display(), "handoff: socket bound, spawning successor");
 
+    // **CRITICAL**: pause checkpoints + flushes on every cache from
+    // the moment handoff starts, not just from `freeze_all` later.
+    // The successor's WriteCache::open during WARMING reads the WAL
+    // at that moment; if the predecessor's flush_scheduler fires a
+    // checkpoint between then and PREDS_DEAD, the truncate drops
+    // entries the successor's `replay_wal_tail` needs to pick up,
+    // causing silent data loss observable as "verify: bad magic
+    // header 0" in fio. Setting the flag this early covers the
+    // entire WARMING + READY-wait + freeze + cutover window.
+    router.set_all_caches_freeze(true).await;
+
     // Detect kernel features for strategy selection.
     let per_io_daemon = router.is_per_io_daemon_supported();
     let strategy = strategy::select(per_io_daemon);
@@ -128,6 +139,14 @@ pub async fn run_predecessor(
 
     // Reap the successor regardless of outcome — it's our child.
     drop_successor(successor).await;
+
+    // If we're staying alive (Aborted, RevivedFromFailedHandoff), or
+    // even if we're exiting on Succeeded, clear the freeze flag so
+    // any cleanup paths in the existing flush_scheduler can run.
+    // For Succeeded, the predecessor exits anyway so the flag is
+    // moot. For Aborted/Revived, the predecessor resumes normal
+    // serving and needs flush_scheduler back to truncate WAL.
+    router.set_all_caches_freeze(false).await;
 
     result
 }
