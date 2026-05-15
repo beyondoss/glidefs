@@ -2911,8 +2911,11 @@ impl ExportRouter {
         }
 
         info!(count = states.len(), "handoff: freezing all handlers");
-        for (_, handler, _) in &states {
+        for (_, handler, cache) in &states {
             handler.freeze();
+            // Pause the per-export checkpoint truncate so the WAL
+            // stays intact for the successor's tail-replay window.
+            cache.set_freeze_in_progress(true);
         }
 
         use futures::stream::{self, StreamExt};
@@ -2938,16 +2941,38 @@ impl ExportRouter {
         Ok(())
     }
 
-    /// Reverse [`freeze_all`]. Called on the predecessor's revival path
-    /// if the successor crashes between PREDS_DEAD and ALIVE.
-    pub async fn unfreeze_all(&self) {
-        let handlers: Vec<Arc<BlockHandler>> = self
+    /// Set the per-export `freeze_in_progress` flag on every WriteCache.
+    /// While `true`, the flush_scheduler's checkpoint cycle skips WAL
+    /// truncation. Used by:
+    /// - Predecessor's `freeze_all` (briefly, during the cutover window)
+    /// - Successor's WARMING phase (the whole time the predecessor is
+    ///   still alive and may be appending to the WAL we share)
+    pub async fn set_all_caches_freeze(&self, frozen: bool) {
+        let caches: Vec<Arc<WriteCache<Active>>> = self
             .exports
             .iter()
-            .map(|e| Arc::clone(&e.value().handler))
+            .map(|e| Arc::clone(&e.value().cache))
             .collect();
-        for h in handlers {
+        for c in caches {
+            c.set_freeze_in_progress(frozen);
+        }
+    }
+
+    /// Reverse [`freeze_all`]. Called on the predecessor's revival path
+    /// if the successor crashes between PREDS_DEAD and ALIVE. Also
+    /// resumes per-export checkpoint truncation.
+    pub async fn unfreeze_all(&self) {
+        let states: Vec<(Arc<BlockHandler>, Arc<WriteCache<Active>>)> = self
+            .exports
+            .iter()
+            .map(|e| {
+                let s = e.value();
+                (Arc::clone(&s.handler), Arc::clone(&s.cache))
+            })
+            .collect();
+        for (h, c) in states {
             h.unfreeze();
+            c.set_freeze_in_progress(false);
         }
         info!("handoff: handlers unfrozen (handoff aborted)");
     }

@@ -290,6 +290,16 @@ impl WriteCache<Active> {
         self.inner.sequence.current()
     }
 
+    /// Toggle the "freeze in progress" flag. While set,
+    /// [`Self::checkpoint`] skips the WAL truncate step (the metadata
+    /// save still runs). Used by the handoff predecessor to keep the
+    /// WAL intact across the successor's WARMING → CUTOVER window.
+    pub fn set_freeze_in_progress(&self, frozen: bool) {
+        self.inner
+            .freeze_in_progress
+            .store(frozen, std::sync::atomic::Ordering::Release);
+    }
+
     /// Replay any WAL entries newer than the current sequence number and
     /// apply them to the in-memory state map.
     ///
@@ -427,7 +437,33 @@ impl WriteCache<Active> {
     pub async fn checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
         crate::task::spawn_blocking_named("checkpoint", move || {
+            // Always save the block-state metadata file — it's the
+            // canonical record of what's PRESENT/DIRTY/SYNCING.
             inner.save_block_states()?;
+
+            // **Skip WAL truncate during the handoff freeze window.**
+            // The successor's `replay_wal_tail` reads the same WAL the
+            // predecessor was appending into. If we truncate here while
+            // the successor is in WARMING/CUTOVER, any entry the
+            // predecessor has acked since the successor's WARMING-time
+            // open vanishes from the WAL — the metadata file captures
+            // the state, but the successor's already-loaded state_map
+            // doesn't get re-loaded. Without the truncate, those
+            // entries remain in the WAL and the successor's tail-replay
+            // picks them up.
+            //
+            // The freeze window is bounded (~hundreds of ms). The WAL
+            // grows briefly. After the predecessor exits, the successor
+            // starts fresh and resumes normal checkpoint behavior on
+            // its own WriteCache.
+            if inner
+                .freeze_in_progress
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                debug!("checkpoint: skipping WAL truncate (freeze in progress)");
+                return Ok(());
+            }
+
             inner.wal.truncate()?;
             debug!("checkpoint complete");
             Ok(())

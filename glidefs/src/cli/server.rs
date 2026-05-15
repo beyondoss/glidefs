@@ -627,6 +627,17 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     // serving I/O while we do this — the whole point of the design.
     let built = build_router_only(config_path.clone()).await?;
 
+    // **Successor passive mode**: each WriteCache starts with
+    // `freeze_in_progress=true` so its flush_scheduler doesn't truncate
+    // the WAL while the predecessor is still appending to it. The flag
+    // is cleared after handoff::run_successor's takeover completes
+    // (in run_successor below). This is the same in-process mechanism
+    // the predecessor uses to suppress its own checkpoint during the
+    // freeze window — applied to the successor side for the whole
+    // WARMING + CUTOVER window since the successor doesn't have
+    // exclusive ownership of the on-disk state until then.
+    built.router.set_all_caches_freeze(true).await;
+
     // Drive the handoff protocol. After this returns, our router owns
     // every device the predecessor used to own.
     let timeouts = crate::handoff::HandoffTimeouts::default();
@@ -639,6 +650,11 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     .context("handoff successor takeover failed")?;
 
     info!("successor: takeover complete, entering serve loop");
+
+    // Predecessor has fully exited (takeover wouldn't return ALIVE
+    // otherwise). Resume per-export checkpoint truncation — we now
+    // own the WAL exclusively.
+    built.router.set_all_caches_freeze(false).await;
 
     // Phase 1 MVP: wait briefly for the predecessor to release its
     // listener fds (NBD TCP/Unix, HTTP API). Predecessor's signal loop

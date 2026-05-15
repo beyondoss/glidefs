@@ -290,6 +290,17 @@ pub(crate) struct CacheInner {
     /// failure, block map load failure). Exposed via metrics for monitoring.
     pub(super) recovery_warnings: AtomicU64,
 
+    /// Set during a graceful handoff's freeze window to suppress WAL
+    /// truncation in [`crate::block::write_cache::WriteCache::checkpoint`].
+    /// Without this, the predecessor's checkpoint can truncate the WAL
+    /// between the successor's WARMING-time replay and PREDS_DEAD,
+    /// dropping entries the successor's `replay_wal_tail` needs.
+    /// `save_block_states` still runs (metadata file stays current);
+    /// only the truncate is skipped. WAL grows briefly (handoff window
+    /// is bounded), then the successor's WAL fully replaces it on
+    /// predecessor exit.
+    pub(super) freeze_in_progress: std::sync::atomic::AtomicBool,
+
     /// Per-export flush serialization lock.
     ///
     /// Serializes flush + manifest upload operations to prevent concurrent
