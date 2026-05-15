@@ -102,6 +102,19 @@ Predecessor's normal shutdown drains dirty blocks to S3. After a successful hand
 | crc32c verify failures | 0 |
 | Side-channel oracle corrupt blocks | 0 |
 
+## Known limitations (Phase 1 MVP scope)
+
+The MVP ships with two stress-mode test failures that are tracked but unresolved:
+
+- **`handoff_sequential_50_crh`**: 50 back-to-back handoffs under continuous fio write+verify. The handoff protocol completes correctly each time (50 successful predecessor→successor transitions, tail-replay catches WAL diffs), but fio reports occasional `bad magic header 0` verify failures within the first ~10 seconds of the test. Diagnostic logging confirms tail-replay is firing and replaying thousands of entries per handoff. The race is somewhere in the in-flight ublk-bio handling during the QUIESCED transition, not in the WAL/state-map ownership transfer that this protocol manages.
+- **`handoff_multi_export_5_crh`**: similar verify failure with 5 exports in parallel (single handoff). Likely shares root cause with sequential.
+
+What does work:
+- **`handoff_durability_crh_per_pr`**: single export, single handoff, 30 s of continuous fio + verify — clean.
+- **`handoff_fault_injection_grid_crh`**: all three successor-crash variants (`s_crash_after_warming`, `s_crash_after_ready`, `s_crash_after_cutover`) end with predecessor-revival serving cleanly.
+
+The likely culprit is in-flight ublk bio interleaving during the kernel's QUIESCED→reissue transition, not the userspace state machine. Investigation continues.
+
 ## Failure-injection grid (verified)
 
 | Inject point | Predecessor outcome | Asserted |
