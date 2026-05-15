@@ -27,7 +27,7 @@ mod worker_pool;
 use worker_pool::WorkerPool;
 
 use crate::block::handler::BlockHandler;
-use device::KernelFeatures;
+pub use device::KernelFeatures;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -155,6 +155,22 @@ impl UblkServer {
     pub fn with_cache_dir(mut self, dir: PathBuf) -> Self {
         self.cache_dir = Some(dir);
         self
+    }
+
+    /// Kernel features detected at startup. Exposed for the handoff
+    /// strategy selector (`crate::handoff::strategy::select`).
+    pub fn kernel_features(&self) -> &KernelFeatures {
+        &self.features
+    }
+
+    /// Active device IDs paired with their export names. Used by the
+    /// handoff predecessor to populate the export snapshot sent in
+    /// `HelloAck`.
+    pub fn snapshot_dev_ids(&self) -> Vec<(i32, String)> {
+        self.devices
+            .iter()
+            .map(|(name, dev)| (dev.dev_id(), name.clone()))
+            .collect()
     }
 
     /// Load ALL persisted device IDs from a previous run.
@@ -681,6 +697,213 @@ impl UblkServer {
                     .await;
                 tracing::info!(deleted, "background orphan sweep complete");
             });
+        }
+
+        self.persist_devices();
+        recovered
+    }
+
+    /// Recover a known list of QUIESCED ublk devices identified by
+    /// `(dev_id, export_name)` pairs — fast path for graceful handoff.
+    ///
+    /// Unlike [`recover_quiesced_devices`], this skips the kernel scan
+    /// (`for_each_dev_id` + per-device state probe) entirely. The
+    /// handoff predecessor already knows which devices it owns and
+    /// passes the list via the handoff socket; the successor goes
+    /// directly into the parallel `recover()` loop.
+    ///
+    /// This shaves the per-device kernel scan from the stall window —
+    /// at 1000-device density, the scan alone is ~150 ms. With this
+    /// path the only kernel work in the stall window is the actual
+    /// `START_USER_RECOVERY` + per-tag FETCH_REQ + `END_USER_RECOVERY`
+    /// trio per device.
+    ///
+    /// **State preconditions** (caller responsibility — not re-checked):
+    /// - Every `dev_id` in `ids` references a device the kernel has in
+    ///   QUIESCED state. If the device is LIVE or already deleted, the
+    ///   recovery ioctl will fail and the device will be reported as
+    ///   failed (returned as part of `usize` shortfall).
+    /// - The `BlockHandler` returned by `get_handler(export_name)` is
+    ///   ready to serve I/O (foyer cache open, WAL replayed, etc.).
+    /// - `nr_queues` per device matches the kernel's view; mismatch
+    ///   causes recovery to fail.
+    ///
+    /// Returns the number of successfully recovered devices.
+    pub async fn recover_devices_by_id(
+        &mut self,
+        ids: &[(i32, String)],
+        get_handler: impl Fn(&str) -> Option<std::sync::Arc<BlockHandler>>,
+    ) -> usize {
+        if !self.features.recovery {
+            tracing::warn!(
+                "kernel does not support UBLK_F_USER_RECOVERY; cannot recover handoff devices"
+            );
+            return 0;
+        }
+        if ids.is_empty() {
+            return 0;
+        }
+
+        // Probe kernel for nr_queues per device — handoff snapshot
+        // doesn't carry it, and we need it for `UblkDevice::recover`.
+        // One spawn_blocking; CTRL_URING is thread_local.
+        //
+        // Race-window note: the predecessor closed its io_uring fds
+        // microseconds ago. The kernel transitions the device to
+        // QUIESCED via `ublk_ch_release`, but the transition is not
+        // guaranteed to be observable by the successor's probing
+        // `UblkCtrl::new_simple` immediately — we've measured states of
+        // LIVE (1) when the predecessor's fd close hasn't propagated
+        // through ublk_drv's per-device state machine yet. Poll briefly
+        // (up to ~1 s budget) for QUIESCED before declaring the device
+        // unrecoverable.
+        let probed: Vec<(i32, String, u16)> = {
+            let ids = ids.to_vec();
+            tokio::task::spawn_blocking(move || {
+                let mut out = Vec::with_capacity(ids.len());
+                for (dev_id, export_name) in ids {
+                    // Aggressive poll: 50µs intervals for the first
+                    // 100ms (covers the typical kernel transition
+                    // latency), then 1ms intervals. Total budget 1s.
+                    //
+                    // The kernel triggers the LIVE→QUIESCED transition
+                    // synchronously inside `ublk_ch_release` when the
+                    // predecessor's last cdev fd closes — so observation
+                    // is bounded only by IPC + scheduling latency.
+                    // Polling at 50µs is well below the kernel's natural
+                    // wakeup granularity but cheap enough to be a
+                    // non-issue (each iteration is one ioctl).
+                    let total_budget = std::time::Duration::from_secs(1);
+                    let deadline = std::time::Instant::now() + total_budget;
+                    let fast_phase_end =
+                        std::time::Instant::now() + std::time::Duration::from_millis(100);
+
+                    let result = loop {
+                        let Ok(ctrl) = ublk_core::ctrl::UblkCtrl::new_simple(dev_id) else {
+                            break None;
+                        };
+                        let state = ctrl.dev_info().state as u32;
+                        if state == ublk_core::sys::UBLK_S_DEV_QUIESCED {
+                            break Some((ctrl.dev_info().nr_hw_queues, state));
+                        }
+                        let now = std::time::Instant::now();
+                        if now >= deadline {
+                            break Some((ctrl.dev_info().nr_hw_queues, state));
+                        }
+                        let delay = if now < fast_phase_end {
+                            std::time::Duration::from_micros(50)
+                        } else {
+                            std::time::Duration::from_millis(1)
+                        };
+                        std::thread::sleep(delay);
+                    };
+
+                    match result {
+                        None => {
+                            tracing::warn!(
+                                dev_id, export = %export_name,
+                                "handoff: cannot open ublk ctrl, skipping"
+                            );
+                            continue;
+                        }
+                        Some((_nr_queues, state)) if state != ublk_core::sys::UBLK_S_DEV_QUIESCED => {
+                            tracing::warn!(
+                                dev_id, export = %export_name, state,
+                                "handoff: device never reached QUIESCED within 1s budget, skipping"
+                            );
+                            continue;
+                        }
+                        Some((nr_queues, _)) => {
+                            out.push((dev_id, export_name, nr_queues));
+                        }
+                    }
+                }
+                out
+            })
+            .await
+            .unwrap_or_default()
+        };
+
+        if probed.is_empty() {
+            return 0;
+        }
+
+        // Resolve handlers. Missing handler = caller bug (successor's
+        // router should have every export the predecessor's snapshot
+        // listed). Log and skip rather than kill the kernel device —
+        // unlike crash recovery, in handoff we know who owns what.
+        let mut to_recover: Vec<(i32, String, std::sync::Arc<BlockHandler>, u16)> =
+            Vec::with_capacity(probed.len());
+        for (dev_id, export_name, nr_queues) in probed {
+            if self.devices.contains_key(&export_name) {
+                tracing::debug!(
+                    dev_id, export = %export_name,
+                    "handoff: already registered, skipping"
+                );
+                continue;
+            }
+            let Some(handler) = get_handler(&export_name) else {
+                tracing::error!(
+                    dev_id, export = %export_name,
+                    "handoff: no handler for known export — successor's router is incomplete"
+                );
+                continue;
+            };
+            to_recover.push((dev_id, export_name, handler, nr_queues));
+        }
+
+        tracing::info!(count = to_recover.len(), "handoff: recovering devices");
+
+        // Parallel recover() loop — same machinery as the crash-recovery
+        // path, just without scan-then-classify.
+        let preferred_node = self.preferred_node();
+        let outcomes: Vec<Result<(String, device::UblkDevice), (i32, String)>> = {
+            use futures::stream::{self, StreamExt};
+            stream::iter(to_recover)
+                .map(|(dev_id, export_name, handler, nr_queues)| {
+                    let features = self.features.clone();
+                    let pool = &self.pool;
+                    async move {
+                        match device::UblkDevice::recover(
+                            dev_id,
+                            handler,
+                            nr_queues,
+                            export_name.clone(),
+                            &features,
+                            preferred_node,
+                            pool,
+                        )
+                        .await
+                        {
+                            Ok(dev) => {
+                                tracing::info!(
+                                    dev_id, export = %export_name,
+                                    path = %dev.dev_path().display(),
+                                    "handoff: device recovered"
+                                );
+                                Ok((export_name, dev))
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    dev_id, export = %export_name, error = %e,
+                                    "handoff: device recovery failed"
+                                );
+                                Err((dev_id, export_name))
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered(RECOVERY_CONCURRENCY)
+                .collect()
+                .await
+        };
+
+        let mut recovered = 0usize;
+        for outcome in outcomes {
+            if let Ok((name, dev)) = outcome {
+                self.devices.insert(name, dev);
+                recovered += 1;
+            }
         }
 
         self.persist_devices();

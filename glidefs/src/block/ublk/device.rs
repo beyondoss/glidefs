@@ -66,31 +66,38 @@ const DATA_FILE_FD_INDEX: u32 = 1;
 
 /// Kernel ublk capabilities detected at startup.
 #[derive(Debug, Clone)]
-pub(crate) struct KernelFeatures {
+pub struct KernelFeatures {
     /// `UBLK_F_USER_RECOVERY` — device survives daemon crash in QUIESCED state.
     pub recovery: bool,
     /// `UBLK_F_CMD_IOCTL_ENCODE` — uring commands use ioctl encoding.
     /// Required on kernels built without `CONFIG_BLKDEV_UBLK_LEGACY_OPCODES`.
     pub ioctl_encode: bool,
+    /// `UBLK_F_PER_IO_DAEMON` — kernel 6.16+. Per-tag daemon ownership
+    /// instead of per-queue. Enables true zero-stall daemon handoff
+    /// (see `handoff::strategy::piod`). Currently always `false` on our
+    /// production kernel (6.12); detection wired for future PIOD support.
+    pub per_io_daemon: bool,
 }
 
 /// Probe the running kernel for supported ublk feature flags.
 ///
 /// Returns conservative defaults (all false) on pre-6.5 kernels where
 /// `get_features()` is unavailable.
-pub(crate) fn detect_features() -> KernelFeatures {
+pub fn detect_features() -> KernelFeatures {
     let raw = UblkCtrl::get_features().unwrap_or(0);
     let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
     let ioctl_encode = (raw & sys::UBLK_F_CMD_IOCTL_ENCODE as u64) != 0;
+    let per_io_daemon = (raw & sys::UBLK_F_PER_IO_DAEMON as u64) != 0;
 
     tracing::info!(
         recovery,
         ioctl_encode,
+        per_io_daemon,
         raw_features = format_args!("0x{:x}", raw),
         "ublk kernel feature detection"
     );
 
-    KernelFeatures { recovery, ioctl_encode }
+    KernelFeatures { recovery, ioctl_encode, per_io_daemon }
 }
 
 // ---------------------------------------------------------------------------

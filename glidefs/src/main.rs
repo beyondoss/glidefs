@@ -8,6 +8,8 @@ mod oci;
 mod parse_object_store;
 mod storage_compatibility;
 mod task;
+#[allow(unsafe_code)] // libc socket/bind/connect/sendmsg/recvmsg for SCM_RIGHTS
+mod handoff;
 
 use tikv_jemallocator::Jemalloc;
 
@@ -57,6 +59,15 @@ fn install_panic_hook() {
 #[tokio::main]
 async fn main() -> Result<()> {
     install_panic_hook();
+
+    // Successor-mode entry: if the predecessor spawned us with
+    // `--handoff-from <socket>`, take over and continue serving instead
+    // of doing a cold-start. We sniff argv directly so the rest of the
+    // CLI grammar (clap) stays unchanged.
+    if let Some(socket) = handoff::successor::handoff_from_arg() {
+        return cli::server::run_server_as_successor(socket).await;
+    }
+
     let cli = cli::Cli::parse_args();
 
     match cli.command {
@@ -68,6 +79,9 @@ async fn main() -> Result<()> {
         }
         cli::Commands::Run { config } => {
             cli::server::run_server(config).await?;
+        }
+        cli::Commands::Handoff { socket } => {
+            cli::handoff_cmd::run(socket).await?;
         }
         cli::Commands::Bless {
             image,

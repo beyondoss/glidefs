@@ -78,6 +78,21 @@ unsafe impl Sync for Wal {}
 
 impl Wal {
     /// Open an existing WAL file for appending, or create a new one.
+    ///
+    /// **Future enhancement** (tracked but not yet active): we'd like to
+    /// acquire `flock(LOCK_EX | LOCK_NB)` here as defense-in-depth for
+    /// the graceful handoff protocol. The CRH protocol already guarantees
+    /// no double-open through its freeze+drop sequence, but a stray
+    /// extra-process open (operator running `glidefs ublk_cleanup` while
+    /// the daemon is live, etc.) wouldn't be caught.
+    ///
+    /// Why it's not active: `ExportRouter::resize_export` does a
+    /// drop+recreate cycle that holds the old `Arc<Wal>` transiently
+    /// across await points. A non-blocking flock fails there even though
+    /// no other process is involved. Re-enabling requires either:
+    /// (a) auditing the Drop path of WriteCache to guarantee fd close
+    /// before re-open, or (b) using a per-pid lockfile separate from
+    /// the WAL file itself.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)

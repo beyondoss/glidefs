@@ -139,13 +139,29 @@ impl WriteCache<Initializing> {
             }
         }
 
-        // Open WAL for new appends (clean file, no torn tail)
+        // Open WAL for new appends (clean file, no torn tail).
+        //
+        // `Wal::open` acquires LOCK_EX|LOCK_NB on the fd. If a previous
+        // daemon is still alive (handoff bug), the lock is held and we
+        // get WouldBlock — propagate as Locked so the caller (successor
+        // process during handoff) knows to abort cleanly. For any other
+        // error (corrupt file etc.) the existing retry-with-remove path
+        // is preserved.
         let wal = match Wal::open(&wal_path) {
             Ok(w) => w,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(CacheError::Locked(wal_path.clone()));
+            }
             Err(e) => {
                 warn!(error = %e, "failed to open WAL, removing and creating new");
                 let _ = std::fs::remove_file(&wal_path);
-                Wal::open(&wal_path).map_err(CacheError::Io)?
+                Wal::open(&wal_path).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        CacheError::Locked(wal_path.clone())
+                    } else {
+                        CacheError::Io(e)
+                    }
+                })?
             }
         };
 
@@ -326,7 +342,14 @@ impl WriteCache<Initializing> {
         let state_map = SparseStateMap::new(num_blocks);
         let block_size = config.block_size;
         let sequence = SequenceNumber::new(0);
-        let wal = Wal::open(&config.wal_path())?;
+        let wal_path = config.wal_path();
+        let wal = Wal::open(&wal_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                CacheError::Locked(wal_path.clone())
+            } else {
+                CacheError::Io(e)
+            }
+        })?;
         let export_name = config.device_name.clone();
         let (zbb, zbh) = shared_zero_block(block_size);
 

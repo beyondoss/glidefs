@@ -713,6 +713,20 @@ impl SequenceNumber {
     pub fn current(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    /// Atomically advance the counter to at least `target`. Used by the
+    /// handoff successor's tail-replay path to skip past WAL entries
+    /// the predecessor wrote between WARMING and FREEZE, so future
+    /// writes on this successor get monotonically-increasing sequence
+    /// numbers strictly greater than anything in the inherited WAL.
+    #[inline]
+    pub fn advance_to(&self, target: u64) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                if v < target { Some(target) } else { None }
+            });
+    }
 }
 
 // ============================================================================

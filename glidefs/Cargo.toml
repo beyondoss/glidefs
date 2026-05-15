@@ -29,6 +29,10 @@ blktests = ["ublk", "test-utils"]
 # Loom concurrency model checking — swaps std atomics for loom atomics
 # in SparseStateMap. Used by the standalone loom-tests crate.
 loom = ["dep:loom"]
+# Compile in fault-injection hooks for handoff state-machine tests.
+# Each variant maps to an `--inject-failure=<name>` CLI flag that the
+# infallible test toggles to verify the recovery paths.
+test-fault-injection = []
 
 [dependencies]
 console-subscriber = { version = "0.5", optional = true }
@@ -158,3 +162,8 @@ required-features = ["fio-bench"]
 name = "fio_verify"
 path = "tests/fio_verify.rs"
 required-features = ["fio-bench"]
+
+[[test]]
+name = "handoff_durability"
+path = "tests/handoff_durability.rs"
+required-features = ["fio-bench", "ublk"]

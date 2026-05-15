@@ -282,6 +282,85 @@ impl WriteCache<Active> {
         self.inner.recovery_warnings.load(Ordering::Relaxed)
     }
 
+    /// Current WAL sequence number. Read by the handoff predecessor to
+    /// populate the `last_wal_seq` field of `ExportSnapshot`; the
+    /// successor uses it to sanity-check that its WAL replay reached at
+    /// least this point.
+    pub fn last_persisted_seq(&self) -> u64 {
+        self.inner.sequence.current()
+    }
+
+    /// Replay any WAL entries newer than the current sequence number and
+    /// apply them to the in-memory state map.
+    ///
+    /// **Critical for graceful handoff correctness.** The successor's
+    /// `WriteCache::open` runs during WARMING, before the predecessor's
+    /// `freeze_all()`. Writes that arrive at the predecessor between
+    /// WARMING and FREEZE get fsync'd to the WAL on disk but the
+    /// successor's already-open state map doesn't know about them. After
+    /// the predecessor's PREDS_DEAD message, the successor must call
+    /// this to pick up the tail of new WAL entries.
+    ///
+    /// Returns the number of entries replayed.
+    pub fn replay_wal_tail(&self) -> Result<usize, super::CacheError> {
+        use crate::block::block_map::SparseBlockState;
+        use crate::block::wal::Wal;
+
+        let min_seq = self.inner.sequence.current();
+        let wal_path = self.inner.config.wal_path();
+        let entries = Wal::replay(&wal_path, min_seq).map_err(|e| {
+            super::CacheError::Io(std::io::Error::other(format!(
+                "WAL tail replay failed: {e}"
+            )))
+        })?;
+
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let num_blocks = self.inner.num_blocks;
+        let mut max_seq = min_seq;
+        for entry in &entries {
+            let idx = entry.block_index as usize;
+            max_seq = max_seq.max(entry.sequence);
+            if idx >= num_blocks {
+                continue;
+            }
+            let old = self.inner.state_map.get(idx);
+            if old != SparseBlockState::DIRTY {
+                self.inner.state_map.set_present(idx);
+                let current = self.inner.state_map.get(idx);
+                if current != SparseBlockState::DIRTY {
+                    if self
+                        .inner
+                        .state_map
+                        .cas(idx, current, SparseBlockState::DIRTY)
+                        .is_ok()
+                    {
+                        self.inner
+                            .dirty_block_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        // Bump the sequence counter past the new max so future writes
+        // get monotonically-increasing sequence numbers.
+        if max_seq > self.inner.sequence.current() {
+            self.inner.sequence.advance_to(max_seq);
+        }
+
+        tracing::info!(
+            replayed = entries.len(),
+            min_seq,
+            max_seq,
+            "WriteCache: tail-replayed WAL entries after handoff"
+        );
+
+        Ok(entries.len())
+    }
+
     /// Get the device size.
     #[allow(dead_code)]
     pub fn device_size(&self) -> u64 {

@@ -50,6 +50,24 @@
 
 include!(concat!(env!("OUT_DIR"), "/ublk_cmd.rs"));
 
+/// `UBLK_F_PER_IO_DAEMON` — per-IO daemon ownership (kernel 6.16+).
+///
+/// When set, the kernel tracks the daemon (task) per outstanding I/O command
+/// rather than per queue, allowing two processes to drive different tags of
+/// the same queue concurrently. This is the building block for true
+/// zero-stall daemon handoff — see `glidefs/src/handoff/` for the
+/// per-tag handoff protocol that uses it.
+///
+/// Defined here as a fallback for older kernel headers (the build host
+/// kernel may not have this constant yet). The bit value matches the
+/// upstream Linux kernel ABI exactly:
+///   `#define UBLK_F_PER_IO_DAEMON (1ULL << 12)`
+///
+/// Whether the running kernel actually honors this flag is detected at
+/// runtime via `UBLK_U_CMD_GET_FEATURES` — see
+/// `glidefs/src/block/ublk/device.rs::detect_features`.
+pub const UBLK_F_PER_IO_DAEMON: u32 = 1 << 12;
+
 /// Convert a packed u64 sqe address to an `ublk_auto_buf_reg` structure.
 ///
 /// This function unpacks the automatic buffer registration data from the format
