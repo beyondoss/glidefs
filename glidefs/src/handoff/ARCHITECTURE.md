@@ -113,7 +113,7 @@ Predecessor's normal shutdown drains dirty blocks to S3. After a successful hand
 ## Future work
 
 - **PIOD strategy** (kernel 6.16+): per-tag handoff via `UBLK_F_PER_IO_DAEMON`. Sub-millisecond stall floor. Slots in via `strategy::select` runtime branch — protocol unchanged.
-- **Pre-warm worker queue slots during WARMING**: currently `recover_devices_by_id`'s parallel `AddQueue` dispatch is the largest contributor to the 250 ms kernel-stall. Pre-allocating worker placements drops it to ~150 ms.
+- **Pre-warm worker queue slots during WARMING** (deferred — task 3.1): investigated. The kernel-stall window is dominated by the QUIESCED probe (~50–100 ms) and per-tag FETCH_REQ submission, not by `worker_for` hash computation (microseconds) or worker pool dispatch (~ms). Pre-warming would require pre-registering cdev fds in workers' fixed-file tables — but the cdev fds only exist once the device is QUIESCED, which is the same point we already probe. So the optimization saves ~ms not ~tens of ms. Not worth the API churn until the rest of the stall window is squeezed.
 - **Skip the QUIESCED probe**: call `START_USER_RECOVERY` directly and retry on `-EBUSY`. Saves the 50µs–1ms poll round-trips.
 - **Listener fd inheritance via SCM_RIGHTS**: eliminates the bind-retry on the successor side. Phase 2.
 - **`glidefs handoff --dry-run`**: walks WARMING through READY then aborts, useful for canary validation.

@@ -111,7 +111,22 @@ impl WriteCache<Initializing> {
         //
         // Uses atomic write (temp → fsync → rename) so a crash during
         // rewrite leaves the original WAL intact rather than truncated.
-        {
+        //
+        // **CRITICAL — skip in handoff successor mode**: the rename()
+        // creates a new inode. The predecessor's still-open WAL fd
+        // points to the OLD inode (renames don't touch open fds), so
+        // predecessor's subsequent appends go to an unreachable file.
+        // Successor's `replay_wal_tail` reads the NEW inode and misses
+        // those appends. Manifests as "verify: bad magic header 0" in
+        // fio under sequential / multi-export stress.
+        // Predecessor's WAL is canonical until handoff completes; the
+        // successor uses the existing inode as-is and lets the
+        // predecessor's flush_scheduler / our own post-takeover
+        // checkpoint handle WAL hygiene.
+        let in_successor_passive_mode = std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !in_successor_passive_mode {
             use crate::block::wal::serialize_entry;
             use std::io::Write as IoWrite;
             let mut buf = Vec::new();
