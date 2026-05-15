@@ -300,6 +300,17 @@ impl WriteCache<Active> {
             .store(frozen, std::sync::atomic::Ordering::Release);
     }
 
+    /// Wait for any in-flight `flush_packs` + `sync_manifest` cycle to
+    /// finish. Bounded by the caller via `tokio::time::timeout`.
+    ///
+    /// Used by handoff `freeze_all` to fence the predecessor: any
+    /// uploaded packs MUST also be registered in the manifest before
+    /// the predecessor exits — otherwise the successor reads zeros for
+    /// blocks whose packs are in S3 but not in the manifest.
+    pub async fn wait_for_inflight_flush(&self) {
+        let _g = self.inner.flush_lock.lock().await;
+    }
+
     /// Replay any WAL entries newer than the current sequence number and
     /// apply them to the in-memory state map.
     ///
@@ -369,6 +380,104 @@ impl WriteCache<Active> {
         );
 
         Ok(entries.len())
+    }
+
+    /// Post-takeover recovery for a flushing file the predecessor was
+    /// using when handoff started.
+    ///
+    /// In passive mode (handoff successor WARMING), `WriteCache::open`
+    /// detects the flushing file but defers recovery — it can't safely
+    /// touch the file or the active data file while the predecessor is
+    /// still uploading. After PREDS_DEAD, the predecessor is gone and
+    /// we can finish the work safely:
+    ///
+    /// - **Flushing file still present**: predecessor exited mid-upload.
+    ///   For every SYNCING block in our state_map, copy the bytes from
+    ///   the flushing file back into the active data file, transition
+    ///   SYNCING→DIRTY, then unlink the flushing file. The flush
+    ///   scheduler will re-upload these blocks normally.
+    /// - **Flushing file gone**: predecessor finished its flush before
+    ///   exiting. Blocks are CLEAN in S3 and registered in the manifest.
+    ///   Our state_map (loaded at WARMING-time open) still says SYNCING.
+    ///   Transition SYNCING→NOT_PRESENT so subsequent reads fall back
+    ///   to S3 — the predecessor's foyer entries are gone with its
+    ///   process, but S3 is durable.
+    ///
+    /// Returns the number of blocks acted on (recovered + invalidated).
+    pub fn recover_pending_flush_file(&self) -> Result<usize, super::CacheError> {
+        use crate::block::block_map::SparseBlockState;
+        use std::os::unix::fs::FileExt;
+
+        let flushing_path = self.inner.config.flushing_path();
+        let block_size = self.inner.config.block_size;
+        let device_size = self.inner.config.device_size;
+
+        let syncing_blocks: Vec<usize> = self
+            .inner
+            .state_map
+            .iter_present()
+            .filter(|&(_, state)| state == SparseBlockState::SYNCING)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if syncing_blocks.is_empty() && !flushing_path.exists() {
+            return Ok(0);
+        }
+
+        if !flushing_path.exists() {
+            // Predecessor finished the flush before exiting. Demote
+            // SYNCING → NOT_PRESENT so reads go through S3.
+            for idx in &syncing_blocks {
+                let _ = self.inner.state_map.cas(
+                    *idx,
+                    SparseBlockState::SYNCING,
+                    SparseBlockState::NOT_PRESENT,
+                );
+            }
+            tracing::info!(
+                invalidated = syncing_blocks.len(),
+                "post-takeover recovery: predecessor completed flush; SYNCING→NOT_PRESENT (S3 fallback)"
+            );
+            return Ok(syncing_blocks.len());
+        }
+
+        // Predecessor exited mid-upload. Recover the blocks.
+        let flushing_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&flushing_path)?;
+
+        let df_guard = self.inner.data_file.read();
+        let mut recovered = 0usize;
+        let mut buf = vec![0u8; block_size];
+        for idx in &syncing_blocks {
+            let offset = *idx as u64 * block_size as u64;
+            let valid_bytes = std::cmp::min(
+                block_size as u64,
+                device_size.saturating_sub(offset),
+            ) as usize;
+            if valid_bytes == 0 {
+                continue;
+            }
+            flushing_file.read_exact_at(&mut buf[..valid_bytes], offset)?;
+            df_guard.write_all_at(&buf[..valid_bytes], offset)?;
+            let _ = self.inner.state_map.cas(
+                *idx,
+                SparseBlockState::SYNCING,
+                SparseBlockState::DIRTY,
+            );
+            self.inner
+                .dirty_block_count
+                .fetch_add(1, Ordering::Relaxed);
+            recovered += 1;
+        }
+        drop(df_guard);
+        drop(flushing_file);
+        std::fs::remove_file(&flushing_path)?;
+        tracing::info!(
+            recovered,
+            "post-takeover recovery: predecessor exited mid-flush; copied flushing→active"
+        );
+        Ok(recovered)
     }
 
     /// Get the device size.

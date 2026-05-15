@@ -64,6 +64,17 @@ async fn flush_and_sync(
     flush_backoff: &mut Duration,
     last_flush_failure: &mut Option<tokio::time::Instant>,
 ) -> Option<FlushResult> {
+    // Hold the per-cache flush_lock for the entire flush_packs +
+    // sync_manifest cycle. The handoff freeze step
+    // (`router.freeze_all`) acquires this same lock to fence the
+    // predecessor before it exits, so any uploaded packs are also
+    // registered in the manifest before the cutover. Without it, the
+    // predecessor could exit between pack-upload and manifest-sync,
+    // leaving packs in S3 that no manifest references — the successor
+    // then reads those blocks via the (stale) manifest, finds nothing,
+    // and serves zeros (visible as fio "verify: bad magic header 0").
+    let _flush_guard = cache.flush_lock().lock().await;
+
     match cache
         .flush_packs(content_store, pack_index_cache, volume_manifest, Some(clean_cache))
         .await

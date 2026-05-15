@@ -2918,7 +2918,40 @@ impl ExportRouter {
             cache.set_freeze_in_progress(true);
         }
 
+        // **Fence in-flight flush + manifest-sync cycles** before the
+        // predecessor exits. The flush scheduler holds `flush_lock` for
+        // the entire flush_packs+sync_manifest sequence
+        // (`flush_scheduler::flush_and_sync`); acquiring the lock here
+        // blocks until any in-flight cycle either completes (manifest
+        // synced, packs visible to the successor) or times out.
+        //
+        // Bounded at 8s per export — enough for a typical 64MB pack
+        // batch + manifest sync over slow S3 (file:// in tests is much
+        // faster), short enough to not block handoff if the upload is
+        // genuinely stuck. On timeout we proceed with the cutover and
+        // accept the (rare) possibility of orphaned packs in S3 — the
+        // test fleet's GC scrubber reclaims them.
         use futures::stream::{self, StreamExt};
+        stream::iter(states.iter().map(|(name, _, cache)| (name.clone(), Arc::clone(cache))))
+            .for_each_concurrent(16, |(name, cache)| async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    cache.wait_for_inflight_flush(),
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(_) => {
+                        warn!(
+                            export = %name,
+                            "handoff: in-flight flush did not complete within 8s; \
+                             proceeding with cutover (orphan-pack scrubber will reclaim)"
+                        );
+                    }
+                }
+            })
+            .await;
+
         let errs: Vec<_> = stream::iter(states.into_iter())
             .map(|(name, _handler, cache)| async move {
                 tokio::task::spawn_blocking(move || cache.flush())
@@ -3020,9 +3053,17 @@ impl ExportRouter {
         // Done before the ublk-level recovery so the BlockHandler's
         // view of state_map is current by the time the kernel reissues
         // bios at us.
+        //
+        // Then resolve any flushing-file the predecessor was uploading
+        // when handoff started (`recover_pending_flush_file`). We
+        // deferred this in `WriteCache::open` (passive mode) because
+        // touching the active data file or the flushing file while the
+        // predecessor was still uploading would race writes and
+        // corrupt blocks.
         for (_, export_name) in ids {
             if let Some(state) = self.exports.get(export_name) {
                 let cache = Arc::clone(&state.value().cache);
+                let cache_for_recovery = Arc::clone(&cache);
                 match tokio::task::spawn_blocking(move || cache.replay_wal_tail())
                     .await
                 {
@@ -3048,6 +3089,85 @@ impl ExportRouter {
                             incomplete_count: 1,
                             details: format!("spawn_blocking failed: {e}"),
                         });
+                    }
+                }
+
+                match tokio::task::spawn_blocking(move || {
+                    cache_for_recovery.recover_pending_flush_file()
+                })
+                .await
+                {
+                    Ok(Ok(n)) => {
+                        if n > 0 {
+                            tracing::info!(
+                                export = %export_name,
+                                acted_on = n,
+                                "handoff: post-takeover flush-file recovery"
+                            );
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        return Err(RouterError::ShutdownIncomplete {
+                            incomplete_count: 1,
+                            details: format!(
+                                "post-takeover flush-file recovery failed for '{export_name}': {e}"
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(RouterError::ShutdownIncomplete {
+                            incomplete_count: 1,
+                            details: format!("spawn_blocking failed: {e}"),
+                        });
+                    }
+                }
+
+                // **Reload the volume manifest from S3.** The successor
+                // loaded the manifest at WARMING-time, which is BEFORE
+                // the predecessor's freeze fence. The predecessor may
+                // have completed a `sync_manifest` call between then
+                // and PREDS_DEAD, registering new packs. Without a
+                // reload, the successor's in-memory manifest doesn't
+                // know about those packs — reads of blocks resolved
+                // through the manifest return zero (visible as fio
+                // "verify: bad magic header 0"), and the successor's
+                // own next manifest sync hits an ETag PreconditionFailed.
+                let cs = Arc::clone(&state.value().content_store);
+                let vm = Arc::clone(&state.value().volume_manifest);
+                let cache_for_etag = Arc::clone(&state.value().cache);
+                match cs.get_manifest(export_name).await {
+                    Ok(Some((data, etag))) => {
+                        match crate::block::volume_manifest::VolumeManifest::deserialize(&data) {
+                            Ok(new_vm) => {
+                                *vm.write() = new_vm;
+                                *cache_for_etag.inner.manifest_etag.lock() = etag;
+                                tracing::info!(
+                                    export = %export_name,
+                                    "handoff: reloaded volume manifest from S3"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    export = %export_name,
+                                    error = %e,
+                                    "handoff: failed to deserialize reloaded manifest \
+                                     — keeping pre-handoff in-memory copy (some pack \
+                                     references may be missing until next successful sync)"
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // No manifest in S3 — predecessor never flushed.
+                        // Our pre-handoff in-memory manifest is empty too. OK.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            export = %export_name,
+                            error = %e,
+                            "handoff: failed to fetch reloaded manifest from S3 \
+                             — keeping pre-handoff in-memory copy"
+                        );
                     }
                 }
             }

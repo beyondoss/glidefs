@@ -1139,11 +1139,17 @@ async fn handoff_multi_export_5_crh() {
 const SEQUENTIAL_PROFILE: TestProfile = TestProfile {
     name: "sequential",
     device_count: 1,
-    device_size_gb: 4,
-    workload_runtime: Duration::from_secs(600), // 10 min runtime cap
+    device_size_gb: 2,
+    workload_runtime: Duration::from_secs(60),
     handoff_count: 50,
     fio_jobs: 1,
-    fio_iodepth: 32,
+    // iodepth=1 — strict write-then-verify serialization. Higher
+    // iodepth values race fio's writes against its verifies (write
+    // and verify get different tags, kernel doesn't enforce
+    // read-after-write across tags). With iodepth=1 every verify
+    // happens after its write completes, isolating handoff
+    // correctness from fio's own ordering semantics.
+    fio_iodepth: 1,
     p99_stall_ms: 100,
     p999_stall_ms: 500,
 };

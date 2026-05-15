@@ -199,7 +199,32 @@ impl WriteCache<Initializing> {
         // writes; other DIRTY blocks are pre-rotation and need recovery
         // from the flushing file.
         let flushing_path = config.flushing_path();
-        if flushing_path.exists() {
+        if flushing_path.exists() && in_successor_passive_mode {
+            // **Handoff successor passive mode**: the flushing file
+            // belongs to the still-running predecessor's in-flight
+            // S3 upload. We must NOT recover from it here — recovery
+            // would:
+            //   1. pwrite old block data from the flushing file back
+            //      to the active data file, overwriting any new
+            //      writes the predecessor has applied since rotation
+            //      (visible to fio as "verify: bad magic header 0"),
+            //   2. CAS SYNCING→DIRTY in our state_map while the
+            //      predecessor's state_map still shows SYNCING,
+            //   3. remove the flushing file path while the
+            //      predecessor's open fd still depends on the inode
+            //      for its in-flight upload.
+            //
+            // Leave the flushing file alone. After cutover the
+            // successor calls `recover_pending_flush_file` (in
+            // `run_server_as_successor`) which re-checks the file:
+            // if the predecessor finished its flush before exiting,
+            // the file is gone and we have nothing to do; if not,
+            // we recover normally.
+            info!(
+                rotation_seq,
+                "found flushing file — deferring recovery until after handoff cutover (passive mode)"
+            );
+        } else if flushing_path.exists() {
             info!(rotation_seq, "found flushing file — recovering from interrupted flush");
             let flushing_file = SyncFile::open(&flushing_path, false, config.device_size)?;
             let block_size = config.block_size;
