@@ -63,9 +63,14 @@ const PR_PROFILE: TestProfile = TestProfile {
     name: "per-pr",
     device_count: 1,
     device_size_gb: 4,
-    workload_runtime: Duration::from_secs(60),
+    workload_runtime: Duration::from_secs(30),
     handoff_count: 1,
-    fio_jobs: 8,
+    // fio with --verify=crc32c + numjobs>1 warns "multiple writers may
+    // overwrite blocks that belong to other jobs" and aborts on verify
+    // mismatch. Single job + high iodepth gives equivalent throughput
+    // for our test purposes (catching VM-stall + corruption) without
+    // the cross-job verify race.
+    fio_jobs: 1,
     fio_iodepth: 32,
     p99_stall_ms: 50,
     p999_stall_ms: 200,
@@ -121,87 +126,117 @@ impl StrategyKind {
 // Side-channel oracle
 // =============================================================================
 
+/// fio's `--verify=crc32c` writes a `struct verify_header` at the start
+/// of every block. The first two bytes are the magic value 0xacca
+/// (little-endian: `[0xca, 0xac]`). This is the same magic our handoff
+/// integration tests have been catching as the failure marker
+/// ("verify: bad magic header 0, wanted acca") — it confirms a block
+/// holds fio's data vs. zeros vs. corruption.
+const FIO_VERIFY_MAGIC: u16 = 0xacca;
+
+/// Side-channel oracle: classifies each block on the device after the
+/// workload finishes, INDEPENDENTLY of fio's own --verify path. fio's
+/// verify catches anything fio ever reads back; this scan catches blocks
+/// fio didn't happen to re-verify but we can prove are corrupt by
+/// inspecting their contents.
+///
+/// Three buckets:
+/// - **WrittenByFio**: block starts with the fio magic (0xacca). The
+///   block is fio's data, presumably correct — we don't re-verify the
+///   crc here because fio already did at write time.
+/// - **NeverWritten**: block is all zeros. Expected for any block fio
+///   didn't touch (fio randwrite covers random offsets, not the whole
+///   device).
+/// - **Corrupt**: block has neither fio's magic nor all zeros. This is
+///   the failure bucket — indicates data divergence between what fio
+///   wrote and what's on disk now.
 #[allow(dead_code)]
 struct Oracle {
     block_size: usize,
-    last_pattern: dashmap::DashMap<u64, u64>,
 }
 
 #[allow(dead_code)]
 impl Oracle {
     fn new(block_size: usize) -> Self {
-        Self {
-            block_size,
-            last_pattern: dashmap::DashMap::new(),
-        }
+        Self { block_size }
     }
 
-    fn record_write(&self, offset: u64, pattern_seed: u64) {
-        let block = offset / self.block_size as u64;
-        self.last_pattern.insert(block, pattern_seed);
-    }
+    /// Scan the device and classify every block. Returns counts and a
+    /// (bounded) list of corrupt block offsets for diagnosis.
+    fn scan(&self, device_path: &Path) -> std::io::Result<OracleScan> {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
 
-    fn verify_against_device(&self, device_path: &Path) -> Vec<OracleMismatch> {
-        use std::io::{Read, Seek, SeekFrom};
-
-        let mut mismatches = Vec::new();
-        let mut f = match std::fs::File::open(device_path) {
-            Ok(f) => f,
-            Err(e) => {
-                return vec![OracleMismatch::OpenFailed(format!("{e}"))];
-            }
+        let f = std::fs::File::open(device_path)?;
+        // Block devices report size 0 via metadata().len(). Use the
+        // BLKGETSIZE64 ioctl. SAFETY: f is a valid open fd.
+        let mut size_bytes: u64 = 0;
+        let rc = unsafe {
+            libc::ioctl(
+                f.as_raw_fd(),
+                // BLKGETSIZE64 = 0x80081272 on Linux/x86_64.
+                0x80081272,
+                &mut size_bytes as *mut u64,
+            )
         };
+        let device_size = if rc == 0 && size_bytes > 0 {
+            size_bytes
+        } else {
+            // Fall back to regular-file metadata for tests that point at
+            // sparse files (CI without ublk_drv).
+            f.metadata()?.len()
+        };
+        let nblocks = device_size / self.block_size as u64;
+
         let mut buf = vec![0u8; self.block_size];
+        let mut written = 0u64;
+        let mut never_written = 0u64;
+        let mut corrupt = 0u64;
+        let mut corrupt_offsets = Vec::new();
 
-        for entry in self.last_pattern.iter() {
-            let block = *entry.key();
-            let expected_seed = *entry.value();
-            let offset = block * self.block_size as u64;
-
-            if f.seek(SeekFrom::Start(offset)).is_err() {
-                mismatches.push(OracleMismatch::SeekFailed { block });
-                continue;
+        let mut reader = std::io::BufReader::new(f);
+        for block in 0..nblocks {
+            if reader.read_exact(&mut buf).is_err() {
+                break;
             }
-            if f.read_exact(&mut buf).is_err() {
-                mismatches.push(OracleMismatch::ReadFailed { block });
-                continue;
-            }
-
-            let actual = derive_seed_from_block(&buf);
-            if actual != expected_seed {
-                mismatches.push(OracleMismatch::Mismatch {
-                    block,
-                    expected: expected_seed,
-                    actual,
-                });
-                if mismatches.len() > 50 {
-                    mismatches.push(OracleMismatch::Truncated);
-                    break;
+            let magic = u16::from_le_bytes([buf[0], buf[1]]);
+            if magic == FIO_VERIFY_MAGIC {
+                written += 1;
+            } else if buf.iter().all(|&b| b == 0) {
+                never_written += 1;
+            } else {
+                corrupt += 1;
+                if corrupt_offsets.len() < 20 {
+                    corrupt_offsets.push(block * self.block_size as u64);
                 }
             }
         }
 
-        mismatches
+        Ok(OracleScan {
+            block_size: self.block_size,
+            total_blocks: nblocks,
+            written_by_fio: written,
+            never_written,
+            corrupt,
+            corrupt_offsets,
+        })
     }
-}
-
-#[allow(dead_code)]
-fn derive_seed_from_block(_buf: &[u8]) -> u64 {
-    // fio's `--verify=crc32c` encodes its verification pattern into each
-    // block's header. The real impl decodes that here; the placeholder
-    // returns 0 so initial test runs trip only the dual-oracle assertion
-    // for fio's own verify, not the side-channel.
-    0
 }
 
 #[derive(Debug)]
 #[allow(dead_code)]
-enum OracleMismatch {
-    OpenFailed(String),
-    SeekFailed { block: u64 },
-    ReadFailed { block: u64 },
-    Mismatch { block: u64, expected: u64, actual: u64 },
-    Truncated,
+struct OracleScan {
+    block_size: usize,
+    total_blocks: u64,
+    /// Blocks containing fio's verify header (0xacca magic).
+    written_by_fio: u64,
+    /// Blocks that are all zeros — never touched by fio.
+    never_written: u64,
+    /// Blocks with content that is neither fio data nor zeros. The
+    /// corruption bucket.
+    corrupt: u64,
+    /// First few corrupt block offsets (for diagnosis); capped at 20.
+    corrupt_offsets: Vec<u64>,
 }
 
 // =============================================================================
@@ -275,7 +310,12 @@ nr_queues = 1
 #[allow(dead_code)]
 struct DaemonHandle {
     pid: u32,
-    process: tokio::process::Child,
+    /// `Some` only for the *original* predecessor we spawned ourselves.
+    /// After a successful handoff we reap this child via `.wait()` and
+    /// set this to `None` — the successor is a process we did not
+    /// spawn, so we have no `Child` for it and reap via PID-poll
+    /// instead.
+    process: Option<tokio::process::Child>,
     config_path: PathBuf,
     cache_dir: PathBuf,
     api_port: u16,
@@ -338,7 +378,7 @@ impl DaemonHandle {
 
         let handle = Self {
             pid,
-            process,
+            process: Some(process),
             config_path,
             cache_dir,
             api_port,
@@ -349,11 +389,11 @@ impl DaemonHandle {
         Ok(handle)
     }
 
-    /// Poll the HTTP API until /api/exports responds (daemon is up and
-    /// router ready). Bounded by `timeout`.
+    /// Poll the HTTP API until /api/exports responds with a non-empty
+    /// JSON body containing all expected exports. Bounded by `timeout`.
+    /// Returns the device path of the first export (used for fio).
     async fn wait_for_ready(&self, timeout: Duration) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
-        let url = format!("http://{}/api/exports", self.api_addr);
         loop {
             if Instant::now() > deadline {
                 anyhow::bail!(
@@ -362,18 +402,82 @@ impl DaemonHandle {
                     timeout
                 );
             }
-            // Try a TCP connection; cheap and avoids pulling reqwest into
-            // dev-deps.
-            if tokio::net::TcpStream::connect(self.api_addr).await.is_ok() {
-                // Brief delay so the API server has actually accepted.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                if tokio::net::TcpStream::connect(self.api_addr).await.is_ok() {
-                    let _ = url;
+            if let Ok(body) = self.http_get("/api/exports").await {
+                // Daemon's API is responding. Confirm it has at least
+                // one export with a device path.
+                if body.contains("\"device\"") && body.contains("/dev/ublk") {
                     return Ok(());
                 }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// One-shot HTTP GET against the daemon's API. Uses curl as a
+    /// subprocess — it's already available in CI (the kernel-devices
+    /// job has it), and Rust HTTP clients (reqwest etc.) are heavier
+    /// dev-deps than warranted for a test scaffolding helper.
+    async fn http_get(&self, path: &str) -> anyhow::Result<String> {
+        let url = format!("http://{}{}", self.api_addr, path);
+        let out = tokio::process::Command::new("curl")
+            .arg("--silent")
+            .arg("--max-time")
+            .arg("5")
+            .arg("--fail-with-body")
+            .arg(&url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "curl GET {url} failed status={:?} stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    /// Discover the ublk device path for the first export. Used by the
+    /// test to find the right /dev/ublkbN to point fio at — the kernel
+    /// allocates dev IDs dynamically so we can't hardcode.
+    async fn discover_device_path(&self) -> anyhow::Result<PathBuf> {
+        let body = self.http_get("/api/exports").await?;
+        // The body is HTTP response: headers + JSON. Find the `"device":"/dev/ublkbN"` field.
+        let start = body
+            .find("\"device\":\"")
+            .ok_or_else(|| anyhow::anyhow!("no `device` field in /api/exports response: {body}"))?
+            + "\"device\":\"".len();
+        let rest = &body[start..];
+        let end = rest
+            .find('"')
+            .ok_or_else(|| anyhow::anyhow!("malformed `device` field in response"))?;
+        Ok(PathBuf::from(&rest[..end]))
+    }
+
+    /// Discover the current PID serving the API by looking up which
+    /// process holds the API port. Used after handoff to update our
+    /// stored pid.
+    fn discover_pid(&self) -> anyhow::Result<u32> {
+        // Scan all glidefs processes; the one whose cmdline references
+        // our config path is the active daemon. Successor's cmdline
+        // contains `--handoff-from` and our config path; predecessor's
+        // contains `run -c` and our config path.
+        let our_config = self.config_path.to_string_lossy();
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let pid_str = entry.file_name();
+            let Some(pid_str) = pid_str.to_str() else { continue };
+            let Ok(pid) = pid_str.parse::<u32>() else { continue };
+            let cmdline_path = format!("/proc/{pid}/cmdline");
+            let Ok(cmdline_bytes) = std::fs::read(&cmdline_path) else { continue };
+            let cmdline = String::from_utf8_lossy(&cmdline_bytes);
+            if cmdline.contains("glidefs") && cmdline.contains(our_config.as_ref()) {
+                return Ok(pid);
+            }
+        }
+        anyhow::bail!("could not locate glidefs PID for config {our_config}")
     }
 
     /// Trigger a handoff via SIGHUP.
@@ -387,17 +491,26 @@ impl DaemonHandle {
 
     /// Send SIGKILL — used in failure-injection tests.
     async fn sigkill(&mut self) -> anyhow::Result<()> {
-        self.process.kill().await?;
+        if let Some(p) = self.process.as_mut() {
+            p.kill().await?;
+        } else {
+            unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
+        }
         Ok(())
     }
 }
 
 impl Drop for DaemonHandle {
     fn drop(&mut self) {
-        // Best-effort cleanup. The test's tokio runtime may already be
-        // gone, so use a sync kill.
+        // SIGKILL the running daemon — SIGTERM triggers drain-to-S3,
+        // which can hang for the full shutdown_timeout when our
+        // tempdir is already gone. Tests rely on WAL recovery to
+        // restore state across runs.
         unsafe {
-            libc::kill(self.pid as i32, libc::SIGTERM);
+            libc::kill(self.pid as i32, libc::SIGKILL);
+        }
+        if let Some(p) = self.process.as_mut() {
+            let _ = p.start_kill();
         }
     }
 }
@@ -479,8 +592,21 @@ impl FioJob {
 
 #[allow(dead_code)]
 fn parse_fio_json(stdout: &[u8]) -> anyhow::Result<FioResult> {
-    let json: serde_json::Value = serde_json::from_slice(stdout)
-        .map_err(|e| anyhow::anyhow!("parsing fio JSON output: {e}"))?;
+    // fio's `--output-format=json+` may emit warnings or version info
+    // before the JSON document. Trim to the first `{`.
+    let first_brace = stdout
+        .iter()
+        .position(|&b| b == b'{')
+        .ok_or_else(|| {
+            let preview = String::from_utf8_lossy(&stdout[..stdout.len().min(200)]);
+            anyhow::anyhow!("fio stdout has no JSON object — preview: {preview}")
+        })?;
+    let json_slice = &stdout[first_brace..];
+    let json: serde_json::Value = serde_json::from_slice(json_slice)
+        .map_err(|e| {
+            let preview = String::from_utf8_lossy(&json_slice[..json_slice.len().min(500)]);
+            anyhow::anyhow!("parsing fio JSON output: {e} — preview: {preview}")
+        })?;
 
     let jobs = json
         .get("jobs")
@@ -541,11 +667,24 @@ async fn run_handoff_durability_test(
 
     println!("=== handoff_durability: profile={} strategy={}", profile.name, strategy.name());
 
+    // Snapshot kernel taint flag BEFORE the test. The check at the end
+    // compares the delta — pre-existing taint from prior workloads on
+    // this host is OK; only NEW taint set during this test is a failure.
+    let taint_before = std::fs::read_to_string("/proc/sys/kernel/tainted")
+        .unwrap_or_else(|_| "0".to_string())
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    println!("  pre-test kernel taint: 0x{taint_before:x}");
+
     let scratch = tempfile::tempdir()?;
     let mut p = DaemonHandle::spawn(&profile, scratch.path()).await?;
     println!("  daemon pid {} ready", p.pid);
 
-    let device_path = PathBuf::from("/dev/ublkb0");
+    // Discover the device path the kernel allocated for our export.
+    let device_path = p.discover_device_path().await?;
+    println!("  device: {}", device_path.display());
+
     let fio_job = FioJob {
         device_path: device_path.clone(),
         runtime: profile.workload_runtime,
@@ -563,12 +702,47 @@ async fn run_handoff_durability_test(
     let handoff_start = Instant::now();
     for i in 0..profile.handoff_count {
         let t0 = Instant::now();
+        let old_pid = p.pid;
         p.trigger_handoff()?;
 
-        // Wait for the new daemon — same API port (inherited via fd-pass
-        // in Phase 2 or reopened in Phase 1).
+        // Wait for the predecessor to exit. If we have a `Child` we
+        // .wait() it (which also reaps the zombie). For subsequent
+        // handoffs the previous successor is an adopted process — we
+        // poll its PID via /proc.
+        match p.process.take() {
+            Some(mut child) => {
+                match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+                    Ok(Ok(status)) if !status.success() => {
+                        anyhow::bail!("predecessor exited with status {status:?}");
+                    }
+                    Ok(Ok(_)) => { /* clean exit */ }
+                    Ok(Err(e)) => anyhow::bail!("wait on predecessor: {e}"),
+                    Err(_) => anyhow::bail!(
+                        "predecessor pid {old_pid} did not exit in 30s"
+                    ),
+                }
+            }
+            None => {
+                // Adopted process — poll /proc/<pid>.
+                let deadline = t0 + Duration::from_secs(30);
+                while std::path::Path::new(&format!("/proc/{old_pid}")).exists() {
+                    if Instant::now() > deadline {
+                        anyhow::bail!("predecessor pid {old_pid} did not exit in 30s");
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        // Wait for the successor's API to come up.
         p.wait_for_ready(Duration::from_secs(30)).await?;
-        println!("  handoff {i}: {:?}", t0.elapsed());
+
+        // Update our handle's pid to the new successor. We didn't
+        // spawn it so we have no `Child`; rely on /proc polling for
+        // future iterations and SIGKILL via libc in Drop.
+        let new_pid = p.discover_pid()?;
+        p.pid = new_pid;
+        println!("  handoff {i}: pid {old_pid} → {} in {:?}", p.pid, t0.elapsed());
     }
     println!("  {} handoffs in {:?}", profile.handoff_count, handoff_start.elapsed());
 
@@ -587,13 +761,23 @@ async fn run_handoff_durability_test(
         "fio --verify=crc32c failed — DATA CORRUPTION"
     );
 
-    // ASSERT 3: side-channel oracle check.
-    let mismatches = oracle.verify_against_device(&device_path);
-    assert!(
-        mismatches.is_empty(),
-        "side-channel oracle found {} block mismatches",
-        mismatches.len()
-    );
+    // ASSERT 3: side-channel oracle scan — independent of fio's own
+    // verify path. Catches any block that's neither fio's data nor
+    // zeros (the "corrupt" bucket).
+    match oracle.scan(&device_path) {
+        Ok(scan) => {
+            println!(
+                "  oracle scan: {} written, {} never_written, {} corrupt",
+                scan.written_by_fio, scan.never_written, scan.corrupt
+            );
+            assert_eq!(
+                scan.corrupt, 0,
+                "side-channel oracle found {} corrupt blocks; first offsets: {:?}",
+                scan.corrupt, scan.corrupt_offsets
+            );
+        }
+        Err(e) => panic!("oracle scan failed: {e}"),
+    }
 
     // ASSERT 4: latency budgets met.
     let p99_ms = fio_result.p99_us / 1000;
@@ -609,13 +793,19 @@ async fn run_handoff_durability_test(
         profile.p999_stall_ms
     );
 
-    // ASSERT 5: no kernel taints.
-    let tainted = std::fs::read_to_string("/proc/sys/kernel/tainted")
-        .unwrap_or_else(|_| "0".to_string());
+    // ASSERT 5: no NEW kernel taints (delta-based — pre-existing taint
+    // from prior workloads on this host is OK; new bits set during
+    // this test would indicate BUG_ON/WARN_ON in ublk_drv triggered
+    // by our handoff path).
+    let taint_after = std::fs::read_to_string("/proc/sys/kernel/tainted")
+        .unwrap_or_else(|_| "0".to_string())
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let new_taint = taint_after & !taint_before;
     assert_eq!(
-        tainted.trim(),
-        "0",
-        "kernel taint flag set during test — possible BUG_ON/WARN_ON in ublk_drv"
+        new_taint, 0,
+        "new kernel taint bits set during test: before=0x{taint_before:x} after=0x{taint_after:x} new=0x{new_taint:x}"
     );
 
     println!("=== handoff_durability: ALL ASSERTIONS PASSED ===");

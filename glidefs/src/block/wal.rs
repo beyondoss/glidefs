@@ -141,6 +141,7 @@ impl Wal {
             .open(&lockfile_path)?;
 
         let our_pid = std::process::id();
+        let our_ppid = unsafe { libc::getppid() } as u32;
         let existing_pid = read_pid_from_lockfile(&lockfile);
 
         match existing_pid {
@@ -148,6 +149,23 @@ impl Wal {
                 // Same process — accept (resize_export drop+recreate
                 // race). The flock isn't reacquired here because per-fd
                 // semantics would conflict with the existing fd.
+            }
+            Some(pid) if pid == our_ppid && process_alive(pid) => {
+                // **Graceful handoff scenario**: the predecessor process
+                // (our parent — we were forked+exec'd by it via
+                // `handoff::run_predecessor::spawn_successor`) still
+                // holds the WAL open while we WARM. This is the
+                // intentional, correct pattern for CRH and is NOT a
+                // double-open hazard: we only read existing WAL state
+                // here, and the predecessor's `freeze_all()` fsyncs
+                // before our `replay_wal_tail()` runs. The predecessor
+                // will exit shortly after sending ALIVE, releasing the
+                // flock; future re-opens in this (successor) process
+                // see the stale PID and reclaim ownership normally.
+                tracing::info!(
+                    pid, path = %path.display(),
+                    "WAL open: accepting parent-process ownership (handoff successor WARMING)"
+                );
             }
             Some(pid) if process_alive(pid) => {
                 return Err(io::Error::new(
@@ -693,6 +711,26 @@ mod tests {
             content.trim().parse::<u32>().unwrap() == our_pid,
             "lockfile should now contain our PID {our_pid}, got: {content:?}"
         );
+        drop(wal);
+    }
+
+    /// Handoff scenario: lockfile holds our parent's pid. Successor
+    /// (us, forked+exec'd by predecessor) must be able to open WAL
+    /// during WARMING. The parent process is alive (init=1 is always
+    /// alive); we simulate parent ownership by writing PPID into the
+    /// lockfile.
+    #[test]
+    fn test_wal_lockfile_allows_parent_process_during_handoff() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("handoff.wal");
+        let lockfile_path = wal_path.with_extension("wal.lock");
+
+        // Write our PPID into the lockfile — the handoff scenario.
+        let ppid = unsafe { libc::getppid() } as u32;
+        std::fs::write(&lockfile_path, format!("{ppid}\n").as_bytes()).unwrap();
+
+        let wal = Wal::open(&wal_path)
+            .expect("WAL open should accept parent-process ownership during handoff");
         drop(wal);
     }
 
