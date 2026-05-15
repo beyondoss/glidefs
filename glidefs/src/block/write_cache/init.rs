@@ -299,7 +299,20 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(recovery_warning_count),
-            freeze_in_progress: std::sync::atomic::AtomicBool::new(false),
+            // Default to true if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
+            // is set in the env. The handoff successor sets it before
+            // calling `build_router_only` so every WriteCache is born
+            // in passive mode (no flushing, no checkpoint truncate)
+            // until takeover completes. Without this, the per-export
+            // flush_scheduler — started inside `create_export` BEFORE
+            // `set_all_caches_freeze(true)` runs in `run_server_as_successor`
+            // — could fire a rotation during the brief window and break
+            // cross-process file-handle sharing with the predecessor.
+            freeze_in_progress: std::sync::atomic::AtomicBool::new(
+                std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+            ),
 
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),
@@ -368,7 +381,20 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(0),
-            freeze_in_progress: std::sync::atomic::AtomicBool::new(false),
+            // Default to true if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
+            // is set in the env. The handoff successor sets it before
+            // calling `build_router_only` so every WriteCache is born
+            // in passive mode (no flushing, no checkpoint truncate)
+            // until takeover completes. Without this, the per-export
+            // flush_scheduler — started inside `create_export` BEFORE
+            // `set_all_caches_freeze(true)` runs in `run_server_as_successor`
+            // — could fire a rotation during the brief window and break
+            // cross-process file-handle sharing with the predecessor.
+            freeze_in_progress: std::sync::atomic::AtomicBool::new(
+                std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+            ),
 
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),

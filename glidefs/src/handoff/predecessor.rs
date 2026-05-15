@@ -52,12 +52,22 @@ pub enum HandoffOutcome {
 /// `config_path` is forwarded to the spawned successor via `--config` so
 /// it can re-read the same configuration during WARMING. The handoff
 /// socket is bound here and removed on exit.
+#[tracing::instrument(
+    name = "handoff.predecessor",
+    skip_all,
+    fields(
+        socket = %socket_path.display(),
+        binary = %successor_binary.display(),
+        config = %config_path.display(),
+    ),
+)]
 pub async fn run_predecessor(
     router: Arc<ExportRouter>,
     socket_path: &Path,
     successor_binary: &Path,
     config_path: &Path,
     timeouts: HandoffTimeouts,
+    dry_run: bool,
 ) -> Result<HandoffOutcome> {
     let started = Instant::now();
     let _ = std::fs::remove_file(socket_path); // tolerate stale
@@ -76,8 +86,8 @@ pub async fn run_predecessor(
     tracing::info!(strategy = strategy_name, "handoff: selected cutover strategy");
 
     // Spawn the successor.
-    let successor = spawn_successor(successor_binary, socket_path, config_path)?;
-    tracing::info!(pid = successor.id().unwrap_or(0), "handoff: successor spawned");
+    let successor = spawn_successor(successor_binary, socket_path, config_path, dry_run)?;
+    tracing::info!(pid = successor.id().unwrap_or(0), dry_run, "handoff: successor spawned");
 
     // Accept the successor's connection. SEQPACKET is connection-
     // oriented like SOCK_STREAM — recv on the listener fd directly
@@ -144,7 +154,7 @@ async fn run_protocol(
         }),
     };
 
-    let HandoffMessage::Hello { protocol_version, capabilities, successor_pid } = msg else {
+    let HandoffMessage::Hello { protocol_version, capabilities, successor_pid, dry_run } = msg else {
         return Ok(HandoffOutcome::Aborted {
             reason: format!("expected HELLO, got {msg:?}"),
             duration: started.elapsed(),
@@ -208,7 +218,26 @@ async fn run_protocol(
         }),
     };
     match msg {
-        HandoffMessage::Ready => {}
+        HandoffMessage::Ready => {
+            // Dry-run successful: successor proved WARMING works.
+            // Send Abort(Other("dry-run-complete")), do NOT initiate
+            // cutover — predecessor stays SERVING, successor exits.
+            if dry_run {
+                tracing::info!("handoff: dry-run mode — WARMING succeeded, aborting before cutover");
+                send_one(
+                    sock,
+                    &HandoffMessage::Abort(AbortReason::Other(
+                        "dry-run-complete".to_string(),
+                    )),
+                )
+                .await
+                .ok();
+                return Ok(HandoffOutcome::Aborted {
+                    reason: "dry-run completed successfully".into(),
+                    duration: started.elapsed(),
+                });
+            }
+        }
         HandoffMessage::Abort(r) => {
             return Ok(HandoffOutcome::Aborted {
                 reason: format!("successor aborted: {r:?}"),
@@ -315,11 +344,16 @@ async fn run_protocol(
     };
 
     let duration = started.elapsed();
+    let duration_ms = duration.as_millis() as u64;
     tracing::info!(
         recovered_count,
-        duration_ms = duration.as_millis() as u64,
+        duration_ms,
         "handoff: SUCCESS — successor serving, predecessor exiting"
     );
+    crate::handoff::metrics::record_outcome(
+        crate::handoff::metrics::HandoffOutcomeKind::Succeeded,
+    );
+    crate::handoff::metrics::record_stall_ms(duration_ms);
     Ok(HandoffOutcome::Succeeded {
         recovered_count,
         duration,
@@ -330,6 +364,7 @@ fn spawn_successor(
     binary: &Path,
     socket_path: &Path,
     config_path: &Path,
+    dry_run: bool,
 ) -> Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.arg("--handoff-from")
@@ -337,6 +372,9 @@ fn spawn_successor(
         .arg("--config")
         .arg(config_path)
         .stdin(std::process::Stdio::null());
+    if dry_run {
+        cmd.arg("--dry-run");
+    }
     // stdout/stderr inherit so successor logs flow to the same place.
     let child = cmd.spawn().context("spawning successor process")?;
     Ok(child)

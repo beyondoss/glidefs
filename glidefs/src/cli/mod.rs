@@ -75,6 +75,12 @@ pub enum Commands {
         /// `/run/glidefs/handoff.sock`.
         #[arg(long, default_value = "/run/glidefs/handoff.sock")]
         socket: PathBuf,
+        /// Dry-run mode: spawn a successor that performs WARMING (proves
+        /// it can open foyer cache, replay WAL, build router, prefetch
+        /// S3) then aborts cleanly without ever touching kernel devices.
+        /// Use as a canary check before fleet-wide upgrades.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Run garbage collection to clean up orphaned packs in S3
     Gc {

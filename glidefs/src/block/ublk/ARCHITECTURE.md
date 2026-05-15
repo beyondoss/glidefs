@@ -301,3 +301,16 @@ On hardware where the kernel can't identify the backing device's node (single-so
 | Worker thread panics outside `tick()` | Worker join handle reports the error on shutdown | Pool exits; daemon restarts via systemd; recovery reattaches devices |
 | `kill_dev()` fails during explicit `remove_device` | Warning logged; best-effort cleanup; export is removed from the API | Orphan sweep on the next daemon start kills the leftover kernel device |
 | `persist_devices()` write fails | Warning logged; operation succeeds; device IDs may change on next restart | New IDs on restart; exports still functional |
+
+## Graceful handoff (Cooperative Recovery Handoff)
+
+Beyond crash recovery, the ublk subsystem participates in graceful zero-downtime daemon restart via the `crate::handoff` module. Two extra entry points exist:
+
+| Function | Where | Why |
+|----------|-------|-----|
+| `UblkServer::snapshot_dev_ids()` | `mod.rs` | Called by predecessor's `handoff_snapshot()` to populate the export → kernel-dev_id mapping the successor needs to skip the kernel-scan in `for_each_dev_id`. |
+| `UblkServer::recover_devices_by_id(ids, get_handler)` | `mod.rs` | Successor-side fast-path recovery. Skips `for_each_dev_id` (the cold-start scan), takes a known list of `(dev_id, export_name)` from the handoff snapshot, polls each device for QUIESCED state with backoff, then runs the same parallel `recover()` loop as `recover_quiesced_devices`. |
+
+The QUIESCED probe is the largest contributor to the ~250 ms kernel-stall window: it has to absorb the latency between the predecessor's UblkServer drop and the kernel's `ublk_ch_release`-driven state transition. A future optimization (task 3.2) calls `START_USER_RECOVERY` directly and retries on `-EBUSY` instead, eliminating the probe round-trips.
+
+See `glidefs/src/handoff/ARCHITECTURE.md` for the full protocol.

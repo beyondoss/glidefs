@@ -116,6 +116,13 @@ pub enum HandoffMessage {
         capabilities: Capabilities,
         /// PID of the successor process. Predecessor logs it; not load-bearing.
         successor_pid: i32,
+        /// Dry-run mode: the successor performs WARMING (proves it can
+        /// open foyer cache, replay WAL, build router, prefetch S3)
+        /// then signals abort. Predecessor never reaches CUTOVER, so
+        /// nothing destructive happens. Operator gets a yes/no on
+        /// "would this binary handoff cleanly". Default false.
+        #[serde(default)]
+        dry_run: bool,
     },
 
     /// Predecessor's response to Hello — carries the export inventory.

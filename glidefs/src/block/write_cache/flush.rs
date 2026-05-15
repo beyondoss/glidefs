@@ -1302,6 +1302,27 @@ impl WriteCache<Active> {
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: Option<&Arc<dyn BlockCache>>,
     ) -> Result<(FlushStats, u64), CacheError> {
+        // **Skip flush during the handoff freeze window.** Rotation
+        // (rename(active_path, flushing_path) + new active file) breaks
+        // the cross-process file-handle sharing between predecessor and
+        // successor: post-rotation writes go to a new inode, but the
+        // successor's `File` handle still points to the old inode (now
+        // at flushing_path). The successor would read zeros for any
+        // post-rotation block. Suppressing flush during the handoff
+        // window keeps the active file's inode stable so both processes
+        // share the same backing store.
+        //
+        // The freeze window is bounded (~hundreds of ms). Dirty data
+        // accumulates briefly; the new daemon resumes flushing once
+        // takeover completes.
+        if self
+            .inner
+            .freeze_in_progress
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            debug!("flush_packs: skipping (freeze in progress)");
+            return Ok((FlushStats::default(), 0));
+        }
         self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await
     }

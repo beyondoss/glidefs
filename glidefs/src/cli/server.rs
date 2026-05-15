@@ -478,6 +478,21 @@ async fn serve_with_router(built: BuiltRouter, config_path: PathBuf) -> Result<(
     // Mutex to ensure only one handoff runs at a time.
     let handoff_in_progress = Arc::new(tokio::sync::Mutex::new(()));
 
+    // Spawn the handoff control socket listener for `glidefs handoff`
+    // CLI invocations. mpsc carries (dry_run: bool) — the value tells
+    // the signal loop which mode to launch.
+    let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<bool>(1);
+    let ctrl_socket_path = std::path::PathBuf::from(crate::handoff::DEFAULT_HANDOFF_SOCKET)
+        .with_extension("ctl.sock");
+    {
+        let p = ctrl_socket_path.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_handoff_control_socket(p, ctrl_tx).await {
+                warn!(error = %e, "handoff control socket listener exited");
+            }
+        });
+    }
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -503,26 +518,23 @@ async fn serve_with_router(built: BuiltRouter, config_path: PathBuf) -> Result<(
                     continue;
                 };
                 info!("Received SIGHUP, initiating graceful handoff...");
-                let router_clone = Arc::clone(&router);
-                let config_clone = config_path.clone();
-
-                // Run the handoff inline (in this signal-loop task). We
-                // need its outcome before deciding whether to break the
-                // loop, and the handoff itself only takes ~hundreds of
-                // ms; blocking the signal loop for that long is fine.
-                match run_predecessor_handoff(router_clone, config_clone).await {
-                    Ok(outcome) => {
-                        tracing::info!(?outcome, "handoff complete");
-                        if matches!(outcome, crate::handoff::HandoffOutcome::Succeeded { .. }) {
-                            info!("handoff succeeded — predecessor exiting to release listener fds");
-                            handoff_succeeded = true;
-                            break;
-                        }
-                        // Aborted or Revived — keep serving.
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "handoff failed; predecessor continues serving");
-                    }
+                if dispatch_handoff(&router, &config_path, false, &mut handoff_succeeded).await {
+                    break;
+                }
+                drop(_guard);
+            }
+            ctrl = ctrl_rx.recv() => {
+                let Some(dry_run) = ctrl else {
+                    warn!("handoff control socket channel closed");
+                    continue;
+                };
+                let Ok(_guard) = handoff_in_progress.clone().try_lock_owned() else {
+                    warn!("control-socket handoff request but one already in flight; ignoring");
+                    continue;
+                };
+                info!(dry_run, "Received control-socket handoff request");
+                if dispatch_handoff(&router, &config_path, dry_run, &mut handoff_succeeded).await {
+                    break;
                 }
                 drop(_guard);
             }
@@ -589,6 +601,46 @@ async fn run_predecessor_handoff(
     router: Arc<ExportRouter>,
     config_path: PathBuf,
 ) -> Result<crate::handoff::HandoffOutcome> {
+    run_predecessor_handoff_with_opts(router, config_path, false).await
+}
+
+/// Run a handoff and update the `handoff_succeeded` flag if it
+/// succeeded. Returns `true` to signal the caller to break the signal
+/// loop (a successful real handoff means we exit; a dry-run completion
+/// returns `false` so we keep serving).
+async fn dispatch_handoff(
+    router: &Arc<ExportRouter>,
+    config_path: &PathBuf,
+    dry_run: bool,
+    handoff_succeeded: &mut bool,
+) -> bool {
+    let router = Arc::clone(router);
+    let cfg = config_path.clone();
+    match run_predecessor_handoff_with_opts(router, cfg, dry_run).await {
+        Ok(outcome) => {
+            tracing::info!(?outcome, dry_run, "handoff complete");
+            if !dry_run
+                && matches!(outcome, crate::handoff::HandoffOutcome::Succeeded { .. })
+            {
+                info!("handoff succeeded — predecessor exiting to release listener fds");
+                *handoff_succeeded = true;
+                return true;
+            }
+            // Aborted (incl. dry-run-complete) or Revived — keep serving.
+            false
+        }
+        Err(e) => {
+            tracing::error!(error = %e, dry_run, "handoff failed; predecessor continues serving");
+            false
+        }
+    }
+}
+
+async fn run_predecessor_handoff_with_opts(
+    router: Arc<ExportRouter>,
+    config_path: PathBuf,
+    dry_run: bool,
+) -> Result<crate::handoff::HandoffOutcome> {
     let socket_path = std::path::PathBuf::from(crate::handoff::DEFAULT_HANDOFF_SOCKET);
     let successor_binary =
         std::env::current_exe().context("resolving current binary path for successor exec")?;
@@ -599,6 +651,7 @@ async fn run_predecessor_handoff(
         &successor_binary,
         &config_path,
         timeouts,
+        dry_run,
     )
     .await
 }
@@ -610,6 +663,18 @@ async fn run_predecessor_handoff(
 /// Called from `main.rs` when argv contains `--handoff-from <socket>`.
 pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     init_tracing();
+
+    // Mark this process as a handoff successor BEFORE any WriteCache
+    // construction. CacheInner reads this and starts in passive mode
+    // (freeze_in_progress=true, flush_scheduler can't truncate WAL or
+    // rotate the data file until we clear the flag after takeover).
+    // SAFETY: set_var is unsafe in Rust 2024; called before any
+    // worker threads or background tasks have been spawned, so no
+    // concurrent reader exists.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE", "1");
+    }
 
     info!(socket = %socket_path.display(), "starting in successor mode");
 
@@ -697,14 +762,13 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
 }
 
 /// Background task: accept connections on the handoff control socket
-/// and turn each one into a SIGHUP-equivalent trigger.
+/// and turn each one into a handoff trigger via the mpsc channel.
+/// Carried payload: `bool` — true = dry-run, false = real handoff.
 ///
 /// Wire protocol is one byte each way (see `crate::cli::handoff_cmd::wire`).
-/// Reserved for Phase 2 — Phase 1 MVP relies on SIGHUP only.
-#[allow(dead_code)]
 async fn run_handoff_control_socket(
     socket_path: PathBuf,
-    trigger: tokio::sync::mpsc::Sender<()>,
+    trigger: tokio::sync::mpsc::Sender<bool>,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
@@ -732,19 +796,22 @@ async fn run_handoff_control_socket(
             if stream.read_exact(&mut req).await.is_err() {
                 return;
             }
-            let response_byte = match req[0] {
-                crate::cli::handoff_cmd::wire::REQUEST_HANDOFF => {
-                    match trigger.try_send(()) {
-                        Ok(()) => crate::cli::handoff_cmd::wire::RESPONSE_ACCEPTED,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            crate::cli::handoff_cmd::wire::RESPONSE_BUSY
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            crate::cli::handoff_cmd::wire::RESPONSE_UNSUPPORTED
-                        }
+            let dry_run = match req[0] {
+                crate::cli::handoff_cmd::wire::REQUEST_HANDOFF => Some(false),
+                crate::cli::handoff_cmd::wire::REQUEST_HANDOFF_DRY_RUN => Some(true),
+                _ => None,
+            };
+            let response_byte = match dry_run {
+                None => crate::cli::handoff_cmd::wire::RESPONSE_UNSUPPORTED,
+                Some(d) => match trigger.try_send(d) {
+                    Ok(()) => crate::cli::handoff_cmd::wire::RESPONSE_ACCEPTED,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        crate::cli::handoff_cmd::wire::RESPONSE_BUSY
                     }
-                }
-                _ => crate::cli::handoff_cmd::wire::RESPONSE_UNSUPPORTED,
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        crate::cli::handoff_cmd::wire::RESPONSE_UNSUPPORTED
+                    }
+                },
             };
             let _ = stream.write_all(&[response_byte]).await;
         });

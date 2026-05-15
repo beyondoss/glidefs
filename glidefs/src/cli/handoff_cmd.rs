@@ -16,17 +16,23 @@ use tokio::net::UnixStream;
 
 /// Wire protocol for the control socket. One byte each way.
 const CONTROL_REQUEST_HANDOFF: u8 = b'H';
+const CONTROL_REQUEST_HANDOFF_DRY_RUN: u8 = b'D';
 const CONTROL_RESPONSE_ACCEPTED: u8 = b'A';
 const CONTROL_RESPONSE_BUSY: u8 = b'B';
 const CONTROL_RESPONSE_UNSUPPORTED: u8 = b'U';
 
-pub async fn run(socket: PathBuf) -> Result<()> {
+pub async fn run(socket: PathBuf, dry_run: bool) -> Result<()> {
     let mut stream = UnixStream::connect(&socket)
         .await
         .with_context(|| format!("connecting to handoff control socket {}", socket.display()))?;
 
+    let req = if dry_run {
+        CONTROL_REQUEST_HANDOFF_DRY_RUN
+    } else {
+        CONTROL_REQUEST_HANDOFF
+    };
     stream
-        .write_all(&[CONTROL_REQUEST_HANDOFF])
+        .write_all(&[req])
         .await
         .context("sending handoff request")?;
     stream.flush().await.ok();
@@ -62,6 +68,7 @@ pub async fn run(socket: PathBuf) -> Result<()> {
 /// Constants re-exported for the server-side socket handler.
 pub mod wire {
     pub const REQUEST_HANDOFF: u8 = super::CONTROL_REQUEST_HANDOFF;
+    pub const REQUEST_HANDOFF_DRY_RUN: u8 = super::CONTROL_REQUEST_HANDOFF_DRY_RUN;
     pub const RESPONSE_ACCEPTED: u8 = super::CONTROL_RESPONSE_ACCEPTED;
     pub const RESPONSE_BUSY: u8 = super::CONTROL_RESPONSE_BUSY;
     pub const RESPONSE_UNSUPPORTED: u8 = super::CONTROL_RESPONSE_UNSUPPORTED;

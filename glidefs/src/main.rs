@@ -80,8 +80,8 @@ async fn main() -> Result<()> {
         cli::Commands::Run { config } => {
             cli::server::run_server(config).await?;
         }
-        cli::Commands::Handoff { socket } => {
-            cli::handoff_cmd::run(socket).await?;
+        cli::Commands::Handoff { socket, dry_run } => {
+            cli::handoff_cmd::run(socket, dry_run).await?;
         }
         cli::Commands::Bless {
             image,

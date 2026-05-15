@@ -1,0 +1,83 @@
+# systemd unit for glidefs daemon with graceful zero-downtime handoff.
+#
+# Install:
+#   sudo cp deploy/systemd/glidefs.service /etc/systemd/system/glidefs.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable glidefs
+#   sudo systemctl start glidefs
+#
+# Trigger graceful handoff:
+#   sudo systemctl reload glidefs       # SIGHUP — actually does the handoff
+#   sudo glidefs handoff --dry-run      # canary check (no destructive action)
+
+[Unit]
+Description=GlideFS (S3-backed block storage with zero-downtime handoff)
+Documentation=https://github.com/paraglidehq/glidefs
+After=network-online.target
+Wants=network-online.target
+
+# At-most-once-per-minute restart cap. Without it, a fast spin loop on
+# a startup bug can allocate thousands of orphan ublk kernel devices in
+# minutes (each restart attempt registers fresh /dev/ublkbN entries
+# that stay around in QUIESCED if the daemon never finishes startup).
+StartLimitIntervalSec=60
+StartLimitBurst=1
+
+[Service]
+# Type=simple — handoff doesn't use sd_notify yet (planned). When that
+# lands, switch to Type=notify and add NotifyAccess=all so the
+# successor (different PID) can send notifications.
+Type=simple
+
+# SIGHUP triggers the handoff state machine (cli/server.rs's signal
+# loop). systemctl reload sends SIGHUP via this directive.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Cap auto-restart. Operators get a clear "service failed" with
+# `systemctl status` instead of silent kernel-state damage from a spin
+# loop.
+Restart=on-failure
+RestartSec=10
+
+# Daemon recovery scales with QUIESCED device count + handler load.
+# 600s gives headroom for ~1000 exports.
+TimeoutStartSec=600
+
+# Graceful shutdown timeout. Configured per-export drain budget is in
+# the daemon config (servers.nbd.shutdown_timeout_secs). systemd's
+# TimeoutStopSec must be larger.
+TimeoutStopSec=300
+
+# **KillMode=mixed** — send SIGTERM to the main daemon, but DON'T
+# blanket-kill the entire cgroup. The handoff successor lives in the
+# same cgroup briefly during cutover; killing the cgroup mid-handoff
+# would yank the kernel device out from under the new daemon.
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Pre-create runtime directory for /run/glidefs/ (handoff control
+# socket lives here). systemd manages cleanup on stop.
+RuntimeDirectory=glidefs
+RuntimeDirectoryMode=0755
+
+# Pre-create cache directory.
+ExecStartPre=/bin/mkdir -p /var/cache/glidefs
+
+# Health check after start — daemon's HTTP API on configured port
+# must respond. Adjust port if not 9113.
+ExecStartPost=/bin/bash -c 'for i in $(seq 1 300); do curl -sf http://127.0.0.1:9113/health/ready && exit 0; sleep 2; done; exit 1'
+
+ExecStart=/usr/local/bin/glidefs run --config /etc/glidefs/glidefs.toml
+
+# Required for ublk_drv (CAP_SYS_ADMIN). Drop other ambient caps for
+# defense-in-depth.
+AmbientCapabilities=CAP_SYS_ADMIN
+NoNewPrivileges=true
+
+# Resource limits. ublk uses many fds (one cdev + one io_uring per
+# device); 1k exports → ~16k fds.
+LimitNOFILE=131072
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

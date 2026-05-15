@@ -744,40 +744,19 @@ impl UblkServer {
             return 0;
         }
 
-        // Probe kernel for nr_queues per device — handoff snapshot
-        // doesn't carry it, and we need it for `UblkDevice::recover`.
-        // One spawn_blocking; CTRL_URING is thread_local.
-        //
-        // Race-window note: the predecessor closed its io_uring fds
-        // microseconds ago. The kernel transitions the device to
-        // QUIESCED via `ublk_ch_release`, but the transition is not
-        // guaranteed to be observable by the successor's probing
-        // `UblkCtrl::new_simple` immediately — we've measured states of
-        // LIVE (1) when the predecessor's fd close hasn't propagated
-        // through ublk_drv's per-device state machine yet. Poll briefly
-        // (up to ~1 s budget) for QUIESCED before declaring the device
-        // unrecoverable.
+        // Poll for QUIESCED state before recovery. Faster than
+        // having `UblkDevice::recover` retry `start_user_recover` on
+        // -EBUSY (each ioctl is ~1ms; hammering it 100x = 100ms+
+        // worth of kernel work per device). Bounded 1s budget.
         let probed: Vec<(i32, String, u16)> = {
             let ids = ids.to_vec();
             tokio::task::spawn_blocking(move || {
                 let mut out = Vec::with_capacity(ids.len());
                 for (dev_id, export_name) in ids {
-                    // Aggressive poll: 50µs intervals for the first
-                    // 100ms (covers the typical kernel transition
-                    // latency), then 1ms intervals. Total budget 1s.
-                    //
-                    // The kernel triggers the LIVE→QUIESCED transition
-                    // synchronously inside `ublk_ch_release` when the
-                    // predecessor's last cdev fd closes — so observation
-                    // is bounded only by IPC + scheduling latency.
-                    // Polling at 50µs is well below the kernel's natural
-                    // wakeup granularity but cheap enough to be a
-                    // non-issue (each iteration is one ioctl).
                     let total_budget = std::time::Duration::from_secs(1);
                     let deadline = std::time::Instant::now() + total_budget;
                     let fast_phase_end =
                         std::time::Instant::now() + std::time::Duration::from_millis(100);
-
                     let result = loop {
                         let Ok(ctrl) = ublk_core::ctrl::UblkCtrl::new_simple(dev_id) else {
                             break None;
@@ -797,7 +776,6 @@ impl UblkServer {
                         };
                         std::thread::sleep(delay);
                     };
-
                     match result {
                         None => {
                             tracing::warn!(
@@ -806,10 +784,12 @@ impl UblkServer {
                             );
                             continue;
                         }
-                        Some((_nr_queues, state)) if state != ublk_core::sys::UBLK_S_DEV_QUIESCED => {
+                        Some((_nr_queues, state))
+                            if state != ublk_core::sys::UBLK_S_DEV_QUIESCED =>
+                        {
                             tracing::warn!(
                                 dev_id, export = %export_name, state,
-                                "handoff: device never reached QUIESCED within 1s budget, skipping"
+                                "handoff: device never reached QUIESCED, skipping"
                             );
                             continue;
                         }

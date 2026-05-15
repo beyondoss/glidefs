@@ -46,6 +46,11 @@ pub struct TakeoverResult {
 /// After this returns successfully, the caller enters its normal
 /// serving loop (bind listeners, start scrubber/capacity-monitor, signal
 /// handler, etc.).
+#[tracing::instrument(
+    name = "handoff.successor",
+    skip_all,
+    fields(socket = %socket_path.display()),
+)]
 pub async fn run_successor(
     socket_path: &Path,
     router: Arc<ExportRouter>,
@@ -59,6 +64,7 @@ pub async fn run_successor(
         protocol_version: PROTOCOL_VERSION,
         capabilities: Capabilities::current(),
         successor_pid: std::process::id() as i32,
+        dry_run: dry_run_arg(),
     };
     send_one(&sock, &hello).await.context("send HELLO")?;
 
@@ -277,4 +283,12 @@ pub fn config_arg() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Sniff `--dry-run` from argv. The predecessor passes this when the
+/// operator runs `glidefs handoff --dry-run` — successor performs
+/// WARMING then aborts cleanly.
+#[allow(dead_code)]
+pub fn dry_run_arg() -> bool {
+    std::env::args().any(|a| a == "--dry-run")
 }
