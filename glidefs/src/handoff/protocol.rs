@@ -237,6 +237,7 @@ mod tests {
                 protocol_version: 1,
                 capabilities: Capabilities::current(),
                 successor_pid: 12345,
+                dry_run: false,
             },
             HandoffMessage::HelloAck {
                 protocol_version: 1,
@@ -250,6 +251,7 @@ mod tests {
                     ublk_dev_id: Some(5),
                 }],
                 predecessor_pid: 12344,
+                listener_kinds: vec![],
             },
             HandoffMessage::Ready,
             HandoffMessage::Cutover,
