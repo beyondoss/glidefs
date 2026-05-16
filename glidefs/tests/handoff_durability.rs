@@ -868,7 +868,39 @@ fn pretest_ready() -> bool {
         eprintln!("not root — ublk control device needs CAP_SYS_ADMIN");
         return false;
     }
+    raise_nofile_limit();
     true
+}
+
+/// Bump RLIMIT_NOFILE to at least 65536 (or the hard limit, whichever
+/// is smaller). The handoff test spawns daemons that open a 16 GB foyer
+/// SSD cache, which uses many file descriptors per device segment; on
+/// CI runners the default 1024 soft limit causes `EMFILE` during foyer
+/// startup. Idempotent — no-ops if already high enough.
+fn raise_nofile_limit() {
+    const DESIRED: libc::rlim_t = 65536;
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            eprintln!(
+                "warning: getrlimit(NOFILE) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+        if rl.rlim_cur >= DESIRED {
+            return;
+        }
+        let new_soft = std::cmp::min(DESIRED, rl.rlim_max);
+        let new = libc::rlimit { rlim_cur: new_soft, rlim_max: rl.rlim_max };
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &new) != 0 {
+            eprintln!(
+                "warning: setrlimit(NOFILE, {}) failed: {} (foyer SSD cache may hit EMFILE)",
+                new_soft,
+                std::io::Error::last_os_error(),
+            );
+        }
+    }
 }
 
 #[allow(dead_code)]

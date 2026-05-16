@@ -734,6 +734,18 @@ impl CacheInner {
         self.state_map.count_present()
     }
 
+    /// True iff any block in the cache is currently SYNCING.
+    ///
+    /// Used by `flush_dirty_inner` to detect a stale rotation: if a
+    /// flushing file is on disk and `flushing_active=true` but no block
+    /// is SYNCING (e.g. every claimed block was promoted back to DIRTY
+    /// or evicted), the flushing file is no longer load-bearing and the
+    /// next flush cycle can safely clean it up before rotating again.
+    pub(super) fn has_any_syncing(&self) -> bool {
+        use crate::block::block_map::SparseBlockState;
+        (0..self.num_blocks).any(|i| self.state_map.get(i) == SparseBlockState::SYNCING)
+    }
+
     /// Promote SYNCING blocks from flushing → active file before a guest write.
     ///
     /// When a guest writes to a block being flushed (SYNCING), its pre-rotation

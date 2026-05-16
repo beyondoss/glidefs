@@ -834,9 +834,22 @@ impl WriteCache<Active> {
             // failed). If no rotation is in progress (flushing_active=false,
             // flushing_file=None), the file is stale — try to delete it so
             // this flush cycle can proceed.
-            if !self.inner.flushing_active.load(Ordering::Acquire)
-                && self.inner.flushing_file.lock().is_none()
-            {
+            //
+            // Also stale: an in-flight rotation whose every claimed block
+            // has since transitioned out of SYNCING (promoted back to DIRTY
+            // via guest write, or evicted to NOT_PRESENT). The flushing
+            // file holds data nothing reads anymore — drop it so the next
+            // rotation can proceed.
+            let active_rotation = self.inner.flushing_active.load(Ordering::Acquire)
+                || self.inner.flushing_file.lock().is_some();
+            let stale_rotation = active_rotation && !self.inner.has_any_syncing();
+            if !active_rotation || stale_rotation {
+                if stale_rotation {
+                    info!("clearing stale rotation (no SYNCING blocks remain)");
+                    self.inner.flushing_active.store(false, Ordering::Release);
+                    self.inner.rotation_seq.store(0, Ordering::Release);
+                    drop(self.inner.flushing_file.lock().take());
+                }
                 let flushing_path = self.inner.config.flushing_path();
                 match std::fs::remove_file(&flushing_path) {
                     Ok(()) => {
@@ -1570,8 +1583,10 @@ impl WriteCache<Active> {
     ///
     /// `flush_dirty_inner` is now atomic (uploads packs, syncs manifest,
     /// evicts, checkpoints, and cleans up the flushing file in one
-    /// sequence under `flush_lock`). This wrapper just acquires the lock
-    /// and delegates.
+    /// sequence under `flush_lock`). For the drain path we additionally
+    /// guarantee the S3 manifest exists post-call — even if no packs were
+    /// uploaded (empty export, all-zero writes that cross-dedup to nothing).
+    /// Cold readers depend on the manifest's presence to bootstrap.
     #[must_use = "flush errors must be handled to avoid silent data loss"]
     #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn flush_to_s3(
@@ -1584,6 +1599,21 @@ impl WriteCache<Active> {
         let (stats, _seq_cutpoint) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
+        if stats.packs_uploaded == 0 {
+            // No packs uploaded → atomic flush skipped its internal sync.
+            // Push the manifest unconditionally so the export is
+            // discoverable by cold readers.
+            let manifest_bytes = volume_manifest.read().serialize()?;
+            let expected_etag = self.inner.manifest_etag.lock().clone();
+            let new_etag = content_store
+                .put_manifest(
+                    &self.inner.export_name,
+                    manifest_bytes,
+                    expected_etag.as_deref(),
+                )
+                .await?;
+            *self.inner.manifest_etag.lock() = new_etag;
+        }
         Ok(stats)
     }
 
