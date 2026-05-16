@@ -470,6 +470,9 @@ async fn serve_with_router_inner(
     }
 
     info!("GlideFS ready. Available exports:");
+    // Tell systemd we're ready (Type=notify). No-op when not running
+    // under systemd ($NOTIFY_SOCKET unset).
+    crate::sd_notify::notify_ready();
     for export in router.list_exports().await {
         let device_info = export
             .device

@@ -80,6 +80,7 @@ loom = { version = "0.7", optional = true }
 sha2 = "0.10"
 crc-fast = "1.10.0"
 static_assertions = { workspace = true }
+sd-notify = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ublk-core = { path = "ublk-core", optional = true }

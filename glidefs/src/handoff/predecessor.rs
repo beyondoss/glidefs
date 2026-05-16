@@ -190,6 +190,11 @@ async fn run_protocol(
         "handoff: received HELLO"
     );
 
+    // Tell systemd we're starting a reload. Under Type=notify-reload
+    // this is required; under Type=notify it's a hint that lets
+    // `systemctl reload glidefs` know the operation is in flight.
+    crate::sd_notify::notify_reloading();
+
     // Verify version + capabilities.
     if protocol_version != PROTOCOL_VERSION {
         let reason = AbortReason::VersionMismatch {
@@ -412,6 +417,19 @@ async fn run_protocol(
         duration_ms,
         "handoff: SUCCESS — successor serving, predecessor exiting"
     );
+
+    // **Tell systemd MainPID has moved to the successor.** Without
+    // this, KillMode=mixed/control-group SIGKILLs the entire cgroup
+    // (including the successor) when the predecessor exits cleanly,
+    // because systemd still treats the predecessor as MainPID. We're
+    // currently MainPID, so NotifyAccess=main is enough. The READY=1
+    // in the same datagram tells systemd the (new) MainPID is healthy,
+    // avoiding any "waiting for ready" stall during the swap. See
+    // `RUNBOOK.md`.
+    if successor_pid > 0 {
+        crate::sd_notify::notify_handoff_to(successor_pid as u32);
+    }
+
     crate::handoff::metrics::record_outcome(
         crate::handoff::metrics::HandoffOutcomeKind::Succeeded,
     );

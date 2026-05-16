@@ -5,6 +5,7 @@ pub mod circuit_breaker;
 pub mod config;
 pub mod block;
 pub mod oci;
+pub mod sd_notify;
 pub mod task;
 
 #[allow(unsafe_code)] // libc socket/bind/connect/sendmsg/recvmsg for SCM_RIGHTS

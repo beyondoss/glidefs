@@ -6,6 +6,7 @@ mod config;
 mod block;
 mod oci;
 mod parse_object_store;
+mod sd_notify;
 mod storage_compatibility;
 mod task;
 #[allow(unsafe_code)] // libc socket/bind/connect/sendmsg/recvmsg for SCM_RIGHTS
