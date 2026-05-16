@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::block::handler::BlockHandler;
 use crate::block::router::{ExportRouter, RouterError};
@@ -128,8 +128,17 @@ impl HandoffCoordinator {
     }
 
     /// Quiesce every export for handoff: mark BlockHandlers as frozen,
-    /// fence in-flight flush+sync cycles, then `cache.flush()` to fsync
-    /// each WAL. See `ARCHITECTURE.md` for why each step is needed.
+    /// wait for any in-flight atomic flush to complete, then
+    /// `cache.flush()` to fsync each WAL. See `ARCHITECTURE.md`.
+    ///
+    /// Atomic `flush_packs` (Upload→ManifestSync→Evict→Checkpoint→Cleanup)
+    /// makes S3 self-consistent at every point, BUT the predecessor must
+    /// not exit while a flush cycle is mid-flight — the successor opens
+    /// its `data_file` handle during WARMING (before this freeze) and
+    /// expects the predecessor's flushing-file/checkpoint state to be
+    /// quiesced by the time PREDS_DEAD fires. Acquiring `flush_lock`
+    /// blocks until the cycle finishes; the bound is the atomic flush
+    /// latency itself (seconds, not the old 8s fence floor).
     pub async fn freeze_all(&self) -> Result<(), RouterError> {
         let states: Vec<(String, Arc<BlockHandler>, Arc<WriteCache<Active>>)> = self
             .router
@@ -154,33 +163,27 @@ impl HandoffCoordinator {
             cache.set_handoff_phase(HandoffPhase::Freezing);
         }
 
-        // **Fence in-flight flush + manifest-sync cycles**. The flush
-        // scheduler holds `flush_lock` for the entire pack-upload +
-        // sync_manifest sequence; acquiring the lock here blocks until
-        // the in-flight cycle completes. Without it, the predecessor
-        // can exit between pack-upload and manifest-sync, leaving
-        // packs in S3 that aren't registered in the manifest — the
-        // successor reads those blocks via S3, finds no entry, and
-        // serves zeros (visible as fio "verify: bad magic header 0").
-        //
-        // 8s bound — enough for typical 64MB pack batches, short
-        // enough to bound handoff stall under genuinely stuck
-        // uploads. On timeout we proceed; the manifest reload +
-        // post-takeover recovery in `recover_handoff_devices` cleans
-        // up the partial state.
         use futures::stream::{self, StreamExt};
+
+        // Wait for any in-flight atomic flush to complete. Phase=Freezing
+        // is set before this acquire so any *new* flush_packs call sees
+        // is_active() and short-circuits — only one cycle (the one
+        // already inside the lock when WARMING began) can be in flight.
+        // Generous 30s timeout: a stuck network upload shouldn't hang
+        // handoff forever, but atomic flush typically finishes in ~1s.
         stream::iter(states.iter().map(|(name, _, cache)| (name.clone(), Arc::clone(cache))))
             .for_each_concurrent(16, |(name, cache)| async move {
                 if (tokio::time::timeout(
-                    std::time::Duration::from_secs(8),
+                    std::time::Duration::from_secs(30),
                     cache.wait_for_inflight_flush(),
                 )
                 .await)
                     .is_err()
                 {
-                    warn!(
+                    tracing::warn!(
                         export = %name,
-                        "handoff: in-flight flush did not complete within 8s; proceeding with cutover"
+                        "handoff: in-flight atomic flush did not complete within 30s; \
+                         proceeding with cutover (successor will recover via flushing file + S3)"
                     );
                 }
             })

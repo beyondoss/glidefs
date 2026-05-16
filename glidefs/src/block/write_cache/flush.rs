@@ -310,8 +310,10 @@ impl WriteCache<Active> {
         )
     }
 
-    /// Wait for any in-flight `flush_packs` + `sync_manifest` cycle to
-    /// finish. Bounded by the caller via `tokio::time::timeout`.
+    /// Wait for any in-flight atomic flush cycle (Upload→ManifestSync
+    /// →Evict→Checkpoint) to finish. Bounded by atomic flush latency
+    /// (no longer the 8s freeze fence). Caller may still wrap in
+    /// `tokio::time::timeout` if a hard upper bound is required.
     pub async fn wait_for_inflight_flush(&self) {
         let _g = self.inner.flush_lock.lock().await;
     }
@@ -1343,9 +1345,18 @@ impl WriteCache<Active> {
             staged_appends.push((chunk_idx, pack_id));
         }
 
-        // Apply all staged manifest appends atomically.
+        // **Atomic flush ordering**: Upload → ManifestSync → Evict → Checkpoint → Cleanup.
+        // Matches the Stateright model. Predecessor crash at any point
+        // leaves S3 self-consistent: either the manifest references the
+        // packs (clients read them), or it doesn't (packs are orphaned
+        // and reclaimed by `glidefs gc`). No "packs without manifest
+        // reference" window — that was the bug the 8s freeze fence
+        // worked around.
+
+        // Apply staged manifest appends to in-memory VolumeManifest.
         // Only reached if every chunk upload succeeded.
-        if !staged_appends.is_empty() {
+        let need_sync = !staged_appends.is_empty();
+        if need_sync {
             let mut vm = volume_manifest.write();
             for (chunk_idx, pack_id) in staged_appends {
                 vm.append_pack(chunk_idx, pack_id);
@@ -1355,10 +1366,66 @@ impl WriteCache<Active> {
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::AfterCompute, flushed_blocks.len()).await;
 
+        // ManifestSync: persist to S3 BEFORE eviction. Until the
+        // manifest references the uploaded packs, those blocks are
+        // visible only via the in-memory VM in this process. Crash
+        // here leaves orphans (idempotent reclaim by `glidefs gc`).
+        //
+        // Hold no lock across the await (`parking_lot::RwLock` is not
+        // async-safe across awaits). Serialize from a brief `.read()`
+        // guard, drop, then PUT. Concurrent flushers are serialized by
+        // `flush_lock` (held by the caller).
+        if need_sync {
+            let manifest_bytes = volume_manifest.read().serialize()?;
+            let expected_etag = self.inner.manifest_etag.lock().clone();
+            let mut last_err: Option<crate::block::content_store::ContentStoreError> = None;
+            for attempt in 0..3u32 {
+                match content_store
+                    .put_manifest(
+                        &self.inner.export_name,
+                        manifest_bytes.clone(),
+                        expected_etag.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(new_etag) => {
+                        *self.inner.manifest_etag.lock() = new_etag;
+                        last_err = None;
+                        break;
+                    }
+                    Err(e @ crate::block::content_store::ContentStoreError::PreconditionFailed(_)) => {
+                        // Another host owns this manifest. Don't retry —
+                        // every attempt fails with the same stale ETag.
+                        // Return Err: outer flush_dirty_inner re-dirties
+                        // the SYNCING blocks via flushing-file recovery.
+                        return Err(e.into());
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e, attempt = attempt + 1,
+                            "manifest upload failed in atomic flush, retrying"
+                        );
+                        last_err = Some(e);
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                100 * (1 << attempt),
+                            ))
+                            .await;
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(e.into());
+            }
+        }
+
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::BeforeEvict, flushed_blocks.len()).await;
 
-        // Finalize flushed blocks: SYNCING→NOT_PRESENT.
+        // Evict: SYNCING → NOT_PRESENT. Safe now — S3 has both the
+        // packs AND a manifest that references them, so reads after
+        // eviction resolve via S3.
         //
         // Always evict from the data file. The flush path already inserted
         // every block into foyer (clean_cache) during compute_flush_batch,
@@ -1379,19 +1446,43 @@ impl WriteCache<Active> {
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::AfterEvict, flushed_blocks.len()).await;
 
-        // Drop flushing file handle but keep the file on disk.
+        // Checkpoint: persist block states (now NP) + truncate the WAL.
+        // If this fails, the in-memory state is correct (reads via S3
+        // already work) but .meta is stale; on crash, recovery sees the
+        // previous .meta with these blocks DIRTY + the flushing file
+        // still on disk and re-flushes idempotently (content-addressed
+        // pack IDs cross-dedup against the just-uploaded manifest).
         //
-        // The flushing file is the crash-safety net for the window between
-        // pack upload and manifest sync + checkpoint. If the host crashes
-        // before the manifest reaches S3 and checkpoint persists block states,
-        // recovery uses the flushing file to restore block data. The file is
-        // deleted by checkpoint() after block states are durably persisted.
+        // Don't return Err on checkpoint failure — that would trigger
+        // outer error recovery to re-dirty already-evicted blocks, but
+        // their data is gone (we're about to delete the flushing file).
+        // Instead log + skip cleanup so the flushing file stays as the
+        // crash-safety net; the next flush cycle's checkpoint retries.
+        let checkpoint_ok = match self.checkpoint().await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "checkpoint after atomic flush failed; flushing file preserved");
+                false
+            }
+        };
+
+        // Cleanup: drop flushing-file safety net only after checkpoint
+        // succeeded. Manifest is durable, .meta has CLEAN/NP states,
+        // WAL truncated — flushing file is no longer needed.
         //
         // Clear flushing_active and rotation_seq BEFORE dropping the handle so
         // resolve_read_plan re-enables LocalSsd only after cleanup is complete.
         self.inner.flushing_active.store(false, Ordering::Release);
         self.inner.rotation_seq.store(0, Ordering::Release);
         drop(self.inner.flushing_file.lock().take());
+        if checkpoint_ok {
+            let flushing_path = self.inner.config.flushing_path();
+            if flushing_path.exists()
+                && let Err(e) = std::fs::remove_file(&flushing_path)
+            {
+                warn!(error = %e, "failed to remove flushing file after atomic flush");
+            }
+        }
 
         info!(
             blocks_claimed = total_stats.blocks_claimed,
@@ -1477,10 +1568,10 @@ impl WriteCache<Active> {
 
     /// Flush dirty blocks to S3 + upload manifest (drain/snapshot path).
     ///
-    /// Retries manifest upload up to 3 times before propagating the error,
-    /// mirroring flush_scheduler's pattern. This prevents spurious drain
-    /// failures when blocks are already clean but a transient S3 error
-    /// prevents the manifest upload.
+    /// `flush_dirty_inner` is now atomic (uploads packs, syncs manifest,
+    /// evicts, checkpoints, and cleans up the flushing file in one
+    /// sequence under `flush_lock`). This wrapper just acquires the lock
+    /// and delegates.
     #[must_use = "flush errors must be handled to avoid silent data loss"]
     #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn flush_to_s3(
@@ -1493,58 +1584,16 @@ impl WriteCache<Active> {
         let (stats, _seq_cutpoint) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
-        let manifest_bytes = volume_manifest.read().serialize()?;
-        let expected_etag = self.inner.manifest_etag.lock().clone();
-        let mut last_err = None;
-        for attempt in 0..3u32 {
-            match content_store
-                .put_manifest(
-                    &self.inner.export_name,
-                    manifest_bytes.clone(),
-                    expected_etag.as_deref(),
-                )
-                .await
-            {
-                Ok(new_etag) => {
-                    *self.inner.manifest_etag.lock() = new_etag;
-                    last_err = None;
-                    break;
-                }
-                Err(e @ ContentStoreError::PreconditionFailed(_)) => {
-                    // Another host owns this manifest. Don't retry — every
-                    // attempt will fail with the same stale ETag.
-                    return Err(e.into());
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e, attempt = attempt + 1,
-                        "manifest upload failed in flush_to_s3, retrying"
-                    );
-                    last_err = Some(e);
-                    if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            100 * (1 << attempt),
-                        ))
-                        .await;
-                    }
-                }
-            }
-        }
-        if let Some(e) = last_err {
-            return Err(e.into());
-        }
-        self.checkpoint().await?;
-        // Manifest synced and checkpoint persisted — delete the flushing file.
-        let flushing_path = self.inner.config.flushing_path();
-        if flushing_path.exists()
-            && let Err(e) = std::fs::remove_file(&flushing_path)
-        {
-                warn!(error = %e, "failed to remove flushing file after flush_to_s3");
-        }
         Ok(stats)
     }
 
     /// Take a point-in-time snapshot.
+    ///
+    /// `flush_dirty_inner` is atomic — it uploads packs, syncs the
+    /// manifest, evicts, and checkpoints. After it returns, the
+    /// in-memory `volume_manifest` matches S3 and `manifest_etag`
+    /// holds the fresh ETag. Snapshot re-serializes the manifest for
+    /// `put_snapshot` (the versioned/seq-keyed copy).
     #[must_use = "snapshot errors must be handled"]
     #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn snapshot(
@@ -1559,15 +1608,7 @@ impl WriteCache<Active> {
             .await?;
 
         let manifest_bytes = volume_manifest.read().serialize()?;
-        let expected_etag = self.inner.manifest_etag.lock().clone();
-        let manifest_etag = content_store
-            .put_manifest(
-                &self.inner.export_name,
-                manifest_bytes.clone(),
-                expected_etag.as_deref(),
-            )
-            .await?;
-        *self.inner.manifest_etag.lock() = manifest_etag.clone();
+        let manifest_etag = self.inner.manifest_etag.lock().clone();
 
         let snapshot_persisted = {
             let mut persisted = false;
@@ -1597,14 +1638,6 @@ impl WriteCache<Active> {
             persisted
         };
 
-        self.checkpoint().await?;
-        // Manifest synced and checkpoint persisted — delete the flushing file.
-        let flushing_path = self.inner.config.flushing_path();
-        if flushing_path.exists()
-            && let Err(e) = std::fs::remove_file(&flushing_path)
-        {
-                warn!(error = %e, "failed to remove flushing file after snapshot");
-        }
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,
