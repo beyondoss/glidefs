@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixDatagram;
 
-use crate::block::router::ExportRouter;
+use crate::handoff::HandoffCoordinator;
 use crate::handoff::protocol::{
     AbortReason, Capabilities, HandoffMessage, HandoffTimeouts, PROTOCOL_VERSION,
 };
@@ -30,9 +30,9 @@ const RECV_BUF_BYTES: usize = 64 * 1024;
 
 /// Outcome of the takeover. The successor continues SERVING after this
 /// returns Ok — the calling context is responsible for entering the
-/// normal serve loop with the returned router.
+/// normal serve loop with the returned coordinator (and its router).
 pub struct TakeoverResult {
-    pub router: Arc<ExportRouter>,
+    pub coord: Arc<HandoffCoordinator>,
     pub recovered_count: usize,
     /// Listener fds inherited from the predecessor via SCM_RIGHTS in
     /// the HelloAck payload (NBD TCP/Unix, HTTP API). The successor's
@@ -59,7 +59,7 @@ pub struct TakeoverResult {
 )]
 pub async fn run_successor(
     socket_path: &Path,
-    router: Arc<ExportRouter>,
+    coord: Arc<HandoffCoordinator>,
     timeouts: HandoffTimeouts,
 ) -> Result<TakeoverResult> {
     let sock = connect_seqpacket(socket_path)
@@ -126,7 +126,7 @@ pub async fn run_successor(
     // listed. The caller is responsible for having done all slow startup
     // work before invoking us; we just verify the result.
     let _ = timeouts.warming; // currently unused — kept for future async warm path
-    let missing = missing_exports(&router, &exports).await;
+    let missing = missing_exports(coord.router(), &exports).await;
     if !missing.is_empty() {
         send_one(
             &sock,
@@ -175,7 +175,7 @@ pub async fn run_successor(
     crate::handoff::fault::inject("s_crash_after_cutover");
 
     // Run strategy-specific takeover.
-    let per_io_daemon = router.is_per_io_daemon_supported();
+    let per_io_daemon = coord.is_per_io_daemon_supported();
     let strategy = strategy::select(per_io_daemon);
     if strategy.name() != negotiated_strategy_name {
         return Err(anyhow!(
@@ -185,7 +185,7 @@ pub async fn run_successor(
     }
 
     let mut takeover_ctx = SuccessorTakeoverCtx {
-        router: router.clone(),
+        coord: coord.clone(),
         exports,
     };
     let recovered_count = strategy
@@ -204,14 +204,14 @@ pub async fn run_successor(
     );
 
     Ok(TakeoverResult {
-        router,
+        coord,
         recovered_count,
         inherited_fds,
     })
 }
 
 async fn missing_exports(
-    router: &ExportRouter,
+    router: &crate::block::router::ExportRouter,
     snapshot: &[crate::handoff::protocol::ExportSnapshot],
 ) -> Vec<String> {
     let mut missing = Vec::new();

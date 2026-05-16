@@ -687,8 +687,9 @@ async fn run_predecessor_handoff_with_opts(
     let successor_binary =
         std::env::current_exe().context("resolving current binary path for successor exec")?;
     let timeouts = crate::handoff::HandoffTimeouts::default();
+    let coord = Arc::new(crate::handoff::HandoffCoordinator::new(router));
     crate::handoff::run_predecessor(
-        router,
+        coord,
         &socket_path,
         &successor_binary,
         &config_path,
@@ -734,6 +735,11 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     // serving I/O while we do this — the whole point of the design.
     let built = build_router_only(config_path.clone()).await?;
 
+    // Build the handoff coordinator. It wraps the router and owns
+    // every per-export handoff method (freeze_all, recover_handoff_devices,
+    // revive_after_failed_handoff, etc.).
+    let coord = Arc::new(crate::handoff::HandoffCoordinator::new(Arc::clone(&built.router)));
+
     // **Successor passive mode**: each WriteCache starts with
     // `freeze_in_progress=true` so its flush_scheduler doesn't truncate
     // the WAL while the predecessor is still appending to it. The flag
@@ -743,14 +749,14 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     // freeze window — applied to the successor side for the whole
     // WARMING + CUTOVER window since the successor doesn't have
     // exclusive ownership of the on-disk state until then.
-    built.router.set_all_caches_freeze(true).await;
+    coord.set_all_caches_freeze(true).await;
 
     // Drive the handoff protocol. After this returns, our router owns
     // every device the predecessor used to own.
     let timeouts = crate::handoff::HandoffTimeouts::default();
     let takeover = crate::handoff::run_successor(
         &socket_path,
-        Arc::clone(&built.router),
+        Arc::clone(&coord),
         timeouts,
     )
     .await
@@ -764,7 +770,7 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     // Predecessor has fully exited (takeover wouldn't return ALIVE
     // otherwise). Resume per-export checkpoint truncation — we now
     // own the WAL exclusively.
-    built.router.set_all_caches_freeze(false).await;
+    coord.set_all_caches_freeze(false).await;
 
     // If the predecessor passed its listener fds via SCM_RIGHTS in
     // the HelloAck, we adopt them directly — no bind, no port

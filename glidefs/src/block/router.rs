@@ -1934,35 +1934,6 @@ impl ExportRouter {
         self.exports.get(name).map(|e| Arc::clone(&e.value().handler))
     }
 
-    /// Sync variant of [`Self::get_handler`] — needed by callbacks that
-    /// can't `.await` (e.g., the `Fn` closure passed to ublk recovery).
-    /// DashMap shard access is cheap and lock-free under no contention.
-    pub fn get_handler_sync(&self, name: &str) -> Option<Arc<BlockHandler>> {
-        self.exports.get(name).map(|e| Arc::clone(&e.value().handler))
-    }
-
-    /// True iff the kernel advertises `UBLK_F_PER_IO_DAEMON`. Used by
-    /// the handoff strategy selector to pick PIOD over CRH when
-    /// available. Always false on non-Linux or non-ublk builds.
-    pub fn is_per_io_daemon_supported(&self) -> bool {
-        #[cfg(all(target_os = "linux", feature = "ublk"))]
-        {
-            // Read happens under a brief tokio Mutex lock — but we're
-            // called from sync code paths during startup. Use
-            // try_lock_owned to avoid blocking; if contended (which
-            // would be unusual since this is a config-time check),
-            // conservatively return false.
-            match self.ublk_server.try_lock() {
-                Ok(g) => g.kernel_features().per_io_daemon,
-                Err(_) => false,
-            }
-        }
-        #[cfg(not(all(target_os = "linux", feature = "ublk")))]
-        {
-            false
-        }
-    }
-
     /// Check if an export is readonly.
     #[allow(dead_code)]
     pub async fn is_readonly(&self, name: &str) -> Option<bool> {
@@ -2008,6 +1979,33 @@ impl ExportRouter {
     /// Get export names.
     pub async fn list_export_names(&self) -> Vec<String> {
         self.exports.iter().map(|e| e.key().clone()).collect()
+    }
+
+    // ========================================================================
+    // pub(crate) accessors — exposed for the handoff coordinator
+    // (`crate::handoff::coordinator::HandoffCoordinator`), which sits in a
+    // sibling module and needs to walk per-export state without `pub(super)`
+    // privilege. Not part of the public surface.
+    // ========================================================================
+
+    /// Direct access to the per-export `DashMap`. Lookups are cheap and
+    /// lock-free; iteration holds shard guards briefly.
+    pub(crate) fn exports_map(&self) -> &DashMap<String, ExportState> {
+        &self.exports
+    }
+
+    /// Local SSD cache directory (used by `revive_after_failed_handoff`
+    /// to construct a fresh `UblkServer` after a successor crash).
+    pub(crate) fn cache_dir_path(&self) -> &std::path::Path {
+        &self.cache_dir
+    }
+
+    /// The shared `UblkServer` mutex (cfg-gated to ublk builds).
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub(crate) fn ublk_server_mutex(
+        &self,
+    ) -> &tokio::sync::Mutex<crate::block::ublk::UblkServer> {
+        &self.ublk_server
     }
 
     // --- Device management (unified across transports) ---
@@ -2837,398 +2835,6 @@ impl ExportRouter {
         }
 
         remaining
-    }
-
-    // ========================================================================
-    // Graceful handoff support — methods called from `crate::handoff::*`.
-    // ========================================================================
-
-    /// Snapshot of exports for the predecessor to send in `HelloAck`.
-    /// Includes every export's name, size, readonly flag, last WAL
-    /// sequence, and ublk dev_id (if any). Captured atomically per
-    /// export — values reflect a consistent point-in-time view.
-    pub async fn handoff_snapshot(
-        &self,
-    ) -> Vec<crate::handoff::protocol::ExportSnapshot> {
-        let mut out: Vec<crate::handoff::protocol::ExportSnapshot> = Vec::new();
-
-        // Collect names first to avoid holding shard locks across an
-        // .await for the ublk dev_id lookup.
-        let names: Vec<String> = self.exports.iter().map(|e| e.key().clone()).collect();
-
-        let dev_id_map: HashMap<String, i32> = {
-            #[cfg(all(target_os = "linux", feature = "ublk"))]
-            {
-                let pairs = self.ublk_server.lock().await.snapshot_dev_ids();
-                pairs.into_iter().map(|(id, name)| (name, id)).collect()
-            }
-            #[cfg(not(all(target_os = "linux", feature = "ublk")))]
-            {
-                HashMap::new()
-            }
-        };
-
-        for name in names {
-            let Some(state) = self.exports.get(&name) else {
-                continue;
-            };
-            let state = state.value();
-            let last_wal_seq = state.cache.last_persisted_seq();
-            out.push(crate::handoff::protocol::ExportSnapshot {
-                name: name.clone(),
-                size_bytes: state.handler.device_size(),
-                readonly: state.readonly,
-                last_wal_seq,
-                ublk_dev_id: dev_id_map.get(&name).copied(),
-            });
-        }
-
-        out
-    }
-
-    /// Quiesce every export for handoff: mark BlockHandlers as frozen
-    /// (metadata only — see [`BlockHandler::freeze`] note about why
-    /// it does not gate writes), then `cache.flush()` to fsync each
-    /// WAL.
-    ///
-    /// **Why fsync is required**: skipping it interacts badly with the
-    /// concurrent flush+rotate machinery. If the predecessor's
-    /// flush_scheduler rotates the data file (DIRTY → SYNCING + active
-    /// file → flushing file) between the successor's WARMING-time
-    /// WriteCache::open and the predecessor's drop, the successor's
-    /// state-map view loses entries that were rotated. Fsync forces a
-    /// stable WAL state before the cutover so the successor's
-    /// tail-replay sees the same sequence horizon the predecessor
-    /// committed to.
-    ///
-    /// Cost: fdatasync per export, ~5–50ms each. At fleet scale (~1000
-    /// exports) we parallelize at 16-way concurrency to bound the
-    /// total to a few hundred ms.
-    pub async fn freeze_all(&self) -> Result<(), RouterError> {
-        let states: Vec<(String, Arc<BlockHandler>, Arc<WriteCache<Active>>)> = self
-            .exports
-            .iter()
-            .map(|e| {
-                let name = e.key().clone();
-                let state = e.value();
-                (name, Arc::clone(&state.handler), Arc::clone(&state.cache))
-            })
-            .collect();
-
-        if states.is_empty() {
-            return Ok(());
-        }
-
-        info!(count = states.len(), "handoff: freezing all handlers");
-        for (_, handler, cache) in &states {
-            handler.freeze();
-            // Pause the per-export checkpoint truncate so the WAL
-            // stays intact for the successor's tail-replay window.
-            cache.set_freeze_in_progress(true);
-        }
-
-        // **Fence in-flight flush + manifest-sync cycles**. The flush
-        // scheduler holds `flush_lock` for the entire pack-upload +
-        // sync_manifest sequence; acquiring the lock here blocks until
-        // the in-flight cycle completes. Without it, the predecessor
-        // can exit between pack-upload and manifest-sync, leaving
-        // packs in S3 that aren't registered in the manifest — the
-        // successor reads those blocks via S3, finds no entry, and
-        // serves zeros (visible as fio "verify: bad magic header 0").
-        //
-        // 8s bound — enough for typical 64MB pack batches, short
-        // enough to bound handoff stall under genuinely stuck
-        // uploads. On timeout we proceed; the manifest reload +
-        // post-takeover recovery in `recover_handoff_devices` cleans
-        // up the partial state.
-        use futures::stream::{self, StreamExt};
-        stream::iter(states.iter().map(|(name, _, cache)| (name.clone(), Arc::clone(cache))))
-            .for_each_concurrent(16, |(name, cache)| async move {
-                if (tokio::time::timeout(
-                    std::time::Duration::from_secs(8),
-                    cache.wait_for_inflight_flush(),
-                )
-                .await)
-                    .is_err()
-                {
-                    warn!(
-                        export = %name,
-                        "handoff: in-flight flush did not complete within 8s; proceeding with cutover"
-                    );
-                }
-            })
-            .await;
-
-        let errs: Vec<_> = stream::iter(states.into_iter())
-            .map(|(name, _handler, cache)| async move {
-                tokio::task::spawn_blocking(move || cache.flush())
-                    .await
-                    .map_err(|e| (name.clone(), format!("join: {e}")))
-                    .and_then(|r| r.map_err(|e| (name, format!("flush: {e}"))))
-            })
-            .buffer_unordered(16)
-            .filter_map(|r| async move { r.err() })
-            .collect()
-            .await;
-
-        if let Some((name, detail)) = errs.into_iter().next() {
-            return Err(RouterError::ShutdownIncomplete {
-                incomplete_count: 1,
-                details: format!("freeze fsync failed for '{name}': {detail}"),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Set the per-export `freeze_in_progress` flag on every WriteCache.
-    /// While `true`, the flush_scheduler's checkpoint cycle skips WAL
-    /// truncation. Used by:
-    /// - Predecessor's `freeze_all` (briefly, during the cutover window)
-    /// - Successor's WARMING phase (the whole time the predecessor is
-    ///   still alive and may be appending to the WAL we share)
-    pub async fn set_all_caches_freeze(&self, frozen: bool) {
-        let caches: Vec<Arc<WriteCache<Active>>> = self
-            .exports
-            .iter()
-            .map(|e| Arc::clone(&e.value().cache))
-            .collect();
-        for c in caches {
-            c.set_freeze_in_progress(frozen);
-        }
-    }
-
-    /// Reverse [`freeze_all`]. Called on the predecessor's revival path
-    /// if the successor crashes between PREDS_DEAD and ALIVE. Also
-    /// resumes per-export checkpoint truncation.
-    pub async fn unfreeze_all(&self) {
-        let states: Vec<(Arc<BlockHandler>, Arc<WriteCache<Active>>)> = self
-            .exports
-            .iter()
-            .map(|e| {
-                let s = e.value();
-                (Arc::clone(&s.handler), Arc::clone(&s.cache))
-            })
-            .collect();
-        for (h, c) in states {
-            h.unfreeze();
-            c.set_freeze_in_progress(false);
-        }
-        info!("handoff: handlers unfrozen (handoff aborted)");
-    }
-
-    /// Take the UblkServer out of the router and drop it. This is the
-    /// kernel-level CRH cutover: dropping closes io_uring fds, which
-    /// causes the kernel to transition every device to QUIESCED.
-    ///
-    /// The router keeps everything else alive — ExportRouter, ExportStates,
-    /// WriteCaches, BlockHandlers — so revival is possible if the
-    /// successor crashes before sending ALIVE.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
-    pub async fn take_ublk_server(&self) -> Result<(), RouterError> {
-        let mut guard = self.ublk_server.lock().await;
-        let old = std::mem::take(&mut *guard);
-        drop(guard);
-        // Run shutdown to drop the worker pool cleanly. This blocks
-        // until every worker has exited and its io_urings are closed.
-        if let Err(e) = old.shutdown().await {
-            return Err(RouterError::ShutdownIncomplete {
-                incomplete_count: 1,
-                details: format!("ublk server shutdown failed during handoff cutover: {e}"),
-            });
-        }
-        info!("handoff: ublk server dropped; kernel devices QUIESCED");
-        Ok(())
-    }
-
-    /// Successor-side: recover the QUIESCED devices the predecessor
-    /// left behind. Called from `CrhStrategy::successor_takeover`.
-    ///
-    /// Before the ublk-level recovery, this also **tail-replays each
-    /// export's WAL** to pick up any entries the predecessor fsync'd
-    /// between the successor's WARMING-time WriteCache::open and the
-    /// predecessor's freeze. Without this, writes acknowledged in that
-    /// window would silently disappear on the successor side — the
-    /// failure manifests as fio verify mismatches ("bad magic header 0,
-    /// wanted acca"). See `WriteCache::replay_wal_tail`.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
-    pub async fn recover_handoff_devices(
-        &self,
-        ids: &[(i32, String)],
-    ) -> Result<usize, RouterError> {
-        // Tail-replay WALs for every export we're about to recover.
-        // Done before the ublk-level recovery so the BlockHandler's
-        // view of state_map is current by the time the kernel reissues
-        // bios at us.
-        //
-        // Then resolve any flushing-file the predecessor was uploading
-        // when handoff started (`recover_pending_flush_file`). We
-        // deferred this in `WriteCache::open` (passive mode) because
-        // touching the active data file or the flushing file while the
-        // predecessor was still uploading would race writes and
-        // corrupt blocks.
-        for (_, export_name) in ids {
-            if let Some(state) = self.exports.get(export_name) {
-                let cache = Arc::clone(&state.value().cache);
-                let cache_for_recovery = Arc::clone(&cache);
-                match tokio::task::spawn_blocking(move || cache.replay_wal_tail())
-                    .await
-                {
-                    Ok(Ok(n)) => {
-                        if n > 0 {
-                            tracing::info!(
-                                export = %export_name,
-                                replayed = n,
-                                "handoff: tail-replayed WAL entries"
-                            );
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        return Err(RouterError::ShutdownIncomplete {
-                            incomplete_count: 1,
-                            details: format!(
-                                "WAL tail replay failed for '{export_name}': {e}"
-                            ),
-                        });
-                    }
-                    Err(e) => {
-                        return Err(RouterError::ShutdownIncomplete {
-                            incomplete_count: 1,
-                            details: format!("spawn_blocking failed: {e}"),
-                        });
-                    }
-                }
-
-                match tokio::task::spawn_blocking(move || {
-                    cache_for_recovery.recover_pending_flush_file()
-                })
-                .await
-                {
-                    Ok(Ok(n)) => {
-                        if n > 0 {
-                            tracing::info!(
-                                export = %export_name,
-                                acted_on = n,
-                                "handoff: post-takeover flush-file recovery"
-                            );
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        return Err(RouterError::ShutdownIncomplete {
-                            incomplete_count: 1,
-                            details: format!(
-                                "post-takeover flush-file recovery failed for '{export_name}': {e}"
-                            ),
-                        });
-                    }
-                    Err(e) => {
-                        return Err(RouterError::ShutdownIncomplete {
-                            incomplete_count: 1,
-                            details: format!("spawn_blocking failed: {e}"),
-                        });
-                    }
-                }
-
-                // **Reload the volume manifest from S3.** The successor
-                // loaded the manifest at WARMING-time, which is BEFORE
-                // the predecessor's freeze fence. The predecessor may
-                // have completed a `sync_manifest` call between then
-                // and PREDS_DEAD, registering new packs. Without a
-                // reload, the successor's in-memory manifest doesn't
-                // know about those packs — reads of blocks resolved
-                // through the manifest return zero (visible as fio
-                // "verify: bad magic header 0"), and the successor's
-                // own next manifest sync hits an ETag PreconditionFailed.
-                let cs = Arc::clone(&state.value().content_store);
-                let vm = Arc::clone(&state.value().volume_manifest);
-                let cache_for_etag = Arc::clone(&state.value().cache);
-                match cs.get_manifest(export_name).await {
-                    Ok(Some((data, etag))) => {
-                        match crate::block::volume_manifest::VolumeManifest::deserialize(&data) {
-                            Ok(new_vm) => {
-                                *vm.write() = new_vm;
-                                *cache_for_etag.inner.manifest_etag.lock() = etag;
-                                tracing::info!(
-                                    export = %export_name,
-                                    "handoff: reloaded volume manifest from S3"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    export = %export_name,
-                                    error = %e,
-                                    "handoff: failed to deserialize reloaded manifest \
-                                     — keeping pre-handoff in-memory copy (some pack \
-                                     references may be missing until next successful sync)"
-                                );
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // No manifest in S3 — predecessor never flushed.
-                        // Our pre-handoff in-memory manifest is empty too. OK.
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            export = %export_name,
-                            error = %e,
-                            "handoff: failed to fetch reloaded manifest from S3 \
-                             — keeping pre-handoff in-memory copy"
-                        );
-                    }
-                }
-            }
-        }
-
-        let mut server = self.ublk_server.lock().await;
-        let exports = &self.exports;
-        let get_handler = |name: &str| -> Option<Arc<BlockHandler>> {
-            exports.get(name).map(|e| Arc::clone(&e.value().handler))
-        };
-        let recovered = server.recover_devices_by_id(ids, get_handler).await;
-        Ok(recovered)
-    }
-
-    /// Predecessor-side revival: the successor crashed after we already
-    /// dropped our UblkServer. Spin up a fresh UblkServer and recover
-    /// our own QUIESCED devices via the standard crash-recovery path.
-    /// Returns the number of devices recovered. Caller should then call
-    /// [`unfreeze_all`] so I/O resumes.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
-    pub async fn revive_after_failed_handoff(&self) -> Result<usize, RouterError> {
-        info!("handoff: reviving after failed handoff");
-        // Replace the dropped UblkServer with a fresh one and rerun the
-        // standard crash-recovery scan. Since this scan looks at the
-        // kernel directly (`for_each_dev_id`), it doesn't need our
-        // export inventory — but we still need handlers, which exist
-        // because we never tore down ExportStates.
-        let mut server = self.ublk_server.lock().await;
-        *server = crate::block::ublk::UblkServer::new()
-            .with_cache_dir(self.cache_dir.clone());
-        let exports = &self.exports;
-        let get_handler = |name: &str| -> Option<Arc<BlockHandler>> {
-            exports.get(name).map(|e| Arc::clone(&e.value().handler))
-        };
-        let recovered = server.recover_quiesced_devices(get_handler).await;
-        info!(recovered, "handoff: revival complete");
-        Ok(recovered)
-    }
-
-    /// Stubs for non-Linux / non-ublk builds.
-    #[cfg(not(all(target_os = "linux", feature = "ublk")))]
-    pub async fn take_ublk_server(&self) -> Result<(), RouterError> {
-        Ok(())
-    }
-    #[cfg(not(all(target_os = "linux", feature = "ublk")))]
-    pub async fn recover_handoff_devices(
-        &self,
-        _ids: &[(i32, String)],
-    ) -> Result<usize, RouterError> {
-        Ok(0)
-    }
-    #[cfg(not(all(target_os = "linux", feature = "ublk")))]
-    pub async fn revive_after_failed_handoff(&self) -> Result<usize, RouterError> {
-        Ok(0)
     }
 
     /// Create a minimal router for testing protocol handling.

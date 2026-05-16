@@ -24,7 +24,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UnixDatagram;
 
-use crate::block::router::ExportRouter;
 use crate::handoff::protocol::{
     AbortReason, Capabilities, HandoffMessage, HandoffTimeouts, PROTOCOL_VERSION,
 };
@@ -62,7 +61,7 @@ pub enum HandoffOutcome {
     ),
 )]
 pub async fn run_predecessor(
-    router: Arc<ExportRouter>,
+    coord: Arc<crate::handoff::HandoffCoordinator>,
     socket_path: &Path,
     successor_binary: &Path,
     config_path: &Path,
@@ -88,10 +87,10 @@ pub async fn run_predecessor(
     // causing silent data loss observable as "verify: bad magic
     // header 0" in fio. Setting the flag this early covers the
     // entire WARMING + READY-wait + freeze + cutover window.
-    router.set_all_caches_freeze(true).await;
+    coord.set_all_caches_freeze(true).await;
 
     // Detect kernel features for strategy selection.
-    let per_io_daemon = router.is_per_io_daemon_supported();
+    let per_io_daemon = coord.is_per_io_daemon_supported();
     let strategy = strategy::select(per_io_daemon);
     let strategy_name = strategy.name();
     tracing::info!(strategy = strategy_name, "handoff: selected cutover strategy");
@@ -128,7 +127,7 @@ pub async fn run_predecessor(
     // Run the protocol; capture all errors so we can clean up.
     let result = run_protocol(
         &connected,
-        router.clone(),
+        coord.clone(),
         &*strategy,
         timeouts,
         started,
@@ -146,14 +145,14 @@ pub async fn run_predecessor(
     // For Succeeded, the predecessor exits anyway so the flag is
     // moot. For Aborted/Revived, the predecessor resumes normal
     // serving and needs flush_scheduler back to truncate WAL.
-    router.set_all_caches_freeze(false).await;
+    coord.set_all_caches_freeze(false).await;
 
     result
 }
 
 async fn run_protocol(
     sock: &UnixDatagram,
-    router: Arc<ExportRouter>,
+    coord: Arc<crate::handoff::HandoffCoordinator>,
     strategy: &dyn CutoverStrategy,
     timeouts: HandoffTimeouts,
     started: Instant,
@@ -211,7 +210,7 @@ async fn run_protocol(
     }
 
     // Build snapshot of our exports.
-    let exports = router.handoff_snapshot().await;
+    let exports = coord.snapshot().await;
     tracing::info!(count = exports.len(), "handoff: built export snapshot");
 
     let predecessor_pid = std::process::id() as i32;
@@ -220,7 +219,7 @@ async fn run_protocol(
     // running NBD/HTTP API tasks. The dup'd copies travel via
     // SCM_RIGHTS and are owned by the kernel until the successor
     // claims them via `recvmsg`.
-    let listener_snapshot = router.listener_registry.snapshot();
+    let listener_snapshot = coord.router().listener_registry.snapshot();
     let mut dup_fds: Vec<std::os::fd::OwnedFd> = Vec::with_capacity(listener_snapshot.len());
     let mut listener_kinds = Vec::with_capacity(listener_snapshot.len());
     for (kind, fd) in &listener_snapshot {
@@ -314,12 +313,12 @@ async fn run_protocol(
     tracing::info!("handoff: successor READY; freezing handlers");
 
     // FREEZE: block new writes, fsync WALs.
-    if let Err(e) = router.freeze_all().await {
+    if let Err(e) = coord.freeze_all().await {
         // On freeze failure we are still SERVING; abort the handoff.
         let reason = AbortReason::FreezeFailed { detail: format!("{e:#}") };
         send_one(sock, &HandoffMessage::Abort(reason.clone())).await.ok();
         // Unfreeze so we can keep serving.
-        router.unfreeze_all().await;
+        coord.unfreeze_all().await;
         return Ok(HandoffOutcome::Aborted {
             reason: format!("{:?}", reason),
             duration: started.elapsed(),
@@ -333,15 +332,15 @@ async fn run_protocol(
     send_one(sock, &HandoffMessage::Cutover).await.context("send CUTOVER")?;
     tracing::info!("handoff: CUTOVER sent; running predecessor cutover step");
 
-    let mut cutover_ctx = PredecessorCutoverCtx { router: router.clone() };
+    let mut cutover_ctx = PredecessorCutoverCtx { coord: coord.clone() };
     if let Err(e) = strategy.predecessor_cutover(&mut cutover_ctx).await {
         // The cutover failed. We may already have dropped the UblkServer
         // (kernel devices QUIESCED). Try to revive.
         tracing::error!(error = %e, "handoff: predecessor cutover failed; attempting revival");
-        if let Err(rev) = router.revive_after_failed_handoff().await {
+        if let Err(rev) = coord.revive_after_failed_handoff().await {
             return Err(anyhow!("cutover failed AND revival failed: cutover={e:#} revival={rev:#}"));
         }
-        router.unfreeze_all().await;
+        coord.unfreeze_all().await;
         return Ok(HandoffOutcome::RevivedFromFailedHandoff {
             duration: started.elapsed(),
         });
@@ -360,22 +359,22 @@ async fn run_protocol(
             // Socket EOF / error after PREDS_DEAD — successor likely
             // crashed. Revive.
             tracing::error!(error = %e, "handoff: socket error after PREDS_DEAD; reviving");
-            router
+            coord
                 .revive_after_failed_handoff()
                 .await
                 .context("revival after successor socket-error")?;
-            router.unfreeze_all().await;
+            coord.unfreeze_all().await;
             return Ok(HandoffOutcome::RevivedFromFailedHandoff {
                 duration: started.elapsed(),
             });
         }
         Err(_) => {
             tracing::error!("handoff: timeout waiting for ALIVE; reviving");
-            router
+            coord
                 .revive_after_failed_handoff()
                 .await
                 .context("revival after ALIVE timeout")?;
-            router.unfreeze_all().await;
+            coord.unfreeze_all().await;
             return Ok(HandoffOutcome::RevivedFromFailedHandoff {
                 duration: started.elapsed(),
             });
@@ -386,16 +385,16 @@ async fn run_protocol(
         HandoffMessage::Alive { recovered_count } => recovered_count,
         HandoffMessage::Abort(r) => {
             tracing::error!(reason = ?r, "handoff: successor aborted after PREDS_DEAD; reviving");
-            router.revive_after_failed_handoff().await?;
-            router.unfreeze_all().await;
+            coord.revive_after_failed_handoff().await?;
+            coord.unfreeze_all().await;
             return Ok(HandoffOutcome::RevivedFromFailedHandoff {
                 duration: started.elapsed(),
             });
         }
         other => {
             tracing::error!(?other, "handoff: unexpected message after PREDS_DEAD; reviving");
-            router.revive_after_failed_handoff().await?;
-            router.unfreeze_all().await;
+            coord.revive_after_failed_handoff().await?;
+            coord.unfreeze_all().await;
             return Ok(HandoffOutcome::RevivedFromFailedHandoff {
                 duration: started.elapsed(),
             });

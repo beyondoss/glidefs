@@ -33,23 +33,23 @@ use std::sync::Arc;
 /// take ownership of the `UblkServer` (CRH drops it).
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 pub struct PredecessorCutoverCtx {
-    /// The router whose UblkServer this cutover will retire. Kept alive
-    /// across the cutover so revival is possible if the successor crashes
-    /// after PredsDead.
-    pub router: Arc<crate::block::router::ExportRouter>,
+    /// The handoff coordinator whose UblkServer this cutover will retire.
+    /// Kept alive across the cutover so revival is possible if the
+    /// successor crashes after PredsDead.
+    pub coord: Arc<crate::handoff::HandoffCoordinator>,
 }
 
 #[cfg(not(all(target_os = "linux", feature = "ublk")))]
 pub struct PredecessorCutoverCtx {
     /// Same as the Linux variant minus the ublk-specific fields.
-    pub router: Arc<crate::block::router::ExportRouter>,
+    pub coord: Arc<crate::handoff::HandoffCoordinator>,
 }
 
 /// Context passed to the successor's takeover step.
 pub struct SuccessorTakeoverCtx {
-    /// The router that the successor has built during WARMING. Has
-    /// BlockHandlers for every export in `exports`.
-    pub router: Arc<crate::block::router::ExportRouter>,
+    /// The handoff coordinator the successor has built during WARMING.
+    /// Wraps an `ExportRouter` with handlers for every export in `exports`.
+    pub coord: Arc<crate::handoff::HandoffCoordinator>,
     /// The export snapshot the predecessor sent in HelloAck. Successor
     /// uses dev_ids to call `recover_devices_by_id`.
     pub exports: Vec<ExportSnapshot>,
@@ -96,11 +96,10 @@ pub trait CutoverStrategy: Send + Sync {
         ctx: &SuccessorTakeoverCtx,
         export_name: &str,
     ) -> Option<Arc<BlockHandler>> {
-        // Async lookup happens via the router's `get_handler` method.
-        // For the synchronous closure ublk's recovery API requires,
-        // wrap with try_lock semantics — fine because handlers are
-        // already constructed by the time we get here.
-        ctx.router.get_handler_sync(export_name)
+        // Sync lookup — fine because handlers are already constructed
+        // by the time we get here. The coordinator's helper does a
+        // DashMap shard read (lock-free under no contention).
+        ctx.coord.get_handler_sync(export_name)
     }
 }
 

@@ -23,6 +23,7 @@
 //! - [`successor::run_successor`] — drives the S state machine. Called by
 //!   `main.rs` when `--handoff-from <socket>` is present in argv.
 
+pub mod coordinator;
 pub mod fault;
 pub mod fdpass;
 pub mod listener_registry;
@@ -32,6 +33,7 @@ pub mod protocol;
 pub mod strategy;
 pub mod successor;
 
+pub use coordinator::HandoffCoordinator;
 pub use predecessor::{run_predecessor, HandoffOutcome};
 pub use protocol::{DEFAULT_HANDOFF_SOCKET, HandoffTimeouts};
 pub use successor::{run_successor, TakeoverResult};

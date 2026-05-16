@@ -306,6 +306,17 @@ impl WriteCache<Active> {
         let _g = self.inner.flush_lock.lock().await;
     }
 
+    /// Overwrite the manifest ETag the cache will send on the next
+    /// `put_manifest`. Used by the handoff successor after reloading
+    /// the volume manifest from S3 in `recover_handoff_devices`, so
+    /// the next conditional-PUT carries the fresh ETag (avoiding a
+    /// `PreconditionFailed` from the server's perspective). The
+    /// `pub(crate)` visibility lets the handoff coordinator set this
+    /// from a sibling module without exposing `inner`.
+    pub(crate) fn set_manifest_etag(&self, etag: Option<String>) {
+        *self.inner.manifest_etag.lock() = etag;
+    }
+
     /// Replay any WAL entries newer than the current sequence number and
     /// apply them to the in-memory state map.
     ///

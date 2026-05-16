@@ -43,12 +43,12 @@ impl CutoverStrategy for CrhStrategy {
     async fn predecessor_cutover(&self, ctx: &mut PredecessorCutoverCtx) -> Result<()> {
         tracing::info!("CRH: predecessor cutover — dropping UblkServer");
 
-        // Take the UblkServer out of the router. The router keeps its
+        // Take the UblkServer out of the router. The coordinator keeps its
         // ExportRouter / WriteCache mounts alive (revival fallback if S
         // crashes between PredsDead and Alive).
         #[cfg(all(target_os = "linux", feature = "ublk"))]
         {
-            ctx.router
+            ctx.coord
                 .take_ublk_server()
                 .await
                 .context("failed to take ublk server from router for handoff cutover")?;
@@ -81,10 +81,10 @@ impl CutoverStrategy for CrhStrategy {
 
             tracing::info!(count = ids.len(), "CRH: successor takeover — recovering devices");
 
-            // Strategy holds no per-export state; the router owns the
-            // UblkServer that does the actual recovery work.
+            // Strategy holds no per-export state; the coordinator owns
+            // the UblkServer that does the actual recovery work.
             let recovered = ctx
-                .router
+                .coord
                 .recover_handoff_devices(&ids)
                 .await
                 .context("CRH successor takeover failed during recover_devices_by_id")?;
