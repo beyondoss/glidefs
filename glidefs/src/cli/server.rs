@@ -684,8 +684,8 @@ async fn run_predecessor_handoff_with_opts(
     dry_run: bool,
 ) -> Result<crate::handoff::HandoffOutcome> {
     let socket_path = std::path::PathBuf::from(crate::handoff::DEFAULT_HANDOFF_SOCKET);
-    let successor_binary =
-        std::env::current_exe().context("resolving current binary path for successor exec")?;
+    let successor_binary = successor_binary_path()
+        .context("resolving current binary path for successor exec")?;
     let timeouts = crate::handoff::HandoffTimeouts::default();
     let coord = Arc::new(crate::handoff::HandoffCoordinator::new(router));
     crate::handoff::run_predecessor(
@@ -697,6 +697,35 @@ async fn run_predecessor_handoff_with_opts(
         dry_run,
     )
     .await
+}
+
+/// Resolve the path to use when fork+exec'ing the successor binary.
+///
+/// Prefers argv[0] when it's an absolute path that still exists — this
+/// is the case under systemd (`ExecStart=/usr/local/bin/glidefs ...`)
+/// and survives the binary being atomically replaced in place. After
+/// `install`/`mv` swaps the inode at `/usr/local/bin/glidefs`,
+/// `std::env::current_exe()` (which resolves via `/proc/self/exe`)
+/// reports the path with a ` (deleted)` suffix because it still
+/// references the now-unlinked old inode; fork+exec on that path
+/// fails with ETXTBSY. The path *string* `/usr/local/bin/glidefs`
+/// itself still resolves to the new binary, which is what we want.
+///
+/// Falls back to `current_exe()` (with the ` (deleted)` suffix
+/// stripped) when argv[0] is relative, missing, or doesn't exist —
+/// e.g., manual invocations or test harnesses where argv[0] isn't a
+/// useful absolute path.
+fn successor_binary_path() -> Result<PathBuf> {
+    if let Some(argv0) = std::env::args_os().next() {
+        let p = PathBuf::from(&argv0);
+        if p.is_absolute() && p.exists() {
+            return Ok(p);
+        }
+    }
+    let exe = std::env::current_exe()?;
+    let s = exe.to_string_lossy();
+    let stripped = s.strip_suffix(" (deleted)").unwrap_or(&s);
+    Ok(PathBuf::from(stripped))
 }
 
 /// Successor-mode entry: cold-start the router (WARMING — happens while
