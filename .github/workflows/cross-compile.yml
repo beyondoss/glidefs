@@ -58,14 +58,6 @@ jobs:
             arch: riscv64
             os: ubuntu-latest
             platform: linux
-          - target: x86_64-apple-darwin
-            arch: x86_64
-            os: macos-latest
-            platform: darwin
-          - target: aarch64-apple-darwin
-            arch: aarch64
-            os: macos-latest
-            platform: darwin
 
     steps:
       - name: Checkout
@@ -81,13 +73,11 @@ jobs:
           workspaces: ". -> target"
           shared-key: "cross-${{ matrix.target }}"
 
-      - name: Install cross (Linux only)
-        if: matrix.platform == 'linux'
+      - name: Install cross
         run: |
           cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build with cross (Linux)
-        if: matrix.platform == 'linux'
+      - name: Build with cross
         env:
           # io-uring (transitive dep via foyer) only ships prebuilt bindings for
           # x86_64/aarch64. This flag tells it to use those bindings on other
@@ -95,11 +85,6 @@ jobs:
           RUSTFLAGS: '--cfg=io_uring_skip_arch_check --cfg tokio_unstable'
         run: |
           cross build -p glidefs -p oci-distribution --profile ci --target ${{ matrix.target }} ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
-
-      - name: Build with cargo (macOS)
-        if: matrix.platform == 'darwin'
-        run: |
-          cargo build -p glidefs -p oci-distribution --profile ci --target ${{ matrix.target }}
 
       - name: Prepare binaries
         run: |
