@@ -22,8 +22,16 @@ use std::time::Duration;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Default handoff socket path. Configurable via CLI / config in case
-/// multiple daemons share a host.
+/// multiple daemons share a host. This is the `AF_UNIX SOCK_SEQPACKET`
+/// socket the predecessor binds and the successor connects to during
+/// the two-process handoff protocol; see `ARCHITECTURE.md`.
 pub const DEFAULT_HANDOFF_SOCKET: &str = "/run/glidefs/handoff.sock";
+
+/// Default CTL socket path. Byte-command socket bound by the running
+/// daemon for the `glidefs handoff` CLI and `POST /admin/handoff` to
+/// trigger handoffs without SIGHUP. Distinct from
+/// [`DEFAULT_HANDOFF_SOCKET`] — see `ARCHITECTURE.md`.
+pub const DEFAULT_HANDOFF_CTL_SOCKET: &str = "/run/glidefs/handoff.ctl.sock";
 
 /// Wire protocol bytes for the handoff *control* socket
 /// (`/run/glidefs/handoff.ctl.sock`). One byte each way:
@@ -229,6 +237,19 @@ impl Default for HandoffTimeouts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the protocol socket and CTL socket must be distinct
+    /// paths. The `glidefs handoff` CLI defaults to the CTL socket; the
+    /// successor process connects to the protocol socket. They were
+    /// briefly conflated when the CLI default was set to
+    /// `DEFAULT_HANDOFF_SOCKET`, which silently broke `glidefs handoff`
+    /// from operator shells (the CLI failed with ENOENT on the protocol
+    /// socket while the CTL socket sat untouched).
+    #[test]
+    fn handoff_and_ctl_socket_defaults_differ() {
+        assert_ne!(DEFAULT_HANDOFF_SOCKET, DEFAULT_HANDOFF_CTL_SOCKET);
+        assert!(DEFAULT_HANDOFF_CTL_SOCKET.ends_with(".ctl.sock"));
+    }
 
     #[test]
     fn roundtrip_all_messages() {

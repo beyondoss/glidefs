@@ -842,9 +842,8 @@ where
             // Proxy to the control socket. The local serve_with_router
             // task listens on it and routes to the handoff dispatcher.
             let socket_path = std::path::PathBuf::from(
-                crate::handoff::DEFAULT_HANDOFF_SOCKET,
-            )
-            .with_extension("ctl.sock");
+                crate::handoff::DEFAULT_HANDOFF_CTL_SOCKET,
+            );
             match crate::block::api::trigger_handoff_via_ctl(&socket_path, dry_run).await {
                 Ok(()) => json_response(
                     StatusCode::ACCEPTED,

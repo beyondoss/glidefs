@@ -71,9 +71,11 @@ pub enum Commands {
     /// sending the signal — the actual handoff runs in the daemon.
     /// To watch progress, tail the daemon logs.
     Handoff {
-        /// Path to the daemon's handoff control socket. Defaults to
-        /// `/run/glidefs/handoff.sock`.
-        #[arg(long, default_value = "/run/glidefs/handoff.sock")]
+        /// Path to the daemon's handoff *control* socket. Defaults to
+        /// `/run/glidefs/handoff.ctl.sock`. Note: this is distinct from
+        /// the protocol socket at `/run/glidefs/handoff.sock` that the
+        /// successor connects to during a handoff.
+        #[arg(long, default_value = crate::handoff::DEFAULT_HANDOFF_CTL_SOCKET)]
         socket: PathBuf,
         /// Dry-run mode: spawn a successor that performs WARMING (proves
         /// it can open foyer cache, replay WAL, build router, prefetch

@@ -524,8 +524,8 @@ async fn serve_with_router_inner(
     // CLI invocations. mpsc carries (dry_run: bool) — the value tells
     // the signal loop which mode to launch.
     let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel::<bool>(1);
-    let ctrl_socket_path = std::path::PathBuf::from(crate::handoff::DEFAULT_HANDOFF_SOCKET)
-        .with_extension("ctl.sock");
+    let ctrl_socket_path =
+        std::path::PathBuf::from(crate::handoff::DEFAULT_HANDOFF_CTL_SOCKET);
     {
         let p = ctrl_socket_path.clone();
         tokio::spawn(async move {

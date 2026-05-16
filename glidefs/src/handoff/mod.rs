@@ -35,5 +35,5 @@ pub mod successor;
 
 pub use coordinator::HandoffCoordinator;
 pub use predecessor::{run_predecessor, HandoffOutcome};
-pub use protocol::{DEFAULT_HANDOFF_SOCKET, HandoffTimeouts};
+pub use protocol::{DEFAULT_HANDOFF_CTL_SOCKET, DEFAULT_HANDOFF_SOCKET, HandoffTimeouts};
 pub use successor::{run_successor, TakeoverResult};
