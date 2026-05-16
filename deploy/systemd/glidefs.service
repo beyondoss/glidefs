@@ -24,13 +24,22 @@ StartLimitIntervalSec=60
 StartLimitBurst=1
 
 [Service]
-# Type=simple — handoff doesn't use sd_notify yet (planned). When that
-# lands, switch to Type=notify and add NotifyAccess=all so the
-# successor (different PID) can send notifications.
-Type=simple
+# Type=notify: the daemon signals readiness via sd_notify(READY=1)
+# once listeners are bound, and signals the MainPID handoff via
+# sd_notify(MAINPID=<successor_pid>, READY=1) during graceful handoff.
+# This is what makes graceful handoff safe under KillMode=mixed —
+# systemd's tracked MainPID moves to the successor BEFORE the
+# predecessor exits, so the predecessor's clean exit isn't
+# interpreted as service termination.
+#
+# Requires glidefs v0.6.3+ (older versions don't send sd_notify and
+# will hang at startup under Type=notify waiting for READY).
+Type=notify
+NotifyAccess=main
 
 # SIGHUP triggers the handoff state machine (cli/server.rs's signal
-# loop). systemctl reload sends SIGHUP via this directive.
+# loop). systemctl reload sends SIGHUP via this directive — the
+# canonical "rolling restart" entry point.
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Cap auto-restart. Operators get a clear "service failed" with
@@ -48,24 +57,25 @@ TimeoutStartSec=600
 # TimeoutStopSec must be larger.
 TimeoutStopSec=300
 
-# **KillMode=mixed** — send SIGTERM to the main daemon, but DON'T
-# blanket-kill the entire cgroup. The handoff successor lives in the
-# same cgroup briefly during cutover; killing the cgroup mid-handoff
-# would yank the kernel device out from under the new daemon.
+# **KillMode=mixed** — SIGTERM the MainPID, then SIGKILL the rest of
+# the cgroup. Safe under Type=notify+sd_notify because by the time
+# the predecessor exits during a handoff, MainPID has already moved
+# to the successor (via sd_notify(MAINPID=...)). The predecessor's
+# exit is then a regular process exit, not service termination.
+#
+# Without sd_notify (pre-v0.6.3): this configuration would reap the
+# successor along with the predecessor — see RUNBOOK.md.
 KillMode=mixed
 KillSignal=SIGTERM
 
 # Pre-create runtime directory for /run/glidefs/ (handoff control
-# socket lives here). systemd manages cleanup on stop.
+# socket + handoff protocol socket live here). systemd manages
+# cleanup on stop.
 RuntimeDirectory=glidefs
 RuntimeDirectoryMode=0755
 
 # Pre-create cache directory.
 ExecStartPre=/bin/mkdir -p /var/cache/glidefs
-
-# Health check after start — daemon's HTTP API on configured port
-# must respond. Adjust port if not 9113.
-ExecStartPost=/bin/bash -c 'for i in $(seq 1 300); do curl -sf http://127.0.0.1:9113/health/ready && exit 0; sleep 2; done; exit 1'
 
 ExecStart=/usr/local/bin/glidefs run --config /etc/glidefs/glidefs.toml
 
