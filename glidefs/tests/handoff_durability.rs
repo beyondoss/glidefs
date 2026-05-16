@@ -725,8 +725,21 @@ async fn run_handoff_durability_test(
 
     let fio_handle = tokio::spawn(async move { fio_job.run().await });
 
-    // Let workload settle before handoff.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Let workload settle before handoff. If `GLIDEFS_HANDOFF_TEST_IDLE_SLEEP_SECS`
+    // is set, sleep that many seconds AFTER fio finishes (workload_runtime
+    // elapsed) so the handoff fires in steady-state with the flush
+    // backlog already drained — produces production-realistic per-handoff
+    // timings unobscured by continuous fio churn.
+    let idle_sleep = std::env::var("GLIDEFS_HANDOFF_TEST_IDLE_SLEEP_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(extra) = idle_sleep {
+        let total = profile.workload_runtime + Duration::from_secs(extra);
+        eprintln!("idle-perf mode: waiting {total:?} for fio to finish + drain");
+        tokio::time::sleep(total).await;
+    } else {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 
     let handoff_start = Instant::now();
     for i in 0..profile.handoff_count {
