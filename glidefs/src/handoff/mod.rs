@@ -25,6 +25,7 @@
 
 pub mod fault;
 pub mod fdpass;
+pub mod listener_registry;
 pub mod metrics;
 pub mod predecessor;
 pub mod protocol;

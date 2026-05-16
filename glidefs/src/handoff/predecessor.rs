@@ -215,14 +215,54 @@ async fn run_protocol(
     tracing::info!(count = exports.len(), "handoff: built export snapshot");
 
     let predecessor_pid = std::process::id() as i32;
+
+    // Snapshot listener fds + dup so the originals stay live for our
+    // running NBD/HTTP API tasks. The dup'd copies travel via
+    // SCM_RIGHTS and are owned by the kernel until the successor
+    // claims them via `recvmsg`.
+    let listener_snapshot = router.listener_registry.snapshot();
+    let mut dup_fds: Vec<std::os::fd::OwnedFd> = Vec::with_capacity(listener_snapshot.len());
+    let mut listener_kinds = Vec::with_capacity(listener_snapshot.len());
+    for (kind, fd) in &listener_snapshot {
+        use std::os::fd::FromRawFd;
+        // SAFETY: fd is a valid open listener fd registered by an
+        // active NBD/HTTP server task; dup3 with O_CLOEXEC keeps the
+        // duplicate from leaking into any future fork+exec on our
+        // side, while still being valid to send via SCM_RIGHTS.
+        let dup = unsafe {
+            let dup = libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 0);
+            if dup < 0 {
+                tracing::warn!(
+                    error = %std::io::Error::last_os_error(),
+                    ?kind,
+                    "handoff: dup of listener fd failed; skipping inherit for this listener"
+                );
+                continue;
+            }
+            std::os::fd::OwnedFd::from_raw_fd(dup)
+        };
+        dup_fds.push(dup);
+        listener_kinds.push(kind.clone());
+    }
+    if !listener_kinds.is_empty() {
+        tracing::info!(
+            count = listener_kinds.len(),
+            "handoff: shipping listener fds via SCM_RIGHTS"
+        );
+    }
+
     let ack = HandoffMessage::HelloAck {
         protocol_version: PROTOCOL_VERSION,
         capabilities: negotiated,
         strategy: strategy_name.to_string(),
         exports,
         predecessor_pid,
+        listener_kinds,
     };
-    send_one(sock, &ack).await.context("send HELLO_ACK")?;
+    send_one_with_fds(sock, &ack, &dup_fds)
+        .await
+        .context("send HELLO_ACK")?;
+    drop(dup_fds);
 
     #[cfg(feature = "test-fault-injection")]
     crate::handoff::fault::inject("p_crash_after_hello_ack");
@@ -475,6 +515,23 @@ async fn send_one(sock: &UnixDatagram, msg: &HandoffMessage) -> std::io::Result<
     let bytes = bincode::serialize(msg)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     sock.send(&bytes).await?;
+    Ok(())
+}
+
+/// Like `send_one` but attaches `SCM_RIGHTS` ancillary fds. Used for
+/// `HelloAck` to ship the predecessor's listener fds to the
+/// successor.
+async fn send_one_with_fds(
+    sock: &UnixDatagram,
+    msg: &HandoffMessage,
+    fds: &[std::os::fd::OwnedFd],
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let bytes = bincode::serialize(msg)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    sock.writable().await?;
+    let raw_fds: Vec<i32> = fds.iter().map(|f| f.as_raw_fd()).collect();
+    crate::handoff::fdpass::sendmsg_with_fds(sock, &bytes, &raw_fds)?;
     Ok(())
 }
 

@@ -271,6 +271,23 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
 /// any remaining kernel devices, binds listeners, and enters the signal
 /// loop until shutdown.
 async fn serve_with_router(built: BuiltRouter, config_path: PathBuf) -> Result<()> {
+    serve_with_router_inner(built, config_path, None).await
+}
+
+async fn serve_with_router_with_inherited_fds(
+    built: BuiltRouter,
+    config_path: PathBuf,
+    inherited_fds: crate::handoff::listener_registry::InheritedFds,
+) -> Result<()> {
+    let wrapped = std::sync::Arc::new(parking_lot::Mutex::new(inherited_fds));
+    serve_with_router_inner(built, config_path, Some(wrapped)).await
+}
+
+async fn serve_with_router_inner(
+    built: BuiltRouter,
+    config_path: PathBuf,
+    inherited_fds: Option<std::sync::Arc<parking_lot::Mutex<crate::handoff::listener_registry::InheritedFds>>>,
+) -> Result<()> {
     let BuiltRouter {
         router,
         settings,
@@ -378,11 +395,22 @@ async fn serve_with_router(built: BuiltRouter, config_path: PathBuf) -> Result<(
     if let Some(addresses) = &nbd_config.addresses {
         for addr in addresses {
             info!("Starting NBD server on {}", addr);
-            let nbd_server = NBDServer::new_tcp_with_limiter(
+            let mut nbd_server = NBDServer::new_tcp_with_limiter(
                 Arc::clone(&router),
                 *addr,
                 Arc::clone(&nbd_connection_limiter),
-            );
+            )
+            .with_listener_registry(router.listener_registry.clone());
+            // If we inherited a TCP listener fd from a handoff
+            // predecessor for this address, hand it to the server so
+            // it skips bind() and reuses the predecessor's socket —
+            // existing TCP clients see no disconnection.
+            if let Some(ref fds) = inherited_fds {
+                let kind = crate::handoff::listener_registry::ListenerKind::NbdTcp(addr.to_string());
+                if let Some(fd) = fds.lock().take(&kind) {
+                    nbd_server = nbd_server.with_inherited_listener(fd);
+                }
+            }
             let shutdown_clone = shutdown.clone();
             handles.push(spawn_named("nbd-tcp", async move {
                 nbd_server.start(shutdown_clone).await
@@ -396,11 +424,18 @@ async fn serve_with_router(built: BuiltRouter, config_path: PathBuf) -> Result<(
             "Starting NBD server on Unix socket {}",
             socket_path.display()
         );
-        let nbd_server = NBDServer::new_unix_with_limiter(
+        let mut nbd_server = NBDServer::new_unix_with_limiter(
             Arc::clone(&router),
             socket_path,
             Arc::clone(&nbd_connection_limiter),
-        );
+        )
+        .with_listener_registry(router.listener_registry.clone());
+        if let Some(ref fds) = inherited_fds {
+            let kind = crate::handoff::listener_registry::ListenerKind::NbdUnix;
+            if let Some(fd) = fds.lock().take(&kind) {
+                nbd_server = nbd_server.with_inherited_listener(fd);
+            }
+        }
         let shutdown_clone = shutdown.clone();
         handles.push(spawn_named("nbd-unix", async move {
             nbd_server.start(shutdown_clone).await
@@ -410,11 +445,18 @@ async fn serve_with_router(built: BuiltRouter, config_path: PathBuf) -> Result<(
     // Start HTTP API server
     if let Some(api_addr) = nbd_config.api_address {
         info!("Starting HTTP API server on {}", api_addr);
-        let api_server = ApiServer::new_with_limiter(
+        let mut api_server = ApiServer::new_with_limiter(
             Arc::clone(&router),
             api_addr,
             Arc::clone(&api_connection_limiter),
-        );
+        )
+        .with_listener_registry(router.listener_registry.clone());
+        if let Some(ref fds) = inherited_fds {
+            let kind = crate::handoff::listener_registry::ListenerKind::HttpApi;
+            if let Some(fd) = fds.lock().take(&kind) {
+                api_server = api_server.with_inherited_listener(fd);
+            }
+        }
         let shutdown_clone = shutdown.clone();
         handles.push(spawn_named("http-api", async move {
             api_server.start(shutdown_clone).await
@@ -706,7 +748,7 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     // Drive the handoff protocol. After this returns, our router owns
     // every device the predecessor used to own.
     let timeouts = crate::handoff::HandoffTimeouts::default();
-    let _takeover = crate::handoff::run_successor(
+    let takeover = crate::handoff::run_successor(
         &socket_path,
         Arc::clone(&built.router),
         timeouts,
@@ -714,22 +756,36 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     .await
     .context("handoff successor takeover failed")?;
 
-    info!("successor: takeover complete, entering serve loop");
+    info!(
+        inherited_listeners = takeover.inherited_fds.len(),
+        "successor: takeover complete, entering serve loop"
+    );
 
     // Predecessor has fully exited (takeover wouldn't return ALIVE
     // otherwise). Resume per-export checkpoint truncation — we now
     // own the WAL exclusively.
     built.router.set_all_caches_freeze(false).await;
 
-    // Phase 1 MVP: wait briefly for the predecessor to release its
-    // listener fds (NBD TCP/Unix, HTTP API). Predecessor's signal loop
-    // breaks on successful handoff and drops listeners as part of
-    // shutdown; this typically takes tens of ms. Phase 2 will fix this
-    // properly via SCM_RIGHTS fd-passing.
+    // If the predecessor passed its listener fds via SCM_RIGHTS in
+    // the HelloAck, we adopt them directly — no bind, no port
+    // contention with the still-exiting predecessor process.
+    if !takeover.inherited_fds.is_empty() {
+        return serve_with_router_with_inherited_fds(
+            built,
+            config_path,
+            takeover.inherited_fds,
+        )
+        .await;
+    }
+
+    // Fallback (no inherited fds): wait briefly for the predecessor
+    // to release its listener fds. Predecessor's signal loop breaks
+    // on successful handoff and drops listeners as part of shutdown;
+    // this typically takes tens of ms.
     //
-    // We poll-with-retry on bind rather than a fixed sleep: faster on
-    // the common case (~30ms predecessor exit) and bounded by the
-    // overall serve_with_router timeout.
+    // Poll-with-retry on bind rather than fixed sleep: faster on the
+    // common case (~30ms predecessor exit), bounded by the overall
+    // serve_with_router timeout.
     let api_port = built
         .settings
         .servers

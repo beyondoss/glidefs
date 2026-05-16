@@ -189,6 +189,15 @@ pub struct NBDServer {
     /// `OwnedSemaphorePermit` for its lifetime; the permit drops with
     /// the client task.
     connection_limiter: Arc<Semaphore>,
+    /// Listener-fd registry. When set, `start` registers the listener's
+    /// raw fd here right after `bind`, so the handoff predecessor can
+    /// later snapshot + dup + send via SCM_RIGHTS to the successor.
+    listener_registry: Option<crate::handoff::listener_registry::ListenerRegistry>,
+    /// Optional inherited listener fd (from a handoff successor's
+    /// SCM_RIGHTS receive). When `Some`, `start` reuses it instead of
+    /// calling `bind` — preserving the kernel socket and the in-flight
+    /// TCP/Unix connections currently established on it.
+    inherited_listener: parking_lot::Mutex<Option<std::os::fd::OwnedFd>>,
 }
 
 impl NBDServer {
@@ -215,7 +224,27 @@ impl NBDServer {
             router,
             transport: Transport::Tcp(socket),
             connection_limiter,
+            listener_registry: None,
+            inherited_listener: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Attach a `ListenerRegistry` so that `start` records the bound
+    /// listener fd for later handoff via SCM_RIGHTS.
+    pub fn with_listener_registry(
+        mut self,
+        registry: crate::handoff::listener_registry::ListenerRegistry,
+    ) -> Self {
+        self.listener_registry = Some(registry);
+        self
+    }
+
+    /// Attach an inherited listener fd (received via SCM_RIGHTS from a
+    /// handoff predecessor). When set, `start` reuses this fd instead
+    /// of calling `bind`, preserving in-flight client connections.
+    pub fn with_inherited_listener(self, fd: std::os::fd::OwnedFd) -> Self {
+        *self.inherited_listener.lock() = Some(fd);
+        self
     }
 
     /// Create a Unix socket NBD server with an unlimited connection budget.
@@ -239,6 +268,8 @@ impl NBDServer {
             router,
             transport: Transport::Unix(socket_path.into()),
             connection_limiter,
+            listener_registry: None,
+            inherited_listener: parking_lot::Mutex::new(None),
         }
     }
 
@@ -273,10 +304,25 @@ impl NBDServer {
     /// This listens for connections and spawns a handler for each client.
     /// Returns when the shutdown token is cancelled.
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd};
         match &self.transport {
             Transport::Tcp(socket) => {
-                let listener = TcpListener::bind(socket).await?;
-                info!("NBD server listening on {}", socket);
+                let listener = if let Some(fd) = self.inherited_listener.lock().take() {
+                    info!("NBD TCP server inheriting listener fd from handoff predecessor (target {})", socket);
+                    let std_listener = std::net::TcpListener::from(fd);
+                    std_listener.set_nonblocking(true)?;
+                    TcpListener::from_std(std_listener)?
+                } else {
+                    let l = TcpListener::bind(socket).await?;
+                    info!("NBD server listening on {}", socket);
+                    l
+                };
+                if let Some(reg) = &self.listener_registry {
+                    reg.register(
+                        crate::handoff::listener_registry::ListenerKind::NbdTcp(socket.to_string()),
+                        listener.as_raw_fd(),
+                    );
+                }
 
                 loop {
                     tokio::select! {
@@ -311,19 +357,32 @@ impl NBDServer {
                 }
             }
             Transport::Unix(path) => {
-                // Remove existing socket file if it exists
-                if path.exists() {
-                    warn!("Removing existing Unix socket at {:?}", path);
-                    let _ = std::fs::remove_file(path);
+                let listener = if let Some(fd) = self.inherited_listener.lock().take() {
+                    info!("NBD Unix server inheriting listener fd from handoff predecessor (target {:?})", path);
+                    let std_listener = std::os::unix::net::UnixListener::from(fd);
+                    std_listener.set_nonblocking(true)?;
+                    UnixListener::from_std(std_listener)?
+                } else {
+                    // Remove existing socket file if it exists
+                    if path.exists() {
+                        warn!("Removing existing Unix socket at {:?}", path);
+                        let _ = std::fs::remove_file(path);
+                    }
+                    let l = UnixListener::bind(path).map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to bind NBD Unix socket at {:?}: {}", path, e),
+                        )
+                    })?;
+                    info!("NBD server listening on Unix socket {:?}", path);
+                    l
+                };
+                if let Some(reg) = &self.listener_registry {
+                    reg.register(
+                        crate::handoff::listener_registry::ListenerKind::NbdUnix,
+                        listener.as_raw_fd(),
+                    );
                 }
-
-                let listener = UnixListener::bind(path).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("Failed to bind NBD Unix socket at {:?}: {}", path, e),
-                    )
-                })?;
-                info!("NBD server listening on Unix socket {:?}", path);
 
                 loop {
                     tokio::select! {

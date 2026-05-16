@@ -262,6 +262,14 @@ pub struct RouterConfig {
 ///
 /// Manages multiple NBD exports, each with independent storage and caching.
 pub struct ExportRouter {
+    /// Listener-fd registry. NBD/HTTP-API server tasks register their
+    /// listener fds here on bind; the handoff predecessor snapshots
+    /// the registry, dups every fd, and ships them to the successor
+    /// via SCM_RIGHTS so the successor can resume accepting on the
+    /// same kernel sockets without dropping in-flight client
+    /// connections.
+    pub listener_registry: crate::handoff::listener_registry::ListenerRegistry,
+
     /// Active exports: name → state. Sharded `DashMap` so per-export
     /// lookups don't contend with each other or with create/remove.
     /// Previously a `tokio::sync::RwLock<HashMap<...>>` which serialized
@@ -599,6 +607,7 @@ impl ExportRouter {
         );
 
         Ok(Self {
+            listener_registry: crate::handoff::listener_registry::ListenerRegistry::new(),
             exports: DashMap::new(),
             max_exports: config.max_exports,
             object_store: config.object_store,

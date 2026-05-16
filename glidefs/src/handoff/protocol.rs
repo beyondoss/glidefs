@@ -153,6 +153,14 @@ pub enum HandoffMessage {
         exports: Vec<ExportSnapshot>,
         /// PID of the predecessor process. Successor logs it.
         predecessor_pid: i32,
+        /// Listener-fd kinds that the predecessor is shipping as
+        /// `SCM_RIGHTS` ancillary data alongside this message. The
+        /// successor receives the cmsg fds via
+        /// `fdpass::recvmsg_with_fds` and zips them with this list to
+        /// build an `InheritedFds` map keyed by kind. Empty when the
+        /// predecessor has no listeners (e.g. ublk-only deployments).
+        #[serde(default)]
+        listener_kinds: Vec<crate::handoff::listener_registry::ListenerKind>,
     },
 
     /// Successor signals it has finished WARMING — all slow startup work

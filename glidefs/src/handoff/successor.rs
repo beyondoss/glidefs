@@ -34,6 +34,12 @@ const RECV_BUF_BYTES: usize = 64 * 1024;
 pub struct TakeoverResult {
     pub router: Arc<ExportRouter>,
     pub recovered_count: usize,
+    /// Listener fds inherited from the predecessor via SCM_RIGHTS in
+    /// the HelloAck payload (NBD TCP/Unix, HTTP API). The successor's
+    /// `serve_with_router_with_inherited_fds` consumes these instead
+    /// of binding fresh sockets — preserving in-flight client TCP
+    /// connections across the cutover.
+    pub inherited_fds: crate::handoff::listener_registry::InheritedFds,
 }
 
 /// Run the successor state machine.
@@ -68,26 +74,45 @@ pub async fn run_successor(
     };
     send_one(&sock, &hello).await.context("send HELLO")?;
 
-    // Receive HELLO_ACK.
-    let ack_msg = tokio::time::timeout(timeouts.ready_wait, recv_one(&sock))
+    // Receive HELLO_ACK with optional ancillary listener fds.
+    let (ack_msg, ack_fds) = tokio::time::timeout(timeouts.ready_wait, recv_one_with_fds(&sock))
         .await
         .map_err(|_| anyhow!("timeout waiting for HELLO_ACK"))?
         .context("recv HELLO_ACK")?;
 
-    let (negotiated_strategy_name, exports, predecessor_pid) = match ack_msg {
-        HandoffMessage::HelloAck { strategy, exports, predecessor_pid, capabilities, protocol_version } => {
+    let (negotiated_strategy_name, exports, predecessor_pid, listener_kinds) = match ack_msg {
+        HandoffMessage::HelloAck { strategy, exports, predecessor_pid, capabilities, protocol_version, listener_kinds } => {
             if protocol_version != PROTOCOL_VERSION {
                 return Err(anyhow!(
                     "protocol version mismatch: ours={PROTOCOL_VERSION} theirs={protocol_version}"
                 ));
             }
             tracing::info!(?capabilities, "handoff: negotiated capabilities");
-            (strategy, exports, predecessor_pid)
+            (strategy, exports, predecessor_pid, listener_kinds)
         }
         HandoffMessage::Abort(r) => {
             return Err(anyhow!("predecessor aborted: {r:?}"));
         }
         other => return Err(anyhow!("expected HELLO_ACK, got {other:?}")),
+    };
+
+    let inherited_fds = if !listener_kinds.is_empty() {
+        if listener_kinds.len() != ack_fds.len() {
+            tracing::warn!(
+                kinds = listener_kinds.len(),
+                fds = ack_fds.len(),
+                "handoff: HELLO_ACK kinds/fds count mismatch — dropping inherited fds, will rebind"
+            );
+            crate::handoff::listener_registry::InheritedFds::default()
+        } else {
+            tracing::info!(
+                count = listener_kinds.len(),
+                "handoff: inherited listener fds via SCM_RIGHTS"
+            );
+            crate::handoff::listener_registry::InheritedFds::from_kinds_and_fds(listener_kinds, ack_fds)
+        }
+    } else {
+        crate::handoff::listener_registry::InheritedFds::default()
     };
 
     tracing::info!(
@@ -181,6 +206,7 @@ pub async fn run_successor(
     Ok(TakeoverResult {
         router,
         recovered_count,
+        inherited_fds,
     })
 }
 
@@ -240,6 +266,20 @@ fn connect_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
 
     let std_sock = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(fd) };
     UnixDatagram::from_std(std_sock)
+}
+
+/// Like `recv_one` but also collects any `SCM_RIGHTS` fds carried as
+/// ancillary data. Used for `HelloAck` so the successor can pick up
+/// the predecessor's listener fds.
+async fn recv_one_with_fds(
+    sock: &UnixDatagram,
+) -> std::io::Result<(HandoffMessage, Vec<std::os::fd::OwnedFd>)> {
+    sock.readable().await?;
+    let mut buf = vec![0u8; RECV_BUF_BYTES];
+    let (n, fds) = crate::handoff::fdpass::recvmsg_with_fds(sock, &mut buf)?;
+    let msg = bincode::deserialize(&buf[..n])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok((msg, fds))
 }
 
 async fn recv_one(sock: &UnixDatagram) -> std::io::Result<HandoffMessage> {

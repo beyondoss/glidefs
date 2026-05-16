@@ -1019,6 +1019,11 @@ pub struct ApiServer {
     /// connections are dropped immediately to prevent OOM from connection
     /// flooding.
     connection_limiter: Arc<Semaphore>,
+    /// Listener-fd registry for handoff (see `NBDServer::listener_registry`).
+    listener_registry: Option<crate::handoff::listener_registry::ListenerRegistry>,
+    /// Inherited listener fd from a handoff predecessor (see
+    /// `NBDServer::inherited_listener`).
+    inherited_listener: parking_lot::Mutex<Option<std::os::fd::OwnedFd>>,
 }
 
 impl ApiServer {
@@ -1040,13 +1045,48 @@ impl ApiServer {
             router,
             addr,
             connection_limiter,
+            listener_registry: None,
+            inherited_listener: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Attach a `ListenerRegistry` so that `start` records the bound
+    /// listener fd for later handoff via SCM_RIGHTS.
+    pub fn with_listener_registry(
+        mut self,
+        registry: crate::handoff::listener_registry::ListenerRegistry,
+    ) -> Self {
+        self.listener_registry = Some(registry);
+        self
+    }
+
+    /// Attach an inherited listener fd (received via SCM_RIGHTS from a
+    /// handoff predecessor). When set, `start` reuses it instead of
+    /// calling `bind`.
+    pub fn with_inherited_listener(self, fd: std::os::fd::OwnedFd) -> Self {
+        *self.inherited_listener.lock() = Some(fd);
+        self
     }
 
     /// Start the API server.
     pub async fn start(self, shutdown: CancellationToken) -> std::io::Result<()> {
-        let listener = TcpListener::bind(self.addr).await?;
-        info!("HTTP API server listening on {}", self.addr);
+        use std::os::fd::AsRawFd;
+        let listener = if let Some(fd) = self.inherited_listener.lock().take() {
+            info!("HTTP API server inheriting listener fd from handoff predecessor (target {})", self.addr);
+            let std_listener = std::net::TcpListener::from(fd);
+            std_listener.set_nonblocking(true)?;
+            TcpListener::from_std(std_listener)?
+        } else {
+            let l = TcpListener::bind(self.addr).await?;
+            info!("HTTP API server listening on {}", self.addr);
+            l
+        };
+        if let Some(reg) = &self.listener_registry {
+            reg.register(
+                crate::handoff::listener_registry::ListenerKind::HttpApi,
+                listener.as_raw_fd(),
+            );
+        }
 
         loop {
             tokio::select! {
