@@ -1044,7 +1044,10 @@ const MULTI_EXPORT_PROFILE: TestProfile = TestProfile {
     workload_runtime: Duration::from_secs(30),
     handoff_count: 1,
     fio_jobs: 1,
-    fio_iodepth: 32,
+    // iodepth=1 — same write/verify serialization as the sequential
+    // profile; rules out fio's own RAW races so failures point at
+    // handoff plumbing.
+    fio_iodepth: 1,
     p99_stall_ms: 100,
     p999_stall_ms: 500,
 };

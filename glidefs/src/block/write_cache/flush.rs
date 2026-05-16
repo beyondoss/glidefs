@@ -302,11 +302,6 @@ impl WriteCache<Active> {
 
     /// Wait for any in-flight `flush_packs` + `sync_manifest` cycle to
     /// finish. Bounded by the caller via `tokio::time::timeout`.
-    ///
-    /// Used by handoff `freeze_all` to fence the predecessor: any
-    /// uploaded packs MUST also be registered in the manifest before
-    /// the predecessor exits — otherwise the successor reads zeros for
-    /// blocks whose packs are in S3 but not in the manifest.
     pub async fn wait_for_inflight_flush(&self) {
         let _g = self.inner.flush_lock.lock().await;
     }
@@ -550,21 +545,12 @@ impl WriteCache<Active> {
             // canonical record of what's PRESENT/DIRTY/SYNCING.
             inner.save_block_states()?;
 
-            // **Skip WAL truncate during the handoff freeze window.**
-            // The successor's `replay_wal_tail` reads the same WAL the
-            // predecessor was appending into. If we truncate here while
-            // the successor is in WARMING/CUTOVER, any entry the
-            // predecessor has acked since the successor's WARMING-time
-            // open vanishes from the WAL — the metadata file captures
-            // the state, but the successor's already-loaded state_map
-            // doesn't get re-loaded. Without the truncate, those
-            // entries remain in the WAL and the successor's tail-replay
-            // picks them up.
-            //
-            // The freeze window is bounded (~hundreds of ms). The WAL
-            // grows briefly. After the predecessor exits, the successor
-            // starts fresh and resumes normal checkpoint behavior on
-            // its own WriteCache.
+            // Skip WAL truncate during the handoff freeze window —
+            // the successor's `replay_wal_tail` reads the same WAL
+            // the predecessor was appending into. If we truncate
+            // here while the successor is in WARMING/CUTOVER, any
+            // entry the predecessor has acked since the successor's
+            // WARMING-time open vanishes from the WAL.
             if inner
                 .freeze_in_progress
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -572,7 +558,6 @@ impl WriteCache<Active> {
                 debug!("checkpoint: skipping WAL truncate (freeze in progress)");
                 return Ok(());
             }
-
             inner.wal.truncate()?;
             debug!("checkpoint complete");
             Ok(())

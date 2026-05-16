@@ -2918,36 +2918,34 @@ impl ExportRouter {
             cache.set_freeze_in_progress(true);
         }
 
-        // **Fence in-flight flush + manifest-sync cycles** before the
-        // predecessor exits. The flush scheduler holds `flush_lock` for
-        // the entire flush_packs+sync_manifest sequence
-        // (`flush_scheduler::flush_and_sync`); acquiring the lock here
-        // blocks until any in-flight cycle either completes (manifest
-        // synced, packs visible to the successor) or times out.
+        // **Fence in-flight flush + manifest-sync cycles**. The flush
+        // scheduler holds `flush_lock` for the entire pack-upload +
+        // sync_manifest sequence; acquiring the lock here blocks until
+        // the in-flight cycle completes. Without it, the predecessor
+        // can exit between pack-upload and manifest-sync, leaving
+        // packs in S3 that aren't registered in the manifest — the
+        // successor reads those blocks via S3, finds no entry, and
+        // serves zeros (visible as fio "verify: bad magic header 0").
         //
-        // Bounded at 8s per export — enough for a typical 64MB pack
-        // batch + manifest sync over slow S3 (file:// in tests is much
-        // faster), short enough to not block handoff if the upload is
-        // genuinely stuck. On timeout we proceed with the cutover and
-        // accept the (rare) possibility of orphaned packs in S3 — the
-        // test fleet's GC scrubber reclaims them.
+        // 8s bound — enough for typical 64MB pack batches, short
+        // enough to bound handoff stall under genuinely stuck
+        // uploads. On timeout we proceed; the manifest reload +
+        // post-takeover recovery in `recover_handoff_devices` cleans
+        // up the partial state.
         use futures::stream::{self, StreamExt};
         stream::iter(states.iter().map(|(name, _, cache)| (name.clone(), Arc::clone(cache))))
             .for_each_concurrent(16, |(name, cache)| async move {
-                match tokio::time::timeout(
+                if (tokio::time::timeout(
                     std::time::Duration::from_secs(8),
                     cache.wait_for_inflight_flush(),
                 )
-                .await
+                .await)
+                    .is_err()
                 {
-                    Ok(_) => {}
-                    Err(_) => {
-                        warn!(
-                            export = %name,
-                            "handoff: in-flight flush did not complete within 8s; \
-                             proceeding with cutover (orphan-pack scrubber will reclaim)"
-                        );
-                    }
+                    warn!(
+                        export = %name,
+                        "handoff: in-flight flush did not complete within 8s; proceeding with cutover"
+                    );
                 }
             })
             .await;
