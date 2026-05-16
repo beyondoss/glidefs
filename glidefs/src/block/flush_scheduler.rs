@@ -39,18 +39,18 @@ const FAR_FUTURE: Duration = Duration::from_secs(86400 * 365 * 10);
 struct FlushResult {
     /// Number of packs uploaded to S3 (0 = no dirty blocks or all deduped).
     packs_uploaded: usize,
-    /// Whether the manifest was successfully synced to S3.
-    manifest_synced: bool,
     /// Another host owns this export's manifest (ETag conflict).
     /// When true, the scheduler should stop flushing entirely.
     manifest_conflict: bool,
 }
 
-/// Execute flush_packs + sync_manifest (with retries).
+/// Execute the atomic flush+manifest+checkpoint cycle on the cache.
 ///
-/// Must be called while holding the per-export flush lock. On success: resets
-/// backoff, records metrics, syncs manifest with 3 retries. On failure: extends
-/// exponential backoff, records error metric.
+/// Must be called while holding the per-export flush lock. `flush_packs`
+/// is now atomic — packs upload, manifest sync (with retries), eviction,
+/// and checkpoint all happen inside before it returns. On success: resets
+/// backoff, records metrics. On failure: extends exponential backoff,
+/// records error metric.
 ///
 /// Returns `Some(result)` on flush success, `None` on flush failure.
 #[allow(clippy::too_many_arguments)]
@@ -64,6 +64,11 @@ async fn flush_and_sync(
     flush_backoff: &mut Duration,
     last_flush_failure: &mut Option<tokio::time::Instant>,
 ) -> Option<FlushResult> {
+    // Hold flush_lock for the atomic flush_packs cycle so any caller
+    // that needs a serialization point (e.g. snapshot, drain) can wait
+    // by acquiring the same lock.
+    let _flush_guard = cache.flush_lock().lock().await;
+
     match cache
         .flush_packs(content_store, pack_index_cache, volume_manifest, Some(clean_cache))
         .await
@@ -74,8 +79,6 @@ async fn flush_and_sync(
             metrics.record_flush_blocks_cas_failed(stats.blocks_cas_failed);
             metrics.record_flush_blocks_crc_mismatched(stats.blocks_crc_mismatched);
 
-            let mut manifest_synced = false;
-            let mut manifest_conflict = false;
             if stats.packs_uploaded > 0 || stats.packs_skipped > 0 {
                 info!(
                     packs = stats.packs_uploaded,
@@ -85,46 +88,25 @@ async fn flush_and_sync(
                     bytes = stats.bytes_uploaded,
                     "flushed packs"
                 );
-                for attempt in 0..3u32 {
-                    match cache
-                        .sync_manifest(content_store, volume_manifest)
-                        .await
-                    {
-                        Ok(()) => {
-                            manifest_synced = true;
-                            metrics.record_manifest_synced();
-                            break;
-                        }
-                        Err(e) if e.is_manifest_conflict() => {
-                            tracing::error!(
-                                "manifest ETag conflict — another host owns this export, \
-                                 stopping flush scheduler"
-                            );
-                            metrics.record_manifest_sync_error();
-                            manifest_conflict = true;
-                            break;
-                        }
-                        Err(e) => {
-                            metrics.record_manifest_sync_error();
-                            warn!(
-                                error = %e, attempt = attempt + 1,
-                                "manifest sync failed"
-                            );
-                            if attempt < 2 {
-                                tokio::time::sleep(Duration::from_millis(
-                                    100 * (1 << attempt),
-                                ))
-                                .await;
-                            }
-                        }
-                    }
+                if stats.packs_uploaded > 0 {
+                    metrics.record_manifest_synced();
                 }
             }
 
             Some(FlushResult {
                 packs_uploaded: stats.packs_uploaded,
-                manifest_synced,
-                manifest_conflict,
+                manifest_conflict: false,
+            })
+        }
+        Err(e) if e.is_manifest_conflict() => {
+            tracing::error!(
+                "manifest ETag conflict — another host owns this export, \
+                 stopping flush scheduler"
+            );
+            metrics.record_manifest_sync_error();
+            Some(FlushResult {
+                packs_uploaded: 0,
+                manifest_conflict: true,
             })
         }
         Err(e) => {
@@ -182,15 +164,10 @@ pub async fn flush_scheduler(
     // new writes trigger flush_notify.
     let mut last_flush_failure: Option<tokio::time::Instant> = None;
 
-    // Pending manifest sync: if sync_manifest fails after a successful pack
-    // flush, we retry on the next checkpoint fire to close the window where
-    // packs are on S3 but not referenced by any manifest.
-    let mut manifest_pending = false;
-
     // Demand-driven checkpoint timer. Parked at Duration::MAX when idle (no
-    // dirty blocks, no pending manifest). Activated on first write or at
-    // startup if WAL recovery left dirty blocks. reset() is O(1) — just
-    // moves the entry in tokio's timer wheel.
+    // dirty blocks). Activated on first write or at startup if WAL recovery
+    // left dirty blocks. reset() is O(1) — just moves the entry in tokio's
+    // timer wheel.
     let checkpoint_timer = tokio::time::sleep(FAR_FUTURE);
     tokio::pin!(checkpoint_timer);
     let mut checkpoint_active = false;
@@ -297,44 +274,14 @@ pub async fn flush_scheduler(
                     None => None,
                 };
 
-                // If a previous flush's manifest hasn't been synced yet, retry
-                // that sync before starting a new flush cycle. The flushing file
-                // from the previous flush is kept on disk as a crash-safety net
-                // until checkpoint (after manifest sync) deletes it. Starting a
-                // new flush would rotate the data file, overwriting the flushing
-                // file and destroying that safety net.
-                if manifest_pending {
-                    let _flush_guard = cache.flush_lock().lock().await;
-                    match cache.sync_manifest(&content_store, &volume_manifest).await {
-                        Ok(()) => {
-                            info!("deferred manifest sync succeeded (flush_notify path)");
-                            manifest_pending = false;
-                            metrics.record_manifest_synced();
-                            metrics.set_manifest_pending(false);
-                            if let Err(e) = cache.checkpoint().await {
-                                warn!(error = %e, "checkpoint after deferred manifest sync");
-                            }
-                        }
-                        Err(e) if e.is_manifest_conflict() => {
-                            tracing::error!(
-                                "manifest ETag conflict — another host owns this export, \
-                                 stopping flush scheduler"
-                            );
-                            metrics.record_manifest_sync_error();
-                            return;
-                        }
-                        Err(e) => {
-                            metrics.record_manifest_sync_error();
-                            warn!(error = %e, "deferred manifest sync retry failed (flush_notify path)");
-                        }
-                    }
-                    continue;
-                }
-
                 // Acquire per-export flush lock to serialize with concurrent
-                // drain/snapshot operations. Prevents stale manifest uploads.
+                // drain/snapshot operations. flush_and_sync is now atomic:
+                // the cache itself uploads packs, syncs the manifest, evicts
+                // SYNCING blocks, and checkpoints in one sequence under the
+                // flush lock. The scheduler no longer needs a deferred
+                // manifest-sync retry (the cache retries internally), and on
+                // success the checkpoint is already done.
                 {
-                    let _flush_guard = cache.flush_lock().lock().await;
                     if let Some(result) = flush_and_sync(
                         &cache, &content_store, &pack_index_cache, &volume_manifest,
                         &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
@@ -344,22 +291,7 @@ pub async fn flush_scheduler(
                         if result.manifest_conflict {
                             return;
                         }
-                        if result.packs_uploaded > 0 {
-                            if result.manifest_synced {
-                                manifest_pending = false;
-                                metrics.set_manifest_pending(false);
-                            } else {
-                                // Do NOT checkpoint here. checkpoint persists
-                                // block states as CLEAN and truncates the WAL. If the
-                                // host crashes before manifest sync succeeds, those
-                                // blocks become irrecoverable (CLEAN on disk, but S3
-                                // manifest doesn't reference the packs). The checkpoint
-                                // timer retries manifest sync and will checkpoint after
-                                // it succeeds.
-                                manifest_pending = true;
-                                metrics.set_manifest_pending(true);
-                            }
-                        } else {
+                        if result.packs_uploaded == 0 {
                             // No packs uploaded — still checkpoint to persist
                             // clean block states.
                             if let Err(e) = cache.checkpoint().await {
@@ -373,7 +305,7 @@ pub async fn flush_scheduler(
                             warn!(error = %e, "checkpoint after flush error");
                         }
                     }
-                } // _flush_guard dropped — compaction runs without holding the flush lock.
+                } // compaction runs without holding the flush lock.
 
                 // Compaction runs outside the flush lock so it doesn't block
                 // concurrent drain/snapshot/flush operations.
@@ -399,11 +331,53 @@ pub async fn flush_scheduler(
                                     "compacted chunk — old packs left for GC"
                                 );
                             }
-                            // Compaction modified the manifest — schedule a sync
-                            // so the compacted state is persisted to S3.
+                            // Compaction modified the in-memory manifest —
+                            // sync it to S3 immediately. flush_packs's
+                            // atomic sync only runs when there are dirty
+                            // blocks, so compaction-only changes need
+                            // their own sync.
                             if !compaction_results.is_empty() {
-                                manifest_pending = true;
-                                metrics.set_manifest_pending(true);
+                                let _flush_guard = cache.flush_lock().lock().await;
+                                let mut last_err: Option<crate::block::write_cache::CacheError> = None;
+                                for attempt in 0..3u32 {
+                                    match cache.sync_manifest(&content_store, &volume_manifest).await {
+                                        Ok(()) => {
+                                            metrics.record_manifest_synced();
+                                            last_err = None;
+                                            break;
+                                        }
+                                        Err(e) if e.is_manifest_conflict() => {
+                                            tracing::error!(
+                                                "manifest ETag conflict after compaction \
+                                                 — another host owns this export, stopping \
+                                                 flush scheduler"
+                                            );
+                                            metrics.record_manifest_sync_error();
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            metrics.record_manifest_sync_error();
+                                            warn!(
+                                                error = %e, attempt = attempt + 1,
+                                                "post-compaction manifest sync failed, retrying"
+                                            );
+                                            last_err = Some(e);
+                                            if attempt < 2 {
+                                                tokio::time::sleep(Duration::from_millis(
+                                                    100 * (1 << attempt),
+                                                ))
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(e) = last_err {
+                                    warn!(
+                                        error = %e,
+                                        "post-compaction manifest sync failed after 3 attempts; \
+                                         will retry on next compaction or flush"
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -413,41 +387,10 @@ pub async fn flush_scheduler(
                 }
             }
 
-            // Demand-driven: checkpoint + retry manifest sync + retry S3 flush.
-            // Only fires when dirty blocks or pending manifest exist.
+            // Demand-driven: retry S3 flush after backoff, otherwise checkpoint.
+            // Only fires when dirty blocks exist.
             () = &mut checkpoint_timer => {
-                // Retry manifest sync that failed after a previous pack flush.
-                if manifest_pending {
-                    let _flush_guard = cache.flush_lock().lock().await;
-                    match cache.sync_manifest(&content_store, &volume_manifest).await {
-                        Ok(()) => {
-                            info!("deferred manifest sync succeeded");
-                            manifest_pending = false;
-                            metrics.record_manifest_synced();
-                            metrics.set_manifest_pending(false);
-                            // Checkpoint now: persist CLEAN block states and
-                            // truncate the WAL. Without this, blocks that were
-                            // flushed to S3 remain DIRTY in the .meta file and
-                            // WAL entries are never truncated. On recovery,
-                            // those blocks would be unnecessarily re-uploaded.
-                            if let Err(e) = cache.checkpoint().await {
-                                warn!(error = %e, "checkpoint after deferred manifest sync");
-                            }
-                        }
-                        Err(e) if e.is_manifest_conflict() => {
-                            tracing::error!(
-                                "manifest ETag conflict — another host owns this export, \
-                                 stopping flush scheduler"
-                            );
-                            metrics.record_manifest_sync_error();
-                            return;
-                        }
-                        Err(e) => {
-                            metrics.record_manifest_sync_error();
-                            warn!(error = %e, "deferred manifest sync retry failed");
-                        }
-                    }
-                } else if cache.dirty_block_count() > 0 {
+                if cache.dirty_block_count() > 0 {
                     // If a previous flush failed and enough backoff time has
                     // elapsed, retry the S3 flush. This ensures dirty blocks
                     // eventually reach S3 even if no new writes trigger
@@ -457,18 +400,13 @@ pub async fn flush_scheduler(
                             .is_some_and(|t| t.elapsed() >= flush_backoff);
 
                     if should_retry {
-                        let _flush_guard = cache.flush_lock().lock().await;
                         if let Some(result) = flush_and_sync(
                             &cache, &content_store, &pack_index_cache, &volume_manifest,
                             &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
-                        ).await {
-                            if result.manifest_conflict {
-                                return;
-                            }
-                            if result.packs_uploaded > 0 {
-                                manifest_pending = !result.manifest_synced;
-                                metrics.set_manifest_pending(manifest_pending);
-                            }
+                        ).await
+                            && result.manifest_conflict
+                        {
+                            return;
                         }
                     }
 
@@ -479,7 +417,7 @@ pub async fn flush_scheduler(
                 }
 
                 // Reschedule if still needed, otherwise park the timer.
-                if cache.dirty_block_count() > 0 || manifest_pending {
+                if cache.dirty_block_count() > 0 {
                     checkpoint_timer
                         .as_mut()
                         .reset(tokio::time::Instant::now() + CHECKPOINT_INTERVAL);
@@ -1236,10 +1174,13 @@ mod tests {
             .unwrap();
     }
 
-    /// Verify that when pack uploads succeed but manifest sync fails, a
-    /// simulated crash + recovery still sees the blocks as dirty. This
-    /// prevents data loss: blocks are on S3 as unreferenced packs, and the
-    /// manifest doesn't know about them. Recovery must re-flush them.
+    /// Verify that when pack uploads succeed but manifest sync fails,
+    /// blocks remain dirty (in memory and across a simulated crash).
+    /// With atomic flush, the manifest sync happens INSIDE
+    /// flush_dirty_body BEFORE eviction; failure propagates as Err and
+    /// outer recovery re-dirties the SYNCING blocks via the flushing
+    /// file. So we never observe "dirty=0 but manifest stale" — that
+    /// window no longer exists.
     #[tokio::test(start_paused = true)]
     async fn test_manifest_sync_failure_preserves_dirty_after_crash() {
         let failing_s3 = Arc::new(FailingObjectStore::new());
@@ -1260,6 +1201,7 @@ mod tests {
         ) = test_scheduler_components_with_store(failing_s3 as _).await;
 
         let cache_check = Arc::clone(&cache);
+        let metrics_check = Arc::clone(&metrics);
         let flush_notify_clone = Arc::clone(&flush_notify);
         let cache_dir = temp.path().to_path_buf();
 
@@ -1291,20 +1233,26 @@ mod tests {
             .await;
         });
 
-        // Trigger flush — packs upload (multipart OK), manifest fails (single put).
+        // Trigger flush — packs upload (multipart OK), manifest fails
+        // (single put). flush_dirty_body returns Err inside the atomic
+        // sync step; outer recovery re-dirties the SYNCING blocks.
         flush_notify_clone.notify_one();
 
-        // Wait for in-memory dirty count to reach 0 (blocks CAS'd CLEAN).
+        // Wait for the scheduler to record the flush failure.
         for _ in 0..200 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            if cache_check.dirty_block_count() == 0 {
+            if metrics_check.snapshot().flush_errors > 0 {
                 break;
             }
         }
-        assert_eq!(
-            cache_check.dirty_block_count(),
-            0,
-            "packs should have uploaded (blocks CAS'd CLEAN in memory)"
+        assert!(
+            metrics_check.snapshot().flush_errors > 0,
+            "scheduler should have recorded a flush failure"
+        );
+        assert!(
+            cache_check.dirty_block_count() > 0,
+            "blocks must remain dirty after manifest-sync failure (atomic flush \
+             returned Err before eviction; outer recovery re-dirtied)"
         );
 
         // Shut down scheduler.
@@ -1326,9 +1274,8 @@ mod tests {
         let recovered = recovered.skip_recovery_for_test();
 
         // After recovery, blocks MUST still be dirty. The manifest never
-        // synced, so these blocks exist as unreferenced packs on S3. If
-        // checkpoint() ran after the failed manifest sync, .meta
-        // would show CLEAN + WAL truncated = data loss on crash.
+        // synced, so these blocks exist as unreferenced packs on S3.
+        // The flushing file is preserved as a crash-safety net.
         assert!(
             recovered.dirty_block_count() > 0,
             "blocks must be dirty after crash with unsynced manifest (got 0 — data loss bug)"

@@ -15,11 +15,28 @@
 //! rare (~5s).
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
+
+/// Read the PID stored in a lockfile (one decimal integer per line, our
+/// own format). Returns `None` if the file is empty or unparseable.
+fn read_pid_from_lockfile(file: &File) -> Option<u32> {
+    let mut buf = String::new();
+    let mut f = file;
+    f.seek(SeekFrom::Start(0)).ok()?;
+    f.read_to_string(&mut buf).ok()?;
+    buf.trim().parse::<u32>().ok()
+}
+
+/// Test whether a Linux process is alive without sending it a signal.
+/// `/proc/<pid>` exists iff the process exists. Used to detect stale
+/// PIDs left by a daemon that crashed without removing the lockfile.
+fn process_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
 
 /// A single WAL entry: records that a chunk was modified.
 ///
@@ -63,6 +80,10 @@ pub struct Wal {
     fd: RawFd,
     /// Owns the fd so it gets closed on drop.
     _file: File,
+    /// Cross-process lockfile. Held for the lifetime of the `Wal`. The
+    /// fd's flock (if we acquired it — see [`Wal::open`] for the
+    /// PID-skip case where we don't) is released on close.
+    _lockfile: File,
     /// RwLock: read = append (concurrent), write = truncate (exclusive).
     guard: RwLock<()>,
     #[allow(dead_code)]
@@ -78,19 +99,124 @@ unsafe impl Sync for Wal {}
 
 impl Wal {
     /// Open an existing WAL file for appending, or create a new one.
+    ///
+    /// Defense-in-depth against double-open: a sibling lockfile
+    /// `<wal>.lock` records the owning process's PID and (when held by
+    /// a different process) is `flock(LOCK_EX | LOCK_NB)`'d.
+    ///
+    /// **Why a sibling lockfile, not flock-on-the-WAL-itself**: per-fd
+    /// `flock` semantics mean two opens of the same path within one
+    /// process conflict with each other. This breaks
+    /// `resize_export`'s legitimate drop+recreate cycle when a
+    /// transient extra `Arc<WriteCache>` reference delays the old
+    /// WAL's fd close past the new WAL's open. The PID-aware lockfile
+    /// catches cross-process double-opens (the dangerous case — two
+    /// daemons with diverging in-memory state) without false-positiving
+    /// on same-process re-opens (the benign case — the old instance is
+    /// idle and being torn down).
+    ///
+    /// **What is NOT caught**: two `Wal` instances within the same
+    /// process holding the same path simultaneously. We trust the
+    /// existing teardown logic (`teardown_export`'s drop-then-recreate
+    /// sequence + the warning it logs on `Arc::try_unwrap` failure) to
+    /// keep that scenario benign — only one of the instances has an
+    /// active handler/writer attached.
     pub fn open(path: &Path) -> io::Result<Self> {
+        // 1. Open the data file (O_APPEND for atomic appends).
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .append(true)
             .open(path)?;
-
         let fd = file.as_raw_fd();
+
+        // 2. Open the sibling lockfile and check ownership.
+        let lockfile_path = path.with_extension("wal.lock");
+        let lockfile = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lockfile_path)?;
+
+        let our_pid = std::process::id();
+        let our_ppid = unsafe { libc::getppid() } as u32;
+        let existing_pid = read_pid_from_lockfile(&lockfile);
+
+        match existing_pid {
+            Some(pid) if pid == our_pid => {
+                // Same process — accept (resize_export drop+recreate
+                // race). The flock isn't reacquired here because per-fd
+                // semantics would conflict with the existing fd.
+            }
+            Some(pid) if pid == our_ppid && process_alive(pid) => {
+                // **Graceful handoff scenario**: the predecessor process
+                // (our parent — we were forked+exec'd by it via
+                // `handoff::run_predecessor::spawn_successor`) still
+                // holds the WAL open while we WARM. This is the
+                // intentional, correct pattern for CRH and is NOT a
+                // double-open hazard: we only read existing WAL state
+                // here, and the predecessor's `freeze_all()` fsyncs
+                // before our `replay_wal_tail()` runs. The predecessor
+                // will exit shortly after sending ALIVE, releasing the
+                // flock; future re-opens in this (successor) process
+                // see the stale PID and reclaim ownership normally.
+                tracing::info!(
+                    pid, path = %path.display(),
+                    "WAL open: accepting parent-process ownership (handoff successor WARMING)"
+                );
+            }
+            Some(pid) if process_alive(pid) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "WAL is locked by process {pid}: {} (lockfile {})",
+                        path.display(),
+                        lockfile_path.display()
+                    ),
+                ));
+            }
+            _ => {
+                // No existing PID OR stale PID (process gone). Acquire
+                // flock + write our PID. flock catches the race where
+                // two processes see "no PID" and both try to claim:
+                // only one will get the flock.
+                // SAFETY: lockfile is a valid open fd we own.
+                let lock_ret = unsafe {
+                    libc::flock(lockfile.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
+                };
+                if lock_ret != 0 {
+                    let err = io::Error::last_os_error();
+                    return Err(if err.kind() == io::ErrorKind::WouldBlock {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            format!(
+                                "WAL lockfile contention: {} (lockfile {})",
+                                path.display(),
+                                lockfile_path.display()
+                            ),
+                        )
+                    } else {
+                        err
+                    });
+                }
+                // Write our PID to the lockfile so future opens in
+                // this process can short-circuit. Seek to 0 because
+                // `read_pid_from_lockfile` left the cursor at EOF;
+                // without seeking, write_all would extend the file
+                // with zeros before our PID and parse would fail.
+                use std::io::Write;
+                let _ = lockfile.set_len(0);
+                let _ = (&lockfile).seek(SeekFrom::Start(0));
+                let _ = (&lockfile).write_all(format!("{our_pid}\n").as_bytes());
+            }
+        }
 
         Ok(Wal {
             fd,
             _file: file,
+            _lockfile: lockfile,
             guard: RwLock::new(()),
             path: path.to_path_buf(),
         })
@@ -537,4 +663,95 @@ mod tests {
         assert_eq!(buf.len(), 20); // 8 + 8 + 4
     }
 
+    /// Lockfile defense-in-depth: a second `Wal::open` on the same path
+    /// from a different process must fail fast. Simulated by writing a
+    /// foreign PID into the lockfile and then attempting to open.
+    #[test]
+    fn test_wal_lockfile_blocks_foreign_process() {
+        use std::io::Write;
+
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("locked.wal");
+        let lockfile_path = wal_path.with_extension("wal.lock");
+
+        // Write the init pid (1, always alive) to simulate ownership by
+        // another live process.
+        std::fs::write(&lockfile_path, b"1\n").unwrap();
+
+        let result = Wal::open(&wal_path);
+        match result {
+            Ok(_) => panic!("expected open to fail when foreign pid holds lockfile"),
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock,
+                "expected WouldBlock, got: {e:?}"
+            ),
+        }
+    }
+
+    /// A stale lockfile (PID that no longer exists) must be reclaimable
+    /// — otherwise daemons wedge after a crash.
+    #[test]
+    fn test_wal_lockfile_reclaims_stale_pid() {
+        use std::io::Write;
+
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("stale.wal");
+        let lockfile_path = wal_path.with_extension("wal.lock");
+
+        // Use a PID we're confident is dead. PID 0xFFFFFE (16,777,214)
+        // is well above pid_max on every reasonable Linux config.
+        std::fs::write(&lockfile_path, b"16777214\n").unwrap();
+
+        let wal = Wal::open(&wal_path).expect("stale PID should be reclaimable");
+        // Lockfile now contains our PID.
+        let content = std::fs::read_to_string(&lockfile_path).unwrap();
+        let our_pid = std::process::id();
+        assert!(
+            content.trim().parse::<u32>().unwrap() == our_pid,
+            "lockfile should now contain our PID {our_pid}, got: {content:?}"
+        );
+        drop(wal);
+    }
+
+    /// Handoff scenario: lockfile holds our parent's pid. Successor
+    /// (us, forked+exec'd by predecessor) must be able to open WAL
+    /// during WARMING. The parent process is alive (init=1 is always
+    /// alive); we simulate parent ownership by writing PPID into the
+    /// lockfile.
+    #[test]
+    fn test_wal_lockfile_allows_parent_process_during_handoff() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("handoff.wal");
+        let lockfile_path = wal_path.with_extension("wal.lock");
+
+        // Write our PPID into the lockfile — the handoff scenario.
+        let ppid = unsafe { libc::getppid() } as u32;
+        std::fs::write(&lockfile_path, format!("{ppid}\n").as_bytes()).unwrap();
+
+        let wal = Wal::open(&wal_path)
+            .expect("WAL open should accept parent-process ownership during handoff");
+        drop(wal);
+    }
+
+    /// Same-process re-open of the same path must succeed (resize_export
+    /// drop+recreate). The PID-skip path in `Wal::open` exists for this.
+    #[test]
+    fn test_wal_lockfile_allows_same_process_reopen() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("reopen.wal");
+
+        let wal1 = Wal::open(&wal_path).unwrap();
+        // wal1 is alive — its lockfile holds our PID. Open a second
+        // instance: should succeed (PID match → skip flock).
+        let wal2 = Wal::open(&wal_path).unwrap();
+        // Both can append independently; under O_APPEND the kernel
+        // serializes byte-level writes per inode.
+        let mut buf = Vec::new();
+        serialize_entry(&mut buf, 1, 1);
+        wal1.append_batch(&buf).unwrap();
+        wal2.append_batch(&buf).unwrap();
+        drop(wal1);
+        drop(wal2);
+    }
 }

@@ -25,6 +25,17 @@ pub struct Active;
 #[allow(dead_code)]
 pub struct Draining;
 
+/// Device is frozen for graceful daemon handoff. In-flight writes have
+/// drained, WAL has been fsynced, file handles have been released. New
+/// writes return `CacheError::Frozen`; reads still work via the
+/// data file (which is reopened after takeover).
+///
+/// Held only transiently by the predecessor during the CUTOVER step of
+/// graceful handoff. The successor process never sees this state — it
+/// builds a fresh `Active` cache from disk after the predecessor drops.
+#[allow(dead_code)]
+pub struct Frozen;
+
 // Marker trait to seal the state types
 mod private {
     #[allow(dead_code)]
@@ -33,6 +44,7 @@ mod private {
     impl Sealed for super::Recovering {}
     impl Sealed for super::Active {}
     impl Sealed for super::Draining {}
+    impl Sealed for super::Frozen {}
 }
 
 /// Marker trait for all device states.
@@ -44,3 +56,4 @@ impl DeviceState for Initializing {}
 impl DeviceState for Recovering {}
 impl DeviceState for Active {}
 impl DeviceState for Draining {}
+impl DeviceState for Frozen {}

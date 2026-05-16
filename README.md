@@ -275,37 +275,63 @@ Both transports: the orchestrator doesn't know or care which one is in use. It g
 
 ### Restart Behavior
 
-On startup, GlideFS discovers exports from S3, recovers from the WAL on local SSD, and re-registers kernel devices. Recovery is local — no S3 writes. 2000 exports recover in ~6 seconds.
+There are two restart paths. Prefer the first whenever you control when the restart happens (binary upgrades, config rollouts, planned maintenance):
 
-**NBD (zero-downtime):** The kernel queues I/O during the restart window via `dead_conn_timeout`. VMs never see a disconnect. Device paths (`/dev/nbdN`) stay the same.
+#### Graceful handoff (preferred)
 
-```
-1. SIGUSR1 → drain all exports to S3
-2. SIGTERM → graceful shutdown (NBD devices stay alive in kernel)
-3. Start new binary (same config, same cache dir)
-4. New process discovers exports, recovers from WAL
-5. NBD_CMD_RECONFIGURE swaps socket fds on existing /dev/nbdN devices
-6. Kernel resumes queued I/O on new sockets
-7. /health/ready returns 200
-```
+The currently-serving daemon spawns a successor, the successor does *all* slow startup work in parallel (foyer open, WAL replay, ExportRouter build, S3 prefetch, manifest load) while the predecessor keeps serving I/O, then they coordinate a sub-second cutover. Both processes share the same WAL, SSD cache, and ublk character-device fds; SCM_RIGHTS passes the NBD TCP/Unix and HTTP API listener fds across so existing client TCP connections survive without a reset.
 
-`nbd_dead_conn_timeout` must exceed: drain + restart + recovery. Default 30 seconds.
+Trigger it any of these ways:
 
-The orchestrator does nothing. Same device paths, same VMs, no reconnection needed.
+```bash
+# CLI (operator-friendly, no PID needed)
+glidefs handoff
 
-**ublk (zero-downtime on Linux 6.3+):** With `UBLK_F_USER_RECOVERY_REISSUE`, the kernel keeps `/dev/ublkbN` alive in QUIESCED state and reissues in-flight I/O to the new process. Same device paths, same VMs.
+# CLI dry-run — proves a new binary can WARM successfully without
+# committing to the cutover. Useful as a canary before flipping the
+# real switch.
+glidefs handoff --dry-run
 
-```
-1. SIGUSR1 → drain all exports to S3
-2. SIGTERM → graceful shutdown (ublk devices enter QUIESCED state)
-3. Start new binary (same config, same cache dir)
-4. New process discovers exports, recovers from WAL
-5. Scans for QUIESCED glidefs devices, resumes them via START_USER_RECOVERY
-6. Kernel reissues queued I/O to new process
-7. /health/ready returns 200
+# SIGHUP — for orchestration tools that already know how to send signals
+kill -HUP $(pidof glidefs)
+
+# HTTP API — for in-cluster controllers
+curl -X POST http://127.0.0.1:8080/admin/handoff
+curl -X POST 'http://127.0.0.1:8080/admin/handoff?dry_run=true'
+
+# systemd
+systemctl reload glidefs   # ExecReload=/bin/kill -HUP $MAINPID
 ```
 
-On kernels before 6.3 (no `UBLK_F_USER_RECOVERY`), ublk devices are removed on process exit. VMs get I/O errors and must be re-attached to new device paths after recovery.
+What guests see during a planned handoff:
+
+- **ublk:** kernel-stall window ~50–100 ms (sub-50 ms p99 for healthy daemons; the protocol overhead itself is ~670 ms but pipelined with the kernel transition). Same `/dev/ublkbN` paths, same VMs, zero I/O errors, zero data loss. fio with `--verify=crc32c` running through the cutover sees no errors.
+- **NBD TCP/Unix:** existing client TCP connections survive — the listener fd is inherited via SCM_RIGHTS, so the kernel socket structure is preserved across the new process.
+- **HTTP API:** same — listener fd inherited, in-flight HTTP requests complete on the successor.
+
+Failure handling:
+
+- If the successor crashes after `READY` but before takeover, the predecessor revives via its own `recover_quiesced_devices` path — brief stall, no I/O errors, no data loss.
+- If the predecessor crashes mid-handoff, the successor falls through to the standard crash-recovery path (next case).
+
+Operational guides: `glidefs/src/handoff/ARCHITECTURE.md` (protocol diagram + per-stage breakdown), `glidefs/src/handoff/RUNBOOK.md` (oncall guide for every failure mode), `glidefs_handoff_*` Prometheus metrics (outcome counter + stall histogram).
+
+#### Crash recovery (backstop)
+
+When the daemon dies ungracefully (OOM, bug, host reboot), the kernel keeps `/dev/ublkbN` alive in QUIESCED state (Linux 6.3+ with `UBLK_F_USER_RECOVERY_REISSUE`) and the next daemon that starts picks it up:
+
+```
+1. SIGTERM → ublk devices enter QUIESCED state
+2. Start new binary (same config, same cache dir)
+3. New process discovers exports, recovers from WAL
+4. Scans for QUIESCED glidefs devices, resumes them via START_USER_RECOVERY
+5. Kernel reissues queued I/O to new process
+6. /health/ready returns 200
+```
+
+This is the unplanned restart path — slower (full cold start) but correct. NBD's equivalent is `nbd_dead_conn_timeout`: the kernel queues I/O during the gap; `dead_conn_timeout` must exceed `restart + recovery` (default 30 s).
+
+On kernels before 6.3 (no `UBLK_F_USER_RECOVERY`), ublk devices are removed on process exit; VMs get I/O errors and must be re-attached to new device paths. Use the graceful handoff path on those kernels.
 
 **Full compute node reboot:** Everything starts fresh. Orchestrator creates exports via API, gets device paths, starts VMs.
 

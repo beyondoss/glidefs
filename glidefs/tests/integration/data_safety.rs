@@ -1213,22 +1213,12 @@ impl ObjectStore for ManifestFailingObjectStore {
     }
 }
 
-/// Test: Manifest save failure in flush_to_s3 (drain path) preserves dirty
-/// block *tracking* after crash, even though packs were uploaded and blocks
-/// evicted (NOT_PRESENT) in memory.
-///
-/// flush_to_s3 sequence:
-///   1. flush_dirty_inner() — rotates data file, uploads packs, evicts blocks
-///   2. put_manifest() — fails (3 retries)
-///   3. checkpoint() — skipped because manifest failed
-///
-/// After crash (drop without explicit checkpoint), WAL replay marks blocks
-/// DIRTY on recovery. However, the data file was rotated during flush, so
-/// local SSD data is zeros. A subsequent flush_to_s3 will upload those zeros
-/// and succeed — the original pack data is orphaned (no manifest references it).
-///
-/// This test verifies that the system recovers gracefully: WAL replay marks
-/// blocks dirty, re-flush succeeds, and the cold reader sees the re-flushed data.
+/// Test: Manifest save failure in flush_to_s3 (drain path) keeps blocks
+/// DIRTY in memory and preserves their data across a crash. With atomic
+/// flush the ordering is upload → manifest sync → evict → checkpoint, so
+/// a failed manifest sync returns Err BEFORE eviction; outer recovery
+/// re-dirties via the flushing file. The cold reader sees the ORIGINAL
+/// data after the recovery flush — no zero-data loss.
 #[tokio::test]
 async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
     let s3 = Arc::new(ManifestFailingObjectStore::new());
@@ -1244,7 +1234,7 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
         BLOCK_SIZE as u32,
     )));
 
-    // Session 1: Write blocks, flush_to_s3 with manifest failure, then "crash"
+    // Session 1: write blocks, flush_to_s3 with manifest failure, "crash".
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = Arc::new(cache.skip_recovery_for_test());
@@ -1253,58 +1243,41 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
         let data1 = vec![0xBB; BLOCK_SIZE];
         let data2 = vec![0xCC; BLOCK_SIZE];
         cache.write(0, &data0).unwrap();
-        cache
-            .write(BLOCK_SIZE as u64, &data1)
-            .unwrap();
-        cache
-            .write(2 * BLOCK_SIZE as u64, &data2)
-            .unwrap();
+        cache.write(BLOCK_SIZE as u64, &data1).unwrap();
+        cache.write(2 * BLOCK_SIZE as u64, &data2).unwrap();
         assert_eq!(cache.dirty_block_count(), 3);
 
-        // Enable manifest failure — packs will upload fine, manifest save will fail
         s3.set_fail_manifest(true);
 
         let result = cache.flush_to_s3(&cs, &pic, &vm).await;
         assert!(
             result.is_err(),
-            "flush_to_s3 should fail when manifest save fails"
+            "flush_to_s3 should fail when manifest PUT fails"
         );
 
-        // Packs were uploaded to S3 (multipart succeeded).
-        // Blocks are NOT_PRESENT in memory (evicted after pack upload).
-        // But checkpoint() was NOT called, so on-disk state is still DIRTY.
-        assert_eq!(
-            cache.dirty_block_count(),
-            0,
-            "blocks are NOT_PRESENT in memory after pack upload + eviction"
+        // Atomic flush: eviction never happened (manifest sync returned
+        // Err first). Outer recovery re-dirtied via flushing file.
+        assert!(
+            cache.dirty_block_count() >= 3,
+            "blocks must stay DIRTY after manifest failure (got {})",
+            cache.dirty_block_count()
         );
 
-        // "Crash" — drop without any explicit save.
-        // The protection: checkpoint() was skipped, so .meta file still has blocks
-        // as DIRTY from the last save (or WAL entries exist for them).
         drop(cache);
     }
 
-    // Session 2: Recovery should find blocks dirty on disk
+    // Session 2: recovery sees DIRTY blocks, retry flush succeeds.
     s3.set_fail_manifest(false);
-
     {
         let cache = WriteCache::<Initializing>::open(config.clone()).unwrap();
         let cache = cache.finish_recovery().await.unwrap();
 
-        // Blocks should be dirty (recovered from WAL/metadata)
         assert!(
             cache.dirty_block_count() >= 3,
             "blocks should be dirty after crash recovery, got {}",
             cache.dirty_block_count()
         );
 
-        // Note: local SSD data is zeros because the data file was rotated
-        // during the failed flush. The blocks are dirty from WAL replay but
-        // their on-disk content is the sparse (zeroed) new active file.
-        // The original data is in orphaned S3 packs (manifest was never saved).
-
-        // Retry flush_to_s3 — should succeed now (uploads current SSD content)
         let cache = Arc::new(cache);
         let vm2 = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
             DEVICE_SIZE,
@@ -1319,16 +1292,16 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
         assert_eq!(cache.dirty_block_count(), 0);
     }
 
-    // Verify from cold reader — blocks were re-flushed with zeros (original
-    // data was lost when the data file was rotated during the failed flush).
+    // Cold reader sees the ORIGINAL data — atomic flush preserved it.
     let reader_dir = TempDir::new().unwrap();
     let (reader, reader_cs, reader_pic, reader_vm, reader_cc, reader_m) =
         create_reader(&reader_dir, "manifest-drain-fail", Arc::clone(&s3) as _).await;
 
-    for i in 0u64..3 {
+    let expected = [vec![0xAA; BLOCK_SIZE], vec![0xBB; BLOCK_SIZE], vec![0xCC; BLOCK_SIZE]];
+    for (i, expected) in expected.iter().enumerate() {
         let result = reader
             .read(
-                i * BLOCK_SIZE as u64,
+                (i as u64) * BLOCK_SIZE as u64,
                 BLOCK_SIZE,
                 reader_cc.as_ref(),
                 &reader_pic,
@@ -1340,9 +1313,10 @@ async fn test_manifest_failure_in_drain_preserves_dirty_after_crash() {
             .unwrap();
         assert_eq!(
             result.as_ref(),
-            &vec![0u8; BLOCK_SIZE][..],
-            "block {} should be zeros after manifest failure + eviction recovery",
-            i
+            &expected[..],
+            "block {} data lost across manifest-failure recovery (got 0x{:02X})",
+            i,
+            result[0],
         );
     }
 }
@@ -2337,17 +2311,13 @@ async fn test_cold_wake_stress_concurrent_writes() {
 // =============================================================================
 
 /// Prove: when pack uploads succeed but manifest sync fails, crash recovery
-/// loses block data because the flushing file was already deleted.
-///
-/// Sequence:
-/// 1. Write known data to blocks
-/// 2. flush_packs succeeds (packs on S3, blocks evicted, flushing file deleted)
-/// 3. sync_manifest fails (manifest not on S3)
-/// 4. Simulate crash (drop everything)
-/// 5. Reopen cache from same directory
-/// 6. Read blocks — should contain original data, but contains zeros (BUG)
-///
-/// This test SHOULD FAIL until the fix is applied.
+/// Atomic flush eliminates the C1 window by construction: pack upload,
+/// manifest sync, eviction, checkpoint, and flushing-file cleanup all
+/// happen under one `flush_lock` inside `flush_dirty_body`. If the
+/// manifest PUT fails, `flush_packs` returns `Err` BEFORE eviction;
+/// outer recovery re-dirties the SYNCING blocks via the flushing file.
+/// Crash + reopen then sees DIRTY in WAL + data file intact → data is
+/// preserved.
 #[tokio::test]
 async fn test_c1_flushing_file_deleted_before_manifest_sync_causes_data_loss() {
     let s3 = Arc::new(ManifestFailingObjectStore::new());
@@ -2375,64 +2345,50 @@ async fn test_c1_flushing_file_deleted_before_manifest_sync_causes_data_loss() {
     let cache = WriteCache::open(config.clone()).expect("open cache");
     let cache = cache.skip_recovery_for_test();
 
-    // Step 1: Write known data pattern (0xAA) to 5 blocks.
+    // Write known data pattern (0xAA) to 5 blocks.
     let original_data = vec![0xAA; BLOCK_SIZE];
     for i in 0..5u64 {
         cache.write(i * BLOCK_SIZE as u64, &original_data).unwrap();
     }
     assert_eq!(cache.dirty_block_count(), 5);
 
-    // Verify data is readable before flush.
-    let pre_flush = cache.read_local(0, BLOCK_SIZE).unwrap();
-    assert_eq!(pre_flush[0], 0xAA, "data should be readable before flush");
-
-    // Persist metadata so .meta reflects dirty blocks. In production, the
-    // checkpoint timer (5s) does this periodically. Without this, recovery
-    // won't know the blocks exist.
+    // Persist metadata so recovery sees dirty blocks even if checkpoint
+    // doesn't run after the failed flush.
     cache.checkpoint().await.unwrap();
 
-    // Step 2: flush_packs — packs upload to S3, blocks evicted, flushing file deleted.
-    let (stats, _seq) = cache
-        .flush_packs(&content_store, &pack_index_cache, &volume_manifest, None)
-        .await
-        .expect("flush_packs should succeed (multipart uploads work)");
-    assert!(stats.packs_uploaded > 0, "packs should have been uploaded");
-
-    // At this point: blocks are NOT_PRESENT, flushing file is deleted,
-    // in-memory VolumeManifest knows about the packs.
-    assert_eq!(cache.dirty_block_count(), 0, "blocks should be evicted");
-
-    // Step 3: sync_manifest fails because manifest PUTs fail.
+    // Inject manifest-PUT failure BEFORE flushing. With atomic flush the
+    // sequence is upload → manifest sync → evict; if sync fails, eviction
+    // never happens and the outer recovery re-dirties via the flushing file.
     s3.set_fail_manifest(true);
-    let manifest_result = cache.sync_manifest(&content_store, &volume_manifest).await;
-    assert!(manifest_result.is_err(), "manifest sync should fail");
+    let result = cache
+        .flush_packs(&content_store, &pack_index_cache, &volume_manifest, None)
+        .await;
+    assert!(
+        result.is_err(),
+        "flush_packs must return Err when manifest PUT fails"
+    );
 
-    // No checkpoint ran (sync_manifest checkpoints on success only).
-    // .meta still has the pre-flush state (DIRTY blocks).
+    // Blocks were re-dirtied by outer recovery — they were never evicted.
+    assert!(
+        cache.dirty_block_count() >= 5,
+        "blocks must remain DIRTY after manifest failure (got dirty_count={})",
+        cache.dirty_block_count(),
+    );
 
-    // Step 4: Simulate crash — drop everything.
+    // Crash.
     drop(cache);
 
-    // Step 5: Reopen cache from same directory.
+    // Reopen and read. Data is preserved because the active file still
+    // has it (eviction never happened) and WAL replay marks blocks DIRTY.
     let recovered = WriteCache::<Initializing>::open(config).expect("reopen cache");
     let recovered = recovered.finish_recovery().await.expect("recovery");
 
-    // Step 6: Read blocks — they MUST contain 0xAA. If they contain 0x00,
-    // data was lost because the flushing file was deleted before manifest sync.
-    let block0 = recovered.read_local(0, BLOCK_SIZE).unwrap();
-    assert_eq!(
-        block0[0], 0xAA,
-        "C1 BUG: block 0 data lost after manifest sync failure + crash. \
-         Expected 0xAA but got 0x{:02X}. The flushing file was deleted before \
-         the manifest reached S3, so recovery has no source for the block data.",
-        block0[0],
-    );
-
-    for i in 1..5u64 {
+    for i in 0..5u64 {
         let block = recovered.read_local(i * BLOCK_SIZE as u64, BLOCK_SIZE).unwrap();
         assert_eq!(
             block[0], 0xAA,
-            "C1 BUG: block {i} data lost (got 0x{:02X})",
+            "block {i} data lost after manifest failure + crash (got 0x{:02X}); \
+             atomic flush should preserve data",
             block[0],
         );
     }

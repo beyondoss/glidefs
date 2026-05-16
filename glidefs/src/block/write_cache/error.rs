@@ -42,6 +42,14 @@ pub enum CacheError {
 
     #[error("Volume manifest error: {0}")]
     VolumeManifest(#[from] crate::block::volume_manifest::VolumeManifestError),
+
+    /// WAL is held exclusively by another process. During a graceful
+    /// handoff, the predecessor must release its WAL before the successor
+    /// opens — this error indicates the protocol failed and the daemons
+    /// would otherwise both write to the same WAL. The successor must
+    /// abort and let the predecessor revive.
+    #[error("WAL file is locked by another process (pid in flock owner): {0}")]
+    Locked(std::path::PathBuf),
 }
 
 impl CacheError {

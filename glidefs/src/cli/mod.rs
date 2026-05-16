@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 pub mod bless;
 pub mod gc;
+pub mod handoff_cmd;
 pub mod push;
 pub mod server;
 
@@ -62,6 +63,24 @@ pub enum Commands {
         /// manifest are pushed as a delta layer.
         #[arg(long)]
         base_manifest: Option<String>,
+    },
+    /// Trigger a graceful zero-downtime handoff against a running daemon.
+    ///
+    /// Connects to the daemon's handoff control socket and signals it to
+    /// spawn a successor. The current process exits immediately after
+    /// sending the signal — the actual handoff runs in the daemon.
+    /// To watch progress, tail the daemon logs.
+    Handoff {
+        /// Path to the daemon's handoff control socket. Defaults to
+        /// `/run/glidefs/handoff.sock`.
+        #[arg(long, default_value = "/run/glidefs/handoff.sock")]
+        socket: PathBuf,
+        /// Dry-run mode: spawn a successor that performs WARMING (proves
+        /// it can open foyer cache, replay WAL, build router, prefetch
+        /// S3) then aborts cleanly without ever touching kernel devices.
+        /// Use as a canary check before fleet-wide upgrades.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Run garbage collection to clean up orphaned packs in S3
     Gc {

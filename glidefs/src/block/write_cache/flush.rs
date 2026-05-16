@@ -282,6 +282,222 @@ impl WriteCache<Active> {
         self.inner.recovery_warnings.load(Ordering::Relaxed)
     }
 
+    /// Current WAL sequence number. Read by the handoff predecessor to
+    /// populate the `last_wal_seq` field of `ExportSnapshot`; the
+    /// successor uses it to sanity-check that its WAL replay reached at
+    /// least this point.
+    pub fn last_persisted_seq(&self) -> u64 {
+        self.inner.sequence.current()
+    }
+
+    /// Set the per-cache handoff phase. While non-Idle,
+    /// [`Self::flush_packs`] returns early and [`Self::checkpoint`]
+    /// skips the WAL truncate step (the metadata save still runs).
+    /// Used by the handoff coordinator to gate predecessor- and
+    /// successor-side flushes through the freeze + cutover window.
+    pub fn set_handoff_phase(&self, phase: super::inner::HandoffPhase) {
+        self.inner
+            .handoff_phase
+            .store(phase as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Read the current handoff phase.
+    pub fn handoff_phase(&self) -> super::inner::HandoffPhase {
+        super::inner::HandoffPhase::from_u8(
+            self.inner
+                .handoff_phase
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// Wait for any in-flight atomic flush cycle (Upload→ManifestSync
+    /// →Evict→Checkpoint) to finish. Bounded by atomic flush latency
+    /// (no longer the 8s freeze fence). Caller may still wrap in
+    /// `tokio::time::timeout` if a hard upper bound is required.
+    pub async fn wait_for_inflight_flush(&self) {
+        let _g = self.inner.flush_lock.lock().await;
+    }
+
+    /// Overwrite the manifest ETag the cache will send on the next
+    /// `put_manifest`. Used by the handoff successor after reloading
+    /// the volume manifest from S3 in `recover_handoff_devices`, so
+    /// the next conditional-PUT carries the fresh ETag (avoiding a
+    /// `PreconditionFailed` from the server's perspective). The
+    /// `pub(crate)` visibility lets the handoff coordinator set this
+    /// from a sibling module without exposing `inner`.
+    pub(crate) fn set_manifest_etag(&self, etag: Option<String>) {
+        *self.inner.manifest_etag.lock() = etag;
+    }
+
+    /// Replay any WAL entries newer than the current sequence number and
+    /// apply them to the in-memory state map.
+    ///
+    /// **Critical for graceful handoff correctness.** The successor's
+    /// `WriteCache::open` runs during WARMING, before the predecessor's
+    /// `freeze_all()`. Writes that arrive at the predecessor between
+    /// WARMING and FREEZE get fsync'd to the WAL on disk but the
+    /// successor's already-open state map doesn't know about them. After
+    /// the predecessor's PREDS_DEAD message, the successor must call
+    /// this to pick up the tail of new WAL entries.
+    ///
+    /// Returns the number of entries replayed.
+    pub fn replay_wal_tail(&self) -> Result<usize, super::CacheError> {
+        use crate::block::block_map::SparseBlockState;
+        use crate::block::wal::Wal;
+
+        let min_seq = self.inner.sequence.current();
+        let wal_path = self.inner.config.wal_path();
+        let entries = Wal::replay(&wal_path, min_seq).map_err(|e| {
+            super::CacheError::Io(std::io::Error::other(format!(
+                "WAL tail replay failed: {e}"
+            )))
+        })?;
+
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let num_blocks = self.inner.num_blocks;
+        let mut max_seq = min_seq;
+        for entry in &entries {
+            let idx = entry.block_index as usize;
+            max_seq = max_seq.max(entry.sequence);
+            if idx >= num_blocks {
+                continue;
+            }
+            let old = self.inner.state_map.get(idx);
+            if old != SparseBlockState::DIRTY {
+                self.inner.state_map.set_present(idx);
+                let current = self.inner.state_map.get(idx);
+                if current != SparseBlockState::DIRTY {
+                    if self
+                        .inner
+                        .state_map
+                        .cas(idx, current, SparseBlockState::DIRTY)
+                        .is_ok()
+                    {
+                        self.inner
+                            .dirty_block_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        // Bump the sequence counter past the new max so future writes
+        // get monotonically-increasing sequence numbers.
+        if max_seq > self.inner.sequence.current() {
+            self.inner.sequence.advance_to(max_seq);
+        }
+
+        tracing::info!(
+            replayed = entries.len(),
+            min_seq,
+            max_seq,
+            "WriteCache: tail-replayed WAL entries after handoff"
+        );
+
+        Ok(entries.len())
+    }
+
+    /// Post-takeover recovery for a flushing file the predecessor was
+    /// using when handoff started.
+    ///
+    /// In passive mode (handoff successor WARMING), `WriteCache::open`
+    /// detects the flushing file but defers recovery — it can't safely
+    /// touch the file or the active data file while the predecessor is
+    /// still uploading. After PREDS_DEAD, the predecessor is gone and
+    /// we can finish the work safely:
+    ///
+    /// - **Flushing file still present**: predecessor exited mid-upload.
+    ///   For every SYNCING block in our state_map, copy the bytes from
+    ///   the flushing file back into the active data file, transition
+    ///   SYNCING→DIRTY, then unlink the flushing file. The flush
+    ///   scheduler will re-upload these blocks normally.
+    /// - **Flushing file gone**: predecessor finished its flush before
+    ///   exiting. Blocks are CLEAN in S3 and registered in the manifest.
+    ///   Our state_map (loaded at WARMING-time open) still says SYNCING.
+    ///   Transition SYNCING→NOT_PRESENT so subsequent reads fall back
+    ///   to S3 — the predecessor's foyer entries are gone with its
+    ///   process, but S3 is durable.
+    ///
+    /// Returns the number of blocks acted on (recovered + invalidated).
+    pub fn recover_pending_flush_file(&self) -> Result<usize, super::CacheError> {
+        use crate::block::block_map::SparseBlockState;
+        use std::os::unix::fs::FileExt;
+
+        let flushing_path = self.inner.config.flushing_path();
+        let block_size = self.inner.config.block_size;
+        let device_size = self.inner.config.device_size;
+
+        let syncing_blocks: Vec<usize> = self
+            .inner
+            .state_map
+            .iter_present()
+            .filter(|&(_, state)| state == SparseBlockState::SYNCING)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        if syncing_blocks.is_empty() && !flushing_path.exists() {
+            return Ok(0);
+        }
+
+        if !flushing_path.exists() {
+            // Predecessor finished the flush before exiting. Demote
+            // SYNCING → NOT_PRESENT so reads go through S3.
+            for idx in &syncing_blocks {
+                let _ = self.inner.state_map.cas(
+                    *idx,
+                    SparseBlockState::SYNCING,
+                    SparseBlockState::NOT_PRESENT,
+                );
+            }
+            tracing::info!(
+                invalidated = syncing_blocks.len(),
+                "post-takeover recovery: predecessor completed flush; SYNCING→NOT_PRESENT (S3 fallback)"
+            );
+            return Ok(syncing_blocks.len());
+        }
+
+        // Predecessor exited mid-upload. Recover the blocks.
+        let flushing_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&flushing_path)?;
+
+        let df_guard = self.inner.data_file.read();
+        let mut recovered = 0usize;
+        let mut buf = vec![0u8; block_size];
+        for idx in &syncing_blocks {
+            let offset = *idx as u64 * block_size as u64;
+            let valid_bytes = std::cmp::min(
+                block_size as u64,
+                device_size.saturating_sub(offset),
+            ) as usize;
+            if valid_bytes == 0 {
+                continue;
+            }
+            flushing_file.read_exact_at(&mut buf[..valid_bytes], offset)?;
+            df_guard.write_all_at(&buf[..valid_bytes], offset)?;
+            let _ = self.inner.state_map.cas(
+                *idx,
+                SparseBlockState::SYNCING,
+                SparseBlockState::DIRTY,
+            );
+            self.inner
+                .dirty_block_count
+                .fetch_add(1, Ordering::Relaxed);
+            recovered += 1;
+        }
+        drop(df_guard);
+        drop(flushing_file);
+        std::fs::remove_file(&flushing_path)?;
+        tracing::info!(
+            recovered,
+            "post-takeover recovery: predecessor exited mid-flush; copied flushing→active"
+        );
+        Ok(recovered)
+    }
+
     /// Get the device size.
     #[allow(dead_code)]
     pub fn device_size(&self) -> u64 {
@@ -348,7 +564,26 @@ impl WriteCache<Active> {
     pub async fn checkpoint(&self) -> Result<(), CacheError> {
         let inner = Arc::clone(&self.inner);
         crate::task::spawn_blocking_named("checkpoint", move || {
+            // Always save the block-state metadata file — it's the
+            // canonical record of what's PRESENT/DIRTY/SYNCING.
             inner.save_block_states()?;
+
+            // Skip WAL truncate during the handoff freeze window —
+            // the successor's `replay_wal_tail` reads the same WAL
+            // the predecessor was appending into. If we truncate
+            // here while the successor is in WARMING/CUTOVER, any
+            // entry the predecessor has acked since the successor's
+            // WARMING-time open vanishes from the WAL.
+            if super::inner::HandoffPhase::from_u8(
+                inner
+                    .handoff_phase
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .is_active()
+            {
+                debug!("checkpoint: skipping WAL truncate (handoff in progress)");
+                return Ok(());
+            }
             inner.wal.truncate()?;
             debug!("checkpoint complete");
             Ok(())
@@ -599,9 +834,22 @@ impl WriteCache<Active> {
             // failed). If no rotation is in progress (flushing_active=false,
             // flushing_file=None), the file is stale — try to delete it so
             // this flush cycle can proceed.
-            if !self.inner.flushing_active.load(Ordering::Acquire)
-                && self.inner.flushing_file.lock().is_none()
-            {
+            //
+            // Also stale: an in-flight rotation whose every claimed block
+            // has since transitioned out of SYNCING (promoted back to DIRTY
+            // via guest write, or evicted to NOT_PRESENT). The flushing
+            // file holds data nothing reads anymore — drop it so the next
+            // rotation can proceed.
+            let active_rotation = self.inner.flushing_active.load(Ordering::Acquire)
+                || self.inner.flushing_file.lock().is_some();
+            let stale_rotation = active_rotation && !self.inner.has_any_syncing();
+            if !active_rotation || stale_rotation {
+                if stale_rotation {
+                    info!("clearing stale rotation (no SYNCING blocks remain)");
+                    self.inner.flushing_active.store(false, Ordering::Release);
+                    self.inner.rotation_seq.store(0, Ordering::Release);
+                    drop(self.inner.flushing_file.lock().take());
+                }
                 let flushing_path = self.inner.config.flushing_path();
                 match std::fs::remove_file(&flushing_path) {
                     Ok(()) => {
@@ -1110,9 +1358,18 @@ impl WriteCache<Active> {
             staged_appends.push((chunk_idx, pack_id));
         }
 
-        // Apply all staged manifest appends atomically.
+        // **Atomic flush ordering**: Upload → ManifestSync → Evict → Checkpoint → Cleanup.
+        // Matches the Stateright model. Predecessor crash at any point
+        // leaves S3 self-consistent: either the manifest references the
+        // packs (clients read them), or it doesn't (packs are orphaned
+        // and reclaimed by `glidefs gc`). No "packs without manifest
+        // reference" window — that was the bug the 8s freeze fence
+        // worked around.
+
+        // Apply staged manifest appends to in-memory VolumeManifest.
         // Only reached if every chunk upload succeeded.
-        if !staged_appends.is_empty() {
+        let need_sync = !staged_appends.is_empty();
+        if need_sync {
             let mut vm = volume_manifest.write();
             for (chunk_idx, pack_id) in staged_appends {
                 vm.append_pack(chunk_idx, pack_id);
@@ -1122,10 +1379,66 @@ impl WriteCache<Active> {
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::AfterCompute, flushed_blocks.len()).await;
 
+        // ManifestSync: persist to S3 BEFORE eviction. Until the
+        // manifest references the uploaded packs, those blocks are
+        // visible only via the in-memory VM in this process. Crash
+        // here leaves orphans (idempotent reclaim by `glidefs gc`).
+        //
+        // Hold no lock across the await (`parking_lot::RwLock` is not
+        // async-safe across awaits). Serialize from a brief `.read()`
+        // guard, drop, then PUT. Concurrent flushers are serialized by
+        // `flush_lock` (held by the caller).
+        if need_sync {
+            let manifest_bytes = volume_manifest.read().serialize()?;
+            let expected_etag = self.inner.manifest_etag.lock().clone();
+            let mut last_err: Option<crate::block::content_store::ContentStoreError> = None;
+            for attempt in 0..3u32 {
+                match content_store
+                    .put_manifest(
+                        &self.inner.export_name,
+                        manifest_bytes.clone(),
+                        expected_etag.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(new_etag) => {
+                        *self.inner.manifest_etag.lock() = new_etag;
+                        last_err = None;
+                        break;
+                    }
+                    Err(e @ crate::block::content_store::ContentStoreError::PreconditionFailed(_)) => {
+                        // Another host owns this manifest. Don't retry —
+                        // every attempt fails with the same stale ETag.
+                        // Return Err: outer flush_dirty_inner re-dirties
+                        // the SYNCING blocks via flushing-file recovery.
+                        return Err(e.into());
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e, attempt = attempt + 1,
+                            "manifest upload failed in atomic flush, retrying"
+                        );
+                        last_err = Some(e);
+                        if attempt < 2 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                100 * (1 << attempt),
+                            ))
+                            .await;
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(e.into());
+            }
+        }
+
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::BeforeEvict, flushed_blocks.len()).await;
 
-        // Finalize flushed blocks: SYNCING→NOT_PRESENT.
+        // Evict: SYNCING → NOT_PRESENT. Safe now — S3 has both the
+        // packs AND a manifest that references them, so reads after
+        // eviction resolve via S3.
         //
         // Always evict from the data file. The flush path already inserted
         // every block into foyer (clean_cache) during compute_flush_batch,
@@ -1146,19 +1459,43 @@ impl WriteCache<Active> {
         #[cfg(feature = "test-utils")]
         self.flush_gate(super::inner::FlushStep::AfterEvict, flushed_blocks.len()).await;
 
-        // Drop flushing file handle but keep the file on disk.
+        // Checkpoint: persist block states (now NP) + truncate the WAL.
+        // If this fails, the in-memory state is correct (reads via S3
+        // already work) but .meta is stale; on crash, recovery sees the
+        // previous .meta with these blocks DIRTY + the flushing file
+        // still on disk and re-flushes idempotently (content-addressed
+        // pack IDs cross-dedup against the just-uploaded manifest).
         //
-        // The flushing file is the crash-safety net for the window between
-        // pack upload and manifest sync + checkpoint. If the host crashes
-        // before the manifest reaches S3 and checkpoint persists block states,
-        // recovery uses the flushing file to restore block data. The file is
-        // deleted by checkpoint() after block states are durably persisted.
+        // Don't return Err on checkpoint failure — that would trigger
+        // outer error recovery to re-dirty already-evicted blocks, but
+        // their data is gone (we're about to delete the flushing file).
+        // Instead log + skip cleanup so the flushing file stays as the
+        // crash-safety net; the next flush cycle's checkpoint retries.
+        let checkpoint_ok = match self.checkpoint().await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(error = %e, "checkpoint after atomic flush failed; flushing file preserved");
+                false
+            }
+        };
+
+        // Cleanup: drop flushing-file safety net only after checkpoint
+        // succeeded. Manifest is durable, .meta has CLEAN/NP states,
+        // WAL truncated — flushing file is no longer needed.
         //
         // Clear flushing_active and rotation_seq BEFORE dropping the handle so
         // resolve_read_plan re-enables LocalSsd only after cleanup is complete.
         self.inner.flushing_active.store(false, Ordering::Release);
         self.inner.rotation_seq.store(0, Ordering::Release);
         drop(self.inner.flushing_file.lock().take());
+        if checkpoint_ok {
+            let flushing_path = self.inner.config.flushing_path();
+            if flushing_path.exists()
+                && let Err(e) = std::fs::remove_file(&flushing_path)
+            {
+                warn!(error = %e, "failed to remove flushing file after atomic flush");
+            }
+        }
 
         info!(
             blocks_claimed = total_stats.blocks_claimed,
@@ -1187,6 +1524,23 @@ impl WriteCache<Active> {
         volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
         clean_cache: Option<&Arc<dyn BlockCache>>,
     ) -> Result<(FlushStats, u64), CacheError> {
+        // **Skip flush during the handoff freeze window.** Rotation
+        // (rename(active_path, flushing_path) + new active file) breaks
+        // the cross-process file-handle sharing between predecessor and
+        // successor: post-rotation writes go to a new inode, but the
+        // successor's `File` handle still points to the old inode (now
+        // at flushing_path). The successor would read zeros for any
+        // post-rotation block. Suppressing flush during the handoff
+        // window keeps the active file's inode stable so both processes
+        // share the same backing store.
+        //
+        // The freeze window is bounded (~hundreds of ms). Dirty data
+        // accumulates briefly; the new daemon resumes flushing once
+        // takeover completes.
+        if self.handoff_phase().is_active() {
+            debug!("flush_packs: skipping (handoff in progress)");
+            return Ok((FlushStats::default(), 0));
+        }
         self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)
             .await
     }
@@ -1227,10 +1581,12 @@ impl WriteCache<Active> {
 
     /// Flush dirty blocks to S3 + upload manifest (drain/snapshot path).
     ///
-    /// Retries manifest upload up to 3 times before propagating the error,
-    /// mirroring flush_scheduler's pattern. This prevents spurious drain
-    /// failures when blocks are already clean but a transient S3 error
-    /// prevents the manifest upload.
+    /// `flush_dirty_inner` is now atomic (uploads packs, syncs manifest,
+    /// evicts, checkpoints, and cleans up the flushing file in one
+    /// sequence under `flush_lock`). For the drain path we additionally
+    /// guarantee the S3 manifest exists post-call — even if no packs were
+    /// uploaded (empty export, all-zero writes that cross-dedup to nothing).
+    /// Cold readers depend on the manifest's presence to bootstrap.
     #[must_use = "flush errors must be handled to avoid silent data loss"]
     #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn flush_to_s3(
@@ -1243,58 +1599,31 @@ impl WriteCache<Active> {
         let (stats, _seq_cutpoint) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
-        let manifest_bytes = volume_manifest.read().serialize()?;
-        let expected_etag = self.inner.manifest_etag.lock().clone();
-        let mut last_err = None;
-        for attempt in 0..3u32 {
-            match content_store
+        if stats.packs_uploaded == 0 {
+            // No packs uploaded → atomic flush skipped its internal sync.
+            // Push the manifest unconditionally so the export is
+            // discoverable by cold readers.
+            let manifest_bytes = volume_manifest.read().serialize()?;
+            let expected_etag = self.inner.manifest_etag.lock().clone();
+            let new_etag = content_store
                 .put_manifest(
                     &self.inner.export_name,
-                    manifest_bytes.clone(),
+                    manifest_bytes,
                     expected_etag.as_deref(),
                 )
-                .await
-            {
-                Ok(new_etag) => {
-                    *self.inner.manifest_etag.lock() = new_etag;
-                    last_err = None;
-                    break;
-                }
-                Err(e @ ContentStoreError::PreconditionFailed(_)) => {
-                    // Another host owns this manifest. Don't retry — every
-                    // attempt will fail with the same stale ETag.
-                    return Err(e.into());
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e, attempt = attempt + 1,
-                        "manifest upload failed in flush_to_s3, retrying"
-                    );
-                    last_err = Some(e);
-                    if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            100 * (1 << attempt),
-                        ))
-                        .await;
-                    }
-                }
-            }
-        }
-        if let Some(e) = last_err {
-            return Err(e.into());
-        }
-        self.checkpoint().await?;
-        // Manifest synced and checkpoint persisted — delete the flushing file.
-        let flushing_path = self.inner.config.flushing_path();
-        if flushing_path.exists()
-            && let Err(e) = std::fs::remove_file(&flushing_path)
-        {
-                warn!(error = %e, "failed to remove flushing file after flush_to_s3");
+                .await?;
+            *self.inner.manifest_etag.lock() = new_etag;
         }
         Ok(stats)
     }
 
     /// Take a point-in-time snapshot.
+    ///
+    /// `flush_dirty_inner` is atomic — it uploads packs, syncs the
+    /// manifest, evicts, and checkpoints. After it returns, the
+    /// in-memory `volume_manifest` matches S3 and `manifest_etag`
+    /// holds the fresh ETag. Snapshot re-serializes the manifest for
+    /// `put_snapshot` (the versioned/seq-keyed copy).
     #[must_use = "snapshot errors must be handled"]
     #[instrument(skip(self, content_store, pack_index_cache, volume_manifest))]
     pub async fn snapshot(
@@ -1309,15 +1638,7 @@ impl WriteCache<Active> {
             .await?;
 
         let manifest_bytes = volume_manifest.read().serialize()?;
-        let expected_etag = self.inner.manifest_etag.lock().clone();
-        let manifest_etag = content_store
-            .put_manifest(
-                &self.inner.export_name,
-                manifest_bytes.clone(),
-                expected_etag.as_deref(),
-            )
-            .await?;
-        *self.inner.manifest_etag.lock() = manifest_etag.clone();
+        let manifest_etag = self.inner.manifest_etag.lock().clone();
 
         let snapshot_persisted = {
             let mut persisted = false;
@@ -1347,14 +1668,6 @@ impl WriteCache<Active> {
             persisted
         };
 
-        self.checkpoint().await?;
-        // Manifest synced and checkpoint persisted — delete the flushing file.
-        let flushing_path = self.inner.config.flushing_path();
-        if flushing_path.exists()
-            && let Err(e) = std::fs::remove_file(&flushing_path)
-        {
-                warn!(error = %e, "failed to remove flushing file after snapshot");
-        }
         Ok(SnapshotResult {
             manifest_etag,
             sequence: seq_cutpoint,

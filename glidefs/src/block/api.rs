@@ -174,6 +174,42 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
 
 /// Check if an export name is valid: 1-128 chars, alphanumeric/hyphen/underscore/dot,
 /// starting with an alphanumeric character.
+/// Proxy to the local handoff control socket. Used by the HTTP API
+/// `POST /admin/handoff` endpoint to forward orchestrator-driven
+/// handoff requests (Ansible, box-manager, etc.) through the same
+/// pipeline the `glidefs handoff` CLI uses.
+pub(crate) async fn trigger_handoff_via_ctl(
+    socket_path: &std::path::Path,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("connecting to handoff control socket: {e}"))?;
+    let req_byte = if dry_run {
+        crate::handoff::protocol::ctl_wire::REQUEST_HANDOFF_DRY_RUN
+    } else {
+        crate::handoff::protocol::ctl_wire::REQUEST_HANDOFF
+    };
+    stream.write_all(&[req_byte]).await?;
+    stream.flush().await?;
+    let mut response = [0u8; 1];
+    if stream.read(&mut response).await? == 0 {
+        anyhow::bail!("handoff control socket closed without response");
+    }
+    match response[0] {
+        crate::handoff::protocol::ctl_wire::RESPONSE_ACCEPTED => Ok(()),
+        crate::handoff::protocol::ctl_wire::RESPONSE_BUSY => {
+            anyhow::bail!("handoff already in progress")
+        }
+        crate::handoff::protocol::ctl_wire::RESPONSE_UNSUPPORTED => {
+            anyhow::bail!("daemon does not support handoff over control socket")
+        }
+        other => anyhow::bail!("unexpected response byte: 0x{:02x}", other),
+    }
+}
+
 fn is_valid_export_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 128 {
         return false;
@@ -213,7 +249,8 @@ where
 {
     let start = std::time::Instant::now();
     let method = req.method().clone();
-    let path = req.uri().path().to_string();
+    let uri = req.uri().clone();
+    let path = uri.path().to_string();
     let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
     let response = match (method.clone(), path_parts.as_slice()) {
@@ -794,6 +831,34 @@ where
             json_response(StatusCode::OK, &stats)
         }
 
+        // POST /admin/handoff - trigger a graceful zero-downtime handoff
+        // Optional query string: ?dry_run=true performs WARMING then aborts.
+        // Same effect as `kill -HUP $(pidof glidefs)` or `glidefs handoff`.
+        (Method::POST, ["admin", "handoff"]) => {
+            let dry_run = uri
+                .query()
+                .map(|q| q.contains("dry_run=true") || q.contains("dry_run=1"))
+                .unwrap_or(false);
+            // Proxy to the control socket. The local serve_with_router
+            // task listens on it and routes to the handoff dispatcher.
+            let socket_path = std::path::PathBuf::from(
+                crate::handoff::DEFAULT_HANDOFF_SOCKET,
+            )
+            .with_extension("ctl.sock");
+            match crate::block::api::trigger_handoff_via_ctl(&socket_path, dry_run).await {
+                Ok(()) => json_response(
+                    StatusCode::ACCEPTED,
+                    &ApiResponse::success(format!(
+                        "handoff request accepted (dry_run={dry_run})"
+                    )),
+                ),
+                Err(e) => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("handoff trigger failed: {e}"),
+                ),
+            }
+        }
+
         // GET /metrics - Prometheus metrics for all exports
         (Method::GET, ["metrics"]) => {
             let mut output = String::from(prometheus_header());
@@ -954,6 +1019,11 @@ pub struct ApiServer {
     /// connections are dropped immediately to prevent OOM from connection
     /// flooding.
     connection_limiter: Arc<Semaphore>,
+    /// Listener-fd registry for handoff (see `NBDServer::listener_registry`).
+    listener_registry: Option<crate::handoff::listener_registry::ListenerRegistry>,
+    /// Inherited listener fd from a handoff predecessor (see
+    /// `NBDServer::inherited_listener`).
+    inherited_listener: parking_lot::Mutex<Option<std::os::fd::OwnedFd>>,
 }
 
 impl ApiServer {
@@ -975,13 +1045,48 @@ impl ApiServer {
             router,
             addr,
             connection_limiter,
+            listener_registry: None,
+            inherited_listener: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Attach a `ListenerRegistry` so that `start` records the bound
+    /// listener fd for later handoff via SCM_RIGHTS.
+    pub fn with_listener_registry(
+        mut self,
+        registry: crate::handoff::listener_registry::ListenerRegistry,
+    ) -> Self {
+        self.listener_registry = Some(registry);
+        self
+    }
+
+    /// Attach an inherited listener fd (received via SCM_RIGHTS from a
+    /// handoff predecessor). When set, `start` reuses it instead of
+    /// calling `bind`.
+    pub fn with_inherited_listener(self, fd: std::os::fd::OwnedFd) -> Self {
+        *self.inherited_listener.lock() = Some(fd);
+        self
     }
 
     /// Start the API server.
     pub async fn start(self, shutdown: CancellationToken) -> std::io::Result<()> {
-        let listener = TcpListener::bind(self.addr).await?;
-        info!("HTTP API server listening on {}", self.addr);
+        use std::os::fd::AsRawFd;
+        let listener = if let Some(fd) = self.inherited_listener.lock().take() {
+            info!("HTTP API server inheriting listener fd from handoff predecessor (target {})", self.addr);
+            let std_listener = std::net::TcpListener::from(fd);
+            std_listener.set_nonblocking(true)?;
+            TcpListener::from_std(std_listener)?
+        } else {
+            let l = TcpListener::bind(self.addr).await?;
+            info!("HTTP API server listening on {}", self.addr);
+            l
+        };
+        if let Some(reg) = &self.listener_registry {
+            reg.register(
+                crate::handoff::listener_registry::ListenerKind::HttpApi,
+                listener.as_raw_fd(),
+            );
+        }
 
         loop {
             tokio::select! {

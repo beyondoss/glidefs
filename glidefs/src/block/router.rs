@@ -262,6 +262,14 @@ pub struct RouterConfig {
 ///
 /// Manages multiple NBD exports, each with independent storage and caching.
 pub struct ExportRouter {
+    /// Listener-fd registry. NBD/HTTP-API server tasks register their
+    /// listener fds here on bind; the handoff predecessor snapshots
+    /// the registry, dups every fd, and ships them to the successor
+    /// via SCM_RIGHTS so the successor can resume accepting on the
+    /// same kernel sockets without dropping in-flight client
+    /// connections.
+    pub listener_registry: crate::handoff::listener_registry::ListenerRegistry,
+
     /// Active exports: name → state. Sharded `DashMap` so per-export
     /// lookups don't contend with each other or with create/remove.
     /// Previously a `tokio::sync::RwLock<HashMap<...>>` which serialized
@@ -599,6 +607,7 @@ impl ExportRouter {
         );
 
         Ok(Self {
+            listener_registry: crate::handoff::listener_registry::ListenerRegistry::new(),
             exports: DashMap::new(),
             max_exports: config.max_exports,
             object_store: config.object_store,
@@ -1970,6 +1979,33 @@ impl ExportRouter {
     /// Get export names.
     pub async fn list_export_names(&self) -> Vec<String> {
         self.exports.iter().map(|e| e.key().clone()).collect()
+    }
+
+    // ========================================================================
+    // pub(crate) accessors — exposed for the handoff coordinator
+    // (`crate::handoff::coordinator::HandoffCoordinator`), which sits in a
+    // sibling module and needs to walk per-export state without `pub(super)`
+    // privilege. Not part of the public surface.
+    // ========================================================================
+
+    /// Direct access to the per-export `DashMap`. Lookups are cheap and
+    /// lock-free; iteration holds shard guards briefly.
+    pub(crate) fn exports_map(&self) -> &DashMap<String, ExportState> {
+        &self.exports
+    }
+
+    /// Local SSD cache directory (used by `revive_after_failed_handoff`
+    /// to construct a fresh `UblkServer` after a successor crash).
+    pub(crate) fn cache_dir_path(&self) -> &std::path::Path {
+        &self.cache_dir
+    }
+
+    /// The shared `UblkServer` mutex (cfg-gated to ublk builds).
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub(crate) fn ublk_server_mutex(
+        &self,
+    ) -> &tokio::sync::Mutex<crate::block::ublk::UblkServer> {
+        &self.ublk_server
     }
 
     // --- Device management (unified across transports) ---

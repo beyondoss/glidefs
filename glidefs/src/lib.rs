@@ -7,6 +7,9 @@ pub mod block;
 pub mod oci;
 pub mod task;
 
+#[allow(unsafe_code)] // libc socket/bind/connect/sendmsg/recvmsg for SCM_RIGHTS
+pub mod handoff;
+
 #[cfg(feature = "test-utils")]
 pub mod cli;
 pub mod parse_object_store;

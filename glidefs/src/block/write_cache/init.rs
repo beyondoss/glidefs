@@ -111,7 +111,22 @@ impl WriteCache<Initializing> {
         //
         // Uses atomic write (temp → fsync → rename) so a crash during
         // rewrite leaves the original WAL intact rather than truncated.
-        {
+        //
+        // **CRITICAL — skip in handoff successor mode**: the rename()
+        // creates a new inode. The predecessor's still-open WAL fd
+        // points to the OLD inode (renames don't touch open fds), so
+        // predecessor's subsequent appends go to an unreachable file.
+        // Successor's `replay_wal_tail` reads the NEW inode and misses
+        // those appends. Manifests as "verify: bad magic header 0" in
+        // fio under sequential / multi-export stress.
+        // Predecessor's WAL is canonical until handoff completes; the
+        // successor uses the existing inode as-is and lets the
+        // predecessor's flush_scheduler / our own post-takeover
+        // checkpoint handle WAL hygiene.
+        let in_successor_passive_mode = std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        if !in_successor_passive_mode {
             use crate::block::wal::serialize_entry;
             use std::io::Write as IoWrite;
             let mut buf = Vec::new();
@@ -139,13 +154,29 @@ impl WriteCache<Initializing> {
             }
         }
 
-        // Open WAL for new appends (clean file, no torn tail)
+        // Open WAL for new appends (clean file, no torn tail).
+        //
+        // `Wal::open` acquires LOCK_EX|LOCK_NB on the fd. If a previous
+        // daemon is still alive (handoff bug), the lock is held and we
+        // get WouldBlock — propagate as Locked so the caller (successor
+        // process during handoff) knows to abort cleanly. For any other
+        // error (corrupt file etc.) the existing retry-with-remove path
+        // is preserved.
         let wal = match Wal::open(&wal_path) {
             Ok(w) => w,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(CacheError::Locked(wal_path.clone()));
+            }
             Err(e) => {
                 warn!(error = %e, "failed to open WAL, removing and creating new");
                 let _ = std::fs::remove_file(&wal_path);
-                Wal::open(&wal_path).map_err(CacheError::Io)?
+                Wal::open(&wal_path).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        CacheError::Locked(wal_path.clone())
+                    } else {
+                        CacheError::Io(e)
+                    }
+                })?
             }
         };
 
@@ -168,7 +199,32 @@ impl WriteCache<Initializing> {
         // writes; other DIRTY blocks are pre-rotation and need recovery
         // from the flushing file.
         let flushing_path = config.flushing_path();
-        if flushing_path.exists() {
+        if flushing_path.exists() && in_successor_passive_mode {
+            // **Handoff successor passive mode**: the flushing file
+            // belongs to the still-running predecessor's in-flight
+            // S3 upload. We must NOT recover from it here — recovery
+            // would:
+            //   1. pwrite old block data from the flushing file back
+            //      to the active data file, overwriting any new
+            //      writes the predecessor has applied since rotation
+            //      (visible to fio as "verify: bad magic header 0"),
+            //   2. CAS SYNCING→DIRTY in our state_map while the
+            //      predecessor's state_map still shows SYNCING,
+            //   3. remove the flushing file path while the
+            //      predecessor's open fd still depends on the inode
+            //      for its in-flight upload.
+            //
+            // Leave the flushing file alone. After cutover the
+            // successor calls `recover_pending_flush_file` (in
+            // `run_server_as_successor`) which re-checks the file:
+            // if the predecessor finished its flush before exiting,
+            // the file is gone and we have nothing to do; if not,
+            // we recover normally.
+            info!(
+                rotation_seq,
+                "found flushing file — deferring recovery until after handoff cutover (passive mode)"
+            );
+        } else if flushing_path.exists() {
             info!(rotation_seq, "found flushing file — recovering from interrupted flush");
             let flushing_file = SyncFile::open(&flushing_path, false, config.device_size)?;
             let block_size = config.block_size;
@@ -283,6 +339,25 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(recovery_warning_count),
+            // Default to `Warming` if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
+            // is set in the env. The handoff successor sets it before
+            // calling `build_router_only` so every WriteCache is born
+            // in passive mode (no flushing, no checkpoint truncate)
+            // until takeover completes. Without this, the per-export
+            // flush_scheduler — started inside `create_export` BEFORE
+            // `set_all_caches_phase(Warming)` runs in `run_server_as_successor`
+            // — could fire a rotation during the brief window and break
+            // cross-process file-handle sharing with the predecessor.
+            handoff_phase: std::sync::atomic::AtomicU8::new(
+                if std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    super::inner::HandoffPhase::Warming as u8
+                } else {
+                    super::inner::HandoffPhase::Idle as u8
+                },
+            ),
 
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),
@@ -326,7 +401,14 @@ impl WriteCache<Initializing> {
         let state_map = SparseStateMap::new(num_blocks);
         let block_size = config.block_size;
         let sequence = SequenceNumber::new(0);
-        let wal = Wal::open(&config.wal_path())?;
+        let wal_path = config.wal_path();
+        let wal = Wal::open(&wal_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                CacheError::Locked(wal_path.clone())
+            } else {
+                CacheError::Io(e)
+            }
+        })?;
         let export_name = config.device_name.clone();
         let (zbb, zbh) = shared_zero_block(block_size);
 
@@ -344,6 +426,19 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(0),
+            // Default to `Warming` if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
+            // is set in the env. See the matching block in `open` for
+            // the full rationale.
+            handoff_phase: std::sync::atomic::AtomicU8::new(
+                if std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
+                    super::inner::HandoffPhase::Warming as u8
+                } else {
+                    super::inner::HandoffPhase::Idle as u8
+                },
+            ),
 
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),

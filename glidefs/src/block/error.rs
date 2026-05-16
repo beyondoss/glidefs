@@ -39,6 +39,12 @@ pub enum CommandError {
     ReadOnly,
     /// Block evicted during flush — retry with backfill (ublk only)
     BlockEvicted,
+    /// Handler is frozen for daemon handoff (EBUSY). Transient — the
+    /// caller will be aborted by the kernel transitioning the device to
+    /// QUIESCED moments later. Defense-in-depth; should not be observed
+    /// by a guest in a correctly-functioning handoff because the worker
+    /// pool drop happens immediately after freeze is set.
+    Frozen,
 }
 
 impl CommandError {
@@ -46,7 +52,9 @@ impl CommandError {
     pub fn to_nbd_errno(self) -> u32 {
         match self {
             CommandError::InvalidArgument => super::protocol::NBD_EINVAL,
-            CommandError::IoError | CommandError::BlockEvicted => super::protocol::NBD_EIO,
+            CommandError::IoError | CommandError::BlockEvicted | CommandError::Frozen => {
+                super::protocol::NBD_EIO
+            }
             CommandError::NoSpace => super::protocol::NBD_ENOSPC,
             CommandError::ReadOnly => super::protocol::NBD_EROFS,
         }
@@ -60,6 +68,7 @@ impl CommandError {
             CommandError::IoError | CommandError::BlockEvicted => libc::EIO,
             CommandError::NoSpace => libc::ENOSPC,
             CommandError::ReadOnly => libc::EROFS,
+            CommandError::Frozen => libc::EBUSY,
         }
     }
 }

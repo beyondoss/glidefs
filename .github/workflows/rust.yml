@@ -156,6 +156,10 @@ jobs:
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
       - name: fio verify (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
+      - name: Handoff durability (per-PR profile, ublk)
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,fio-bench,test-fault-injection --test handoff_durability -- --ignored --nocapture handoff_durability_crh_per_pr
+      - name: Handoff fault-injection grid (ublk)
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,fio-bench,test-fault-injection --test handoff_durability -- --ignored --nocapture handoff_fault_injection_grid_crh
       - name: Test (ublk)
         run: cargo test -p glidefs --features ublk,test-utils --verbose
       - name: Docker integration (ublk)

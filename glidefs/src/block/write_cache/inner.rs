@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::block::block_map::{Blake3Hash, SequenceNumber, SparseBlockState, SparseStateMap};
@@ -227,6 +227,54 @@ fn is_zero_block_u64(data: &[u8]) -> bool {
     suffix.iter().all(|&b| b == 0)
 }
 
+/// Per-export handoff phase. Reflects which window of the graceful
+/// daemon-handoff state machine the cache is currently inside.
+///
+/// Stored as an `AtomicU8` on `CacheInner::handoff_phase`. Readers
+/// check `is_active()` (any non-Idle) to gate flush rotation and WAL
+/// truncation; writers (the handoff coordinator) transition the
+/// phase as the predecessor moves through SIGHUP → freeze → cutover.
+///
+/// The variants intentionally encode the protocol's logical phases
+/// even though all current readers collapse on `is_active`. This
+/// leaves room for phase-specific gating (e.g. PIOD distinguishing
+/// per-tag handoff windows from CRH's QUIESCED window) without
+/// adding new flags.
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HandoffPhase {
+    /// No handoff in flight. Default state.
+    Idle = 0,
+    /// Successor has opened the cache; predecessor is still serving.
+    /// On the predecessor side: set as soon as SIGHUP fires (covers
+    /// the WARMING + READY-wait + freeze + cutover window).
+    Warming = 1,
+    /// Predecessor's `freeze_all` is in progress.
+    Freezing = 2,
+    /// Post-CUTOVER, before the successor sends ALIVE.
+    Cutover = 3,
+}
+
+impl HandoffPhase {
+    /// Decode from the raw u8 stored in the atomic. Unknown values
+    /// fall back to `Idle` (defensive — no caller should ever store
+    /// out-of-range values via `set_handoff_phase`).
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Warming,
+            2 => Self::Freezing,
+            3 => Self::Cutover,
+            _ => Self::Idle,
+        }
+    }
+
+    /// True when any handoff phase is in flight. Both current
+    /// readers (`flush_packs`, `checkpoint`) gate on this.
+    pub fn is_active(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+}
+
 /// Internal state shared across all cache states.
 ///
 /// Uses lock-free atomics for block states and presence to avoid contention
@@ -289,6 +337,24 @@ pub(crate) struct CacheInner {
     /// Number of recovery issues encountered during cache open (WAL replay
     /// failure, block map load failure). Exposed via metrics for monitoring.
     pub(super) recovery_warnings: AtomicU64,
+
+    /// Current handoff phase. Set non-Idle during a graceful handoff
+    /// to suppress WAL truncation in
+    /// [`crate::block::write_cache::WriteCache::checkpoint`] and to
+    /// skip new flushes in
+    /// [`crate::block::write_cache::WriteCache::flush_packs`]. Without
+    /// these gates, the predecessor's checkpoint/flush can truncate
+    /// or rotate between the successor's WARMING-time replay and
+    /// PREDS_DEAD, dropping entries or breaking inode sharing.
+    /// `save_block_states` still runs (metadata file stays current);
+    /// only the truncate/rotate is skipped. The WAL grows briefly
+    /// (handoff window is bounded), then the successor's WAL fully
+    /// replaces it on predecessor exit.
+    ///
+    /// Stored as an `AtomicU8` representation of [`HandoffPhase`].
+    /// Use `WriteCache::handoff_phase()` / `set_handoff_phase()`
+    /// rather than reading this directly.
+    pub(super) handoff_phase: AtomicU8,
 
     /// Per-export flush serialization lock.
     ///
@@ -666,6 +732,18 @@ impl CacheInner {
     #[allow(dead_code)]
     pub(super) fn count_present(&self) -> usize {
         self.state_map.count_present()
+    }
+
+    /// True iff any block in the cache is currently SYNCING.
+    ///
+    /// Used by `flush_dirty_inner` to detect a stale rotation: if a
+    /// flushing file is on disk and `flushing_active=true` but no block
+    /// is SYNCING (e.g. every claimed block was promoted back to DIRTY
+    /// or evicted), the flushing file is no longer load-bearing and the
+    /// next flush cycle can safely clean it up before rotating again.
+    pub(super) fn has_any_syncing(&self) -> bool {
+        use crate::block::block_map::SparseBlockState;
+        (0..self.num_blocks).any(|i| self.state_map.get(i) == SparseBlockState::SYNCING)
     }
 
     /// Promote SYNCING blocks from flushing → active file before a guest write.

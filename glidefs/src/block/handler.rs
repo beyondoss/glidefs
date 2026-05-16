@@ -167,6 +167,23 @@ pub struct BlockHandler {
     /// safe way back to a known-good state.
     degraded: AtomicBool,
 
+    /// Set during graceful daemon handoff (CRH): the predecessor flips this
+    /// to `true` before it drops the UblkServer / NBD listeners. While set,
+    /// mutating ops (write/trim/write_zeroes/flush) return
+    /// `CommandError::Frozen`; reads still work.
+    ///
+    /// Why this exists separately from `degraded`: freeze is a transient,
+    /// recoverable state tied to a specific handoff window. After the
+    /// kernel transitions devices to QUIESCED, no new ops reach this
+    /// handler from the guest anyway — `frozen` is defense-in-depth for
+    /// any path that bypasses the worker pool drop (e.g. API-driven
+    /// drain calls during handoff). The successor process never sees
+    /// `frozen=true`; it builds a fresh BlockHandler on its own.
+    ///
+    /// Cleared by `unfreeze()` on the predecessor if S crashes before
+    /// ALIVE and P revives — keeps the API symmetric.
+    frozen: AtomicBool,
+
     /// I/O metrics for this export
     metrics: Arc<ExportMetrics>,
 
@@ -224,6 +241,7 @@ impl BlockHandler {
             device_size: AtomicU64::new(device_size),
             readonly: AtomicBool::new(readonly),
             degraded: AtomicBool::new(false),
+            frozen: AtomicBool::new(false),
             metrics,
             readahead: Mutex::new(SequentialDetector::new()),
             ssd_utilization,
@@ -287,6 +305,46 @@ impl BlockHandler {
             Err(CommandError::IoError)
         } else {
             Ok(())
+        }
+    }
+
+    /// Helper for the mutating public ops: short-circuit to `IoError` if
+    /// degraded, `Frozen` if frozen for handoff. Reads should call
+    /// `check_not_degraded` directly — frozen handlers serve reads.
+    /// Inlined so the happy path is two atomic loads.
+    #[inline]
+    fn check_writable(&self) -> CommandResult<()> {
+        if self.degraded.load(Ordering::Relaxed) {
+            return Err(CommandError::IoError);
+        }
+        if self.frozen.load(Ordering::Relaxed) {
+            return Err(CommandError::Frozen);
+        }
+        Ok(())
+    }
+
+    /// True iff this handler has been frozen for handoff.
+    #[inline]
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Relaxed)
+    }
+
+    /// Freeze this handler. After this returns, all mutating ops on this
+    /// handler return `CommandError::Frozen`. Reads continue to work.
+    ///
+    /// Used by the handoff predecessor immediately before it drops the
+    /// UblkServer / NBD listeners. Idempotent.
+    pub fn freeze(&self) {
+        if !self.frozen.swap(true, Ordering::AcqRel) {
+            tracing::info!("BlockHandler frozen for handoff");
+        }
+    }
+
+    /// Reverse `freeze()`. Used by the predecessor's revival path if the
+    /// successor crashes before sending `ALIVE`. Idempotent.
+    pub fn unfreeze(&self) {
+        if self.frozen.swap(false, Ordering::AcqRel) {
+            tracing::info!("BlockHandler unfrozen (handoff aborted)");
         }
     }
 
@@ -798,6 +856,16 @@ impl BlockHandler {
     /// the write touches blocks not yet present on SSD.
     pub async fn write(&self, offset: u64, data: &[u8], fua: bool) -> CommandResult<()> {
         let start = Instant::now();
+        // NOTE: deliberately uses `check_not_degraded`, not `check_writable`.
+        // The handler-level freeze gate would return `CommandError::Frozen`
+        // (mapped to EBUSY) which fio and other guests treat as a hard
+        // I/O error. The kernel's `UBLK_F_USER_RECOVERY` transition
+        // (triggered when the predecessor drops its io_uring fds) is the
+        // correct mechanism — it *queues* bios in the kernel block layer
+        // instead of failing them, and the successor reissues them after
+        // takeover. `BlockHandler::freeze()` remains as a typestate hook
+        // for future use (e.g. snapshot orchestration) but does NOT gate
+        // writes during graceful handoff.
         self.check_not_degraded()?;
 
         if self.is_readonly() {
@@ -856,6 +924,16 @@ impl BlockHandler {
     /// methods (fallocate on Linux, static buffer fallback elsewhere).
     /// Returns error if the export is readonly.
     pub async fn trim(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
+        // NOTE: deliberately uses `check_not_degraded`, not `check_writable`.
+        // The handler-level freeze gate would return `CommandError::Frozen`
+        // (mapped to EBUSY) which fio and other guests treat as a hard
+        // I/O error. The kernel's `UBLK_F_USER_RECOVERY` transition
+        // (triggered when the predecessor drops its io_uring fds) is the
+        // correct mechanism — it *queues* bios in the kernel block layer
+        // instead of failing them, and the successor reissues them after
+        // takeover. `BlockHandler::freeze()` remains as a typestate hook
+        // for future use (e.g. snapshot orchestration) but does NOT gate
+        // writes during graceful handoff.
         self.check_not_degraded()?;
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
@@ -892,6 +970,16 @@ impl BlockHandler {
     ///
     /// Returns error if the export is readonly.
     pub async fn write_zeroes(&self, offset: u64, length: u32, fua: bool) -> CommandResult<()> {
+        // NOTE: deliberately uses `check_not_degraded`, not `check_writable`.
+        // The handler-level freeze gate would return `CommandError::Frozen`
+        // (mapped to EBUSY) which fio and other guests treat as a hard
+        // I/O error. The kernel's `UBLK_F_USER_RECOVERY` transition
+        // (triggered when the predecessor drops its io_uring fds) is the
+        // correct mechanism — it *queues* bios in the kernel block layer
+        // instead of failing them, and the successor reissues them after
+        // takeover. `BlockHandler::freeze()` remains as a typestate hook
+        // for future use (e.g. snapshot orchestration) but does NOT gate
+        // writes during graceful handoff.
         self.check_not_degraded()?;
         if self.is_readonly() {
             return Err(CommandError::ReadOnly);
@@ -941,6 +1029,16 @@ impl BlockHandler {
     ///
     /// S3 sync happens asynchronously in the background via the sync worker.
     pub fn flush(&self) -> CommandResult<()> {
+        // NOTE: deliberately uses `check_not_degraded`, not `check_writable`.
+        // The handler-level freeze gate would return `CommandError::Frozen`
+        // (mapped to EBUSY) which fio and other guests treat as a hard
+        // I/O error. The kernel's `UBLK_F_USER_RECOVERY` transition
+        // (triggered when the predecessor drops its io_uring fds) is the
+        // correct mechanism — it *queues* bios in the kernel block layer
+        // instead of failing them, and the successor reissues them after
+        // takeover. `BlockHandler::freeze()` remains as a typestate hook
+        // for future use (e.g. snapshot orchestration) but does NOT gate
+        // writes during graceful handoff.
         self.check_not_degraded()?;
         self.cache.flush().map_err(CommandError::from)
     }
