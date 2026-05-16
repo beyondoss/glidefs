@@ -38,6 +38,7 @@ pub use config::WriteCacheConfig;
 pub use error::CacheError;
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 pub use read::{ChunkSource, ReadPlan};
+pub use inner::HandoffPhase;
 use inner::CacheInner;
 
 #[cfg(feature = "test-utils")]

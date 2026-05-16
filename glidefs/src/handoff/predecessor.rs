@@ -87,7 +87,9 @@ pub async fn run_predecessor(
     // causing silent data loss observable as "verify: bad magic
     // header 0" in fio. Setting the flag this early covers the
     // entire WARMING + READY-wait + freeze + cutover window.
-    coord.set_all_caches_freeze(true).await;
+    coord
+        .set_all_caches_phase(crate::block::write_cache::HandoffPhase::Warming)
+        .await;
 
     // Detect kernel features for strategy selection.
     let per_io_daemon = coord.is_per_io_daemon_supported();
@@ -145,7 +147,9 @@ pub async fn run_predecessor(
     // For Succeeded, the predecessor exits anyway so the flag is
     // moot. For Aborted/Revived, the predecessor resumes normal
     // serving and needs flush_scheduler back to truncate WAL.
-    coord.set_all_caches_freeze(false).await;
+    coord
+        .set_all_caches_phase(crate::block::write_cache::HandoffPhase::Idle)
+        .await;
 
     result
 }

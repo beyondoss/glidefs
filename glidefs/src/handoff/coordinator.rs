@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use crate::block::handler::BlockHandler;
 use crate::block::router::{ExportRouter, RouterError};
 use crate::block::state::Active;
-use crate::block::write_cache::WriteCache;
+use crate::block::write_cache::{HandoffPhase, WriteCache};
 use crate::handoff::protocol::ExportSnapshot;
 
 /// All graceful-handoff entry points the predecessor/successor state
@@ -113,8 +113,9 @@ impl HandoffCoordinator {
         out
     }
 
-    /// Set the per-export `freeze_in_progress` flag on every WriteCache.
-    pub async fn set_all_caches_freeze(&self, frozen: bool) {
+    /// Set the per-export handoff phase on every WriteCache.
+    /// Replaces the older `set_all_caches_freeze(bool)` setter.
+    pub async fn set_all_caches_phase(&self, phase: HandoffPhase) {
         let caches: Vec<Arc<WriteCache<Active>>> = self
             .router
             .exports_map()
@@ -122,7 +123,7 @@ impl HandoffCoordinator {
             .map(|e| Arc::clone(&e.value().cache))
             .collect();
         for c in caches {
-            c.set_freeze_in_progress(frozen);
+            c.set_handoff_phase(phase);
         }
     }
 
@@ -150,7 +151,7 @@ impl HandoffCoordinator {
             handler.freeze();
             // Pause the per-export checkpoint truncate so the WAL
             // stays intact for the successor's tail-replay window.
-            cache.set_freeze_in_progress(true);
+            cache.set_handoff_phase(HandoffPhase::Freezing);
         }
 
         // **Fence in-flight flush + manifest-sync cycles**. The flush
@@ -222,7 +223,7 @@ impl HandoffCoordinator {
             .collect();
         for (h, c) in states {
             h.unfreeze();
-            c.set_freeze_in_progress(false);
+            c.set_handoff_phase(HandoffPhase::Idle);
         }
         info!("handoff: handlers unfrozen (handoff aborted)");
     }

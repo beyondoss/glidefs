@@ -290,14 +290,24 @@ impl WriteCache<Active> {
         self.inner.sequence.current()
     }
 
-    /// Toggle the "freeze in progress" flag. While set,
-    /// [`Self::checkpoint`] skips the WAL truncate step (the metadata
-    /// save still runs). Used by the handoff predecessor to keep the
-    /// WAL intact across the successor's WARMING → CUTOVER window.
-    pub fn set_freeze_in_progress(&self, frozen: bool) {
+    /// Set the per-cache handoff phase. While non-Idle,
+    /// [`Self::flush_packs`] returns early and [`Self::checkpoint`]
+    /// skips the WAL truncate step (the metadata save still runs).
+    /// Used by the handoff coordinator to gate predecessor- and
+    /// successor-side flushes through the freeze + cutover window.
+    pub fn set_handoff_phase(&self, phase: super::inner::HandoffPhase) {
         self.inner
-            .freeze_in_progress
-            .store(frozen, std::sync::atomic::Ordering::Release);
+            .handoff_phase
+            .store(phase as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Read the current handoff phase.
+    pub fn handoff_phase(&self) -> super::inner::HandoffPhase {
+        super::inner::HandoffPhase::from_u8(
+            self.inner
+                .handoff_phase
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Wait for any in-flight `flush_packs` + `sync_manifest` cycle to
@@ -562,11 +572,14 @@ impl WriteCache<Active> {
             // here while the successor is in WARMING/CUTOVER, any
             // entry the predecessor has acked since the successor's
             // WARMING-time open vanishes from the WAL.
-            if inner
-                .freeze_in_progress
-                .load(std::sync::atomic::Ordering::Acquire)
+            if super::inner::HandoffPhase::from_u8(
+                inner
+                    .handoff_phase
+                    .load(std::sync::atomic::Ordering::Acquire),
+            )
+            .is_active()
             {
-                debug!("checkpoint: skipping WAL truncate (freeze in progress)");
+                debug!("checkpoint: skipping WAL truncate (handoff in progress)");
                 return Ok(());
             }
             inner.wal.truncate()?;
@@ -1420,12 +1433,8 @@ impl WriteCache<Active> {
         // The freeze window is bounded (~hundreds of ms). Dirty data
         // accumulates briefly; the new daemon resumes flushing once
         // takeover completes.
-        if self
-            .inner
-            .freeze_in_progress
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            debug!("flush_packs: skipping (freeze in progress)");
+        if self.handoff_phase().is_active() {
+            debug!("flush_packs: skipping (handoff in progress)");
             return Ok((FlushStats::default(), 0));
         }
         self.flush_dirty_inner(content_store, pack_index_cache, volume_manifest, clean_cache)

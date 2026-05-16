@@ -339,19 +339,24 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(recovery_warning_count),
-            // Default to true if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
+            // Default to `Warming` if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
             // is set in the env. The handoff successor sets it before
             // calling `build_router_only` so every WriteCache is born
             // in passive mode (no flushing, no checkpoint truncate)
             // until takeover completes. Without this, the per-export
             // flush_scheduler — started inside `create_export` BEFORE
-            // `set_all_caches_freeze(true)` runs in `run_server_as_successor`
+            // `set_all_caches_phase(Warming)` runs in `run_server_as_successor`
             // — could fire a rotation during the brief window and break
             // cross-process file-handle sharing with the predecessor.
-            freeze_in_progress: std::sync::atomic::AtomicBool::new(
-                std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
+            handoff_phase: std::sync::atomic::AtomicU8::new(
+                if std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
                     .map(|v| v == "1")
-                    .unwrap_or(false),
+                    .unwrap_or(false)
+                {
+                    super::inner::HandoffPhase::Warming as u8
+                } else {
+                    super::inner::HandoffPhase::Idle as u8
+                },
             ),
 
             flush_lock: tokio::sync::Mutex::new(()),
@@ -421,19 +426,18 @@ impl WriteCache<Initializing> {
             zero_block_hash: zbh,
             zero_block_bytes: zbb,
             recovery_warnings: AtomicU64::new(0),
-            // Default to true if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
-            // is set in the env. The handoff successor sets it before
-            // calling `build_router_only` so every WriteCache is born
-            // in passive mode (no flushing, no checkpoint truncate)
-            // until takeover completes. Without this, the per-export
-            // flush_scheduler — started inside `create_export` BEFORE
-            // `set_all_caches_freeze(true)` runs in `run_server_as_successor`
-            // — could fire a rotation during the brief window and break
-            // cross-process file-handle sharing with the predecessor.
-            freeze_in_progress: std::sync::atomic::AtomicBool::new(
-                std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
+            // Default to `Warming` if `GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE=1`
+            // is set in the env. See the matching block in `open` for
+            // the full rationale.
+            handoff_phase: std::sync::atomic::AtomicU8::new(
+                if std::env::var("GLIDEFS_HANDOFF_SUCCESSOR_PASSIVE")
                     .map(|v| v == "1")
-                    .unwrap_or(false),
+                    .unwrap_or(false)
+                {
+                    super::inner::HandoffPhase::Warming as u8
+                } else {
+                    super::inner::HandoffPhase::Idle as u8
+                },
             ),
 
             flush_lock: tokio::sync::Mutex::new(()),

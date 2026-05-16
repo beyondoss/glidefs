@@ -709,7 +709,7 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
 
     // Mark this process as a handoff successor BEFORE any WriteCache
     // construction. CacheInner reads this and starts in passive mode
-    // (freeze_in_progress=true, flush_scheduler can't truncate WAL or
+    // (handoff_phase=Warming, flush_scheduler can't truncate WAL or
     // rotate the data file until we clear the flag after takeover).
     // SAFETY: set_var is unsafe in Rust 2024; called before any
     // worker threads or background tasks have been spawned, so no
@@ -741,7 +741,7 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     let coord = Arc::new(crate::handoff::HandoffCoordinator::new(Arc::clone(&built.router)));
 
     // **Successor passive mode**: each WriteCache starts with
-    // `freeze_in_progress=true` so its flush_scheduler doesn't truncate
+    // `handoff_phase=Warming` so its flush_scheduler doesn't truncate
     // the WAL while the predecessor is still appending to it. The flag
     // is cleared after handoff::run_successor's takeover completes
     // (in run_successor below). This is the same in-process mechanism
@@ -749,7 +749,9 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     // freeze window — applied to the successor side for the whole
     // WARMING + CUTOVER window since the successor doesn't have
     // exclusive ownership of the on-disk state until then.
-    coord.set_all_caches_freeze(true).await;
+    coord
+        .set_all_caches_phase(crate::block::write_cache::HandoffPhase::Warming)
+        .await;
 
     // Drive the handoff protocol. After this returns, our router owns
     // every device the predecessor used to own.
@@ -770,7 +772,9 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     // Predecessor has fully exited (takeover wouldn't return ALIVE
     // otherwise). Resume per-export checkpoint truncation — we now
     // own the WAL exclusively.
-    coord.set_all_caches_freeze(false).await;
+    coord
+        .set_all_caches_phase(crate::block::write_cache::HandoffPhase::Idle)
+        .await;
 
     // If the predecessor passed its listener fds via SCM_RIGHTS in
     // the HelloAck, we adopt them directly — no bind, no port
