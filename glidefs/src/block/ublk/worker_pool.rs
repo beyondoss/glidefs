@@ -701,6 +701,11 @@ async fn run_worker_loop(
     rx: &mut mpsc::Receiver<WorkerMsg>,
 ) {
     loop {
+        // Track whether this iteration's inbox drain spawned new io_tasks.
+        // Used below to decide whether to tick the executor BEFORE the
+        // io_uring_enter call — see the comment block at that site.
+        let mut just_added_queue = false;
+
         // Drain inbox non-blockingly. Multiple messages can arrive between
         // ticks (especially during a multi-queue device add).
         loop {
@@ -714,6 +719,7 @@ async fn run_worker_loop(
                 Ok(WorkerMsg::AddQueue { dev, handler, qid, ready }) => {
                     handle_add_queue(idx, ring, state, dev, handler, qid, ready);
                     publish_stats(state);
+                    just_added_queue = true;
                 }
                 Ok(WorkerMsg::RemoveQueue { key, done }) => {
                     // Drop the `hosted` map's `Rc<UblkQueue>` clone. The
@@ -758,22 +764,31 @@ async fn run_worker_loop(
             }
         }
 
-        // Tick the executor BEFORE entering io_uring. Newly spawned
-        // io_tasks (e.g. from a fresh `handle_add_queue`) submit their
-        // initial FETCH_REQ uring_cmd SQEs on their first poll, *not*
-        // at spawn-time. If we entered io_uring_enter first with
-        // `to_wait=1`, we'd block here for up to WORKER_IDLE_NSEC
-        // (250ms) waiting for CQEs that physically can't arrive yet —
-        // no SQE has been submitted. The kernel's
-        // `ublk_ctrl_start_dev` blocks on `wait_for_completion` until
-        // every queue's `nr_io_ready` reaches `queue_depth`, so this
-        // 250ms idle-timeout was directly pinning device-add latency
-        // at exactly 250ms (the daemon experiences this as a 250ms
-        // `START_DEV` ioctl). Polling first flushes the FETCH_REQ
-        // SQEs into the ring, then the submit pushes them to the
-        // kernel immediately, which marks the queues ready and
-        // releases `start_dev`.
-        state.executor.tick();
+        // CONDITIONAL pre-submit tick — only when this iteration's inbox
+        // drain just added a queue (and thus spawned `queue_depth` fresh
+        // io_tasks). Those io_tasks submit their initial FETCH_REQ
+        // uring_cmd SQEs on their FIRST poll, *not* at spawn-time. If we
+        // entered io_uring_enter first with `to_wait=1`, we'd block for
+        // up to WORKER_IDLE_NSEC (250ms) waiting for CQEs that
+        // physically can't arrive yet — no SQE has been submitted.
+        //
+        // The kernel's `ublk_ctrl_start_dev` blocks on
+        // `wait_for_completion` until every queue's `nr_io_ready`
+        // reaches `queue_depth`, so without this tick that 250ms
+        // idle-timeout directly pinned device-add latency at exactly
+        // 250ms (the daemon experiences it as a 250ms `START_DEV`
+        // ioctl). Polling first flushes the FETCH_REQ SQEs into the
+        // ring, then the submit pushes them to the kernel immediately,
+        // which marks the queues ready and releases `start_dev`.
+        //
+        // **Conservative scoping**: gated on `just_added_queue` so this
+        // change ONLY affects the device-add cold path. In steady-state
+        // I/O (no new AddQueues this iteration), behavior is byte-for-
+        // byte identical to before the fix — preserves whatever subtle
+        // invariant `test_overwrite_survives_restart_ublk` relies on.
+        if just_added_queue {
+            state.executor.tick();
+        }
 
         // Drive io_uring. Block in the kernel for up to WORKER_IDLE_NSEC
         // unless an SQE completes or eventfd fires. With nothing hosted,
