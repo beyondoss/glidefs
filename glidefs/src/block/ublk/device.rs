@@ -302,6 +302,24 @@ impl UblkDevice {
                 pool.worker_snapshot(&export_name, qid, preferred_node),
             ));
         }
+        // Surface qid→worker placement so we can see whether queues
+        // spread across workers (parallel mmaps) or pile on a few
+        // (serial). Stage 3a investigation.
+        {
+            let placement: Vec<(u16, usize)> = (0..nr_queues_max)
+                .map(|qid| {
+                    let w = pool.worker_for(&export_name, qid, preferred_node);
+                    (qid, w.idx)
+                })
+                .collect();
+            tracing::info!(
+                target: "glidefs.timing",
+                export = %export_name,
+                nr_queues = nr_queues_max,
+                placement = ?placement,
+                "ublk queue→worker placement"
+            );
+        }
 
         let export_for_json = export_name.clone();
         let handler_for_workers = Arc::clone(&handler);
@@ -310,8 +328,23 @@ impl UblkDevice {
         // build, UblkDev::new, start_dev, and the original ctrl's Drop.
         // CTRL_URING is initialized once (during build) and used for
         // every subsequent op including Drop.
-        let outcome: anyhow::Result<(i32, PathBuf, Arc<UblkDev>, u16)> =
+        #[derive(Default)]
+        struct RegTimings {
+            ctrl_build_us: u128,
+            dev_new_us: u128,
+            addqueue_send_us: u128,
+            ready_recv_us: u128,
+            configure_queue_us: u128,
+            configure_queue_last_us: u128,
+            start_dev_us: u128,
+            spawn_blocking_total_us: u128,
+        }
+        let outcome: anyhow::Result<(i32, PathBuf, Arc<UblkDev>, u16, RegTimings)> =
             tokio::task::spawn_blocking(move || {
+                let t_blocking_start = std::time::Instant::now();
+                let mut timings = RegTimings::default();
+
+                let t = std::time::Instant::now();
                 let ctrl = UblkCtrlBuilder::default()
                     .name("glidefs")
                     .id(preferred_dev_id)
@@ -322,6 +355,7 @@ impl UblkDevice {
                     .ctrl_flags(ctrl_flags)
                     .build()
                     .map_err(|e| anyhow::anyhow!("ublk ctrl build failed: {e:?}"))?;
+                timings.ctrl_build_us = t.elapsed().as_micros();
 
                 let tgt_init = move |d: &mut UblkDev| {
                     d.tgt.dev_size = dev_size;
@@ -352,15 +386,18 @@ impl UblkDevice {
                     };
                     Ok(())
                 };
+                let t = std::time::Instant::now();
                 let dev = Arc::new(
                     UblkDev::new(ctrl.get_name(), tgt_init, &ctrl)
                         .map_err(|e| anyhow::anyhow!("UblkDev::new failed: {e:?}"))?,
                 );
+                timings.dev_new_us = t.elapsed().as_micros();
 
                 let actual_nr_queues = dev.dev_info.nr_hw_queues;
 
                 // AddQueue dispatch via blocking sends. Each worker's
                 // mpsc::Sender accepts blocking_send from a sync ctx.
+                let t = std::time::Instant::now();
                 let mut readys = Vec::with_capacity(actual_nr_queues as usize);
                 for qid in 0..actual_nr_queues {
                     let (worker_idx, snap) = &worker_dispatch[qid as usize];
@@ -378,10 +415,14 @@ impl UblkDevice {
                     super::device::signal_eventfd(snap.eventfd.fd());
                     readys.push((*worker_idx, ready_rx));
                 }
+                timings.addqueue_send_us = t.elapsed().as_micros();
+
                 for (qid_, (worker_idx, ready_rx)) in readys.into_iter().enumerate() {
+                    let t_recv = std::time::Instant::now();
                     let result = ready_rx.blocking_recv().map_err(|_| {
                         anyhow::anyhow!("worker {worker_idx} dropped ready sender")
                     })?;
+                    timings.ready_recv_us += t_recv.elapsed().as_micros();
                     result.map_err(|s| {
                         anyhow::anyhow!("worker {worker_idx} AddQueue failed: {s}")
                     })?;
@@ -396,15 +437,27 @@ impl UblkDevice {
                     // pool model many queues share one worker thread —
                     // there's no meaningful 1:1 mapping. The tid is only
                     // used for diagnostics; recovery doesn't depend on it.
+                    let t_cfg = std::time::Instant::now();
                     let _ = ctrl.configure_queue(&dev, qid_ as u16, 0);
+                    let cfg_us = t_cfg.elapsed().as_micros();
+                    // The last configure_queue triggers build_json (one
+                    // ioctl per qid for queue_affinity) — track it
+                    // separately so we can see if it dominates.
+                    if (qid_ as u16) + 1 == actual_nr_queues {
+                        timings.configure_queue_last_us = cfg_us;
+                    } else {
+                        timings.configure_queue_us += cfg_us;
+                    }
                 }
 
                 // All queues attached. Issue START_DEV (or
                 // END_USER_RECOVERY for the recovery path; ublk-core's
                 // start_dev() picks based on device state).
+                let t = std::time::Instant::now();
                 ctrl.start_dev(&dev).map_err(|e| {
                     anyhow::anyhow!("start_dev failed: {e:?}")
                 })?;
+                timings.start_dev_us = t.elapsed().as_micros();
 
                 let dev_id = i32::try_from(ctrl.dev_info().dev_id)
                     .map_err(|_| anyhow::anyhow!("dev_id overflows i32"))?;
@@ -418,11 +471,13 @@ impl UblkDevice {
                 // on this thread when the closure returns.
                 ctrl.disarm_drop();
 
-                Ok((dev_id, dev_path, dev, actual_nr_queues))
+                timings.spawn_blocking_total_us = t_blocking_start.elapsed().as_micros();
+
+                Ok((dev_id, dev_path, dev, actual_nr_queues, timings))
             })
             .await?;
 
-        let (dev_id_assigned, dev_path, dev, actual_nr_queues) = outcome?;
+        let (dev_id_assigned, dev_path, dev, actual_nr_queues, timings) = outcome?;
         if actual_nr_queues != nr_queues {
             tracing::warn!(
                 requested = nr_queues,
@@ -436,15 +491,41 @@ impl UblkDevice {
         //   aggressive for ublk under load; disable.
         // - scheduler: mq-deadline adds pointless overhead — userspace
         //   handles I/O ordering.
+        //
+        // Backgrounded: each write costs ~50ms on this kernel (block
+        // layer reconfigure), and they're tuning hints — the device is
+        // fully functional without them. Returning the dev_path
+        // immediately and letting these settle out-of-band is worth
+        // ~100ms per device-create. spawn_blocking because they're
+        // blocking sysfs writes.
         if let Some(dev_name) = dev_path.file_name().and_then(|n| n.to_str()) {
-            let queue = format!("/sys/block/{dev_name}/queue");
-            for (param, value) in [("wbt_lat_usec", "0"), ("scheduler", "none")] {
-                let path = format!("{queue}/{param}");
-                if let Err(e) = std::fs::write(&path, value) {
-                    tracing::warn!(path = %path, error = %e, "failed to set block queue param");
+            let dev_name = dev_name.to_string();
+            tokio::task::spawn_blocking(move || {
+                let queue = format!("/sys/block/{dev_name}/queue");
+                for (param, value) in [("wbt_lat_usec", "0"), ("scheduler", "none")] {
+                    let path = format!("{queue}/{param}");
+                    if let Err(e) = std::fs::write(&path, value) {
+                        tracing::warn!(path = %path, error = %e, "failed to set block queue param");
+                    }
                 }
-            }
+            });
         }
+
+        tracing::info!(
+            target: "glidefs.timing",
+            export = %export_name,
+            dev_id = dev_id_assigned,
+            nr_queues = actual_nr_queues,
+            ctrl_build_us = timings.ctrl_build_us as u64,
+            dev_new_us = timings.dev_new_us as u64,
+            addqueue_send_us = timings.addqueue_send_us as u64,
+            ready_recv_us = timings.ready_recv_us as u64,
+            configure_queue_us = timings.configure_queue_us as u64,
+            configure_queue_last_us = timings.configure_queue_last_us as u64,
+            start_dev_us = timings.start_dev_us as u64,
+            spawn_blocking_total_us = timings.spawn_blocking_total_us as u64,
+            "register_inner timing breakdown"
+        );
 
         tracing::info!(
             dev_id = dev_id_assigned,

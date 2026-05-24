@@ -77,7 +77,7 @@ pub(crate) use with_ctrl_ring_mut_internal;
 ///
 /// # Examples
 /// ```no_run
-/// use libublk::{with_ctrl_ring, ublk_init_ctrl_task_ring};
+/// use ublk_core::{with_ctrl_ring, ublk_init_ctrl_task_ring};
 /// use io_uring::{IoUring, squeue};
 /// use std::os::fd::AsRawFd;
 ///
@@ -118,7 +118,7 @@ where
 ///
 /// # Examples
 /// ```no_run
-/// use libublk::{with_ctrl_ring_mut, ublk_init_ctrl_task_ring};
+/// use ublk_core::{with_ctrl_ring_mut, ublk_init_ctrl_task_ring};
 /// use io_uring::{IoUring, squeue};
 ///
 /// // Initialize the control ring first
@@ -158,7 +158,7 @@ where
 ///
 /// ## Basic custom initialization:
 /// ```no_run
-/// use libublk::ublk_init_ctrl_task_ring;
+/// use ublk_core::ublk_init_ctrl_task_ring;
 /// use io_uring::IoUring;
 ///
 /// fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -182,7 +182,7 @@ where
 ///
 /// ## Advanced initialization with custom flags and size:
 /// ```no_run
-/// use libublk::ublk_init_ctrl_task_ring;
+/// use ublk_core::ublk_init_ctrl_task_ring;
 /// use io_uring::IoUring;
 ///
 /// fn advanced_example() -> Result<(), Box<dyn std::error::Error>> {
@@ -2439,18 +2439,32 @@ impl UblkCtrl {
     ///
     pub fn start_dev(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
+        let t_prep = std::time::Instant::now();
         ctrl.prep_start_dev(dev)?;
+        let prep_us = t_prep.elapsed().as_micros() as u64;
 
         // Wait for all queue buffer registrations to complete
+        let t_wait = std::time::Instant::now();
         dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
+        let wait_us = t_wait.elapsed().as_micros() as u64;
 
-        if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+        let t_start = std::time::Instant::now();
+        let result = if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             ctrl.start(unsafe { libc::getpid() as i32 })
         } else if ctrl.for_recover_dev() {
             ctrl.end_user_recover(unsafe { libc::getpid() as i32 })
         } else {
             Err(crate::UblkError::OtherError(-libc::EINVAL))
-        }
+        };
+        let start_us = t_start.elapsed().as_micros() as u64;
+
+        log::info!(
+            target: "glidefs.timing",
+            "ublk-core start_dev breakdown dev_id={} prep_us={} wait_buf_reg_us={} start_ioctl_us={}",
+            ctrl.dev_info.dev_id, prep_us, wait_us, start_us
+        );
+
+        result
     }
 
     /// Start ublk device in async/.await

@@ -23,6 +23,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::block::handler::BlockHandler;
@@ -757,6 +758,23 @@ async fn run_worker_loop(
             }
         }
 
+        // Tick the executor BEFORE entering io_uring. Newly spawned
+        // io_tasks (e.g. from a fresh `handle_add_queue`) submit their
+        // initial FETCH_REQ uring_cmd SQEs on their first poll, *not*
+        // at spawn-time. If we entered io_uring_enter first with
+        // `to_wait=1`, we'd block here for up to WORKER_IDLE_NSEC
+        // (250ms) waiting for CQEs that physically can't arrive yet —
+        // no SQE has been submitted. The kernel's
+        // `ublk_ctrl_start_dev` blocks on `wait_for_completion` until
+        // every queue's `nr_io_ready` reaches `queue_depth`, so this
+        // 250ms idle-timeout was directly pinning device-add latency
+        // at exactly 250ms (the daemon experiences this as a 250ms
+        // `START_DEV` ioctl). Polling first flushes the FETCH_REQ
+        // SQEs into the ring, then the submit pushes them to the
+        // kernel immediately, which marks the queues ready and
+        // releases `start_dev`.
+        state.executor.tick();
+
         // Drive io_uring. Block in the kernel for up to WORKER_IDLE_NSEC
         // unless an SQE completes or eventfd fires. With nothing hosted,
         // we still spin a short timeout so Shutdown via channel-close is
@@ -855,6 +873,7 @@ fn handle_add_queue(
     qid: u16,
     ready: oneshot::Sender<Result<(), String>>,
 ) {
+    let t_total = Instant::now();
     let dev_id = dev.dev_info.dev_id as i32;
     let queue_depth = dev.dev_info.queue_depth;
     let key = QueueKey { dev_id, qid };
@@ -871,8 +890,10 @@ fn handle_add_queue(
     // high_water_mark)` — the count of slots we can spawn into without
     // hitting AtCapacity. Because the worker is single-threaded, this
     // count is stable between here and the final spawn below.
+    let t_preflight = Instant::now();
     let needed = queue_depth as usize;
     let avail = state.executor.available();
+    let t_preflight_us = t_preflight.elapsed().as_micros();
     if avail < needed {
         tracing::error!(
             worker = worker_idx, ?key,
@@ -888,6 +909,7 @@ fn handle_add_queue(
         return;
     }
 
+    let t_queue_new = Instant::now();
     let q = match UblkQueue::new(qid, Arc::clone(&dev), ring) {
         Ok(q) => Rc::new(q),
         Err(e) => {
@@ -895,6 +917,7 @@ fn handle_add_queue(
             return;
         }
     };
+    let t_queue_new_us = t_queue_new.elapsed().as_micros();
 
     // Spawn one io_task per tag. Each future captures `Rc<UblkQueue>`
     // by value, so the queue stays alive as long as any tag's task is
@@ -911,6 +934,7 @@ fn handle_add_queue(
     // because `ready` below never fires. All other queues hosted on
     // this worker are also lost. This is a "should be unreachable"
     // path; if it ever fires, it's a bug in `QueueExecutor::available`.
+    let t_spawn_loop = Instant::now();
     for tag in 0..queue_depth {
         let q_for_task = q.clone();
         let h_for_task = Arc::clone(&handler);
@@ -926,13 +950,20 @@ fn handle_add_queue(
             }
         }).expect("preflight reserved queue_depth slots; spawn must not fail");
     }
+    let t_spawn_loop_us = t_spawn_loop.elapsed().as_micros();
 
     state.hosted.insert(key, q);
     tracing::debug!(
+        target: "glidefs.timing",
         worker = worker_idx,
-        ?key,
+        dev_id,
+        qid,
         depth = queue_depth,
-        "queue hosted"
+        total_us = t_total.elapsed().as_micros() as u64,
+        preflight_us = t_preflight_us as u64,
+        queue_new_us = t_queue_new_us as u64,
+        spawn_loop_us = t_spawn_loop_us as u64,
+        "handle_add_queue timing"
     );
     let _ = ready.send(Ok(()));
 }

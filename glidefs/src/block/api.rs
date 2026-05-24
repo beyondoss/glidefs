@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -427,25 +428,63 @@ where
                         transport: put_req.transport,
                     };
 
-                    match router
+                    let t_handler = Instant::now();
+                    let t_create = Instant::now();
+                    let create_result = router
                         .create_export(
                             config.clone(),
                             put_req.readonly,
                             put_req.manifest_name.as_deref(),
                             put_req.snapshot_sequence,
                         )
-                        .await
+                        .await;
+                    let t_create_ms = t_create.elapsed().as_millis();
+                    match create_result
                     {
                         Ok(()) => {
                             // Run S3 persist and device registration concurrently.
                             // save_export must succeed; register_device is best-effort.
+                            let t_join = Instant::now();
                             #[cfg(target_os = "linux")]
                             let (save_result, register_result) = tokio::join!(
-                                router.save_export(&config),
-                                router.register_device(name, &transport),
+                                async {
+                                    let t = Instant::now();
+                                    let r = router.save_export(&config).await;
+                                    (r, t.elapsed().as_millis())
+                                },
+                                async {
+                                    let t = Instant::now();
+                                    let r = router.register_device(name, &transport).await;
+                                    (r, t.elapsed().as_millis())
+                                },
                             );
                             #[cfg(not(target_os = "linux"))]
-                            let save_result = router.save_export(&config).await;
+                            let save_result = {
+                                let t = Instant::now();
+                                let r = router.save_export(&config).await;
+                                (r, t.elapsed().as_millis())
+                            };
+                            let t_join_ms = t_join.elapsed().as_millis();
+                            #[cfg(target_os = "linux")]
+                            let (save_result, t_save_ms) = save_result;
+                            #[cfg(target_os = "linux")]
+                            let (register_result, t_register_ms) = register_result;
+                            #[cfg(not(target_os = "linux"))]
+                            let (save_result, t_save_ms) = save_result;
+                            #[cfg(not(target_os = "linux"))]
+                            let t_register_ms: u128 = 0;
+
+                            tracing::info!(
+                                target: "glidefs.timing",
+                                export = %name,
+                                fork = put_req.manifest_name.is_some(),
+                                total_ms = t_handler.elapsed().as_millis() as u64,
+                                create_export_ms = t_create_ms as u64,
+                                join_ms = t_join_ms as u64,
+                                save_export_ms = t_save_ms as u64,
+                                register_device_ms = t_register_ms as u64,
+                                "PUT /api/exports timing"
+                            );
 
                             if let Err(e) = save_result {
                                 // Export is functional locally but won't survive a restart.

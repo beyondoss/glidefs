@@ -336,6 +336,14 @@ pub struct ExportRouter {
     /// Cloning the Arc is ~0ns vs ~100ms for an S3 round-trip.
     base_manifest_cache: parking_lot::Mutex<HashMap<String, Arc<VolumeManifest>>>,
 
+    /// Bounded cache for versioned snapshot manifests. Snapshots at
+    /// `snapshots/{name}/{seq:020}` are immutable by construction —
+    /// `seq` is monotonic and never reused for a given name — so any
+    /// `(s3_prefix, manifest_name, sequence)` tuple identifies bytes
+    /// that are byte-identical forever. Safe to cache without LRU.
+    /// Refusal-on-full mirrors `base_manifest_cache`.
+    snapshot_cache: parking_lot::Mutex<HashMap<(String, String, u64), Arc<VolumeManifest>>>,
+
     /// Bounded cache for boot hot sets (immutable, paired with base manifests).
     /// Key: "{s3_prefix}:{hot_set_name}" → parsed block indices.
     /// Arc-wrapped so it can be shared with background prefetch tasks.
@@ -629,6 +637,7 @@ impl ExportRouter {
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             ublk_server,
             base_manifest_cache: parking_lot::Mutex::new(HashMap::new()),
+            snapshot_cache: parking_lot::Mutex::new(HashMap::new()),
             hot_set_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             bless_tasks: RwLock::new(HashMap::new()),
         })
@@ -1086,35 +1095,60 @@ impl ExportRouter {
         // a device smaller than that).
         let mut device_size = config.size_bytes();
 
+        let t_create_inner = Instant::now();
+        let mut t_manifest_fetch_ms: u128 = 0;
+        let mut manifest_cache_hit: Option<bool> = None;
+        let mut t_cache_init_ms: u128 = 0;
+
         let (cache, volume_manifest) = if let Some(manifest_name) = manifest_name {
             // Fork path: load VolumeManifest, preferring in-memory cache for bases/*
             let is_base = manifest_name.starts_with("bases/");
             let cache_key = format!("{}:{}", s3_prefix, manifest_name);
 
+            let t_manifest = Instant::now();
             let fork_vm = if let Some(seq) = snapshot_sequence {
-                // Fork from a specific versioned snapshot (never cached — snapshots are mutable)
-                match content_store.get_snapshot(manifest_name, seq).await {
-                    Ok(Some(data)) => VolumeManifest::deserialize(&data)
-                        .map_err(|e| RouterError::Manifest(format!("failed to deserialize snapshot volume manifest: {}", e)))?,
-                    Ok(None) => {
-                        return Err(RouterError::Manifest(format!(
-                            "snapshot '{}' seq={} not found",
-                            manifest_name, seq
-                        )));
+                // Fork from a versioned snapshot. The path
+                // `snapshots/{name}/{seq:020}` is immutable by construction:
+                // `seq` is monotonic per-export and never reused, so the
+                // bytes for a given (s3_prefix, manifest_name, sequence)
+                // are identical forever. Cache by that triple.
+                let snap_key = (s3_prefix.clone(), manifest_name.to_string(), seq);
+                if let Some(cached) = self.snapshot_cache.lock().get(&snap_key) {
+                    debug!(manifest = %manifest_name, sequence = seq, "snapshot manifest cache hit");
+                    manifest_cache_hit = Some(true);
+                    VolumeManifest::clone(cached)
+                } else {
+                    manifest_cache_hit = Some(false);
+                    let vm = match content_store.get_snapshot(manifest_name, seq).await {
+                        Ok(Some(data)) => VolumeManifest::deserialize(&data)
+                            .map_err(|e| RouterError::Manifest(format!("failed to deserialize snapshot volume manifest: {}", e)))?,
+                        Ok(None) => {
+                            return Err(RouterError::Manifest(format!(
+                                "snapshot '{}' seq={} not found",
+                                manifest_name, seq
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(RouterError::Manifest(format!(
+                                "snapshot '{}' seq={} fetch error: {}",
+                                manifest_name, seq, e
+                            )));
+                        }
+                    };
+                    let mut cache_map = self.snapshot_cache.lock();
+                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
+                        cache_map.insert(snap_key, Arc::new(vm.clone()));
                     }
-                    Err(e) => {
-                        return Err(RouterError::Manifest(format!(
-                            "snapshot '{}' seq={} fetch error: {}",
-                            manifest_name, seq, e
-                        )));
-                    }
+                    vm
                 }
             } else if is_base {
                 // Check base manifest cache first (bases/* are immutable after bless)
                 if let Some(cached) = self.base_manifest_cache.lock().get(&cache_key) {
                     debug!(manifest = %manifest_name, "base manifest cache hit");
+                    manifest_cache_hit = Some(true);
                     VolumeManifest::clone(cached)
                 } else {
+                    manifest_cache_hit = Some(false);
                     // Cache miss — fetch from S3 and populate
                     let vm = match content_store.get_manifest(manifest_name).await {
                         Ok(Some((data, _etag))) => VolumeManifest::deserialize(&data)
@@ -1157,6 +1191,7 @@ impl ExportRouter {
                     }
                 }
             };
+            t_manifest_fetch_ms = t_manifest.elapsed().as_millis();
 
             // Ensure fork is at least as large as the base
             if device_size < fork_vm.size {
@@ -1185,7 +1220,9 @@ impl ExportRouter {
             };
 
             // Open a fresh cache (local SSD starts empty, reads go through VolumeManifest → ChunkMetaCache → S3)
+            let t_cache = Instant::now();
             let cache = WriteCache::open_fresh_active(cache_config)?;
+            t_cache_init_ms = t_cache.elapsed().as_millis();
 
             info!("Export '{}' created from manifest (fork)", name);
             (Arc::new(cache), volume_manifest)
@@ -1422,6 +1459,17 @@ impl ExportRouter {
             name, readonly
         );
 
+        tracing::info!(
+            target: "glidefs.timing",
+            export = %name,
+            fork = manifest_name.is_some(),
+            total_ms = t_create_inner.elapsed().as_millis() as u64,
+            manifest_fetch_ms = t_manifest_fetch_ms as u64,
+            manifest_cache_hit = ?manifest_cache_hit,
+            cache_init_ms = t_cache_init_ms as u64,
+            "create_export timing"
+        );
+
         Ok(())
     }
 
@@ -1466,6 +1514,36 @@ impl ExportRouter {
             "Snapshot of '{}' complete: seq={}, blocks_claimed={}, packs_uploaded={}",
             name, result.sequence, result.stats.blocks_claimed, result.stats.packs_uploaded,
         );
+
+        // Pre-populate the snapshot cache: the next fork from
+        // (this export, this sequence) — almost certain to follow in box-
+        // manager's ensure_derived_snapshot flow — skips the S3 GET entirely.
+        // Cache-miss path only deserializes once; this is the only place
+        // where the daemon that *wrote* the snapshot also has the bytes
+        // already in memory, so cache hand-off is essentially free.
+        if result.snapshot_persisted {
+            match VolumeManifest::deserialize(&result.manifest_bytes) {
+                Ok(vm) => {
+                    let snap_key = (
+                        content_store.base_path().to_string(),
+                        name.to_string(),
+                        result.sequence,
+                    );
+                    let mut cache_map = self.snapshot_cache.lock();
+                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES
+                        && !cache_map.contains_key(&snap_key)
+                    {
+                        cache_map.insert(snap_key, Arc::new(vm));
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "snapshot cache pre-populate skipped: deserialize failed: {}",
+                        e
+                    );
+                }
+            }
+        }
 
         // If a tag was provided, publish the manifest under that name too.
         // Uses manifest_bytes captured under the flush lock inside snapshot()

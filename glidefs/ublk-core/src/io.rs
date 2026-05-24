@@ -14,9 +14,9 @@
 //!
 //! ### Synchronous Device Creation
 //! ```no_run
-//! use libublk::ctrl::UblkCtrl;
-//! use libublk::io::UblkDev;
-//! use libublk::UblkFlags;
+//! use ublk_core::ctrl::UblkCtrl;
+//! use ublk_core::io::UblkDev;
+//! use ublk_core::UblkFlags;
 //!
 //! fn example() -> Result<(), Box<dyn std::error::Error>> {
 //!     let ctrl = UblkCtrl::new(
@@ -49,7 +49,7 @@
 //! the worker thread that owns the ring can submit through it.
 //!
 //! ```no_run
-//! use libublk::WorkerRing;
+//! use ublk_core::WorkerRing;
 //! use io_uring::IoUring;
 //!
 //! fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -71,11 +71,11 @@
 //!
 //! ### Traditional Buffer Operations
 //! ```no_run
-//! use libublk::io::{BufDesc, UblkQueue};
-//! use libublk::helpers::IoBuf;
-//! use libublk::sys;
+//! use ublk_core::io::{BufDesc, UblkQueue};
+//! use ublk_core::helpers::IoBuf;
+//! use ublk_core::sys;
 //!
-//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue) -> Result<(), ublk_core::UblkError> {
 //!     let io_buf = IoBuf::<u8>::new(4096);
 //!     let slice_desc = BufDesc::from_io_buf(&io_buf);
 //!     let result = queue.submit_io_prep_cmd(0, slice_desc, -1, Some(&io_buf)).await?;
@@ -86,10 +86,10 @@
 //!
 //! ### Zero-Copy Operations
 //! ```no_run
-//! use libublk::io::{BufDesc, UblkQueue};
-//! use libublk::sys;
+//! use ublk_core::io::{BufDesc, UblkQueue};
+//! use ublk_core::sys;
 //!
-//! async fn example(queue: &UblkQueue<'_>) -> Result<(), libublk::UblkError> {
+//! async fn example(queue: &UblkQueue) -> Result<(), ublk_core::UblkError> {
 //!     let auto_reg = sys::ublk_auto_buf_reg {
 //!         index: 0, flags: 0, reserved0: 0, reserved1: 0
 //!     };
@@ -102,11 +102,11 @@
 //!
 //! ### Buffer List Operations
 //! ```no_run
-//! use libublk::io::{BufDescList, UblkQueue};
-//! use libublk::helpers::IoBuf;
-//! use libublk::sys;
+//! use ublk_core::io::{BufDescList, UblkQueue};
+//! use ublk_core::helpers::IoBuf;
+//! use ublk_core::sys;
 //!
-//! fn example(queue: UblkQueue) -> Result<UblkQueue, libublk::UblkError> {
+//! fn example(queue: UblkQueue) -> Result<UblkQueue, ublk_core::UblkError> {
 //!     // For traditional buffer operations
 //!     let mut bufs = Vec::new();
 //!     for _ in 0..queue.get_depth() {
