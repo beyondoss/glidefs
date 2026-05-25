@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Two-tier pack index cache backed by foyer HybridCache.
 //!
 //! Keyed by PackId (u64). Each entry stores the block index for one pack,

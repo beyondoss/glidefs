@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 /// Adapter providing `Read + Write + Seek` over GlideFS block storage.
 ///
 /// Bridges the ext4 Writer/Reader (which use std::io traits) with the

@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Multi-tenant export router for NBD server.
 //!
 //! Manages multiple NBD exports, each with its own write cache and S3 storage.

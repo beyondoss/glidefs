@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};

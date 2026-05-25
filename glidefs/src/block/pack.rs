@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Content-addressed pack format (GLPK v3) for S3 block storage.
 //!
 //! Packs batch multiple compressed blocks into a single S3 object to reduce

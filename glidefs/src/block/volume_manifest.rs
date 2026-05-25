@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Volume manifest v5: binary GLVM format with pack ID lists per chunk.
 //!
 //! The volume manifest maps chunk indices to ordered lists of pack IDs.
