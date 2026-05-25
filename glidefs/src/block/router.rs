@@ -1467,14 +1467,19 @@ impl ExportRouter {
             name, readonly
         );
 
+        #[allow(clippy::cast_possible_truncation)]
+        let manifest_fetch_ms = t_manifest_fetch_ms as u64; // timing < u64::MAX millis
+        #[allow(clippy::cast_possible_truncation)]
+        let cache_init_ms = t_cache_init_ms as u64; // timing < u64::MAX millis
+
         tracing::info!(
             target: "glidefs.timing",
             export = %name,
             fork = manifest_name.is_some(),
             total_ms = t_create_inner.elapsed().as_millis() as u64,
-            manifest_fetch_ms = t_manifest_fetch_ms as u64,
+            manifest_fetch_ms,
             manifest_cache_hit = ?manifest_cache_hit,
-            cache_init_ms = t_cache_init_ms as u64,
+            cache_init_ms,
             "create_export timing"
         );
 
@@ -1788,9 +1793,11 @@ impl ExportRouter {
             wal_sync: false,
         })?);
 
+        #[allow(clippy::cast_possible_truncation)]
+        let block_size_u32 = self.block_size as u32; // block_size typically 4096, fits in u32
         let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
             device_size,
-            self.block_size as u32,
+            block_size_u32,
         )));
 
         // Build ContentStore reusing router's shared infra.
@@ -2497,7 +2504,8 @@ impl ExportRouter {
             )
         };
 
-        let new_size_bytes = (new_size_gb * 1_073_741_824.0) as u64;
+        #[allow(clippy::cast_sign_loss)]
+        let new_size_bytes = (new_size_gb * 1_073_741_824.0) as u64; // new_size_gb >= 0, result always positive
         let current_size_gb = current_size as f64 / 1_073_741_824.0;
 
         // Validate: grow only
