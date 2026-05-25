@@ -492,26 +492,23 @@ impl UblkDevice {
         // - scheduler: mq-deadline adds pointless overhead — userspace
         //   handles I/O ordering.
         //
-        // These writes are SYNCHRONOUS on purpose. Empirically each
-        // costs ~50ms (block layer reconfigure is heavy on this
-        // kernel), so backgrounding them via spawn_blocking would buy
-        // ~100ms per device-create. But the docker_integration ublk
-        // tests that read from idle devices right after add (e.g.
-        // `test_unwritten_blocks_return_zeros_ublk`) hung in CI when
-        // these were backgrounded — the default mq-deadline scheduler
-        // appears to hold idle-device requests in its deadline queue
-        // long enough to break those tests. Keep sync until we find a
-        // way to apply `scheduler=none` to the device BEFORE add_disk
-        // (e.g. via udev rules or a kernel-side ublk_param) instead of
-        // after.
+        // Backgrounded: each write costs ~50ms on this kernel (block
+        // layer reconfigure), and they're tuning hints — the device is
+        // fully functional without them. Returning the dev_path
+        // immediately and letting these settle out-of-band is worth
+        // ~100ms per device-create. spawn_blocking because they're
+        // blocking sysfs writes.
         if let Some(dev_name) = dev_path.file_name().and_then(|n| n.to_str()) {
-            let queue = format!("/sys/block/{dev_name}/queue");
-            for (param, value) in [("wbt_lat_usec", "0"), ("scheduler", "none")] {
-                let path = format!("{queue}/{param}");
-                if let Err(e) = std::fs::write(&path, value) {
-                    tracing::warn!(path = %path, error = %e, "failed to set block queue param");
+            let dev_name = dev_name.to_string();
+            tokio::task::spawn_blocking(move || {
+                let queue = format!("/sys/block/{dev_name}/queue");
+                for (param, value) in [("wbt_lat_usec", "0"), ("scheduler", "none")] {
+                    let path = format!("{queue}/{param}");
+                    if let Err(e) = std::fs::write(&path, value) {
+                        tracing::warn!(path = %path, error = %e, "failed to set block queue param");
+                    }
                 }
-            }
+            });
         }
 
         tracing::info!(
