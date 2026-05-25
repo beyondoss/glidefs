@@ -411,7 +411,7 @@ async fn reconcile_prefix(
                     .bytes()
                     .await
                     .map_err(|e| anyhow::anyhow!("failed to read manifest {} bytes: {}", name, e))?;
-                match VolumeManifest::deserialize(&data.to_vec()) {
+                match VolumeManifest::deserialize(&data) {
                     Ok(vm) => Ok(Some((name, vm.all_pack_ids()))),
                     Err(e) => Err(anyhow::anyhow!(
                         "failed to parse volume manifest {}: {}",

@@ -131,6 +131,7 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
             ublk_nr_queues: settings.ublk_nr_queues(),
             nbd_dead_conn_timeout: nbd_config.nbd_dead_conn_timeout(),
             max_exports: nbd_config.max_exports(),
+            manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .context("Failed to initialize export router")?,
@@ -246,6 +247,18 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
 pub async fn run_server(config_path: PathBuf) -> Result<()> {
     init_tracing();
 
+    // Idempotently install the udev rule that applies safe block-layer
+    // tunables (scheduler=none, wbt_lat_usec=0, ...) during the
+    // kernel's `add_disk` KOBJ_ADD uevent. Doing this at daemon
+    // startup means operators don't have to ship the rule out-of-band
+    // (ansible, packer, etc.) — the daemon ensures it's present.
+    // Affects only future device creations; existing devices keep
+    // whatever scheduler they were registered with. Idempotent: only
+    // writes the file + reloads udev if content differs from what's
+    // already on disk.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    install_ublk_udev_rule();
+
     let built = build_router_only(config_path.clone()).await?;
 
     // Recover QUIESCED ublk devices from a previous daemon crash.
@@ -260,6 +273,60 @@ pub async fn run_server(config_path: PathBuf) -> Result<()> {
     }
 
     serve_with_router(built, config_path).await
+}
+
+/// Content of the ublk udev rule, embedded at compile time so the
+/// binary is the source of truth and operators don't need to ship a
+/// file out-of-band.
+///
+/// See `deploy/udev/99-glidefs-ublk.rules` for the canonical version
+/// (the two MUST stay in sync — `include_str!` enforces that).
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+const UBLK_UDEV_RULE: &str =
+    include_str!("../../../deploy/udev/99-glidefs-ublk.rules");
+
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+const UBLK_UDEV_RULE_PATH: &str = "/etc/udev/rules.d/99-glidefs-ublk.rules";
+
+/// Write the udev rule to /etc/udev/rules.d and reload udev — but only
+/// if the file's contents differ. Logs and continues on failure: if we
+/// can't install the rule (read-only fs, no permission, no udev) the
+/// daemon should still come up; block devices will just run with their
+/// kernel defaults until an operator intervenes.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+fn install_ublk_udev_rule() {
+    let path = std::path::Path::new(UBLK_UDEV_RULE_PATH);
+    let needs_write = match std::fs::read_to_string(path) {
+        Ok(existing) => existing != UBLK_UDEV_RULE,
+        Err(_) => true,
+    };
+    if !needs_write {
+        return;
+    }
+    if let Err(e) = std::fs::write(path, UBLK_UDEV_RULE) {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "could not install ublk udev rule — block devices will run with \
+             kernel default scheduler/wbt (functional but suboptimal)"
+        );
+        return;
+    }
+    info!("installed udev rule at {}", path.display());
+    // Tell udev to pick it up. If this fails the rule still applies to
+    // any new device added after udev's next periodic rescan, so a
+    // failure here is non-fatal.
+    match std::process::Command::new("udevadm")
+        .args(["control", "--reload-rules"])
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => warn!(
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "udevadm control --reload-rules exited non-zero"
+        ),
+        Err(e) => warn!(error = %e, "could not invoke udevadm"),
+    }
 }
 
 /// Listener-binding + signal-loop portion of daemon lifecycle. Shared
@@ -752,6 +819,14 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
     }
 
     info!(socket = %socket_path.display(), "starting in successor mode");
+
+    // Same idempotent install as the cold-start path. The cold-start
+    // call in `run_server` doesn't fire on rolling deploys, so without
+    // this any new ublk devices created by the successor would come up
+    // with default tunables (mq-deadline, wbt 2ms, kernel readahead) —
+    // a silent regression on every handoff.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    install_ublk_udev_rule();
 
     // The predecessor passes `--config <path>` to us. Sniff it from argv
     // without invoking clap (clap doesn't know about `--handoff-from`).

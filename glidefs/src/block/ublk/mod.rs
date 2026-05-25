@@ -403,7 +403,7 @@ async fn probe_quiesced_glidefs(dev_id: i32) -> Option<u16> {
         if name != "glidefs" && name != "none" {
             return None;
         }
-        if (ctrl.dev_info().state as u32)
+        if u32::from(ctrl.dev_info().state)
             != ublk_core::sys::UBLK_S_DEV_QUIESCED
         {
             return None;
@@ -521,7 +521,7 @@ impl UblkServer {
                 // Only recover QUIESCED devices. LIVE devices are still
                 // serving I/O (somehow); leave them alone. STOPPED
                 // devices are mid-teardown.
-                let state = ctrl.dev_info().state as u32;
+                let state = u32::from(ctrl.dev_info().state);
                 if state != ublk_core::sys::UBLK_S_DEV_QUIESCED {
                     tracing::debug!(dev_id, %name, state, "skipping non-QUIESCED device");
                     continue;
@@ -761,7 +761,7 @@ impl UblkServer {
                         let Ok(ctrl) = ublk_core::ctrl::UblkCtrl::new_simple(dev_id) else {
                             break None;
                         };
-                        let state = ctrl.dev_info().state as u32;
+                        let state = u32::from(ctrl.dev_info().state);
                         if state == ublk_core::sys::UBLK_S_DEV_QUIESCED {
                             break Some((ctrl.dev_info().nr_hw_queues, state));
                         }
@@ -879,11 +879,9 @@ impl UblkServer {
         };
 
         let mut recovered = 0usize;
-        for outcome in outcomes {
-            if let Ok((name, dev)) = outcome {
-                self.devices.insert(name, dev);
-                recovered += 1;
-            }
+        for (name, dev) in outcomes.into_iter().flatten() {
+            self.devices.insert(name, dev);
+            recovered += 1;
         }
 
         self.persist_devices();

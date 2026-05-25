@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -427,32 +428,76 @@ where
                         transport: put_req.transport,
                     };
 
-                    match router
+                    let t_handler = Instant::now();
+                    let t_create = Instant::now();
+                    let create_result = router
                         .create_export(
                             config.clone(),
                             put_req.readonly,
                             put_req.manifest_name.as_deref(),
                             put_req.snapshot_sequence,
                         )
-                        .await
+                        .await;
+                    let t_create_ms = t_create.elapsed().as_millis();
+                    match create_result
                     {
                         Ok(()) => {
                             // Run S3 persist and device registration concurrently.
                             // save_export must succeed; register_device is best-effort.
+                            let t_join = Instant::now();
                             #[cfg(target_os = "linux")]
                             let (save_result, register_result) = tokio::join!(
-                                router.save_export(&config),
-                                router.register_device(name, &transport),
+                                async {
+                                    let t = Instant::now();
+                                    let r = router.save_export(&config).await;
+                                    (r, t.elapsed().as_millis())
+                                },
+                                async {
+                                    let t = Instant::now();
+                                    let r = router.register_device(name, &transport).await;
+                                    (r, t.elapsed().as_millis())
+                                },
                             );
                             #[cfg(not(target_os = "linux"))]
-                            let save_result = router.save_export(&config).await;
+                            let save_result = {
+                                let t = Instant::now();
+                                let r = router.save_export(&config).await;
+                                (r, t.elapsed().as_millis())
+                            };
+                            let t_join_ms = t_join.elapsed().as_millis();
+                            #[cfg(target_os = "linux")]
+                            let (save_result, t_save_ms) = save_result;
+                            #[cfg(target_os = "linux")]
+                            let (register_result, t_register_ms) = register_result;
+                            #[cfg(not(target_os = "linux"))]
+                            let (save_result, t_save_ms) = save_result;
+                            #[cfg(not(target_os = "linux"))]
+                            let t_register_ms: u128 = 0;
+
+                            tracing::info!(
+                                target: "glidefs.timing",
+                                export = %name,
+                                fork = put_req.manifest_name.is_some(),
+                                total_ms = t_handler.elapsed().as_millis() as u64,
+                                create_export_ms = t_create_ms as u64,
+                                join_ms = t_join_ms as u64,
+                                save_export_ms = t_save_ms as u64,
+                                register_device_ms = t_register_ms as u64,
+                                "PUT /api/exports timing"
+                            );
 
                             if let Err(e) = save_result {
-                                // Export is functional locally but won't survive a restart.
-                                // Return 503 so the orchestrator can retry (create_export is idempotent).
+                                // Without teardown, the in-memory entry silently
+                                // shadows the missing S3 export.json — retries
+                                // hit `create_export`'s idempotency check and
+                                // never re-attempt the S3 write.
+                                router.cleanup_failed_create(name, &transport).await;
                                 return Ok(error_response(
                                     StatusCode::SERVICE_UNAVAILABLE,
-                                    &format!("Export created but definition not persisted to S3: {e}"),
+                                    &format!(
+                                        "Export definition not persisted to S3 ({e}); \
+                                         in-memory state cleaned up, retry the request"
+                                    ),
                                 ));
                             }
 
@@ -1166,6 +1211,7 @@ mod tests {
                 ublk_nr_queues: 1,
                 nbd_dead_conn_timeout: 0,
                 max_exports: 10_000,
+                manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
             })
             .await
             .expect("failed to create test router"),
@@ -1303,6 +1349,195 @@ mod tests {
             Some(r#"{"size_gb": 0.01}"#),
         )
         .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Wraps `InMemory` and fails `put_opts` when armed. Used to simulate
+    /// the S3 outage that makes `save_export` return `Err` mid-PUT.
+    struct PutFailingStore {
+        inner: object_store::memory::InMemory,
+        fail_puts: std::sync::atomic::AtomicBool,
+    }
+
+    impl PutFailingStore {
+        fn new() -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                fail_puts: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail(&self, fail: bool) {
+            self.fail_puts
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Display for PutFailingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PutFailingStore")
+        }
+    }
+
+    impl std::fmt::Debug for PutFailingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PutFailingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for PutFailingStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.fail_puts.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "PutFailingStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "simulated S3 PUT outage",
+                    )),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    async fn create_test_router_with_store(
+        temp_dir: &TempDir,
+        store: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<ExportRouter> {
+        Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store: store,
+                db_path: "test".to_string(),
+                cache_dir: temp_dir.path().to_path_buf(),
+                block_size: 128 * 1024,
+                clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+                wal_sync: false,
+                max_s3_uploads: 0,
+                max_s3_downloads: 0,
+                default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
+                ublk_nr_queues: 1,
+                nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
+                manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+            })
+            .await
+            .expect("failed to create test router"),
+        )
+    }
+
+    /// Full HTTP-stack verification of Stage 2b: when `save_export` fails
+    /// after `create_export` succeeded, the PUT must respond 503 AND clear
+    /// the in-memory entry so a subsequent retry re-runs from scratch.
+    ///
+    /// Without the fix, the second PUT would hit `create_export`'s
+    /// idempotency check, return 200 immediately, and S3 would still have
+    /// no export.json — silent data loss on the next daemon restart.
+    #[tokio::test]
+    async fn test_put_503_on_save_failure_cleans_up_and_retry_succeeds() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(PutFailingStore::new());
+        let router = create_test_router_with_store(&temp, store.clone()).await;
+
+        // Arm the failure: any PUT to S3 (including save_export) returns Err.
+        store.set_fail(true);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "save_export failure must surface as 503"
+        );
+
+        // In-memory state must be gone. The bug: without cleanup_failed_create
+        // the export sits in `self.exports` and GET would return 200.
+        let resp = request(&router, Method::GET, "/api/exports/vol1", None).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "in-memory state must be torn down after save_export failure"
+        );
+
+        // S3 recovers — retry succeeds. This is the "idempotent retry actually
+        // works" assertion: without cleanup, this PUT would hit the idempotency
+        // check and 200 with no S3 write.
+        store.set_fail(false);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "retry after S3 recovery must re-run create_export and save_export"
+        );
+
+        // Confirm the export now exists in-memory.
+        let resp = request(&router, Method::GET, "/api/exports/vol1", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 

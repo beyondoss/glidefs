@@ -71,7 +71,7 @@ pub async fn run_bless(
 
     let volume_manifest_template = VolumeManifest::new(device_size, BLOCK_SIZE);
     let blocks_per_chunk = volume_manifest_template.blocks_per_chunk();
-    let total_blocks = device_size.div_ceil(BLOCK_SIZE as u64) as usize;
+    let total_blocks = device_size.div_ceil(u64::from(BLOCK_SIZE)) as usize;
 
     info!(device_size, total_blocks, blocks_per_chunk, "reading image");
 
@@ -365,7 +365,7 @@ pub async fn run_bless_oci(
         // Collect chunk data under the read lock, then release before awaiting.
         let (blocks_per_chunk, chunk_packs): (u64, Vec<(u32, Vec<u64>)>) = {
             let vm = volume_manifest.read();
-            let bpc = vm.blocks_per_chunk() as u64;
+            let bpc = u64::from(vm.blocks_per_chunk());
             let cp = vm
                 .chunks
                 .iter()
@@ -380,7 +380,7 @@ pub async fn run_bless_oci(
                 match pack_index_cache.get_entries(pack_id).await {
                     Some(entries) => {
                         for e in entries.iter() {
-                            let global_block = *chunk_idx as u64 * blocks_per_chunk + e.chunk_offset as u64;
+                            let global_block = u64::from(*chunk_idx) * blocks_per_chunk + u64::from(e.chunk_offset);
                             indices.push(global_block);
                         }
                     }
@@ -495,7 +495,7 @@ async fn start_chunk_upload(
             .stream_chunk_pack(chunk_idx, pack_id, pack_blocks, BLOCK_SIZE)
             .await
             .context("Failed to stream chunk pack")?;
-        let pack_size = entries.iter().map(|e| e.comp_length as u64).sum::<u64>();
+        let pack_size = entries.iter().map(|e| u64::from(e.comp_length)).sum::<u64>();
         Ok(ChunkUploadResult {
             chunk_idx,
             pack_id,

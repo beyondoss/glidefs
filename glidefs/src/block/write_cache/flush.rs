@@ -8,7 +8,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
 use crate::block::cache::BlockCache;
-use crate::block::content_store::{ContentStore, ContentStoreError};
+use crate::block::content_store::ContentStore;
 use crate::block::state::{Active, Draining};
 
 use super::inner::{CacheInner, is_zero_block};
@@ -82,8 +82,7 @@ fn compute_flush_batch(
         .flushing_file
         .lock()
         .as_ref()
-        .ok_or_else(|| CacheError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        .ok_or_else(|| CacheError::Io(std::io::Error::other(
             "compute_flush_batch: no flushing file (rotation not performed)",
         )))?
         .clone();
@@ -369,8 +368,8 @@ impl WriteCache<Active> {
             if old != SparseBlockState::DIRTY {
                 self.inner.state_map.set_present(idx);
                 let current = self.inner.state_map.get(idx);
-                if current != SparseBlockState::DIRTY {
-                    if self
+                if current != SparseBlockState::DIRTY
+                    && self
                         .inner
                         .state_map
                         .cas(idx, current, SparseBlockState::DIRTY)
@@ -380,7 +379,6 @@ impl WriteCache<Active> {
                             .dirty_block_count
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                }
             }
         }
 
@@ -1310,12 +1308,11 @@ impl WriteCache<Active> {
             // (same content → same pack_id), skip upload entirely.
             {
                 let vm = volume_manifest.read();
-                if let Some(pack_ids) = vm.chunk_pack_ids(chunk_idx) {
-                    if pack_ids.contains(&pack_id) {
+                if let Some(pack_ids) = vm.chunk_pack_ids(chunk_idx)
+                    && pack_ids.contains(&pack_id) {
                         total_stats.packs_skipped += 1;
                         continue;
                     }
-                }
             }
 
             // Cross-export dedup: content-addressed pack_id means identical
@@ -1339,7 +1336,7 @@ impl WriteCache<Active> {
                 total_stats.packs_uploaded += 1;
                 total_stats.bytes_uploaded += index_entries
                     .iter()
-                    .map(|e| e.comp_length as u64)
+                    .map(|e| u64::from(e.comp_length))
                     .sum::<u64>();
                 pack_index_cache.insert_entries(pid, &index_entries);
                 staged_appends.push((ci, pid));
@@ -1352,7 +1349,7 @@ impl WriteCache<Active> {
             total_stats.packs_uploaded += 1;
             total_stats.bytes_uploaded += index_entries
                 .iter()
-                .map(|e| e.comp_length as u64)
+                .map(|e| u64::from(e.comp_length))
                 .sum::<u64>();
             pack_index_cache.insert_entries(pack_id, &index_entries);
             staged_appends.push((chunk_idx, pack_id));

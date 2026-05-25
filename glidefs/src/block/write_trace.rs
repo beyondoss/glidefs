@@ -104,8 +104,8 @@ impl WriteTracer {
     /// span > 1.
     #[inline]
     pub fn record(&self, offset: u64, length: u64, op: TraceOp) {
-        let block_start = (offset / self.block_size as u64) as u32;
-        let block_end = ((offset + length).div_ceil(self.block_size as u64)) as u32;
+        let block_start = (offset / u64::from(self.block_size)) as u32;
+        let block_end = ((offset + length).div_ceil(u64::from(self.block_size))) as u32;
         let span = (block_end - block_start) as u16;
         let elapsed_us = self.start.elapsed().as_micros() as u64;
 

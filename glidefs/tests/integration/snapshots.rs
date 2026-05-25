@@ -141,6 +141,7 @@ async fn test_fork_from_snapshot() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -322,6 +323,7 @@ async fn test_purge_export_deletes_snapshots() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -379,6 +381,7 @@ async fn test_api_list_and_delete_snapshots() {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
+            manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .unwrap(),
@@ -495,6 +498,7 @@ async fn test_remove_without_purge_preserves_snapshots() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -551,6 +555,7 @@ async fn test_snapshot_tag_and_fork() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -619,6 +624,7 @@ async fn test_standalone_tag() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -1109,6 +1115,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -1358,6 +1365,7 @@ async fn test_head_manifest_not_found() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -1393,6 +1401,7 @@ async fn test_fork_parent_deleted_child_survives() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -1475,6 +1484,7 @@ async fn test_fork_parent_deleted_child_survives() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -1557,6 +1567,7 @@ async fn test_fork_concurrent_parent_write_during_fork() {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
+            manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .unwrap(),
@@ -1666,6 +1677,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -1738,6 +1750,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -1794,6 +1807,7 @@ async fn test_fork_from_snapshot_during_active_writes() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();
@@ -1889,6 +1903,7 @@ async fn test_fork_both_children_from_same_parent() {
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     })
     .await
     .unwrap();

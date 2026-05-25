@@ -85,9 +85,9 @@ pub struct KernelFeatures {
 /// `get_features()` is unavailable.
 pub fn detect_features() -> KernelFeatures {
     let raw = UblkCtrl::get_features().unwrap_or(0);
-    let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
-    let ioctl_encode = (raw & sys::UBLK_F_CMD_IOCTL_ENCODE as u64) != 0;
-    let per_io_daemon = (raw & sys::UBLK_F_PER_IO_DAEMON as u64) != 0;
+    let recovery = (raw & u64::from(sys::UBLK_F_USER_RECOVERY)) != 0;
+    let ioctl_encode = (raw & u64::from(sys::UBLK_F_CMD_IOCTL_ENCODE)) != 0;
+    let per_io_daemon = (raw & u64::from(sys::UBLK_F_PER_IO_DAEMON)) != 0;
 
     tracing::info!(
         recovery,
@@ -270,10 +270,10 @@ impl UblkDevice {
         let mut ctrl_flags: u64 = 0;
         if features.recovery {
             ctrl_flags |=
-                sys::UBLK_F_USER_RECOVERY as u64 | sys::UBLK_F_USER_RECOVERY_REISSUE as u64;
+                u64::from(sys::UBLK_F_USER_RECOVERY) | u64::from(sys::UBLK_F_USER_RECOVERY_REISSUE);
         }
         if features.ioctl_encode {
-            ctrl_flags |= sys::UBLK_F_CMD_IOCTL_ENCODE as u64;
+            ctrl_flags |= u64::from(sys::UBLK_F_CMD_IOCTL_ENCODE);
         }
         // USER_COPY decouples buffer ownership from tag arming — `io_task`
         // allocates buffers on demand from a per-worker pool (see
@@ -287,7 +287,7 @@ impl UblkDevice {
         // legacy bounce path — kept as a kill switch in case a kernel exposes
         // a USER_COPY regression.
         if std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none() {
-            ctrl_flags |= sys::UBLK_F_USER_COPY as u64;
+            ctrl_flags |= u64::from(sys::UBLK_F_USER_COPY);
         }
 
         // Snapshot per-worker handles so the spawn_blocking closure can
@@ -302,6 +302,24 @@ impl UblkDevice {
                 pool.worker_snapshot(&export_name, qid, preferred_node),
             ));
         }
+        // Surface qid→worker placement so we can see whether queues
+        // spread across workers (parallel mmaps) or pile on a few
+        // (serial). Stage 3a investigation.
+        {
+            let placement: Vec<(u16, usize)> = (0..nr_queues_max)
+                .map(|qid| {
+                    let w = pool.worker_for(&export_name, qid, preferred_node);
+                    (qid, w.idx)
+                })
+                .collect();
+            tracing::info!(
+                target: "glidefs.timing",
+                export = %export_name,
+                nr_queues = nr_queues_max,
+                placement = ?placement,
+                "ublk queue→worker placement"
+            );
+        }
 
         let export_for_json = export_name.clone();
         let handler_for_workers = Arc::clone(&handler);
@@ -310,8 +328,23 @@ impl UblkDevice {
         // build, UblkDev::new, start_dev, and the original ctrl's Drop.
         // CTRL_URING is initialized once (during build) and used for
         // every subsequent op including Drop.
-        let outcome: anyhow::Result<(i32, PathBuf, Arc<UblkDev>, u16)> =
+        #[derive(Default)]
+        struct RegTimings {
+            ctrl_build_us: u128,
+            dev_new_us: u128,
+            addqueue_send_us: u128,
+            ready_recv_us: u128,
+            configure_queue_us: u128,
+            configure_queue_last_us: u128,
+            start_dev_us: u128,
+            spawn_blocking_total_us: u128,
+        }
+        let outcome: anyhow::Result<(i32, PathBuf, Arc<UblkDev>, u16, RegTimings)> =
             tokio::task::spawn_blocking(move || {
+                let t_blocking_start = std::time::Instant::now();
+                let mut timings = RegTimings::default();
+
+                let t = std::time::Instant::now();
                 let ctrl = UblkCtrlBuilder::default()
                     .name("glidefs")
                     .id(preferred_dev_id)
@@ -322,6 +355,7 @@ impl UblkDevice {
                     .ctrl_flags(ctrl_flags)
                     .build()
                     .map_err(|e| anyhow::anyhow!("ublk ctrl build failed: {e:?}"))?;
+                timings.ctrl_build_us = t.elapsed().as_micros();
 
                 let tgt_init = move |d: &mut UblkDev| {
                     d.tgt.dev_size = dev_size;
@@ -352,15 +386,18 @@ impl UblkDevice {
                     };
                     Ok(())
                 };
+                let t = std::time::Instant::now();
                 let dev = Arc::new(
                     UblkDev::new(ctrl.get_name(), tgt_init, &ctrl)
                         .map_err(|e| anyhow::anyhow!("UblkDev::new failed: {e:?}"))?,
                 );
+                timings.dev_new_us = t.elapsed().as_micros();
 
                 let actual_nr_queues = dev.dev_info.nr_hw_queues;
 
                 // AddQueue dispatch via blocking sends. Each worker's
                 // mpsc::Sender accepts blocking_send from a sync ctx.
+                let t = std::time::Instant::now();
                 let mut readys = Vec::with_capacity(actual_nr_queues as usize);
                 for qid in 0..actual_nr_queues {
                     let (worker_idx, snap) = &worker_dispatch[qid as usize];
@@ -378,10 +415,14 @@ impl UblkDevice {
                     super::device::signal_eventfd(snap.eventfd.fd());
                     readys.push((*worker_idx, ready_rx));
                 }
+                timings.addqueue_send_us = t.elapsed().as_micros();
+
                 for (qid_, (worker_idx, ready_rx)) in readys.into_iter().enumerate() {
+                    let t_recv = std::time::Instant::now();
                     let result = ready_rx.blocking_recv().map_err(|_| {
                         anyhow::anyhow!("worker {worker_idx} dropped ready sender")
                     })?;
+                    timings.ready_recv_us += t_recv.elapsed().as_micros();
                     result.map_err(|s| {
                         anyhow::anyhow!("worker {worker_idx} AddQueue failed: {s}")
                     })?;
@@ -396,15 +437,27 @@ impl UblkDevice {
                     // pool model many queues share one worker thread —
                     // there's no meaningful 1:1 mapping. The tid is only
                     // used for diagnostics; recovery doesn't depend on it.
+                    let t_cfg = std::time::Instant::now();
                     let _ = ctrl.configure_queue(&dev, qid_ as u16, 0);
+                    let cfg_us = t_cfg.elapsed().as_micros();
+                    // The last configure_queue triggers build_json (one
+                    // ioctl per qid for queue_affinity) — track it
+                    // separately so we can see if it dominates.
+                    if (qid_ as u16) + 1 == actual_nr_queues {
+                        timings.configure_queue_last_us = cfg_us;
+                    } else {
+                        timings.configure_queue_us += cfg_us;
+                    }
                 }
 
                 // All queues attached. Issue START_DEV (or
                 // END_USER_RECOVERY for the recovery path; ublk-core's
                 // start_dev() picks based on device state).
+                let t = std::time::Instant::now();
                 ctrl.start_dev(&dev).map_err(|e| {
                     anyhow::anyhow!("start_dev failed: {e:?}")
                 })?;
+                timings.start_dev_us = t.elapsed().as_micros();
 
                 let dev_id = i32::try_from(ctrl.dev_info().dev_id)
                     .map_err(|_| anyhow::anyhow!("dev_id overflows i32"))?;
@@ -418,11 +471,13 @@ impl UblkDevice {
                 // on this thread when the closure returns.
                 ctrl.disarm_drop();
 
-                Ok((dev_id, dev_path, dev, actual_nr_queues))
+                timings.spawn_blocking_total_us = t_blocking_start.elapsed().as_micros();
+
+                Ok((dev_id, dev_path, dev, actual_nr_queues, timings))
             })
             .await?;
 
-        let (dev_id_assigned, dev_path, dev, actual_nr_queues) = outcome?;
+        let (dev_id_assigned, dev_path, dev, actual_nr_queues, timings) = outcome?;
         if actual_nr_queues != nr_queues {
             tracing::warn!(
                 requested = nr_queues,
@@ -431,20 +486,39 @@ impl UblkDevice {
             );
         }
 
-        // Tune kernel block queue for a userspace device:
-        // - wbt (write-back throttle): default 2ms target is too
-        //   aggressive for ublk under load; disable.
-        // - scheduler: mq-deadline adds pointless overhead — userspace
-        //   handles I/O ordering.
-        if let Some(dev_name) = dev_path.file_name().and_then(|n| n.to_str()) {
-            let queue = format!("/sys/block/{dev_name}/queue");
-            for (param, value) in [("wbt_lat_usec", "0"), ("scheduler", "none")] {
-                let path = format!("{queue}/{param}");
-                if let Err(e) = std::fs::write(&path, value) {
-                    tracing::warn!(path = %path, error = %e, "failed to set block queue param");
-                }
-            }
-        }
+        // Block-layer tunables (scheduler=none, wbt_lat_usec=0,
+        // add_random=0, read_ahead_kb=0) are NOT applied here. They
+        // ship as a udev rule in `deploy/udev/99-glidefs-ublk.rules`
+        // which fires during the kernel's `add_disk` KOBJ_ADD uevent
+        // — before userspace can open /dev/ublkbN and before any bios
+        // are routed through the device.
+        //
+        // Why udev instead of a post-add_disk sysfs write from here:
+        // changing `scheduler` calls `elv_iosched_store` →
+        // `blk_mq_freeze_queue_wait`, which on kernel 6.17+ counts
+        // our armed FETCH_REQ uring_cmds as in-flight requests. They
+        // never "complete" — they're parked waiting for the next
+        // I/O — so the freeze blocks indefinitely. We reproduced this
+        // on Azure 6.17 with the tokio worker's kernel stack pinned
+        // in `blk_mq_freeze_queue_wait`. udev fires the writes during
+        // KOBJ_ADD, before FETCH_REQs are armed, so the freeze has
+        // nothing to wait for.
+
+        tracing::info!(
+            target: "glidefs.timing",
+            export = %export_name,
+            dev_id = dev_id_assigned,
+            nr_queues = actual_nr_queues,
+            ctrl_build_us = timings.ctrl_build_us as u64,
+            dev_new_us = timings.dev_new_us as u64,
+            addqueue_send_us = timings.addqueue_send_us as u64,
+            ready_recv_us = timings.ready_recv_us as u64,
+            configure_queue_us = timings.configure_queue_us as u64,
+            configure_queue_last_us = timings.configure_queue_last_us as u64,
+            start_dev_us = timings.start_dev_us as u64,
+            spawn_blocking_total_us = timings.spawn_blocking_total_us as u64,
+            "register_inner timing breakdown"
+        );
 
         tracing::info!(
             dev_id = dev_id_assigned,
@@ -513,7 +587,7 @@ impl UblkDevice {
         // `ManuallyDrop<UblkDevice>` itself — we'd double-free the
         // fields — and the original Drop impl is just a `trace!`, so
         // skipping it is benign.
-        let mut this = std::mem::ManuallyDrop::new(self);
+        let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: each field is read exactly once and ownership is
         // tracked statically below. `this` is never dropped.
         let dev_id = this.dev_id;
@@ -1115,7 +1189,7 @@ pub(super) async fn io_task(
     tag: u16,
     handler: &BlockHandler,
 ) -> Result<(), UblkError> {
-    let user_copy = (q.dev.dev_info.flags & ublk_core::sys::UBLK_F_USER_COPY as u64) != 0;
+    let user_copy = (q.dev.dev_info.flags & u64::from(ublk_core::sys::UBLK_F_USER_COPY)) != 0;
     if user_copy {
         return io_task_user_copy(q, tag, handler).await;
     }

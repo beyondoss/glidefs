@@ -707,7 +707,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
 
         let max_blocks = ((self.max_disk_size - 1) / BLOCK_SIZE as i64 + 1) as u64;
-        let max_groups = ((max_blocks - 1) / BLOCKS_PER_GROUP as u64 + 1) as u32;
+        let max_groups = ((max_blocks - 1) / u64::from(BLOCKS_PER_GROUP) + 1) as u32;
         self.gd_blocks = (max_groups - 1) / GROUPS_PER_DESCRIPTOR_BLOCK + 1;
 
         // Skip past superblock and group descriptor table
@@ -1082,7 +1082,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.write_bytes(&jbd2_sb)?;
 
         // Zero-fill remaining journal blocks
-        self.write_zeros((self.journal_blocks as i64 - 1) * BLOCK_SIZE as i64)?;
+        self.write_zeros((i64::from(self.journal_blocks) - 1) * BLOCK_SIZE as i64)?;
 
         // Build extent data for journal inode: single extent covering all journal blocks
         let mut extent_data = [0u8; INODE_DATA_SIZE];
@@ -1099,7 +1099,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         extent_data[20..24].copy_from_slice(&journal_start.to_le_bytes()); // ee_start_lo
 
         // Create journal inode at index 7 (inode 8)
-        let journal_size = self.journal_blocks as i64 * BLOCK_SIZE as i64;
+        let journal_size = i64::from(self.journal_blocks) * BLOCK_SIZE as i64;
         self.inodes[7] = Some(Inode {
             number: format::INODE_JOURNAL,
             size: journal_size,
@@ -1356,7 +1356,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         for gd in &gds {
             gd.write_to(&mut self.f)?;
         }
-        self.pos = (1 + self.gd_blocks) as i64 * BLOCK_SIZE as i64;
+        self.pos = i64::from(1 + self.gd_blocks) * BLOCK_SIZE as i64;
 
         // Write superblock at block 0 (offset 1024)
         let total_inodes = inodes_per_group * groups;

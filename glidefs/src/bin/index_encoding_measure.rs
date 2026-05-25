@@ -765,9 +765,9 @@ fn human(bytes: usize) -> String {
     if bytes >= 1 << 30 {
         format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
     } else if bytes >= 1 << 20 {
-        format!("{:.1} MB", bytes as f64 / (1 << 20) as f64)
+        format!("{:.1} MB", bytes as f64 / f64::from(1 << 20))
     } else if bytes >= 1 << 10 {
-        format!("{:.1} KB", bytes as f64 / (1 << 10) as f64)
+        format!("{:.1} KB", bytes as f64 / f64::from(1 << 10))
     } else {
         format!("{bytes} B")
     }
@@ -818,7 +818,7 @@ fn main() {
     let sample_raw = sample_count as u64 * block_size as u64;
     let sample_compressed: u64 = blocks[..sample_count]
         .iter()
-        .map(|b| b.comp_len as u64)
+        .map(|b| u64::from(b.comp_len))
         .sum();
     println!(
         "LZ4 compression ratio (sample of {} blocks): {:.2}x",
@@ -1029,7 +1029,7 @@ fn main() {
     println!();
     println!("Scheme 4 (Pack-Level Compression) Data Penalty");
     println!("===============================================");
-    let avg_comp_len: f64 = blocks.iter().map(|b| b.comp_len as f64).sum::<f64>() / blocks.len() as f64;
+    let avg_comp_len: f64 = blocks.iter().map(|b| f64::from(b.comp_len)).sum::<f64>() / blocks.len() as f64;
     let raw_per_block = block_size as f64;
     let lz4_ratio = raw_per_block / avg_comp_len;
     let data_penalty = (raw_per_block - avg_comp_len) / avg_comp_len * 100.0;

@@ -77,7 +77,7 @@ pub(crate) use with_ctrl_ring_mut_internal;
 ///
 /// # Examples
 /// ```no_run
-/// use libublk::{with_ctrl_ring, ublk_init_ctrl_task_ring};
+/// use ublk_core::{with_ctrl_ring, ublk_init_ctrl_task_ring};
 /// use io_uring::{IoUring, squeue};
 /// use std::os::fd::AsRawFd;
 ///
@@ -118,7 +118,7 @@ where
 ///
 /// # Examples
 /// ```no_run
-/// use libublk::{with_ctrl_ring_mut, ublk_init_ctrl_task_ring};
+/// use ublk_core::{with_ctrl_ring_mut, ublk_init_ctrl_task_ring};
 /// use io_uring::{IoUring, squeue};
 ///
 /// // Initialize the control ring first
@@ -158,7 +158,7 @@ where
 ///
 /// ## Basic custom initialization:
 /// ```no_run
-/// use libublk::ublk_init_ctrl_task_ring;
+/// use ublk_core::ublk_init_ctrl_task_ring;
 /// use io_uring::IoUring;
 ///
 /// fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -182,7 +182,7 @@ where
 ///
 /// ## Advanced initialization with custom flags and size:
 /// ```no_run
-/// use libublk::ublk_init_ctrl_task_ring;
+/// use ublk_core::ublk_init_ctrl_task_ring;
 /// use io_uring::IoUring;
 ///
 /// fn advanced_example() -> Result<(), Box<dyn std::error::Error>> {
@@ -849,7 +849,7 @@ impl UblkCtrlInner {
         qid: u16,
     ) -> Result<UblkQueueAffinity, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
-        self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+        self.get_queue_affinity_async(u32::from(qid), &mut kernel_affinity)
             .await?;
 
         if self
@@ -866,7 +866,7 @@ impl UblkCtrlInner {
     /// Get queue affinity from kernel and optionally transform for single CPU mode
     fn get_queue_affinity_effective(&mut self, qid: u16) -> Result<UblkQueueAffinity, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
-        self.get_queue_affinity(qid as u32, &mut kernel_affinity)?;
+        self.get_queue_affinity(u32::from(qid), &mut kernel_affinity)?;
 
         if self
             .dev_flags
@@ -887,7 +887,7 @@ impl UblkCtrlInner {
         cpu: Option<usize>,
     ) -> Result<usize, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
-        self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+        self.get_queue_affinity_async(u32::from(qid), &mut kernel_affinity)
             .await?;
 
         let selected_cpu = if let Some(cpu) = cpu {
@@ -918,7 +918,7 @@ impl UblkCtrlInner {
         cpu: Option<usize>,
     ) -> Result<usize, UblkError> {
         let mut kernel_affinity = UblkQueueAffinity::new();
-        self.get_queue_affinity(qid as u32, &mut kernel_affinity)?;
+        self.get_queue_affinity(u32::from(qid), &mut kernel_affinity)?;
 
         let selected_cpu = if let Some(cpu) = cpu {
             // Validate that the specified CPU is in the affinity mask
@@ -954,7 +954,7 @@ impl UblkCtrlInner {
         } else {
             // For multi-CPU mode, use kernel's full affinity
             let mut kernel_affinity = UblkQueueAffinity::new();
-            self.get_queue_affinity(qid as u32, &mut kernel_affinity)?;
+            self.get_queue_affinity(u32::from(qid), &mut kernel_affinity)?;
             Ok(kernel_affinity)
         }
     }
@@ -974,7 +974,7 @@ impl UblkCtrlInner {
         } else {
             // For multi-CPU mode, use kernel's full affinity
             let mut kernel_affinity = UblkQueueAffinity::new();
-            self.get_queue_affinity_async(qid as u32, &mut kernel_affinity)
+            self.get_queue_affinity_async(u32::from(qid), &mut kernel_affinity)
                 .await?;
             Ok(kernel_affinity)
         }
@@ -1245,7 +1245,7 @@ impl UblkCtrlInner {
     }
 
     fn is_unprivileged(&self) -> bool {
-        (self.dev_info.flags & (super::sys::UBLK_F_UNPRIVILEGED_DEV as u64)) != 0
+        (self.dev_info.flags & u64::from(super::sys::UBLK_F_UNPRIVILEGED_DEV)) != 0
     }
 
     pub(crate) fn get_cdev_path(&self) -> String {
@@ -1261,7 +1261,7 @@ impl UblkCtrlInner {
     }
 
     fn dev_state_desc(&self) -> String {
-        match self.dev_info.state as u32 {
+        match u32::from(self.dev_info.state) {
             sys::UBLK_S_DEV_DEAD => "DEAD".to_string(),
             sys::UBLK_S_DEV_LIVE => "LIVE".to_string(),
             sys::UBLK_S_DEV_QUIESCED => "QUIESCED".to_string(),
@@ -1727,7 +1727,7 @@ impl UblkCtrlInner {
     fn prepare_get_queue_affinity_cmd(q: u32, bm: &mut UblkQueueAffinity) -> UblkCtrlCmdData {
         UblkCtrlCmdData::new_data_buffer_cmd(
             sys::UBLK_U_CMD_GET_QUEUE_AFFINITY,
-            q as u64,
+            u64::from(q),
             bm.addr() as u64,
             bm.buf_len() as u32,
             true, // read_buffer
@@ -2047,9 +2047,9 @@ impl UblkCtrlInner {
         if dev_flags.intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER) {
             // mlock feature is incompatible with certain other features
             Self::validate_param(
-                (flags & sys::UBLK_F_USER_COPY as u64) == 0
-                    && (flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0
-                    && (flags & sys::UBLK_F_SUPPORT_ZERO_COPY as u64) == 0,
+                (flags & u64::from(sys::UBLK_F_USER_COPY)) == 0
+                    && (flags & u64::from(sys::UBLK_F_AUTO_BUF_REG)) == 0
+                    && (flags & u64::from(sys::UBLK_F_SUPPORT_ZERO_COPY)) == 0,
             )?;
         }
 
@@ -2414,7 +2414,7 @@ impl UblkCtrl {
             let res = self.get_inner_mut().__start_user_recover();
             if let Ok(r) = res {
                 if r == -libc::EBUSY {
-                    std::thread::sleep(std::time::Duration::from_millis(unit as u64));
+                    std::thread::sleep(std::time::Duration::from_millis(u64::from(unit)));
                     count += unit;
                     if count < 30000 {
                         continue;
@@ -2439,18 +2439,32 @@ impl UblkCtrl {
     ///
     pub fn start_dev(&self, dev: &UblkDev) -> Result<i32, UblkError> {
         let mut ctrl = self.get_inner_mut();
+        let t_prep = std::time::Instant::now();
         ctrl.prep_start_dev(dev)?;
+        let prep_us = t_prep.elapsed().as_micros() as u64;
 
         // Wait for all queue buffer registrations to complete
+        let t_wait = std::time::Instant::now();
         dev.wait_for_buffer_registration(ctrl.dev_info.nr_hw_queues as usize)?;
+        let wait_us = t_wait.elapsed().as_micros() as u64;
 
-        if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
+        let t_start = std::time::Instant::now();
+        let result = if ctrl.dev_info.state != sys::UBLK_S_DEV_QUIESCED as u16 {
             ctrl.start(unsafe { libc::getpid() as i32 })
         } else if ctrl.for_recover_dev() {
             ctrl.end_user_recover(unsafe { libc::getpid() as i32 })
         } else {
             Err(crate::UblkError::OtherError(-libc::EINVAL))
-        }
+        };
+        let start_us = t_start.elapsed().as_micros() as u64;
+
+        log::info!(
+            target: "glidefs.timing",
+            "ublk-core start_dev breakdown dev_id={} prep_us={} wait_buf_reg_us={} start_ioctl_us={}",
+            ctrl.dev_info.dev_id, prep_us, wait_us, start_us
+        );
+
+        result
     }
 
     /// Start ublk device in async/.await
@@ -2546,7 +2560,7 @@ impl UblkCtrl {
             .unwrap_or_else(|_| {
                 // Fallback to kernel affinity if thread affinity creation fails
                 let mut affinity = UblkQueueAffinity::new();
-                self.get_queue_affinity(queue_id as u32, &mut affinity)
+                self.get_queue_affinity(u32::from(queue_id), &mut affinity)
                     .unwrap_or_default();
                 affinity
             })

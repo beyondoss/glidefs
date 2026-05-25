@@ -553,7 +553,7 @@ impl CacheInner {
 
         // Fast path: single page-aligned write within one block (common case).
         if start_block == end_block
-            && offset % PAGE_SIZE == 0
+            && offset.is_multiple_of(PAGE_SIZE)
             && data.len() == PAGE_SIZE as usize
         {
             let page = ((offset % block_size) / PAGE_SIZE) as usize;
@@ -1086,7 +1086,7 @@ impl CacheInner {
         for _ in 0..entry_count {
             read_hashed!(&mut entry_buf);
             let idx = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap()) as usize;
-            let mut state = entry_buf[4];
+            let state = entry_buf[4];
 
             if idx >= num_blocks {
                 continue; // skip out-of-bounds (shrink safety)

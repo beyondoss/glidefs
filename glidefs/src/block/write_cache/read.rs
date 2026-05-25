@@ -908,8 +908,8 @@ impl WriteCache<Active> {
                 let range_start = blocks.first().unwrap().2;
                 let last = blocks.last().unwrap();
                 let range_end = last.2 + last.3;
-                let span = (range_end - range_start) as u64;
-                let total_data: u64 = blocks.iter().map(|&(_, _, _, cl)| cl as u64).sum();
+                let span = u64::from(range_end - range_start);
+                let total_data: u64 = blocks.iter().map(|&(_, _, _, cl)| u64::from(cl)).sum();
                 let gap = span - total_data;
 
                 // Sparse or single block — fetch each block individually.

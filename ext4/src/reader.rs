@@ -94,8 +94,8 @@ impl<R: Read + Seek> Reader<R> {
             ));
         }
         let index = (ino - 1) % self.sb.inodes_per_group;
-        let table_block = self.group_descs[group].inode_table_low as u64;
-        Ok(table_block * BLOCK_SIZE + index as u64 * INODE_SIZE as u64)
+        let table_block = u64::from(self.group_descs[group].inode_table_low);
+        Ok(table_block * BLOCK_SIZE + u64::from(index) * INODE_SIZE as u64)
     }
 
     /// Read and parse an inode by number.
@@ -131,7 +131,7 @@ impl<R: Read + Seek> Reader<R> {
             for i in 0..header.entries as usize {
                 let off = EXTENT_NODE_SIZE + i * EXTENT_NODE_SIZE;
                 let leaf = ExtentLeaf::read_from(&block_data[off..]);
-                extents.push((leaf.start, leaf.length as u32));
+                extents.push((leaf.start, u32::from(leaf.length)));
             }
             Ok(extents)
         } else {
@@ -181,7 +181,7 @@ impl<R: Read + Seek> Reader<R> {
                 for j in 0..leaf_header.entries as usize {
                     let loff = EXTENT_NODE_SIZE + j * EXTENT_NODE_SIZE;
                     let leaf = ExtentLeaf::read_from(&leaf_block[loff..]);
-                    extents.push((leaf.start, leaf.length as u32));
+                    extents.push((leaf.start, u32::from(leaf.length)));
                 }
             }
             Ok(extents)
@@ -310,7 +310,7 @@ impl<R: Read + Seek> Reader<R> {
 
         // Block xattrs
         if inode.xattr_block_low != 0 {
-            let block = self.read_block(inode.xattr_block_low as u64)?;
+            let block = self.read_block(u64::from(inode.xattr_block_low))?;
             let block_magic = u32::from_le_bytes([block[0], block[1], block[2], block[3]]);
             if block_magic == XATTR_HEADER_MAGIC {
                 format::get_xattrs(&block[32..], &mut xattrs, 32);
@@ -459,9 +459,9 @@ impl<R: Read + Seek> Reader<R> {
                 let mut header = tar::Header::new_gnu();
                 header.set_entry_type(tar::EntryType::Link);
                 header.set_size(0);
-                header.set_mode((entry.mode & !TYPE_MASK) as u32);
-                header.set_uid(entry.uid as u64);
-                header.set_gid(entry.gid as u64);
+                header.set_mode(u32::from(entry.mode & !TYPE_MASK));
+                header.set_uid(u64::from(entry.uid));
+                header.set_gid(u64::from(entry.gid));
                 header.set_mtime(entry.mtime & 0xFFFFFFFF);
                 header.set_cksum();
                 builder.append_link(&mut header, &entry.path, first_path)?;
@@ -471,9 +471,9 @@ impl<R: Read + Seek> Reader<R> {
         }
 
         let mut header = tar::Header::new_gnu();
-        header.set_mode((entry.mode & !TYPE_MASK) as u32);
-        header.set_uid(entry.uid as u64);
-        header.set_gid(entry.gid as u64);
+        header.set_mode(u32::from(entry.mode & !TYPE_MASK));
+        header.set_uid(u64::from(entry.uid));
+        header.set_gid(u64::from(entry.gid));
         header.set_mtime(entry.mtime & 0xFFFFFFFF);
 
         match file_type {
@@ -629,7 +629,7 @@ impl<R: Read + Seek> Read for ExtentReader<'_, R> {
 
         if !self.block_loaded {
             let (phys_block, _) = self.extents[self.extent_idx];
-            let block_num = phys_block + self.block_in_extent as u64;
+            let block_num = phys_block + u64::from(self.block_in_extent);
             self.inner.seek(SeekFrom::Start(block_num * BLOCK_SIZE))?;
             self.inner.read_exact(&mut self.block_buf)?;
             self.block_loaded = true;

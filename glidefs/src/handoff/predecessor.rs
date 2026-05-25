@@ -465,7 +465,6 @@ async fn drop_successor(mut child: tokio::process::Child) {
     // hang on the successor — it has its own life now.
     if let Ok(Some(status)) = child.try_wait() {
         tracing::info!(?status, "successor process already exited");
-        return;
     }
     // On Succeeded path, the successor doesn't exit — it keeps serving.
     // Detach (don't wait), but ensure we don't leak zombies via systemd

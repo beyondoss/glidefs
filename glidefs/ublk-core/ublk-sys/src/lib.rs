@@ -99,10 +99,10 @@ pub fn ublk_sqe_addr_to_auto_buf_reg(sqe_addr: u64) -> ublk_auto_buf_reg {
 /// - bits 32-63: reserved1
 #[inline(always)]
 pub fn ublk_auto_buf_reg_to_sqe_addr(buf: &ublk_auto_buf_reg) -> u64 {
-    buf.index as u64
-        | (buf.flags as u64) << 16
-        | (buf.reserved0 as u64) << 24
-        | (buf.reserved1 as u64) << 32
+    u64::from(buf.index)
+        | u64::from(buf.flags) << 16
+        | u64::from(buf.reserved0) << 24
+        | u64::from(buf.reserved1) << 32
 }
 
 #[cfg(test)]

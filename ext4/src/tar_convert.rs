@@ -308,11 +308,10 @@ fn write_layer_entries<R: Read, W: Read + Write + Seek>(
         }
 
         // Skip if a different (higher) layer owns this path.
-        if let Some(&owning_layer) = merge.owner.get(&normalized) {
-            if owning_layer != layer_idx {
+        if let Some(&owning_layer) = merge.owner.get(&normalized)
+            && owning_layer != layer_idx {
                 continue;
             }
-        }
 
         fs.make_parents(&name)?;
         write_tar_entry_with_pax(fs, &mut entry, &name, &link_name)?;

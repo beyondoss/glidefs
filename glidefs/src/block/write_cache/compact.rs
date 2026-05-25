@@ -278,7 +278,7 @@ pub async fn compact_chunk(
     // Derive pack size from index entries (for logging/stats only).
     let pack_size: u64 = index_entries
         .iter()
-        .map(|e| (e.offset as u64) + (e.comp_length as u64))
+        .map(|e| u64::from(e.offset) + u64::from(e.comp_length))
         .max()
         .unwrap_or(0)
         + (index_entries.len() as u64) * (crate::block::pack::PACK_INDEX_ENTRY_SIZE as u64)

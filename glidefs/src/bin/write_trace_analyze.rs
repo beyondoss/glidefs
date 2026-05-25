@@ -75,12 +75,12 @@ fn main() {
     // =========================================================================
 
     let total_writes = entries.len();
-    let total_blocks_touched: u64 = entries.iter().map(|e| e.span as u64).sum();
+    let total_blocks_touched: u64 = entries.iter().map(|e| u64::from(e.span)).sum();
 
     // Unique blocks: each distinct block_index that was written
     let mut block_write_counts: HashMap<u32, u64> = HashMap::new();
     for e in &entries {
-        for b in e.block_index..(e.block_index + e.span as u32) {
+        for b in e.block_index..(e.block_index + u32::from(e.span)) {
             *block_write_counts.entry(b).or_default() += 1;
         }
     }
@@ -198,7 +198,7 @@ fn main() {
             while entry_idx < entries.len() && entries[entry_idx].elapsed_us < window_end {
                 let e = &entries[entry_idx];
                 ops_in_window += 1;
-                for b in e.block_index..(e.block_index + e.span as u32) {
+                for b in e.block_index..(e.block_index + u32::from(e.span)) {
                     unique_in_window.insert(b);
                 }
                 entry_idx += 1;
@@ -240,8 +240,8 @@ fn main() {
         for e in &entries {
             let bucket = ((e.elapsed_us - first_ts) / bucket_us) as usize;
             let bucket = bucket.min(num_buckets - 1);
-            bucket_counts[bucket] += e.span as u64;
-            for b in e.block_index..(e.block_index + e.span as u32) {
+            bucket_counts[bucket] += u64::from(e.span);
+            for b in e.block_index..(e.block_index + u32::from(e.span)) {
                 bucket_unique[bucket].insert(b);
             }
         }
@@ -310,7 +310,7 @@ fn main() {
         let mut last_flush_ts = first_ts;
 
         for e in &entries {
-            for b in e.block_index..(e.block_index + e.span as u32) {
+            for b in e.block_index..(e.block_index + u32::from(e.span)) {
                 dirty.insert(b);
             }
             if dirty.len() >= ps {
@@ -412,11 +412,11 @@ fn main() {
 
 fn human(bytes: usize) -> String {
     if bytes >= 1 << 30 {
-        format!("{:.1}GB", bytes as f64 / (1 << 30) as f64)
+        format!("{:.1}GB", bytes as f64 / f64::from(1 << 30))
     } else if bytes >= 1 << 20 {
-        format!("{:.1}MB", bytes as f64 / (1 << 20) as f64)
+        format!("{:.1}MB", bytes as f64 / f64::from(1 << 20))
     } else if bytes >= 1 << 10 {
-        format!("{:.1}KB", bytes as f64 / (1 << 10) as f64)
+        format!("{:.1}KB", bytes as f64 / f64::from(1 << 10))
     } else {
         format!("{bytes}B")
     }

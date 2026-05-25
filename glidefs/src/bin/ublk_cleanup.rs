@@ -82,7 +82,7 @@ fn main() -> ExitCode {
         match (stop_result, del_result) {
             (_, Ok(_)) => {
                 killed += 1;
-                if killed % 100 == 0 {
+                if killed.is_multiple_of(100) {
                     eprintln!("deleted {killed} so far...");
                 }
             }
