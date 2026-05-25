@@ -92,7 +92,9 @@ impl WriteCache<Active> {
         // have data on SSD yet (CAS'd but not pwritten). SYNCING blocks
         // have data in the flushing file, not the active file.
         if !(start_block..=end_block).all(|i| {
-            self.inner.state_map.get(i as usize)
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = i as usize; // usize >= u64 on 64-bit systems
+            self.inner.state_map.get(idx)
                 == crate::block::block_map::SparseBlockState::DIRTY
         }) {
             return None;
@@ -165,7 +167,9 @@ impl WriteCache<Active> {
             // Block is entirely beyond device - shouldn't happen but handle gracefully
             return Ok(Some(Bytes::from(vec![0u8; block_size])));
         } else {
-            std::cmp::min(block_size as u64, device_size - offset) as usize
+            #[allow(clippy::cast_possible_truncation)]
+            let bytes = std::cmp::min(block_size as u64, device_size - offset) as usize; // usize >= u64 on 64-bit
+            bytes
         };
 
         let mut buf = vec![0u8; block_size];
@@ -197,7 +201,8 @@ impl WriteCache<Active> {
             }
             // Flushing file gone — flush completed between state check and
             // lock acquisition. Block is now NOT_PRESENT (or re-dirtied).
-            let state2 = self.inner.state_map.get(block_num as usize);
+            #[allow(clippy::cast_possible_truncation)]
+            let state2 = self.inner.state_map.get(block_num as usize); // usize >= u64 on 64-bit systems
             if state2 == crate::block::block_map::SparseBlockState::NOT_PRESENT {
                 return Ok(None);
             }
