@@ -554,12 +554,15 @@ pub fn write_inode(
     block: &[u8],
     xattr_inline: &[u8],
 ) -> io::Result<()> {
-    let extra_isize = (INODE_USED_SIZE - 128) as u16;
+    #[allow(clippy::cast_possible_truncation)]
+    let extra_isize = (INODE_USED_SIZE - 128) as u16; // 152-128=24 fits in u16
+    #[allow(clippy::cast_possible_truncation)]
+    let uid_u16 = uid as u16; // uid low 16 bits
 
     w.write_all(&mode.to_le_bytes())?;
-    w.write_all(&(uid as u16).to_le_bytes())?; // uid low
-    #[allow(clippy::cast_possible_truncation)]
-    let size_u32 = size as u32; // typical files fit in u32
+    w.write_all(&uid_u16.to_le_bytes())?; // uid low
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let size_u32 = size as u32; // typical files fit in u32, sizes are non-negative
     w.write_all(&size_u32.to_le_bytes())?; // size low
     #[allow(clippy::cast_possible_truncation)]
     let atime_u32 = atime as u32; // timestamp fits in u32 (32-bit UNIX time)
@@ -571,7 +574,9 @@ pub fn write_inode(
     let mtime_u32 = mtime as u32; // timestamp fits in u32
     w.write_all(&mtime_u32.to_le_bytes())?;
     w.write_all(&0u32.to_le_bytes())?; // dtime
-    w.write_all(&(gid as u16).to_le_bytes())?; // gid low
+    #[allow(clippy::cast_possible_truncation)]
+    let gid_u16 = gid as u16; // gid low 16 bits
+    w.write_all(&gid_u16.to_le_bytes())?; // gid low
     #[allow(clippy::cast_possible_truncation)]
     let links_u16 = links_count as u16; // link count fits in u16
     w.write_all(&links_u16.to_le_bytes())?;
@@ -587,7 +592,9 @@ pub fn write_inode(
 
     w.write_all(&0u32.to_le_bytes())?; // generation
     w.write_all(&xattr_block_low.to_le_bytes())?;
-    w.write_all(&((size >> 32) as u32).to_le_bytes())?; // size high
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let size_high = (size >> 32) as u32; // size high 32 bits, sizes are non-negative
+    w.write_all(&size_high.to_le_bytes())?; // size high
     w.write_all(&0u32.to_le_bytes())?; // obsolete_fragment_addr
     w.write_all(&0u16.to_le_bytes())?; // blocks high
     w.write_all(&0u16.to_le_bytes())?; // xattr block high
@@ -600,7 +607,9 @@ pub fn write_inode(
     w.write_all(&((ctime >> 32) as u32).to_le_bytes())?; // ctime extra
     w.write_all(&((mtime >> 32) as u32).to_le_bytes())?; // mtime extra
     w.write_all(&((atime >> 32) as u32).to_le_bytes())?; // atime extra
-    w.write_all(&(crtime as u32).to_le_bytes())?;
+    #[allow(clippy::cast_possible_truncation)]
+    let crtime_u32 = crtime as u32; // crtime fits in u32
+    w.write_all(&crtime_u32.to_le_bytes())?;
     w.write_all(&((crtime >> 32) as u32).to_le_bytes())?; // crtime extra
     // That's INODE_USED_SIZE = 152 bytes written.
     // Note: version_high and projid live in the extra inode space and are
