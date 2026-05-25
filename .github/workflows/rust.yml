@@ -152,6 +152,21 @@ jobs:
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+      - name: Report kernel version
+        run: |
+          uname -r
+          # The zc_glidefs test logs the negotiated transport so the CI
+          # log shows whether ZC or USER_COPY was selected.
+      - name: Zero-copy auto-detect (ublk, multi-thread runtime)
+        # zc_glidefs uses #[tokio::test(flavor = "multi_thread")]. On a
+        # ZC-capable kernel it exercises io_task_zero_copy; on older
+        # kernels it falls back to USER_COPY. Either path must pass.
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,test-utils --test zc_glidefs -- --nocapture
+      - name: USER_COPY path (forced via GLIDEFS_NO_ZERO_COPY=1)
+        # Forces the legacy USER_COPY transport even on a ZC-capable
+        # kernel — verifies that path still works after the ZC
+        # integration landed.
+        run: sudo -E env "PATH=$PATH" GLIDEFS_NO_ZERO_COPY=1 cargo test -p glidefs --release --features ublk,test-utils --test zc_glidefs -- --nocapture
       - name: fio benchmark (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
       - name: fio verify (ublk)

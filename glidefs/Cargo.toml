@@ -165,6 +165,11 @@ path = "tests/fio_verify.rs"
 required-features = ["fio-bench"]
 
 [[test]]
+name = "zc_glidefs"
+path = "tests/zc_glidefs.rs"
+required-features = ["ublk", "test-utils"]
+
+[[test]]
 name = "handoff_durability"
 path = "tests/handoff_durability.rs"
 required-features = ["fio-bench", "ublk"]

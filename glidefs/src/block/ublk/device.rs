@@ -314,7 +314,20 @@ impl UblkDevice {
         //                                 per-tag IoBuf
         //   `GLIDEFS_NO_ZERO_COPY=1`    — force USER_COPY even on a
         //                                 ZC-capable kernel
+        // The ZC integration spawns a blocking thread that uses
+        // `Handle::block_on` to call into the async `BlockHandler` API.
+        // That pattern needs a multi-thread runtime to make progress —
+        // on a current-thread runtime, block_on deadlocks because there's
+        // no other thread to drive the awaited future. The production
+        // daemon uses multi-thread, but many tests use `#[tokio::test]`
+        // which is current-thread by default. Detect that and fall back
+        // to USER_COPY so existing tests still pass on ZC-capable kernels.
+        let runtime_ok = matches!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread,
+        );
         let use_zc = features.zero_copy
+            && runtime_ok
             && std::env::var_os("GLIDEFS_NO_ZERO_COPY").is_none()
             && std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none();
         if use_zc {
