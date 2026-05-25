@@ -309,9 +309,27 @@ fn run_worker(cdev_fd: RawFd, stop: Arc<AtomicBool>) -> Result<(), String> {
     }
     let mut tags: Vec<PerTag> = vec![PerTag::default(); depth as usize];
 
+    let mut aborted_seen = 0usize;
     loop {
         if stop.load(Ordering::SeqCst) {
-            break;
+            // Stop requested: wait briefly for any in-flight CQEs (which
+            // will now arrive as UBLK_IO_RES_ABORT after stop_dev) and exit.
+            match ring.submit_and_wait(0) {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let cqes: Vec<cqueue::Entry> = ring.completion().collect();
+            if cqes.is_empty() && aborted_seen > 0 {
+                break;
+            }
+            for cqe in cqes {
+                aborted_seen += 1;
+                let _ = cqe.user_data();
+            }
+            if aborted_seen >= depth as usize {
+                break;
+            }
+            continue;
         }
 
         match ring.submit_and_wait(1) {
