@@ -10,6 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -203,40 +205,16 @@ pub async fn run_gc(
 
     // Load GC state
     let mut state = GcState::load(&state_file)?;
-    let mut stats = GcStats::default();
 
-    // Discover all S3 prefixes that contain manifests or chunks
-    let prefixes = discover_s3_prefixes(&*object_store, &db_path).await?;
-    info!(count = prefixes.len(), "discovered S3 prefixes");
-
-    // Process prefixes in parallel. Each prefix is an independent S3 namespace.
-    let per_prefix_budget = max_deletes / prefixes.len().max(1);
-    let results: Vec<Result<(GcStateDelta, GcStats)>> =
-        futures::stream::iter(prefixes.iter())
-            .map(|prefix| {
-                let store = std::sync::Arc::clone(&object_store);
-                let state_ref = &state;
-                async move {
-                    let content_store = ContentStore::new(store, prefix);
-                    reconcile_prefix(
-                        &content_store,
-                        state_ref,
-                        grace_period,
-                        per_prefix_budget,
-                        dry_run,
-                    )
-                    .await
-                }
-            })
-            .buffer_unordered(16)
-            .collect()
-            .await;
-
-    for result in results {
-        let (delta, prefix_stats) = result?;
-        state.apply_delta(delta);
-        stats.merge(prefix_stats);
-    }
+    let stats = gc_orchestrate(
+        &object_store,
+        &db_path,
+        &mut state,
+        grace_period,
+        max_deletes,
+        dry_run,
+    )
+    .await?;
 
     // Save updated state
     state.save(&state_file)?;
@@ -260,28 +238,130 @@ pub async fn run_gc(
 }
 
 // ---------------------------------------------------------------------------
+// Orchestration: discover prefixes + reconcile each under a shared budget
+// ---------------------------------------------------------------------------
+
+/// Reconcile every export prefix under `db_path`, sharing a global delete
+/// budget across all of them.
+///
+/// Using a single `AtomicUsize` budget (rather than dividing `max_deletes` per
+/// prefix up front) avoids two failure modes:
+/// * Per-prefix division can collapse to zero when `prefixes.len() > max_deletes`,
+///   silently disabling all deletion.
+/// * Per-prefix division also wastes budget on prefixes with nothing to delete.
+async fn gc_orchestrate(
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    db_path: &str,
+    state: &mut GcState,
+    grace_period: Duration,
+    max_deletes: usize,
+    dry_run: bool,
+) -> Result<GcStats> {
+    let prefixes = discover_s3_prefixes(&**object_store, db_path).await?;
+    info!(count = prefixes.len(), "discovered S3 prefixes");
+
+    let budget = Arc::new(AtomicUsize::new(max_deletes));
+    let mut stats = GcStats::default();
+
+    let results: Vec<Result<(GcStateDelta, GcStats)>> = futures::stream::iter(prefixes.iter())
+        .map(|prefix| {
+            let store = Arc::clone(object_store);
+            let budget = Arc::clone(&budget);
+            let state_ref = &*state;
+            async move {
+                let content_store = ContentStore::new(store, prefix);
+                reconcile_prefix(&content_store, state_ref, grace_period, &budget, dry_run).await
+            }
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await;
+
+    for result in results {
+        let (delta, prefix_stats) = result?;
+        state.apply_delta(delta);
+        stats.merge(prefix_stats);
+    }
+    Ok(stats)
+}
+
+/// Atomically claim one delete slot from the shared budget.
+/// Returns true if a slot was claimed (caller may delete), false if exhausted.
+fn try_claim_delete_slot(budget: &AtomicUsize) -> bool {
+    budget
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            // `then` is lazy so we don't compute `v - 1` (and underflow) when v == 0.
+            (v > 0).then(|| v - 1)
+        })
+        .is_ok()
+}
+
+// ---------------------------------------------------------------------------
 // S3 prefix discovery
 // ---------------------------------------------------------------------------
 
 /// Discover all unique S3 prefixes under `{db_path}/exports/`.
 ///
-/// Uses `list_with_delimiter` to enumerate only the top-level export directory
-/// names -- O(exports) instead of O(total_objects).
+/// Walks the object listing with `list_with_offset`, skipping past each export's
+/// subtree once seen by jumping to the next key strictly greater than every key
+/// under `{prefix}/...` (using `0x30` = '0', the next byte after '/' = `0x2F`).
+///
+/// We avoid `list_with_delimiter` here because its pagination is an
+/// implementation detail of each backend — a non-paginating implementation
+/// would silently truncate at the first page and skip exports alphabetically
+/// beyond it. `list*` streams, by trait contract, must yield all matching keys.
+/// On real S3, `list_with_offset` is translated to `start-after`, so this is
+/// still O(exports) round-trips, not O(total_objects).
 async fn discover_s3_prefixes(
     object_store: &dyn object_store::ObjectStore,
     db_path: &str,
 ) -> Result<Vec<String>> {
-    let exports_prefix = ObjectPath::from(format!("{}/exports/", db_path.trim_end_matches('/')));
-    let result = object_store
-        .list_with_delimiter(Some(&exports_prefix))
-        .await?;
+    let exports_prefix_str = format!("{}/exports/", db_path.trim_end_matches('/'));
+    let exports_prefix = ObjectPath::from(exports_prefix_str.clone());
 
-    let mut prefixes: Vec<String> = result
-        .common_prefixes
-        .into_iter()
-        .map(|p| p.to_string().trim_end_matches('/').to_string())
-        .collect();
+    let mut prefixes = Vec::new();
+    // Start the offset just below any conceivable key under `exports/`. The
+    // empty path means "no offset" on first call.
+    let mut offset = exports_prefix.clone();
+    let mut first = true;
+
+    loop {
+        let mut stream = if first {
+            first = false;
+            object_store.list(Some(&exports_prefix))
+        } else {
+            object_store.list_with_offset(Some(&exports_prefix), &offset)
+        };
+
+        let entry = stream.next().await;
+        drop(stream);
+
+        let Some(result) = entry else {
+            break;
+        };
+        let meta = result?;
+        let path_str = meta.location.to_string();
+        let Some(rel) = path_str.strip_prefix(&exports_prefix_str) else {
+            // List returned something outside our prefix — defensive break.
+            break;
+        };
+        // Skip stray top-level files (no slash → no export directory).
+        let Some(slash) = rel.find('/') else {
+            // Try to skip past this key.
+            offset = meta.location;
+            continue;
+        };
+        let name = &rel[..slash];
+        prefixes.push(format!("{}{}", exports_prefix_str, name));
+        // Skip the entire subtree by jumping to `{exports/}{name}0`: '/' is
+        // 0x2F and '0' is 0x30, so this comes strictly after every key under
+        // `{exports/}{name}/...` but before any sibling whose name starts
+        // with a byte ≥ '0'.
+        offset = ObjectPath::from(format!("{}{}0", exports_prefix_str, name));
+    }
+
     prefixes.sort();
+    prefixes.dedup();
     Ok(prefixes)
 }
 
@@ -356,13 +436,15 @@ fn parse_pack_path(rel: &str) -> Option<(u32, PackId)> {
 /// **Pass 2**: Stream snapshot manifests one at a time. For each, remove any
 /// referenced packs from `maybe_dead`. Whatever survives is truly dead.
 ///
-/// Memory: O(live_manifest_packs + maybe_dead + max_deletes).
+/// Memory: O(live_manifest_packs + maybe_dead + claimed_budget).
 /// Snapshot manifests are never held simultaneously.
+/// The shared `budget` is decremented atomically as deletes are claimed, so
+/// the total across concurrent prefixes never exceeds the global cap.
 async fn reconcile_prefix(
     content_store: &ContentStore,
     state: &GcState,
     grace_period: Duration,
-    max_deletes: usize,
+    budget: &AtomicUsize,
     dry_run: bool,
 ) -> Result<(GcStateDelta, GcStats)> {
     let mut stats = GcStats::default();
@@ -572,7 +654,7 @@ async fn reconcile_prefix(
             || (grace_period.is_zero() && is_new);
         if is_eligible {
             stats.eligible_for_deletion += 1;
-            if eligible.len() < max_deletes {
+            if try_claim_delete_slot(budget) {
                 eligible.push((chunk_idx, pack_id));
             }
         }
@@ -653,11 +735,12 @@ pub async fn reconcile_prefix_for_test(
     max_deletes: usize,
     dry_run: bool,
 ) -> Result<GcTestReport> {
+    let budget = AtomicUsize::new(max_deletes);
     let (delta, stats) = reconcile_prefix(
         content_store,
         state,
         grace_period,
-        max_deletes,
+        &budget,
         dry_run,
     )
     .await?;
@@ -1632,5 +1715,202 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: max_deletes must apply globally, not per-prefix.
+    // -----------------------------------------------------------------------
+
+    /// Before the fix, `run_gc` divided `max_deletes` evenly across all
+    /// discovered prefixes (`per_prefix_budget = max_deletes / prefixes.len()`).
+    /// With more prefixes than the budget allows (e.g. 10K prefixes vs the 100K
+    /// default), this collapsed to zero per prefix and nothing got deleted.
+    ///
+    /// The post-fix budget is a single shared `AtomicUsize` claimed across all
+    /// prefixes, so any prefix can spend the whole budget if no one else
+    /// claims first. This test pins `max_deletes = 2` against 3 prefixes,
+    /// each with one ready-to-delete pack. The naive division (2/3 = 0) would
+    /// delete nothing; the shared budget deletes exactly 2.
+    #[tokio::test]
+    async fn test_gc_shared_budget_caps_total_deletes_across_prefixes() {
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let exports = ["test/exports/vm1", "test/exports/vm2", "test/exports/vm3"];
+        let chunk_idx = 0u32;
+        let dead: PackId = 0xDEAD_BEEF_DEAD_BEEF;
+
+        // Each prefix: one dead pack + an empty manifest that references no packs.
+        for &p in &exports {
+            let cs = ContentStore::new(Arc::clone(&s3), p);
+            cs.put_chunk_pack(chunk_idx, dead, vec![0u8; 100])
+                .await
+                .unwrap();
+            let vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
+            cs.put_manifest("vm", vm.serialize().unwrap(), None)
+                .await
+                .unwrap();
+        }
+
+        let mut state = new_gc_state_for_test();
+        let stats = gc_orchestrate(
+            &s3,
+            "test",
+            &mut state,
+            Duration::ZERO, // zero grace → eligible immediately
+            2,              // global budget across all 3 prefixes
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.prefixes_scanned, 3);
+        assert_eq!(stats.dead_found, 3, "all three prefixes have one dead pack");
+        assert_eq!(stats.eligible_for_deletion, 3);
+        assert_eq!(
+            stats.packs_deleted, 2,
+            "shared budget should cap total deletes at 2 (not 0 from naive division)"
+        );
+
+        // Exactly one of the three packs should survive — confirms the cap.
+        let mut survivors = 0;
+        for &p in &exports {
+            let cs = ContentStore::new(Arc::clone(&s3), p);
+            if list_all_packs(&cs).await.unwrap().contains(&(chunk_idx, dead)) {
+                survivors += 1;
+            }
+        }
+        assert_eq!(survivors, 1, "exactly 1 pack should survive the budget cap");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: discover_s3_prefixes must not depend on the backend
+    // paginating `list_with_delimiter`. An ObjectStore impl that returns a
+    // single page used to silently truncate the prefix list at 1000 exports
+    // (S3's default page size). After the fix, we use `list_with_offset`,
+    // which is a Stream that must yield all matching keys per trait contract.
+    // -----------------------------------------------------------------------
+
+    /// Wraps `InMemory`, but `list_with_delimiter` returns only the first N
+    /// entries with no continuation token — simulating a backend that does
+    /// not paginate. All other methods delegate cleanly.
+    #[derive(Debug)]
+    struct TruncatingDelimiterStore {
+        inner: InMemory,
+        delimiter_cap: usize,
+    }
+
+    impl TruncatingDelimiterStore {
+        fn new(delimiter_cap: usize) -> Self {
+            Self {
+                inner: InMemory::new(),
+                delimiter_cap,
+            }
+        }
+    }
+
+    impl std::fmt::Display for TruncatingDelimiterStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "TruncatingDelimiterStore")
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for TruncatingDelimiterStore {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> ObjectStoreResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> ObjectStoreResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &ObjectPath) -> ObjectStoreResult<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> ObjectStoreResult<ListResult> {
+            let mut result = self.inner.list_with_delimiter(prefix).await?;
+            result.common_prefixes.truncate(self.delimiter_cap);
+            result.objects.truncate(self.delimiter_cap);
+            Ok(result)
+        }
+
+        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> ObjectStoreResult<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+        ) -> ObjectStoreResult<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discover_s3_prefixes_robust_to_non_paginating_backend() {
+        // Backend returns at most 2 common_prefixes from list_with_delimiter.
+        let store = Arc::new(TruncatingDelimiterStore::new(2));
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::clone(&store) as _;
+
+        // Create 5 distinct export prefixes, each with one manifest.
+        let count = 5usize;
+        for i in 0..count {
+            let cs = ContentStore::new(Arc::clone(&s3), &format!("db/exports/vm{i:03}"));
+            cs.put_manifest("m", b"x".to_vec(), None).await.unwrap();
+        }
+
+        let prefixes = discover_s3_prefixes(&*s3, "db").await.unwrap();
+        assert_eq!(
+            prefixes.len(),
+            count,
+            "discover_s3_prefixes must return all 5 prefixes regardless of \
+             list_with_delimiter pagination behavior; got {:?}",
+            prefixes
+        );
+        for i in 0..count {
+            assert!(prefixes.contains(&format!("db/exports/vm{i:03}")));
+        }
+    }
+
+    /// Sanity: many prefixes round-trip correctly through discover_s3_prefixes
+    /// on InMemory (which paginates list naturally as a Stream).
+    #[tokio::test]
+    async fn test_discover_s3_prefixes_many_exports() {
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let count = 1500usize;
+        for i in 0..count {
+            let cs = ContentStore::new(Arc::clone(&s3), &format!("db/exports/vm{i:06}"));
+            cs.put_manifest("m", b"x".to_vec(), None).await.unwrap();
+        }
+        let prefixes = discover_s3_prefixes(&*s3, "db").await.unwrap();
+        assert_eq!(prefixes.len(), count);
     }
 }
