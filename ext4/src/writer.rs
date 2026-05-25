@@ -1,4 +1,4 @@
-#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 /// Core ext4 writer — deterministic, sequential, write-only.
 ///
 /// Ported from: github.com/Microsoft/hcsshim/ext4/internal/compactext4
