@@ -236,66 +236,136 @@ impl ConnectInfo {
 }
 
 // ---------------------------------------------------------------------------
-// TestContext — MinIO container + S3 object_store
+// TestContext — shared MinIO container, isolated per-test bucket
 // ---------------------------------------------------------------------------
+//
+// Previously each TestContext spawned its own MinIO container. Under
+// parallel test execution (cargo's default), N MinIOs competed for host
+// resources on CI runners and produced ~40% flake rate: transient S3
+// errors that surfaced as EIO on reads, empty discover_exports listings,
+// and "ublk read failed". The errors were a real glidefs response to a
+// real (test-induced) backend failure mode — not a glidefs bug — but
+// the test infrastructure was unintentionally creating it.
+//
+// Fix: spin up ONE MinIO process-wide and give each TestContext its own
+// bucket. Tests run in parallel without container-resource contention;
+// each test's S3 namespace remains fully isolated via the unique bucket.
+
+/// Process-wide shared MinIO. Initialized on first `TestContext::new()`
+/// call; held alive for the entire test process. Container teardown
+/// happens at process exit when this OnceCell is dropped.
+static SHARED_MINIO: tokio::sync::OnceCell<SharedMinio> = tokio::sync::OnceCell::const_new();
+
+/// Monotonic bucket counter so concurrent tests don't collide.
+static BUCKET_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct SharedMinio {
+    _container: ContainerAsync<MinIO>,
+    endpoint: String,
+}
+
+async fn shared_minio() -> &'static SharedMinio {
+    SHARED_MINIO
+        .get_or_init(|| async {
+            let minio = MinIO::default().start().await.unwrap();
+            let host = minio.get_host().await.unwrap();
+
+            // Retry port lookup — Docker can race between container start and
+            // port mapping visibility, causing PortNotExposed on loaded machines.
+            let port = {
+                let mut last_err = None;
+                let mut port = None;
+                for _ in 0..10 {
+                    match minio.get_host_port_ipv4(9000).await {
+                        Ok(p) => {
+                            port = Some(p);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                    }
+                }
+                port.unwrap_or_else(|| {
+                    panic!("MinIO port 9000 not available after retries: {:?}", last_err)
+                })
+            };
+
+            // Wait for MinIO HTTP to actually answer — `start()` returns
+            // before the server is fully accepting requests on heavily
+            // loaded CI hosts.
+            let endpoint = format!("http://{}:{}", host, port);
+            for attempt in 0..20 {
+                let probe = minio
+                    .exec(ExecCommand::new(vec![
+                        "curl",
+                        "-sf",
+                        "-o",
+                        "/dev/null",
+                        "http://localhost:9000/minio/health/ready",
+                    ]))
+                    .await;
+                if let Ok(mut r) = probe {
+                    let _ = r.stdout_to_vec().await;
+                    if r.exit_code().await.unwrap_or(Some(1)) == Some(0) {
+                        break;
+                    }
+                }
+                if attempt == 19 {
+                    panic!("MinIO never became ready after 20 attempts");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+
+            SharedMinio {
+                _container: minio,
+                endpoint,
+            }
+        })
+        .await
+}
 
 pub struct TestContext {
-    pub _minio: ContainerAsync<MinIO>,
     pub object_store: Arc<dyn ObjectStore>,
 }
 
 impl TestContext {
-    /// Start a MinIO container and build an S3 object_store pointing at it.
+    /// Get a fresh, isolated S3 namespace inside the process-wide MinIO.
+    /// Each call allocates a unique bucket so concurrent tests don't see
+    /// each other's data.
     pub async fn new() -> Self {
-        let minio = MinIO::default().start().await.unwrap();
-        let host = minio.get_host().await.unwrap();
+        let minio = shared_minio().await;
+        let id = BUCKET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // MinIO bucket names: lowercase, 3-63 chars, alphanumeric + hyphen.
+        let bucket = format!("test-bucket-{id:06}");
 
-        // Retry port lookup — Docker can race between container start and
-        // port mapping visibility, causing PortNotExposed on loaded machines.
-        let port = {
-            let mut last_err = None;
-            let mut port = None;
-            for _ in 0..10 {
-                match minio.get_host_port_ipv4(9000).await {
-                    Ok(p) => { port = Some(p); break; }
-                    Err(e) => {
-                        last_err = Some(e);
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                }
-            }
-            port.unwrap_or_else(|| panic!("MinIO port 9000 not available after retries: {:?}", last_err))
-        };
-        let endpoint = format!("http://{}:{}", host, port);
-
-        // Create bucket using curl with AWS SigV4 auth inside the container
-        // (reqwest basic_auth doesn't work for S3 API — MinIO requires SigV4).
-        // Retry: exec() confirms the command started but not that it completed,
-        // and MinIO may not be ready to accept requests immediately.
+        // Create the bucket via the shared MinIO. Use the container's own
+        // curl + SigV4 auth (reqwest basic_auth doesn't work against S3).
         for attempt in 0..10 {
             let result = minio
+                ._container
                 .exec(ExecCommand::new(vec![
-                    "curl",
-                    "-sf",
-                    "-X",
-                    "PUT",
-                    "--aws-sigv4",
-                    "aws:amz:us-east-1:s3",
-                    "-u",
-                    "minioadmin:minioadmin",
-                    "http://localhost:9000/test-bucket",
+                    "curl".to_string(),
+                    "-sf".to_string(),
+                    "-X".to_string(),
+                    "PUT".to_string(),
+                    "--aws-sigv4".to_string(),
+                    "aws:amz:us-east-1:s3".to_string(),
+                    "-u".to_string(),
+                    "minioadmin:minioadmin".to_string(),
+                    format!("http://localhost:9000/{bucket}"),
                 ]))
                 .await;
             match result {
                 Ok(mut r) => {
-                    // stdout_to_vec blocks until the exec command exits.
                     let _ = r.stdout_to_vec().await;
                     if r.exit_code().await.unwrap_or(Some(1)) == Some(0) {
                         break;
                     }
                     if attempt >= 9 {
                         panic!(
-                            "bucket creation failed after retries (exit code {:?})",
+                            "bucket creation failed for {bucket} after retries (exit {:?})",
                             r.exit_code().await,
                         );
                     }
@@ -304,15 +374,15 @@ impl TestContext {
                 Err(_) if attempt < 9 => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
-                Err(e) => panic!("bucket creation exec failed after retries: {e}"),
+                Err(e) => panic!("bucket creation exec failed for {bucket}: {e}"),
             }
         }
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(
             AmazonS3Builder::new()
-                .with_endpoint(&endpoint)
+                .with_endpoint(&minio.endpoint)
                 .with_region("us-east-1")
-                .with_bucket_name("test-bucket")
+                .with_bucket_name(&bucket)
                 .with_access_key_id("minioadmin")
                 .with_secret_access_key("minioadmin")
                 .with_allow_http(true)
@@ -320,10 +390,7 @@ impl TestContext {
                 .unwrap(),
         );
 
-        Self {
-            _minio: minio,
-            object_store,
-        }
+        Self { object_store }
     }
 }
 

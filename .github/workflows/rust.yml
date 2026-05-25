@@ -50,13 +50,7 @@ jobs:
         with:
           workspaces: ". -> target"
       - name: Run docker integration tests
-        # --test-threads=1: each test spawns its own MinIO testcontainer.
-        # Running 4+ in parallel on a 4-vCPU CI runner caused ~40% flake
-        # rate (EIO on reads / empty discover_exports) from MinIO under
-        # resource contention. Verified pre-existing on `main` (sample:
-        # 6/10 pass at threads=4 vs 5/5 at threads=1 on the same host).
-        # Cost: ~5min longer wall-clock; benefit: reliable.
-        run: cargo test -p glidefs --features docker-tests --test docker_integration --verbose -- --test-threads=1
+        run: cargo test -p glidefs --features docker-tests --test docker_integration --verbose
 
   integrity-suite:
     name: Data Integrity Suite
