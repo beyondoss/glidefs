@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 /// Measure content-addressed dedup effectiveness at various block sizes.
 ///
 /// Point this at real disk images or filesystem exports and it tells you

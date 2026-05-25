@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 /// Measure block-level churn between a base image and forked images.
 ///
 /// Compares 128KB blocks by BLAKE3 hash to produce empirical data on:

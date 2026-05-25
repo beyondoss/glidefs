@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 /// Pack index encoding analysis using REAL disk image data.
 ///
 /// Reads blocks from raw disk images at configurable block sizes, computes
