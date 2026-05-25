@@ -77,6 +77,11 @@ pub struct KernelFeatures {
     /// (see `handoff::strategy::piod`). Currently always `false` on our
     /// production kernel (6.12); detection wired for future PIOD support.
     pub per_io_daemon: bool,
+    /// `UBLK_F_SUPPORT_ZERO_COPY` + `UBLK_F_AUTO_BUF_REG` — kernel ≥6.11
+    /// (usable from ≥6.17). When both bits are present, ublk-core's
+    /// auto-detect flips the device to the zero-copy transport when the
+    /// caller sets `UBLK_DEV_F_PREFER_ZERO_COPY`.
+    pub zero_copy: bool,
 }
 
 /// Probe the running kernel for supported ublk feature flags.
@@ -88,16 +93,24 @@ pub fn detect_features() -> KernelFeatures {
     let recovery = (raw & u64::from(sys::UBLK_F_USER_RECOVERY)) != 0;
     let ioctl_encode = (raw & u64::from(sys::UBLK_F_CMD_IOCTL_ENCODE)) != 0;
     let per_io_daemon = (raw & u64::from(sys::UBLK_F_PER_IO_DAEMON)) != 0;
+    let zero_copy = (raw & u64::from(sys::UBLK_F_SUPPORT_ZERO_COPY)) != 0
+        && (raw & u64::from(sys::UBLK_F_AUTO_BUF_REG)) != 0;
 
     tracing::info!(
         recovery,
         ioctl_encode,
         per_io_daemon,
+        zero_copy,
         raw_features = format_args!("0x{:x}", raw),
         "ublk kernel feature detection"
     );
 
-    KernelFeatures { recovery, ioctl_encode, per_io_daemon }
+    KernelFeatures {
+        recovery,
+        ioctl_encode,
+        per_io_daemon,
+        zero_copy,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +272,7 @@ impl UblkDevice {
         #[allow(clippy::cast_possible_truncation)]
         let bs_shift = handler.block_size().trailing_zeros() as u8; // block_size is power of 2, trailing_zeros <= 13
 
-        let dev_flags = match mode {
+        let mut dev_flags = match mode {
             DeviceMode::Add => UblkFlags::UBLK_DEV_F_ADD_DEV,
             DeviceMode::Recover { .. } => UblkFlags::UBLK_DEV_F_RECOVER_DEV,
         };
@@ -284,11 +297,38 @@ impl UblkDevice {
         // K × POOL_SLOTS × SLOT_SIZE (= 512 MB on 16 workers) regardless of
         // device count.
         //
-        // Default on. `GLIDEFS_BOUNCE_MODE=1` reverts to the per-tag-stable
-        // legacy bounce path — kept as a kill switch in case a kernel exposes
-        // a USER_COPY regression.
-        if std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none() {
+        // Transport selection: prefer kernel zero-copy when available
+        // (UBLK_F_SUPPORT_ZERO_COPY + UBLK_F_AUTO_BUF_REG, kernel ≥6.11
+        // with ublk_drv from ≥6.17 actually working — see
+        // `ublk-core/tests/zero_copy_roundtrip.rs`). When the kernel
+        // doesn't advertise both bits, fall back to USER_COPY (kernel
+        // ≥6.0). The control side is automatic: `UblkCtrl::new` queries
+        // `UBLK_CMD_GET_FEATURES` and, if `UBLK_DEV_F_PREFER_ZERO_COPY`
+        // is set in dev_flags below, ORs the ZC bits into dev_info.flags
+        // when both kernel-feature bits are present. Otherwise leaves
+        // them off and our USER_COPY request takes effect.
+        //
+        // Escape hatches:
+        //   `GLIDEFS_BOUNCE_MODE=1`     — pure traditional path (no
+        //                                 USER_COPY, no ZC), legacy
+        //                                 per-tag IoBuf
+        //   `GLIDEFS_NO_ZERO_COPY=1`    — force USER_COPY even on a
+        //                                 ZC-capable kernel
+        let use_zc = features.zero_copy
+            && std::env::var_os("GLIDEFS_NO_ZERO_COPY").is_none()
+            && std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none();
+        if use_zc {
+            dev_flags |= UblkFlags::UBLK_DEV_F_PREFER_ZERO_COPY;
+            tracing::info!(
+                export = %export_name,
+                "ublk: zero-copy transport (AUTO_BUF_REG) selected"
+            );
+        } else if std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none() {
             ctrl_flags |= u64::from(sys::UBLK_F_USER_COPY);
+            tracing::info!(
+                export = %export_name,
+                "ublk: USER_COPY transport selected (kernel lacks ZC or opt-out)"
+            );
         }
 
         // Snapshot per-worker handles so the spawn_blocking closure can
@@ -1214,11 +1254,30 @@ fn panic_payload_to_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
 pub(super) async fn io_task(
     q: &UblkQueue,
     tag: u16,
-    handler: &BlockHandler,
+    handler: &Arc<BlockHandler>,
 ) -> Result<(), UblkError> {
-    let user_copy = (q.dev.dev_info.flags & u64::from(ublk_core::sys::UBLK_F_USER_COPY)) != 0;
+    let dev_flags = q.dev.dev_info.flags;
+    let zero_copy = (dev_flags & u64::from(ublk_core::sys::UBLK_F_AUTO_BUF_REG)) != 0
+        && (dev_flags & u64::from(ublk_core::sys::UBLK_F_SUPPORT_ZERO_COPY)) != 0;
+    if zero_copy {
+        // ZC queues run via a dedicated OS thread (one per queue) that owns
+        // its own io_uring sized for queue_depth. Only tag 0's io_task
+        // actually drives the queue — the other tags are dummies whose
+        // futures park forever (or until the worker pool's queue executor
+        // shuts down). This is wasteful of executor slots but keeps the
+        // per-tag spawn invariant in worker_pool happy while we ship the
+        // ZC integration.
+        if tag == 0 {
+            return io_task_zero_copy(q, handler.clone()).await;
+        }
+        // Park the other tags' futures forever; they'll be dropped when
+        // the worker tears down.
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
+    let user_copy = (dev_flags & u64::from(ublk_core::sys::UBLK_F_USER_COPY)) != 0;
     if user_copy {
-        return io_task_user_copy(q, tag, handler).await;
+        return io_task_user_copy(q, tag, &**handler).await;
     }
 
     let mut buffer = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
@@ -1245,6 +1304,185 @@ pub(super) async fn io_task(
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), result)
             .await?;
     }
+}
+
+/// Bridge between glidefs's BlockHandler and ublk-core's ZcTarget trait.
+///
+/// Allocates one anonymous memfd per tag as a per-I/O bounce area; the
+/// kernel drains/fills the bio against this memfd via WRITE_FIXED/READ_FIXED
+/// (no userspace memcpy of bio data — kernel DMA only). After the data
+/// plane completes, the worker thread reads/writes the memfd via pread/
+/// pwrite to extract data for the existing async handler logic.
+///
+/// This is functional but not perf-optimal — the cache file isn't the
+/// direct source/sink, so we still do one extra pwrite/pread per I/O.
+/// A follow-up can replace the staging memfd with the cache file directly
+/// for the hot-cache case.
+struct GlidefsZcTarget {
+    handler: Arc<BlockHandler>,
+    runtime: tokio::runtime::Handle,
+    /// `staging[tag]` is an anonymous memfd sized to max_io_buf_bytes.
+    /// Kept open for the lifetime of the queue worker.
+    staging: Vec<std::os::fd::RawFd>,
+    max_io_buf_bytes: u32,
+}
+
+impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
+    fn dispatch(
+        &self,
+        op: u8,
+        offset: u64,
+        length: u32,
+        tag: u16,
+    ) -> ublk_core::zc::ZcAction {
+        let memfd = self.staging[tag as usize];
+        match u32::from(op) {
+            sys::UBLK_IO_OP_FLUSH => {
+                let res = match self.runtime.block_on(async { self.handler.flush() }) {
+                    Ok(()) => 0,
+                    Err(_) => -libc::EIO,
+                };
+                ublk_core::zc::ZcAction::Complete(res)
+            }
+            sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
+                // No-op for now (covered by USER_COPY's identical
+                // behavior on these ops). A future revision can route
+                // through `handler.discard_range`.
+                ublk_core::zc::ZcAction::Complete(0)
+            }
+            sys::UBLK_IO_OP_READ => {
+                // Fetch via handler.read_into into a userspace buf, copy
+                // into the staging memfd at offset 0, then READ_FIXED
+                // delivers bytes to the bio.
+                let mut buf = vec![0u8; length as usize];
+                let r = self
+                    .runtime
+                    .block_on(self.handler.read_into(offset, length, &mut buf));
+                match r {
+                    Ok(n) => {
+                        let written = unsafe {
+                            libc::pwrite(
+                                memfd,
+                                buf.as_ptr() as *const libc::c_void,
+                                n,
+                                0,
+                            )
+                        };
+                        if written < 0 {
+                            ublk_core::zc::ZcAction::Complete(-libc::EIO)
+                        } else {
+                            ublk_core::zc::ZcAction::ReadFixedFrom {
+                                fd: memfd,
+                                src_offset: 0,
+                            }
+                        }
+                    }
+                    Err(_) => ublk_core::zc::ZcAction::Complete(-libc::EIO),
+                }
+            }
+            sys::UBLK_IO_OP_WRITE => {
+                // WriteFixedTo drains bio → staging memfd. after_write
+                // pulls the bytes out and calls handler.write.
+                ublk_core::zc::ZcAction::WriteFixedTo {
+                    fd: memfd,
+                    dst_offset: 0,
+                }
+            }
+            _ => ublk_core::zc::ZcAction::Complete(-libc::EIO),
+        }
+    }
+
+    fn after_write(
+        &self,
+        _op: u8,
+        offset: u64,
+        length: u32,
+        tag: u16,
+        result: i32,
+    ) -> i32 {
+        if result < 0 {
+            return result;
+        }
+        let memfd = self.staging[tag as usize];
+        let mut buf = vec![0u8; length as usize];
+        let n = unsafe {
+            libc::pread(
+                memfd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                length as usize,
+                0,
+            )
+        };
+        if n < 0 || n as usize != length as usize {
+            return -libc::EIO;
+        }
+        match self.runtime.block_on(self.handler.write(offset, &buf, false)) {
+            Ok(()) => 0,
+            Err(_) => -libc::EIO,
+        }
+    }
+}
+
+pub(super) async fn io_task_zero_copy(
+    q: &UblkQueue,
+    handler: Arc<BlockHandler>,
+) -> Result<(), UblkError> {
+    use std::os::fd::RawFd;
+    let cdev_fd: RawFd = q.dev.tgt.fds[0];
+    let qid = q.get_qid();
+    let queue_depth = q.dev.dev_info.queue_depth;
+    let max_io_buf_bytes = q.dev.dev_info.max_io_buf_bytes;
+    let runtime = tokio::runtime::Handle::current();
+
+    // Allocate per-tag staging memfds. Each is sized for max_io_buf_bytes
+    // so any single I/O can be staged through it.
+    let mut staging: Vec<RawFd> = Vec::with_capacity(queue_depth as usize);
+    for tag in 0..queue_depth {
+        let name = std::ffi::CString::new(format!("glidefs-zc-stage-{}-{}", qid, tag))
+            .map_err(|_| UblkError::OtherError(-libc::EINVAL))?;
+        let fd = unsafe {
+            libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0u32) as RawFd
+        };
+        if fd < 0 {
+            for &existing in &staging {
+                unsafe { libc::close(existing) };
+            }
+            return Err(UblkError::IOError(std::io::Error::last_os_error()));
+        }
+        if unsafe { libc::ftruncate(fd, i64::from(max_io_buf_bytes)) } < 0 {
+            unsafe { libc::close(fd) };
+            for &existing in &staging {
+                unsafe { libc::close(existing) };
+            }
+            return Err(UblkError::IOError(std::io::Error::last_os_error()));
+        }
+        staging.push(fd);
+    }
+
+    let target: Arc<dyn ublk_core::zc::ZcTarget> = Arc::new(GlidefsZcTarget {
+        handler,
+        runtime,
+        staging: staging.clone(),
+        max_io_buf_bytes,
+    });
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let stop_for_thread = Arc::clone(&stop);
+    let join = tokio::task::spawn_blocking(move || {
+        ublk_core::zc::run_zc_queue(cdev_fd, qid, queue_depth, target, stop_for_thread)
+    });
+
+    // Park here until the OS thread exits. spawn_blocking returns a
+    // JoinHandle we can await; the thread runs run_zc_queue until stop=true.
+    // When the worker pool tears down the queue, the dev fd closes and
+    // the kernel ABORTs pending FETCHes — run_zc_queue exits.
+    let _ = join.await;
+
+    // Close the staging memfds.
+    for fd in staging {
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
 }
 
 /// `UBLK_F_USER_COPY` variant of `io_task`.
