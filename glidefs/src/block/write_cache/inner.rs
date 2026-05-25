@@ -554,7 +554,11 @@ impl CacheInner {
         // Fast path: single page-aligned write within one block (common case).
         if start_block == end_block
             && offset.is_multiple_of(PAGE_SIZE)
-            && data.len() == PAGE_SIZE as usize
+            && {
+                #[allow(clippy::cast_possible_truncation)]
+                let page_size = PAGE_SIZE as usize; // usize >= u64 on 64-bit
+                data.len() == page_size
+            }
         {
             let page = ((offset % block_size) / PAGE_SIZE) as usize;
             let crc = crc_fast::crc32_iscsi(data);
@@ -584,9 +588,12 @@ impl CacheInner {
                     let page_start = block_start + (page as u64) * PAGE_SIZE;
                     let page_end = page_start + PAGE_SIZE;
                     if offset <= page_start && end >= page_end {
-                        let slice_start = (page_start - offset) as usize;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let slice_start = (page_start - offset) as usize; // usize >= u64 on 64-bit
+                        #[allow(clippy::cast_possible_truncation)]
+                        let page_size = PAGE_SIZE as usize; // usize >= u64 on 64-bit
                         entry[page] = crc_fast::crc32_iscsi(
-                            &data[slice_start..slice_start + PAGE_SIZE as usize],
+                            &data[slice_start..slice_start + page_size],
                         );
                     } else if end > page_start && offset < page_end {
                         entry[page] = 0;
@@ -598,9 +605,12 @@ impl CacheInner {
                     let page_start = block_start + (page as u64) * PAGE_SIZE;
                     let page_end = page_start + PAGE_SIZE;
                     if offset <= page_start && end >= page_end {
-                        let slice_start = (page_start - offset) as usize;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let slice_start = (page_start - offset) as usize; // usize >= u64 on 64-bit
+                        #[allow(clippy::cast_possible_truncation)]
+                        let page_size = PAGE_SIZE as usize; // usize >= u64 on 64-bit
                         crcs[page] = crc_fast::crc32_iscsi(
-                            &data[slice_start..slice_start + PAGE_SIZE as usize],
+                            &data[slice_start..slice_start + page_size],
                         );
                     } else if end > page_start && offset < page_end {
                         crcs[page] = 0;
