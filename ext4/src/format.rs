@@ -558,13 +558,23 @@ pub fn write_inode(
 
     w.write_all(&mode.to_le_bytes())?;
     w.write_all(&(uid as u16).to_le_bytes())?; // uid low
-    w.write_all(&(size as u32).to_le_bytes())?; // size low
-    w.write_all(&(atime as u32).to_le_bytes())?;
-    w.write_all(&(ctime as u32).to_le_bytes())?;
-    w.write_all(&(mtime as u32).to_le_bytes())?;
+    #[allow(clippy::cast_possible_truncation)]
+    let size_u32 = size as u32; // typical files fit in u32
+    w.write_all(&size_u32.to_le_bytes())?; // size low
+    #[allow(clippy::cast_possible_truncation)]
+    let atime_u32 = atime as u32; // timestamp fits in u32 (32-bit UNIX time)
+    w.write_all(&atime_u32.to_le_bytes())?;
+    #[allow(clippy::cast_possible_truncation)]
+    let ctime_u32 = ctime as u32; // timestamp fits in u32
+    w.write_all(&ctime_u32.to_le_bytes())?;
+    #[allow(clippy::cast_possible_truncation)]
+    let mtime_u32 = mtime as u32; // timestamp fits in u32
+    w.write_all(&mtime_u32.to_le_bytes())?;
     w.write_all(&0u32.to_le_bytes())?; // dtime
     w.write_all(&(gid as u16).to_le_bytes())?; // gid low
-    w.write_all(&(links_count as u16).to_le_bytes())?;
+    #[allow(clippy::cast_possible_truncation)]
+    let links_u16 = links_count as u16; // link count fits in u16
+    w.write_all(&links_u16.to_le_bytes())?;
     w.write_all(&blocks_low.to_le_bytes())?;
     w.write_all(&flags.bits().to_le_bytes())?;
     w.write_all(&0u32.to_le_bytes())?; // version
