@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Lock-free circuit breaker for protecting external service calls.
 //!
 //! This implementation is provably race-free through:

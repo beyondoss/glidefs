@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 use crate::block::api::ApiServer;
 use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
 use crate::block::router::ExportRouter;

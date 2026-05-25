@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 use bytes::Bytes;
 use crate::block::block_map::{blake3_128, lz4_compress, shared_zero_block, Blake3Hash};
 use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};

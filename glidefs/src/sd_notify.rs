@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Best-effort sd_notify wrappers for systemd integration.
 //!
 //! All functions here are no-ops when `$NOTIFY_SOCKET` is unset (the

@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! NBD kernel device management via generic netlink (`NBD_GENL`).
 //!
 //! Creates `/dev/nbdN` block devices backed by `BlockHandler` instances. Each
