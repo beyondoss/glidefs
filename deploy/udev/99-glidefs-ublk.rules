@@ -1,0 +1,38 @@
+# udev rules for GlideFS ublk block devices.
+#
+# Install:
+#   sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
+#   sudo udevadm control --reload-rules
+#
+# These run during the KOBJ_ADD uevent in the kernel's `add_disk` path —
+# BEFORE userspace can open /dev/ublkbN and before any bios are routed
+# through the device. That timing is critical: writing
+# `/sys/block/.../queue/scheduler` triggers `blk_mq_freeze_queue_wait`,
+# which on kernel 6.17+ waits for armed FETCH_REQ uring_cmds. If we
+# tried to apply these settings AFTER the daemon armed FETCH_REQs (e.g.
+# from a `tokio::task::spawn_blocking` post-`add_disk`), the freeze
+# would block forever. Applying them at add-time avoids that entirely.
+#
+# Tunables we set:
+#
+# - scheduler=none — userspace handles I/O ordering; `mq-deadline`'s
+#   per-CPU staging adds latency for no benefit on ublk (no seeks).
+#
+# - wbt_lat_usec=0 — disable Write-Back Throttle. Default (~2ms target)
+#   misreads our userspace+S3 round-trip latency as queue congestion
+#   and clamps dispatch to single-digit IOPS.
+#
+# - add_random=0 — don't feed ublk completion events into the kernel
+#   entropy pool. Useful for HDDs (real entropy from seek timing);
+#   pointless for ublk. Saves a tiny bit of CPU per request.
+#
+# - read_ahead_kb=0 — glidefs does its own readahead inside the
+#   handler (`trigger_readahead` in `block/handler.rs`), tuned for our
+#   pack/chunk geometry. Kernel readahead duplicates work and pollutes
+#   the hot-set cache with prefetches we'd issue ourselves anyway.
+
+ACTION=="add", SUBSYSTEM=="block", KERNEL=="ublkb*", \
+    ATTR{queue/scheduler}="none", \
+    ATTR{queue/wbt_lat_usec}="0", \
+    ATTR{queue/add_random}="0", \
+    ATTR{queue/read_ahead_kb}="0"

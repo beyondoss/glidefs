@@ -486,38 +486,23 @@ impl UblkDevice {
             );
         }
 
-        // Disable write-back throttle for this userspace device. The
-        // kernel default (~2ms target latency) is far too aggressive
-        // for ublk: real per-request latency is much higher because we
-        // round-trip through userspace + S3, and WBT misreads that as
-        // queue congestion and clamps dispatch to single-digit IOPS.
-        // `wbt_lat_usec=0` is a simple per-queue store; doesn't freeze
-        // the queue, safe on any kernel.
+        // Block-layer tunables (scheduler=none, wbt_lat_usec=0,
+        // add_random=0, read_ahead_kb=0) are NOT applied here. They
+        // ship as a udev rule in `deploy/udev/99-glidefs-ublk.rules`
+        // which fires during the kernel's `add_disk` KOBJ_ADD uevent
+        // — before userspace can open /dev/ublkbN and before any bios
+        // are routed through the device.
         //
-        // We do NOT touch `scheduler` here. Writing
-        // `/sys/block/.../queue/scheduler` triggers
-        // `elv_iosched_store` → `blk_mq_freeze_queue` which waits for
-        // all in-flight requests to drain. On kernel 6.17+ the kernel
-        // counts our armed FETCH_REQ uring_cmds as in-flight; they
-        // never "complete" because they're long-lived (parked waiting
-        // for the next I/O). Result: the sysfs write hangs forever
-        // and the spawn_blocking task leaks a thread. Reproduced via
-        // `test_export_discovery_from_s3_ublk` on Azure 6.17 with the
-        // tokio worker's kernel stack pinned in
-        // `blk_mq_freeze_queue_wait`. The default `mq-deadline`
-        // scheduler costs us some overhead but is functionally fine;
-        // reclaiming it cleanly requires a udev rule that fires
-        // during the `add_disk` uevent (before FETCH_REQs are armed)
-        // or a kernel-side ublk_param. Tracked as follow-up.
-        if let Some(dev_name) = dev_path.file_name().and_then(|n| n.to_str()) {
-            let dev_name = dev_name.to_string();
-            tokio::task::spawn_blocking(move || {
-                let path = format!("/sys/block/{dev_name}/queue/wbt_lat_usec");
-                if let Err(e) = std::fs::write(&path, "0") {
-                    tracing::warn!(path = %path, error = %e, "failed to disable wbt");
-                }
-            });
-        }
+        // Why udev instead of a post-add_disk sysfs write from here:
+        // changing `scheduler` calls `elv_iosched_store` →
+        // `blk_mq_freeze_queue_wait`, which on kernel 6.17+ counts
+        // our armed FETCH_REQ uring_cmds as in-flight requests. They
+        // never "complete" — they're parked waiting for the next
+        // I/O — so the freeze blocks indefinitely. We reproduced this
+        // on Azure 6.17 with the tokio worker's kernel stack pinned
+        // in `blk_mq_freeze_queue_wait`. udev fires the writes during
+        // KOBJ_ADD, before FETCH_REQs are armed, so the freeze has
+        // nothing to wait for.
 
         tracing::info!(
             target: "glidefs.timing",
