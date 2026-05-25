@@ -1351,6 +1351,194 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Wraps `InMemory` and fails `put_opts` when armed. Used to simulate
+    /// the S3 outage that makes `save_export` return `Err` mid-PUT.
+    struct PutFailingStore {
+        inner: object_store::memory::InMemory,
+        fail_puts: std::sync::atomic::AtomicBool,
+    }
+
+    impl PutFailingStore {
+        fn new() -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                fail_puts: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn set_fail(&self, fail: bool) {
+            self.fail_puts
+                .store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Display for PutFailingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PutFailingStore")
+        }
+    }
+
+    impl std::fmt::Debug for PutFailingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "PutFailingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for PutFailingStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if self.fail_puts.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "PutFailingStore",
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "simulated S3 PUT outage",
+                    )),
+                });
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    async fn create_test_router_with_store(
+        temp_dir: &TempDir,
+        store: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<ExportRouter> {
+        Arc::new(
+            ExportRouter::new(RouterConfig {
+                object_store: store,
+                db_path: "test".to_string(),
+                cache_dir: temp_dir.path().to_path_buf(),
+                block_size: 128 * 1024,
+                clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+                wal_sync: false,
+                max_s3_uploads: 0,
+                max_s3_downloads: 0,
+                default_flush_threshold: crate::block::pack::DEFAULT_FLUSH_THRESHOLD,
+                ublk_nr_queues: 1,
+                nbd_dead_conn_timeout: 0,
+                max_exports: 10_000,
+            })
+            .await
+            .expect("failed to create test router"),
+        )
+    }
+
+    /// Full HTTP-stack verification of Stage 2b: when `save_export` fails
+    /// after `create_export` succeeded, the PUT must respond 503 AND clear
+    /// the in-memory entry so a subsequent retry re-runs from scratch.
+    ///
+    /// Without the fix, the second PUT would hit `create_export`'s
+    /// idempotency check, return 200 immediately, and S3 would still have
+    /// no export.json — silent data loss on the next daemon restart.
+    #[tokio::test]
+    async fn test_put_503_on_save_failure_cleans_up_and_retry_succeeds() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(PutFailingStore::new());
+        let router = create_test_router_with_store(&temp, store.clone()).await;
+
+        // Arm the failure: any PUT to S3 (including save_export) returns Err.
+        store.set_fail(true);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "save_export failure must surface as 503"
+        );
+
+        // In-memory state must be gone. The bug: without cleanup_failed_create
+        // the export sits in `self.exports` and GET would return 200.
+        let resp = request(&router, Method::GET, "/api/exports/vol1", None).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "in-memory state must be torn down after save_export failure"
+        );
+
+        // S3 recovers — retry succeeds. This is the "idempotent retry actually
+        // works" assertion: without cleanup, this PUT would hit the idempotency
+        // check and 200 with no S3 write.
+        store.set_fail(false);
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "retry after S3 recovery must re-run create_export and save_export"
+        );
+
+        // Confirm the export now exists in-memory.
+        let resp = request(&router, Method::GET, "/api/exports/vol1", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn test_get_existing_export() {
         let temp = TempDir::new().unwrap();
