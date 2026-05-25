@@ -400,4 +400,37 @@ impl WriteCache<Active> {
         Ok(())
     }
 
+    /// Metadata-only commit for ublk zero-copy writes. The kernel has
+    /// already drained the bio into the data file via `IORING_OP_WRITE_FIXED`
+    /// at the time this is called, so we skip the pwrite that
+    /// `pwrite_and_commit` does. We also skip `capture_page_crcs` — the data
+    /// never enters userspace, so we have no source to hash from. Flush-time
+    /// CRC verification handles a missing entry by skipping the check (see
+    /// `flush.rs` page-CRC mismatch branch); the trade-off is that ZC-written
+    /// blocks lose end-to-end CRC protection on the flush path.
+    ///
+    /// **Lock requirement**: caller must already hold a `data_file` read
+    /// guard (typically the inflight rotation-gate from
+    /// `CacheInner::zc_inflight_enter`) and pass the held `&SyncFile`
+    /// here. Re-acquiring the lock internally would deadlock against a
+    /// queued rotation writer (parking_lot is task-fair — a new reader
+    /// blocks behind the writer, which itself is blocked behind the
+    /// inflight reader).
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn commit_after_zc_write_with(
+        &self,
+        df: &super::inner::SyncFile,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), CacheError> {
+        if length == 0 {
+            return Ok(());
+        }
+        let block_size = self.inner.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + length - 1) / block_size;
+        self.inner.promote_syncing_blocks(df, start_block, end_block, true)?;
+        self.wal_append_and_mark_dirty(df, start_block, end_block)?;
+        Ok(())
+    }
 }

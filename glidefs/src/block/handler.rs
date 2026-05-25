@@ -1056,6 +1056,43 @@ impl BlockHandler {
         self.cache.inner().data_file_fd()
     }
 
+    /// Acquire an owned rotation-gate guard for a ublk ZC I/O.
+    ///
+    /// Hold across the entire kernel I/O lifetime (SQE submit → kernel data
+    /// plane → after_* metadata commit). Rotation blocks until every
+    /// inflight guard drops; the state-machine update in
+    /// `commit_after_zc_write` always observes the same active file the
+    /// kernel wrote to.
+    ///
+    /// `Send + 'static` — the guard can be moved into a tokio task,
+    /// then forwarded through the ZC channel into the worker's inflight
+    /// slot.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_inflight_enter(
+        &self,
+    ) -> parking_lot::lock_api::ArcRwLockReadGuard<
+        parking_lot::RawRwLock,
+        crate::block::write_cache::SyncFile,
+    > {
+        self.cache.inner().zc_inflight_enter()
+    }
+
+    /// Pwrite data into the cache file at a chunk's actual device offset
+    /// (for the ublk ZC cold-read path: decompressed S3 data lands in the
+    /// cache, then a subsequent `READ_FIXED` against the cache fd fills the
+    /// kernel bio without going through userspace).
+    ///
+    /// Holds `data_file.read()` briefly — does NOT enter the rotation gate,
+    /// callers must already be inside [`zc_inflight_enter`].
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_backfill_pwrite(
+        &self,
+        offset: u64,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        self.cache.inner().pwrite_data_file(data, offset)
+    }
+
     /// Phase 1 of ublk zero-copy write: prepare metadata before data write.
     ///
     /// Validates the request (readonly, SSD-full, bounds), then marks blocks
@@ -1155,6 +1192,75 @@ impl BlockHandler {
             self.flush()?;
         }
 
+        self.metrics.record_write_latency(start.elapsed());
+        Ok(())
+    }
+
+    /// Phase 2 of ublk zero-copy write: metadata commit for kernel-completed
+    /// data write.
+    ///
+    /// The kernel has already drained the bio into the data file via
+    /// `IORING_OP_WRITE_FIXED` by the time this is called. We promote any
+    /// SYNCING blocks back to the active file and append + mark dirty under
+    /// the data_file read lock — same invariants as `pwrite_and_commit`,
+    /// minus the pwrite (kernel did it) and the per-page CRC capture (no
+    /// userspace data to hash).
+    ///
+    /// ## CRC trade-off (deferred)
+    ///
+    /// `pwrite_and_commit` records a per-page CRC32C from the guest's write
+    /// buffer (see `write_cache/inner.rs::capture_page_crcs`). The flush
+    /// path re-reads each page from the data file at flush time and
+    /// compares the recomputed CRC against the captured one
+    /// (`write_cache/flush.rs::flush_block`, line 113 onward — the
+    /// `stored_crc == 0` branch is the "no CRC captured, skip
+    /// verification" escape). The check catches page-cache eviction bugs,
+    /// silent disk corruption, and kernel-side data-path bugs.
+    ///
+    /// For ZC writes we never see the data — it goes kernel→cache file
+    /// via DMA — so we can't compute the source CRC. We leave the per-page
+    /// CRC entries at 0 (the default). Flush will skip verification for
+    /// these blocks, *losing* end-to-end CRC protection on ZC-written data.
+    ///
+    /// Mitigations under consideration (none implemented yet):
+    /// 1. Read-back-after-write: pread the just-written data from the
+    ///    cache file in `after_write`, CRC it, store. Cost: doubles disk
+    ///    I/O per ZC write — defeats most of the perf benefit.
+    /// 2. Compute-at-flush-read-time: flush already reads the data to
+    ///    upload to S3 (`flush.rs::flush_block` does a pread); record the
+    ///    CRC there. Doesn't catch corruption *between* the ZC write and
+    ///    the flush read, but catches everything from the flush onward.
+    ///    Cheaper and probably the right call once we sit down to do it.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn commit_after_zc_write_with(
+        &self,
+        df: &crate::block::write_cache::SyncFile,
+        offset: u64,
+        length: u64,
+        fua: bool,
+    ) -> CommandResult<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let start = Instant::now();
+        self.metrics.record_guest_write(length);
+        self.cache
+            .commit_after_zc_write_with(df, offset, length)
+            .map_err(|e| match e {
+                CacheError::BlockEvicted => CommandError::BlockEvicted,
+                other => {
+                    tracing::warn!(error = %other, "commit_after_zc_write failed");
+                    CommandError::IoError
+                }
+            })?;
+        if let Some(ref tracer) = self.write_tracer {
+            tracer.record(offset, length, super::write_trace::TraceOp::Write);
+        }
+        self.check_flush_threshold();
+        if fua {
+            self.flush()?;
+        }
         self.metrics.record_write_latency(start.elapsed());
         Ok(())
     }

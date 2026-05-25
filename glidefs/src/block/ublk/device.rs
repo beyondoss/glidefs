@@ -298,37 +298,17 @@ impl UblkDevice {
         // device count.
         //
         // Transport selection: prefer kernel zero-copy when available
-        // (UBLK_F_SUPPORT_ZERO_COPY + UBLK_F_AUTO_BUF_REG, kernel ≥6.11
-        // with ublk_drv from ≥6.17 actually working — see
-        // `ublk-core/tests/zero_copy_roundtrip.rs`). When the kernel
-        // doesn't advertise both bits, fall back to USER_COPY (kernel
-        // ≥6.0). The control side is automatic: `UblkCtrl::new` queries
+        // (`UBLK_F_SUPPORT_ZERO_COPY + UBLK_F_AUTO_BUF_REG`, kernel ≥6.11
+        // with ublk_drv from ≥6.17 actually working). On older kernels
+        // fall back to USER_COPY. `UblkCtrl::new` queries
         // `UBLK_CMD_GET_FEATURES` and, if `UBLK_DEV_F_PREFER_ZERO_COPY`
-        // is set in dev_flags below, ORs the ZC bits into dev_info.flags
-        // when both kernel-feature bits are present. Otherwise leaves
-        // them off and our USER_COPY request takes effect.
+        // is set in `dev_flags`, ORs the ZC bits into `dev_info.flags`
+        // when both kernel-feature bits are present. Otherwise leaves them
+        // off and the USER_COPY request below takes effect.
         //
-        // Escape hatches:
-        //   `GLIDEFS_BOUNCE_MODE=1`     — pure traditional path (no
-        //                                 USER_COPY, no ZC), legacy
-        //                                 per-tag IoBuf
-        //   `GLIDEFS_NO_ZERO_COPY=1`    — force USER_COPY even on a
-        //                                 ZC-capable kernel
-        // The ZC integration spawns a blocking thread that uses
-        // `Handle::block_on` to call into the async `BlockHandler` API.
-        // That pattern needs a multi-thread runtime to make progress —
-        // on a current-thread runtime, block_on deadlocks because there's
-        // no other thread to drive the awaited future. The production
-        // daemon uses multi-thread, but many tests use `#[tokio::test]`
-        // which is current-thread by default. Detect that and fall back
-        // to USER_COPY so existing tests still pass on ZC-capable kernels.
-        let runtime_ok = matches!(
-            tokio::runtime::Handle::current().runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread,
-        );
+        // `GLIDEFS_BOUNCE_MODE=1` (test-only) disables both transports and
+        // forces the legacy per-tag-IoBuf path.
         let use_zc = features.zero_copy
-            && runtime_ok
-            && std::env::var_os("GLIDEFS_NO_ZERO_COPY").is_none()
             && std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none();
         if use_zc {
             dev_flags |= UblkFlags::UBLK_DEV_F_PREFER_ZERO_COPY;
@@ -340,7 +320,7 @@ impl UblkDevice {
             ctrl_flags |= u64::from(sys::UBLK_F_USER_COPY);
             tracing::info!(
                 export = %export_name,
-                "ublk: USER_COPY transport selected (kernel lacks ZC or opt-out)"
+                "ublk: USER_COPY transport selected (kernel lacks ZC)"
             );
         }
 
@@ -1273,19 +1253,13 @@ pub(super) async fn io_task(
     let zero_copy = (dev_flags & u64::from(ublk_core::sys::UBLK_F_AUTO_BUF_REG)) != 0
         && (dev_flags & u64::from(ublk_core::sys::UBLK_F_SUPPORT_ZERO_COPY)) != 0;
     if zero_copy {
-        // ZC queues run via a dedicated OS thread (one per queue) that owns
-        // its own io_uring sized for queue_depth. Only tag 0's io_task
-        // actually drives the queue — the other tags are dummies whose
-        // futures park forever (or until the worker pool's queue executor
-        // shuts down). This is wasteful of executor slots but keeps the
-        // per-tag spawn invariant in worker_pool happy while we ship the
-        // ZC integration.
+        // ZC queues are driven by a single dedicated OS thread (per queue)
+        // that owns the queue's ZC io_uring. Tag 0's `io_task` hosts that
+        // thread and lives until it exits; all other tags' `io_task`s
+        // return immediately so their executor slots are freed.
         if tag == 0 {
             return io_task_zero_copy(q, handler.clone()).await;
         }
-        // Park the other tags' futures forever; they'll be dropped when
-        // the worker tears down.
-        std::future::pending::<()>().await;
         return Ok(());
     }
     let user_copy = (dev_flags & u64::from(ublk_core::sys::UBLK_F_USER_COPY)) != 0;
@@ -1319,25 +1293,55 @@ pub(super) async fn io_task(
     }
 }
 
-/// Bridge between glidefs's BlockHandler and ublk-core's ZcTarget trait.
+/// Bridge between glidefs's `BlockHandler` and ublk-core's `ZcTarget`.
 ///
-/// Allocates one anonymous memfd per tag as a per-I/O bounce area; the
-/// kernel drains/fills the bio against this memfd via WRITE_FIXED/READ_FIXED
-/// (no userspace memcpy of bio data — kernel DMA only). After the data
-/// plane completes, the worker thread reads/writes the memfd via pread/
-/// pwrite to extract data for the existing async handler logic.
+/// The kernel auto-registers each bio's pages as an io_uring fixed buffer at
+/// `buf_index=tag` on FETCH; this target tells the kernel where the *other*
+/// end of the DMA is:
 ///
-/// This is functional but not perf-optimal — the cache file isn't the
-/// direct source/sink, so we still do one extra pwrite/pread per I/O.
-/// A follow-up can replace the staging memfd with the cache file directly
-/// for the hot-cache case.
+/// - **WRITE** (one chunk): bio → cache file at device offset via
+///   `WRITE_FIXED(data_file_fd, dst_offset=offset, buf_index=tag)`. The
+///   kernel DMAs directly to the cache SSD. After `pre_write` lands
+///   metadata (backfill, set-present); `after_write` does the state-machine
+///   commit.
+/// - **READ (hot, all-DIRTY)**: cache file → bio via N `READ_FIXED` SQEs,
+///   one per chunk, all targeting `buf_index=tag` at the chunk's
+///   `buf_offset`. No userspace copy on the data plane.
+/// - **READ (cold S3 / Zero / mixed)**: for each non-LocalSsd chunk we
+///   pwrite into the cache file at the block's start offset (backfill —
+///   the same disk write a future write-path backfill would do), then
+///   submit `READ_FIXED` from the same cache fd. `Zero` chunks read from
+///   `/dev/zero`. No memfd staging area.
+///
+/// **Rotation safety**: the dispatcher acquires `handler.zc_inflight_enter()`
+/// (an `ArcRwLockReadGuard` on the cache's `data_file` lock) *before*
+/// capturing the data-file fd, and forwards it to the worker via
+/// `ZcQueueHandle::submit(.., keepalive=Some(guard))`. The worker holds it
+/// in the per-tag inflight slot until `after_write`/`after_read` returns +
+/// COMMIT goes out. Rotation (`flush.rs::rotate_data_file_inner`) acquires
+/// `data_file.write()` and blocks until every inflight guard drops, so the
+/// state-map transition in `commit_after_zc_write` always operates on the
+/// same active file the kernel wrote to.
+///
+/// All async handler work (`pre_write`, `resolve_read`, cold pwrites)
+/// happens on tokio tasks. The ZC worker thread never blocks on async
+/// futures — it dispatches to a tokio task, returns `Deferred`, and the
+/// task pushes the data-plane SQE back via `ZcQueueHandle::submit`.
 struct GlidefsZcTarget {
     handler: Arc<BlockHandler>,
     runtime: tokio::runtime::Handle,
-    /// `staging[tag]` is an anonymous memfd sized to max_io_buf_bytes.
-    /// Kept open for the lifetime of the queue worker.
-    staging: Vec<std::os::fd::RawFd>,
-    max_io_buf_bytes: u32,
+    /// `/dev/zero` opened once at queue setup. Used as the source fd for
+    /// `READ_FIXED` covering all-zero chunks — no userspace memset, no
+    /// pwrite of zeros to the cache file.
+    dev_zero_fd: std::os::fd::RawFd,
+}
+
+impl Drop for GlidefsZcTarget {
+    fn drop(&mut self) {
+        if self.dev_zero_fd >= 0 {
+            unsafe { libc::close(self.dev_zero_fd) };
+        }
+    }
 }
 
 impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
@@ -1347,54 +1351,89 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
         offset: u64,
         length: u32,
         tag: u16,
-    ) -> ublk_core::zc::ZcAction {
-        let memfd = self.staging[tag as usize];
+        handle: &ublk_core::zc::ZcQueueHandle,
+    ) -> ublk_core::zc::ZcDispatch {
+        use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp, ZcDispatch};
+
         match u32::from(op) {
             sys::UBLK_IO_OP_FLUSH => {
-                let res = match self.runtime.block_on(async { self.handler.flush() }) {
+                let res = match self.handler.flush() {
                     Ok(()) => 0,
                     Err(_) => -libc::EIO,
                 };
-                ublk_core::zc::ZcAction::Complete(res)
+                ZcDispatch::Inline(ZcAction::Complete(res))
             }
             sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
-                // No-op for now (covered by USER_COPY's identical
-                // behavior on these ops). A future revision can route
-                // through `handler.discard_range`.
-                ublk_core::zc::ZcAction::Complete(0)
+                ZcDispatch::Inline(ZcAction::Complete(0))
             }
-            sys::UBLK_IO_OP_READ => {
-                let mut buf = vec![0u8; length as usize];
-                let r = self
-                    .runtime
-                    .block_on(self.handler.read_into(offset, length, &mut buf));
-                match r {
-                    Ok(n) => {
-                        let written = unsafe {
-                            libc::pwrite(
-                                memfd,
-                                buf.as_ptr() as *const libc::c_void,
-                                n,
-                                0,
-                            )
-                        };
-                        if written < 0 {
-                            ublk_core::zc::ZcAction::Complete(-libc::EIO)
-                        } else {
-                            ublk_core::zc::ZcAction::ReadFixedFrom {
-                                fd: memfd,
-                                src_offset: 0,
-                            }
+            sys::UBLK_IO_OP_WRITE => {
+                let handler = Arc::clone(&self.handler);
+                let handle = handle.clone();
+                self.runtime.spawn(async move {
+                    let mut guard = SubmitGuard::new(tag, handle);
+                    match handler.pre_write(offset, u64::from(length)).await {
+                        Ok(()) => {
+                            // Acquire the rotation gate, then read fd from
+                            // the gate's own deref. Calling
+                            // `data_file.read()` again while the read_arc
+                            // guard is held would self-deadlock if a writer
+                            // is queued (parking_lot is task-fair — a new
+                            // read attempt queues behind the writer, which
+                            // is itself queued behind the inflight reader).
+                            let gate = handler.zc_inflight_enter();
+                            let fd = {
+                                use std::os::unix::io::AsRawFd;
+                                (*gate).as_raw_fd_for_ublk_zc()
+                            };
+                            let action = ZcAction::Chunks(vec![ZcChunk {
+                                op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
+                                buf_offset: 0,
+                                length,
+                            }]);
+                            guard.commit(action, Some(Box::new(gate)));
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, offset, length, "ZC pre_write failed");
+                            guard.commit(ZcAction::Complete(-libc::EIO), None);
                         }
                     }
-                    Err(_) => ublk_core::zc::ZcAction::Complete(-libc::EIO),
-                }
+                });
+                ZcDispatch::Deferred
             }
-            sys::UBLK_IO_OP_WRITE => ublk_core::zc::ZcAction::WriteFixedTo {
-                fd: memfd,
-                dst_offset: 0,
-            },
-            _ => ublk_core::zc::ZcAction::Complete(-libc::EIO),
+            sys::UBLK_IO_OP_READ => {
+                let handler = Arc::clone(&self.handler);
+                let handle = handle.clone();
+                let dev_zero_fd = self.dev_zero_fd;
+                self.runtime.spawn(async move {
+                    let mut guard = SubmitGuard::new(tag, handle);
+                    match handler.resolve_read(offset, length).await {
+                        Ok(plan) => {
+                            // Enter the rotation gate BEFORE capturing the
+                            // data-file fd or doing any cold-path pwrite —
+                            // everything that touches the cache file in this
+                            // I/O happens while rotation is held off. fd is
+                            // pulled from the gate's deref (see WRITE branch
+                            // for the deadlock rationale).
+                            let gate = handler.zc_inflight_enter();
+                            let fd = (*gate).as_raw_fd_for_ublk_zc();
+                            let action = build_read_chunks_in_file(
+                                &handler,
+                                &plan,
+                                &*gate,
+                                fd,
+                                dev_zero_fd,
+                            );
+                            guard.commit(action, Some(Box::new(gate)));
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, offset, length, "ZC resolve_read failed");
+                            guard.commit(ZcAction::Complete(-libc::EIO), None);
+                        }
+                    }
+                });
+                ZcDispatch::Deferred
+            }
+            _ => ZcDispatch::Inline(ZcAction::Complete(-libc::EIO)),
         }
     }
 
@@ -1403,36 +1442,189 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
         _op: u8,
         offset: u64,
         length: u32,
-        tag: u16,
+        _tag: u16,
         result: i32,
+        keepalive: Option<&(dyn std::any::Any + Send)>,
     ) -> i32 {
         if result < 0 {
             return result;
         }
-        let memfd = self.staging[tag as usize];
-        let mut buf = vec![0u8; length as usize];
-        let n = unsafe {
-            libc::pread(
-                memfd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                length as usize,
-                0,
-            )
-        };
-        if n < 0 || n as usize != length as usize {
+        // Downcast the keepalive back to the rotation-gate guard so we can
+        // pass the held `&SyncFile` to the commit path without re-acquiring
+        // `data_file.read()` (which would deadlock against a queued
+        // rotation writer).
+        let df: Option<&crate::block::write_cache::SyncFile> = keepalive
+            .and_then(|k| {
+                k.downcast_ref::<parking_lot::lock_api::ArcRwLockReadGuard<
+                    parking_lot::RawRwLock,
+                    crate::block::write_cache::SyncFile,
+                >>()
+            })
+            .map(|g| &**g);
+        let Some(df) = df else {
+            tracing::error!(offset, length, "ZC after_write: missing rotation-gate keepalive");
             return -libc::EIO;
-        }
-        match self.runtime.block_on(self.handler.write(offset, &buf, false)) {
+        };
+        match self.handler.commit_after_zc_write_with(df, offset, u64::from(length), false) {
             Ok(()) => {
                 #[allow(clippy::cast_possible_wrap)]
                 let r = length as i32;
                 r
             }
-            Err(_) => -libc::EIO,
+            Err(e) => {
+                tracing::warn!(?e, offset, length, "ZC commit_after_zc_write failed");
+                -libc::EIO
+            }
         }
     }
 }
 
+/// Drop-guard around `ZcQueueHandle::submit` for ZC dispatch tasks. If a
+/// spawned task panics or is cancelled before calling `commit`, the guard's
+/// `Drop` posts `-EIO` so the kernel I/O doesn't hang forever. The kernel
+/// `STOP_DEV` path would eventually clean it up, but that requires device
+/// teardown — fatal for a single misbehaving I/O.
+struct SubmitGuard {
+    tag: u16,
+    handle: Option<ublk_core::zc::ZcQueueHandle>,
+}
+
+impl SubmitGuard {
+    fn new(tag: u16, handle: ublk_core::zc::ZcQueueHandle) -> Self {
+        Self { tag, handle: Some(handle) }
+    }
+
+    fn commit(
+        &mut self,
+        action: ublk_core::zc::ZcAction,
+        keepalive: Option<ublk_core::zc::Keepalive>,
+    ) {
+        if let Some(handle) = self.handle.take() {
+            handle.submit(self.tag, action, keepalive);
+        }
+    }
+}
+
+impl Drop for SubmitGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            tracing::error!(
+                tag = self.tag,
+                "ZC dispatch task dropped without commit — sending -EIO"
+            );
+            handle.submit(self.tag, ublk_core::zc::ZcAction::Complete(-libc::EIO), None);
+        }
+    }
+}
+
+/// Translate a `ReadPlan` into one or more `READ_FIXED` chunks.
+///
+/// - `ChunkSource::LocalSsd { file_offset }`: direct `READ_FIXED` from the
+///   cache fd at `file_offset` into the bio at `buf_offset`. Hot path; no
+///   userspace touch of the data.
+/// - `ChunkSource::InMemory(data)`: pwrite the full block via the held
+///   `&SyncFile` (the rotation gate's deref — no re-locking) at
+///   `block_start`, then `READ_FIXED` from the cache fd at
+///   `block_start + slice_start` for `slice_len` bytes.
+/// - `ChunkSource::Zero`: `READ_FIXED` from `/dev/zero` into the bio at
+///   `buf_offset`. No pwrite, no userspace memset.
+fn build_read_chunks_in_file(
+    _handler: &BlockHandler,
+    plan: &crate::block::write_cache::ReadPlan,
+    df: &crate::block::write_cache::SyncFile,
+    data_fd: std::os::fd::RawFd,
+    dev_zero_fd: std::os::fd::RawFd,
+) -> ublk_core::zc::ZcAction {
+    use crate::block::write_cache::ChunkSource;
+    use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp};
+
+    if plan.entries.is_empty() {
+        return ZcAction::Complete(0);
+    }
+
+    let mut chunks: Vec<ZcChunk> = Vec::with_capacity(plan.entries.len());
+    let mut buf_offset: u32 = 0;
+    for entry in &plan.entries {
+        #[allow(clippy::cast_possible_truncation)]
+        let slice_len = entry.slice_len as u32;
+        let chunk_op = match &entry.source {
+            ChunkSource::LocalSsd { file_offset } => ZcChunkOp::ReadFixed {
+                fd: data_fd,
+                src_offset: *file_offset,
+            },
+            ChunkSource::InMemory(data) => {
+                // Backfill the FULL block into the cache file via the held
+                // gate's `&SyncFile`. No fresh `data_file.read()` call —
+                // that would self-deadlock if a writer is queued.
+                if let Err(e) = df.write_all_at(data, entry.block_start) {
+                    tracing::warn!(
+                        ?e,
+                        block_start = entry.block_start,
+                        "ZC cold-read pwrite (backfill) failed"
+                    );
+                    return ZcAction::Complete(-libc::EIO);
+                }
+                ZcChunkOp::ReadFixed {
+                    fd: data_fd,
+                    src_offset: entry.block_start + entry.slice_start as u64,
+                }
+            }
+            ChunkSource::Zero => ZcChunkOp::ReadFixed {
+                fd: dev_zero_fd,
+                src_offset: 0,
+            },
+        };
+        chunks.push(ZcChunk {
+            op: chunk_op,
+            buf_offset,
+            length: slice_len,
+        });
+        buf_offset = buf_offset.saturating_add(slice_len);
+    }
+    ZcAction::Chunks(chunks)
+}
+
+/// Dedicated multi-thread tokio runtime for the ZC dispatch hot path.
+///
+/// Reason it exists: the ZC worker thread calls `runtime.spawn(...)` for each
+/// FETCH it dispatches (async `pre_write` / `resolve_read` then a back-
+/// channel submit). Those tasks must make progress *concurrently* with
+/// whoever owns the parent runtime — e.g. a test using `Command::output()`
+/// synchronously on a `current_thread` runtime would block its only thread,
+/// starving any spawned ZC dispatch task and hanging the device. Production
+/// already uses `#[tokio::main]` (multi-thread), but tests routinely don't.
+/// Owning our own runtime is the architectural fix.
+///
+/// Shared across all ZC queues / devices in the process. Sized to
+/// `available_parallelism` so it scales with the host. Lazy init; lives for
+/// the rest of the process — never explicitly dropped (no clean point).
+fn zc_dispatch_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(4);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(cpus)
+            .thread_name("glidefs-zc-dispatch")
+            .enable_all()
+            .build()
+            .expect("failed to build ZC dispatch runtime")
+    })
+}
+
+/// One async task per queue. Spawns a dedicated OS thread for the ZC
+/// io_uring loop, then awaits its completion via a oneshot.
+///
+/// **Why a dedicated OS thread**: `run_zc_queue` is a synchronous
+/// `submit_and_wait`-driven loop. The kernel requires `IORING_SETUP_SINGLE_
+/// ISSUER` on this ring — only one thread may push SQEs. Folding this into
+/// the existing tokio runtime would mean integrating io_uring as an
+/// `AsyncFd` and submitting via futures, which is a much bigger surgery.
+/// One thread per queue is the cheapest correct hosting; the dedicated ZC
+/// dispatch runtime (see [`zc_dispatch_runtime`]) owns the async handler
+/// work.
 pub(super) async fn io_task_zero_copy(
     q: &UblkQueue,
     handler: Arc<BlockHandler>,
@@ -1441,80 +1633,47 @@ pub(super) async fn io_task_zero_copy(
     let cdev_fd: RawFd = q.dev.tgt.fds[0];
     let qid = q.get_qid();
     let queue_depth = q.dev.dev_info.queue_depth;
-    let max_io_buf_bytes = q.dev.dev_info.max_io_buf_bytes;
-    let runtime = tokio::runtime::Handle::current();
+    let dev_id = q.dev.dev_info.dev_id;
+    let runtime = zc_dispatch_runtime().handle().clone();
 
-    // Allocate per-tag staging memfds. Each is sized for max_io_buf_bytes
-    // so any single I/O can be staged through it.
-    let mut staging: Vec<RawFd> = Vec::with_capacity(queue_depth as usize);
-    for tag in 0..queue_depth {
-        let name = std::ffi::CString::new(format!("glidefs-zc-stage-{}-{}", qid, tag))
-            .map_err(|_| UblkError::OtherError(-libc::EINVAL))?;
-        let fd = unsafe {
-            libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0u32) as RawFd
-        };
-        if fd < 0 {
-            for &existing in &staging {
-                unsafe { libc::close(existing) };
-            }
-            return Err(UblkError::IOError(std::io::Error::last_os_error()));
-        }
-        if unsafe { libc::ftruncate(fd, i64::from(max_io_buf_bytes)) } < 0 {
-            unsafe { libc::close(fd) };
-            for &existing in &staging {
-                unsafe { libc::close(existing) };
-            }
-            return Err(UblkError::IOError(std::io::Error::last_os_error()));
-        }
-        staging.push(fd);
+    // Open /dev/zero once per queue. Used as the source fd for READ_FIXED
+    // on zero-block chunks — kernel reads zeros directly into bio, no
+    // userspace memset, no per-tag scratch buffer.
+    let dev_zero_path = std::ffi::CString::new("/dev/zero").unwrap();
+    let dev_zero_fd = unsafe { libc::open(dev_zero_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if dev_zero_fd < 0 {
+        return Err(UblkError::IOError(std::io::Error::last_os_error()));
     }
 
     let target: Arc<dyn ublk_core::zc::ZcTarget> = Arc::new(GlidefsZcTarget {
         handler,
         runtime,
-        staging: staging.clone(),
-        max_io_buf_bytes,
+        dev_zero_fd,
     });
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Spawn a plain OS thread (NOT tokio::spawn_blocking) for the ZC
-    // worker loop. The worker calls Handle::block_on from this thread,
-    // which requires a non-tokio thread context. Using spawn_blocking
-    // creates a JoinHandle tied to tokio's runtime; awaiting it from the
-    // custom QueueExecutor (which io_task runs on) can stall the wakeup
-    // chain on cross-executor boundaries. A plain OS thread sidesteps
-    // both issues.
     let stop_for_thread = Arc::clone(&stop);
-    let handle = std::thread::Builder::new()
-        .name(format!("glidefs-zc-{}-{}", q.dev.dev_info.dev_id, qid))
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let _join = std::thread::Builder::new()
+        .name(format!("glidefs-zc-{}-{}", dev_id, qid))
         .spawn(move || {
-            let _ = ublk_core::zc::run_zc_queue(
+            let result = ublk_core::zc::run_zc_queue(
                 cdev_fd,
                 qid,
                 queue_depth,
                 target,
                 stop_for_thread,
             );
+            let _ = done_tx.send(result);
         })
         .map_err(|e| UblkError::IOError(std::io::Error::other(e.to_string())))?;
 
-    // We can't await an OS thread directly. Poll periodically; on
-    // shutdown signal, the kernel ABORTs in-flight FETCHes which the
-    // worker observes and exits. If the worker hangs, the future stays
-    // pending — but io_task is itself dropped on shutdown which leaks
-    // the thread; acceptable for the integration shim.
-    let _ = handle;
-    // Park the io_task future forever (or until executor cancels it).
-    // Worker thread continues servicing I/O; dropping the future means
-    // the worker is leaked, but the kernel ABORT-on-stop_dev path
-    // already releases its resources.
-    std::future::pending::<()>().await;
-
-    // Close the staging memfds.
-    for fd in staging {
-        unsafe { libc::close(fd) };
+    // Kernel `STOP_DEV` aborts in-flight FETCHes → `run_zc_queue` observes
+    // the ABORT CQEs → exits its loop → `done_tx` fires → we return.
+    match done_rx.await {
+        Ok(result) => result,
+        Err(_) => Ok(()),
     }
-    Ok(())
 }
 
 /// `UBLK_F_USER_COPY` variant of `io_task`.

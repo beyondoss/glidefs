@@ -26,7 +26,9 @@ use std::time::Duration;
 use ublk_core::ctrl::UblkCtrlBuilder;
 use ublk_core::io::UblkDev;
 use ublk_core::sys;
-use ublk_core::zc::{run_zc_queue, ZcAction, ZcTarget};
+use ublk_core::zc::{
+    run_zc_queue, ZcAction, ZcChunk, ZcChunkOp, ZcDispatch, ZcQueueHandle, ZcTarget,
+};
 use ublk_core::UblkFlags;
 
 const DEV_SIZE: u64 = 1 << 20;
@@ -46,19 +48,29 @@ struct MemfdTarget {
 }
 
 impl ZcTarget for MemfdTarget {
-    fn dispatch(&self, op: u8, offset: u64, _length: u32, _tag: u16) -> ZcAction {
-        match u32::from(op) {
-            sys::UBLK_IO_OP_READ => ZcAction::ReadFixedFrom {
-                fd: self.fd,
-                src_offset: offset,
-            },
-            sys::UBLK_IO_OP_WRITE => ZcAction::WriteFixedTo {
-                fd: self.fd,
-                dst_offset: offset,
-            },
+    fn dispatch(
+        &self,
+        op: u8,
+        offset: u64,
+        length: u32,
+        _tag: u16,
+        _handle: &ZcQueueHandle,
+    ) -> ZcDispatch {
+        let action = match u32::from(op) {
+            sys::UBLK_IO_OP_READ => ZcAction::Chunks(vec![ZcChunk {
+                op: ZcChunkOp::ReadFixed { fd: self.fd, src_offset: offset },
+                buf_offset: 0,
+                length,
+            }]),
+            sys::UBLK_IO_OP_WRITE => ZcAction::Chunks(vec![ZcChunk {
+                op: ZcChunkOp::WriteFixed { fd: self.fd, dst_offset: offset },
+                buf_offset: 0,
+                length,
+            }]),
             sys::UBLK_IO_OP_FLUSH => ZcAction::Complete(0),
             _ => ZcAction::Complete(-libc::EIO),
-        }
+        };
+        ZcDispatch::Inline(action)
     }
 }
 

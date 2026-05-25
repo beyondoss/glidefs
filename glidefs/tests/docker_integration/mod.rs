@@ -252,12 +252,58 @@ impl ConnectInfo {
 // each test's S3 namespace remains fully isolated via the unique bucket.
 
 /// Process-wide shared MinIO. Initialized on first `TestContext::new()`
-/// call; held alive for the entire test process. Container teardown
-/// happens at process exit when this OnceCell is dropped.
+/// call; held alive for the entire test process.
+///
+/// **Why we can't rely on Drop:** Rust statics never run `Drop` at program
+/// exit, so the `ContainerAsync` inside this `OnceCell` is never cleaned
+/// up by the testcontainers crate's normal mechanism. testcontainers-rs
+/// 0.26 also has no Ryuk-style sidecar reaper. Without intervention,
+/// every test process leaves its MinIO container running forever.
+///
+/// We work around this by stashing the container ID in a static and
+/// registering a libc::atexit handler that shells out to `docker rm -f`
+/// at process shutdown. See `register_minio_atexit_cleanup`.
+///
+/// Limitation: atexit doesn't run on `SIGKILL` / abort. A SIGKILLed test
+/// process can still leak its container.
 static SHARED_MINIO: tokio::sync::OnceCell<SharedMinio> = tokio::sync::OnceCell::const_new();
 
 /// Monotonic bucket counter so concurrent tests don't collide.
 static BUCKET_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Container IDs registered for atexit cleanup. We use a `Mutex<Vec<_>>`
+/// rather than `OnceLock<String>` for forward-compatibility with multiple
+/// shared containers; today there's only ever one.
+static ATEXIT_CONTAINER_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static ATEXIT_REGISTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn atexit_cleanup_containers() {
+    // atexit runs after main() returns. The tokio runtime is gone by now,
+    // so we can't use the testcontainers async API — just shell out.
+    let ids = match ATEXIT_CONTAINER_IDS.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(_) => return,
+    };
+    for id in ids {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &id])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+fn register_minio_atexit_cleanup(container_id: String) {
+    if let Ok(mut ids) = ATEXIT_CONTAINER_IDS.lock() {
+        ids.push(container_id);
+    }
+    if !ATEXIT_REGISTERED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        // SAFETY: atexit_cleanup_containers is `extern "C"` and only touches
+        // static state via Mutex/AtomicBool, which is safe in atexit context.
+        unsafe { libc::atexit(atexit_cleanup_containers) };
+    }
+}
 
 struct SharedMinio {
     _container: ContainerAsync<MinIO>,
@@ -268,6 +314,7 @@ async fn shared_minio() -> &'static SharedMinio {
     SHARED_MINIO
         .get_or_init(|| async {
             let minio = MinIO::default().start().await.unwrap();
+            register_minio_atexit_cleanup(minio.id().to_string());
             let host = minio.get_host().await.unwrap();
 
             // Retry port lookup — Docker can race between container start and

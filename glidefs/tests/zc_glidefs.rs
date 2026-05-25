@@ -14,10 +14,9 @@
 //!   - /dev/ublk-control is absent
 //!   - the test isn't running as root
 //!
-//! Uses `#[tokio::test(flavor = "multi_thread")]` so glidefs's ZC
-//! integration (which uses `Handle::block_on` from a blocking thread)
-//! can make progress. On a single-thread runtime, glidefs detects the
-//! flavor and falls back to USER_COPY automatically.
+//! Uses `#[tokio::test(flavor = "multi_thread")]` because the daemon-side
+//! ZC integration `spawn`s async dispatch work onto the tokio runtime from
+//! a non-tokio thread (the per-queue ZC io_uring loop).
 
 #![cfg(all(target_os = "linux", feature = "ublk"))]
 
@@ -85,13 +84,96 @@ async fn setup_router() -> (Arc<ExportRouter>, TempDir) {
     (router, cache_dir)
 }
 
-/// One I/O at the start of the device — a 4 KiB write followed by a
-/// 4 KiB read with byte-level comparison. Runs whichever transport
-/// glidefs auto-selects (ZC on ≥6.17, USER_COPY otherwise).
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+/// Single-chunk 4 KiB write → 4 KiB read. Smoke test for the hot path
+/// (post-write block is DIRTY → `ChunkSource::LocalSsd` → `READ_FIXED`).
+#[tokio::test(flavor = "multi_thread")]
 async fn zc_glidefs_roundtrip_4k() {
+    run_scenario("zc-4k", |dev| {
+        write_pattern(dev, 0, 4096)?;
+        verify_pattern(dev, 0, 4096)?;
+        Ok(())
+    })
+    .await;
+}
+
+/// 32-chunk read: write 128 KiB sequentially (across 32×4 KiB blocks),
+/// then read 128 KiB starting at offset 0 in one I/O. The ZC dispatch
+/// emits 32 `READ_FIXED` SQEs all targeting `buf_index=tag` at increasing
+/// `buf_offset`. Exercises the multi-chunk SQE fan-out + per-tag CQE
+/// aggregation in `run_zc_queue`.
+#[tokio::test(flavor = "multi_thread")]
+async fn zc_glidefs_multi_chunk_128k() {
+    run_scenario("zc-multi-chunk", |dev| {
+        write_pattern(dev, 0, 128 * 1024)?;
+        verify_pattern(dev, 0, 128 * 1024)?;
+        Ok(())
+    })
+    .await;
+}
+
+/// Cold read: read a never-written block. The plan resolves to
+/// `ChunkSource::Zero` (block is NOT_PRESENT and S3 is empty) — dispatch
+/// uses `/dev/zero` as the `READ_FIXED` source. No userspace memset, no
+/// memfd staging.
+#[tokio::test(flavor = "multi_thread")]
+async fn zc_glidefs_cold_zero_read() {
+    run_scenario("zc-cold-zero", |dev| {
+        let mut readback = aligned_4k(&vec![0u8; 4096]);
+        let mut file = open_direct(dev, false)?;
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(64 * 1024))?;
+        file.read_exact(&mut readback)?;
+        assert!(readback.iter().all(|&b| b == 0), "cold read non-zero");
+        Ok(())
+    })
+    .await;
+}
+
+/// Mixed read: write block A, leave block B unwritten, read across both
+/// in one I/O. ReadPlan has one `LocalSsd` entry + one `Zero` entry.
+/// Exercises multi-chunk dispatch with heterogeneous chunk sources.
+#[tokio::test(flavor = "multi_thread")]
+async fn zc_glidefs_mixed_dirty_and_zero() {
+    run_scenario("zc-mixed", |dev| {
+        // Write block 0 (offset 0).
+        write_pattern(dev, 0, 4096)?;
+        // Read [0, 8192) — block 0 DIRTY, block 1 still NOT_PRESENT.
+        let mut readback = aligned_4k(&vec![0u8; 8192]);
+        let mut file = open_direct(dev, false)?;
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut readback)?;
+        let pattern: Vec<u8> = (0..4096usize).map(|i| (i & 0xff) as u8).collect();
+        assert_eq!(&readback[..4096], pattern.as_slice(), "block 0 mismatch");
+        assert!(readback[4096..].iter().all(|&b| b == 0), "block 1 not zero");
+        Ok(())
+    })
+    .await;
+}
+
+/// Cross-block write: write 8 KiB straddling block boundary 0..1.
+/// `pre_write` backfills + sets present for both blocks, then the kernel
+/// `WRITE_FIXED` lands the bio into the cache at offset. Read it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn zc_glidefs_cross_block_write_8k() {
+    run_scenario("zc-cross-block", |dev| {
+        write_pattern(dev, 0, 8192)?;
+        verify_pattern(dev, 0, 8192)?;
+        Ok(())
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+async fn run_scenario<F>(name: &str, work: F)
+where
+    F: FnOnce(&Path) -> std::io::Result<()> + Send + 'static,
+{
     if let Some(why) = skip_reason() {
-        eprintln!("skip: {why}");
+        eprintln!("skip [{name}]: {why}");
         return;
     }
 
@@ -103,14 +185,13 @@ async fn zc_glidefs_roundtrip_4k() {
         .add_device(EXPORT_NAME, handler)
         .await
         .expect("ublk register");
-    eprintln!("ublk device: {} (flags: {:#x})", dev_path.display(), 0);
+    eprintln!("[{name}] ublk device: {}", dev_path.display());
 
     let bdev = dev_path.clone();
-    let io_result = tokio::task::spawn_blocking(move || run_io(&bdev))
+    let io_result = tokio::task::spawn_blocking(move || work(&bdev))
         .await
         .expect("spawn_blocking join");
 
-    // Shut down first so we don't leak the kernel device on assertion failure.
     if let Err(e) = ublk_server.shutdown().await {
         eprintln!("ublk shutdown error: {e}");
     }
@@ -118,40 +199,54 @@ async fn zc_glidefs_roundtrip_4k() {
         eprintln!("router shutdown error: {e}");
     }
 
-    io_result.expect("zc roundtrip");
+    io_result.unwrap_or_else(|e| panic!("[{name}] failed: {e}"));
+    eprintln!("[{name}] OK");
 }
 
-fn run_io(dev: &Path) -> std::io::Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
+fn open_direct(dev: &Path, write: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-
-    let pattern: Vec<u8> = (0..4096usize).map(|i| (i & 0xff) as u8).collect();
-    let aligned = aligned_4k(&pattern);
-
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(dev)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&aligned)?;
-        file.sync_data()?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).custom_flags(libc::O_DIRECT);
+    if write {
+        opts.write(true);
     }
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(dev)?;
-        let mut readback = aligned_4k(&vec![0u8; 4096]);
-        file.seek(SeekFrom::Start(0))?;
-        file.read_exact(&mut readback)?;
-        assert_eq!(
-            &readback[..pattern.len()],
-            pattern.as_slice(),
-            "roundtrip data mismatch"
-        );
-        eprintln!("ROUND-TRIP MATCH");
+    opts.open(dev)
+}
+
+/// Increasing-byte pattern: byte i = ((offset + i) & 0xff). Lets us verify
+/// content + alignment even when writes straddle block boundaries.
+fn write_pattern(dev: &Path, offset: u64, len: usize) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let pattern: Vec<u8> = (0..len)
+        .map(|i| ((offset as usize + i) & 0xff) as u8)
+        .collect();
+    let aligned = aligned_4k(&pattern);
+    let mut file = open_direct(dev, true)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(&aligned)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+fn verify_pattern(dev: &Path, offset: u64, len: usize) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let pattern: Vec<u8> = (0..len)
+        .map(|i| ((offset as usize + i) & 0xff) as u8)
+        .collect();
+    let mut readback = aligned_4k(&vec![0u8; len]);
+    let mut file = open_direct(dev, false)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(&mut readback)?;
+    if &readback[..len] != pattern.as_slice() {
+        // Find first mismatch.
+        let bad = readback[..len].iter().zip(pattern.iter()).position(|(a, b)| a != b).unwrap();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "data mismatch at byte {bad}: got {:#x}, want {:#x} (offset {}, len {})",
+                readback[bad], pattern[bad], offset, len
+            ),
+        ));
     }
     Ok(())
 }

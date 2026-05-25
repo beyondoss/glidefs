@@ -20,7 +20,7 @@ mod fio_bench {
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
-    const DEVICE_SIZE_GB: f64 = 2.0;
+    const DEVICE_SIZE_GB: f64 = 0.25; // 256 MiB — fits in QEMU 4G VM with headroom
 
     fn ublk_available() -> bool {
         Path::new("/dev/ublk-control").exists()
@@ -39,6 +39,17 @@ mod fio_bench {
 
     impl BenchServer {
         async fn start() -> Self {
+            Self::start_with_options(false).await
+        }
+
+        /// Same as `start` but forces the legacy `UBLK_F_USER_COPY` transport
+        /// even on a ZC-capable kernel — used by the A/B benchmark to
+        /// compare the two transports on the same kernel.
+        async fn start_force_user_copy() -> Self {
+            Self::start_with_options(true).await
+        }
+
+        async fn start_with_options(force_user_copy: bool) -> Self {
             let cache_dir = TempDir::new().unwrap();
             let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
             let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
@@ -53,7 +64,11 @@ mod fio_bench {
                     wal_sync: false,
                     max_s3_uploads: 128,
                     max_s3_downloads: 512,
-                    default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
+                    // Disable auto-flush so the bench measures transport
+                    // throughput against a hot cache, not S3 store traffic.
+                    // Without this, the in-memory store accumulates blocks
+                    // and OOMs the 4 GiB QEMU VM.
+                    default_flush_threshold: 0,
                     ublk_nr_queues: 4,
                     nbd_dead_conn_timeout: 0,
                     max_exports: 10_000,
@@ -80,6 +95,9 @@ mod fio_bench {
                 .expect("no handler for bench export");
 
             let mut ublk_server = UblkServer::new();
+            if force_user_copy {
+                ublk_server.force_user_copy_transport();
+            }
             let dev_path = ublk_server
                 .add_device("bench", handler)
                 .await
@@ -247,7 +265,7 @@ mod fio_bench {
     // The actual test
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fio_benchmark() {
         if !ublk_available() {
             eprintln!("skipping fio benchmark: ublk_drv not available");
@@ -273,5 +291,120 @@ mod fio_bench {
         print_results(&[write_result, read_result, mixed_result]);
 
         server.shutdown().await;
+    }
+
+    /// A/B benchmark: ZC vs USER_COPY on the same kernel.
+    ///
+    /// Runs four canonical workloads against a hot-cache device under each
+    /// transport. Prints per-workload IOPS / bandwidth / latency for both,
+    /// then a delta table. On a ZC-capable kernel (≥6.17) we expect ZC to
+    /// win on every workload by skipping the kernel↔userspace memcpy on
+    /// the data plane.
+    ///
+    /// Skips if the kernel doesn't advertise both ZC bits — the comparison
+    /// is meaningless there (both runs would be USER_COPY).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fio_benchmark_zc_vs_usercopy() {
+        if !ublk_available() {
+            eprintln!("skipping fio A/B benchmark: ublk_drv not available");
+            return;
+        }
+        if !fio_available() {
+            eprintln!("skipping fio A/B benchmark: fio not installed");
+            return;
+        }
+
+        // Probe: does the kernel actually support ZC? If not, both runs are
+        // USER_COPY and the comparison is noise.
+        let features = glidefs::block::ublk::device::detect_features();
+        if !features.zero_copy {
+            eprintln!(
+                "skipping fio A/B benchmark: kernel does not advertise \
+                 UBLK_F_SUPPORT_ZERO_COPY + UBLK_F_AUTO_BUF_REG"
+            );
+            return;
+        }
+
+        let workloads: &[(&str, &str, &[&str])] = &[
+            ("4k-randwrite", "randwrite", &["--bs=4k"]),
+            ("4k-randread", "randread", &["--bs=4k"]),
+            ("128k-seqwrite", "write", &["--bs=128k"]),
+            ("128k-seqread", "read", &["--bs=128k"]),
+        ];
+
+        eprintln!("\n=== Pass 1: kernel ZC transport (UBLK_F_AUTO_BUF_REG) ===");
+        let zc_results = {
+            let server = BenchServer::start().await;
+            // Pre-fill so reads hit the warm cache.
+            let _prefill = run_fio("prefill", "write", &server.dev_path, &["--bs=128k"]);
+            let mut out = Vec::new();
+            for (name, rw, args) in workloads {
+                let r = run_fio(name, rw, &server.dev_path, args);
+                out.push(r);
+            }
+            server.shutdown().await;
+            out
+        };
+
+        eprintln!("\n=== Pass 2: legacy USER_COPY transport (forced) ===");
+        let uc_results = {
+            let server = BenchServer::start_force_user_copy().await;
+            let _prefill = run_fio("prefill", "write", &server.dev_path, &["--bs=128k"]);
+            let mut out = Vec::new();
+            for (name, rw, args) in workloads {
+                let r = run_fio(name, rw, &server.dev_path, args);
+                out.push(r);
+            }
+            server.shutdown().await;
+            out
+        };
+
+        eprintln!("\n=== ZC results ===");
+        print_results(&zc_results);
+        eprintln!("=== USER_COPY results ===");
+        print_results(&uc_results);
+
+        eprintln!("\n=== ZC vs USER_COPY delta (positive = ZC wins) ===");
+        eprintln!(
+            "{:<16} {:>12} {:>12} {:>12}",
+            "workload", "iops Δ%", "bw Δ%", "p99 lat Δ%"
+        );
+        eprintln!("{}", "-".repeat(54));
+        let mut wins = 0usize;
+        for (zc, uc) in zc_results.iter().zip(uc_results.iter()) {
+            let zc_iops = zc.read_iops.max(zc.write_iops);
+            let uc_iops = uc.read_iops.max(uc.write_iops);
+            let zc_bw = zc.read_bw_kib.max(zc.write_bw_kib);
+            let uc_bw = uc.read_bw_kib.max(uc.write_bw_kib);
+            let zc_p99 = zc.read_lat_p99_ns.max(zc.write_lat_p99_ns);
+            let uc_p99 = uc.read_lat_p99_ns.max(uc.write_lat_p99_ns);
+
+            let iops_d = pct_delta(zc_iops, uc_iops);
+            let bw_d = pct_delta(zc_bw, uc_bw);
+            // Lower latency is better — invert sign so positive = ZC wins.
+            let p99_d = -pct_delta(zc_p99, uc_p99);
+
+            eprintln!(
+                "{:<16} {:>+11.2}% {:>+11.2}% {:>+11.2}%",
+                zc.workload, iops_d, bw_d, p99_d
+            );
+            if iops_d >= 10.0 {
+                wins += 1;
+            }
+        }
+        eprintln!();
+        eprintln!(
+            "ZC won (≥10% IOPS uplift) on {} / {} workloads",
+            wins,
+            zc_results.len()
+        );
+    }
+
+    fn pct_delta(a: f64, b: f64) -> f64 {
+        if b == 0.0 {
+            0.0
+        } else {
+            (a - b) / b * 100.0
+        }
     }
 }

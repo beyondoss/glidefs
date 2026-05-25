@@ -157,16 +157,13 @@ jobs:
           uname -r
           # The zc_glidefs test logs the negotiated transport so the CI
           # log shows whether ZC or USER_COPY was selected.
-      - name: Zero-copy auto-detect (ublk, multi-thread runtime)
-        # zc_glidefs uses #[tokio::test(flavor = "multi_thread")]. On a
-        # ZC-capable kernel it exercises io_task_zero_copy; on older
-        # kernels it falls back to USER_COPY. Either path must pass.
+      - name: Zero-copy auto-detect (ublk)
+        # zc_glidefs auto-detects the kernel transport: on a ZC-capable
+        # kernel it exercises `io_task_zero_copy`; on older kernels it
+        # falls back to USER_COPY. The ubuntu-24.04 host kernel is older
+        # than 6.17, so this CI job exercises the USER_COPY fallback path
+        # — the dedicated QEMU 6.17 job exercises the ZC path.
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,test-utils --test zc_glidefs -- --nocapture
-      - name: USER_COPY path (forced via GLIDEFS_NO_ZERO_COPY=1)
-        # Forces the legacy USER_COPY transport even on a ZC-capable
-        # kernel — verifies that path still works after the ZC
-        # integration landed.
-        run: sudo -E env "PATH=$PATH" GLIDEFS_NO_ZERO_COPY=1 cargo test -p glidefs --release --features ublk,test-utils --test zc_glidefs -- --nocapture
       - name: fio benchmark (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
       - name: fio verify (ublk)

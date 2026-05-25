@@ -36,9 +36,15 @@ enum BlockLocation {
 /// of a read request without going through an intermediate buffer.
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 pub enum ChunkSource {
-    /// Block is all zeros — memset the destination.
+    /// Block is all zeros — kernel can `READ_FIXED` from `/dev/zero` (or
+    /// equivalent) into the bio.
     Zero,
-    /// Block data already in memory (local pread, clean cache, or S3 fetch) — memcpy to destination.
+    /// Block data lives on the local cache SSD at `file_offset` in the data
+    /// file. Caller issues `IORING_OP_READ_FIXED` against the current data
+    /// file fd directly into the bio — no userspace copy.
+    LocalSsd { file_offset: u64 },
+    /// Block data already in memory (clean cache or S3 fetch) — memcpy to
+    /// destination via a userspace bounce. Cold path; not hot-path eligible.
     InMemory(Bytes),
 }
 
@@ -47,6 +53,10 @@ pub enum ChunkSource {
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 pub struct ChunkPlanEntry {
     pub source: ChunkSource,
+    /// Byte offset of the *block* (chunk) this entry covers — i.e.
+    /// `block_idx * block_size`. The ZC cold-read path pwrites
+    /// `InMemory(data)` at this offset before issuing READ_FIXED.
+    pub block_start: u64,
     /// Byte offset within the chunk to start copying from.
     pub slice_start: usize,
     /// Number of bytes to copy from this chunk.
@@ -258,14 +268,56 @@ impl WriteCache<Active> {
         let start_chunk = offset / chunk_size;
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
 
-        // All reads go through the cold path which uses pread via the RwLock'd
-        // data_file (always correct fd). File rotation (flush)
-        // renames the active file and opens a new one — the io_uring-registered
-        // fd permanently points to the old inode after the first rotation,
-        // making LocalSsd (Fixed fd) unsafe for all subsequent I/O.
-        //
-        // Box to keep the parent future (io_task_zc) small — locate_block/
-        // fetch_coalesced have deep async call trees that inflate the state machine.
+        // Hot path: every block in range is DIRTY and no flush rotation is
+        // in progress. Emit `LocalSsd` entries; the ublk worker submits
+        // `READ_FIXED` against the current data file fd (per-IO, not the
+        // permanently-registered Fixed slot) directly into the bio. The fd
+        // is captured at submission time; rotation after submission is
+        // safe because io_uring `fget`s the underlying file struct at SQE
+        // intake and holds it until the I/O completes.
+        if !self.inner.flushing_active.load(Ordering::Acquire) {
+            let all_dirty = (start_chunk..=end_chunk).all(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                let idx = i as usize;
+                self.inner.state_map.get(idx)
+                    == crate::block::block_map::SparseBlockState::DIRTY
+            });
+            if all_dirty {
+                #[allow(clippy::cast_possible_truncation)]
+                let num_chunks = (end_chunk - start_chunk + 1) as usize;
+                let mut entries = Vec::with_capacity(num_chunks);
+                for i in 0..num_chunks {
+                    let block_idx = start_chunk + i as u64;
+                    let chunk_start_byte = block_idx * chunk_size;
+                    let slice_start = if block_idx == start_chunk {
+                        (offset - chunk_start_byte) as usize
+                    } else {
+                        0
+                    };
+                    let slice_end = if block_idx == end_chunk {
+                        let end_byte = offset + len as u64;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let relative_end = (end_byte - chunk_start_byte) as usize;
+                        std::cmp::min(relative_end, self.inner.config.block_size)
+                    } else {
+                        self.inner.config.block_size
+                    };
+                    entries.push(ChunkPlanEntry {
+                        source: ChunkSource::LocalSsd {
+                            file_offset: chunk_start_byte + slice_start as u64,
+                        },
+                        block_start: chunk_start_byte,
+                        slice_start,
+                        slice_len: slice_end - slice_start,
+                    });
+                }
+                return Ok(ReadPlan { entries });
+            }
+        }
+
+        // Cold path. Box to keep the parent future small — locate_block /
+        // fetch_coalesced have deep async call trees that inflate the state
+        // machine.
         Box::pin(self.resolve_read_plan_cold(
             offset, len, start_chunk, end_chunk, clean_cache,
             pack_index_cache, volume_manifest, content_store, metrics,
@@ -389,6 +441,7 @@ impl WriteCache<Active> {
 
             entries.push(ChunkPlanEntry {
                 source,
+                block_start: chunk_start_byte,
                 slice_start,
                 slice_len: slice_end - slice_start,
             });

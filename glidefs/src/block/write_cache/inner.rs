@@ -97,6 +97,17 @@ mod sync_file {
             use std::os::unix::io::AsRawFd;
             self.file.as_raw_fd()
         }
+
+        /// Same as `as_raw_fd` — distinct name to make the ublk ZC call
+        /// site greppable when auditing rotation-gate discipline. Always
+        /// call this through a `data_file` read-guard deref, never via a
+        /// fresh `data_file.read()` while another guard is held (would
+        /// deadlock against a queued writer under parking_lot's task-fair
+        /// policy).
+        #[cfg(target_os = "linux")]
+        pub fn as_raw_fd_for_ublk_zc(&self) -> std::os::unix::io::RawFd {
+            self.as_raw_fd()
+        }
     }
 }
 
@@ -289,7 +300,15 @@ pub(crate) struct CacheInner {
     /// Uses positional I/O (pread/pwrite) which is thread-safe. RwLock is
     /// read-locked for all I/O (~2ns overhead); write-locked only during
     /// file rotation (once per flush cycle).
-    pub(super) data_file: parking_lot::RwLock<SyncFile>,
+    /// Active data file behind an `Arc<RwLock<_>>` so the ublk ZC path can
+    /// acquire an owned [`parking_lot::lock_api::ArcRwLockReadGuard`] that
+    /// outlives the async io_uring boundary. The guard is held from
+    /// "SQE submission" through "after_write metadata commit"; rotation
+    /// takes `.write()` and blocks until every inflight ZC I/O drops its
+    /// guard. Without this, a flush rotating between WRITE_FIXED and the
+    /// state-machine commit would land the data in the now-flushing file
+    /// while the state map says DIRTY-in-active — silent corruption.
+    pub(super) data_file: Arc<parking_lot::RwLock<SyncFile>>,
 
     /// Flushing file: the previous active file being uploaded to S3.
     /// Only set during an active flush. Immutable once set
@@ -526,6 +545,22 @@ impl CacheInner {
     #[inline]
     pub(crate) fn data_file_fd(&self) -> std::os::unix::io::RawFd {
         self.data_file.read().as_raw_fd()
+    }
+
+    /// Acquire an owned read-lock guard that gates `data_file` rotation.
+    ///
+    /// The returned guard is `Send` and `'static`. Hold it across the entire
+    /// ublk ZC I/O lifetime (SQE submission → kernel data plane →
+    /// `after_*` metadata commit). While any inflight guard is held,
+    /// `rotate_data_file` blocks on `data_file.write()` and cannot swap
+    /// the file. This serializes ZC I/O with rotation so the state-map
+    /// transition in `commit_after_zc_write` always operates on the same
+    /// file the kernel wrote to.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub(crate) fn zc_inflight_enter(
+        &self,
+    ) -> parking_lot::lock_api::ArcRwLockReadGuard<parking_lot::RawRwLock, SyncFile> {
+        self.data_file.read_arc()
     }
 
     /// Write data to the data file via the RwLock'd handle (always correct fd).

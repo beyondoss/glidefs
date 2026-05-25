@@ -163,6 +163,16 @@ impl UblkServer {
         &self.features
     }
 
+    /// Force the legacy `UBLK_F_USER_COPY` transport on subsequent
+    /// `add_device` calls, even on a kernel that advertises
+    /// `UBLK_F_SUPPORT_ZERO_COPY + UBLK_F_AUTO_BUF_REG`. Used for A/B
+    /// benchmarking ZC vs USER_COPY on the same kernel. Production code
+    /// must not call this — the auto-detect picks the best available
+    /// transport.
+    pub fn force_user_copy_transport(&mut self) {
+        self.features.zero_copy = false;
+    }
+
     /// Active device IDs paired with their export names. Used by the
     /// handoff predecessor to populate the export snapshot sent in
     /// `HelloAck`.
