@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
@@ -92,7 +93,9 @@ impl WriteCache<Active> {
         // have data on SSD yet (CAS'd but not pwritten). SYNCING blocks
         // have data in the flushing file, not the active file.
         if !(start_block..=end_block).all(|i| {
-            self.inner.state_map.get(i as usize)
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = i as usize; // usize >= u64 on 64-bit systems
+            self.inner.state_map.get(idx)
                 == crate::block::block_map::SparseBlockState::DIRTY
         }) {
             return None;
@@ -165,7 +168,9 @@ impl WriteCache<Active> {
             // Block is entirely beyond device - shouldn't happen but handle gracefully
             return Ok(Some(Bytes::from(vec![0u8; block_size])));
         } else {
-            std::cmp::min(block_size as u64, device_size - offset) as usize
+            #[allow(clippy::cast_possible_truncation)]
+            let bytes = std::cmp::min(block_size as u64, device_size - offset) as usize; // usize >= u64 on 64-bit
+            bytes
         };
 
         let mut buf = vec![0u8; block_size];
@@ -181,7 +186,8 @@ impl WriteCache<Active> {
 
         // Re-check state: the block may have been evicted (SYNCING→NOT_PRESENT)
         // between the caller's is_present() check and now.
-        let state = self.inner.state_map.get(block_num as usize);
+        #[allow(clippy::cast_possible_truncation)]
+        let state = self.inner.state_map.get(block_num as usize); // usize >= u64 on 64-bit systems
         if state == crate::block::block_map::SparseBlockState::NOT_PRESENT {
             return Ok(None);
         }
@@ -196,7 +202,8 @@ impl WriteCache<Active> {
             }
             // Flushing file gone — flush completed between state check and
             // lock acquisition. Block is now NOT_PRESENT (or re-dirtied).
-            let state2 = self.inner.state_map.get(block_num as usize);
+            #[allow(clippy::cast_possible_truncation)]
+            let state2 = self.inner.state_map.get(block_num as usize); // usize >= u64 on 64-bit systems
             if state2 == crate::block::block_map::SparseBlockState::NOT_PRESENT {
                 return Ok(None);
             }
@@ -281,7 +288,8 @@ impl WriteCache<Active> {
         metrics: &super::super::metrics::ExportMetrics,
     ) -> Result<ReadPlan, CacheError> {
         let chunk_size = self.inner.config.block_size as u64;
-        let num_chunks = (end_chunk - start_chunk + 1) as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let num_chunks = (end_chunk - start_chunk + 1) as usize; // usize >= u64 on 64-bit systems
 
         // Locate all blocks concurrently, then coalesce S3 fetches.
         // All local reads go through pread (via locate_block → sync_read_local_block)
@@ -372,7 +380,8 @@ impl WriteCache<Active> {
             };
             let slice_end = if block_idx == end_chunk {
                 let end_byte = offset + len as u64;
-                let relative_end = (end_byte - chunk_start_byte) as usize;
+                #[allow(clippy::cast_possible_truncation)]
+                let relative_end = (end_byte - chunk_start_byte) as usize; // usize >= u64 on 64-bit systems
                 std::cmp::min(relative_end, self.inner.config.block_size)
             } else {
                 self.inner.config.block_size
@@ -446,9 +455,11 @@ impl WriteCache<Active> {
 
         // Single block fast path
         if num_blocks == 1 {
+            #[allow(clippy::cast_possible_truncation)]
+            let start_block_idx = start_block as usize; // usize >= u64 on 64-bit systems
             let block_data = self
                 .resolve_block(
-                    start_block as usize,
+                    start_block_idx,
                     clean_cache,
                     pack_index_cache,
                     volume_manifest,
@@ -457,7 +468,8 @@ impl WriteCache<Active> {
                 )
                 .await?;
             let block_start_byte = start_block * block_size;
-            let slice_start = (offset - block_start_byte) as usize;
+            #[allow(clippy::cast_possible_truncation)]
+            let slice_start = (offset - block_start_byte) as usize; // usize >= u64 on 64-bit systems
             let slice_end = slice_start + len;
             return Ok(block_data.slice(slice_start..std::cmp::min(slice_end, block_data.len())));
         }

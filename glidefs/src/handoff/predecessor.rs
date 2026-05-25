@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Predecessor-side state machine for graceful daemon handoff.
 //!
 //! The predecessor is the *currently serving* daemon. When a handoff is

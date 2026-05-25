@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::FileExt;

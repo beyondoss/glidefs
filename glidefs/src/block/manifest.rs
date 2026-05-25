@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Manifest utility functions and hot set format.
 //!
 //! The legacy binary Manifest format (v2) has been replaced by VolumeManifest (JSON).

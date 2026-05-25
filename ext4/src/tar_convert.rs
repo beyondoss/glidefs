@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 /// tar-to-ext4 conversion.
 ///
 /// Ported from: github.com/Microsoft/hcsshim/ext4/tar2ext4

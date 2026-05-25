@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 /// Empirical pack size analysis using real disk images.
 ///
 /// Reads 128KB blocks from raw disk images (same images used by dedup_measure),

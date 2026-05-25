@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
@@ -554,18 +555,25 @@ impl CacheInner {
         // Fast path: single page-aligned write within one block (common case).
         if start_block == end_block
             && offset.is_multiple_of(PAGE_SIZE)
-            && data.len() == PAGE_SIZE as usize
+            && {
+                #[allow(clippy::cast_possible_truncation)]
+                let page_size = PAGE_SIZE as usize; // usize >= u64 on 64-bit
+                data.len() == page_size
+            }
         {
             let page = ((offset % block_size) / PAGE_SIZE) as usize;
             let crc = crc_fast::crc32_iscsi(data);
             // Try update existing entry first (common after first write).
-            if let Some(mut entry) = self.page_crcs.get_mut(&(start_block as u32)) {
+            #[allow(clippy::cast_possible_truncation)]
+            if let Some(mut entry) = self.page_crcs.get_mut(&(start_block as u32)) { // block numbers fit in u32
                 entry[page] = crc;
             } else {
                 // Allocate outside any lock, then insert.
                 let mut crcs = vec![0u32; ppb].into_boxed_slice();
                 crcs[page] = crc;
-                self.page_crcs.insert(start_block as u32, crcs);
+                #[allow(clippy::cast_possible_truncation)]
+                let block_key = start_block as u32; // block numbers fit in u32
+                self.page_crcs.insert(block_key, crcs);
             }
             return;
         }
@@ -574,14 +582,19 @@ impl CacheInner {
         for block in start_block..=end_block {
             let block_start = block * block_size;
 
-            if let Some(mut entry) = self.page_crcs.get_mut(&(block as u32)) {
+            #[allow(clippy::cast_possible_truncation)]
+            let block_key = block as u32; // block numbers fit in u32
+            if let Some(mut entry) = self.page_crcs.get_mut(&block_key) {
                 for page in 0..ppb {
                     let page_start = block_start + (page as u64) * PAGE_SIZE;
                     let page_end = page_start + PAGE_SIZE;
                     if offset <= page_start && end >= page_end {
-                        let slice_start = (page_start - offset) as usize;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let slice_start = (page_start - offset) as usize; // usize >= u64 on 64-bit
+                        #[allow(clippy::cast_possible_truncation)]
+                        let page_size = PAGE_SIZE as usize; // usize >= u64 on 64-bit
                         entry[page] = crc_fast::crc32_iscsi(
-                            &data[slice_start..slice_start + PAGE_SIZE as usize],
+                            &data[slice_start..slice_start + page_size],
                         );
                     } else if end > page_start && offset < page_end {
                         entry[page] = 0;
@@ -593,15 +606,18 @@ impl CacheInner {
                     let page_start = block_start + (page as u64) * PAGE_SIZE;
                     let page_end = page_start + PAGE_SIZE;
                     if offset <= page_start && end >= page_end {
-                        let slice_start = (page_start - offset) as usize;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let slice_start = (page_start - offset) as usize; // usize >= u64 on 64-bit
+                        #[allow(clippy::cast_possible_truncation)]
+                        let page_size = PAGE_SIZE as usize; // usize >= u64 on 64-bit
                         crcs[page] = crc_fast::crc32_iscsi(
-                            &data[slice_start..slice_start + PAGE_SIZE as usize],
+                            &data[slice_start..slice_start + page_size],
                         );
                     } else if end > page_start && offset < page_end {
                         crcs[page] = 0;
                     }
                 }
-                self.page_crcs.insert(block as u32, crcs);
+                self.page_crcs.insert(block_key, crcs);
             }
         }
     }
@@ -619,7 +635,9 @@ impl CacheInner {
         for block in start_block..=end_block {
             let block_start = block * block_size;
 
-            if let Some(mut entry) = self.page_crcs.get_mut(&(block as u32)) {
+            #[allow(clippy::cast_possible_truncation)]
+            let block_key = block as u32; // block numbers fit in u32
+            if let Some(mut entry) = self.page_crcs.get_mut(&block_key) {
                 for page in 0..ppb {
                     let page_start = block_start + (page as u64) * PAGE_SIZE;
                     let page_end = page_start + PAGE_SIZE;
@@ -640,7 +658,7 @@ impl CacheInner {
                         crcs[page] = 0;
                     }
                 }
-                self.page_crcs.insert(block as u32, crcs);
+                self.page_crcs.insert(block_key, crcs);
             }
         }
     }

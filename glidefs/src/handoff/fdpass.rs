@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! SCM_RIGHTS file-descriptor passing over a SOCK_SEQPACKET socket.
 //!
 //! Used by the handoff protocol to pass listener fds (NBD TCP / Unix,

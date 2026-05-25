@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Content-addressed pack format (GLPK v3) for S3 block storage.
 //!
 //! Packs batch multiple compressed blocks into a single S3 object to reduce
@@ -78,7 +79,9 @@ pub fn content_pack_id(blocks: &[(super::block_map::Blake3Hash, u32, bytes::Byte
     for (hash, chunk_offset, compressed) in blocks {
         hasher.update(&chunk_offset.to_le_bytes());
         hasher.update(hash.as_bytes());
-        hasher.update(&(compressed.len() as u32).to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        let compressed_len_u32 = compressed.len() as u32; // compressed block < 4GB
+        hasher.update(&compressed_len_u32.to_le_bytes());
         hasher.update(compressed);
     }
     let hash = hasher.finalize();

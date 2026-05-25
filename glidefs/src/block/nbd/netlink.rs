@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Generic netlink interface to the kernel NBD module (`NBD_GENL`).
 //!
 //! Creates and destroys `/dev/nbdN` block devices by sending commands to the
@@ -129,7 +130,9 @@ fn open_genl_socket() -> io::Result<RawFd> {
 
     // Bind to kernel (pid=0, groups=0)
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    addr.nl_family = libc::AF_NETLINK as u16;
+    #[allow(clippy::cast_possible_truncation)]
+    let af_netlink = libc::AF_NETLINK as u16; // AF_NETLINK = 16, fits in u16
+    addr.nl_family = af_netlink;
     let ret = unsafe {
         libc::bind(
             fd,
@@ -314,7 +317,9 @@ pub fn connect(
     // Build socket list: NBD_ATTR_SOCKETS → [ NBD_SOCK_ITEM → NBD_SOCK_FD ]
     let mut sock_attrs = Vec::new();
     let mut sock_entry = Vec::new();
-    put_nla_u32(&mut sock_entry, NBD_SOCK_FD, socket_fd as u32);
+    #[allow(clippy::cast_sign_loss)]
+    let socket_fd_u32 = socket_fd as u32; // socket_fd >= 0, safe unsigned cast
+    put_nla_u32(&mut sock_entry, NBD_SOCK_FD, socket_fd_u32);
     put_nla(&mut sock_attrs, NBD_SOCK_ITEM | NLA_F_NESTED, &sock_entry);
 
     // Build connect attributes (matches nbd-client's netlink_configure)
@@ -322,7 +327,9 @@ pub fn connect(
     // Include NBD_ATTR_INDEX only when reclaiming a specific device path.
     // Omitting it tells the kernel to auto-assign the lowest free index.
     if let Some(index) = preferred_index {
-        put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index as u32);
+        #[allow(clippy::cast_sign_loss)]
+    let index_u32 = index as u32; // index >= 0, safe unsigned cast
+    put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index_u32);
     }
     put_nla_u64(&mut attrs, NBD_ATTR_SIZE_BYTES, size_bytes);
     put_nla_u64(&mut attrs, NBD_ATTR_BLOCK_SIZE_BYTES, u64::from(block_size));
@@ -361,9 +368,11 @@ pub fn connect(
                 let echoed_attrs = &payload[4 + 16 + 4..];
                 for (attr_type, attr_data) in parse_nla(echoed_attrs) {
                     if attr_type == NBD_ATTR_INDEX && attr_data.len() >= 4 {
-                        return Ok(u32::from_ne_bytes([
+                        #[allow(clippy::cast_possible_wrap)]
+                        let value = u32::from_ne_bytes([
                             attr_data[0], attr_data[1], attr_data[2], attr_data[3],
-                        ]) as i32);
+                        ]) as i32; // interpret bytes as signed int
+                        return Ok(value);
                     }
                 }
             }
@@ -398,7 +407,9 @@ pub fn disconnect(index: i32) -> io::Result<()> {
     let family_id = resolve_nbd_family(fd)?;
 
     let mut attrs = Vec::new();
-    put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index as u32);
+    #[allow(clippy::cast_sign_loss)]
+    let index_u32 = index as u32; // index >= 0, safe unsigned cast
+    put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index_u32);
 
     let msg = build_genl_msg(family_id, NBD_CMD_DISCONNECT, 3, &attrs);
     nl_send(fd, &msg)?;
@@ -417,11 +428,14 @@ pub fn reconfigure(index: i32, socket_fd: RawFd) -> io::Result<()> {
 
     let mut sock_attrs = Vec::new();
     let mut sock_entry = Vec::new();
-    put_nla_u32(&mut sock_entry, NBD_SOCK_FD, socket_fd as u32);
+    #[allow(clippy::cast_sign_loss)]
+    { put_nla_u32(&mut sock_entry, NBD_SOCK_FD, socket_fd as u32); } // socket_fd >= 0, safe unsigned cast
     put_nla(&mut sock_attrs, NBD_SOCK_ITEM | NLA_F_NESTED, &sock_entry);
 
     let mut attrs = Vec::new();
-    put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index as u32);
+    #[allow(clippy::cast_sign_loss)]
+    let index_u32 = index as u32; // index >= 0, safe unsigned cast
+    put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index_u32);
     put_nla(&mut attrs, NBD_ATTR_SOCKETS | NLA_F_NESTED, &sock_attrs);
 
     let msg = build_genl_msg(family_id, NBD_CMD_RECONFIGURE, 4, &attrs);

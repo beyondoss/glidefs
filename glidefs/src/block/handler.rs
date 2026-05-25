@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Transport-agnostic block I/O handler.
 //!
 //! This module provides:
@@ -538,7 +539,8 @@ impl BlockHandler {
 
         // Slow path: at least one block needs backfill.
         for block in start_block..=end_block {
-            let idx = block as usize;
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = block as usize; // usize >= u64 on 64-bit systems
             let block_start = block * block_size_u64;
 
             // Slice of guest data that falls within this block.
@@ -546,7 +548,8 @@ impl BlockHandler {
             let write_end = (offset + data.len() as u64).min(block_start + block_size_u64);
             let data_offset = (write_start - offset) as usize;
             let block_local_start = (write_start - block_start) as usize;
-            let write_len = (write_end - write_start) as usize;
+            #[allow(clippy::cast_possible_truncation)]
+            let write_len = (write_end - write_start) as usize; // usize >= u64 on 64-bit systems
 
             // Resolve the block state. DIRTY/SYNCING blocks have data on
             // local SSD (or promotable from the flushing file via
@@ -1072,7 +1075,9 @@ impl BlockHandler {
         }
 
         let util = f64::from_bits(self.ssd_utilization.load(Ordering::Relaxed));
-        if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, length as usize) {
+        #[allow(clippy::cast_possible_truncation)]
+        let length_usize = length as usize; // usize >= u64 on 64-bit systems
+        if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, length_usize) {
             return Err(CommandError::NoSpace);
         }
 

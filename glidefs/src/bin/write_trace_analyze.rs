@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 /// Analyze block-level write traces from GlideFS NBD handler.
 ///
 /// Reads a binary trace file (produced by WriteTracer when enabled per-export)

@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Successor-side state machine for graceful daemon handoff.
 //!
 //! The successor is launched by the predecessor via `fork+exec` with

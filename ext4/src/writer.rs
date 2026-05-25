@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 /// Core ext4 writer — deterministic, sequential, write-only.
 ///
 /// Ported from: github.com/Microsoft/hcsshim/ext4/internal/compactext4
@@ -19,16 +20,21 @@ pub use crate::format::{BLOCK_SIZE, INLINE_DATA_SIZE};
 
 // ---- Constants ----
 
-const BLOCKS_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32;
-const MAX_INODES_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32;
-const INODES_PER_GROUP_INCREMENT: u32 = (BLOCK_SIZE as u32) / (INODE_SIZE as u32);
+#[allow(clippy::cast_possible_truncation)]
+const BLOCKS_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32; // 4096*8=32768 fits in u32
+#[allow(clippy::cast_possible_truncation)]
+const MAX_INODES_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32; // 4096*8=32768 fits in u32
+#[allow(clippy::cast_possible_truncation)]
+const INODES_PER_GROUP_INCREMENT: u32 = (BLOCK_SIZE as u32) / (INODE_SIZE as u32); // 4096/256=16 fits in u32
 const DEFAULT_MAX_DISK_SIZE: i64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 const MAX_MAX_DISK_SIZE: i64 = 16 * 1024 * 1024 * 1024 * 1024; // 16 TiB
-const GROUPS_PER_DESCRIPTOR_BLOCK: u32 = (BLOCK_SIZE as u32) / format::GROUP_DESCRIPTOR_SIZE as u32;
+#[allow(clippy::cast_possible_truncation)]
+const GROUPS_PER_DESCRIPTOR_BLOCK: u32 = (BLOCK_SIZE as u32) / format::GROUP_DESCRIPTOR_SIZE as u32; // 4096/32=128 fits in u32
 const MAX_FILE_SIZE: i64 = 128 * 1024 * 1024 * 1024; // 128 GiB
 const MAX_BLOCKS_PER_EXTENT: u32 = 0x8000;
 const INODE_LOST_AND_FOUND: u32 = INODE_FIRST;
-const EXTRA_ISIZE: u16 = (INODE_USED_SIZE - 128) as u16;
+#[allow(clippy::cast_possible_truncation)]
+const EXTRA_ISIZE: u16 = (INODE_USED_SIZE - 128) as u16; // 152-128=24 fits in u16
 
 // ---- Public types ----
 
@@ -144,11 +150,13 @@ struct XattrState {
 
 impl XattrState {
     fn new() -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        let block_left = BLOCK_SIZE as usize - XATTR_BLOCK_OVERHEAD; // usize >= u64 on 64-bit
         Self {
             inode_attrs: Vec::new(),
             block_attrs: Vec::new(),
             inode_left: INODE_EXTRA_SIZE - XATTR_INODE_OVERHEAD,
-            block_left: BLOCK_SIZE as usize - XATTR_BLOCK_OVERHEAD,
+            block_left,
         }
     }
 
@@ -175,19 +183,26 @@ impl XattrState {
 }
 
 fn put_xattrs(xattrs: &[Xattr], buf: &mut [u8], offset_delta: u16) {
-    let buf_len = buf.len() as u16;
+    #[allow(clippy::cast_possible_truncation)]
+    let buf_len = buf.len() as u16; // xattr buffers fit in u16
     let mut offset = buf_len + offset_delta;
     let mut entry_pos = 0usize;
     let mut data_end = buf.len();
     for xattr in xattrs {
         let vl = xattr.value_len();
-        offset -= vl as u16;
-        buf[entry_pos] = xattr.name.len() as u8;
+        #[allow(clippy::cast_possible_truncation)]
+        let vl_u16 = vl as u16; // xattr value length fits in u16
+        offset -= vl_u16;
+        #[allow(clippy::cast_possible_truncation)]
+        let name_len = xattr.name.len() as u8; // compressed xattr names fit in u8
+        buf[entry_pos] = name_len;
         buf[entry_pos + 1] = xattr.index;
         buf[entry_pos + 2..entry_pos + 4].copy_from_slice(&offset.to_le_bytes());
         // bytes 4..8 = value_inum (0)
         buf[entry_pos + 4..entry_pos + 8].copy_from_slice(&0u32.to_le_bytes());
-        buf[entry_pos + 8..entry_pos + 12].copy_from_slice(&(xattr.value.len() as u32).to_le_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        let value_len = xattr.value.len() as u32; // single xattr values fit in u32
+        buf[entry_pos + 8..entry_pos + 12].copy_from_slice(&value_len.to_le_bytes());
         buf[entry_pos + 12..entry_pos + 16].copy_from_slice(&hash_xattr_entry(&xattr.name, &xattr.value).to_le_bytes());
         let name_bytes = xattr.name.as_bytes();
         buf[entry_pos + 16..entry_pos + 16 + name_bytes.len()].copy_from_slice(name_bytes);
@@ -246,7 +261,9 @@ impl<W: Read + Write + Seek> Writer<W> {
                     } else if *size == 0 {
                         w.max_disk_size = DEFAULT_MAX_DISK_SIZE;
                     } else {
-                        w.max_disk_size = (*size + BLOCK_SIZE as i64 - 1) & !(BLOCK_SIZE as i64 - 1);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let block_size = BLOCK_SIZE as i64; // BLOCK_SIZE (4096) fits in i64
+                        w.max_disk_size = (*size + block_size - 1) & !(block_size - 1);
                     }
                 }
                 WriterOption::Uuid(u) => w.uuid = *u,
@@ -259,13 +276,17 @@ impl<W: Read + Write + Seek> Writer<W> {
     // ---- low-level I/O ----
 
     fn write_bytes(&mut self, b: &[u8]) -> io::Result<usize> {
-        if self.pos + b.len() as i64 > self.max_disk_size {
+        #[allow(clippy::cast_possible_truncation)]
+        let b_len = b.len() as i64; // data sizes fit in i64
+        if self.pos + b_len > self.max_disk_size {
             return Err(io::Error::other(
                 format!("disk exceeded maximum size of {} bytes", self.max_disk_size),
             ));
         }
         let n = self.f.write(b)?;
-        self.pos += n as i64;
+        #[allow(clippy::cast_possible_truncation)]
+        let n_i64 = n as i64; // write result fits in i64
+        self.pos += n_i64;
         Ok(n)
     }
 
@@ -278,10 +299,15 @@ impl<W: Read + Write + Seek> Writer<W> {
         let zeros = [0u8; 4096];
         let mut remaining = n;
         while remaining > 0 {
-            let chunk = remaining.min(zeros.len() as i64) as usize;
+            #[allow(clippy::cast_possible_truncation)]
+            let zeros_len = zeros.len() as i64; // 4096 fits in i64
+            #[allow(clippy::cast_possible_truncation)]
+            let chunk = remaining.min(zeros_len) as usize; // chunk fits in usize
             self.f.write_all(&zeros[..chunk])?;
-            self.pos += chunk as i64;
-            remaining -= chunk as i64;
+            #[allow(clippy::cast_possible_truncation)]
+            let chunk_i64 = chunk as i64; // chunk fits in i64
+            self.pos += chunk_i64;
+            remaining -= chunk_i64;
         }
         Ok(())
     }

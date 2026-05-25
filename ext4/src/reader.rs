@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_truncation)]
 /// ext4 filesystem reader — parse an ext4 image and extract files.
 ///
 /// Counterpart to the writer: reads superblock, group descriptors, inode table,
@@ -167,8 +168,10 @@ impl<R: Read + Seek> Reader<R> {
                         ),
                     ));
                 }
+                #[allow(clippy::cast_possible_truncation)]
+                let block_size_usize = BLOCK_SIZE as usize; // usize >= u64 on 64-bit systems
                 let max_leaf_entries =
-                    (BLOCK_SIZE as usize - EXTENT_NODE_SIZE) / EXTENT_NODE_SIZE;
+                    (block_size_usize - EXTENT_NODE_SIZE) / EXTENT_NODE_SIZE;
                 if leaf_header.entries as usize > max_leaf_entries {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -234,7 +237,8 @@ impl<R: Read + Seek> Reader<R> {
 
     /// Read inline data from inode block area + xattr overflow.
     fn read_inline_data(&mut self, inode: &ParsedInode) -> io::Result<Vec<u8>> {
-        let size = inode.size as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let size = inode.size as usize; // usize >= u64 on 64-bit systems
         let mut data = Vec::with_capacity(size);
 
         // First part: from inode block[0..60]
@@ -325,7 +329,8 @@ impl<R: Read + Seek> Reader<R> {
 
     /// Read a symlink target.
     pub fn read_symlink(&mut self, inode: &ParsedInode) -> io::Result<String> {
-        let size = inode.size as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let size = inode.size as usize; // usize >= u64 on 64-bit systems
         if size <= SMALL_SYMLINK_SIZE {
             // Small symlink: target stored inline in inode block area
             let target = std::str::from_utf8(&inode.block[..size])

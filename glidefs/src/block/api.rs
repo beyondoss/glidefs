@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! HTTP API for dynamic export management.
 //!
 //! Provides REST endpoints for creating, draining, promoting, and removing exports.

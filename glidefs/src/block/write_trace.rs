@@ -1,4 +1,4 @@
-#![allow(dead_code)] // Reader functions used by write_trace_analyze binary
+#![allow(dead_code, clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Block-level write trace recorder.
 //!
 //! Records every block write/trim/zero with microsecond timestamps to a binary
