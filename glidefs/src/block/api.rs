@@ -487,11 +487,17 @@ where
                             );
 
                             if let Err(e) = save_result {
-                                // Export is functional locally but won't survive a restart.
-                                // Return 503 so the orchestrator can retry (create_export is idempotent).
+                                // Without teardown, the in-memory entry silently
+                                // shadows the missing S3 export.json — retries
+                                // hit `create_export`'s idempotency check and
+                                // never re-attempt the S3 write.
+                                router.cleanup_failed_create(name, &transport).await;
                                 return Ok(error_response(
                                     StatusCode::SERVICE_UNAVAILABLE,
-                                    &format!("Export created but definition not persisted to S3: {e}"),
+                                    &format!(
+                                        "Export definition not persisted to S3 ({e}); \
+                                         in-memory state cleaned up, retry the request"
+                                    ),
                                 ));
                             }
 

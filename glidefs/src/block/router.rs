@@ -2544,6 +2544,43 @@ impl ExportRouter {
         Ok(())
     }
 
+    /// Tear down in-memory state for an export whose `save_export` failed
+    /// after `create_export` succeeded. Without this, the `create_export`
+    /// idempotency check makes every retry a no-op success while
+    /// `export.json` never lands in S3 — the export silently disappears
+    /// on next daemon restart. `skip_drain=true`: no S3 manifest to stay
+    /// consistent with, and the orchestrator already saw 503.
+    pub async fn cleanup_failed_create(&self, name: &str, transport: &str) {
+        let Some((_k, state)) = self.exports.remove(name) else {
+            return;
+        };
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(e) = self.remove_device(name, transport).await {
+                warn!(
+                    export = %name,
+                    error = %e,
+                    "cleanup_failed_create: remove_device failed (continuing)"
+                );
+            }
+        }
+        let _ = transport;
+
+        let _ = Self::teardown_export(name, state, true).await;
+
+        let cache_file = self.cache_dir.join(format!("{}.cache", name));
+        let flushing_file = self.cache_dir.join(format!("{}.flushing", name));
+        let meta_file = self.cache_dir.join(format!("{}.meta", name));
+        let wal_file = self.cache_dir.join(format!("{}.wal", name));
+        remove_file_if_exists(&cache_file);
+        remove_file_if_exists(&flushing_file);
+        remove_file_if_exists(&meta_file);
+        remove_file_if_exists(&wal_file);
+
+        info!(export = %name, "cleanup_failed_create: in-memory state cleared");
+    }
+
     /// Remove an export.
     ///
     /// If `purge` is true, also delete the local cache files.
@@ -3367,6 +3404,53 @@ mod tests {
 
         let result = router.remove_export("vol1", false).await;
         assert!(result.is_ok(), "Remove should succeed");
+
+        assert_eq!(router.list_exports().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_failed_create_removes_in_memory_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // Successful create_export puts the export in self.exports.
+        router
+            .create_export(test_export_config("vol1"), false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(router.list_exports().await.len(), 1);
+
+        // Simulate "save_export failed" by directly calling cleanup_failed_create.
+        // (In real life this is called from api.rs after save_export returns Err.)
+        router.cleanup_failed_create("vol1", "nbd").await;
+
+        // Export must be gone from in-memory state. The bug it fixes:
+        // without this, the entry stays in self.exports, create_export's
+        // idempotency check makes every retry a no-op success, but the
+        // export.json is never written and the export is lost on restart.
+        assert_eq!(
+            router.list_exports().await.len(),
+            0,
+            "cleanup_failed_create must remove the in-memory entry"
+        );
+
+        // After cleanup, a retry of create_export should re-run from scratch
+        // (not be silently no-op'd by idempotency).
+        router
+            .create_export(test_export_config("vol1"), false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(router.list_exports().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_failed_create_idempotent_when_export_absent() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // Calling cleanup on an export that was never created should be a no-op.
+        // (e.g., create_export itself failed before reaching the exports map insert.)
+        router.cleanup_failed_create("never-existed", "nbd").await;
 
         assert_eq!(router.list_exports().await.len(), 0);
     }
