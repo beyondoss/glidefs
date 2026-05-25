@@ -22,7 +22,8 @@ impl WriteCache<Active> {
         let mut batch = Vec::new();
         let mut to_dirty: SmallVec<[usize; 16]> = SmallVec::new();
         for block in start_block..=end_block {
-            let idx = block as usize;
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = block as usize; // usize >= u64 on 64-bit systems
             if idx >= self.inner.num_blocks {
                 continue;
             }
