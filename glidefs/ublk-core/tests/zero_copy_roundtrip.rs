@@ -96,9 +96,9 @@ fn zero_copy_roundtrip() {
     // EBUSY.
     let cdev_fd: RawFd = dev.tgt.fds[0];
 
-    // Spawn worker thread BEFORE start_dev — once start_dev returns, the
-    // kernel will accept I/O on /dev/ublkbN and expects a target to be
-    // pumping the cdev.
+    // Spawn worker BEFORE start_dev so its FETCHes are armed when the
+    // kernel transitions the queue to LIVE. Match ublk-core's UblkQueue
+    // setup order: workers arm fetches first, main thread runs start_dev.
     let stop = Arc::new(AtomicBool::new(false));
     let worker = {
         let stop = Arc::clone(&stop);
@@ -107,11 +107,9 @@ fn zero_copy_roundtrip() {
             .spawn(move || run_worker(cdev_fd, stop))
             .expect("spawn worker")
     };
-
-    // Give the worker a moment to open cdev and arm FETCHes before the kernel
-    // starts dispatching I/O. start_dev itself doesn't block on this because
-    // AUTO_BUF_REG short-circuits wait_for_buffer_registration.
-    thread::sleep(Duration::from_millis(50));
+    // Sleep so the worker has time to mmap + submit fetches before
+    // start_dev runs.
+    thread::sleep(Duration::from_millis(100));
 
     eprintln!("start_dev...");
     ctrl.start_dev(&dev).expect("start_dev");
@@ -219,20 +217,22 @@ impl Drop for AlignedBuf {
 // Worker — runs in a thread, owns its own io_uring + sparse buffer table.
 // ---------------------------------------------------------------------------
 
-/// User-data encoding to distinguish FETCH/COMMIT cmd CQEs from data-plane
-/// (READ/WRITE_FIXED) CQEs. Tag is bits 0-15; bit 63 is "is data-plane".
-const UD_DATA_PLANE: u64 = 1 << 63;
-fn ud_cmd(tag: u16) -> u64 {
-    u64::from(tag)
+/// User-data encoding matching `UblkIOCtx::build_user_data`:
+/// - bits 0-15: tag
+/// - bits 16-23: op (low 8 bits of cmd_op)
+/// - bit 63: target_io (1 = data-plane, 0 = ublk cmd)
+const UD_TARGET_IO: u64 = 1 << 63;
+fn ud_cmd(tag: u16, cmd_op: u32) -> u64 {
+    u64::from(tag) | (u64::from(cmd_op & 0xff) << 16)
 }
-fn ud_data(tag: u16) -> u64 {
-    UD_DATA_PLANE | u64::from(tag)
+fn ud_data(tag: u16, op: u8) -> u64 {
+    UD_TARGET_IO | u64::from(tag) | (u64::from(op) << 16)
 }
 fn ud_tag(ud: u64) -> u16 {
     (ud & 0xffff) as u16
 }
 fn ud_is_data(ud: u64) -> bool {
-    (ud & UD_DATA_PLANE) != 0
+    (ud & UD_TARGET_IO) != 0
 }
 
 
@@ -363,11 +363,16 @@ fn run_worker(cdev_fd: RawFd, stop: Arc<AtomicBool>) -> Result<(), String> {
                 to_submit.push(build_commit_and_fetch(cdev_fd, qid, tag, res));
             } else {
                 // FETCH (or COMMIT_AND_FETCH) cmd CQE.
-                if res == sys::UBLK_IO_RES_ABORT as i32
-                    || res == -(libc::ENODEV)
-                    || res < 0
-                {
-                    // Device going away — stop arming new fetches.
+                if res == sys::UBLK_IO_RES_ABORT as i32 {
+                    continue;
+                }
+                if res == -(libc::ENODEV) {
+                    eprintln!("[worker] re-arm FETCH tag={} after -ENODEV", tag);
+                    to_submit.push(build_fetch(cdev_fd, qid, tag, -1));
+                    continue;
+                }
+                if res < 0 {
+                    eprintln!("[worker] unexpected cmd CQE res={} tag={}", res, tag);
                     continue;
                 }
                 let iod = unsafe {
@@ -391,7 +396,7 @@ fn run_worker(cdev_fd: RawFd, stop: Arc<AtomicBool>) -> Result<(), String> {
                             )
                             .offset(offset)
                             .build()
-                            .user_data(ud_data(tag)),
+                            .user_data(ud_data(tag, op)),
                         );
                     }
                     sys::UBLK_IO_OP_WRITE => {
@@ -404,7 +409,7 @@ fn run_worker(cdev_fd: RawFd, stop: Arc<AtomicBool>) -> Result<(), String> {
                             )
                             .offset(offset)
                             .build()
-                            .user_data(ud_data(tag)),
+                            .user_data(ud_data(tag, op)),
                         );
                     }
                     sys::UBLK_IO_OP_FLUSH => {
@@ -480,7 +485,7 @@ fn build_fetch(cdev_fd: RawFd, qid: u16, tag: u16, result: i32) -> squeue::Entry
     let mut sqe = opcode::UringCmd16::new(types::Fd(cdev_fd), sys::UBLK_U_IO_FETCH_REQ)
         .cmd(cmd_bytes)
         .build()
-        .user_data(ud_cmd(tag));
+        .user_data(ud_cmd(tag, sys::UBLK_U_IO_FETCH_REQ));
     // Overwrite sqe.addr with the packed auto_buf_reg.
     let auto_addr = ublk_sys::ublk_auto_buf_reg_to_sqe_addr(&auto);
     override_sqe!(&mut sqe, addr, auto_addr);
@@ -507,7 +512,7 @@ fn build_commit_and_fetch(cdev_fd: RawFd, qid: u16, tag: u16, result: i32) -> sq
     )
     .cmd(cmd_bytes)
     .build()
-    .user_data(ud_cmd(tag));
+    .user_data(ud_cmd(tag, sys::UBLK_U_IO_COMMIT_AND_FETCH_REQ));
     let auto_addr = ublk_sys::ublk_auto_buf_reg_to_sqe_addr(&auto);
     override_sqe!(&mut sqe, addr, auto_addr);
     sqe
