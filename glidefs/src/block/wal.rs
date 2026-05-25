@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Write-Ahead Log for crash recovery.
 //!
 //! Append-only log on local SSD. Each entry records which chunk was modified

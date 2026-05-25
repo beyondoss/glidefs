@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! Generic netlink interface to the kernel NBD module (`NBD_GENL`).
 //!
 //! Creates and destroys `/dev/nbdN` block devices by sending commands to the

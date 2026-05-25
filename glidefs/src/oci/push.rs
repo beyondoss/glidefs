@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 /// OCI push pipeline: GlideFS block storage → ext4 → tar → gzip → registry.
 ///
 /// Exports an ext4 filesystem from GlideFS blocks, compresses it as a gzip tar

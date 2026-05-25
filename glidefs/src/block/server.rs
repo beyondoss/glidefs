@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 //! NBD server implementation with multi-export support.
 //!
 //! This module provides a TCP/Unix socket NBD server that supports multiple
