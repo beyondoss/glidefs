@@ -819,6 +819,14 @@ pub async fn run_server_as_successor(socket_path: PathBuf) -> Result<()> {
 
     info!(socket = %socket_path.display(), "starting in successor mode");
 
+    // Same idempotent install as the cold-start path. The cold-start
+    // call in `run_server` doesn't fire on rolling deploys, so without
+    // this any new ublk devices created by the successor would come up
+    // with default tunables (mq-deadline, wbt 2ms, kernel readahead) —
+    // a silent regression on every handoff.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    install_ublk_udev_rule();
+
     // The predecessor passes `--config <path>` to us. Sniff it from argv
     // without invoking clap (clap doesn't know about `--handoff-from`).
     let config_path = crate::handoff::successor::config_arg().ok_or_else(|| {
