@@ -13,6 +13,7 @@ pub mod helpers;
 pub mod io;
 pub mod sys;
 pub mod uring_async;
+pub mod zc;
 
 // Re-export important types for unified buffer management.
 //
