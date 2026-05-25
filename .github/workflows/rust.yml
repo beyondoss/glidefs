@@ -50,13 +50,7 @@ jobs:
         with:
           workspaces: ". -> target"
       - name: Run docker integration tests
-        # --test-threads=1: there's a rare hang in test_unwritten_blocks_return_zeros_ublk
-        # under parallel execution that we couldn't reproduce locally even with the
-        # shared-MinIO harness fix. CI saw it consistently. Serialize for reliability.
-        # The shared-MinIO refactor still stands — it correctly tests glidefs against
-        # one S3 backend rather than four competing containers — but doesn't fully
-        # close the hang window. Track-down ticket: investigate test_unwritten ublk hang.
-        run: cargo test -p glidefs --features docker-tests --test docker_integration --verbose -- --test-threads=1
+        run: cargo test -p glidefs --features docker-tests --test docker_integration --verbose
 
   integrity-suite:
     name: Data Integrity Suite
