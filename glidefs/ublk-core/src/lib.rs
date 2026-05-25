@@ -65,6 +65,17 @@ bitflags! {
         /// It is required for ublk to be used as swap disk
         const UBLK_DEV_F_MLOCK_IO_BUFFER = 0b00100000;
 
+        /// Opt in to kernel zero-copy transport (`UBLK_F_SUPPORT_ZERO_COPY` +
+        /// `UBLK_F_AUTO_BUF_REG`) when the running kernel advertises support.
+        ///
+        /// Caller signals: "I'm able to submit I/O via `BufDesc::AutoReg` and
+        /// drive the data plane with `IORING_OP_*_FIXED` ops against my
+        /// backing file". `UblkCtrl::new` checks kernel features and sets
+        /// the corresponding `UBLK_F_*` flags on the final `dev_info` only
+        /// if both this bit AND the kernel support are present. Without
+        /// kernel support the device falls back to copy-mode silently.
+        const UBLK_DEV_F_PREFER_ZERO_COPY = 0b01000000;
+
         const UBLK_DEV_F_INTERNAL_0 = 1_u32 << 31;
         const UBLK_DEV_F_INTERNAL_1 = 1_u32 << 30;
         const UBLK_DEV_F_INTERNAL_2 = 1_u32 << 29;
