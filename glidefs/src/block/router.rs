@@ -34,10 +34,27 @@ use tokio::task::JoinHandle;
 use serde::Deserialize;
 use tracing::{debug, error, info, trace, warn};
 
-/// Maximum number of entries in the base manifest / hot set caches.
-/// Bases are immutable after bless, so eviction policy doesn't matter —
-/// we just cap memory usage. 64 entries ≈ a few MB at most.
-const MAX_BASE_CACHE_ENTRIES: usize = 64;
+/// Default memory budget (bytes) for the manifest cache.
+/// 64 MiB fits ~1000 small-volume manifests or ~10 manifests for 10TB
+/// volumes — see `VolumeManifest::size_estimate` for the math.
+pub const DEFAULT_MANIFEST_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum number of entries in the hot set cache. Hot sets are small
+/// (a few KiB each), so count-based capping is fine.
+const MAX_HOT_SET_CACHE_ENTRIES: usize = 64;
+
+/// Encodes a base-manifest key for the foyer manifest cache.
+fn base_manifest_cache_key(s3_prefix: &str, manifest_name: &str) -> String {
+    format!("b:{s3_prefix}:{manifest_name}")
+}
+
+/// Encodes a snapshot-manifest key for the foyer manifest cache.
+/// The triple `(s3_prefix, manifest_name, sequence)` is immutable by
+/// construction (sequences are monotonic + never reused for a name),
+/// so the bytes for a given key are byte-identical forever.
+fn snapshot_manifest_cache_key(s3_prefix: &str, manifest_name: &str, sequence: u64) -> String {
+    format!("s:{s3_prefix}:{manifest_name}:{sequence}")
+}
 
 /// Errors that can occur during export operations.
 #[derive(Error, Debug)]
@@ -256,6 +273,10 @@ pub struct RouterConfig {
     /// this cap returns `RouterError::ExportLimitReached`. Caps the cost
     /// of a tenant repeatedly POSTing /api/exports.
     pub max_exports: usize,
+    /// Memory budget (bytes) for the in-memory manifest cache. See
+    /// `DEFAULT_MANIFEST_CACHE_BYTES`. Sized for the volume scale of
+    /// the deployment — 10TB volumes need MB-per-manifest headroom.
+    pub manifest_cache_bytes: usize,
 }
 
 /// Multi-tenant export router.
@@ -331,18 +352,18 @@ pub struct ExportRouter {
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     ublk_server: tokio::sync::Mutex<crate::block::ublk::UblkServer>,
 
-    /// Bounded cache for blessed base manifests (bases/* are immutable after bless).
-    /// Key: "{s3_prefix}:{manifest_name}" → deserialized VolumeManifest.
-    /// Cloning the Arc is ~0ns vs ~100ms for an S3 round-trip.
-    base_manifest_cache: parking_lot::Mutex<HashMap<String, Arc<VolumeManifest>>>,
-
-    /// Bounded cache for versioned snapshot manifests. Snapshots at
-    /// `snapshots/{name}/{seq:020}` are immutable by construction —
-    /// `seq` is monotonic and never reused for a given name — so any
-    /// `(s3_prefix, manifest_name, sequence)` tuple identifies bytes
-    /// that are byte-identical forever. Safe to cache without LRU.
-    /// Refusal-on-full mirrors `base_manifest_cache`.
-    snapshot_cache: parking_lot::Mutex<HashMap<(String, String, u64), Arc<VolumeManifest>>>,
+    /// Memory-bounded cache for deserialized volume manifests — both
+    /// blessed bases (`b:{s3_prefix}:{name}`) and versioned snapshots
+    /// (`s:{s3_prefix}:{name}:{seq}`). Both populations are immutable
+    /// once written (bless seals a base; sequences are monotonic and
+    /// never reused for a name) so cached bytes never go stale.
+    ///
+    /// Foyer's S3-FIFO eviction handles working-set drift better than
+    /// the previous refusal-on-full HashMap, which froze the first N
+    /// distinct entries and silently dropped everything after — fine
+    /// for tiny base-set fleets, broken once snapshot churn or large
+    /// volumes (10TB+) entered the mix.
+    manifest_cache: foyer::Cache<String, Arc<VolumeManifest>>,
 
     /// Bounded cache for boot hot sets (immutable, paired with base manifests).
     /// Key: "{s3_prefix}:{hot_set_name}" → parsed block indices.
@@ -600,6 +621,13 @@ impl ExportRouter {
                 .map_err(|e| RouterError::Manifest(format!("pack index cache: {e}")))?,
         );
 
+        let manifest_cache: foyer::Cache<String, Arc<VolumeManifest>> =
+            foyer::Cache::builder(config.manifest_cache_bytes)
+                .with_name("glidefs-manifest-cache")
+                .with_eviction_config(foyer::EvictionConfig::S3Fifo(foyer::S3FifoConfig::default()))
+                .with_weighter(|_k: &String, v: &Arc<VolumeManifest>| v.size_estimate())
+                .build();
+
         // Build device managers before moving config.cache_dir.
         #[cfg(target_os = "linux")]
         let nbd_devices = tokio::sync::Mutex::new(
@@ -636,8 +664,7 @@ impl ExportRouter {
             nbd_devices,
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             ublk_server,
-            base_manifest_cache: parking_lot::Mutex::new(HashMap::new()),
-            snapshot_cache: parking_lot::Mutex::new(HashMap::new()),
+            manifest_cache,
             hot_set_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             bless_tasks: RwLock::new(HashMap::new()),
         })
@@ -668,12 +695,9 @@ impl ExportRouter {
             }
         };
 
-        let remaining_capacity = MAX_BASE_CACHE_ENTRIES
-            .saturating_sub(self.base_manifest_cache.lock().len());
         let bases: Vec<_> = manifests
             .into_iter()
             .filter(|name| name.starts_with("bases/"))
-            .take(remaining_capacity)
             .collect();
         if bases.is_empty() {
             debug!("prewarm: no base manifests found under {}", s3_prefix);
@@ -692,17 +716,14 @@ impl ExportRouter {
             .for_each_concurrent(8, |manifest_name| {
                 let cs = Arc::clone(&cs);
                 async move {
-                    let cache_key = format!("{}:{}", s3_prefix, &manifest_name);
+                    let cache_key = base_manifest_cache_key(s3_prefix, &manifest_name);
 
                     // Manifest
-                    if !self.base_manifest_cache.lock().contains_key(&cache_key) {
+                    if self.manifest_cache.get(&cache_key).is_none() {
                         match cs.get_manifest(&manifest_name).await {
                             Ok(Some((data, _etag))) => match VolumeManifest::deserialize(&data) {
                                 Ok(vm) => {
-                                    let mut cache_map = self.base_manifest_cache.lock();
-                                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
-                                        cache_map.insert(cache_key.clone(), Arc::new(vm));
-                                    }
+                                    self.manifest_cache.insert(cache_key, Arc::new(vm));
                                 }
                                 Err(e) => warn!(
                                     manifest = %manifest_name,
@@ -728,7 +749,7 @@ impl ExportRouter {
                             Ok(Some(data)) => match deserialize_hot_set(&data) {
                                 Ok(chunks) => {
                                     let mut cache_map = self.hot_set_cache.lock();
-                                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
+                                    if cache_map.len() < MAX_HOT_SET_CACHE_ENTRIES {
                                         cache_map.insert(hot_cache_key, Arc::new(chunks));
                                     }
                                 }
@@ -748,10 +769,10 @@ impl ExportRouter {
             })
             .await;
 
-        let manifest_count = self.base_manifest_cache.lock().len();
         let hot_set_count = self.hot_set_cache.lock().len();
+        let manifest_bytes = self.manifest_cache.usage();
         info!(
-            manifests = manifest_count,
+            manifest_cache_bytes = manifest_bytes,
             hot_sets = hot_set_count,
             "base cache pre-warm complete"
         );
@@ -1103,20 +1124,14 @@ impl ExportRouter {
         let (cache, volume_manifest) = if let Some(manifest_name) = manifest_name {
             // Fork path: load VolumeManifest, preferring in-memory cache for bases/*
             let is_base = manifest_name.starts_with("bases/");
-            let cache_key = format!("{}:{}", s3_prefix, manifest_name);
 
             let t_manifest = Instant::now();
             let fork_vm = if let Some(seq) = snapshot_sequence {
-                // Fork from a versioned snapshot. The path
-                // `snapshots/{name}/{seq:020}` is immutable by construction:
-                // `seq` is monotonic per-export and never reused, so the
-                // bytes for a given (s3_prefix, manifest_name, sequence)
-                // are identical forever. Cache by that triple.
-                let snap_key = (s3_prefix.clone(), manifest_name.to_string(), seq);
-                if let Some(cached) = self.snapshot_cache.lock().get(&snap_key) {
+                let snap_key = snapshot_manifest_cache_key(&s3_prefix, manifest_name, seq);
+                if let Some(entry) = self.manifest_cache.get(&snap_key) {
                     debug!(manifest = %manifest_name, sequence = seq, "snapshot manifest cache hit");
                     manifest_cache_hit = Some(true);
-                    VolumeManifest::clone(cached)
+                    VolumeManifest::clone(entry.value())
                 } else {
                     manifest_cache_hit = Some(false);
                     let vm = match content_store.get_snapshot(manifest_name, seq).await {
@@ -1135,21 +1150,17 @@ impl ExportRouter {
                             )));
                         }
                     };
-                    let mut cache_map = self.snapshot_cache.lock();
-                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
-                        cache_map.insert(snap_key, Arc::new(vm.clone()));
-                    }
+                    self.manifest_cache.insert(snap_key, Arc::new(vm.clone()));
                     vm
                 }
             } else if is_base {
-                // Check base manifest cache first (bases/* are immutable after bless)
-                if let Some(cached) = self.base_manifest_cache.lock().get(&cache_key) {
+                let cache_key = base_manifest_cache_key(&s3_prefix, manifest_name);
+                if let Some(entry) = self.manifest_cache.get(&cache_key) {
                     debug!(manifest = %manifest_name, "base manifest cache hit");
                     manifest_cache_hit = Some(true);
-                    VolumeManifest::clone(cached)
+                    VolumeManifest::clone(entry.value())
                 } else {
                     manifest_cache_hit = Some(false);
-                    // Cache miss — fetch from S3 and populate
                     let vm = match content_store.get_manifest(manifest_name).await {
                         Ok(Some((data, _etag))) => VolumeManifest::deserialize(&data)
                             .map_err(|e| RouterError::Manifest(format!("failed to deserialize volume manifest: {}", e)))?,
@@ -1166,10 +1177,7 @@ impl ExportRouter {
                             )));
                         }
                     };
-                    let mut cache_map = self.base_manifest_cache.lock();
-                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
-                        cache_map.insert(cache_key.clone(), Arc::new(vm.clone()));
-                    }
+                    self.manifest_cache.insert(cache_key, Arc::new(vm.clone()));
                     vm
                 }
             } else {
@@ -1335,7 +1343,7 @@ impl ExportRouter {
                                 let chunks = Arc::new(chunks);
                                 if is_base {
                                     let mut cache_map = hot_set_cache.lock();
-                                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES {
+                                    if cache_map.len() < MAX_HOT_SET_CACHE_ENTRIES {
                                         cache_map.insert(hot_cache_key, Arc::clone(&chunks));
                                     }
                                 }
@@ -1524,16 +1532,13 @@ impl ExportRouter {
         if result.snapshot_persisted {
             match VolumeManifest::deserialize(&result.manifest_bytes) {
                 Ok(vm) => {
-                    let snap_key = (
-                        content_store.base_path().to_string(),
-                        name.to_string(),
+                    let snap_key = snapshot_manifest_cache_key(
+                        content_store.base_path(),
+                        name,
                         result.sequence,
                     );
-                    let mut cache_map = self.snapshot_cache.lock();
-                    if cache_map.len() < MAX_BASE_CACHE_ENTRIES
-                        && !cache_map.contains_key(&snap_key)
-                    {
-                        cache_map.insert(snap_key, Arc::new(vm));
+                    if self.manifest_cache.get(&snap_key).is_none() {
+                        self.manifest_cache.insert(snap_key, Arc::new(vm));
                     }
                 }
                 Err(e) => {
@@ -2974,6 +2979,7 @@ impl ExportRouter {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .expect("failed to create test router")
@@ -3141,6 +3147,7 @@ mod tests {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 2,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .unwrap();
@@ -3223,6 +3230,7 @@ mod tests {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .expect("failed to create test router")
@@ -4785,6 +4793,7 @@ mod tests {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .unwrap();
@@ -4822,6 +4831,7 @@ mod tests {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .unwrap();
@@ -4870,6 +4880,7 @@ mod tests {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .unwrap();
@@ -4900,6 +4911,7 @@ mod tests {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .unwrap();
@@ -5006,6 +5018,7 @@ mod tests {
             ublk_nr_queues: 1,
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
+            manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
         .unwrap();

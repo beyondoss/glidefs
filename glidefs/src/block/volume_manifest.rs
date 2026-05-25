@@ -81,6 +81,22 @@ impl VolumeManifest {
         (self.chunk_size / self.block_size as u64) as u32
     }
 
+    /// Estimated heap bytes — used as the weighter for the manifest cache so
+    /// budgeting is in bytes, not entry count. A 10TB volume's manifest is
+    /// ~80× larger than a 128GB volume's, and a count-based cap can't tell
+    /// the difference. Conservative per-entry overhead (48B node + 24B Vec
+    /// header) so we don't under-account on tightly-bounded caches.
+    pub fn size_estimate(&self) -> usize {
+        use std::mem::size_of;
+        let header = size_of::<Self>();
+        let chunks: usize = self
+            .chunks
+            .values()
+            .map(|e| 48 + 24 + 8 * e.packs.len())
+            .sum();
+        header + chunks
+    }
+
     /// Total number of chunks needed to cover the device.
     #[allow(dead_code)]
     pub fn num_chunks(&self) -> u32 {
