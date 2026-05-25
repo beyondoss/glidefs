@@ -19,16 +19,21 @@ pub use crate::format::{BLOCK_SIZE, INLINE_DATA_SIZE};
 
 // ---- Constants ----
 
-const BLOCKS_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32;
-const MAX_INODES_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32;
-const INODES_PER_GROUP_INCREMENT: u32 = (BLOCK_SIZE as u32) / (INODE_SIZE as u32);
+#[allow(clippy::cast_possible_truncation)]
+const BLOCKS_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32; // 4096*8=32768 fits in u32
+#[allow(clippy::cast_possible_truncation)]
+const MAX_INODES_PER_GROUP: u32 = (BLOCK_SIZE * 8) as u32; // 4096*8=32768 fits in u32
+#[allow(clippy::cast_possible_truncation)]
+const INODES_PER_GROUP_INCREMENT: u32 = (BLOCK_SIZE as u32) / (INODE_SIZE as u32); // 4096/256=16 fits in u32
 const DEFAULT_MAX_DISK_SIZE: i64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 const MAX_MAX_DISK_SIZE: i64 = 16 * 1024 * 1024 * 1024 * 1024; // 16 TiB
-const GROUPS_PER_DESCRIPTOR_BLOCK: u32 = (BLOCK_SIZE as u32) / format::GROUP_DESCRIPTOR_SIZE as u32;
+#[allow(clippy::cast_possible_truncation)]
+const GROUPS_PER_DESCRIPTOR_BLOCK: u32 = (BLOCK_SIZE as u32) / format::GROUP_DESCRIPTOR_SIZE as u32; // 4096/32=128 fits in u32
 const MAX_FILE_SIZE: i64 = 128 * 1024 * 1024 * 1024; // 128 GiB
 const MAX_BLOCKS_PER_EXTENT: u32 = 0x8000;
 const INODE_LOST_AND_FOUND: u32 = INODE_FIRST;
-const EXTRA_ISIZE: u16 = (INODE_USED_SIZE - 128) as u16;
+#[allow(clippy::cast_possible_truncation)]
+const EXTRA_ISIZE: u16 = (INODE_USED_SIZE - 128) as u16; // 152-128=24 fits in u16
 
 // ---- Public types ----
 
@@ -144,11 +149,13 @@ struct XattrState {
 
 impl XattrState {
     fn new() -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        let block_left = BLOCK_SIZE as usize - XATTR_BLOCK_OVERHEAD; // usize >= u64 on 64-bit
         Self {
             inode_attrs: Vec::new(),
             block_attrs: Vec::new(),
             inode_left: INODE_EXTRA_SIZE - XATTR_INODE_OVERHEAD,
-            block_left: BLOCK_SIZE as usize - XATTR_BLOCK_OVERHEAD,
+            block_left,
         }
     }
 
@@ -175,7 +182,8 @@ impl XattrState {
 }
 
 fn put_xattrs(xattrs: &[Xattr], buf: &mut [u8], offset_delta: u16) {
-    let buf_len = buf.len() as u16;
+    #[allow(clippy::cast_possible_truncation)]
+    let buf_len = buf.len() as u16; // xattr buffers fit in u16
     let mut offset = buf_len + offset_delta;
     let mut entry_pos = 0usize;
     let mut data_end = buf.len();
