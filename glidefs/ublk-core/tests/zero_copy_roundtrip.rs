@@ -262,8 +262,11 @@ fn run_worker(cdev_fd: RawFd, stop: Arc<AtomicBool>) -> Result<(), String> {
     // Register a sparse buffer table sized for our queue depth. The kernel
     // will populate slot=tag with each bio's pages when it forwards I/O
     // for that tag (because we set UBLK_F_AUTO_BUF_REG).
-    ring.submitter().register_buffers_sparse(depth as u32)
-        .map_err(|e| format!("register_buffers_sparse: {}", e))?;
+    eprintln!("[worker] register_buffers_sparse({})", depth);
+    match ring.submitter().register_buffers_sparse(depth as u32) {
+        Ok(()) => eprintln!("[worker] sparse OK"),
+        Err(e) => eprintln!("[worker] sparse err: {} (continuing)", e),
+    }
 
     // mmap io_cmd_buf for this queue — kernel writes the per-tag io
     // descriptor (start_sector, nr_sectors, op_flags) there.
@@ -486,7 +489,6 @@ fn build_fetch(cdev_fd: RawFd, qid: u16, tag: u16, result: i32) -> squeue::Entry
         .cmd(cmd_bytes)
         .build()
         .user_data(ud_cmd(tag, sys::UBLK_U_IO_FETCH_REQ));
-    // Overwrite sqe.addr with the packed auto_buf_reg.
     let auto_addr = ublk_sys::ublk_auto_buf_reg_to_sqe_addr(&auto);
     override_sqe!(&mut sqe, addr, auto_addr);
     sqe
