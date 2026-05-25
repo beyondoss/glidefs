@@ -51,6 +51,7 @@ fn create_router_config(s3: Arc<dyn ObjectStore>, dir: &TempDir) -> RouterConfig
         ublk_nr_queues: 1,
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
+        manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
     }
 }
 
