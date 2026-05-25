@@ -10,3 +10,4 @@ glidefs/fuzz/artifacts
 # fio verify state files left behind by `cargo test --test fio_verify`.
 glidefs/*-verify.state
 local-*-verify.state
+.claude/scheduled_tasks.lock

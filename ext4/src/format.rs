@@ -749,12 +749,12 @@ impl SuperBlock {
 
     /// Calculate total block count (combining low and high 32-bit parts).
     pub fn total_blocks(&self) -> u64 {
-        (self.blocks_count_low as u64) | ((self.blocks_count_high as u64) << 32)
+        u64::from(self.blocks_count_low) | (u64::from(self.blocks_count_high) << 32)
     }
 
     /// Calculate free block count (combining low and high 32-bit parts).
     pub fn free_blocks(&self) -> u64 {
-        (self.free_blocks_count_low as u64) | ((self.free_blocks_count_high as u64) << 32)
+        u64::from(self.free_blocks_count_low) | (u64::from(self.free_blocks_count_high) << 32)
     }
 
     /// Calculate used blocks.
@@ -824,13 +824,13 @@ impl ParsedInode {
         }
 
         let mode = le_u16(buf, 0);
-        let uid_low = le_u16(buf, 2) as u32;
-        let size_low = le_u32(buf, 4) as u64;
-        let atime_low = le_u32(buf, 8) as u64;
-        let ctime_low = le_u32(buf, 12) as u64;
-        let mtime_low = le_u32(buf, 16) as u64;
+        let uid_low = u32::from(le_u16(buf, 2));
+        let size_low = u64::from(le_u32(buf, 4));
+        let atime_low = u64::from(le_u32(buf, 8));
+        let ctime_low = u64::from(le_u32(buf, 12));
+        let mtime_low = u64::from(le_u32(buf, 16));
         // offset 20: dtime
-        let gid_low = le_u16(buf, 24) as u32;
+        let gid_low = u32::from(le_u16(buf, 24));
         let links_count = le_u16(buf, 26);
         let blocks_low = le_u32(buf, 28);
         let flags = InodeFlags::from_bits_truncate(le_u32(buf, 32));
@@ -840,21 +840,21 @@ impl ParsedInode {
         block.copy_from_slice(&buf[40..100]);
         // offset 100: generation
         let xattr_block_low = le_u32(buf, 104);
-        let size_high = le_u32(buf, 108) as u64;
+        let size_high = u64::from(le_u32(buf, 108));
         // offset 112: obsolete_fragment_addr
         // offset 116: blocks_high (2)
         // offset 118: xattr_block_high (2)
-        let uid_high = le_u16(buf, 120) as u32;
-        let gid_high = le_u16(buf, 122) as u32;
+        let uid_high = u32::from(le_u16(buf, 120));
+        let gid_high = u32::from(le_u16(buf, 122));
         // offset 124: checksum_low (2)
         // offset 126: reserved (2)
         let extra_isize = le_u16(buf, 128);
         // offset 130: checksum_high (2)
-        let ctime_extra = le_u32(buf, 132) as u64;
-        let mtime_extra = le_u32(buf, 136) as u64;
-        let atime_extra = le_u32(buf, 140) as u64;
-        let crtime_low = le_u32(buf, 144) as u64;
-        let crtime_extra = le_u32(buf, 148) as u64;
+        let ctime_extra = u64::from(le_u32(buf, 132));
+        let mtime_extra = u64::from(le_u32(buf, 136));
+        let atime_extra = u64::from(le_u32(buf, 140));
+        let crtime_low = u64::from(le_u32(buf, 144));
+        let crtime_extra = u64::from(le_u32(buf, 148));
         // That's INODE_USED_SIZE = 152 bytes.
 
         // Extra inode space (after used size) contains inline xattrs.
@@ -921,8 +921,8 @@ pub struct ExtentLeaf {
 
 impl ExtentLeaf {
     pub fn read_from(buf: &[u8]) -> Self {
-        let start_high = le_u16(buf, 6) as u64;
-        let start_low = le_u32(buf, 8) as u64;
+        let start_high = u64::from(le_u16(buf, 6));
+        let start_low = u64::from(le_u32(buf, 8));
         ExtentLeaf {
             block: le_u32(buf, 0),
             length: le_u16(buf, 4),
@@ -940,8 +940,8 @@ pub struct ExtentIndex {
 
 impl ExtentIndex {
     pub fn read_from(buf: &[u8]) -> Self {
-        let leaf_low = le_u32(buf, 4) as u64;
-        let leaf_high = le_u16(buf, 8) as u64;
+        let leaf_low = u64::from(le_u32(buf, 4));
+        let leaf_high = u64::from(le_u16(buf, 8));
         ExtentIndex {
             block: le_u32(buf, 0),
             leaf: leaf_low | (leaf_high << 32),

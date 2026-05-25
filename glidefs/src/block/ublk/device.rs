@@ -85,9 +85,9 @@ pub struct KernelFeatures {
 /// `get_features()` is unavailable.
 pub fn detect_features() -> KernelFeatures {
     let raw = UblkCtrl::get_features().unwrap_or(0);
-    let recovery = (raw & sys::UBLK_F_USER_RECOVERY as u64) != 0;
-    let ioctl_encode = (raw & sys::UBLK_F_CMD_IOCTL_ENCODE as u64) != 0;
-    let per_io_daemon = (raw & sys::UBLK_F_PER_IO_DAEMON as u64) != 0;
+    let recovery = (raw & u64::from(sys::UBLK_F_USER_RECOVERY)) != 0;
+    let ioctl_encode = (raw & u64::from(sys::UBLK_F_CMD_IOCTL_ENCODE)) != 0;
+    let per_io_daemon = (raw & u64::from(sys::UBLK_F_PER_IO_DAEMON)) != 0;
 
     tracing::info!(
         recovery,
@@ -270,10 +270,10 @@ impl UblkDevice {
         let mut ctrl_flags: u64 = 0;
         if features.recovery {
             ctrl_flags |=
-                sys::UBLK_F_USER_RECOVERY as u64 | sys::UBLK_F_USER_RECOVERY_REISSUE as u64;
+                u64::from(sys::UBLK_F_USER_RECOVERY) | u64::from(sys::UBLK_F_USER_RECOVERY_REISSUE);
         }
         if features.ioctl_encode {
-            ctrl_flags |= sys::UBLK_F_CMD_IOCTL_ENCODE as u64;
+            ctrl_flags |= u64::from(sys::UBLK_F_CMD_IOCTL_ENCODE);
         }
         // USER_COPY decouples buffer ownership from tag arming — `io_task`
         // allocates buffers on demand from a per-worker pool (see
@@ -287,7 +287,7 @@ impl UblkDevice {
         // legacy bounce path — kept as a kill switch in case a kernel exposes
         // a USER_COPY regression.
         if std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none() {
-            ctrl_flags |= sys::UBLK_F_USER_COPY as u64;
+            ctrl_flags |= u64::from(sys::UBLK_F_USER_COPY);
         }
 
         // Snapshot per-worker handles so the spawn_blocking closure can
@@ -587,7 +587,7 @@ impl UblkDevice {
         // `ManuallyDrop<UblkDevice>` itself — we'd double-free the
         // fields — and the original Drop impl is just a `trace!`, so
         // skipping it is benign.
-        let mut this = std::mem::ManuallyDrop::new(self);
+        let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: each field is read exactly once and ownership is
         // tracked statically below. `this` is never dropped.
         let dev_id = this.dev_id;
@@ -1189,7 +1189,7 @@ pub(super) async fn io_task(
     tag: u16,
     handler: &BlockHandler,
 ) -> Result<(), UblkError> {
-    let user_copy = (q.dev.dev_info.flags & ublk_core::sys::UBLK_F_USER_COPY as u64) != 0;
+    let user_copy = (q.dev.dev_info.flags & u64::from(ublk_core::sys::UBLK_F_USER_COPY)) != 0;
     if user_copy {
         return io_task_user_copy(q, tag, handler).await;
     }

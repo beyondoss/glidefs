@@ -350,9 +350,9 @@ impl<'a> BufDesc<'a> {
     /// * `UBLK_F_AUTO_BUF_REG` and `UBLK_F_USER_COPY` cannot be used together
     #[inline]
     pub fn validate_compatibility(&self, device_flags: u64) -> Result<(), UblkError> {
-        let has_auto_buf_reg = (device_flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0;
-        let has_user_copy = (device_flags & sys::UBLK_F_USER_COPY as u64) != 0;
-        let has_zoned = (device_flags & sys::UBLK_F_ZONED as u64) != 0;
+        let has_auto_buf_reg = (device_flags & u64::from(sys::UBLK_F_AUTO_BUF_REG)) != 0;
+        let has_user_copy = (device_flags & u64::from(sys::UBLK_F_USER_COPY)) != 0;
+        let has_zoned = (device_flags & u64::from(sys::UBLK_F_ZONED)) != 0;
 
         // Check for invalid flag combination
         if has_auto_buf_reg && has_user_copy {
@@ -579,10 +579,10 @@ impl<'a> UblkIOCtx<'a> {
     pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
         assert!((offset & !sys::UBLK_IO_BUF_BITS_MASK) == 0);
 
-        sys::UBLKSRV_IO_BUF_OFFSET as u64
-            + ((((q_id as u64) << sys::UBLK_QID_OFF) as u64)
-                | ((tag as u64) << sys::UBLK_TAG_OFF) as u64
-                | offset as u64)
+        u64::from(sys::UBLKSRV_IO_BUF_OFFSET)
+            + (((u64::from(q_id) << sys::UBLK_QID_OFF) as u64)
+                | (u64::from(tag) << sys::UBLK_TAG_OFF) as u64
+                | u64::from(offset))
     }
 
     /// Build userdata for submitting io via io_uring
@@ -603,9 +603,9 @@ impl<'a> UblkIOCtx<'a> {
         assert!((tgt_data >> 16) == 0);
 
         let op = op & 0xff;
-        tag as u64
-            | (op << 16) as u64
-            | (tgt_data << 24) as u64
+        u64::from(tag)
+            | u64::from(op << 16)
+            | u64::from(tgt_data << 24)
             | if is_target_io {
                 UblkUringData::Target as u64
             } else {
@@ -882,7 +882,7 @@ impl UblkDev {
     /// Wait for all queues to complete buffer registration
     pub fn wait_for_buffer_registration(&self, nr_hw_queues: usize) -> Result<(), UblkError> {
         if (self.dev_info.flags
-            & (crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY) as u64)
+            & u64::from(crate::sys::UBLK_F_AUTO_BUF_REG | crate::sys::UBLK_F_USER_COPY))
             != 0
         {
             return Ok(());
@@ -1063,7 +1063,7 @@ impl Drop for UblkQueue {
             }
         }
 
-        let depth = dev.dev_info.queue_depth as u32;
+        let depth = u32::from(dev.dev_info.queue_depth);
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
 
         //unmap, otherwise our cdev won't be released
@@ -1119,16 +1119,16 @@ impl UblkQueue {
     pub fn new(q_id: u16, dev: Arc<UblkDev>, ring: &WorkerRing) -> Result<UblkQueue, UblkError> {
         let tgt = &dev.tgt;
 
-        if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0
-            && (dev.dev_info.flags & sys::UBLK_F_USER_COPY as u64) != 0
+        if (dev.dev_info.flags & u64::from(sys::UBLK_F_AUTO_BUF_REG)) != 0
+            && (dev.dev_info.flags & u64::from(sys::UBLK_F_USER_COPY)) != 0
         {
             return Err(UblkError::InvalidVal);
         }
 
-        let depth = dev.dev_info.queue_depth as u32;
+        let depth = u32::from(dev.dev_info.queue_depth);
         let cdev_fd = dev.cdev_file.as_raw_fd();
         let cmd_buf_sz = UblkQueue::cmd_buf_sz(depth) as usize;
-        let max_cmd_buf_sz = UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH) as libc::off_t;
+        let max_cmd_buf_sz = libc::off_t::from(UblkQueue::cmd_buf_sz(sys::UBLK_MAX_QUEUE_DEPTH));
 
         // We deliberately do NOT register the cdev fd into the worker
         // ring's fixed-file table. SQEs use `types::Fd(cdev_fd)` and pay
@@ -1166,7 +1166,7 @@ impl UblkQueue {
         // queue should register; subsequent queues skip. ublk's
         // production path has ZC permanently disabled, so this branch
         // is dead — just log and skip if it ever triggers.
-        if (dev.dev_info.flags & sys::UBLK_F_AUTO_BUF_REG as u64) != 0 {
+        if (dev.dev_info.flags & u64::from(sys::UBLK_F_AUTO_BUF_REG)) != 0 {
             log::warn!(
                 "UBLK_F_AUTO_BUF_REG set but multi-queue rings don't \
                  yet share buffer tables; skipping register_buffers_sparse"
@@ -1174,7 +1174,7 @@ impl UblkQueue {
         }
 
         let off =
-            sys::UBLKSRV_CMD_BUF_OFFSET as libc::off_t + (q_id as libc::off_t) * max_cmd_buf_sz;
+            libc::off_t::from(sys::UBLKSRV_CMD_BUF_OFFSET) + libc::off_t::from(q_id) * max_cmd_buf_sz;
         let io_cmd_buf = unsafe {
             libc::mmap(
                 std::ptr::null_mut::<libc::c_void>(),
@@ -1189,7 +1189,7 @@ impl UblkQueue {
             return Err(UblkError::IOError(std::io::Error::last_os_error()));
         }
 
-        let nr_ios = depth + tgt.extra_ios as u32;
+        let nr_ios = depth + u32::from(tgt.extra_ios);
         let mut bufs = Vec::<*mut u8>::with_capacity(nr_ios as usize);
         unsafe {
             bufs.set_len(nr_ios as usize);
@@ -1208,12 +1208,12 @@ impl UblkQueue {
 
         let q = UblkQueue {
             flags: dev_flags_native
-                | if (dev_info_flags & (sys::UBLK_F_CMD_IOCTL_ENCODE as u64)) != 0 {
+                | if (dev_info_flags & u64::from(sys::UBLK_F_CMD_IOCTL_ENCODE)) != 0 {
                     Self::UBLK_QUEUE_IOCTL_ENCODE
                 } else {
                     UblkFlags::empty()
                 }
-                | if (dev_info_flags & (sys::UBLK_F_AUTO_BUF_REG as u64)) != 0 {
+                | if (dev_info_flags & u64::from(sys::UBLK_F_AUTO_BUF_REG)) != 0 {
                     Self::UBLK_QUEUE_AUTO_BUF_REG
                 } else {
                     UblkFlags::empty()
@@ -1289,8 +1289,8 @@ impl UblkQueue {
     ///
     #[inline(always)]
     pub fn get_iod(&self, tag: u16) -> &sys::ublksrv_io_desc {
-        assert!((tag as u32) < self.q_depth);
-        let iod = (self.io_cmd_buf + tag as u64 * 24) as *const sys::ublksrv_io_desc;
+        assert!(u32::from(tag) < self.q_depth);
+        let iod = (self.io_cmd_buf + u64::from(tag) * 24) as *const sys::ublksrv_io_desc;
         unsafe { &*iod }
     }
 
@@ -1600,7 +1600,7 @@ impl UblkQueue {
         result: i32,
     ) -> UblkUringOpFuture {
         let f = UblkUringOpFuture::new(0);
-        let user_data = f.user_data | (tag as u64);
+        let user_data = f.user_data | u64::from(tag);
         self.ring.with_mut(|r: &mut IoUring<squeue::Entry>| {
             self.__queue_io_cmd(r, tag, cmd_op, buf_addr as u64, None, user_data, result)
         });
@@ -1630,7 +1630,7 @@ impl UblkQueue {
         let auto_buf_addr = Some(bindings::ublk_auto_buf_reg_to_sqe_addr(buf_reg_data));
 
         let f = UblkUringOpFuture::new(0);
-        let user_data = f.user_data | (tag as u64);
+        let user_data = f.user_data | u64::from(tag);
         self.ring.with_mut(|r: &mut IoUring<squeue::Entry>| {
             self.__queue_io_cmd(r, tag, cmd_op, 0, auto_buf_addr, user_data, result)
         });
@@ -1887,11 +1887,11 @@ impl UblkQueue {
 
     fn submit_reg_unreg_io_buf(&self, op: u32, tag: u16, buf_index: u16) -> UblkUringOpFuture {
         let f = UblkUringOpFuture::new(0);
-        let user_data = f.user_data | (tag as u64);
+        let user_data = f.user_data | u64::from(tag);
 
         let io_cmd = sys::ublksrv_io_cmd {
             tag,
-            addr: buf_index as u64,
+            addr: u64::from(buf_index),
             q_id: self.q_id,
             result: 0,
         };
@@ -1962,7 +1962,7 @@ impl UblkQueue {
             };
 
             assert!(
-                ((self.dev_flags & (crate::sys::UBLK_F_USER_COPY as u64)) != 0) == bufs.is_none()
+                ((self.dev_flags & u64::from(crate::sys::UBLK_F_USER_COPY)) != 0) == bufs.is_none()
             );
             self.ring.with_mut(|ring| {
                 self.queue_io_cmd(
@@ -2084,7 +2084,7 @@ impl UblkQueue {
             }
             BufDescList::AutoRegs(auto_reg_slice) => {
                 // AutoReg operations require UBLK_F_AUTO_BUF_REG
-                if (self.dev_flags & sys::UBLK_F_AUTO_BUF_REG as u64) == 0 {
+                if (self.dev_flags & u64::from(sys::UBLK_F_AUTO_BUF_REG)) == 0 {
                     return Err(UblkError::OtherError(-libc::ENOTSUP));
                 }
 
@@ -2436,7 +2436,7 @@ impl UblkQueue {
 
     #[inline]
     fn __wait_ios(&self, to_wait: usize) -> Result<i32, UblkError> {
-        let ts = types::Timespec::new().sec(Self::UBLK_QUEUE_IDLE_SECS as u64);
+        let ts = types::Timespec::new().sec(u64::from(Self::UBLK_QUEUE_IDLE_SECS));
         let args = types::SubmitArgs::new().timespec(&ts);
 
         let state = self.state.borrow();

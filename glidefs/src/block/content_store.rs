@@ -366,8 +366,8 @@ impl ContentStore {
         let sem = self.download_semaphore.clone();
         let store = Arc::clone(&self.object_store);
         let path = ObjectPath::from(key.to_string());
-        let start = offset as u64;
-        let end = start + comp_length as u64;
+        let start = u64::from(offset);
+        let end = start + u64::from(comp_length);
         let s3_result = tokio::spawn(async move {
             let _permit = match &sem {
                 Some(s) => Some(
@@ -768,7 +768,7 @@ impl ContentStore {
         }
         let trailer_start = data.len() - TRAILER_SIZE;
         let block_count =
-            u16::from_le_bytes([data[trailer_start], data[trailer_start + 1]]) as u64;
+            u64::from(u16::from_le_bytes([data[trailer_start], data[trailer_start + 1]]));
         let precise_suffix =
             block_count * PACK_INDEX_ENTRY_SIZE as u64 + TRAILER_SIZE as u64;
 

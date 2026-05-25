@@ -64,7 +64,7 @@ pub fn sendmsg_with_fds(
         msg_controllen: if fds.is_empty() {
             0
         } else {
-            unsafe { libc::CMSG_LEN((std::mem::size_of::<RawFd>() * fds.len()) as u32) as _ }
+            unsafe { libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as _ }
         },
         msg_flags: 0,
     };
@@ -75,7 +75,7 @@ pub fn sendmsg_with_fds(
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             (*cmsg).cmsg_len = libc::CMSG_LEN(
-                (std::mem::size_of::<RawFd>() * fds.len()) as u32,
+                std::mem::size_of_val(fds) as u32,
             ) as _;
             let data_ptr = libc::CMSG_DATA(cmsg) as *mut RawFd;
             for (i, fd) in fds.iter().enumerate() {

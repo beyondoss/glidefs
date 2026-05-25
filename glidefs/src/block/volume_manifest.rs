@@ -78,7 +78,7 @@ impl VolumeManifest {
 
     /// Number of blocks that fit in one chunk.
     pub fn blocks_per_chunk(&self) -> u32 {
-        (self.chunk_size / self.block_size as u64) as u32
+        (self.chunk_size / u64::from(self.block_size)) as u32
     }
 
     /// Estimated heap bytes — used as the weighter for the manifest cache so
@@ -105,13 +105,13 @@ impl VolumeManifest {
 
     /// Which chunk index contains the given block index.
     pub fn chunk_idx_for_block(&self, block_index: u64) -> u32 {
-        let block_byte_offset = block_index * self.block_size as u64;
+        let block_byte_offset = block_index * u64::from(self.block_size);
         (block_byte_offset / self.chunk_size) as u32
     }
 
     /// Block offset within its chunk (0-based).
     pub fn block_offset_in_chunk(&self, block_index: u64) -> u32 {
-        let blocks_per_chunk = self.blocks_per_chunk() as u64;
+        let blocks_per_chunk = u64::from(self.blocks_per_chunk());
         (block_index % blocks_per_chunk) as u32
     }
 
@@ -282,10 +282,10 @@ impl VolumeManifest {
         }
         let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
         if version != VOLUME_MANIFEST_VERSION {
-            return Err(VolumeManifestError::UnsupportedVersion(version as u32));
+            return Err(VolumeManifestError::UnsupportedVersion(u32::from(version)));
         }
         let chunk_count = u32::from_le_bytes(data[6..10].try_into().unwrap()) as usize;
-        let chunk_size = u32::from_le_bytes(data[10..14].try_into().unwrap()) as u64;
+        let chunk_size = u64::from(u32::from_le_bytes(data[10..14].try_into().unwrap()));
         let block_size = u32::from_le_bytes(data[14..18].try_into().unwrap());
         let device_size = u64::from_le_bytes(data[18..26].try_into().unwrap());
         // reserved: data[26..32]

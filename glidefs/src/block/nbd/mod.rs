@@ -250,7 +250,7 @@ impl NbdDeviceManager {
                             );
                             let size = size_bytes;
                             let dead_conn_timeout = self.dead_conn_timeout;
-                            let server_flags = TRANSMISSION_FLAGS as u64;
+                            let server_flags = u64::from(TRANSMISSION_FLAGS);
                             tokio::task::spawn_blocking(move || {
                                 netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, Some(index))
                             })
@@ -267,7 +267,7 @@ impl NbdDeviceManager {
                     );
                     let size = size_bytes;
                     let dead_conn_timeout = self.dead_conn_timeout;
-                    let server_flags = TRANSMISSION_FLAGS as u64;
+                    let server_flags = u64::from(TRANSMISSION_FLAGS);
                     tokio::task::spawn_blocking(move || {
                         netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, Some(index))
                     })
@@ -277,7 +277,7 @@ impl NbdDeviceManager {
                 // First time for this export — auto-assign.
                 let size = size_bytes;
                 let dead_conn_timeout = self.dead_conn_timeout;
-                let server_flags = TRANSMISSION_FLAGS as u64;
+                let server_flags = u64::from(TRANSMISSION_FLAGS);
                 tokio::task::spawn_blocking(move || {
                     netlink::connect(client_fd, size, 512, server_flags, dead_conn_timeout, None)
                 })

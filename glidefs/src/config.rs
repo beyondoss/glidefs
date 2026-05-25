@@ -39,11 +39,10 @@ impl Settings {
     /// M4 surfaced this — the daemon registered every ublk export with
     /// `queues=1` despite `glidefs.toml` declaring `nr_queues = 4`.
     pub fn ublk_nr_queues(&self) -> u16 {
-        if let Some(ublk_cfg) = self.servers.ublk.as_ref() {
-            if let Some(n) = ublk_cfg.nr_queues {
+        if let Some(ublk_cfg) = self.servers.ublk.as_ref()
+            && let Some(n) = ublk_cfg.nr_queues {
                 return n;
             }
-        }
         self.servers
             .nbd
             .as_ref()

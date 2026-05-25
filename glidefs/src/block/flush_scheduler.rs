@@ -399,8 +399,8 @@ pub async fn flush_scheduler(
                         && last_flush_failure
                             .is_some_and(|t| t.elapsed() >= flush_backoff);
 
-                    if should_retry {
-                        if let Some(result) = flush_and_sync(
+                    if should_retry
+                        && let Some(result) = flush_and_sync(
                             &cache, &content_store, &pack_index_cache, &volume_manifest,
                             &clean_cache, &metrics, &mut flush_backoff, &mut last_flush_failure,
                         ).await
@@ -408,7 +408,6 @@ pub async fn flush_scheduler(
                         {
                             return;
                         }
-                    }
 
                     // Always checkpoint locally when dirty.
                     if let Err(e) = cache.checkpoint().await {

@@ -36,7 +36,7 @@ impl UblkUringOpFuture {
                 waker: None,
                 result: None,
             });
-            let user_data = ((key as u32) << 16) as u64 | tgt_io;
+            let user_data = u64::from((key as u32) << 16) | tgt_io;
             log::trace!("uring: new future data {:x}/{:x}", user_data, key);
             UblkUringOpFuture { user_data }
         })

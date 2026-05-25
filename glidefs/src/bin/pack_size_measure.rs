@@ -325,9 +325,9 @@ fn measure_pack_size(
 
 fn human(bytes: usize) -> String {
     if bytes >= 1 << 20 {
-        format!("{:.1}MB", bytes as f64 / (1 << 20) as f64)
+        format!("{:.1}MB", bytes as f64 / f64::from(1 << 20))
     } else if bytes >= 1 << 10 {
-        format!("{:.1}KB", bytes as f64 / (1 << 10) as f64)
+        format!("{:.1}KB", bytes as f64 / f64::from(1 << 10))
     } else {
         format!("{bytes}B")
     }

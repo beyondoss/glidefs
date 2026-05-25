@@ -37,7 +37,7 @@ use crate::block::state::Draining;
 pub use config::WriteCacheConfig;
 pub use error::CacheError;
 #[cfg(all(target_os = "linux", feature = "ublk"))]
-pub use read::{ChunkSource, ReadPlan};
+pub use read::ReadPlan;
 pub use inner::HandoffPhase;
 use inner::CacheInner;
 

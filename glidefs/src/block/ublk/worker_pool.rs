@@ -387,13 +387,13 @@ impl WorkerPool {
     ) -> &WorkerHandle {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64-bit offset basis
         for &b in export_name.as_bytes() {
-            h ^= b as u64;
+            h ^= u64::from(b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
         }
         // Mix qid in via a multiplier large enough to distribute across
         // the low bits regardless of name-hash; doesn't need to be a
         // cryptographic PRP, just a permutation.
-        let qid_seed: u64 = (qid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let qid_seed: u64 = u64::from(qid).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mixed = h ^ qid_seed;
 
         // Resolve a per-node bucket when the device has a preference

@@ -1881,7 +1881,7 @@ impl ExportRouter {
         let hot_set = {
             let (blocks_per_chunk, chunk_packs): (u64, Vec<(u32, Vec<u64>)>) = {
                 let vm = volume_manifest.read();
-                let bpc = vm.blocks_per_chunk() as u64;
+                let bpc = u64::from(vm.blocks_per_chunk());
                 let cp = vm
                     .chunks
                     .iter()
@@ -1897,7 +1897,7 @@ impl ExportRouter {
                         Some(entries) => {
                             for e in entries.iter() {
                                 let global_block =
-                                    *chunk_idx as u64 * blocks_per_chunk + e.chunk_offset as u64;
+                                    u64::from(*chunk_idx) * blocks_per_chunk + u64::from(e.chunk_offset);
                                 indices.push(global_block);
                             }
                         }
@@ -2733,7 +2733,7 @@ impl ExportRouter {
         let names: Vec<String> = self.exports.iter().map(|e| e.key().clone()).collect();
         let export_list: Vec<(String, ExportState)> = names
             .into_iter()
-            .filter_map(|name| self.exports.remove(&name).map(|(k, v)| (k, v)))
+            .filter_map(|name| self.exports.remove(&name))
             .collect();
 
         use futures::stream::{self, StreamExt};

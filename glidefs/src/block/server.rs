@@ -304,7 +304,7 @@ impl NBDServer {
     /// This listens for connections and spawns a handler for each client.
     /// Returns when the shutdown token is cancelled.
     pub async fn start(&self, shutdown: CancellationToken) -> std::io::Result<()> {
-        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::fd::AsRawFd;
         match &self.transport {
             Transport::Tcp(socket) => {
                 let listener = if let Some(fd) = self.inherited_listener.lock().take() {
@@ -930,7 +930,7 @@ impl<R: AsyncRead + Unpin + Send + 'static, W: AsyncWrite + Unpin + Send + 'stat
                 // to keep the protocol stream in sync.
                 if matches!(request.cmd_type, NBDCommand::Write) {
                     let buf = drain_buf.get_or_insert_with(|| vec![0u8; 64 * 1024]);
-                    let mut remaining = request.length as u64;
+                    let mut remaining = u64::from(request.length);
                     while remaining > 0 {
                         let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
                         reader.read_exact(&mut buf[..to_read]).await

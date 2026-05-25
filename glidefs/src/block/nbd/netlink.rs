@@ -325,10 +325,10 @@ pub fn connect(
         put_nla_u32(&mut attrs, NBD_ATTR_INDEX, index as u32);
     }
     put_nla_u64(&mut attrs, NBD_ATTR_SIZE_BYTES, size_bytes);
-    put_nla_u64(&mut attrs, NBD_ATTR_BLOCK_SIZE_BYTES, block_size as u64);
+    put_nla_u64(&mut attrs, NBD_ATTR_BLOCK_SIZE_BYTES, u64::from(block_size));
     put_nla_u64(&mut attrs, NBD_ATTR_SERVER_FLAGS, server_flags);
     if dead_conn_timeout > 0 {
-        put_nla_u64(&mut attrs, NBD_ATTR_DEAD_CONN_TIMEOUT, dead_conn_timeout as u64);
+        put_nla_u64(&mut attrs, NBD_ATTR_DEAD_CONN_TIMEOUT, u64::from(dead_conn_timeout));
     }
     put_nla(&mut attrs, NBD_ATTR_SOCKETS | NLA_F_NESTED, &sock_attrs);
 

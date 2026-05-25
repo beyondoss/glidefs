@@ -607,8 +607,8 @@ impl BlockHandler {
                 let has_s3_data = {
                     let (bo, pids) = {
                         let vm = self.volume_manifest.read();
-                        let ci = vm.chunk_idx_for_block(block as u64);
-                        let bo = vm.block_offset_in_chunk(block as u64);
+                        let ci = vm.chunk_idx_for_block(block);
+                        let bo = vm.block_offset_in_chunk(block);
                         let pids = vm.chunk_pack_ids(ci).map(|ids| ids.to_vec()).unwrap_or_default();
                         (bo, pids)
                     };
@@ -742,11 +742,11 @@ impl BlockHandler {
         // Clamp reads that partially extend past the device boundary:
         // return real data for the on-device portion, zeros for the rest.
         let clamped_len = std::cmp::min(
-            length as u64,
+            u64::from(length),
             self.device_size() - offset,
         ) as u32;
 
-        self.metrics.record_guest_read(clamped_len as u64);
+        self.metrics.record_guest_read(u64::from(clamped_len));
 
         let data = self
             .cache
@@ -804,11 +804,11 @@ impl BlockHandler {
 
         // Clamp reads that partially extend past the device boundary.
         let clamped_len = std::cmp::min(
-            length as u64,
+            u64::from(length),
             self.device_size() - offset,
         ) as u32;
 
-        self.metrics.record_guest_read(clamped_len as u64);
+        self.metrics.record_guest_read(u64::from(clamped_len));
 
         // Fast path: all blocks present on local SSD → pread directly into
         // caller buffer. Zero allocation, zero memcpy.
@@ -939,7 +939,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
+        if offset.checked_add(u64::from(length)).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -947,11 +947,11 @@ impl BlockHandler {
             return Ok(());
         }
 
-        self.backfill_blocks_in_range(offset, length as u64).await?;
-        self.cache.zero_range(offset, length as u64)?;
+        self.backfill_blocks_in_range(offset, u64::from(length)).await?;
+        self.cache.zero_range(offset, u64::from(length))?;
 
         if let Some(ref tracer) = self.write_tracer {
-            tracer.record(offset, length as u64, super::write_trace::TraceOp::Trim);
+            tracer.record(offset, u64::from(length), super::write_trace::TraceOp::Trim);
         }
         self.check_flush_threshold();
 
@@ -985,7 +985,7 @@ impl BlockHandler {
             return Err(CommandError::ReadOnly);
         }
 
-        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
+        if offset.checked_add(u64::from(length)).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -993,13 +993,13 @@ impl BlockHandler {
             return Ok(());
         }
 
-        self.backfill_blocks_in_range(offset, length as u64).await?;
-        self.cache.zero_range(offset, length as u64)?;
+        self.backfill_blocks_in_range(offset, u64::from(length)).await?;
+        self.cache.zero_range(offset, u64::from(length))?;
 
         if let Some(ref tracer) = self.write_tracer {
             tracer.record(
                 offset,
-                length as u64,
+                u64::from(length),
                 super::write_trace::TraceOp::WriteZeroes,
             );
         }
@@ -1015,7 +1015,7 @@ impl BlockHandler {
     /// Cache hint - no-op for our implementation.
     pub fn cache(&self, offset: u64, length: u32) -> CommandResult<()> {
         self.check_not_degraded()?;
-        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
+        if offset.checked_add(u64::from(length)).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
         Ok(())
@@ -1165,7 +1165,7 @@ impl BlockHandler {
         offset: u64,
         length: u32,
     ) -> CommandResult<super::write_cache::ReadPlan> {
-        if offset.checked_add(length as u64).is_none_or(|end| end > self.device_size()) {
+        if offset.checked_add(u64::from(length)).is_none_or(|end| end > self.device_size()) {
             return Err(CommandError::InvalidArgument);
         }
 
@@ -1175,7 +1175,7 @@ impl BlockHandler {
             });
         }
 
-        self.metrics.record_guest_read(length as u64);
+        self.metrics.record_guest_read(u64::from(length));
 
         let plan = self
             .cache
