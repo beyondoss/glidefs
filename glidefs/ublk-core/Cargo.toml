@@ -61,3 +61,5 @@ macro_metavars_in_unsafe = "allow"
 
 [dev-dependencies]
 libc = "0.2"
+env_logger = "0.10"
+io-uring = "0.7"
