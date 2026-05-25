@@ -88,29 +88,32 @@ async fn setup_router() -> (Arc<ExportRouter>, TempDir) {
 /// One I/O at the start of the device — a 4 KiB write followed by a
 /// 4 KiB read with byte-level comparison. Runs whichever transport
 /// glidefs auto-selects (ZC on ≥6.17, USER_COPY otherwise).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn zc_glidefs_roundtrip_4k() {
     if let Some(why) = skip_reason() {
         eprintln!("skip: {why}");
         return;
     }
 
+    eprintln!("[test] setup_router...");
     let (router, _cache_dir) = setup_router().await;
+    eprintln!("[test] get_handler...");
     let handler = router.get_handler(EXPORT_NAME).await.expect("handler");
 
+    eprintln!("[test] UblkServer::new + add_device...");
     let mut ublk_server = UblkServer::new();
     let dev_path = ublk_server
         .add_device(EXPORT_NAME, handler)
         .await
         .expect("ublk register");
-    eprintln!("ublk device: {}", dev_path.display());
+    eprintln!("[test] ublk device: {}", dev_path.display());
 
-    // Block to do raw I/O on the bdev. We do this in spawn_blocking so we
-    // don't tie up an async worker doing read_exact / write_all.
+    eprintln!("[test] spawning bdev I/O...");
     let bdev = dev_path.clone();
     let io_result = tokio::task::spawn_blocking(move || run_io(&bdev))
         .await
         .expect("spawn_blocking join");
+    eprintln!("[test] I/O completed: {:?}", io_result);
 
     // Shut down first so we don't leak the kernel device on assertion failure.
     if let Err(e) = ublk_server.shutdown().await {
@@ -127,6 +130,7 @@ fn run_io(dev: &Path) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::OpenOptionsExt;
 
+    eprintln!("[io] opening {} for write", dev.display());
     let pattern: Vec<u8> = (0..4096usize).map(|i| (i & 0xff) as u8).collect();
     let aligned = aligned_4k(&pattern);
 
@@ -136,23 +140,30 @@ fn run_io(dev: &Path) -> std::io::Result<()> {
             .write(true)
             .custom_flags(libc::O_DIRECT)
             .open(dev)?;
+        eprintln!("[io] opened, write_all 4096");
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&aligned)?;
+        eprintln!("[io] write done; sync_data");
         file.sync_data()?;
+        eprintln!("[io] sync done");
     }
     {
+        eprintln!("[io] opening {} for read", dev.display());
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
             .open(dev)?;
         let mut readback = aligned_4k(&vec![0u8; 4096]);
         file.seek(SeekFrom::Start(0))?;
+        eprintln!("[io] read_exact 4096");
         file.read_exact(&mut readback)?;
+        eprintln!("[io] read done; compare");
         assert_eq!(
             &readback[..pattern.len()],
             pattern.as_slice(),
             "roundtrip data mismatch"
         );
+        eprintln!("[io] ROUND-TRIP MATCH");
     }
     Ok(())
 }
