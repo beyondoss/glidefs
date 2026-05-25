@@ -95,25 +95,20 @@ async fn zc_glidefs_roundtrip_4k() {
         return;
     }
 
-    eprintln!("[test] setup_router...");
     let (router, _cache_dir) = setup_router().await;
-    eprintln!("[test] get_handler...");
     let handler = router.get_handler(EXPORT_NAME).await.expect("handler");
 
-    eprintln!("[test] UblkServer::new + add_device...");
     let mut ublk_server = UblkServer::new();
     let dev_path = ublk_server
         .add_device(EXPORT_NAME, handler)
         .await
         .expect("ublk register");
-    eprintln!("[test] ublk device: {}", dev_path.display());
+    eprintln!("ublk device: {} (flags: {:#x})", dev_path.display(), 0);
 
-    eprintln!("[test] spawning bdev I/O...");
     let bdev = dev_path.clone();
     let io_result = tokio::task::spawn_blocking(move || run_io(&bdev))
         .await
         .expect("spawn_blocking join");
-    eprintln!("[test] I/O completed: {:?}", io_result);
 
     // Shut down first so we don't leak the kernel device on assertion failure.
     if let Err(e) = ublk_server.shutdown().await {
@@ -130,7 +125,6 @@ fn run_io(dev: &Path) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::OpenOptionsExt;
 
-    eprintln!("[io] opening {} for write", dev.display());
     let pattern: Vec<u8> = (0..4096usize).map(|i| (i & 0xff) as u8).collect();
     let aligned = aligned_4k(&pattern);
 
@@ -140,30 +134,24 @@ fn run_io(dev: &Path) -> std::io::Result<()> {
             .write(true)
             .custom_flags(libc::O_DIRECT)
             .open(dev)?;
-        eprintln!("[io] opened, write_all 4096");
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&aligned)?;
-        eprintln!("[io] write done; sync_data");
         file.sync_data()?;
-        eprintln!("[io] sync done");
     }
     {
-        eprintln!("[io] opening {} for read", dev.display());
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
             .open(dev)?;
         let mut readback = aligned_4k(&vec![0u8; 4096]);
         file.seek(SeekFrom::Start(0))?;
-        eprintln!("[io] read_exact 4096");
         file.read_exact(&mut readback)?;
-        eprintln!("[io] read done; compare");
         assert_eq!(
             &readback[..pattern.len()],
             pattern.as_slice(),
             "roundtrip data mismatch"
         );
-        eprintln!("[io] ROUND-TRIP MATCH");
+        eprintln!("ROUND-TRIP MATCH");
     }
     Ok(())
 }

@@ -1348,17 +1348,6 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
         length: u32,
         tag: u16,
     ) -> ublk_core::zc::ZcAction {
-        // DIAGNOSTIC: bypass async handler. Return success of full length.
-        // For reads, bio is left whatever the kernel allocated (likely
-        // zeros). For writes, the bio's data is discarded.
-        if std::env::var_os("GLIDEFS_ZC_NOOP").is_some() {
-            #[allow(clippy::cast_possible_wrap)]
-            let result = match u32::from(op) {
-                sys::UBLK_IO_OP_READ | sys::UBLK_IO_OP_WRITE => length as i32,
-                _ => 0,
-            };
-            return ublk_core::zc::ZcAction::Complete(result);
-        }
         let memfd = self.staging[tag as usize];
         match u32::from(op) {
             sys::UBLK_IO_OP_FLUSH => {
@@ -1375,9 +1364,6 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 ublk_core::zc::ZcAction::Complete(0)
             }
             sys::UBLK_IO_OP_READ => {
-                // Fetch via handler.read_into into a userspace buf, copy
-                // into the staging memfd at offset 0, then READ_FIXED
-                // delivers bytes to the bio.
                 let mut buf = vec![0u8; length as usize];
                 let r = self
                     .runtime
@@ -1404,14 +1390,10 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                     Err(_) => ublk_core::zc::ZcAction::Complete(-libc::EIO),
                 }
             }
-            sys::UBLK_IO_OP_WRITE => {
-                // WriteFixedTo drains bio → staging memfd. after_write
-                // pulls the bytes out and calls handler.write.
-                ublk_core::zc::ZcAction::WriteFixedTo {
-                    fd: memfd,
-                    dst_offset: 0,
-                }
-            }
+            sys::UBLK_IO_OP_WRITE => ublk_core::zc::ZcAction::WriteFixedTo {
+                fd: memfd,
+                dst_offset: 0,
+            },
             _ => ublk_core::zc::ZcAction::Complete(-libc::EIO),
         }
     }
@@ -1441,7 +1423,11 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
             return -libc::EIO;
         }
         match self.runtime.block_on(self.handler.write(offset, &buf, false)) {
-            Ok(()) => 0,
+            Ok(()) => {
+                #[allow(clippy::cast_possible_wrap)]
+                let r = length as i32;
+                r
+            }
             Err(_) => -libc::EIO,
         }
     }
