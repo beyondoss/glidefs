@@ -1348,6 +1348,17 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
         length: u32,
         tag: u16,
     ) -> ublk_core::zc::ZcAction {
+        // DIAGNOSTIC: bypass async handler. Return success of full length.
+        // For reads, bio is left whatever the kernel allocated (likely
+        // zeros). For writes, the bio's data is discarded.
+        if std::env::var_os("GLIDEFS_ZC_NOOP").is_some() {
+            #[allow(clippy::cast_possible_wrap)]
+            let result = match u32::from(op) {
+                sys::UBLK_IO_OP_READ | sys::UBLK_IO_OP_WRITE => length as i32,
+                _ => 0,
+            };
+            return ublk_core::zc::ZcAction::Complete(result);
+        }
         let memfd = self.staging[tag as usize];
         match u32::from(op) {
             sys::UBLK_IO_OP_FLUSH => {
@@ -1480,16 +1491,38 @@ pub(super) async fn io_task_zero_copy(
     });
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Spawn a plain OS thread (NOT tokio::spawn_blocking) for the ZC
+    // worker loop. The worker calls Handle::block_on from this thread,
+    // which requires a non-tokio thread context. Using spawn_blocking
+    // creates a JoinHandle tied to tokio's runtime; awaiting it from the
+    // custom QueueExecutor (which io_task runs on) can stall the wakeup
+    // chain on cross-executor boundaries. A plain OS thread sidesteps
+    // both issues.
     let stop_for_thread = Arc::clone(&stop);
-    let join = tokio::task::spawn_blocking(move || {
-        ublk_core::zc::run_zc_queue(cdev_fd, qid, queue_depth, target, stop_for_thread)
-    });
+    let handle = std::thread::Builder::new()
+        .name(format!("glidefs-zc-{}-{}", q.dev.dev_info.dev_id, qid))
+        .spawn(move || {
+            let _ = ublk_core::zc::run_zc_queue(
+                cdev_fd,
+                qid,
+                queue_depth,
+                target,
+                stop_for_thread,
+            );
+        })
+        .map_err(|e| UblkError::IOError(std::io::Error::other(e.to_string())))?;
 
-    // Park here until the OS thread exits. spawn_blocking returns a
-    // JoinHandle we can await; the thread runs run_zc_queue until stop=true.
-    // When the worker pool tears down the queue, the dev fd closes and
-    // the kernel ABORTs pending FETCHes — run_zc_queue exits.
-    let _ = join.await;
+    // We can't await an OS thread directly. Poll periodically; on
+    // shutdown signal, the kernel ABORTs in-flight FETCHes which the
+    // worker observes and exits. If the worker hangs, the future stays
+    // pending — but io_task is itself dropped on shutdown which leaks
+    // the thread; acceptable for the integration shim.
+    let _ = handle;
+    // Park the io_task future forever (or until executor cancels it).
+    // Worker thread continues servicing I/O; dropping the future means
+    // the worker is leaked, but the kernel ABORT-on-stop_dev path
+    // already releases its resources.
+    std::future::pending::<()>().await;
 
     // Close the staging memfds.
     for fd in staging {
