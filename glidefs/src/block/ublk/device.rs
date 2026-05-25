@@ -256,7 +256,8 @@ impl UblkDevice {
         pool: &super::worker_pool::WorkerPool,
     ) -> anyhow::Result<Self> {
         let dev_size = handler.device_size();
-        let bs_shift = handler.block_size().trailing_zeros() as u8;
+        #[allow(clippy::cast_possible_truncation)]
+        let bs_shift = handler.block_size().trailing_zeros() as u8; // block_size is power of 2, trailing_zeros <= 13
 
         let dev_flags = match mode {
             DeviceMode::Add => UblkFlags::UBLK_DEV_F_ADD_DEV,
@@ -504,19 +505,36 @@ impl UblkDevice {
         // KOBJ_ADD, before FETCH_REQs are armed, so the freeze has
         // nothing to wait for.
 
+        #[allow(clippy::cast_possible_truncation)]
+        let ctrl_build_us = timings.ctrl_build_us as u64; // timing < u64::MAX micros (realistic)
+        #[allow(clippy::cast_possible_truncation)]
+        let dev_new_us = timings.dev_new_us as u64; // timing < u64::MAX micros
+        #[allow(clippy::cast_possible_truncation)]
+        let addqueue_send_us = timings.addqueue_send_us as u64; // timing < u64::MAX micros
+        #[allow(clippy::cast_possible_truncation)]
+        let ready_recv_us = timings.ready_recv_us as u64; // timing < u64::MAX micros
+        #[allow(clippy::cast_possible_truncation)]
+        let configure_queue_us = timings.configure_queue_us as u64; // timing < u64::MAX micros
+        #[allow(clippy::cast_possible_truncation)]
+        let configure_queue_last_us = timings.configure_queue_last_us as u64; // timing < u64::MAX micros
+        #[allow(clippy::cast_possible_truncation)]
+        let start_dev_us = timings.start_dev_us as u64; // timing < u64::MAX micros
+        #[allow(clippy::cast_possible_truncation)]
+        let spawn_blocking_total_us = timings.spawn_blocking_total_us as u64; // timing < u64::MAX micros
+
         tracing::info!(
             target: "glidefs.timing",
             export = %export_name,
             dev_id = dev_id_assigned,
             nr_queues = actual_nr_queues,
-            ctrl_build_us = timings.ctrl_build_us as u64,
-            dev_new_us = timings.dev_new_us as u64,
-            addqueue_send_us = timings.addqueue_send_us as u64,
-            ready_recv_us = timings.ready_recv_us as u64,
-            configure_queue_us = timings.configure_queue_us as u64,
-            configure_queue_last_us = timings.configure_queue_last_us as u64,
-            start_dev_us = timings.start_dev_us as u64,
-            spawn_blocking_total_us = timings.spawn_blocking_total_us as u64,
+            ctrl_build_us,
+            dev_new_us,
+            addqueue_send_us,
+            ready_recv_us,
+            configure_queue_us,
+            configure_queue_last_us,
+            start_dev_us,
+            spawn_blocking_total_us,
             "register_inner timing breakdown"
         );
 
@@ -694,12 +712,21 @@ impl UblkDevice {
         .map_err(|e| anyhow::anyhow!("ublk del_dev failed: {}", e))?;
         let t_del = t0.elapsed();
 
+        #[allow(clippy::cast_possible_truncation)]
+        let ms_acks = t_acks.as_millis() as u64; // timing < u64::MAX millis (reasonable)
+        #[allow(clippy::cast_possible_truncation)]
+        let ms_kill = t_kill.as_millis() as u64; // timing < u64::MAX millis
+        #[allow(clippy::cast_possible_truncation)]
+        let ms_dropdev = t_dropdev.as_millis() as u64; // timing < u64::MAX millis
+        #[allow(clippy::cast_possible_truncation)]
+        let ms_total = t_del.as_millis() as u64; // timing < u64::MAX millis
+
         tracing::info!(
             dev_id,
-            ms_acks = t_acks.as_millis() as u64,
-            ms_kill = t_kill.as_millis() as u64,
-            ms_dropdev = t_dropdev.as_millis() as u64,
-            ms_total = t_del.as_millis() as u64,
+            ms_acks,
+            ms_kill,
+            ms_dropdev,
+            ms_total,
             "unregister timing"
         );
 
