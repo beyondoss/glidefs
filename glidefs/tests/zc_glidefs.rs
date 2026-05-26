@@ -698,6 +698,126 @@ fn rotation_race_workload(dev: &Path, total: usize) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Flush + rotation deadlock — found in the 10-min soak (April 2026).
+///
+/// Three-actor deadlock between:
+///   1. ZC writes inflight, each holding `data_file.read_arc()` via the
+///      keepalive in `run_zc_queue`'s `inflight[tag]` slot.
+///   2. The flush scheduler queuing `data_file.write()` (task-fair) for
+///      a rotation triggered by the dirty-block threshold.
+///   3. A `UBLK_IO_OP_FLUSH` arriving while the writer is queued. The op
+///      is dispatched INLINE on the io_uring loop thread, which calls
+///      `handler.flush()` → `cache.flush()` → `data_file.read()` →
+///      blocks behind the queued writer (task-fair).
+///
+/// The loop thread can no longer process `WRITE_FIXED` CQEs, so inflight
+/// reads never drop, so the writer never proceeds, so the FLUSH stays
+/// blocked. Deadlock.
+///
+/// Reproducer: tiny `flush_threshold` (rotations constant), many
+/// concurrent writers interleaving `write_all` with `sync_data` (the
+/// fsync that becomes a `UBLK_IO_OP_FLUSH`). 30 s watchdog: if the work
+/// doesn't finish, we declare deadlock.
+#[tokio::test(flavor = "multi_thread")]
+async fn zc_glidefs_flush_rotation_deadlock() {
+    if let Some(why) = skip_reason() {
+        eprintln!("skip [zc-flush-deadlock]: {why}");
+        return;
+    }
+
+    // flush_threshold=2: every couple of dirty blocks triggers a
+    // rotation. Combined with continuous writes, the writer side of the
+    // rotation gate is queued nearly all the time — which is the
+    // necessary precondition for the FLUSH op to block in
+    // `data_file.read()`.
+    let (router, _cache_dir) = setup_router_with_flush_threshold(2).await;
+    let handler = router.get_handler(EXPORT_NAME).await.expect("handler");
+
+    let mut ublk_server = UblkServer::new();
+    let dev_path = ublk_server
+        .add_device(EXPORT_NAME, handler)
+        .await
+        .expect("ublk register");
+    eprintln!("[zc-flush-deadlock] ublk device: {}", dev_path.display());
+
+    let bdev = dev_path.clone();
+    // Run the workload on an OS thread; cap the wait with a channel
+    // recv_timeout so the deadlock surfaces as a clear timeout rather
+    // than wedging the test runner forever.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("zc-flush-deadlock-driver".into())
+        .spawn(move || {
+            let _ = tx.send(flush_rotation_deadlock_workload(&bdev));
+        })
+        .expect("spawn driver");
+
+    let outcome = rx.recv_timeout(Duration::from_secs(30));
+
+    // On deadlock, do NOT attempt graceful shutdown — the shutdown path
+    // (which also goes through the cache + flush scheduler) will block
+    // on the same lock as the io_uring loop, and the test would wedge
+    // forever waiting on its own cleanup. Panic immediately; process
+    // exit will tear everything down.
+    match outcome {
+        Ok(Ok(())) => {
+            if let Err(e) = ublk_server.shutdown().await {
+                eprintln!("ublk shutdown error: {e}");
+            }
+            if let Err(e) = router.shutdown().await {
+                eprintln!("router shutdown error: {e}");
+            }
+            eprintln!("[zc-flush-deadlock] OK");
+        }
+        Ok(Err(e)) => panic!("[zc-flush-deadlock] workload error: {e}"),
+        Err(_) => panic!(
+            "[zc-flush-deadlock] DEADLOCK: write+sync workload didn't \
+             complete within 30s. Loop-thread FLUSH dispatch is \
+             blocked behind a queued rotation writer."
+        ),
+    }
+}
+
+fn flush_rotation_deadlock_workload(dev: &Path) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    const WRITERS: usize = 8;
+    const ITERS_PER_WRITER: usize = 64;
+    // Spread writes across a small window so blocks get touched, mixed,
+    // and re-dirtied — keeps the flush scheduler firing rotations.
+    const HOT_WINDOW_BLOCKS: u64 = 256;
+
+    let dev_path = dev.to_path_buf();
+    let mut handles = Vec::with_capacity(WRITERS);
+    for w in 0..WRITERS {
+        let dev_path = dev_path.clone();
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("zc-flush-deadlock-w{w}"))
+                .spawn(move || -> std::io::Result<()> {
+                    let mut file = open_direct(&dev_path, true)?;
+                    let buf = aligned_4k(&vec![(w as u8).wrapping_add(1); 4096]);
+                    for i in 0..ITERS_PER_WRITER {
+                        let block = ((w * ITERS_PER_WRITER + i) as u64) % HOT_WINDOW_BLOCKS;
+                        let offset = block * 4096;
+                        file.seek(SeekFrom::Start(offset))?;
+                        file.write_all(&buf)?;
+                        // The fsync — `UBLK_IO_OP_FLUSH` arrives at the
+                        // userspace handler. The deadlock lives here:
+                        // if a rotation writer is queued and the io_uring
+                        // loop services FLUSH inline, this never returns.
+                        file.sync_data()?;
+                    }
+                    Ok(())
+                })
+                .expect("writer spawn"),
+        );
+    }
+    for h in handles {
+        h.join().expect("writer panicked")?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------

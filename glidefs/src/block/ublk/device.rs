@@ -1382,11 +1382,34 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
 
         match u32::from(op) {
             sys::UBLK_IO_OP_FLUSH => {
-                let res = match self.handler.flush() {
-                    Ok(()) => 0,
-                    Err(_) => -libc::EIO,
-                };
-                ZcDispatch::Inline(ZcAction::Complete(res))
+                // FLUSH must be Deferred, not Inline. `handler.flush()` →
+                // `cache.flush()` acquires `data_file.read()` task-fairly.
+                // If a rotation writer is queued (which happens almost
+                // continuously under sustained writes with small
+                // `flush_threshold`), running it inline parks the
+                // io_uring loop on that read. The loop can no longer
+                // service WRITE_FIXED CQEs, so the inflight `read_arc()`
+                // guards never drop, so the rotation writer never
+                // proceeds — three-actor deadlock. Spawning offloads
+                // the blocking acquisition to a tokio worker; the loop
+                // keeps draining CQEs, the inflight guards release on
+                // schedule, the rotation completes, this task's read
+                // unblocks, FLUSH completes. Caught by
+                // `zc_glidefs_flush_rotation_deadlock`.
+                let handler = Arc::clone(&self.handler);
+                let handle = handle.clone();
+                self.runtime.spawn(async move {
+                    let mut guard = SubmitGuard::new(tag, handle);
+                    let res = tokio::task::spawn_blocking(move || handler.flush())
+                        .await
+                        .map(|inner| match inner {
+                            Ok(()) => 0,
+                            Err(_) => -libc::EIO,
+                        })
+                        .unwrap_or(-libc::EIO);
+                    guard.commit(ZcAction::Complete(res), None);
+                });
+                ZcDispatch::Deferred
             }
             sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
                 ZcDispatch::Inline(ZcAction::Complete(0))
