@@ -330,7 +330,7 @@ mod fio_bench {
         // both "passes" of this A/B test would actually be USER_COPY,
         // making the delta meaningless. Skip in that mode; the comparison
         // only belongs in the zero-copy row.
-        if std::env::var_os("GLIDEFS_FORCE_USER_COPY").is_some() {
+        if std::env::var("GLIDEFS_FORCE_USER_COPY").is_ok_and(|v| !v.is_empty()) {
             eprintln!(
                 "skipping fio A/B benchmark: GLIDEFS_FORCE_USER_COPY set \
                  — the matrix's USER_COPY row already exercises that path \

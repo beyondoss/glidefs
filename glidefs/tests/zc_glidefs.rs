@@ -213,7 +213,7 @@ async fn zc_glidefs_soak() {
         eprintln!("skip [zc-soak]: {why}");
         return;
     }
-    if std::env::var_os("GLIDEFS_TEST_FORCE_USER_COPY").is_some() {
+    if std::env::var("GLIDEFS_TEST_FORCE_USER_COPY").is_ok_and(|v| !v.is_empty()) {
         // The soak's flush thresholds and concurrency are tuned for the
         // ZC dispatch path. Under forced USER_COPY the per-IO syscall
         // bounce can't drain the device fast enough on a small-CPU
@@ -403,7 +403,7 @@ async fn zc_glidefs_multi_device_soak() {
         eprintln!("skip [zc-multi-soak]: {why}");
         return;
     }
-    if std::env::var_os("GLIDEFS_TEST_FORCE_USER_COPY").is_some() {
+    if std::env::var("GLIDEFS_TEST_FORCE_USER_COPY").is_ok_and(|v| !v.is_empty()) {
         // Same reason as the single-device soak: the cycle pacing is
         // tuned for ZC. USER_COPY can't drain fast enough on a small VM
         // and would wedge.
@@ -774,7 +774,7 @@ async fn zc_glidefs_concurrent_rw_race_on_evicted_block() {
         eprintln!("skip [zc-rw-race]: {why}");
         return;
     }
-    if std::env::var_os("GLIDEFS_TEST_FORCE_USER_COPY").is_some() {
+    if std::env::var("GLIDEFS_TEST_FORCE_USER_COPY").is_ok_and(|v| !v.is_empty()) {
         eprintln!(
             "skip [zc-rw-race]: USER_COPY path doesn't have this race \
              (no userspace pwrite to active cache file on cold reads)"
@@ -1175,7 +1175,7 @@ where
     // USER_COPY fallback path on a kernel that would otherwise pick ZC.
     // Lets us verify the legacy transport still works after the ZC rewrite
     // without needing a second VM at a non-ZC kernel.
-    if std::env::var_os("GLIDEFS_TEST_FORCE_USER_COPY").is_some() {
+    if std::env::var("GLIDEFS_TEST_FORCE_USER_COPY").is_ok_and(|v| !v.is_empty()) {
         ublk_server.force_user_copy_transport();
         eprintln!("[{name}] forcing USER_COPY transport (test-only)");
     }

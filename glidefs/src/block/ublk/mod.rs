@@ -113,7 +113,7 @@ impl UblkServer {
         // daemon binary uses USER_COPY+pool even on a ZC-capable kernel.
         // Pair with the matching ZC run for an apples-to-apples
         // RSS-per-export and throughput delta on the same kernel.
-        if std::env::var_os("GLIDEFS_FORCE_USER_COPY").is_some() {
+        if std::env::var("GLIDEFS_FORCE_USER_COPY").is_ok_and(|v| !v.is_empty()) {
             features.zero_copy = false;
             tracing::warn!(
                 "GLIDEFS_FORCE_USER_COPY=1 — masking kernel ZC support; \
