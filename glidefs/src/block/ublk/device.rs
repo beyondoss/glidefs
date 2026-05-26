@@ -1947,8 +1947,18 @@ pub(super) async fn io_task_zero_copy(
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
 
+    // Cross-thread wake-up eventfd. Owned out here (not inside
+    // `run_zc_queue`) so the Drop guard can write to it after flipping
+    // `stop` — that's what gives us a synchronous LIVE→QUIESCED
+    // transition during handoff cutover. EFD_NONBLOCK so loop reads
+    // never block; EFD_CLOEXEC because nothing in glidefs forks.
+    let wake_fd: RawFd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if wake_fd < 0 {
+        return Err(UblkError::IOError(std::io::Error::last_os_error()));
+    }
+
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    let _join = std::thread::Builder::new()
+    let join = std::thread::Builder::new()
         .name(format!("glidefs-zc-{}-{}", dev_id, qid))
         .spawn(move || {
             let result = ublk_core::zc::run_zc_queue(
@@ -1957,13 +1967,69 @@ pub(super) async fn io_task_zero_copy(
                 queue_depth,
                 target,
                 stop_for_thread,
+                wake_fd,
             );
             let _ = done_tx.send(result);
         })
         .map_err(|e| UblkError::IOError(std::io::Error::other(e.to_string())))?;
 
+    // Drop guard: if the future is cancelled (worker pool shutdown
+    // during handoff cutover, panic during normal shutdown, etc.):
+    //
+    //   1. Flip `stop = true`
+    //   2. Write to `wake_fd` so any in-flight `submit_and_wait(1)`
+    //      returns immediately via the PollAdd CQE (without this, the
+    //      loop sleeps until the next real CQE — which never comes on a
+    //      quiesced device, deadlocking shutdown).
+    //   3. Join the ZC thread.
+    //   4. Close `wake_fd`.
+    //
+    // The thread sees `stop`, drains pending CQEs non-blockingly, then
+    // breaks → IoUring drops → its fd closes → kernel transitions the
+    // ublk device LIVE→QUIESCED (UBLK_F_USER_RECOVERY contract). That's
+    // the path the successor's recovery requires.
+    //
+    // Caught by `handoff_durability_crh_per_pr` + `fs_crash_recovery::
+    // test_fs_crash_fsync_honored_ublk`.
+    struct ZcThreadGuard {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        wake_fd: RawFd,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for ZcThreadGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Wake the loop. Errors ignored — at worst we wait for the
+            // thread's own bounded poll timeout.
+            let one = 1u64.to_ne_bytes();
+            unsafe {
+                libc::write(self.wake_fd, one.as_ptr() as *const _, 8);
+            }
+            if let Some(j) = self.join.take() {
+                let h = j;
+                let detach_after = std::time::Duration::from_secs(5);
+                let start = std::time::Instant::now();
+                while !h.is_finished() && start.elapsed() < detach_after {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if h.is_finished() {
+                    let _ = h.join();
+                }
+                // else: detach — the thread will exit when the process does.
+            }
+            unsafe { libc::close(self.wake_fd) };
+        }
+    }
+    let _zc_guard = ZcThreadGuard {
+        stop,
+        wake_fd,
+        join: Some(join),
+    };
+
     // Kernel `STOP_DEV` aborts in-flight FETCHes → `run_zc_queue` observes
     // the ABORT CQEs → exits its loop → `done_tx` fires → we return.
+    // Future cancellation (handoff cutover) hits `ZcThreadGuard::drop`
+    // instead, which signals `stop` and waits for the thread to exit.
     match done_rx.await {
         Ok(result) => result,
         Err(_) => Ok(()),

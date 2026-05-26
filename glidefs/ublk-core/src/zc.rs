@@ -317,6 +317,25 @@ fn build_eventfd_poll_sqe(efd: RawFd) -> squeue::Entry {
 
 /// Run a zero-copy queue worker until `stop` is set.
 ///
+/// `wake_fd` is an externally-owned eventfd (created by the caller via
+/// [`libc::eventfd`] with `EFD_NONBLOCK | EFD_CLOEXEC`). The loop arms
+/// a `PollAdd` on it so that cross-thread `handle.submit` AND an
+/// out-of-band `stop` signal can both wake the io_uring loop:
+///
+///   * `submit` writes 8 bytes to `wake_fd` → PollAdd CQE → loop drains
+///     the mpsc and pushes the deferred SQEs.
+///   * Drop-guard / cancellation flips `stop` then writes 8 bytes to
+///     `wake_fd` → PollAdd CQE → loop checks `stop` → drains in-flight
+///     CQEs once non-blockingly → breaks. Closing the `IoUring` drops
+///     its fd; the kernel sees the last uring on `cdev_fd` close and
+///     transitions the device LIVE → QUIESCED (USER_RECOVERY contract).
+///
+/// Without external ownership of `wake_fd`, a caller that wanted to
+/// stop the loop synchronously had no way to wake it from
+/// `submit_and_wait(1)`. The handoff predecessor's worker-pool drop
+/// hits exactly that case — see
+/// `tests/handoff_durability::handoff_durability_crh_per_pr`.
+///
 /// See module docs for the architecture.
 pub fn run_zc_queue(
     cdev_fd: RawFd,
@@ -324,6 +343,7 @@ pub fn run_zc_queue(
     queue_depth: u16,
     target: Arc<dyn ZcTarget>,
     stop: Arc<AtomicBool>,
+    wake_fd: RawFd,
 ) -> Result<(), UblkError> {
     if queue_depth == 0 {
         return Err(UblkError::OtherError(-libc::EINVAL));
@@ -348,12 +368,7 @@ pub fn run_zc_queue(
         .register_files(&[cdev_fd])
         .map_err(UblkError::IOError)?;
 
-    // Eventfd for cross-thread wake-up. `EFD_NONBLOCK` so drain reads
-    // never block; the actual wait happens in `io_uring_enter` via PollAdd.
-    let eventfd_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-    if eventfd_fd < 0 {
-        return Err(UblkError::IOError(std::io::Error::last_os_error()));
-    }
+    let eventfd_fd = wake_fd;
     let (tx, rx) = mpsc::channel::<DeferredEntry>();
     let handle = ZcQueueHandle { tx, eventfd_fd };
 
@@ -378,7 +393,7 @@ pub fn run_zc_queue(
         )
     };
     if io_cmd_buf == libc::MAP_FAILED {
-        unsafe { libc::close(eventfd_fd) };
+        // `wake_fd` is owned by the caller — don't close it here.
         return Err(UblkError::IOError(std::io::Error::last_os_error()));
     }
 
@@ -476,24 +491,35 @@ pub fn run_zc_queue(
 
     loop {
         if stop.load(Ordering::SeqCst) {
-            match ring.submit_and_wait(0) {
-                Ok(_) => {}
-                Err(_) => break,
-            }
-            let cqes: Vec<cqueue::Entry> = ring.completion().collect();
-            if cqes.is_empty() && aborted > 0 {
-                break;
-            }
-            for cqe in cqes {
-                let ud = cqe.user_data();
-                if !ud_is_eventfd(ud) {
-                    aborted += 1;
-                }
-            }
-            if aborted >= queue_depth as usize {
-                break;
-            }
-            continue;
+            // Two exit paths land here:
+            //
+            // (a) Kernel `STOP_DEV` issued an abort wave for every armed
+            //     FETCH and the caller flipped `stop` to drain. We can
+            //     still wait briefly for those CQEs so the slot/keepalive
+            //     drops run on the loop thread (correct lifetime for the
+            //     gate guards).
+            //
+            // (b) Userspace-driven graceful exit — the most important is
+            //     the handoff predecessor's cutover, which needs the
+            //     `cdev_fd` io_uring closed so the kernel transitions the
+            //     ublk device to QUIESCED (UBLK_F_USER_RECOVERY contract:
+            //     LIVE → QUIESCED happens iff every uring touching cdev
+            //     closes). No abort wave is coming because the predecessor
+            //     never issued `STOP_DEV`. If we wait for one we hang the
+            //     handoff — which is exactly what kept the per-PR
+            //     handoff_durability test (successor saw state=1, skipped
+            //     recovery, then UblkCtrl::new EOPNOTSUPP'd on the
+            //     still-LIVE device).
+            //
+            // Resolution: drain a single non-blocking pass so any CQE
+            // already in the ring gets processed (preserves the
+            // STOP_DEV-driven drain semantics), then break unconditionally.
+            // Dropping the `IoUring` closes its fd, the kernel sees the
+            // last uring on cdev gone, the device transitions to QUIESCED,
+            // and the successor can take over.
+            let _ = ring.submit_and_wait(0);
+            let _drain: Vec<cqueue::Entry> = ring.completion().collect();
+            break;
         }
 
         match ring.submit_and_wait(1) {
@@ -501,7 +527,7 @@ pub fn run_zc_queue(
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(e) => {
                 unsafe { libc::munmap(io_cmd_buf, cmd_buf_sz) };
-                unsafe { libc::close(eventfd_fd) };
+                // `wake_fd` is owned by the caller — don't close it here.
                 return Err(UblkError::IOError(e));
             }
         }
@@ -623,6 +649,6 @@ pub fn run_zc_queue(
     }
 
     unsafe { libc::munmap(io_cmd_buf, cmd_buf_sz) };
-    unsafe { libc::close(eventfd_fd) };
+    // `wake_fd` is owned by the caller — don't close it here.
     Ok(())
 }

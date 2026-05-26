@@ -136,12 +136,17 @@ fn zero_copy_roundtrip() {
 
     let target: Arc<dyn ZcTarget> = Arc::new(MemfdTarget { fd: backing_fd });
     let stop = Arc::new(AtomicBool::new(false));
+    // Eventfd ownership moved to the caller in this revision; in this
+    // smoke test we create + leak (the worker breaks via kernel ABORT
+    // and the test process exits soon after).
+    let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    assert!(wake_fd >= 0, "eventfd");
     let worker = {
         let target = Arc::clone(&target);
         let stop = Arc::clone(&stop);
         thread::Builder::new()
             .name("zc-rt-worker".into())
-            .spawn(move || run_zc_queue(cdev_fd, 0, QUEUE_DEPTH, target, stop))
+            .spawn(move || run_zc_queue(cdev_fd, 0, QUEUE_DEPTH, target, stop, wake_fd))
             .expect("spawn worker")
     };
 
