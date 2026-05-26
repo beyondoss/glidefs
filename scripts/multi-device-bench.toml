@@ -1,0 +1,17 @@
+# Bench daemon config — runs inside QEMU 6.17 VM.
+# memory:// backend so flush_mode=manual exports never hit network.
+# api_address = 127.0.0.1:9113 matches ublk_bench.py's API_DEFAULT.
+
+[cache]
+dir = "/var/cache/glidefs-bench"
+disk_size_gb = 8.0
+memory_size_gb = 1.0
+
+[storage]
+url = "memory:///"
+
+[servers.nbd]
+api_address = "127.0.0.1:9113"
+
+[servers.ublk]
+nr_queues = 4

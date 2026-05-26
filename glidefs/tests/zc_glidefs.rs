@@ -373,6 +373,257 @@ async fn zc_glidefs_soak() {
     );
 }
 
+/// Multi-device density soak.
+///
+/// What the single-device `zc_glidefs_soak` can't reach:
+///   * worker_pool's queue→worker scheduling under N-device contention
+///     — each export's queues are mapped to a worker via QueueKey hash;
+///     concurrent dispatch across N exports verifies that scheduling
+///     stays fair and doesn't deadlock under load.
+///   * cross-device rotation gate independence — each export has its
+///     own `data_file` RwLock; a writer queued on one MUST NOT block
+///     dispatch on another.
+///   * the ZC inline fast path under genuine concurrent dispatch from
+///     many queues (the single-device soak has 1 device × 4 queues).
+///   * per-export memory accumulation at density — RSS / N tells us
+///     the production-class memory budget per VM.
+///
+/// Defaults are tuned for CI runners (4 vCPU / 16 GB): N=4 devices,
+/// 10 s. Override via:
+///   * `GLIDEFS_MULTI_SOAK_DEVICES=N`  (production-scale N=32-64
+///     in a host-class machine)
+///   * `GLIDEFS_MULTI_SOAK_DURATION_S=N`  (manual / nightly long soak)
+///
+/// Acceptance is the same shape as the single-device soak: every
+/// cycle's verify must succeed (byte-mismatch → panic), RSS bounded,
+/// FDs bounded by a per-device budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn zc_glidefs_multi_device_soak() {
+    if let Some(why) = skip_reason() {
+        eprintln!("skip [zc-multi-soak]: {why}");
+        return;
+    }
+    if std::env::var_os("GLIDEFS_TEST_FORCE_USER_COPY").is_some() {
+        // Same reason as the single-device soak: the cycle pacing is
+        // tuned for ZC. USER_COPY can't drain fast enough on a small VM
+        // and would wedge.
+        eprintln!("skip [zc-multi-soak]: USER_COPY transport (soak is ZC-tuned)");
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("GLIDEFS_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,glidefs=info")),
+        )
+        .try_init();
+
+    let n_devices: usize = std::env::var("GLIDEFS_MULTI_SOAK_DEVICES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let duration = Duration::from_secs(
+        std::env::var("GLIDEFS_MULTI_SOAK_DURATION_S")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(10),
+    );
+
+    eprintln!(
+        "[zc-multi-soak] N={n_devices} devices, duration={duration:?}"
+    );
+
+    // Build a router with the same shape as single-soak (memory:// S3
+    // mock + periodic GC reaper). Create N exports and register each as
+    // a ublk device.
+    let cache_dir = TempDir::new().unwrap();
+    let s3: Arc<InMemory> = Arc::new(InMemory::new());
+    let s3_dyn: Arc<dyn ObjectStore> = s3.clone();
+    let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+    let router = Arc::new(
+        ExportRouter::new(RouterConfig {
+            object_store: s3_dyn,
+            db_path: "zc-multi-soak".to_string(),
+            cache_dir: cache_dir.path().to_path_buf(),
+            block_size: 4096,
+            clean_cache,
+            wal_sync: false,
+            max_s3_uploads: 8,
+            max_s3_downloads: 16,
+            default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
+            ublk_nr_queues: 1,
+            nbd_dead_conn_timeout: 0,
+            // Default `max_exports` (10) would cap us at N≤10; lift it
+            // here for the density test. Production setting comes from
+            // the router's own config; this only changes the test.
+            max_exports: (n_devices + 4).max(64),
+            manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+        })
+        .await
+        .expect("router"),
+    );
+
+    let export_names: Vec<String> =
+        (0..n_devices).map(|i| format!("multi-soak-{i:04}")).collect();
+    for name in &export_names {
+        let cfg = ExportConfig {
+            name: name.clone(),
+            size_gb: DEVICE_SIZE_GB,
+            s3_prefix: None,
+            block_size: None,
+            flush_threshold: None,
+            flush_mode: None,
+            transport: None,
+        };
+        router
+            .create_export(cfg, false, None, None)
+            .await
+            .expect("create_export");
+    }
+
+    // GC reaper — identical shape to the single-device soak's. Keeps
+    // the InMemory S3 mock bounded under the N×rotation throughput we
+    // generate, otherwise per-export pack accumulation in the mock
+    // would dominate RSS (production GC happens out-of-band via the
+    // `glidefs gc` CLI).
+    const GC_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+    const GC_STALE_MS: i64 = 5_000;
+    let gc_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gc_stop_t = Arc::clone(&gc_stop);
+    let s3_for_gc: Arc<InMemory> = Arc::clone(&s3);
+    let gc_handle = tokio::spawn(async move {
+        use futures::StreamExt;
+        use object_store::ObjectMeta;
+        while !gc_stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let mut entries: Vec<ObjectMeta> = s3_for_gc
+                .list(None)
+                .filter_map(|r| async move { r.ok() })
+                .collect()
+                .await;
+            entries.sort_by_key(|e| e.last_modified);
+            let total: u64 = entries.iter().map(|e| e.size).sum();
+            if total <= GC_BUDGET_BYTES {
+                continue;
+            }
+            let cutoff = chrono::Utc::now()
+                - chrono::Duration::milliseconds(GC_STALE_MS);
+            let mut to_free = total - GC_BUDGET_BYTES;
+            for entry in &entries {
+                if to_free == 0 {
+                    break;
+                }
+                if entry.last_modified > cutoff {
+                    break;
+                }
+                let _ = s3_for_gc.delete(&entry.location).await;
+                to_free = to_free.saturating_sub(entry.size);
+            }
+        }
+    });
+
+    let mut ublk_server = UblkServer::new();
+    let mut dev_paths = Vec::with_capacity(n_devices);
+    for name in &export_names {
+        let handler = router.get_handler(name).await.expect("handler");
+        let dev = ublk_server
+            .add_device(name, handler)
+            .await
+            .expect("ublk register");
+        dev_paths.push(dev);
+    }
+    eprintln!(
+        "[zc-multi-soak] registered {} devices: {} .. {}",
+        dev_paths.len(),
+        dev_paths.first().map(|p| p.display().to_string()).unwrap_or_default(),
+        dev_paths.last().map(|p| p.display().to_string()).unwrap_or_default(),
+    );
+
+    let rss_start = read_rss_bytes();
+    let fds_start = count_open_fds();
+
+    // Run all soak_loops in parallel via spawn_blocking. Each driver
+    // owns one device's worth of writers/verifier.
+    let mut workers = Vec::with_capacity(n_devices);
+    for dev in dev_paths {
+        let dev = dev.clone();
+        workers.push(tokio::task::spawn_blocking(move || soak_loop(&dev, duration)));
+    }
+
+    let mut total_cycles = 0u64;
+    let mut total_bytes = 0u64;
+    let mut errors = 0usize;
+    for w in workers {
+        match w.await {
+            Ok(Ok((cycles, bytes))) => {
+                total_cycles += cycles;
+                total_bytes += bytes;
+            }
+            Ok(Err(e)) => {
+                errors += 1;
+                eprintln!("[zc-multi-soak] driver error: {e}");
+            }
+            Err(e) => {
+                errors += 1;
+                eprintln!("[zc-multi-soak] driver join failed: {e}");
+            }
+        }
+    }
+
+    let rss_end = read_rss_bytes();
+    let fds_end = count_open_fds();
+
+    gc_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = gc_handle.await;
+
+    if let Err(e) = ublk_server.shutdown().await {
+        eprintln!("ublk shutdown error: {e}");
+    }
+    if let Err(e) = router.shutdown().await {
+        eprintln!("router shutdown error: {e}");
+    }
+    drop(cache_dir);
+
+    let mb = total_bytes as f64 / (1024.0 * 1024.0);
+    let mbps = mb / duration.as_secs_f64();
+    let rss_growth = rss_end.saturating_sub(rss_start);
+    eprintln!(
+        "[zc-multi-soak] OK: {n_devices} devices, {total_cycles} cycle-runs, \
+         {mb:.0} MB ({mbps:.0} MB/s aggregate), \
+         rss start={} MiB end={} MiB grew={} MiB, fds start={fds_start} end={fds_end}",
+        rss_start / (1024 * 1024),
+        rss_end / (1024 * 1024),
+        rss_growth / (1024 * 1024),
+    );
+
+    assert_eq!(errors, 0, "{errors} drivers failed — see logs above");
+
+    // Per-device RSS bound. The 1h single-device soak grew 264 MiB
+    // (allocator HWM + GC steady state); the per-device delta is
+    // roughly constant. Allow 64 MiB per device + 256 MiB base —
+    // catches unbounded growth without false-positiving on jemalloc
+    // arenas at small N.
+    let rss_budget_mib: u64 = 256 + 64 * n_devices as u64;
+    assert!(
+        rss_growth < rss_budget_mib * 1024 * 1024,
+        "RSS grew by {} MiB across {n_devices} devices ({:?}) — budget {} MiB",
+        rss_growth / (1024 * 1024),
+        duration,
+        rss_budget_mib,
+    );
+
+    // FD budget. Each ZC device opens ~30 FDs (cdev, ring, scratch
+    // memfd, /dev/zero, eventfds). Allow start + 64×N — catches
+    // per-IO FD leaks.
+    let fd_budget = fds_start + 64 * n_devices;
+    assert!(
+        fds_end <= fd_budget,
+        "FD count grew from {} to {} (budget {}) — possible per-IO leak",
+        fds_start, fds_end, fd_budget,
+    );
+}
+
 /// Soak inner loop. Returns (cycles_completed, total_bytes_io'd).
 fn soak_loop(dev: &Path, duration: Duration) -> std::io::Result<(u64, u64)> {
     const CHUNK: usize = 64 * 1024;
