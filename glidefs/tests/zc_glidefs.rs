@@ -20,6 +20,14 @@
 
 #![cfg(all(target_os = "linux", feature = "ublk"))]
 
+// Match production: the `glidefs` binary uses jemalloc. Default glibc
+// malloc retains per-thread arenas indefinitely under the soak's
+// short-thread + heavy-allocation pattern, making RSS look like a leak
+// when it's allocator fragmentation. The leak detector in
+// `zc_glidefs_soak` must measure the allocator we actually ship.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,12 +61,26 @@ async fn setup_router() -> (Arc<ExportRouter>, TempDir) {
 async fn setup_router_with_flush_threshold(
     default_flush_threshold: usize,
 ) -> (Arc<ExportRouter>, TempDir) {
+    let (router, cache_dir, _s3) =
+        setup_router_full(default_flush_threshold, Arc::new(InMemory::new())).await;
+    (router, cache_dir)
+}
+
+/// Like [`setup_router_with_flush_threshold`] but returns the typed
+/// `Arc<InMemory>` so the caller can attach a periodic-GC task that
+/// simulates production's out-of-band pack reaper. The default
+/// `setup_router*` helpers can't return the typed handle because they
+/// erase to `Arc<dyn ObjectStore>` at construction time.
+async fn setup_router_full(
+    default_flush_threshold: usize,
+    s3: Arc<InMemory>,
+) -> (Arc<ExportRouter>, TempDir, Arc<InMemory>) {
     let cache_dir = TempDir::new().unwrap();
-    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let s3_dyn: Arc<dyn ObjectStore> = s3.clone();
     let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
     let router = Arc::new(
         ExportRouter::new(RouterConfig {
-            object_store: s3,
+            object_store: s3_dyn,
             db_path: "zc-test".to_string(),
             cache_dir: cache_dir.path().to_path_buf(),
             block_size: 4096,
@@ -88,7 +110,7 @@ async fn setup_router_with_flush_threshold(
         .create_export(config, false, None, None)
         .await
         .expect("create_export");
-    (router, cache_dir)
+    (router, cache_dir, s3)
 }
 
 /// Single-chunk 4 KiB write → 4 KiB read. Smoke test for the hot path
@@ -226,9 +248,69 @@ async fn zc_glidefs_soak() {
     // under sustained load are avoided. We have a separate dedicated
     // rotation-race test (`zc_glidefs_rotation_race_under_load`) that
     // hammers rotation with flush_threshold=4 in a short burst.
-    let (router, _cache_dir) =
-        setup_router_with_flush_threshold(DEFAULT_FLUSH_THRESHOLD).await;
+    let (router, _cache_dir, s3) =
+        setup_router_full(DEFAULT_FLUSH_THRESHOLD, Arc::new(InMemory::new())).await;
     let handler = router.get_handler(EXPORT_NAME).await.expect("handler");
+
+    // Simulate production's out-of-band pack GC. The `InMemory`
+    // object-store mock retains every uploaded pack forever; production
+    // S3 does the same, but a separate GC process (the
+    // `glidefs gc` CLI) reaps compaction-orphaned packs on a schedule.
+    // Without a similar reaper here the soak's RSS would grow linearly
+    // with cycle count — not because of a glidefs leak, but because the
+    // test S3 mock accumulates the same compacted/deduplicated pack
+    // bytes that real S3 would also keep around (and that the long-run
+    // memory check should NOT attribute to the daemon under test).
+    //
+    // The reaper:
+    //   * walks the mock every 250 ms,
+    //   * sorts entries by `last_modified`,
+    //   * deletes anything older than `STALE_MS` (the manifest-and-
+    //     freshly-uploaded-pack window) once total bytes exceed the
+    //     budget.
+    //
+    // It only deletes packs older than the freshness window, so an
+    // in-flight flush's just-uploaded pack — referenced by the
+    // about-to-be-PUT manifest — survives long enough to be linked.
+    // The soak's reads are served from the dirty cache (the workload
+    // never goes cold), so deleted-from-S3 packs aren't read back.
+    const GC_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+    const GC_STALE_MS: i64 = 5_000;
+    let gc_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gc_stop_t = Arc::clone(&gc_stop);
+    let s3_for_gc: Arc<InMemory> = Arc::clone(&s3);
+    let gc_handle = tokio::spawn(async move {
+        use futures::StreamExt;
+        use object_store::ObjectMeta;
+        while !gc_stop_t.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let mut entries: Vec<ObjectMeta> = s3_for_gc
+                .list(None)
+                .filter_map(|r| async move { r.ok() })
+                .collect()
+                .await;
+            entries.sort_by_key(|e| e.last_modified);
+            let total: u64 = entries.iter().map(|e| e.size).sum();
+            if total <= GC_BUDGET_BYTES {
+                continue;
+            }
+            let cutoff = chrono::Utc::now()
+                - chrono::Duration::milliseconds(GC_STALE_MS);
+            let mut to_free = total - GC_BUDGET_BYTES;
+            for entry in &entries {
+                if to_free == 0 {
+                    break;
+                }
+                if entry.last_modified > cutoff {
+                    // Too fresh — might be referenced by an unposted
+                    // manifest. Stop; come back next tick.
+                    break;
+                }
+                let _ = s3_for_gc.delete(&entry.location).await;
+                to_free = to_free.saturating_sub(entry.size);
+            }
+        }
+    });
 
     let mut ublk_server = UblkServer::new();
     let dev_path = ublk_server
@@ -247,6 +329,9 @@ async fn zc_glidefs_soak() {
 
     let rss_end = read_rss_bytes();
     let fds_end = count_open_fds();
+
+    gc_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = gc_handle.await;
 
     if let Err(e) = ublk_server.shutdown().await {
         eprintln!("ublk shutdown error: {e}");
