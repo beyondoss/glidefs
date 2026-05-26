@@ -70,7 +70,7 @@ impl ZcTarget for MemfdTarget {
             sys::UBLK_IO_OP_FLUSH => ZcAction::Complete(0),
             _ => ZcAction::Complete(-libc::EIO),
         };
-        ZcDispatch::Inline(action)
+        ZcDispatch::Inline { action, keepalive: None }
     }
 }
 

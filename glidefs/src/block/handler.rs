@@ -1089,6 +1089,86 @@ impl BlockHandler {
         self.cache.inner().zc_inflight_enter()
     }
 
+    /// Non-blocking variant of [`zc_inflight_enter`]: returns `None` if a
+    /// rotation writer is queued (task-fair `parking_lot` would otherwise
+    /// queue this read behind the writer).
+    ///
+    /// Used by the ZC dispatch's inline fast path — the loop thread calls
+    /// this from the FETCH-CQE handler. If the gate is uncontended we do
+    /// the entire write dispatch inline (no `runtime.spawn`, no mpsc, no
+    /// eventfd round-trip). If contended, we fall back to the async
+    /// deferred path which can park on the gate without blocking the
+    /// loop.
+    ///
+    /// Critical: this is `try_*`, so it CAN'T deadlock the loop thread
+    /// against a queued rotation writer (the rotation-vs-flush deadlock
+    /// is fixed via deferred FLUSH; this preserves the same loop-thread
+    /// non-blocking invariant for WRITE).
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn try_zc_inflight_enter(
+        &self,
+    ) -> Option<parking_lot::lock_api::ArcRwLockReadGuard<
+        parking_lot::RawRwLock,
+        crate::block::write_cache::SyncFile,
+    >> {
+        self.cache.inner().try_zc_inflight_enter()
+    }
+
+    /// Synchronous fast-path equivalent of [`pre_write`].
+    ///
+    /// Returns `Some(Ok(()))` if `pre_write` would have completed without
+    /// awaiting anything (warm cache, full-block writes, all blocks
+    /// PRESENT — the steady-state for sustained workloads). Returns
+    /// `Some(Err(..))` if validation rejects the request synchronously
+    /// (readonly, bounds, NoSpace). Returns `None` if any block in the
+    /// range needs S3 backfill — caller must fall back to the async
+    /// `pre_write`.
+    ///
+    /// Used by the ZC inline fast path to keep the loop thread out of
+    /// the async runtime entirely when no S3 traffic is needed.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn pre_write_sync(&self, offset: u64, length: u64) -> Option<CommandResult<()>> {
+        if self.is_readonly() {
+            return Some(Err(CommandError::ReadOnly));
+        }
+        if offset.checked_add(length).is_none_or(|end| end > self.device_size()) {
+            return Some(Err(CommandError::InvalidArgument));
+        }
+        if length == 0 {
+            return Some(Ok(()));
+        }
+        let util = f64::from_bits(self.ssd_utilization.load(Ordering::Relaxed));
+        #[allow(clippy::cast_possible_truncation)]
+        let length_usize = length as usize;
+        if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, length_usize) {
+            return Some(Err(CommandError::NoSpace));
+        }
+
+        // Walk the block range. If any block is NOT_PRESENT *and* the
+        // write doesn't cover the whole block, async backfill from S3 is
+        // required — bail. Otherwise everything pre_write does is
+        // synchronous.
+        let block_size = self.cache.block_size() as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + length - 1) / block_size;
+        for block in start_block..=end_block {
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = block as usize;
+            if self.cache.is_block_present(idx) {
+                continue;
+            }
+            let block_start = block * block_size;
+            let write_start = offset.max(block_start);
+            let write_end = (offset + length).min(block_start + block_size);
+            if write_end - write_start < block_size {
+                // Partial write to NOT_PRESENT block — needs backfill.
+                return None;
+            }
+            // Full-block write to NOT_PRESENT block — no backfill needed.
+        }
+        Some(self.cache.pre_write(offset, length).map_err(CommandError::from))
+    }
+
     /// Pwrite data into the cache file at a chunk's actual device offset
     /// (for the ublk ZC cold-read path: decompressed S3 data lands in the
     /// cache, then a subsequent `READ_FIXED` against the cache fd fills the

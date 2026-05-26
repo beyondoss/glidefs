@@ -108,7 +108,18 @@ impl UblkServer {
     /// called inside a tokio runtime context — workers re-enter the
     /// runtime to run handler futures (S3 fetches, etc.).
     pub fn new() -> Self {
-        let features = device::detect_features();
+        let mut features = device::detect_features();
+        // `GLIDEFS_FORCE_USER_COPY=1` masks the ZC bit at startup so the
+        // daemon binary uses USER_COPY+pool even on a ZC-capable kernel.
+        // Pair with the matching ZC run for an apples-to-apples
+        // RSS-per-export and throughput delta on the same kernel.
+        if std::env::var_os("GLIDEFS_FORCE_USER_COPY").is_some() {
+            features.zero_copy = false;
+            tracing::warn!(
+                "GLIDEFS_FORCE_USER_COPY=1 — masking kernel ZC support; \
+                 daemon will use USER_COPY+pool transport"
+            );
+        }
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)

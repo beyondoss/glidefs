@@ -563,6 +563,16 @@ impl CacheInner {
         self.data_file.read_arc()
     }
 
+    /// Non-blocking variant: returns `None` if `data_file.write()` is
+    /// held or queued (task-fair `parking_lot` would block a `read_arc`
+    /// here). Used by the ZC dispatch inline fast path.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub(crate) fn try_zc_inflight_enter(
+        &self,
+    ) -> Option<parking_lot::lock_api::ArcRwLockReadGuard<parking_lot::RawRwLock, SyncFile>> {
+        self.data_file.try_read_arc()
+    }
+
     /// Write data to the data file via the RwLock'd handle (always correct fd).
     ///
     /// Used by the ublk write path — pwrite via the RwLock ensures writes

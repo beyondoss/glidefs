@@ -1412,9 +1412,68 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 ZcDispatch::Deferred
             }
             sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
-                ZcDispatch::Inline(ZcAction::Complete(0))
+                ZcDispatch::Inline { action: ZcAction::Complete(0), keepalive: None }
             }
             sys::UBLK_IO_OP_WRITE => {
+                // Inline fast path: avoid `runtime.spawn` + mpsc/eventfd
+                // round-trip when (1) the rotation gate is uncontended and
+                // (2) `pre_write` would not need an S3 backfill. Both are
+                // the steady-state hot path under sustained workloads with
+                // a warm cache. Measured: ~5-10 μs saved per IO at small
+                // block sizes — closes the ZC-vs-USER_COPY write gap
+                // surfaced by the parallel-fio bench.
+                //
+                // Correctness:
+                //  * `try_zc_inflight_enter` returns `None` if a rotation
+                //    writer is queued — never blocks the loop thread.
+                //    Falls through to the deferred path which CAN park
+                //    the dispatch worker on the gate.
+                //  * `pre_write_sync` returns `None` if backfill is
+                //    needed — falls through.
+                //  * On the inline path the gate moves into the inflight
+                //    slot's keepalive (via `ZcDispatch::Inline { ..,
+                //    keepalive }`), guaranteeing the same active file
+                //    for the entire kernel WRITE_FIXED window. Identical
+                //    lifetime to the deferred path.
+                if let Some(gate) = self.handler.try_zc_inflight_enter() {
+                    if let Some(pre_res) = self.handler.pre_write_sync(offset, u64::from(length)) {
+                        if let Err(e) = pre_res {
+                            tracing::warn!(?e, offset, length, "ZC pre_write_sync failed");
+                            return ZcDispatch::Inline {
+                                action: ZcAction::Complete(-libc::EIO),
+                                keepalive: None,
+                            };
+                        }
+                        use std::os::unix::io::AsRawFd;
+                        let fd = (*gate).as_raw_fd_for_ublk_zc();
+                        if let Err(e) = self.handler.zc_promote_for_write_with(
+                            &*gate,
+                            offset,
+                            u64::from(length),
+                        ) {
+                            tracing::warn!(?e, offset, length, "ZC promote failed (inline)");
+                            return ZcDispatch::Inline {
+                                action: ZcAction::Complete(-libc::EIO),
+                                keepalive: None,
+                            };
+                        }
+                        let action = ZcAction::Chunks(vec![ZcChunk {
+                            op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
+                            buf_offset: 0,
+                            length,
+                        }]);
+                        return ZcDispatch::Inline {
+                            action,
+                            keepalive: Some(Box::new(gate)),
+                        };
+                    }
+                    // Pre-write needs async backfill — drop the gate
+                    // before falling through (the deferred path
+                    // re-acquires it after the async backfill resolves).
+                    drop(gate);
+                }
+
+                // Slow path: gate contended OR backfill required.
                 let handler = Arc::clone(&self.handler);
                 let handle = handle.clone();
                 self.runtime.spawn(async move {
@@ -1471,6 +1530,26 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 ZcDispatch::Deferred
             }
             sys::UBLK_IO_OP_READ => {
+                // Inline fast path mirroring the WRITE case: if the gate
+                // is uncontended AND every block in the range is DIRTY
+                // (no cold-fetch needed), the entire dispatch is
+                // synchronous — skip `runtime.spawn` and the mpsc/eventfd
+                // round-trip. Closes the read-tail regression introduced
+                // by the WRITE fast path (reads competing with inline
+                // writes on the loop thread saw their p99 widen).
+                if let Some(gate) = self.handler.try_zc_inflight_enter() {
+                    if let Some(action) =
+                        try_zc_read_hot_path(&self.handler, &*gate, offset, length)
+                    {
+                        return ZcDispatch::Inline {
+                            action,
+                            keepalive: Some(Box::new(gate)),
+                        };
+                    }
+                    drop(gate);
+                }
+
+                // Slow path: cold read or contended gate.
                 let handler = Arc::clone(&self.handler);
                 let handle = handle.clone();
                 let dev_zero_fd = self.dev_zero_fd;
@@ -1526,7 +1605,7 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 });
                 ZcDispatch::Deferred
             }
-            _ => ZcDispatch::Inline(ZcAction::Complete(-libc::EIO)),
+            _ => ZcDispatch::Inline { action: ZcAction::Complete(-libc::EIO), keepalive: None },
         }
     }
 

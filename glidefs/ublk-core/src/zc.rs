@@ -98,7 +98,18 @@ pub type Keepalive = Box<dyn Any + Send + 'static>;
 /// What [`ZcTarget::dispatch`] resolved to right now.
 pub enum ZcDispatch {
     /// Worker submits the action in the same iteration. No channel hop.
-    Inline(ZcAction),
+    ///
+    /// `keepalive` extends the lifetime of any borrowed handles (e.g. a
+    /// rotation-gate guard) past the kernel-side I/O — same semantics
+    /// as [`ZcQueueHandle::submit`]'s `keepalive` arg, but without
+    /// crossing the mpsc/eventfd. Used by the inline fast path
+    /// (uncontended gate + synchronous pre-flight) to skip the
+    /// `runtime.spawn` + cross-thread hop that dominates per-IO cost
+    /// at small block sizes.
+    Inline {
+        action: ZcAction,
+        keepalive: Option<Keepalive>,
+    },
     /// Target spawned async work (or otherwise needs more time) and will
     /// call [`ZcQueueHandle::submit`] later.
     Deferred,
@@ -573,21 +584,33 @@ pub fn run_zc_queue(
                 slot.keepalive = None;
 
                 match target.dispatch(op, offset, length, tag, &handle) {
-                    ZcDispatch::Inline(ZcAction::Chunks(chunks)) => {
-                        if chunks.is_empty() {
-                            slot.first_error = Some(-libc::EINVAL);
-                            to_submit.push(finalize(tag, &mut inflight, &target, qid));
-                        } else {
-                            #[allow(clippy::cast_possible_truncation)]
-                            { slot.outstanding = chunks.len() as u32; }
-                            for ch in chunks {
-                                to_submit.push(build_chunk_sqe(ch, tag, op));
+                    ZcDispatch::Inline { action, keepalive } => {
+                        // Stash keepalive BEFORE pushing chunk SQEs — the
+                        // kernel may complete chunks fast enough that
+                        // `finalize` runs before this `match` arm returns
+                        // (no, that's not possible on this thread, but the
+                        // intent is: the gate guard must outlive the
+                        // WRITE_FIXED submission, and consumption happens
+                        // in `finalize` via the slot field).
+                        slot.keepalive = keepalive;
+                        match action {
+                            ZcAction::Chunks(chunks) => {
+                                if chunks.is_empty() {
+                                    slot.first_error = Some(-libc::EINVAL);
+                                    to_submit.push(finalize(tag, &mut inflight, &target, qid));
+                                } else {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    { slot.outstanding = chunks.len() as u32; }
+                                    for ch in chunks {
+                                        to_submit.push(build_chunk_sqe(ch, tag, op));
+                                    }
+                                }
+                            }
+                            ZcAction::Complete(r) => {
+                                slot.first_error = Some(r);
+                                to_submit.push(finalize(tag, &mut inflight, &target, qid));
                             }
                         }
-                    }
-                    ZcDispatch::Inline(ZcAction::Complete(r)) => {
-                        slot.first_error = Some(r);
-                        to_submit.push(finalize(tag, &mut inflight, &target, qid));
                     }
                     ZcDispatch::Deferred => {
                         // Target will call handle.submit later.
