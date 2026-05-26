@@ -400,22 +400,78 @@ impl WriteCache<Active> {
         Ok(())
     }
 
-    /// Metadata-only commit for ublk zero-copy writes. The kernel has
-    /// already drained the bio into the data file via `IORING_OP_WRITE_FIXED`
-    /// at the time this is called, so we skip the pwrite that
-    /// `pwrite_and_commit` does. We also skip `capture_page_crcs` — the data
-    /// never enters userspace, so we have no source to hash from. Flush-time
-    /// CRC verification handles a missing entry by skipping the check (see
-    /// `flush.rs` page-CRC mismatch branch); the trade-off is that ZC-written
-    /// blocks lose end-to-end CRC protection on the flush path.
+    /// Step 1 of ublk zero-copy write: promote any SYNCING blocks in the
+    /// range BEFORE the kernel `IORING_OP_WRITE_FIXED` writes new data.
     ///
-    /// **Lock requirement**: caller must already hold a `data_file` read
-    /// guard (typically the inflight rotation-gate from
-    /// `CacheInner::zc_inflight_enter`) and pass the held `&SyncFile`
-    /// here. Re-acquiring the lock internally would deadlock against a
-    /// queued rotation writer (parking_lot is task-fair — a new reader
-    /// blocks behind the writer, which itself is blocked behind the
-    /// inflight reader).
+    /// The stateright model (`stateright-model/src/lib.rs`) requires the
+    /// write phase order `Promote* → PwriteData → WalAppend →
+    /// TransitionDirty`. For USER_COPY, `pwrite_and_commit` runs all four
+    /// under the data_file read lock in that order. For ZC the kernel
+    /// does the data write (PwriteData) via WRITE_FIXED, and we have to
+    /// arrange for promote to happen *before* that — otherwise promote's
+    /// pwrite copies the *flushing*-file contents (the old version) on
+    /// top of the just-written new data, silently rolling the write back.
+    ///
+    /// Call sequence the ZC dispatcher follows:
+    /// 1. `pre_write` — state machine prep, no lock held
+    /// 2. acquire the rotation gate (read_arc)
+    /// 3. **this method** — promote any SYNCING blocks to DIRTY, copying
+    ///    flushing→active under the held gate
+    /// 4. submit WRITE_FIXED (kernel overwrites with new data)
+    /// 5. `commit_after_zc_write_with` — WAL append + state transition
+    ///    (no more promote)
+    /// 6. drop gate
+    ///
+    /// **Lock requirement**: caller holds the rotation gate; pass the
+    /// `&SyncFile` from the guard. Re-acquiring `data_file.read()` while
+    /// the inflight guard is held deadlocks against a queued rotation
+    /// writer under parking_lot's task-fair policy.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_promote_for_write_with(
+        &self,
+        df: &super::inner::SyncFile,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), CacheError> {
+        if length == 0 {
+            return Ok(());
+        }
+        let block_size = self.inner.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + length - 1) / block_size;
+        // `require_promotion=false`: the kernel WRITE_FIXED is about to
+        // overwrite the entire block, so we don't NEED the prior data —
+        // we only want to preserve it for SYNCING blocks where the
+        // flushing file is still around (so the post-WRITE_FIXED state
+        // accurately reflects a "promote then overwrite" rather than
+        // a torn promote-eviction race). For NOT_PRESENT blocks that
+        // raced with an eviction (flushing file already dropped),
+        // returning `BlockEvicted` would fail writes that are otherwise
+        // perfectly recoverable (kernel will write the whole block).
+        self.inner.promote_syncing_blocks(df, start_block, end_block, false)?;
+        Ok(())
+    }
+
+    /// Step 2 of ublk zero-copy write: WAL append + state transition,
+    /// AFTER the kernel `WRITE_FIXED` has landed the data. See
+    /// [`zc_promote_for_write_with`](Self::zc_promote_for_write_with)
+    /// for the full write-phase ordering and why promote does NOT happen
+    /// here (it must run before the kernel's data write to satisfy the
+    /// stateright model's `Promote* → PwriteData → WalAppend →
+    /// TransitionDirty` invariant).
+    ///
+    /// The CRC capture that `pwrite_and_commit` does is omitted — for ZC
+    /// the data never enters userspace, so we have no source bytes to
+    /// hash. Flush handles a missing CRC entry by skipping per-page
+    /// verification (see `flush.rs` `stored_crc == 0` branch).
+    ///
+    /// See `BlockHandler::commit_after_zc_write_with` for the integrity
+    /// contract: cache-file corruption in the WRITE_FIXED→flush window
+    /// is the gap we accept, same as every Linux ZC block-storage stack;
+    /// BLAKE3 still covers the S3 path end-to-end.
+    ///
+    /// **Lock requirement**: caller holds the rotation gate; pass the
+    /// `&SyncFile` from the guard.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     pub fn commit_after_zc_write_with(
         &self,
@@ -429,7 +485,10 @@ impl WriteCache<Active> {
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (offset + length - 1) / block_size;
-        self.inner.promote_syncing_blocks(df, start_block, end_block, true)?;
+        // No promote here — already done by `zc_promote_for_write_with`
+        // before WRITE_FIXED. Promoting again would re-copy from the
+        // flushing file (now containing pre-WRITE_FIXED data) on top of
+        // the kernel's just-landed new data — silent write rollback.
         self.wal_append_and_mark_dirty(df, start_block, end_block)?;
         Ok(())
     }

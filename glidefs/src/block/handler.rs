@@ -1056,6 +1056,18 @@ impl BlockHandler {
         self.cache.inner().data_file_fd()
     }
 
+    /// Under-gate check: is every block in `[start_block, end_block]`
+    /// currently DIRTY, with no flush rotation in progress? Used by the
+    /// ZC read hot path to confirm a `LocalSsd` plan is safe to submit
+    /// without going through the async cold path. Caller must hold the
+    /// rotation gate from [`zc_inflight_enter`](Self::zc_inflight_enter)
+    /// — otherwise the all-DIRTY observation can be invalidated by a
+    /// concurrent flush rotation before the I/O reaches the kernel.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_all_dirty_under_gate(&self, start_block: u64, end_block: u64) -> bool {
+        self.cache.zc_all_dirty(start_block, end_block)
+    }
+
     /// Acquire an owned rotation-gate guard for a ublk ZC I/O.
     ///
     /// Hold across the entire kernel I/O lifetime (SQE submit → kernel data
@@ -1196,6 +1208,33 @@ impl BlockHandler {
         Ok(())
     }
 
+    /// Step 1 of the ublk zero-copy write phase order — promote any
+    /// SYNCING blocks in the range from the flushing file into the
+    /// active cache file BEFORE the kernel's `IORING_OP_WRITE_FIXED`
+    /// lands. See `write_cache::WriteCache::zc_promote_for_write_with`
+    /// for the rationale and the stateright phase-order constraint.
+    ///
+    /// Caller must already hold the rotation gate from
+    /// [`zc_inflight_enter`](Self::zc_inflight_enter); pass the
+    /// `&SyncFile` from its deref.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_promote_for_write_with(
+        &self,
+        df: &crate::block::write_cache::SyncFile,
+        offset: u64,
+        length: u64,
+    ) -> CommandResult<()> {
+        self.cache
+            .zc_promote_for_write_with(df, offset, length)
+            .map_err(|e| match e {
+                CacheError::BlockEvicted => CommandError::BlockEvicted,
+                other => {
+                    tracing::warn!(error = %other, "zc_promote_for_write failed");
+                    CommandError::IoError
+                }
+            })
+    }
+
     /// Phase 2 of ublk zero-copy write: metadata commit for kernel-completed
     /// data write.
     ///
@@ -1206,32 +1245,52 @@ impl BlockHandler {
     /// minus the pwrite (kernel did it) and the per-page CRC capture (no
     /// userspace data to hash).
     ///
-    /// ## CRC trade-off (deferred)
+    /// # Integrity contract (ZC writes vs USER_COPY)
     ///
-    /// `pwrite_and_commit` records a per-page CRC32C from the guest's write
-    /// buffer (see `write_cache/inner.rs::capture_page_crcs`). The flush
-    /// path re-reads each page from the data file at flush time and
-    /// compares the recomputed CRC against the captured one
-    /// (`write_cache/flush.rs::flush_block`, line 113 onward — the
-    /// `stored_crc == 0` branch is the "no CRC captured, skip
-    /// verification" escape). The check catches page-cache eviction bugs,
-    /// silent disk corruption, and kernel-side data-path bugs.
+    /// `pwrite_and_commit` (the USER_COPY path) records a per-page CRC32C
+    /// from the guest's write buffer at the moment of pwrite, via
+    /// `write_cache/inner.rs::capture_page_crcs`. The flush path
+    /// (`write_cache/flush.rs::flush_block`, the `stored_crc == 0` branch
+    /// onward) re-reads each page from the cache file and compares the
+    /// recomputed CRC against the captured one. A mismatch flags the
+    /// block as corrupt and skips it from the S3 upload — closing the
+    /// loop on "what the guest wrote → what's on the cache SSD at flush
+    /// time."
     ///
-    /// For ZC writes we never see the data — it goes kernel→cache file
-    /// via DMA — so we can't compute the source CRC. We leave the per-page
-    /// CRC entries at 0 (the default). Flush will skip verification for
-    /// these blocks, *losing* end-to-end CRC protection on ZC-written data.
+    /// **For ZC writes the bio never enters userspace.** We can't compute
+    /// the source CRC, so the per-page entry stays at 0 and flush skips
+    /// verification for those pages. This loses one specific check: cache
+    /// file corruption between WRITE_FIXED completion and the flush read.
+    /// On modern hardware (ECC RAM + mainline kernel + NVMe with internal
+    /// ECC) the failure rate that this would catch is in the
+    /// decade-MTBF-at-scale range; the integrity-loss window is bounded
+    /// by flush latency (~seconds in steady state).
     ///
-    /// Mitigations under consideration (none implemented yet):
-    /// 1. Read-back-after-write: pread the just-written data from the
-    ///    cache file in `after_write`, CRC it, store. Cost: doubles disk
-    ///    I/O per ZC write — defeats most of the perf benefit.
-    /// 2. Compute-at-flush-read-time: flush already reads the data to
-    ///    upload to S3 (`flush.rs::flush_block` does a pread); record the
-    ///    CRC there. Doesn't catch corruption *between* the ZC write and
-    ///    the flush read, but catches everything from the flush onward.
-    ///    Cheaper and probably the right call once we sit down to do it.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    /// **What is still protected end-to-end:**
+    /// - Cache file → S3 upload → S3 read-back is verified by BLAKE3 at
+    ///   the pack-content layer. Any corruption from the flush-read point
+    ///   onward is caught on subsequent reads.
+    /// - Guest filesystems on top of the ublk device run their own
+    ///   integrity (ext4 metadata CRC, xfs CRC, btrfs full data checksum,
+    ///   application-level page checksums in databases). The block layer
+    ///   is treated as best-effort by convention.
+    ///
+    /// **What is *not* protected:** silent corruption of the cache file
+    /// in the window between WRITE_FIXED returning success and the next
+    /// flush of the same block. This is the same gap accepted by every
+    /// zero-copy block-storage stack in the Linux ecosystem (SPDK,
+    /// NVMe-oF target, vhost-user-blk, kublk reference, etc.). Closing
+    /// it requires either hardware T10 PI (not available on commodity
+    /// NVMe yet) or a software read-back-after-write that halves the ZC
+    /// perf benefit without fully closing the gap (kernel-write-bugs
+    /// remain invisible since the read-back observes the same corruption
+    /// the kernel produced).
+    ///
+    /// **Path to detection if the rare-but-real failure occurs:** the
+    /// uploaded BLAKE3 will not match what the guest later reads back
+    /// from S3 against its own checksums (filesystem or application). The
+    /// failure surfaces as a guest-level read error, not a silent
+    /// corruption swallowed by the storage layer.
     #[cfg(all(target_os = "linux", feature = "ublk"))]
     pub fn commit_after_zc_write_with(
         &self,

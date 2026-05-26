@@ -1385,6 +1385,28 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                                 use std::os::unix::io::AsRawFd;
                                 (*gate).as_raw_fd_for_ublk_zc()
                             };
+                            // Promote any SYNCING blocks BEFORE the kernel
+                            // writes. The stateright write-phase model
+                            // requires `Promote* → PwriteData → WalAppend
+                            // → TransitionDirty`. For USER_COPY,
+                            // `pwrite_and_commit` does all four under one
+                            // lock. For ZC the kernel does PwriteData
+                            // (WRITE_FIXED) and we can't reorder around
+                            // it — so promote happens here, before the
+                            // kernel's data write, holding the gate the
+                            // whole way. Running promote AFTER WRITE_FIXED
+                            // would re-copy flushing-file (old) data on top
+                            // of the just-landed new data → silent
+                            // rollback (caught by the soak test).
+                            if let Err(e) = handler.zc_promote_for_write_with(
+                                &*gate,
+                                offset,
+                                u64::from(length),
+                            ) {
+                                tracing::warn!(?e, offset, length, "ZC promote failed");
+                                guard.commit(ZcAction::Complete(-libc::EIO), None);
+                                return;
+                            }
                             let action = ZcAction::Chunks(vec![ZcChunk {
                                 op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
                                 buf_offset: 0,
@@ -1406,14 +1428,33 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 let dev_zero_fd = self.dev_zero_fd;
                 self.runtime.spawn(async move {
                     let mut guard = SubmitGuard::new(tag, handle);
+                    // Try the hot path FIRST, under the rotation gate.
+                    // If every block in the range is DIRTY (and no flush
+                    // rotation is in progress), we can submit LocalSsd
+                    // chunks directly without touching the async cold
+                    // path. The gate keeps the read plan's `file_offset`
+                    // pointers consistent with the data file the kernel
+                    // will read from at WRITE_FIXED submission time.
+                    //
+                    // Cold path (mismatched state, cross-block boundary,
+                    // S3-resident data) doesn't hold the gate across
+                    // the async fetch — rotation can proceed during S3
+                    // I/O. We re-acquire the gate for the brief data-
+                    // plane window (pwrite + READ_FIXED).
+                    {
+                        let gate = handler.zc_inflight_enter();
+                        if let Some(action) =
+                            try_zc_read_hot_path(&handler, &*gate, offset, length)
+                        {
+                            guard.commit(action, Some(Box::new(gate)));
+                            return;
+                        }
+                        // Drop gate before async cold path.
+                    }
+
                     match handler.resolve_read(offset, length).await {
                         Ok(plan) => {
-                            // Enter the rotation gate BEFORE capturing the
-                            // data-file fd or doing any cold-path pwrite —
-                            // everything that touches the cache file in this
-                            // I/O happens while rotation is held off. fd is
-                            // pulled from the gate's deref (see WRITE branch
-                            // for the deadlock rationale).
+                            // Re-acquire gate for the data plane.
                             let gate = handler.zc_inflight_enter();
                             let fd = (*gate).as_raw_fd_for_ublk_zc();
                             let action = build_read_chunks_in_file(
@@ -1517,6 +1558,78 @@ impl Drop for SubmitGuard {
     }
 }
 
+/// Under-gate hot-path check for ZC reads.
+///
+/// Returns `Some(action)` if EVERY block in `[offset, offset+length)` is
+/// currently DIRTY (and no flush rotation is in progress) — the read can
+/// be served as direct `READ_FIXED` from the held gate's data file
+/// without touching the async cold path. Returns `None` if any block
+/// requires S3 fetch or backfill — caller drops the gate and falls
+/// through to the async resolution.
+///
+/// Critical correctness property: the all-DIRTY check is done WHILE
+/// HOLDING the gate. Rotation can't transition any DIRTY block to
+/// SYNCING during the check, so by the time we emit LocalSsd entries
+/// the data is guaranteed to be in the active file the gate's fd
+/// points to. Without the gate, rotation between check and submit
+/// could redirect the data to the flushing file — caught by the soak
+/// test as a read-back-zero corruption.
+fn try_zc_read_hot_path(
+    handler: &BlockHandler,
+    df: &crate::block::write_cache::SyncFile,
+    offset: u64,
+    length: u32,
+) -> Option<ublk_core::zc::ZcAction> {
+    use std::os::unix::io::AsRawFd;
+    use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp};
+
+    let block_size = handler.block_size() as u64;
+    if length == 0 || block_size == 0 {
+        return None;
+    }
+    let start_block = offset / block_size;
+    let end_block = (offset + u64::from(length) - 1) / block_size;
+
+    if !handler.zc_all_dirty_under_gate(start_block, end_block) {
+        return None;
+    }
+
+    let fd = df.as_raw_fd();
+    #[allow(clippy::cast_possible_truncation)]
+    let num_chunks = (end_block - start_block + 1) as usize;
+    let mut chunks: Vec<ZcChunk> = Vec::with_capacity(num_chunks);
+    let mut buf_offset: u32 = 0;
+    for i in 0..num_chunks {
+        let block_idx = start_block + i as u64;
+        let chunk_start_byte = block_idx * block_size;
+        let slice_start = if block_idx == start_block {
+            #[allow(clippy::cast_possible_truncation)]
+            { (offset - chunk_start_byte) as u32 }
+        } else {
+            0
+        };
+        let slice_end = if block_idx == end_block {
+            let end_byte = offset + u64::from(length);
+            #[allow(clippy::cast_possible_truncation)]
+            let relative_end = (end_byte - chunk_start_byte) as u32;
+            relative_end.min(block_size as u32)
+        } else {
+            block_size as u32
+        };
+        let slice_len = slice_end - slice_start;
+        chunks.push(ZcChunk {
+            op: ZcChunkOp::ReadFixed {
+                fd,
+                src_offset: chunk_start_byte + u64::from(slice_start),
+            },
+            buf_offset,
+            length: slice_len,
+        });
+        buf_offset = buf_offset.saturating_add(slice_len);
+    }
+    Some(ZcAction::Chunks(chunks))
+}
+
 /// Translate a `ReadPlan` into one or more `READ_FIXED` chunks.
 ///
 /// - `ChunkSource::LocalSsd { file_offset }`: direct `READ_FIXED` from the
@@ -1544,7 +1657,7 @@ fn build_read_chunks_in_file(
 
     let mut chunks: Vec<ZcChunk> = Vec::with_capacity(plan.entries.len());
     let mut buf_offset: u32 = 0;
-    for entry in &plan.entries {
+    for entry in plan.entries.iter() {
         #[allow(clippy::cast_possible_truncation)]
         let slice_len = entry.slice_len as u32;
         let chunk_op = match &entry.source {
