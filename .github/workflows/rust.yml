@@ -130,6 +130,48 @@ jobs:
         if: failure()
         run: sudo dmesg --color=never | tail -200
 
+  ublk-transports:
+    # ublk transport matrix: exercise both ZC and USER_COPY dispatch
+    # paths on the same kernel. ubuntu-24.04 advertises ZC, so the
+    # default-env run exercises `io_task_zero_copy`/`run_zc_queue`/
+    # rotation-gate; the forced-env run exercises the legacy
+    # `io_task_user_copy` fallback. A regression on either path
+    # fails CI.
+    name: ublk-transport-${{ matrix.transport }}
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - transport: zero-copy
+            force_user_copy: ""
+          - transport: user-copy
+            force_user_copy: "1"
+    env:
+      GLIDEFS_TEST_FORCE_USER_COPY: ${{ matrix.force_user_copy }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          shared-key: "ublk-${{ matrix.transport }}"
+      - name: Install kernel modules + fio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r) fio
+      - name: Load kernel modules
+        run: |
+          sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+      - name: Report kernel version
+        run: uname -r
+      - name: zc_glidefs (${{ matrix.transport }})
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,test-utils --test zc_glidefs -- --nocapture
+      - name: Kernel logs (on failure)
+        if: failure()
+        run: sudo dmesg --color=never | tail -200
+
   kernel-devices:
     name: Kernel Devices (Linux)
     timeout-minutes: 30
@@ -153,17 +195,7 @@ jobs:
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
       - name: Report kernel version
-        run: |
-          uname -r
-          # The zc_glidefs test logs the negotiated transport so the CI
-          # log shows whether ZC or USER_COPY was selected.
-      - name: Zero-copy auto-detect (ublk)
-        # zc_glidefs auto-detects the kernel transport: on a ZC-capable
-        # kernel it exercises `io_task_zero_copy`; on older kernels it
-        # falls back to USER_COPY. The ubuntu-24.04 host kernel is older
-        # than 6.17, so this CI job exercises the USER_COPY fallback path
-        # — the dedicated QEMU 6.17 job exercises the ZC path.
-        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,test-utils --test zc_glidefs -- --nocapture
+        run: uname -r
       - name: fio benchmark (ublk)
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
       - name: fio verify (ublk)

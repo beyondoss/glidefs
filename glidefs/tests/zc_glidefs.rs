@@ -191,6 +191,16 @@ async fn zc_glidefs_soak() {
         eprintln!("skip [zc-soak]: {why}");
         return;
     }
+    if std::env::var_os("GLIDEFS_TEST_FORCE_USER_COPY").is_some() {
+        // The soak's flush thresholds and concurrency are tuned for the
+        // ZC dispatch path. Under forced USER_COPY the per-IO syscall
+        // bounce can't drain the device fast enough on a small-CPU
+        // QEMU VM and the test wedges. USER_COPY's data-plane is
+        // covered by the other tests in this file (cross-block,
+        // mixed-dirty, multi-chunk, rotation-race).
+        eprintln!("skip [zc-soak]: USER_COPY transport (soak is ZC-tuned)");
+        return;
+    }
     // Init a stderr tracing subscriber so glidefs internal diagnostics
     // (Zero-source returns, InMemory-of-zeros, promote anomalies) surface
     // when the soak fails — this is exactly the data we need to root-
@@ -385,6 +395,181 @@ fn count_open_fds() -> usize {
     std::fs::read_dir("/proc/self/fd")
         .map(|d| d.count())
         .unwrap_or(0)
+}
+
+/// Concurrent R+W on the same evicted block — the cold-read backfill race.
+///
+/// **ZC-specific:** the race is in the ZC cold-read path's pwrite to the
+/// active cache file at the block's device offset (colliding with a
+/// concurrent kernel `WRITE_FIXED` to the same offset). USER_COPY's
+/// cold-read path returns the decompressed `Bytes` and the io_task
+/// memcpies them into the kernel buffer via `pwrite(cdev_fd, ...)` —
+/// no userspace pwrite to the active cache file, no race. We skip this
+/// test under forced USER_COPY for two reasons: (1) the failure mode
+/// it targets doesn't exist there, (2) the heavy R+W concurrency wedges
+/// the per-IO syscall path on the 4-CPU CI VM.
+///
+/// Scenario:
+/// 1. Pre-fill blocks with generation 0, flush + wait for eviction (state
+///    → NOT_PRESENT, data only in S3).
+/// 2. For each round, concurrently launch:
+///    - A WRITER thread that writes generation `R` to a freshly-evicted
+///      block.
+///    - A READER thread that reads that same block.
+/// 3. After both threads join, single-thread re-read and verify the
+///    block holds generation `R`.
+///
+/// If the cold-read path's `pwrite_all_at(s3_data, block_start)` races
+/// with the writer's `WRITE_FIXED` to the same offset:
+/// - WRITER lands generation R via the kernel data plane, after_write
+///   transitions state to DIRTY.
+/// - READER (still in its async S3 fetch task) returns to the dispatch
+///   path, pwrites the now-stale gen 0 bytes to the same active-file
+///   offset, then submits READ_FIXED.
+/// - State map says DIRTY (gen R, per writer's commit) but the disk has
+///   gen 0 (clobbered by reader's backfill). Verify-re-read returns
+///   gen 0. Silent write loss.
+///
+/// Each pre-filled block is used exactly once for a race round, so each
+/// round starts from the "NOT_PRESENT + data in S3" precondition.
+#[tokio::test(flavor = "multi_thread")]
+async fn zc_glidefs_concurrent_rw_race_on_evicted_block() {
+    if let Some(why) = skip_reason() {
+        eprintln!("skip [zc-rw-race]: {why}");
+        return;
+    }
+    if std::env::var_os("GLIDEFS_TEST_FORCE_USER_COPY").is_some() {
+        eprintln!(
+            "skip [zc-rw-race]: USER_COPY path doesn't have this race \
+             (no userspace pwrite to active cache file on cold reads)"
+        );
+        return;
+    }
+    // Low flush threshold so the pre-fill writes evict quickly and
+    // every block is NOT_PRESENT (data only in S3) by the time we
+    // start the race rounds.
+    let (router, _cache_dir) = setup_router_with_flush_threshold(8).await;
+    let handler = router.get_handler(EXPORT_NAME).await.expect("handler");
+
+    let mut ublk_server = UblkServer::new();
+    let dev_path = ublk_server
+        .add_device(EXPORT_NAME, handler)
+        .await
+        .expect("ublk register");
+    eprintln!("[zc-rw-race] ublk device: {}", dev_path.display());
+
+    let bdev = dev_path.clone();
+    let io_result = tokio::task::spawn_blocking(move || rw_race_workload(&bdev))
+        .await
+        .expect("spawn_blocking join");
+
+    if let Err(e) = ublk_server.shutdown().await {
+        eprintln!("ublk shutdown error: {e}");
+    }
+    if let Err(e) = router.shutdown().await {
+        eprintln!("router shutdown error: {e}");
+    }
+
+    io_result.unwrap_or_else(|e| panic!("[zc-rw-race] failed: {e}"));
+    eprintln!("[zc-rw-race] OK");
+}
+
+fn rw_race_block_pattern(block_idx: u64, generation: u64) -> [u8; 4096] {
+    let mut buf = [0u8; 4096];
+    buf[..8].copy_from_slice(&generation.to_le_bytes());
+    buf[8..16].copy_from_slice(&block_idx.to_le_bytes());
+    let seed = block_idx
+        .wrapping_mul(2_654_435_761)
+        .wrapping_add(generation.wrapping_mul(1_000_003));
+    for (i, b) in buf[16..].iter_mut().enumerate() {
+        *b = seed.wrapping_add((i as u64).wrapping_mul(11)) as u8;
+    }
+    buf
+}
+
+fn rw_race_workload(dev: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    const ROUNDS: u64 = 256;
+
+    // Phase 1: pre-fill blocks 0..ROUNDS with generation 0. Force flush
+    // via sync_data; the low flush_threshold (8) makes nearly every
+    // write trip a flush, so by the end of this phase every block is
+    // SYNCING or NOT_PRESENT.
+    {
+        let mut file = open_direct(dev, true)?;
+        for block_idx in 0..ROUNDS {
+            let pat = rw_race_block_pattern(block_idx, 0);
+            let aligned = aligned_4k(&pat);
+            file.seek(SeekFrom::Start(block_idx * 4096))?;
+            file.write_all(&aligned)?;
+        }
+        file.sync_data()?;
+    }
+    // Give the async flush worker time to finish evictions (state →
+    // NOT_PRESENT, data only in S3).
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Phase 2: race rounds. Each round uses a unique freshly-evicted
+    // block. The writer writes generation `round`, the reader reads
+    // the block concurrently. After both join, verify the block holds
+    // generation `round`.
+    for round in 1..ROUNDS {
+        let block_idx = round;
+        let off = block_idx * 4096;
+
+        let dev_w = dev.to_path_buf();
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            let pat = rw_race_block_pattern(block_idx, round);
+            let aligned = aligned_4k(&pat);
+            let mut f = open_direct(&dev_w, true)?;
+            f.seek(SeekFrom::Start(off))?;
+            f.write_all(&aligned)?;
+            f.sync_data()?;
+            Ok(())
+        });
+
+        let dev_r = dev.to_path_buf();
+        let reader = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut buf = aligned_4k(&[0u8; 4096]);
+            let mut f = open_direct(&dev_r, false)?;
+            f.seek(SeekFrom::Start(off))?;
+            f.read_exact(&mut buf)?;
+            Ok(())
+        });
+
+        writer.join().expect("writer panicked")?;
+        reader.join().expect("reader panicked")?;
+
+        // Verify: re-read and confirm the block holds `round`.
+        let mut buf = aligned_4k(&[0u8; 4096]);
+        let mut f = open_direct(dev, false)?;
+        f.seek(SeekFrom::Start(off))?;
+        f.read_exact(&mut buf)?;
+        let observed_gen = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let observed_block = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+
+        if observed_block != block_idx {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "round {round}: block-idx mismatch — observed {observed_block}, want {block_idx} (torn read or block confusion)"
+                ),
+            ));
+        }
+        if observed_gen != round {
+            let expected = rw_race_block_pattern(block_idx, round);
+            let body_matches = expected[16..] == buf[16..];
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "round {round}: write lost — block {block_idx} reads back generation {observed_gen} (expected {round}). \
+                     Body pattern matches expected: {body_matches}. \
+                     This is the cold-read backfill clobber race."
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Rotation race: force frequent flushes during a heavy concurrent write

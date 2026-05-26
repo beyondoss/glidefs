@@ -1334,12 +1334,37 @@ struct GlidefsZcTarget {
     /// `READ_FIXED` covering all-zero chunks — no userspace memset, no
     /// pwrite of zeros to the cache file.
     dev_zero_fd: std::os::fd::RawFd,
+    /// Per-queue scratch memfd, sized to `queue_depth * max_io_buf_bytes`.
+    /// Tag T owns the slot at byte offset `T * scratch_slot_bytes`.
+    ///
+    /// **Why this exists:** the ZC cold-read path fetches data from S3
+    /// (already in userspace) and must DMA it into the bio via
+    /// `READ_FIXED`. The previous implementation pwrote that data into
+    /// the active cache file at the block's device offset, then
+    /// `READ_FIXED`'d from there. That races with concurrent kernel
+    /// `WRITE_FIXED`s to the same offset: read pwrites stale (S3) bytes
+    /// after write lands new bytes → silent write loss (caught by
+    /// `zc_glidefs_concurrent_rw_race_on_evicted_block`).
+    ///
+    /// Per-tag scratch is isolated from device-offset writes by
+    /// construction. The earlier "no memfd staging area" directive
+    /// targeted per-IO BIO REGISTRATION in the hot path — the kernel
+    /// still auto-registers the bio directly; no userspace memfd
+    /// appears in the WRITE_FIXED or hot-path READ_FIXED sequence. The
+    /// cold path inherently has a userspace bounce (the decompressed
+    /// S3 `Bytes`); the scratch slot is just where we land it.
+    scratch_fd: std::os::fd::RawFd,
+    /// Bytes per tag in the scratch memfd. Equals `max_io_buf_bytes`.
+    scratch_slot_bytes: u64,
 }
 
 impl Drop for GlidefsZcTarget {
     fn drop(&mut self) {
         if self.dev_zero_fd >= 0 {
             unsafe { libc::close(self.dev_zero_fd) };
+        }
+        if self.scratch_fd >= 0 {
+            unsafe { libc::close(self.scratch_fd) };
         }
     }
 }
@@ -1426,6 +1451,8 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 let handler = Arc::clone(&self.handler);
                 let handle = handle.clone();
                 let dev_zero_fd = self.dev_zero_fd;
+                let scratch_fd = self.scratch_fd;
+                let scratch_slot_offset = u64::from(tag) * self.scratch_slot_bytes;
                 self.runtime.spawn(async move {
                     let mut guard = SubmitGuard::new(tag, handle);
                     // Try the hot path FIRST, under the rotation gate.
@@ -1463,6 +1490,8 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                                 &*gate,
                                 fd,
                                 dev_zero_fd,
+                                scratch_fd,
+                                scratch_slot_offset,
                             );
                             guard.commit(action, Some(Box::new(gate)));
                         }
@@ -1632,21 +1661,26 @@ fn try_zc_read_hot_path(
 
 /// Translate a `ReadPlan` into one or more `READ_FIXED` chunks.
 ///
-/// - `ChunkSource::LocalSsd { file_offset }`: direct `READ_FIXED` from the
-///   cache fd at `file_offset` into the bio at `buf_offset`. Hot path; no
-///   userspace touch of the data.
-/// - `ChunkSource::InMemory(data)`: pwrite the full block via the held
-///   `&SyncFile` (the rotation gate's deref — no re-locking) at
-///   `block_start`, then `READ_FIXED` from the cache fd at
-///   `block_start + slice_start` for `slice_len` bytes.
-/// - `ChunkSource::Zero`: `READ_FIXED` from `/dev/zero` into the bio at
-///   `buf_offset`. No pwrite, no userspace memset.
+/// - `ChunkSource::LocalSsd { file_offset }`: direct `READ_FIXED` from
+///   the cache fd at `file_offset` into the bio. Hot path; no userspace
+///   touch of the data.
+/// - `ChunkSource::InMemory(data)`: pwrite the slice into this tag's
+///   scratch slot (memfd, per-tag isolated), then `READ_FIXED` from
+///   `scratch_fd` at `slot_offset + within_slot_offset`. Critically,
+///   the scratch is NOT the device-offset cache file — that means a
+///   concurrent ZC write's `WRITE_FIXED` to the same block offset can't
+///   collide with our cold-read pwrite. See
+///   `zc_glidefs_concurrent_rw_race_on_evicted_block` for the failure
+///   mode the prior cache-file-pwrite version produced.
+/// - `ChunkSource::Zero`: `READ_FIXED` from `/dev/zero` into the bio.
 fn build_read_chunks_in_file(
     _handler: &BlockHandler,
     plan: &crate::block::write_cache::ReadPlan,
-    df: &crate::block::write_cache::SyncFile,
+    _df: &crate::block::write_cache::SyncFile,
     data_fd: std::os::fd::RawFd,
     dev_zero_fd: std::os::fd::RawFd,
+    scratch_fd: std::os::fd::RawFd,
+    scratch_slot_offset: u64,
 ) -> ublk_core::zc::ZcAction {
     use crate::block::write_cache::ChunkSource;
     use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp};
@@ -1657,6 +1691,7 @@ fn build_read_chunks_in_file(
 
     let mut chunks: Vec<ZcChunk> = Vec::with_capacity(plan.entries.len());
     let mut buf_offset: u32 = 0;
+    let mut scratch_used: u64 = 0;
     for entry in plan.entries.iter() {
         #[allow(clippy::cast_possible_truncation)]
         let slice_len = entry.slice_len as u32;
@@ -1666,21 +1701,35 @@ fn build_read_chunks_in_file(
                 src_offset: *file_offset,
             },
             ChunkSource::InMemory(data) => {
-                // Backfill the FULL block into the cache file via the held
-                // gate's `&SyncFile`. No fresh `data_file.read()` call —
-                // that would self-deadlock if a writer is queued.
-                if let Err(e) = df.write_all_at(data, entry.block_start) {
+                // Land just the needed slice into this tag's scratch slot.
+                let slice = &data[entry.slice_start..entry.slice_start + entry.slice_len];
+                let scratch_off = scratch_slot_offset + scratch_used;
+                // SAFETY: scratch_fd is a memfd we own; the buffer is
+                // a valid `&[u8]`. pwrite never reads from the buffer
+                // after returning. Failure returns negative; we propagate.
+                let written = unsafe {
+                    libc::pwrite(
+                        scratch_fd,
+                        slice.as_ptr() as *const libc::c_void,
+                        slice.len(),
+                        scratch_off as libc::off_t,
+                    )
+                };
+                if written < 0 || written as usize != slice.len() {
                     tracing::warn!(
-                        ?e,
-                        block_start = entry.block_start,
-                        "ZC cold-read pwrite (backfill) failed"
+                        scratch_off,
+                        len = slice.len(),
+                        written,
+                        "ZC cold-read scratch pwrite failed"
                     );
                     return ZcAction::Complete(-libc::EIO);
                 }
-                ZcChunkOp::ReadFixed {
-                    fd: data_fd,
-                    src_offset: entry.block_start + entry.slice_start as u64,
-                }
+                let op = ZcChunkOp::ReadFixed {
+                    fd: scratch_fd,
+                    src_offset: scratch_off,
+                };
+                scratch_used += entry.slice_len as u64;
+                op
             }
             ChunkSource::Zero => ZcChunkOp::ReadFixed {
                 fd: dev_zero_fd,
@@ -1758,10 +1807,40 @@ pub(super) async fn io_task_zero_copy(
         return Err(UblkError::IOError(std::io::Error::last_os_error()));
     }
 
+    // Per-queue scratch memfd, sized to queue_depth × max_io_buf_bytes.
+    // Each tag T owns slot at byte offset T * max_io_buf_bytes. Used as
+    // the bounce target for cold-path reads (InMemory chunks) so the
+    // pwrite can't collide with concurrent device-offset writes. See
+    // `GlidefsZcTarget::scratch_fd` doc-comment for the failure mode
+    // this prevents.
+    let max_io_buf_bytes = q.dev.dev_info.max_io_buf_bytes;
+    let scratch_slot_bytes = u64::from(max_io_buf_bytes);
+    let scratch_total = scratch_slot_bytes
+        .checked_mul(u64::from(queue_depth))
+        .ok_or(UblkError::OtherError(-libc::EINVAL))?;
+    let scratch_name = std::ffi::CString::new(format!("glidefs-zc-scratch-{}-{}", dev_id, qid))
+        .map_err(|_| UblkError::OtherError(-libc::EINVAL))?;
+    let scratch_fd =
+        unsafe { libc::syscall(libc::SYS_memfd_create, scratch_name.as_ptr(), 0u32) as RawFd };
+    if scratch_fd < 0 {
+        unsafe { libc::close(dev_zero_fd) };
+        return Err(UblkError::IOError(std::io::Error::last_os_error()));
+    }
+    if unsafe { libc::ftruncate(scratch_fd, scratch_total as i64) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(scratch_fd);
+            libc::close(dev_zero_fd);
+        }
+        return Err(UblkError::IOError(err));
+    }
+
     let target: Arc<dyn ublk_core::zc::ZcTarget> = Arc::new(GlidefsZcTarget {
         handler,
         runtime,
         dev_zero_fd,
+        scratch_fd,
+        scratch_slot_bytes,
     });
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
