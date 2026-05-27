@@ -292,6 +292,70 @@ impl HandoffPhase {
 /// Uses lock-free atomics for block states and presence to avoid contention
 /// under high write concurrency. The data file uses positional I/O which is
 /// inherently thread-safe, eliminating all locking on the hot path.
+/// Sparse per-block "promote pwrite in progress" claim, used by
+/// `promote_syncing_blocks` to serialize the pread+pwrite window across
+/// concurrent promoters of the same block without changing the state
+/// machine (state stays SYNCING through the claim so eviction can still
+/// race in; see `pf02_eviction_during_promote_read`).
+///
+/// **Sparse on purpose.** The claim is held only across the pread+pwrite
+/// window (~30–100 µs per block), so at any instant the in-flight set is
+/// bounded by `num_queues × queue_depth` across the device — typically
+/// <256 entries. Storing this as a fixed-size bitmap would cost 1 byte
+/// per block per export (8 MiB per 1 TiB export at 128 KiB blocks); at
+/// the 20k-export fleet scale that's hundreds of GB of allocator-resident
+/// state for an occasionally-held flag. Sparse storage costs O(in-flight),
+/// independent of device size.
+///
+/// Empty cost: `Mutex<HashSet>` ≈ 64 B per export.
+/// Per-claim cost: one short mutex critical section (insert/remove). The
+/// mutex contends only during the promote handshake itself, never on the
+/// data plane.
+pub(crate) struct PromoteClaimBitmap {
+    in_flight: parking_lot::Mutex<std::collections::HashSet<usize>>,
+    released: parking_lot::Condvar,
+}
+
+impl PromoteClaimBitmap {
+    pub(super) fn new() -> Self {
+        Self {
+            in_flight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            released: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// Insert `idx` into the in-flight set. `true` iff this caller's
+    /// insertion was new (i.e., they own the claim).
+    pub(super) fn try_claim(&self, idx: usize) -> bool {
+        self.in_flight.lock().insert(idx)
+    }
+
+    /// Park until another task `release`s `idx` (or `deadline` passes).
+    /// Returns `true` if the claim was actually released; `false` on
+    /// timeout. Real parking via `Condvar`, NOT a busy-spin / sleep
+    /// loop — calling this from a tokio task still blocks the executor
+    /// thread, but only for the actual wait, with no CPU burn.
+    pub(super) fn wait_for_release(&self, idx: usize, deadline: std::time::Instant) -> bool {
+        let mut g = self.in_flight.lock();
+        while g.contains(&idx) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let timeout = deadline.duration_since(now);
+            // Spurious wake-ups are fine — the while-loop re-checks
+            // `contains` and re-arms if needed.
+            let _ = self.released.wait_for(&mut g, timeout);
+        }
+        true
+    }
+
+    pub(super) fn release(&self, idx: usize) {
+        self.in_flight.lock().remove(&idx);
+        self.released.notify_all();
+    }
+}
+
 pub(crate) struct CacheInner {
     /// Configuration
     pub(super) config: WriteCacheConfig,
@@ -326,6 +390,16 @@ pub(crate) struct CacheInner {
     /// Combines block state and presence into a single sparse page table.
     /// State encoding: 0=NotPresent, 1=Clean (transient), 2=Dirty, 3=Syncing
     pub(super) state_map: SparseStateMap,
+
+    /// Side-band per-block "promote pwrite in progress" claim. Held only
+    /// across `promote_syncing_blocks`'s `ff.read_exact_at` →
+    /// `df.write_all_at` window, so two concurrent promoters can't both
+    /// pwrite OLD bytes that race a sibling bio's `WRITE_FIXED` NEW bytes
+    /// (blktests block/042 corruption flake). Orthogonal to the state
+    /// map: `state == SYNCING` is preserved across the pread+pwrite, so
+    /// the flush thread's `transition_syncing_to_not_present` eviction
+    /// can still race through (see `pf02_eviction_during_promote_read`).
+    pub(super) promote_claim: PromoteClaimBitmap,
 
     /// Number of blocks (for bounds checking)
     pub(super) num_blocks: usize,
@@ -862,6 +936,12 @@ impl CacheInner {
                 if idx >= self.num_blocks {
                     continue;
                 }
+                let state = self.state_map.get(idx);
+                if state != SparseBlockState::SYNCING
+                    && state != SparseBlockState::NOT_PRESENT
+                {
+                    continue;
+                }
                 let offset = block * block_size;
                 let valid = std::cmp::min(
                     block_size,
@@ -870,61 +950,43 @@ impl CacheInner {
                 if valid == 0 {
                     continue;
                 }
-                // CAS-first promote: claim the block transition BEFORE the
-                // pwrite, not after. Without this, two sibling ZC partial
-                // writes to the same SYNCING block both observe SYNCING,
-                // both pwrite OLD bytes from the flushing file, and one's
-                // pwrite can clobber the other's already-landed
-                // `WRITE_FIXED` partial bytes — the same corruption shape
-                // as the backfill race, just on the post-rotation path.
+                // Per-block promote claim. The state CAS stays at the end
+                // (kept idempotent for the eviction-during-promote contract
+                // covered by `pf02_eviction_during_promote_read`), but we
+                // also need to prevent two concurrent promoters from
+                // racing their pwrites: if A's pwrite, A's WRITE_FIXED,
+                // and B's pwrite interleave in that order, B's OLD bytes
+                // clobber A's just-landed NEW bytes — the blktests
+                // block/042 corruption flake.
                 //
-                // `state → CLEAN` is the claim sentinel (matches
-                // `try_claim_block` for NOT_PRESENT). Loser sees CLEAN and
-                // spins briefly until the winner transitions CLEAN→DIRTY,
-                // then skips — its caller's subsequent `WRITE_FIXED`
-                // overlays the winner's pwrite correctly.
-                let state = self.state_map.get(idx);
-                let claimed = match state {
-                    SparseBlockState::SYNCING => {
-                        self.state_map
-                            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::CLEAN)
-                            .is_ok()
-                    }
-                    SparseBlockState::NOT_PRESENT => {
-                        self.state_map
-                            .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::CLEAN)
-                            .is_ok()
-                    }
-                    _ => continue, // DIRTY or CLEAN — nothing to promote.
-                };
-                if !claimed {
-                    // Another promoter claimed it. Wait briefly for them
-                    // to land DIRTY (or for the block to fall back to
-                    // NOT_PRESENT via an eviction race). Bounded so a
-                    // panicking winner can't park us indefinitely.
+                // The `promote_claim` bitmap is a side-band gate orthogonal
+                // to the state machine: at most one task pwrites per block
+                // at a time, but `state == SYNCING` is preserved across the
+                // pread+pwrite window so the flush thread's
+                // `transition_syncing_to_not_present` can still race
+                // through to NOT_PRESENT.
+                if !self.promote_claim.try_claim(idx) {
+                    // Another promoter holds the claim. Park on the
+                    // condvar until they release — bounded by a deadline
+                    // so a panicking holder can't park us indefinitely.
+                    // Once the claim is released, whatever the prior
+                    // promoter did is visible in the active file, so we
+                    // skip our own pread/pwrite; the caller's subsequent
+                    // pwrite will land on top correctly.
                     let deadline = std::time::Instant::now()
                         + std::time::Duration::from_secs(5);
-                    loop {
-                        let s = self.state_map.get(idx);
-                        if s != SparseBlockState::CLEAN {
-                            break;
-                        }
-                        if std::time::Instant::now() >= deadline {
-                            tracing::warn!(
-                                block = idx,
-                                "promote: timed out waiting for prior promoter's CLEAN→DIRTY transition; proceeding"
-                            );
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    if !self.promote_claim.wait_for_release(idx, deadline) {
+                        tracing::warn!(
+                            block = idx,
+                            "promote: timed out waiting for prior promote claim release; proceeding"
+                        );
                     }
                     continue;
                 }
-                // We hold the CLEAN claim. Read from flushing, write to
-                // active. Propagate errors — silent skip on a flushing
-                // read failure would leave the active file as zeros for
-                // un-covered bytes of the sibling's WRITE_FIXED.
-                ff.read_exact_at(&mut buf[..valid], offset)?;
+                // We hold the claim. Propagate errors: silent skip on a
+                // flushing-read failure would leave the active file as
+                // zeros for un-covered bytes of the sibling's WRITE_FIXED.
+                let pread_err = ff.read_exact_at(&mut buf[..valid], offset);
 
                 #[cfg(feature = "test-utils")]
                 {
@@ -934,7 +996,7 @@ impl CacheInner {
                     }
                 }
 
-                df.write_all_at(&buf[..valid], offset)?;
+                let pwrite_res = pread_err.and_then(|_| df.write_all_at(&buf[..valid], offset));
 
                 #[cfg(feature = "test-utils")]
                 {
@@ -944,23 +1006,29 @@ impl CacheInner {
                     }
                 }
 
-                // Transition CLEAN → DIRTY. Bookkeeping mirrors what the
-                // pre-CAS-gate version did, scoped to whichever original
-                // state we claimed from.
-                let cas_ok = self
-                    .state_map
-                    .cas(idx, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
-                    .is_ok();
-                if cas_ok {
-                    if state == SparseBlockState::SYNCING {
+                // Final CAS preserves the original contract: SYNCING→DIRTY
+                // or NOT_PRESENT→DIRTY at the end of promote. Eviction may
+                // have raced (state→NOT_PRESENT) — in that case CAS fails
+                // harmlessly; the pwrite we already landed is still
+                // correct in the active file.
+                if state == SparseBlockState::SYNCING {
+                    if self
+                        .state_map
+                        .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                        .is_ok()
+                    {
                         self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                     }
+                } else if self
+                    .state_map
+                    .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
+                    .is_ok()
+                {
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                 }
-                // If cas_ok is false, the block was evicted (CLEAN→NOT_PRESENT)
-                // by a racing flush mid-promote. The pwrite we just landed
-                // is still in the active file; the next caller that hits
-                // NOT_PRESENT will re-promote or backfill from S3.
+                self.promote_claim.release(idx);
+                pwrite_res?;
             }
         } else if require_promotion {
             // No flushing file available. If any block in the range needs
