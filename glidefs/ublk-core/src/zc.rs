@@ -489,7 +489,7 @@ pub fn run_zc_queue(
         build_commit_sqe(qid, tag, final_res)
     };
 
-    loop {
+    'outer: loop {
         if stop.load(Ordering::SeqCst) {
             // Two exit paths land here:
             //
@@ -591,6 +591,17 @@ pub fn run_zc_queue(
                     to_submit.push(finalize(tag, &mut inflight, &target, qid));
                 }
             } else if res == sys::UBLK_IO_RES_ABORT as i32 || res < 0 {
+                // Kernel `STOP_DEV` aborts every armed FETCH with
+                // `UBLK_IO_RES_ABORT`. Once we've drained one abort per
+                // tag, no more CQEs are coming (no in-flight chunk SQEs,
+                // no re-armed FETCHes), and the next `submit_and_wait(1)`
+                // would sleep forever. Count aborts; when we've seen them
+                // all, break the outer loop so the caller's `done_rx`
+                // resolves and `UblkDevice::unregister` can finish.
+                aborted = aborted.saturating_add(1);
+                if aborted >= queue_depth as usize {
+                    break 'outer;
+                }
                 continue;
             } else {
                 let iod = unsafe {

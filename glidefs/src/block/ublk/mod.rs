@@ -946,6 +946,7 @@ impl UblkServer {
     /// this path, just resource drops.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         let device_count = self.devices.len();
+        let dev_ids: Vec<i32> = self.devices.values().map(|d| d.dev_id()).collect();
 
         // Drop the worker pool — every worker receives `Shutdown`,
         // drops its hosted queues' Rc clones (the io_task futures are
@@ -970,6 +971,46 @@ impl UblkServer {
             // Touch nothing — the map remains accurate as long as the
             // kernel devices it points to are still QUIESCED.
             let _ = cache_dir;
+        }
+
+        // The LIVE→QUIESCED transition is driven by the kernel observing
+        // the last io_uring fd touching the cdev close. Closing happens
+        // synchronously when we drop the worker pool + devices above,
+        // but the kernel's state-machine update is itself asynchronous —
+        // returning before it lands creates a flaky window where a
+        // subsequent `add_device(recover)` on the same dev_id (e.g.
+        // fs_crash_recovery phase 3) issues `GET_DEV_INFO2` against an
+        // in-flight transition and the kernel responds `-EOPNOTSUPP`.
+        // Poll each device for QUIESCED state with a bounded deadline
+        // before returning. Idempotent; safe if the device is already
+        // gone (probe returns `None`) or never reaches QUIESCED (we time
+        // out and log — the caller can still proceed).
+        for dev_id in dev_ids {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let state = tokio::task::spawn_blocking(move || -> Option<u32> {
+                    let ctrl = ublk_core::ctrl::UblkCtrl::new_simple(dev_id).ok()?;
+                    Some(u32::from(ctrl.dev_info().state))
+                })
+                .await
+                .ok()
+                .flatten();
+                match state {
+                    Some(s) if s == ublk_core::sys::UBLK_S_DEV_QUIESCED => break,
+                    None => break, // device gone — nothing to wait for
+                    _ => {
+                        if std::time::Instant::now() >= deadline {
+                            tracing::warn!(
+                                dev_id,
+                                state = ?state,
+                                "ublk device did not reach QUIESCED within deadline"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
         }
 
         tracing::info!(
