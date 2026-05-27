@@ -83,6 +83,9 @@ mod blktests {
         dev_path: &Path,
         groups: &[&str],
     ) -> (usize, usize, usize) {
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+
         let dev_str = dev_path.to_str().unwrap().to_string();
         let blktests_dir = blktests_dir.to_path_buf();
         let groups: Vec<String> = groups.iter().map(|s| s.to_string()).collect();
@@ -93,60 +96,70 @@ mod blktests {
             dev_str
         );
 
-        let dev_str_clone = dev_str.clone();
-        let output = tokio::task::spawn_blocking(move || {
-            // -q: quick mode — only runs tests marked QUICK or TIMED.
-            // TIMEOUT env var limits individual test runtime.
-            let mut args = vec!["-q".to_string()];
-            args.extend(groups);
-            Command::new(blktests_dir.join("check"))
-                .current_dir(&blktests_dir)
-                .env("TEST_DEVS", &dev_str_clone)
-                .env("TIMEOUT", "60")
-                .args(&args)
-                .output()
-                .expect("blktests check failed to execute")
-        })
-        .await
-        .expect("spawn_blocking panicked");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        eprintln!("[blktests] stdout:\n{stdout}");
-        if !stderr.is_empty() {
-            eprintln!("[blktests] stderr:\n{stderr}");
-        }
-
-        // Count results from output lines like:
-        //   block/001 (stress test) [passed]
-        //   block/002 (something) [failed]
-        //   block/003 (something) [not run]
-        // Tests that fail due to missing kernel modules / CI VM limitations,
-        // not due to glidefs bugs. Exclude from the failure count.
         const INFRA_ONLY: &[&str] = &[
             "block/003", // discard/TRIM — glidefs doesn't support TRIM
             "block/008", // needs CPU hotplug (unavailable in CI VMs)
             "block/039", // needs null_blk kernel module
         ];
 
-        let mut passed = 0;
-        let mut failed = 0;
-        let mut skipped = 0;
-        for line in stdout.lines() {
-            if line.contains("[passed]") {
-                passed += 1;
-            } else if line.contains("[failed]") {
-                if INFRA_ONLY.iter().any(|t| line.starts_with(t)) {
-                    eprintln!("[blktests] ignoring infra-only failure: {line}");
-                    skipped += 1;
-                } else {
-                    failed += 1;
+        // Stream subprocess output line-by-line instead of capturing the
+        // full buffer up front. The previous `.output()` form ate all
+        // stdout/stderr until the subprocess exited, so CI looked
+        // "hung" for the entire blktests run — no progress visible until
+        // the whole group finished. Streaming gives the libtest
+        // 60-second heartbeat something useful to interleave with.
+        let dev_str_clone = dev_str.clone();
+        let (passed, failed, skipped) = tokio::task::spawn_blocking(move || {
+            let mut args = vec!["-q".to_string()];
+            args.extend(groups);
+            let mut child = Command::new(blktests_dir.join("check"))
+                .current_dir(&blktests_dir)
+                .env("TEST_DEVS", &dev_str_clone)
+                .env("TIMEOUT", "60")
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("blktests check failed to spawn");
+
+            let stdout = child.stdout.take().expect("piped stdout");
+            let stderr = child.stderr.take().expect("piped stderr");
+
+            // Drain stderr on a background thread so the parent doesn't
+            // block when the child writes only to stderr.
+            let stderr_thread = std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    eprintln!("[blktests:stderr] {line}");
                 }
-            } else if line.contains("[not run]") {
-                skipped += 1;
+            });
+
+            let mut passed = 0usize;
+            let mut failed = 0usize;
+            let mut skipped = 0usize;
+            let reader = BufReader::new(stdout);
+            for line in reader.lines().map_while(Result::ok) {
+                eprintln!("[blktests] {line}");
+                if line.contains("[passed]") {
+                    passed += 1;
+                } else if line.contains("[failed]") {
+                    if INFRA_ONLY.iter().any(|t| line.starts_with(t)) {
+                        eprintln!("[blktests] ignoring infra-only failure: {line}");
+                        skipped += 1;
+                    } else {
+                        failed += 1;
+                    }
+                } else if line.contains("[not run]") {
+                    skipped += 1;
+                }
             }
-        }
+
+            let _ = child.wait();
+            let _ = stderr_thread.join();
+            (passed, failed, skipped)
+        })
+        .await
+        .expect("spawn_blocking panicked");
 
         eprintln!(
             "[blktests] results for {}: {} passed, {} failed, {} skipped",
