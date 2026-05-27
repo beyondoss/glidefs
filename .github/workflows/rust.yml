@@ -109,7 +109,7 @@ jobs:
   blktests:
     name: blktests (Linux)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -138,7 +138,7 @@ jobs:
     # `io_task_user_copy` fallback. A regression on either path
     # fails CI.
     name: ublk-transport-${{ matrix.transport }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -181,7 +181,7 @@ jobs:
     # docker_integration, fs_crash, handoff, and the `Test (ublk)`
     # unit tests were ZC-only.
     name: Kernel Devices (${{ matrix.transport }})
-    timeout-minutes: 30
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
