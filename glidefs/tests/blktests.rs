@@ -296,6 +296,78 @@ mod blktests {
         }
     }
 
+    /// Flake-hunting harness for blktests block/042 (`dio-offsets`).
+    ///
+    /// Sets up the same ublk device the real blktests run uses and loops the
+    /// upstream `dio-offsets` binary against it, asserting zero failures.
+    /// At ~25% pre-fix and 0% post-fix this is the regression test for the
+    /// `pre_write` sibling-bio backfill race
+    /// (see `BlockHandler::backfill_blocks_in_range` doc).
+    ///
+    /// `#[ignore]` because it depends on a built `dio-offsets` binary; CI
+    /// already exercises this end-to-end through the normal `blktests`
+    /// test which runs `block/042` via the `check` script. This harness
+    /// is for local flake-hunting / future regression catching:
+    ///
+    /// ```ignore
+    /// sudo -E cargo test -p glidefs --release --features blktests --test blktests \
+    ///   dio_offsets_flake_hunt -- --ignored --nocapture --test-threads=1
+    /// ```
+    ///
+    /// `DIO_DIRECT_ITERS=N` controls iteration count (default 20).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn dio_offsets_flake_hunt() {
+        if !is_root() || !ublk_available() { return; }
+        let blktests = ensure_blktests();
+        let server = BlktestServer::start().await;
+        let Some(ref dev) = server.ublk_dev else { return; };
+        let iters = std::env::var("DIO_DIRECT_ITERS")
+            .ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(20);
+        let dio_offsets_bin = blktests.join("src/dio-offsets");
+        assert!(dio_offsets_bin.exists(), "dio-offsets binary not built");
+        let dev_name = dev.file_name().unwrap().to_str().unwrap().to_string();
+        let read_sysfs = |attr: &str| -> String {
+            std::fs::read_to_string(format!("/sys/class/block/{dev_name}/queue/{attr}"))
+                .unwrap().trim().to_string()
+        };
+        let max_segments = read_sysfs("max_segments");
+        let max_sectors_kb = read_sysfs("max_sectors_kb");
+        let dma_alignment = read_sysfs("dma_alignment");
+        let virt_boundary = read_sysfs("virt_boundary_mask");
+        let logical_block_size = read_sysfs("logical_block_size");
+        let dev_str = dev.to_str().unwrap().to_string();
+        eprintln!("device={dev_str} max_seg={max_segments} max_kb={max_sectors_kb} dma={dma_alignment} virt={virt_boundary} lbs={logical_block_size}");
+        let mut pass = 0;
+        let mut fail = 0;
+        for i in 0..iters {
+            let output = tokio::task::spawn_blocking({
+                let bin = dio_offsets_bin.clone();
+                let dev = dev_str.clone();
+                let ms = max_segments.clone();
+                let mkb = max_sectors_kb.clone();
+                let da = dma_alignment.clone();
+                let vb = virt_boundary.clone();
+                let lbs = logical_block_size.clone();
+                move || std::process::Command::new(bin)
+                    .args([&dev, &ms, &mkb, &da, &vb, &lbs])
+                    .output()
+                    .expect("dio-offsets failed to exec")
+            }).await.unwrap();
+            if output.status.success() {
+                pass += 1;
+                eprintln!("iter {i}: PASS");
+            } else {
+                fail += 1;
+                eprintln!("iter {i}: FAIL stderr={}",
+                    String::from_utf8_lossy(&output.stderr).trim());
+            }
+        }
+        eprintln!("=== summary: pass={pass} fail={fail} ===");
+        server.shutdown().await;
+        assert_eq!(fail, 0, "dio-offsets flaked");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn blktests_block_and_nbd() {
         if !is_root() {

@@ -862,12 +862,6 @@ impl CacheInner {
                 if idx >= self.num_blocks {
                     continue;
                 }
-                let state = self.state_map.get(idx);
-                if state != SparseBlockState::SYNCING
-                    && state != SparseBlockState::NOT_PRESENT
-                {
-                    continue;
-                }
                 let offset = block * block_size;
                 let valid = std::cmp::min(
                     block_size,
@@ -876,13 +870,60 @@ impl CacheInner {
                 if valid == 0 {
                     continue;
                 }
-                // Propagate both read and write errors. If reading from
-                // the flushing file fails (SSD error), we must not
-                // silently skip promotion — the active file has zeros for
-                // this block, so a sub-block guest write would leave the
-                // non-written portion as zeros instead of the original
-                // data. Failing the write to the guest is safer than
-                // silent data corruption.
+                // CAS-first promote: claim the block transition BEFORE the
+                // pwrite, not after. Without this, two sibling ZC partial
+                // writes to the same SYNCING block both observe SYNCING,
+                // both pwrite OLD bytes from the flushing file, and one's
+                // pwrite can clobber the other's already-landed
+                // `WRITE_FIXED` partial bytes — the same corruption shape
+                // as the backfill race, just on the post-rotation path.
+                //
+                // `state → CLEAN` is the claim sentinel (matches
+                // `try_claim_block` for NOT_PRESENT). Loser sees CLEAN and
+                // spins briefly until the winner transitions CLEAN→DIRTY,
+                // then skips — its caller's subsequent `WRITE_FIXED`
+                // overlays the winner's pwrite correctly.
+                let state = self.state_map.get(idx);
+                let claimed = match state {
+                    SparseBlockState::SYNCING => {
+                        self.state_map
+                            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::CLEAN)
+                            .is_ok()
+                    }
+                    SparseBlockState::NOT_PRESENT => {
+                        self.state_map
+                            .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::CLEAN)
+                            .is_ok()
+                    }
+                    _ => continue, // DIRTY or CLEAN — nothing to promote.
+                };
+                if !claimed {
+                    // Another promoter claimed it. Wait briefly for them
+                    // to land DIRTY (or for the block to fall back to
+                    // NOT_PRESENT via an eviction race). Bounded so a
+                    // panicking winner can't park us indefinitely.
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(5);
+                    loop {
+                        let s = self.state_map.get(idx);
+                        if s != SparseBlockState::CLEAN {
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            tracing::warn!(
+                                block = idx,
+                                "promote: timed out waiting for prior promoter's CLEAN→DIRTY transition; proceeding"
+                            );
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                    continue;
+                }
+                // We hold the CLEAN claim. Read from flushing, write to
+                // active. Propagate errors — silent skip on a flushing
+                // read failure would leave the active file as zeros for
+                // un-covered bytes of the sibling's WRITE_FIXED.
                 ff.read_exact_at(&mut buf[..valid], offset)?;
 
                 #[cfg(feature = "test-utils")]
@@ -903,33 +944,23 @@ impl CacheInner {
                     }
                 }
 
-                if state == SparseBlockState::SYNCING {
-                    // CAS SYNCING→DIRTY immediately after copying data.
-                    // This prevents the flush thread from evicting the block
-                    // (SYNCING→NOT_PRESENT) between here and the caller's
-                    // transition_to_dirty. If the CAS fails, either another
-                    // writer promoted it first (fine) or flush already evicted
-                    // it (the data we just copied is still valid in active).
-                    if self
-                        .state_map
-                        .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
-                        .is_ok()
-                    {
+                // Transition CLEAN → DIRTY. Bookkeeping mirrors what the
+                // pre-CAS-gate version did, scoped to whichever original
+                // state we claimed from.
+                let cas_ok = self
+                    .state_map
+                    .cas(idx, SparseBlockState::CLEAN, SparseBlockState::DIRTY)
+                    .is_ok();
+                if cas_ok {
+                    if state == SparseBlockState::SYNCING {
                         self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                     }
-                } else {
-                    // NOT_PRESENT: block was evicted between pre_write (which
-                    // saw SYNCING and skipped backfill) and now. The flushing
-                    // file still has the data. CAS NOT_PRESENT→DIRTY.
-                    if self
-                        .state_map
-                        .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
-                        .is_ok()
-                    {
-                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                 }
+                // If cas_ok is false, the block was evicted (CLEAN→NOT_PRESENT)
+                // by a racing flush mid-promote. The pwrite we just landed
+                // is still in the active file; the next caller that hits
+                // NOT_PRESENT will re-promote or backfill from S3.
             }
         } else if require_promotion {
             // No flushing file available. If any block in the range needs
