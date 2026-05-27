@@ -216,7 +216,7 @@ jobs:
       - name: Report kernel version
         run: uname -r
       - name: fio benchmark (${{ matrix.transport }})
-        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture --test-threads=1
       - name: fio verify (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
       - name: Handoff durability per-PR (${{ matrix.transport }})
