@@ -328,7 +328,7 @@ impl WriteCache<Initializing> {
 
         let inner = Arc::new(CacheInner {
             config,
-            data_file: parking_lot::RwLock::new(data_file),
+            data_file: Arc::new(parking_lot::RwLock::new(data_file)),
             flushing_file: parking_lot::Mutex::new(None),
             state_map,
             num_blocks,
@@ -415,7 +415,7 @@ impl WriteCache<Initializing> {
 
         let inner = Arc::new(CacheInner {
             config,
-            data_file: parking_lot::RwLock::new(data_file),
+            data_file: Arc::new(parking_lot::RwLock::new(data_file)),
             flushing_file: parking_lot::Mutex::new(None),
             state_map,
             num_blocks,

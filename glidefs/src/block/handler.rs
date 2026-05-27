@@ -1056,6 +1056,135 @@ impl BlockHandler {
         self.cache.inner().data_file_fd()
     }
 
+    /// Under-gate check: is every block in `[start_block, end_block]`
+    /// currently DIRTY, with no flush rotation in progress? Used by the
+    /// ZC read hot path to confirm a `LocalSsd` plan is safe to submit
+    /// without going through the async cold path. Caller must hold the
+    /// rotation gate from [`zc_inflight_enter`](Self::zc_inflight_enter)
+    /// — otherwise the all-DIRTY observation can be invalidated by a
+    /// concurrent flush rotation before the I/O reaches the kernel.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_all_dirty_under_gate(&self, start_block: u64, end_block: u64) -> bool {
+        self.cache.zc_all_dirty(start_block, end_block)
+    }
+
+    /// Acquire an owned rotation-gate guard for a ublk ZC I/O.
+    ///
+    /// Hold across the entire kernel I/O lifetime (SQE submit → kernel data
+    /// plane → after_* metadata commit). Rotation blocks until every
+    /// inflight guard drops; the state-machine update in
+    /// `commit_after_zc_write` always observes the same active file the
+    /// kernel wrote to.
+    ///
+    /// `Send + 'static` — the guard can be moved into a tokio task,
+    /// then forwarded through the ZC channel into the worker's inflight
+    /// slot.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_inflight_enter(
+        &self,
+    ) -> parking_lot::lock_api::ArcRwLockReadGuard<
+        parking_lot::RawRwLock,
+        crate::block::write_cache::SyncFile,
+    > {
+        self.cache.inner().zc_inflight_enter()
+    }
+
+    /// Non-blocking variant of [`zc_inflight_enter`]: returns `None` if a
+    /// rotation writer is queued (task-fair `parking_lot` would otherwise
+    /// queue this read behind the writer).
+    ///
+    /// Used by the ZC dispatch's inline fast path — the loop thread calls
+    /// this from the FETCH-CQE handler. If the gate is uncontended we do
+    /// the entire write dispatch inline (no `runtime.spawn`, no mpsc, no
+    /// eventfd round-trip). If contended, we fall back to the async
+    /// deferred path which can park on the gate without blocking the
+    /// loop.
+    ///
+    /// Critical: this is `try_*`, so it CAN'T deadlock the loop thread
+    /// against a queued rotation writer (the rotation-vs-flush deadlock
+    /// is fixed via deferred FLUSH; this preserves the same loop-thread
+    /// non-blocking invariant for WRITE).
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn try_zc_inflight_enter(
+        &self,
+    ) -> Option<parking_lot::lock_api::ArcRwLockReadGuard<
+        parking_lot::RawRwLock,
+        crate::block::write_cache::SyncFile,
+    >> {
+        self.cache.inner().try_zc_inflight_enter()
+    }
+
+    /// Synchronous fast-path equivalent of [`pre_write`].
+    ///
+    /// Returns `Some(Ok(()))` if `pre_write` would have completed without
+    /// awaiting anything (warm cache, full-block writes, all blocks
+    /// PRESENT — the steady-state for sustained workloads). Returns
+    /// `Some(Err(..))` if validation rejects the request synchronously
+    /// (readonly, bounds, NoSpace). Returns `None` if any block in the
+    /// range needs S3 backfill — caller must fall back to the async
+    /// `pre_write`.
+    ///
+    /// Used by the ZC inline fast path to keep the loop thread out of
+    /// the async runtime entirely when no S3 traffic is needed.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn pre_write_sync(&self, offset: u64, length: u64) -> Option<CommandResult<()>> {
+        if self.is_readonly() {
+            return Some(Err(CommandError::ReadOnly));
+        }
+        if offset.checked_add(length).is_none_or(|end| end > self.device_size()) {
+            return Some(Err(CommandError::InvalidArgument));
+        }
+        if length == 0 {
+            return Some(Ok(()));
+        }
+        let util = f64::from_bits(self.ssd_utilization.load(Ordering::Relaxed));
+        #[allow(clippy::cast_possible_truncation)]
+        let length_usize = length as usize;
+        if util > WRITE_REJECT_THRESHOLD && self.cache.has_new_blocks(offset, length_usize) {
+            return Some(Err(CommandError::NoSpace));
+        }
+
+        // Walk the block range. If any block is NOT_PRESENT *and* the
+        // write doesn't cover the whole block, async backfill from S3 is
+        // required — bail. Otherwise everything pre_write does is
+        // synchronous.
+        let block_size = self.cache.block_size() as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + length - 1) / block_size;
+        for block in start_block..=end_block {
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = block as usize;
+            if self.cache.is_block_present(idx) {
+                continue;
+            }
+            let block_start = block * block_size;
+            let write_start = offset.max(block_start);
+            let write_end = (offset + length).min(block_start + block_size);
+            if write_end - write_start < block_size {
+                // Partial write to NOT_PRESENT block — needs backfill.
+                return None;
+            }
+            // Full-block write to NOT_PRESENT block — no backfill needed.
+        }
+        Some(self.cache.pre_write(offset, length).map_err(CommandError::from))
+    }
+
+    /// Pwrite data into the cache file at a chunk's actual device offset
+    /// (for the ublk ZC cold-read path: decompressed S3 data lands in the
+    /// cache, then a subsequent `READ_FIXED` against the cache fd fills the
+    /// kernel bio without going through userspace).
+    ///
+    /// Holds `data_file.read()` briefly — does NOT enter the rotation gate,
+    /// callers must already be inside [`zc_inflight_enter`].
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_backfill_pwrite(
+        &self,
+        offset: u64,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        self.cache.inner().pwrite_data_file(data, offset)
+    }
+
     /// Phase 1 of ublk zero-copy write: prepare metadata before data write.
     ///
     /// Validates the request (readonly, SSD-full, bounds), then marks blocks
@@ -1155,6 +1284,122 @@ impl BlockHandler {
             self.flush()?;
         }
 
+        self.metrics.record_write_latency(start.elapsed());
+        Ok(())
+    }
+
+    /// Step 1 of the ublk zero-copy write phase order — promote any
+    /// SYNCING blocks in the range from the flushing file into the
+    /// active cache file BEFORE the kernel's `IORING_OP_WRITE_FIXED`
+    /// lands. See `write_cache::WriteCache::zc_promote_for_write_with`
+    /// for the rationale and the stateright phase-order constraint.
+    ///
+    /// Caller must already hold the rotation gate from
+    /// [`zc_inflight_enter`](Self::zc_inflight_enter); pass the
+    /// `&SyncFile` from its deref.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_promote_for_write_with(
+        &self,
+        df: &crate::block::write_cache::SyncFile,
+        offset: u64,
+        length: u64,
+    ) -> CommandResult<()> {
+        self.cache
+            .zc_promote_for_write_with(df, offset, length)
+            .map_err(|e| match e {
+                CacheError::BlockEvicted => CommandError::BlockEvicted,
+                other => {
+                    tracing::warn!(error = %other, "zc_promote_for_write failed");
+                    CommandError::IoError
+                }
+            })
+    }
+
+    /// Phase 2 of ublk zero-copy write: metadata commit for kernel-completed
+    /// data write.
+    ///
+    /// The kernel has already drained the bio into the data file via
+    /// `IORING_OP_WRITE_FIXED` by the time this is called. We promote any
+    /// SYNCING blocks back to the active file and append + mark dirty under
+    /// the data_file read lock — same invariants as `pwrite_and_commit`,
+    /// minus the pwrite (kernel did it) and the per-page CRC capture (no
+    /// userspace data to hash).
+    ///
+    /// # Integrity contract (ZC writes vs USER_COPY)
+    ///
+    /// `pwrite_and_commit` (the USER_COPY path) records a per-page CRC32C
+    /// from the guest's write buffer at the moment of pwrite, via
+    /// `write_cache/inner.rs::capture_page_crcs`. The flush path
+    /// (`write_cache/flush.rs::flush_block`, the `stored_crc == 0` branch
+    /// onward) re-reads each page from the cache file and compares the
+    /// recomputed CRC against the captured one. A mismatch flags the
+    /// block as corrupt and skips it from the S3 upload — closing the
+    /// loop on "what the guest wrote → what's on the cache SSD at flush
+    /// time."
+    ///
+    /// **For ZC writes the bio never enters userspace.** We can't compute
+    /// the source CRC, so the per-page entry stays at 0 and flush skips
+    /// verification for those pages. This loses one specific check: cache
+    /// file corruption between WRITE_FIXED completion and the flush read.
+    /// On modern hardware (ECC RAM + mainline kernel + NVMe with internal
+    /// ECC) the failure rate that this would catch is in the
+    /// decade-MTBF-at-scale range; the integrity-loss window is bounded
+    /// by flush latency (~seconds in steady state).
+    ///
+    /// **What is still protected end-to-end:**
+    /// - Cache file → S3 upload → S3 read-back is verified by BLAKE3 at
+    ///   the pack-content layer. Any corruption from the flush-read point
+    ///   onward is caught on subsequent reads.
+    /// - Guest filesystems on top of the ublk device run their own
+    ///   integrity (ext4 metadata CRC, xfs CRC, btrfs full data checksum,
+    ///   application-level page checksums in databases). The block layer
+    ///   is treated as best-effort by convention.
+    ///
+    /// **What is *not* protected:** silent corruption of the cache file
+    /// in the window between WRITE_FIXED returning success and the next
+    /// flush of the same block. This is the same gap accepted by every
+    /// zero-copy block-storage stack in the Linux ecosystem (SPDK,
+    /// NVMe-oF target, vhost-user-blk, kublk reference, etc.). Closing
+    /// it requires either hardware T10 PI (not available on commodity
+    /// NVMe yet) or a software read-back-after-write that halves the ZC
+    /// perf benefit without fully closing the gap (kernel-write-bugs
+    /// remain invisible since the read-back observes the same corruption
+    /// the kernel produced).
+    ///
+    /// **Path to detection if the rare-but-real failure occurs:** the
+    /// uploaded BLAKE3 will not match what the guest later reads back
+    /// from S3 against its own checksums (filesystem or application). The
+    /// failure surfaces as a guest-level read error, not a silent
+    /// corruption swallowed by the storage layer.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn commit_after_zc_write_with(
+        &self,
+        df: &crate::block::write_cache::SyncFile,
+        offset: u64,
+        length: u64,
+        fua: bool,
+    ) -> CommandResult<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let start = Instant::now();
+        self.metrics.record_guest_write(length);
+        self.cache
+            .commit_after_zc_write_with(df, offset, length)
+            .map_err(|e| match e {
+                CacheError::BlockEvicted => CommandError::BlockEvicted,
+                other => {
+                    tracing::warn!(error = %other, "commit_after_zc_write failed");
+                    CommandError::IoError
+                }
+            })?;
+        if let Some(ref tracer) = self.write_tracer {
+            tracer.record(offset, length, super::write_trace::TraceOp::Write);
+        }
+        self.check_flush_threshold();
+        if fua {
+            self.flush()?;
+        }
         self.metrics.record_write_latency(start.elapsed());
         Ok(())
     }

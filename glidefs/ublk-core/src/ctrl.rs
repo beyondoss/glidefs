@@ -1110,6 +1110,62 @@ impl UblkCtrlInner {
         };
     }
 
+    /// Enable kernel zero-copy transport when (a) the caller opted in via
+    /// `UBLK_DEV_F_PREFER_ZERO_COPY` and (b) the running kernel advertises
+    /// support for `UBLK_F_SUPPORT_ZERO_COPY` + `UBLK_F_AUTO_BUF_REG`.
+    ///
+    /// The opt-in is mandatory because the AUTO_BUF_REG transport requires
+    /// the caller to drive the data plane with `IORING_OP_*_FIXED` ops and
+    /// submit I/O via `BufDesc::AutoReg`. Callers that still use
+    /// `BufDesc::Slice` would fail validation if AUTO_BUF_REG were enabled
+    /// transparently. The opt-in says "I'm ready"; the kernel-feature check
+    /// says "I can"; together they pick the transport.
+    ///
+    /// Caller-set transport flags (USER_COPY, AUTO_BUF_REG, SUPPORT_ZERO_COPY,
+    /// MLOCK_IO_BUFFER) win — they're a stronger signal than the opt-in
+    /// dev_flag.
+    ///
+    /// Must run AFTER `detect_features()` and BEFORE `handle_device_lifecycle()`
+    /// (which sends the final `dev_info` to the kernel via `UBLK_CMD_ADD_DEV`).
+    fn maybe_enable_zero_copy(&mut self) {
+        const ZC_BITS: u64 =
+            (sys::UBLK_F_SUPPORT_ZERO_COPY | sys::UBLK_F_AUTO_BUF_REG) as u64;
+        const TRANSPORT_PICKED: u64 = (sys::UBLK_F_USER_COPY
+            | sys::UBLK_F_AUTO_BUF_REG
+            | sys::UBLK_F_SUPPORT_ZERO_COPY) as u64;
+
+        let opt_in = self
+            .dev_flags
+            .intersects(UblkFlags::UBLK_DEV_F_PREFER_ZERO_COPY);
+        let caller_picked = (self.dev_info.flags & TRANSPORT_PICKED) != 0;
+        let mlock = self
+            .dev_flags
+            .intersects(UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER);
+        let kernel_supports = self
+            .features
+            .map_or(false, |f| (f & ZC_BITS) == ZC_BITS);
+
+        if !opt_in || caller_picked || mlock {
+            return;
+        }
+
+        if kernel_supports {
+            self.dev_info.flags |= ZC_BITS;
+            log::info!(
+                "ctrl: device {} transport=zero-copy kernel_features={:#x} flags={:#x}",
+                self.dev_info.dev_id,
+                self.features.unwrap_or(0),
+                self.dev_info.flags
+            );
+        } else {
+            log::info!(
+                "ctrl: device {} transport=copy-mode opt-in set but kernel lacks AUTO_BUF_REG+SUPPORT_ZERO_COPY (kernel_features={:#x})",
+                self.dev_info.dev_id,
+                self.features.unwrap_or(0)
+            );
+        }
+    }
+
     fn new(config: UblkCtrlConfig) -> Result<UblkCtrlInner, UblkError> {
         let dev_info = Self::create_device_info(
             config.id,
@@ -1141,6 +1197,7 @@ impl UblkCtrlInner {
         };
 
         dev.detect_features();
+        dev.maybe_enable_zero_copy();
         dev.handle_device_lifecycle(config.id)?;
 
         log::info!(
@@ -1183,6 +1240,7 @@ impl UblkCtrlInner {
         };
 
         dev.detect_features_async().await;
+        dev.maybe_enable_zero_copy();
         dev.handle_device_lifecycle_async(config.id).await?;
 
         log::info!(

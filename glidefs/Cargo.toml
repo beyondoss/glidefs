@@ -68,7 +68,7 @@ blake3 = "1.8"
 lz4_flex = "0.12"
 rayon = "1.11"
 tempfile = "3.21"
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
 chrono = { version = "0.4.43", features = ["serde"] }
 bitflags = "2"
 tar = "0.4"
@@ -163,6 +163,11 @@ required-features = ["fio-bench"]
 name = "fio_verify"
 path = "tests/fio_verify.rs"
 required-features = ["fio-bench"]
+
+[[test]]
+name = "zc_glidefs"
+path = "tests/zc_glidefs.rs"
+required-features = ["ublk", "test-utils"]
 
 [[test]]
 name = "handoff_durability"

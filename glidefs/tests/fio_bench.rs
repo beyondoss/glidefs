@@ -20,7 +20,7 @@ mod fio_bench {
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
-    const DEVICE_SIZE_GB: f64 = 2.0;
+    const DEVICE_SIZE_GB: f64 = 0.25; // 256 MiB — fits in QEMU 4G VM with headroom
 
     fn ublk_available() -> bool {
         Path::new("/dev/ublk-control").exists()
@@ -39,6 +39,7 @@ mod fio_bench {
 
     impl BenchServer {
         async fn start() -> Self {
+            let force_user_copy = false;
             let cache_dir = TempDir::new().unwrap();
             let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
             let clean_cache: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
@@ -53,7 +54,11 @@ mod fio_bench {
                     wal_sync: false,
                     max_s3_uploads: 128,
                     max_s3_downloads: 512,
-                    default_flush_threshold: DEFAULT_FLUSH_THRESHOLD,
+                    // Disable auto-flush so the bench measures transport
+                    // throughput against a hot cache, not S3 store traffic.
+                    // Without this, the in-memory store accumulates blocks
+                    // and OOMs the 4 GiB QEMU VM.
+                    default_flush_threshold: 0,
                     ublk_nr_queues: 4,
                     nbd_dead_conn_timeout: 0,
                     max_exports: 10_000,
@@ -80,6 +85,9 @@ mod fio_bench {
                 .expect("no handler for bench export");
 
             let mut ublk_server = UblkServer::new();
+            if force_user_copy {
+                ublk_server.force_user_copy_transport();
+            }
             let dev_path = ublk_server
                 .add_device("bench", handler)
                 .await
@@ -247,7 +255,7 @@ mod fio_bench {
     // The actual test
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fio_benchmark() {
         if !ublk_available() {
             eprintln!("skipping fio benchmark: ublk_drv not available");

@@ -374,6 +374,11 @@ pub struct ExportRouter {
     /// In-flight OCI bless tasks: "{s3_prefix}/{name}" → status.
     /// Entries exist only while in-flight. Removed on completion or failure.
     bless_tasks: RwLock<HashMap<String, BlessStatus>>,
+
+    /// Owns the lifetime of `cache_dir` when constructed via `new_for_test()`.
+    /// `Drop` removes the dir; production routers leave the field `None`.
+    #[cfg(test)]
+    _test_temp_dir: Option<tempfile::TempDir>,
 }
 
 /// Validate an export name: 1-128 chars, alphanumeric/hyphen/underscore/dot,
@@ -668,6 +673,8 @@ impl ExportRouter {
             manifest_cache,
             hot_set_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             bless_tasks: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            _test_temp_dir: None,
         })
     }
 
@@ -2972,13 +2979,13 @@ impl ExportRouter {
     pub(crate) async fn new_for_test() -> Self {
         use crate::block::cache::SimpleBlockCache;
         let s3: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let temp_dir = std::env::temp_dir().join(format!("glidefs-test-{:016x}", rand::random::<u64>()));
-        std::fs::create_dir_all(&temp_dir).expect("Failed to create test cache dir");
+        let temp_dir = tempfile::tempdir().expect("Failed to create test cache dir");
+        let cache_dir = temp_dir.path().to_path_buf();
 
-        Self::new(RouterConfig {
+        let mut router = Self::new(RouterConfig {
             object_store: s3,
             db_path: "test".to_string(),
-            cache_dir: temp_dir,
+            cache_dir,
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
             wal_sync: false,
@@ -2991,7 +2998,10 @@ impl ExportRouter {
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
         })
         .await
-        .expect("failed to create test router")
+        .expect("failed to create test router");
+
+        router._test_temp_dir = Some(temp_dir);
+        router
     }
 }
 

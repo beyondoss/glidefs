@@ -58,3 +58,8 @@ manual_strip = "allow"
 borrow_deref_ref = "allow"
 await_holding_lock = "allow"
 macro_metavars_in_unsafe = "allow"
+
+[dev-dependencies]
+libc = "0.2"
+env_logger = "0.10"
+io-uring = "0.7"

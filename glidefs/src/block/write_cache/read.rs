@@ -36,9 +36,15 @@ enum BlockLocation {
 /// of a read request without going through an intermediate buffer.
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 pub enum ChunkSource {
-    /// Block is all zeros — memset the destination.
+    /// Block is all zeros — kernel can `READ_FIXED` from `/dev/zero` (or
+    /// equivalent) into the bio.
     Zero,
-    /// Block data already in memory (local pread, clean cache, or S3 fetch) — memcpy to destination.
+    /// Block data lives on the local cache SSD at `file_offset` in the data
+    /// file. Caller issues `IORING_OP_READ_FIXED` against the current data
+    /// file fd directly into the bio — no userspace copy.
+    LocalSsd { file_offset: u64 },
+    /// Block data already in memory (clean cache or S3 fetch) — memcpy to
+    /// destination via a userspace bounce. Cold path; not hot-path eligible.
     InMemory(Bytes),
 }
 
@@ -47,6 +53,10 @@ pub enum ChunkSource {
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 pub struct ChunkPlanEntry {
     pub source: ChunkSource,
+    /// Byte offset of the *block* (chunk) this entry covers — i.e.
+    /// `block_idx * block_size`. The ZC cold-read path pwrites
+    /// `InMemory(data)` at this offset before issuing READ_FIXED.
+    pub block_start: u64,
     /// Byte offset within the chunk to start copying from.
     pub slice_start: usize,
     /// Number of bytes to copy from this chunk.
@@ -220,6 +230,26 @@ impl WriteCache<Active> {
         Ok(Some(Bytes::from(buf)))
     }
 
+    /// Under-gate hot-path check: is every block in `[start_block,
+    /// end_block]` currently DIRTY, with no flush rotation in progress?
+    /// Mirrors the inline check at the top of `resolve_read_plan` but
+    /// exposes it so the ZC dispatch can test eligibility WHILE holding
+    /// the rotation gate (without taking the gate, the observation can
+    /// be invalidated by a concurrent flush before the I/O reaches the
+    /// kernel — caught by the soak test).
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub fn zc_all_dirty(&self, start_block: u64, end_block: u64) -> bool {
+        if self.inner.flushing_active.load(Ordering::Acquire) {
+            return false;
+        }
+        (start_block..=end_block).all(|b| {
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = b as usize;
+            self.inner.state_map.get(idx)
+                == crate::block::block_map::SparseBlockState::DIRTY
+        })
+    }
+
     /// Build a read plan for the ublk zero-copy path.
     ///
     /// Same resolution order as `read`, but instead of copying data into a
@@ -258,14 +288,22 @@ impl WriteCache<Active> {
         let start_chunk = offset / chunk_size;
         let end_chunk = (offset + len as u64 - 1) / chunk_size;
 
-        // All reads go through the cold path which uses pread via the RwLock'd
-        // data_file (always correct fd). File rotation (flush)
-        // renames the active file and opens a new one — the io_uring-registered
-        // fd permanently points to the old inode after the first rotation,
-        // making LocalSsd (Fixed fd) unsafe for all subsequent I/O.
+        // No hot-path branch here. The ZC dispatcher
+        // (ublk/device.rs::try_zc_read_hot_path) handles the all-DIRTY
+        // → LocalSsd case under the rotation gate. Emitting LocalSsd
+        // entries from here would be unsafe — without the gate held by
+        // the caller, the `file_offset` pointers can be invalidated by a
+        // flush rotation between plan return and SQE submission, causing
+        // READ_FIXED to read sparse zeros from a post-rotation active
+        // file (soak-test-caught corruption). This path now exclusively
+        // produces `InMemory(data)` / `Zero` plan entries — the dispatch
+        // path pwrites those into the cache file under the gate and then
+        // issues READ_FIXED from the same fd, which is race-free because
+        // the data is owned by the userspace `Bytes` until pwrite.
         //
-        // Box to keep the parent future (io_task_zc) small — locate_block/
-        // fetch_coalesced have deep async call trees that inflate the state machine.
+        // Box to keep the parent future small — locate_block /
+        // fetch_coalesced have deep async call trees that inflate the
+        // state machine.
         Box::pin(self.resolve_read_plan_cold(
             offset, len, start_chunk, end_chunk, clean_cache,
             pack_index_cache, volume_manifest, content_store, metrics,
@@ -389,6 +427,7 @@ impl WriteCache<Active> {
 
             entries.push(ChunkPlanEntry {
                 source,
+                block_start: chunk_start_byte,
                 slice_start,
                 slice_len: slice_end - slice_start,
             });

@@ -108,7 +108,18 @@ impl UblkServer {
     /// called inside a tokio runtime context — workers re-enter the
     /// runtime to run handler futures (S3 fetches, etc.).
     pub fn new() -> Self {
-        let features = device::detect_features();
+        let mut features = device::detect_features();
+        // `GLIDEFS_FORCE_USER_COPY=1` masks the ZC bit at startup so the
+        // daemon binary uses USER_COPY+pool even on a ZC-capable kernel.
+        // Pair with the matching ZC run for an apples-to-apples
+        // RSS-per-export and throughput delta on the same kernel.
+        if std::env::var("GLIDEFS_FORCE_USER_COPY").is_ok_and(|v| !v.is_empty()) {
+            features.zero_copy = false;
+            tracing::warn!(
+                "GLIDEFS_FORCE_USER_COPY=1 — masking kernel ZC support; \
+                 daemon will use USER_COPY+pool transport"
+            );
+        }
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -161,6 +172,16 @@ impl UblkServer {
     /// strategy selector (`crate::handoff::strategy::select`).
     pub fn kernel_features(&self) -> &KernelFeatures {
         &self.features
+    }
+
+    /// Force the legacy `UBLK_F_USER_COPY` transport on subsequent
+    /// `add_device` calls, even on a kernel that advertises
+    /// `UBLK_F_SUPPORT_ZERO_COPY + UBLK_F_AUTO_BUF_REG`. Used for A/B
+    /// benchmarking ZC vs USER_COPY on the same kernel. Production code
+    /// must not call this — the auto-detect picks the best available
+    /// transport.
+    pub fn force_user_copy_transport(&mut self) {
+        self.features.zero_copy = false;
     }
 
     /// Active device IDs paired with their export names. Used by the
@@ -925,6 +946,7 @@ impl UblkServer {
     /// this path, just resource drops.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         let device_count = self.devices.len();
+        let dev_ids: Vec<i32> = self.devices.values().map(|d| d.dev_id()).collect();
 
         // Drop the worker pool — every worker receives `Shutdown`,
         // drops its hosted queues' Rc clones (the io_task futures are
@@ -949,6 +971,43 @@ impl UblkServer {
             // Touch nothing — the map remains accurate as long as the
             // kernel devices it points to are still QUIESCED.
             let _ = cache_dir;
+        }
+
+        // The LIVE→QUIESCED transition is driven by the kernel observing
+        // the last io_uring fd touching the cdev close. Closing happens
+        // synchronously when we drop the worker pool + devices above,
+        // but the kernel's state-machine update is itself asynchronous —
+        // returning before it lands creates a flaky window where a
+        // subsequent `add_device(recover)` on the same dev_id (e.g.
+        // fs_crash_recovery phase 3) issues `GET_DEV_INFO2` against an
+        // in-flight transition and the kernel responds `-EOPNOTSUPP`.
+        // Poll each device for QUIESCED state with a bounded *outer*
+        // deadline AND a per-probe `timeout`, so a stuck control-plane
+        // ioctl in `UblkCtrl::new_simple` can't park the awaiter forever
+        // (the outer-deadline-only version wedged CI when a probe
+        // blocked in the kernel — `spawn_blocking` doesn't cancel on
+        // await abandonment, so the wrapping `timeout` is the only
+        // way to actually move past it).
+        let outer_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        for dev_id in dev_ids {
+            while std::time::Instant::now() < outer_deadline {
+                let probe = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    tokio::task::spawn_blocking(move || -> Option<u32> {
+                        let ctrl = ublk_core::ctrl::UblkCtrl::new_simple(dev_id).ok()?;
+                        Some(u32::from(ctrl.dev_info().state))
+                    }),
+                )
+                .await;
+                let state = probe.ok().and_then(|r| r.ok()).flatten();
+                match state {
+                    Some(s) if s == ublk_core::sys::UBLK_S_DEV_QUIESCED => break,
+                    None => break, // device gone or probe timed out
+                    _ => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
         }
 
         tracing::info!(

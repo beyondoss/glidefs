@@ -77,6 +77,11 @@ pub struct KernelFeatures {
     /// (see `handoff::strategy::piod`). Currently always `false` on our
     /// production kernel (6.12); detection wired for future PIOD support.
     pub per_io_daemon: bool,
+    /// `UBLK_F_SUPPORT_ZERO_COPY` + `UBLK_F_AUTO_BUF_REG` — kernel ≥6.11
+    /// (usable from ≥6.17). When both bits are present, ublk-core's
+    /// auto-detect flips the device to the zero-copy transport when the
+    /// caller sets `UBLK_DEV_F_PREFER_ZERO_COPY`.
+    pub zero_copy: bool,
 }
 
 /// Probe the running kernel for supported ublk feature flags.
@@ -88,16 +93,24 @@ pub fn detect_features() -> KernelFeatures {
     let recovery = (raw & u64::from(sys::UBLK_F_USER_RECOVERY)) != 0;
     let ioctl_encode = (raw & u64::from(sys::UBLK_F_CMD_IOCTL_ENCODE)) != 0;
     let per_io_daemon = (raw & u64::from(sys::UBLK_F_PER_IO_DAEMON)) != 0;
+    let zero_copy = (raw & u64::from(sys::UBLK_F_SUPPORT_ZERO_COPY)) != 0
+        && (raw & u64::from(sys::UBLK_F_AUTO_BUF_REG)) != 0;
 
     tracing::info!(
         recovery,
         ioctl_encode,
         per_io_daemon,
+        zero_copy,
         raw_features = format_args!("0x{:x}", raw),
         "ublk kernel feature detection"
     );
 
-    KernelFeatures { recovery, ioctl_encode, per_io_daemon }
+    KernelFeatures {
+        recovery,
+        ioctl_encode,
+        per_io_daemon,
+        zero_copy,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +272,7 @@ impl UblkDevice {
         #[allow(clippy::cast_possible_truncation)]
         let bs_shift = handler.block_size().trailing_zeros() as u8; // block_size is power of 2, trailing_zeros <= 13
 
-        let dev_flags = match mode {
+        let mut dev_flags = match mode {
             DeviceMode::Add => UblkFlags::UBLK_DEV_F_ADD_DEV,
             DeviceMode::Recover { .. } => UblkFlags::UBLK_DEV_F_RECOVER_DEV,
         };
@@ -284,11 +297,31 @@ impl UblkDevice {
         // K × POOL_SLOTS × SLOT_SIZE (= 512 MB on 16 workers) regardless of
         // device count.
         //
-        // Default on. `GLIDEFS_BOUNCE_MODE=1` reverts to the per-tag-stable
-        // legacy bounce path — kept as a kill switch in case a kernel exposes
-        // a USER_COPY regression.
-        if std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none() {
+        // Transport selection: prefer kernel zero-copy when available
+        // (`UBLK_F_SUPPORT_ZERO_COPY + UBLK_F_AUTO_BUF_REG`, kernel ≥6.11
+        // with ublk_drv from ≥6.17 actually working). On older kernels
+        // fall back to USER_COPY. `UblkCtrl::new` queries
+        // `UBLK_CMD_GET_FEATURES` and, if `UBLK_DEV_F_PREFER_ZERO_COPY`
+        // is set in `dev_flags`, ORs the ZC bits into `dev_info.flags`
+        // when both kernel-feature bits are present. Otherwise leaves them
+        // off and the USER_COPY request below takes effect.
+        //
+        // `GLIDEFS_BOUNCE_MODE=1` (test-only) disables both transports and
+        // forces the legacy per-tag-IoBuf path.
+        let use_zc = features.zero_copy
+            && std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none();
+        if use_zc {
+            dev_flags |= UblkFlags::UBLK_DEV_F_PREFER_ZERO_COPY;
+            tracing::info!(
+                export = %export_name,
+                "ublk: zero-copy transport (AUTO_BUF_REG) selected"
+            );
+        } else if std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none() {
             ctrl_flags |= u64::from(sys::UBLK_F_USER_COPY);
+            tracing::info!(
+                export = %export_name,
+                "ublk: USER_COPY transport selected (kernel lacks ZC)"
+            );
         }
 
         // Snapshot per-worker handles so the spawn_blocking closure can
@@ -1214,11 +1247,24 @@ fn panic_payload_to_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
 pub(super) async fn io_task(
     q: &UblkQueue,
     tag: u16,
-    handler: &BlockHandler,
+    handler: &Arc<BlockHandler>,
 ) -> Result<(), UblkError> {
-    let user_copy = (q.dev.dev_info.flags & u64::from(ublk_core::sys::UBLK_F_USER_COPY)) != 0;
+    let dev_flags = q.dev.dev_info.flags;
+    let zero_copy = (dev_flags & u64::from(ublk_core::sys::UBLK_F_AUTO_BUF_REG)) != 0
+        && (dev_flags & u64::from(ublk_core::sys::UBLK_F_SUPPORT_ZERO_COPY)) != 0;
+    if zero_copy {
+        // ZC queues are driven by a single dedicated OS thread (per queue)
+        // that owns the queue's ZC io_uring. Tag 0's `io_task` hosts that
+        // thread and lives until it exits; all other tags' `io_task`s
+        // return immediately so their executor slots are freed.
+        if tag == 0 {
+            return io_task_zero_copy(q, handler.clone()).await;
+        }
+        return Ok(());
+    }
+    let user_copy = (dev_flags & u64::from(ublk_core::sys::UBLK_F_USER_COPY)) != 0;
     if user_copy {
-        return io_task_user_copy(q, tag, handler).await;
+        return io_task_user_copy(q, tag, &**handler).await;
     }
 
     let mut buffer = IoBuf::<u8>::new(q.dev.dev_info.max_io_buf_bytes as usize);
@@ -1244,6 +1290,749 @@ pub(super) async fn io_task(
 
         q.submit_io_commit_cmd(tag, BufDesc::Slice(buffer.as_slice()), result)
             .await?;
+    }
+}
+
+/// Bridge between glidefs's `BlockHandler` and ublk-core's `ZcTarget`.
+///
+/// The kernel auto-registers each bio's pages as an io_uring fixed buffer at
+/// `buf_index=tag` on FETCH; this target tells the kernel where the *other*
+/// end of the DMA is:
+///
+/// - **WRITE** (one chunk): bio → cache file at device offset via
+///   `WRITE_FIXED(data_file_fd, dst_offset=offset, buf_index=tag)`. The
+///   kernel DMAs directly to the cache SSD. After `pre_write` lands
+///   metadata (backfill, set-present); `after_write` does the state-machine
+///   commit.
+/// - **READ (hot, all-DIRTY)**: cache file → bio via N `READ_FIXED` SQEs,
+///   one per chunk, all targeting `buf_index=tag` at the chunk's
+///   `buf_offset`. No userspace copy on the data plane.
+/// - **READ (cold S3 / Zero / mixed)**: for each non-LocalSsd chunk we
+///   pwrite into the cache file at the block's start offset (backfill —
+///   the same disk write a future write-path backfill would do), then
+///   submit `READ_FIXED` from the same cache fd. `Zero` chunks read from
+///   `/dev/zero`. No memfd staging area.
+///
+/// **Rotation safety**: the dispatcher acquires `handler.zc_inflight_enter()`
+/// (an `ArcRwLockReadGuard` on the cache's `data_file` lock) *before*
+/// capturing the data-file fd, and forwards it to the worker via
+/// `ZcQueueHandle::submit(.., keepalive=Some(guard))`. The worker holds it
+/// in the per-tag inflight slot until `after_write`/`after_read` returns +
+/// COMMIT goes out. Rotation (`flush.rs::rotate_data_file_inner`) acquires
+/// `data_file.write()` and blocks until every inflight guard drops, so the
+/// state-map transition in `commit_after_zc_write` always operates on the
+/// same active file the kernel wrote to.
+///
+/// All async handler work (`pre_write`, `resolve_read`, cold pwrites)
+/// happens on tokio tasks. The ZC worker thread never blocks on async
+/// futures — it dispatches to a tokio task, returns `Deferred`, and the
+/// task pushes the data-plane SQE back via `ZcQueueHandle::submit`.
+struct GlidefsZcTarget {
+    handler: Arc<BlockHandler>,
+    runtime: tokio::runtime::Handle,
+    /// `/dev/zero` opened once at queue setup. Used as the source fd for
+    /// `READ_FIXED` covering all-zero chunks — no userspace memset, no
+    /// pwrite of zeros to the cache file.
+    dev_zero_fd: std::os::fd::RawFd,
+    /// Per-queue scratch memfd, sized to `queue_depth * max_io_buf_bytes`.
+    /// Tag T owns the slot at byte offset `T * scratch_slot_bytes`.
+    ///
+    /// **Why this exists:** the ZC cold-read path fetches data from S3
+    /// (already in userspace) and must DMA it into the bio via
+    /// `READ_FIXED`. The previous implementation pwrote that data into
+    /// the active cache file at the block's device offset, then
+    /// `READ_FIXED`'d from there. That races with concurrent kernel
+    /// `WRITE_FIXED`s to the same offset: read pwrites stale (S3) bytes
+    /// after write lands new bytes → silent write loss (caught by
+    /// `zc_glidefs_concurrent_rw_race_on_evicted_block`).
+    ///
+    /// Per-tag scratch is isolated from device-offset writes by
+    /// construction. The earlier "no memfd staging area" directive
+    /// targeted per-IO BIO REGISTRATION in the hot path — the kernel
+    /// still auto-registers the bio directly; no userspace memfd
+    /// appears in the WRITE_FIXED or hot-path READ_FIXED sequence. The
+    /// cold path inherently has a userspace bounce (the decompressed
+    /// S3 `Bytes`); the scratch slot is just where we land it.
+    scratch_fd: std::os::fd::RawFd,
+    /// Bytes per tag in the scratch memfd. Equals `max_io_buf_bytes`.
+    scratch_slot_bytes: u64,
+}
+
+impl Drop for GlidefsZcTarget {
+    fn drop(&mut self) {
+        if self.dev_zero_fd >= 0 {
+            unsafe { libc::close(self.dev_zero_fd) };
+        }
+        if self.scratch_fd >= 0 {
+            unsafe { libc::close(self.scratch_fd) };
+        }
+    }
+}
+
+impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
+    fn dispatch(
+        &self,
+        op: u8,
+        offset: u64,
+        length: u32,
+        tag: u16,
+        handle: &ublk_core::zc::ZcQueueHandle,
+    ) -> ublk_core::zc::ZcDispatch {
+        use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp, ZcDispatch};
+
+        match u32::from(op) {
+            sys::UBLK_IO_OP_FLUSH => {
+                // FLUSH must be Deferred, not Inline. `handler.flush()` →
+                // `cache.flush()` acquires `data_file.read()` task-fairly.
+                // If a rotation writer is queued (which happens almost
+                // continuously under sustained writes with small
+                // `flush_threshold`), running it inline parks the
+                // io_uring loop on that read. The loop can no longer
+                // service WRITE_FIXED CQEs, so the inflight `read_arc()`
+                // guards never drop, so the rotation writer never
+                // proceeds — three-actor deadlock. Spawning offloads
+                // the blocking acquisition to a tokio worker; the loop
+                // keeps draining CQEs, the inflight guards release on
+                // schedule, the rotation completes, this task's read
+                // unblocks, FLUSH completes. Caught by
+                // `zc_glidefs_flush_rotation_deadlock`.
+                let handler = Arc::clone(&self.handler);
+                let handle = handle.clone();
+                self.runtime.spawn(async move {
+                    let mut guard = SubmitGuard::new(tag, handle);
+                    let res = tokio::task::spawn_blocking(move || handler.flush())
+                        .await
+                        .map(|inner| match inner {
+                            Ok(()) => 0,
+                            Err(_) => -libc::EIO,
+                        })
+                        .unwrap_or(-libc::EIO);
+                    guard.commit(ZcAction::Complete(res), None);
+                });
+                ZcDispatch::Deferred
+            }
+            sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
+                ZcDispatch::Inline { action: ZcAction::Complete(0), keepalive: None }
+            }
+            sys::UBLK_IO_OP_WRITE => {
+                // Inline fast path: avoid `runtime.spawn` + mpsc/eventfd
+                // round-trip when (1) the rotation gate is uncontended and
+                // (2) `pre_write` would not need an S3 backfill. Both are
+                // the steady-state hot path under sustained workloads with
+                // a warm cache. Measured: ~5-10 μs saved per IO at small
+                // block sizes — closes the ZC-vs-USER_COPY write gap
+                // surfaced by the parallel-fio bench.
+                //
+                // Correctness:
+                //  * `try_zc_inflight_enter` returns `None` if a rotation
+                //    writer is queued — never blocks the loop thread.
+                //    Falls through to the deferred path which CAN park
+                //    the dispatch worker on the gate.
+                //  * `pre_write_sync` returns `None` if backfill is
+                //    needed — falls through.
+                //  * On the inline path the gate moves into the inflight
+                //    slot's keepalive (via `ZcDispatch::Inline { ..,
+                //    keepalive }`), guaranteeing the same active file
+                //    for the entire kernel WRITE_FIXED window. Identical
+                //    lifetime to the deferred path.
+                if let Some(gate) = self.handler.try_zc_inflight_enter() {
+                    if let Some(pre_res) = self.handler.pre_write_sync(offset, u64::from(length)) {
+                        if let Err(e) = pre_res {
+                            tracing::warn!(?e, offset, length, "ZC pre_write_sync failed");
+                            return ZcDispatch::Inline {
+                                action: ZcAction::Complete(-libc::EIO),
+                                keepalive: None,
+                            };
+                        }
+                        use std::os::unix::io::AsRawFd;
+                        let fd = (*gate).as_raw_fd_for_ublk_zc();
+                        if let Err(e) = self.handler.zc_promote_for_write_with(
+                            &*gate,
+                            offset,
+                            u64::from(length),
+                        ) {
+                            tracing::warn!(?e, offset, length, "ZC promote failed (inline)");
+                            return ZcDispatch::Inline {
+                                action: ZcAction::Complete(-libc::EIO),
+                                keepalive: None,
+                            };
+                        }
+                        let action = ZcAction::Chunks(vec![ZcChunk {
+                            op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
+                            buf_offset: 0,
+                            length,
+                        }]);
+                        return ZcDispatch::Inline {
+                            action,
+                            keepalive: Some(Box::new(gate)),
+                        };
+                    }
+                    // Pre-write needs async backfill — drop the gate
+                    // before falling through (the deferred path
+                    // re-acquires it after the async backfill resolves).
+                    drop(gate);
+                }
+
+                // Slow path: gate contended OR backfill required.
+                let handler = Arc::clone(&self.handler);
+                let handle = handle.clone();
+                self.runtime.spawn(async move {
+                    let mut guard = SubmitGuard::new(tag, handle);
+                    match handler.pre_write(offset, u64::from(length)).await {
+                        Ok(()) => {
+                            // Acquire the rotation gate, then read fd from
+                            // the gate's own deref. Calling
+                            // `data_file.read()` again while the read_arc
+                            // guard is held would self-deadlock if a writer
+                            // is queued (parking_lot is task-fair — a new
+                            // read attempt queues behind the writer, which
+                            // is itself queued behind the inflight reader).
+                            let gate = handler.zc_inflight_enter();
+                            let fd = {
+                                use std::os::unix::io::AsRawFd;
+                                (*gate).as_raw_fd_for_ublk_zc()
+                            };
+                            // Promote any SYNCING blocks BEFORE the kernel
+                            // writes. The stateright write-phase model
+                            // requires `Promote* → PwriteData → WalAppend
+                            // → TransitionDirty`. For USER_COPY,
+                            // `pwrite_and_commit` does all four under one
+                            // lock. For ZC the kernel does PwriteData
+                            // (WRITE_FIXED) and we can't reorder around
+                            // it — so promote happens here, before the
+                            // kernel's data write, holding the gate the
+                            // whole way. Running promote AFTER WRITE_FIXED
+                            // would re-copy flushing-file (old) data on top
+                            // of the just-landed new data → silent
+                            // rollback (caught by the soak test).
+                            if let Err(e) = handler.zc_promote_for_write_with(
+                                &*gate,
+                                offset,
+                                u64::from(length),
+                            ) {
+                                tracing::warn!(?e, offset, length, "ZC promote failed");
+                                guard.commit(ZcAction::Complete(-libc::EIO), None);
+                                return;
+                            }
+                            let action = ZcAction::Chunks(vec![ZcChunk {
+                                op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
+                                buf_offset: 0,
+                                length,
+                            }]);
+                            guard.commit(action, Some(Box::new(gate)));
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, offset, length, "ZC pre_write failed");
+                            guard.commit(ZcAction::Complete(-libc::EIO), None);
+                        }
+                    }
+                });
+                ZcDispatch::Deferred
+            }
+            sys::UBLK_IO_OP_READ => {
+                // Inline fast path mirroring the WRITE case: if the gate
+                // is uncontended AND every block in the range is DIRTY
+                // (no cold-fetch needed), the entire dispatch is
+                // synchronous — skip `runtime.spawn` and the mpsc/eventfd
+                // round-trip. Closes the read-tail regression introduced
+                // by the WRITE fast path (reads competing with inline
+                // writes on the loop thread saw their p99 widen).
+                if let Some(gate) = self.handler.try_zc_inflight_enter() {
+                    if let Some(action) =
+                        try_zc_read_hot_path(&self.handler, &*gate, offset, length)
+                    {
+                        return ZcDispatch::Inline {
+                            action,
+                            keepalive: Some(Box::new(gate)),
+                        };
+                    }
+                    drop(gate);
+                }
+
+                // Slow path: cold read or contended gate.
+                let handler = Arc::clone(&self.handler);
+                let handle = handle.clone();
+                let dev_zero_fd = self.dev_zero_fd;
+                let scratch_fd = self.scratch_fd;
+                let scratch_slot_offset = u64::from(tag) * self.scratch_slot_bytes;
+                self.runtime.spawn(async move {
+                    let mut guard = SubmitGuard::new(tag, handle);
+                    // Try the hot path FIRST, under the rotation gate.
+                    // If every block in the range is DIRTY (and no flush
+                    // rotation is in progress), we can submit LocalSsd
+                    // chunks directly without touching the async cold
+                    // path. The gate keeps the read plan's `file_offset`
+                    // pointers consistent with the data file the kernel
+                    // will read from at WRITE_FIXED submission time.
+                    //
+                    // Cold path (mismatched state, cross-block boundary,
+                    // S3-resident data) doesn't hold the gate across
+                    // the async fetch — rotation can proceed during S3
+                    // I/O. We re-acquire the gate for the brief data-
+                    // plane window (pwrite + READ_FIXED).
+                    {
+                        let gate = handler.zc_inflight_enter();
+                        if let Some(action) =
+                            try_zc_read_hot_path(&handler, &*gate, offset, length)
+                        {
+                            guard.commit(action, Some(Box::new(gate)));
+                            return;
+                        }
+                        // Drop gate before async cold path.
+                    }
+
+                    match handler.resolve_read(offset, length).await {
+                        Ok(plan) => {
+                            // Re-acquire gate for the data plane.
+                            let gate = handler.zc_inflight_enter();
+                            let fd = (*gate).as_raw_fd_for_ublk_zc();
+                            let action = build_read_chunks_in_file(
+                                &handler,
+                                &plan,
+                                &*gate,
+                                fd,
+                                dev_zero_fd,
+                                scratch_fd,
+                                scratch_slot_offset,
+                            );
+                            guard.commit(action, Some(Box::new(gate)));
+                        }
+                        Err(e) => {
+                            tracing::warn!(?e, offset, length, "ZC resolve_read failed");
+                            guard.commit(ZcAction::Complete(-libc::EIO), None);
+                        }
+                    }
+                });
+                ZcDispatch::Deferred
+            }
+            _ => ZcDispatch::Inline { action: ZcAction::Complete(-libc::EIO), keepalive: None },
+        }
+    }
+
+    fn after_write(
+        &self,
+        _op: u8,
+        offset: u64,
+        length: u32,
+        _tag: u16,
+        result: i32,
+        keepalive: Option<&(dyn std::any::Any + Send)>,
+    ) -> i32 {
+        if result < 0 {
+            return result;
+        }
+        // Downcast the keepalive back to the rotation-gate guard so we can
+        // pass the held `&SyncFile` to the commit path without re-acquiring
+        // `data_file.read()` (which would deadlock against a queued
+        // rotation writer).
+        let df: Option<&crate::block::write_cache::SyncFile> = keepalive
+            .and_then(|k| {
+                k.downcast_ref::<parking_lot::lock_api::ArcRwLockReadGuard<
+                    parking_lot::RawRwLock,
+                    crate::block::write_cache::SyncFile,
+                >>()
+            })
+            .map(|g| &**g);
+        let Some(df) = df else {
+            tracing::error!(offset, length, "ZC after_write: missing rotation-gate keepalive");
+            return -libc::EIO;
+        };
+        match self.handler.commit_after_zc_write_with(df, offset, u64::from(length), false) {
+            Ok(()) => {
+                #[allow(clippy::cast_possible_wrap)]
+                let r = length as i32;
+                r
+            }
+            Err(e) => {
+                tracing::warn!(?e, offset, length, "ZC commit_after_zc_write failed");
+                -libc::EIO
+            }
+        }
+    }
+}
+
+/// Drop-guard around `ZcQueueHandle::submit` for ZC dispatch tasks. If a
+/// spawned task panics or is cancelled before calling `commit`, the guard's
+/// `Drop` posts `-EIO` so the kernel I/O doesn't hang forever. The kernel
+/// `STOP_DEV` path would eventually clean it up, but that requires device
+/// teardown — fatal for a single misbehaving I/O.
+struct SubmitGuard {
+    tag: u16,
+    handle: Option<ublk_core::zc::ZcQueueHandle>,
+}
+
+impl SubmitGuard {
+    fn new(tag: u16, handle: ublk_core::zc::ZcQueueHandle) -> Self {
+        Self { tag, handle: Some(handle) }
+    }
+
+    fn commit(
+        &mut self,
+        action: ublk_core::zc::ZcAction,
+        keepalive: Option<ublk_core::zc::Keepalive>,
+    ) {
+        if let Some(handle) = self.handle.take() {
+            handle.submit(self.tag, action, keepalive);
+        }
+    }
+}
+
+impl Drop for SubmitGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            tracing::error!(
+                tag = self.tag,
+                "ZC dispatch task dropped without commit — sending -EIO"
+            );
+            handle.submit(self.tag, ublk_core::zc::ZcAction::Complete(-libc::EIO), None);
+        }
+    }
+}
+
+/// Under-gate hot-path check for ZC reads.
+///
+/// Returns `Some(action)` if EVERY block in `[offset, offset+length)` is
+/// currently DIRTY (and no flush rotation is in progress) — the read can
+/// be served as direct `READ_FIXED` from the held gate's data file
+/// without touching the async cold path. Returns `None` if any block
+/// requires S3 fetch or backfill — caller drops the gate and falls
+/// through to the async resolution.
+///
+/// Critical correctness property: the all-DIRTY check is done WHILE
+/// HOLDING the gate. Rotation can't transition any DIRTY block to
+/// SYNCING during the check, so by the time we emit LocalSsd entries
+/// the data is guaranteed to be in the active file the gate's fd
+/// points to. Without the gate, rotation between check and submit
+/// could redirect the data to the flushing file — caught by the soak
+/// test as a read-back-zero corruption.
+fn try_zc_read_hot_path(
+    handler: &BlockHandler,
+    df: &crate::block::write_cache::SyncFile,
+    offset: u64,
+    length: u32,
+) -> Option<ublk_core::zc::ZcAction> {
+    use std::os::unix::io::AsRawFd;
+    use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp};
+
+    let block_size = handler.block_size() as u64;
+    if length == 0 || block_size == 0 {
+        return None;
+    }
+    let start_block = offset / block_size;
+    let end_block = (offset + u64::from(length) - 1) / block_size;
+
+    if !handler.zc_all_dirty_under_gate(start_block, end_block) {
+        return None;
+    }
+
+    let fd = df.as_raw_fd();
+    #[allow(clippy::cast_possible_truncation)]
+    let num_chunks = (end_block - start_block + 1) as usize;
+    let mut chunks: Vec<ZcChunk> = Vec::with_capacity(num_chunks);
+    let mut buf_offset: u32 = 0;
+    for i in 0..num_chunks {
+        let block_idx = start_block + i as u64;
+        let chunk_start_byte = block_idx * block_size;
+        let slice_start = if block_idx == start_block {
+            #[allow(clippy::cast_possible_truncation)]
+            { (offset - chunk_start_byte) as u32 }
+        } else {
+            0
+        };
+        let slice_end = if block_idx == end_block {
+            let end_byte = offset + u64::from(length);
+            #[allow(clippy::cast_possible_truncation)]
+            let relative_end = (end_byte - chunk_start_byte) as u32;
+            relative_end.min(block_size as u32)
+        } else {
+            block_size as u32
+        };
+        let slice_len = slice_end - slice_start;
+        chunks.push(ZcChunk {
+            op: ZcChunkOp::ReadFixed {
+                fd,
+                src_offset: chunk_start_byte + u64::from(slice_start),
+            },
+            buf_offset,
+            length: slice_len,
+        });
+        buf_offset = buf_offset.saturating_add(slice_len);
+    }
+    Some(ZcAction::Chunks(chunks))
+}
+
+/// Translate a `ReadPlan` into one or more `READ_FIXED` chunks.
+///
+/// - `ChunkSource::LocalSsd { file_offset }`: direct `READ_FIXED` from
+///   the cache fd at `file_offset` into the bio. Hot path; no userspace
+///   touch of the data.
+/// - `ChunkSource::InMemory(data)`: pwrite the slice into this tag's
+///   scratch slot (memfd, per-tag isolated), then `READ_FIXED` from
+///   `scratch_fd` at `slot_offset + within_slot_offset`. Critically,
+///   the scratch is NOT the device-offset cache file — that means a
+///   concurrent ZC write's `WRITE_FIXED` to the same block offset can't
+///   collide with our cold-read pwrite. See
+///   `zc_glidefs_concurrent_rw_race_on_evicted_block` for the failure
+///   mode the prior cache-file-pwrite version produced.
+/// - `ChunkSource::Zero`: `READ_FIXED` from `/dev/zero` into the bio.
+fn build_read_chunks_in_file(
+    _handler: &BlockHandler,
+    plan: &crate::block::write_cache::ReadPlan,
+    _df: &crate::block::write_cache::SyncFile,
+    data_fd: std::os::fd::RawFd,
+    dev_zero_fd: std::os::fd::RawFd,
+    scratch_fd: std::os::fd::RawFd,
+    scratch_slot_offset: u64,
+) -> ublk_core::zc::ZcAction {
+    use crate::block::write_cache::ChunkSource;
+    use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp};
+
+    if plan.entries.is_empty() {
+        return ZcAction::Complete(0);
+    }
+
+    let mut chunks: Vec<ZcChunk> = Vec::with_capacity(plan.entries.len());
+    let mut buf_offset: u32 = 0;
+    let mut scratch_used: u64 = 0;
+    for entry in plan.entries.iter() {
+        #[allow(clippy::cast_possible_truncation)]
+        let slice_len = entry.slice_len as u32;
+        let chunk_op = match &entry.source {
+            ChunkSource::LocalSsd { file_offset } => ZcChunkOp::ReadFixed {
+                fd: data_fd,
+                src_offset: *file_offset,
+            },
+            ChunkSource::InMemory(data) => {
+                // Land just the needed slice into this tag's scratch slot.
+                let slice = &data[entry.slice_start..entry.slice_start + entry.slice_len];
+                let scratch_off = scratch_slot_offset + scratch_used;
+                // SAFETY: scratch_fd is a memfd we own; the buffer is
+                // a valid `&[u8]`. pwrite never reads from the buffer
+                // after returning. Failure returns negative; we propagate.
+                let written = unsafe {
+                    libc::pwrite(
+                        scratch_fd,
+                        slice.as_ptr() as *const libc::c_void,
+                        slice.len(),
+                        scratch_off as libc::off_t,
+                    )
+                };
+                if written < 0 || written as usize != slice.len() {
+                    tracing::warn!(
+                        scratch_off,
+                        len = slice.len(),
+                        written,
+                        "ZC cold-read scratch pwrite failed"
+                    );
+                    return ZcAction::Complete(-libc::EIO);
+                }
+                let op = ZcChunkOp::ReadFixed {
+                    fd: scratch_fd,
+                    src_offset: scratch_off,
+                };
+                scratch_used += entry.slice_len as u64;
+                op
+            }
+            ChunkSource::Zero => ZcChunkOp::ReadFixed {
+                fd: dev_zero_fd,
+                src_offset: 0,
+            },
+        };
+        chunks.push(ZcChunk {
+            op: chunk_op,
+            buf_offset,
+            length: slice_len,
+        });
+        buf_offset = buf_offset.saturating_add(slice_len);
+    }
+    ZcAction::Chunks(chunks)
+}
+
+/// Dedicated multi-thread tokio runtime for the ZC dispatch hot path.
+///
+/// Reason it exists: the ZC worker thread calls `runtime.spawn(...)` for each
+/// FETCH it dispatches (async `pre_write` / `resolve_read` then a back-
+/// channel submit). Those tasks must make progress *concurrently* with
+/// whoever owns the parent runtime — e.g. a test using `Command::output()`
+/// synchronously on a `current_thread` runtime would block its only thread,
+/// starving any spawned ZC dispatch task and hanging the device. Production
+/// already uses `#[tokio::main]` (multi-thread), but tests routinely don't.
+/// Owning our own runtime is the architectural fix.
+///
+/// Shared across all ZC queues / devices in the process. Sized to
+/// `available_parallelism` so it scales with the host. Lazy init; lives for
+/// the rest of the process — never explicitly dropped (no clean point).
+fn zc_dispatch_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(4);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(cpus)
+            .thread_name("glidefs-zc-dispatch")
+            .enable_all()
+            .build()
+            .expect("failed to build ZC dispatch runtime")
+    })
+}
+
+/// One async task per queue. Spawns a dedicated OS thread for the ZC
+/// io_uring loop, then awaits its completion via a oneshot.
+///
+/// **Why a dedicated OS thread**: `run_zc_queue` is a synchronous
+/// `submit_and_wait`-driven loop. The kernel requires `IORING_SETUP_SINGLE_
+/// ISSUER` on this ring — only one thread may push SQEs. Folding this into
+/// the existing tokio runtime would mean integrating io_uring as an
+/// `AsyncFd` and submitting via futures, which is a much bigger surgery.
+/// One thread per queue is the cheapest correct hosting; the dedicated ZC
+/// dispatch runtime (see [`zc_dispatch_runtime`]) owns the async handler
+/// work.
+pub(super) async fn io_task_zero_copy(
+    q: &UblkQueue,
+    handler: Arc<BlockHandler>,
+) -> Result<(), UblkError> {
+    use std::os::fd::RawFd;
+    let cdev_fd: RawFd = q.dev.tgt.fds[0];
+    let qid = q.get_qid();
+    let queue_depth = q.dev.dev_info.queue_depth;
+    let dev_id = q.dev.dev_info.dev_id;
+    let runtime = zc_dispatch_runtime().handle().clone();
+
+    // Open /dev/zero once per queue. Used as the source fd for READ_FIXED
+    // on zero-block chunks — kernel reads zeros directly into bio, no
+    // userspace memset, no per-tag scratch buffer.
+    let dev_zero_path = std::ffi::CString::new("/dev/zero").unwrap();
+    let dev_zero_fd = unsafe { libc::open(dev_zero_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if dev_zero_fd < 0 {
+        return Err(UblkError::IOError(std::io::Error::last_os_error()));
+    }
+
+    // Per-queue scratch memfd, sized to queue_depth × max_io_buf_bytes.
+    // Each tag T owns slot at byte offset T * max_io_buf_bytes. Used as
+    // the bounce target for cold-path reads (InMemory chunks) so the
+    // pwrite can't collide with concurrent device-offset writes. See
+    // `GlidefsZcTarget::scratch_fd` doc-comment for the failure mode
+    // this prevents.
+    let max_io_buf_bytes = q.dev.dev_info.max_io_buf_bytes;
+    let scratch_slot_bytes = u64::from(max_io_buf_bytes);
+    let scratch_total = scratch_slot_bytes
+        .checked_mul(u64::from(queue_depth))
+        .ok_or(UblkError::OtherError(-libc::EINVAL))?;
+    let scratch_name = std::ffi::CString::new(format!("glidefs-zc-scratch-{}-{}", dev_id, qid))
+        .map_err(|_| UblkError::OtherError(-libc::EINVAL))?;
+    let scratch_fd =
+        unsafe { libc::syscall(libc::SYS_memfd_create, scratch_name.as_ptr(), 0u32) as RawFd };
+    if scratch_fd < 0 {
+        unsafe { libc::close(dev_zero_fd) };
+        return Err(UblkError::IOError(std::io::Error::last_os_error()));
+    }
+    if unsafe { libc::ftruncate(scratch_fd, scratch_total as i64) } < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(scratch_fd);
+            libc::close(dev_zero_fd);
+        }
+        return Err(UblkError::IOError(err));
+    }
+
+    let target: Arc<dyn ublk_core::zc::ZcTarget> = Arc::new(GlidefsZcTarget {
+        handler,
+        runtime,
+        dev_zero_fd,
+        scratch_fd,
+        scratch_slot_bytes,
+    });
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+
+    // Cross-thread wake-up eventfd. Owned out here (not inside
+    // `run_zc_queue`) so the Drop guard can write to it after flipping
+    // `stop` — that's what gives us a synchronous LIVE→QUIESCED
+    // transition during handoff cutover. EFD_NONBLOCK so loop reads
+    // never block; EFD_CLOEXEC because nothing in glidefs forks.
+    let wake_fd: RawFd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if wake_fd < 0 {
+        return Err(UblkError::IOError(std::io::Error::last_os_error()));
+    }
+
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let join = std::thread::Builder::new()
+        .name(format!("glidefs-zc-{}-{}", dev_id, qid))
+        .spawn(move || {
+            let result = ublk_core::zc::run_zc_queue(
+                cdev_fd,
+                qid,
+                queue_depth,
+                target,
+                stop_for_thread,
+                wake_fd,
+            );
+            let _ = done_tx.send(result);
+        })
+        .map_err(|e| UblkError::IOError(std::io::Error::other(e.to_string())))?;
+
+    // Drop guard: if the future is cancelled (worker pool shutdown
+    // during handoff cutover, panic during normal shutdown, etc.):
+    //
+    //   1. Flip `stop = true`
+    //   2. Write to `wake_fd` so any in-flight `submit_and_wait(1)`
+    //      returns immediately via the PollAdd CQE (without this, the
+    //      loop sleeps until the next real CQE — which never comes on a
+    //      quiesced device, deadlocking shutdown).
+    //   3. Join the ZC thread.
+    //   4. Close `wake_fd`.
+    //
+    // The thread sees `stop`, drains pending CQEs non-blockingly, then
+    // breaks → IoUring drops → its fd closes → kernel transitions the
+    // ublk device LIVE→QUIESCED (UBLK_F_USER_RECOVERY contract). That's
+    // the path the successor's recovery requires.
+    //
+    // Caught by `handoff_durability_crh_per_pr` + `fs_crash_recovery::
+    // test_fs_crash_fsync_honored_ublk`.
+    struct ZcThreadGuard {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        wake_fd: RawFd,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for ZcThreadGuard {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Wake the loop. Errors ignored — at worst we wait for the
+            // thread's own bounded poll timeout.
+            let one = 1u64.to_ne_bytes();
+            unsafe {
+                libc::write(self.wake_fd, one.as_ptr() as *const _, 8);
+            }
+            if let Some(j) = self.join.take() {
+                let h = j;
+                let detach_after = std::time::Duration::from_secs(5);
+                let start = std::time::Instant::now();
+                while !h.is_finished() && start.elapsed() < detach_after {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                if h.is_finished() {
+                    let _ = h.join();
+                }
+                // else: detach — the thread will exit when the process does.
+            }
+            unsafe { libc::close(self.wake_fd) };
+        }
+    }
+    let _zc_guard = ZcThreadGuard {
+        stop,
+        wake_fd,
+        join: Some(join),
+    };
+
+    // Kernel `STOP_DEV` aborts in-flight FETCHes → `run_zc_queue` observes
+    // the ABORT CQEs → exits its loop → `done_tx` fires → we return.
+    // Future cancellation (handoff cutover) hits `ZcThreadGuard::drop`
+    // instead, which signals `stop` and waits for the thread to exit.
+    match done_rx.await {
+        Ok(result) => result,
+        Err(_) => Ok(()),
     }
 }
 

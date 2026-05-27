@@ -109,7 +109,7 @@ jobs:
   blktests:
     name: blktests (Linux)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -130,10 +130,70 @@ jobs:
         if: failure()
         run: sudo dmesg --color=never | tail -200
 
-  kernel-devices:
-    name: Kernel Devices (Linux)
-    timeout-minutes: 30
+  ublk-transports:
+    # ublk transport matrix: exercise both ZC and USER_COPY dispatch
+    # paths on the same kernel. ubuntu-24.04 advertises ZC, so the
+    # default-env run exercises `io_task_zero_copy`/`run_zc_queue`/
+    # rotation-gate; the forced-env run exercises the legacy
+    # `io_task_user_copy` fallback. A regression on either path
+    # fails CI.
+    name: ublk-transport-${{ matrix.transport }}
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - transport: zero-copy
+            force_user_copy: ""
+          - transport: user-copy
+            force_user_copy: "1"
+    env:
+      GLIDEFS_TEST_FORCE_USER_COPY: ${{ matrix.force_user_copy }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          shared-key: "ublk-${{ matrix.transport }}"
+      - name: Install kernel modules + fio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r) fio
+      - name: Load kernel modules
+        run: |
+          sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+      - name: Report kernel version
+        run: uname -r
+      - name: zc_glidefs (${{ matrix.transport }})
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,test-utils --test zc_glidefs -- --nocapture
+      - name: Kernel logs (on failure)
+        if: failure()
+        run: sudo dmesg --color=never | tail -200
+
+  kernel-devices:
+    # Full kernel-device data-plane suite under BOTH ublk transports.
+    # GitHub schedules each matrix entry as a separate runner, so the
+    # two transports run in parallel — total wall-time stays at one
+    # job's worth. Without this, only the `zc_glidefs` test in
+    # `ublk-transports` ran against USER_COPY; fio_bench, fio_verify,
+    # docker_integration, fs_crash, handoff, and the `Test (ublk)`
+    # unit tests were ZC-only.
+    name: Kernel Devices (${{ matrix.transport }})
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - transport: zero-copy
+            force_user_copy: ""
+          - transport: user-copy
+            force_user_copy: "1"
+    env:
+      GLIDEFS_FORCE_USER_COPY: ${{ matrix.force_user_copy }}
+      GLIDEFS_TEST_FORCE_USER_COPY: ${{ matrix.force_user_copy }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -142,6 +202,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          shared-key: "kernel-devices-${{ matrix.transport }}"
       - name: Install kernel modules + fio
         run: |
           sudo apt-get update
@@ -152,19 +213,21 @@ jobs:
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
-      - name: fio benchmark (ublk)
-        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture
-      - name: fio verify (ublk)
+      - name: Report kernel version
+        run: uname -r
+      - name: fio benchmark (${{ matrix.transport }})
+        run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture --test-threads=1
+      - name: fio verify (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_verify -- --nocapture
-      - name: Handoff durability (per-PR profile, ublk)
+      - name: Handoff durability per-PR (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,fio-bench,test-fault-injection --test handoff_durability -- --ignored --nocapture handoff_durability_crh_per_pr
-      - name: Handoff fault-injection grid (ublk)
+      - name: Handoff fault-injection grid (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features ublk,fio-bench,test-fault-injection --test handoff_durability -- --ignored --nocapture handoff_fault_injection_grid_crh
-      - name: Test (ublk)
+      - name: Test (${{ matrix.transport }})
         run: cargo test -p glidefs --features ublk,test-utils --verbose
-      - name: Docker integration (ublk)
+      - name: Docker integration (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration ublk --verbose
-      - name: Filesystem crash recovery (nbd + ublk)
+      - name: Filesystem crash recovery (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features ublk,docker-tests --test docker_integration --verbose fs_crash -- --nocapture
       - name: Kernel logs (on failure)
         if: failure()
