@@ -983,10 +983,26 @@ impl CacheInner {
                     }
                     continue;
                 }
-                // We hold the claim. Propagate errors: silent skip on a
-                // flushing-read failure would leave the active file as
-                // zeros for un-covered bytes of the sibling's WRITE_FIXED.
-                let pread_err = ff.read_exact_at(&mut buf[..valid], offset);
+                // We hold the claim. Wrap the rest in a RAII guard so a
+                // panic or early return — including the `?` propagation on
+                // pwrite errors — releases the claim and wakes waiters.
+                // Without this, a panicking holder would park every
+                // subsequent promoter for the full 5 s deadline.
+                struct ClaimGuard<'a> {
+                    claim: &'a PromoteClaimBitmap,
+                    idx: usize,
+                }
+                impl<'a> Drop for ClaimGuard<'a> {
+                    fn drop(&mut self) {
+                        self.claim.release(self.idx);
+                    }
+                }
+                let _guard = ClaimGuard { claim: &self.promote_claim, idx };
+
+                // Propagate errors: silent skip on a flushing-read failure
+                // would leave the active file as zeros for un-covered
+                // bytes of the sibling's WRITE_FIXED.
+                ff.read_exact_at(&mut buf[..valid], offset)?;
 
                 #[cfg(feature = "test-utils")]
                 {
@@ -996,7 +1012,7 @@ impl CacheInner {
                     }
                 }
 
-                let pwrite_res = pread_err.and_then(|_| df.write_all_at(&buf[..valid], offset));
+                df.write_all_at(&buf[..valid], offset)?;
 
                 #[cfg(feature = "test-utils")]
                 {
@@ -1027,8 +1043,7 @@ impl CacheInner {
                 {
                     self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                 }
-                self.promote_claim.release(idx);
-                pwrite_res?;
+                // _guard drops here, releasing the claim + waking waiters.
             }
         } else if require_promotion {
             // No flushing file available. If any block in the range needs
