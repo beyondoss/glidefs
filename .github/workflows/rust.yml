@@ -124,6 +124,10 @@ jobs:
         run: |
           sudo modprobe nbd || echo "nbd not available"
           sudo modprobe ublk_drv || echo "ublk_drv not available"
+      - name: Install ublk udev rule
+        run: |
+          sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
+          sudo udevadm control --reload-rules
       - name: Run blktests
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features blktests --test blktests -- --nocapture
       - name: Kernel logs (on failure)
@@ -164,6 +168,10 @@ jobs:
       - name: Load kernel modules
         run: |
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+      - name: Install ublk udev rule
+        run: |
+          sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
+          sudo udevadm control --reload-rules
       - name: Report kernel version
         run: uname -r
       - name: zc_glidefs (${{ matrix.transport }})
@@ -213,6 +221,10 @@ jobs:
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+      - name: Install ublk udev rule
+        run: |
+          sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
+          sudo udevadm control --reload-rules
       - name: Report kernel version
         run: uname -r
       - name: fio benchmark (${{ matrix.transport }})
