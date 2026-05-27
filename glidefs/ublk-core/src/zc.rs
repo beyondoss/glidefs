@@ -590,18 +590,32 @@ pub fn run_zc_queue(
                 if slot.outstanding == 0 {
                     to_submit.push(finalize(tag, &mut inflight, &target, qid));
                 }
-            } else if res == sys::UBLK_IO_RES_ABORT as i32 || res < 0 {
-                // Kernel `STOP_DEV` aborts every armed FETCH with
-                // `UBLK_IO_RES_ABORT`. Once we've drained one abort per
-                // tag, no more CQEs are coming (no in-flight chunk SQEs,
-                // no re-armed FETCHes), and the next `submit_and_wait(1)`
-                // would sleep forever. Count aborts; when we've seen them
-                // all, break the outer loop so the caller's `done_rx`
-                // resolves and `UblkDevice::unregister` can finish.
+            } else if res == sys::UBLK_IO_RES_ABORT as i32 {
+                // Kernel `STOP_DEV` aborts every armed FETCH with the
+                // `UBLK_IO_RES_ABORT` sentinel (= -ENODEV). Once we've
+                // drained one abort per tag, no more CQEs are coming
+                // (no in-flight chunk SQEs, no re-armed FETCHes), and
+                // the next `submit_and_wait(1)` would sleep forever.
+                // Count aborts; when we've seen them all, break the
+                // outer loop so the caller's `done_rx` resolves and
+                // `UblkDevice::unregister` can finish.
+                //
+                // *Only* the -ENODEV sentinel counts. Other negative
+                // returns on a non-data CQE (transient `-EAGAIN`,
+                // `-EINTR`, pre-START_DEV `-EINVAL`, etc.) are not
+                // queue-terminal — counting them caused a CI hang where
+                // ~queue_depth pre-START_DEV transient errors broke the
+                // loop before the device was even live, leaving the
+                // kernel device with no userspace handler.
                 aborted = aborted.saturating_add(1);
                 if aborted >= queue_depth as usize {
                     break 'outer;
                 }
+                continue;
+            } else if res < 0 {
+                // Transient or unexpected error on a non-data CQE — skip
+                // and keep the loop running. The kernel will re-issue or
+                // STOP_DEV will eventually flush the queue with ABORTs.
                 continue;
             } else {
                 let iod = unsafe {
