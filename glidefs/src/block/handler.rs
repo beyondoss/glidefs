@@ -487,10 +487,31 @@ impl BlockHandler {
             // `data corruption` flake.
             //
             // `try_claim_block` CAS's NOT_PRESENT→CLEAN; the winner does
-            // the pwrite + transitions DIRTY. Losers exited the
-            // CLEAN-wait loop above, then `is_block_present` returned
-            // true, so they `continue`d past this point already.
+            // the pwrite + transitions DIRTY.
             if !self.cache.try_claim_block(idx) {
+                // We LOST the CAS — another caller claimed the block
+                // between our `wait_for_clean` at the top of the loop
+                // and now (their CAS landed during our S3 fetch).
+                //
+                // Critical: we MUST wait here for the winner's pwrite to
+                // complete (state CLEAN→DIRTY) before returning. Without
+                // this wait, our caller's subsequent kernel WRITE_FIXED
+                // submits immediately, lands its NEW bytes, and then the
+                // winner's S3 pwrite (still in flight) clobbers them
+                // with stale data. This is the actual block/042
+                // corruption shape: the top-of-loop wait is necessary
+                // but not sufficient — losers entering AFTER the wait
+                // need to wait again.
+                while self.cache.block_state(idx).is_clean() {
+                    if std::time::Instant::now() >= clean_deadline {
+                        tracing::warn!(
+                            block = idx,
+                            "backfill: timed out waiting for CAS winner's CLEAN→DIRTY after losing CAS; proceeding"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                }
                 continue;
             }
             self.cache.write(block_start, &block_data)?;
