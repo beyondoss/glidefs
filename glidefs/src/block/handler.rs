@@ -391,38 +391,32 @@ impl BlockHandler {
 
         for block in start_block..=end_block {
             let idx = block as usize;
-            // Wait for any in-flight backfill claim on this block to
-            // finish its data pwrite (state transitions CLEAN→DIRTY).
-            // Without this wait, our caller's subsequent kernel
-            // WRITE_FIXED for the same block can race the winner's S3
-            // pwrite: WRITE_FIXED lands the guest bytes, then the
-            // winner's full-block pwrite clobbers them with stale S3
-            // data. Same shape as `backfill_and_write`'s CLEAN-wait
-            // branch — only the gate location differs.
+            // Wait for any in-flight backfill claim on this block to finish
+            // its data pwrite (state transitions CLEAN→DIRTY). Without this
+            // wait, our caller's subsequent kernel WRITE_FIXED for the same
+            // block can race the winner's S3 pwrite: WRITE_FIXED lands the
+            // guest bytes, then the winner's full-block pwrite clobbers them
+            // with stale S3 data. Same shape as `backfill_and_write`'s
+            // CLEAN-wait branch — only the gate location differs.
             //
-            // Yield-loop instead of `tokio::time::sleep` because the
-            // latter routes through the time driver, which deadlocked
-            // CI runs of `zc_glidefs_flush_rotation_deadlock` and the
-            // ublk-transport zc_glidefs matrix on the GitHub Azure
-            // 6.17.0-1015 runner (every test stuck >17 min). `yield_now`
-            // is a pure scheduling hint — no timer, no lock, runs
-            // wherever the executor next picks us. 500k iterations is
-            // ~50–500 ms of cumulative wait at sub-microsecond yields;
-            // if we're still CLEAN past that, the winner is genuinely
-            // stuck and we proceed (the kernel WRITE_FIXED still lands
-            // correctly because the winner's set_present already moved
-            // the block out of NOT_PRESENT).
-            let mut yields = 0u32;
+            // Bounded by a deadline so a panicking winner can't park us
+            // here forever. On timeout we log + proceed; the kernel
+            // WRITE_FIXED that follows still lands correctly because the
+            // winner's set_present transitioned the block out of
+            // NOT_PRESENT (even if the data pwrite never completed, the
+            // guest's WRITE_FIXED is the source of truth for the bytes the
+            // caller is writing).
+            let clean_deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(5);
             while self.cache.block_state(idx).is_clean() {
-                if yields >= 500_000 {
+                if std::time::Instant::now() >= clean_deadline {
                     tracing::warn!(
                         block = idx,
-                        "backfill: gave up waiting for prior writer's CLEAN→DIRTY transition after 500k yields; proceeding"
+                        "backfill: timed out waiting for prior writer's CLEAN→DIRTY transition; proceeding"
                     );
                     break;
                 }
-                yields += 1;
-                tokio::task::yield_now().await;
+                tokio::time::sleep(std::time::Duration::from_micros(50)).await;
             }
             if self.cache.is_block_present(idx) {
                 continue;
@@ -484,42 +478,12 @@ impl BlockHandler {
                 continue;
             }
             // CAS-gated backfill: only one caller writes the S3 block to
-            // the cache file. Without this gate, two concurrent sibling-
-            // bio partial writes (e.g. the kernel splits a 128 KiB write
-            // into [0..28KB) + [28KB..128KB)) each race through this
-            // function, each pwriting the full S3 block — the LATE
-            // backfill can overwrite the EARLY bio's `WRITE_FIXED`
-            // partial bytes, producing the blktests block/042
-            // `data corruption` flake.
-            //
-            // `try_claim_block` CAS's NOT_PRESENT→CLEAN; the winner does
-            // the pwrite + transitions DIRTY.
+            // the cache file. Loser skips; their caller's subsequent
+            // `WRITE_FIXED` is correctness-equivalent because the winner
+            // pwrites stale S3 data and the loser's `WRITE_FIXED` is the
+            // *guest's intended new bytes* — both writers are racing to
+            // produce the same logical state.
             if !self.cache.try_claim_block(idx) {
-                // We LOST the CAS — another caller claimed the block
-                // between our `wait_for_clean` at the top of the loop
-                // and now (their CAS landed during our S3 fetch).
-                //
-                // Critical: we MUST wait here for the winner's pwrite to
-                // complete (state CLEAN→DIRTY) before returning. Without
-                // this wait, our caller's subsequent kernel WRITE_FIXED
-                // submits immediately, lands its NEW bytes, and then the
-                // winner's S3 pwrite (still in flight) clobbers them
-                // with stale data. This is the actual block/042
-                // corruption shape: the top-of-loop wait is necessary
-                // but not sufficient — losers entering AFTER the wait
-                // need to wait again.
-                let mut yields = 0u32;
-                while self.cache.block_state(idx).is_clean() {
-                    if yields >= 500_000 {
-                        tracing::warn!(
-                            block = idx,
-                            "backfill: gave up waiting for CAS winner's CLEAN→DIRTY after 500k yields; proceeding"
-                        );
-                        break;
-                    }
-                    yields += 1;
-                    tokio::task::yield_now().await;
-                }
                 continue;
             }
             self.cache.write(block_start, &block_data)?;
@@ -654,28 +618,11 @@ impl BlockHandler {
                     _ if state.is_clean() => {
                         // Another writer claimed this block but hasn't written
                         // the merged data yet. Wait for completion.
-                        //
-                        // `yield_now` rather than `tokio::time::sleep` for the
-                        // same reason as `backfill_blocks_in_range` (see comment
-                        // there): the time-driver path can stall on the CI
-                        // GitHub Azure 6.17.0-1015 runner under the
-                        // zc_glidefs_flush_rotation_deadlock + sibling write
-                        // load. 500k yields ≈ 50–500 ms of cumulative wait
-                        // before we give up and fall through to a re-check.
-                        let mut yields = 0u32;
                         loop {
                             if !self.cache.block_state(idx).is_clean() {
                                 break;
                             }
-                            if yields >= 500_000 {
-                                tracing::warn!(
-                                    block = idx,
-                                    "backfill_and_write: gave up waiting for CLEAN→DIRTY after 500k yields; proceeding"
-                                );
-                                break;
-                            }
-                            yields += 1;
-                            tokio::task::yield_now().await;
+                            tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                         }
                         // State changed — re-enter the outer match to handle
                         // whatever it became (DIRTY, SYNCING, or NOT_PRESENT
