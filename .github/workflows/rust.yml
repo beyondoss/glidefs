@@ -116,36 +116,58 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - name: Pin to ublk-working kernel (work around 1015 ublk_drv NULL deref)
-        # linux-azure 6.17.0-1015 has a backport-order regression in
-        # ublk_drv: ublk_ctrl_add_dev() calls ublk_init_queues() before
-        # ublk_add_tag_set(), so the new NUMA-aware code in
-        # ublk_get_queue_numa_node() reads tag_set.map[0].mq_map (still
-        # NULL until ublk_add_tag_set runs) and oopses the io_uring
-        # worker. Upstream Linux has the calls in the correct order.
-        # Drop this step when Ubuntu ships 6.17.0-1016+ with the fix.
+      - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
+        # linux-azure 6.17.0-1015 has a backport-order regression:
+        # ublk_ctrl_add_dev() calls ublk_init_queues() *before*
+        # ublk_add_tag_set(), so the new ublk_get_queue_numa_node()
+        # helper reads tag_set.map[0].mq_map (NULL until
+        # ublk_add_tag_set runs) and oopses the io_uring worker on every
+        # UBLK_CMD_ADD_DEV. Upstream Linux has the calls in the correct
+        # order (drivers/block/ublk_drv.c:4790-4794 in v6.18-rc).
+        #
+        # Workaround: binary-patch 2 bytes in the loaded ublk_drv.ko to
+        # turn the `jb` (loop back to NULL deref) into `nop nop`, which
+        # exits the CPU-search loop on the first iteration, returns
+        # NUMA_NO_NODE, and lets kvzalloc_node fall back to default
+        # allocation. We lose NUMA-aware queue placement on this build
+        # only — same behavior as upstream pre-NUMA-patch.
+        #
+        # Pattern is unique in the .ko: 39 f0 72 d6
+        #   39 f0 = cmp %esi,%eax    (loop bound check)
+        #   72 d6 = jb -0x2a         (back to NULL deref)
+        # Patch: 72 d6 → 90 90 (two NOPs, fall through to NUMA_NO_NODE).
+        #
+        # Drop when Ubuntu ships 6.17.0-1016+ with the call-order fix.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            linux-image-6.17.0-1013-azure \
-            linux-modules-extra-6.17.0-1013-azure \
-            linux-headers-6.17.0-1013-azure \
-            kexec-tools
-          sudo kexec -l /boot/vmlinuz-6.17.0-1013-azure \
-            --initrd=/boot/initrd.img-6.17.0-1013-azure \
-            --reuse-cmdline
-          sudo systemctl kexec
-      - name: Wait for kexec target kernel to come up
-        run: |
-          for i in $(seq 1 60); do
-            current=$(uname -r)
-            if [ "$current" = "6.17.0-1013-azure" ]; then
-              echo "kexec succeeded — running on $current"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "kexec timeout — still on $(uname -r)"; exit 1
+          uname -r
+          KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
+          [ -f "$KO_SRC" ] || { echo "module not at $KO_SRC"; ls /lib/modules/$(uname -r)/kernel/drivers/block/; exit 0; }
+          # Ensure we don't have ublk_drv currently loaded
+          sudo rmmod ublk_drv 2>/dev/null || true
+          # Decompress, patch, recompress in place
+          sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          python3 - <<'PY'
+          import re, sys
+          PATH = "/tmp/ublk_drv.ko"
+          data = bytearray(open(PATH, "rb").read())
+          # cmp %esi,%eax ; jb -0x2a
+          matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
+          if len(matches) != 1:
+              print(f"expected 1 match, found {len(matches)} — module may already be patched or different kernel version", file=sys.stderr)
+              # Check if NOPs already there (idempotent)
+              nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
+              if nop_pattern:
+                  print("module already patched — skipping", file=sys.stderr)
+                  sys.exit(0)
+              sys.exit(1)
+          off = matches[0].start() + 2
+          data[off:off+2] = b'\x90\x90'
+          open(PATH, "wb").write(bytes(data))
+          print(f"patched offset {hex(off)} (jb -> nop nop)")
+          PY
+          # Replace the on-disk module so modprobe picks up the patched copy
+          sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
+          sudo depmod -a
       - name: Install kernel modules + build deps
         run: |
           sudo apt-get install -y linux-modules-extra-$(uname -r) build-essential fio
@@ -190,30 +212,33 @@ jobs:
         with:
           workspaces: ". -> target"
           shared-key: "ublk-${{ matrix.transport }}"
-      - name: Pin to ublk-working kernel (work around 1015 ublk_drv NULL deref)
+      - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
         # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            linux-image-6.17.0-1013-azure \
-            linux-modules-extra-6.17.0-1013-azure \
-            linux-headers-6.17.0-1013-azure \
-            kexec-tools
-          sudo kexec -l /boot/vmlinuz-6.17.0-1013-azure \
-            --initrd=/boot/initrd.img-6.17.0-1013-azure \
-            --reuse-cmdline
-          sudo systemctl kexec
-      - name: Wait for kexec target kernel to come up
-        run: |
-          for i in $(seq 1 60); do
-            current=$(uname -r)
-            if [ "$current" = "6.17.0-1013-azure" ]; then
-              echo "kexec succeeded — running on $current"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "kexec timeout — still on $(uname -r)"; exit 1
+          uname -r
+          KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
+          [ -f "$KO_SRC" ] || { echo "module not at $KO_SRC"; ls /lib/modules/$(uname -r)/kernel/drivers/block/; exit 0; }
+          sudo rmmod ublk_drv 2>/dev/null || true
+          sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          python3 - <<'PY'
+          import re, sys
+          PATH = "/tmp/ublk_drv.ko"
+          data = bytearray(open(PATH, "rb").read())
+          matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
+          if len(matches) != 1:
+              nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
+              if nop_pattern:
+                  print("module already patched — skipping", file=sys.stderr)
+                  sys.exit(0)
+              print(f"expected 1 match, found {len(matches)}", file=sys.stderr)
+              sys.exit(1)
+          off = matches[0].start() + 2
+          data[off:off+2] = b'\x90\x90'
+          open(PATH, "wb").write(bytes(data))
+          print(f"patched offset {hex(off)}")
+          PY
+          sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
+          sudo depmod -a
       - name: Install kernel modules + fio
         run: |
           sudo apt-get install -y linux-modules-extra-$(uname -r) fio
@@ -263,30 +288,33 @@ jobs:
         with:
           workspaces: ". -> target"
           shared-key: "kernel-devices-${{ matrix.transport }}"
-      - name: Pin to ublk-working kernel (work around 1015 ublk_drv NULL deref)
+      - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
         # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            linux-image-6.17.0-1013-azure \
-            linux-modules-extra-6.17.0-1013-azure \
-            linux-headers-6.17.0-1013-azure \
-            kexec-tools
-          sudo kexec -l /boot/vmlinuz-6.17.0-1013-azure \
-            --initrd=/boot/initrd.img-6.17.0-1013-azure \
-            --reuse-cmdline
-          sudo systemctl kexec
-      - name: Wait for kexec target kernel to come up
-        run: |
-          for i in $(seq 1 60); do
-            current=$(uname -r)
-            if [ "$current" = "6.17.0-1013-azure" ]; then
-              echo "kexec succeeded — running on $current"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "kexec timeout — still on $(uname -r)"; exit 1
+          uname -r
+          KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
+          [ -f "$KO_SRC" ] || { echo "module not at $KO_SRC"; ls /lib/modules/$(uname -r)/kernel/drivers/block/; exit 0; }
+          sudo rmmod ublk_drv 2>/dev/null || true
+          sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          python3 - <<'PY'
+          import re, sys
+          PATH = "/tmp/ublk_drv.ko"
+          data = bytearray(open(PATH, "rb").read())
+          matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
+          if len(matches) != 1:
+              nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
+              if nop_pattern:
+                  print("module already patched — skipping", file=sys.stderr)
+                  sys.exit(0)
+              print(f"expected 1 match, found {len(matches)}", file=sys.stderr)
+              sys.exit(1)
+          off = matches[0].start() + 2
+          data[off:off+2] = b'\x90\x90'
+          open(PATH, "wb").write(bytes(data))
+          print(f"patched offset {hex(off)}")
+          PY
+          sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
+          sudo depmod -a
       - name: Install kernel modules + fio
         run: |
           sudo apt-get install -y linux-modules-extra-$(uname -r) fio
