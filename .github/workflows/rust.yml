@@ -120,10 +120,72 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-modules-extra-$(uname -r) build-essential fio
+      - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
+        # linux-azure 6.17.0-1015 has a backport-order regression:
+        # ublk_ctrl_add_dev() calls ublk_init_queues() *before*
+        # ublk_add_tag_set(), so the new ublk_get_queue_numa_node()
+        # helper reads tag_set.map[0].mq_map (NULL until
+        # ublk_add_tag_set runs) and oopses the io_uring worker on every
+        # UBLK_CMD_ADD_DEV. Upstream Linux has the calls in the correct
+        # order (drivers/block/ublk_drv.c:4790-4794 in v6.18-rc).
+        #
+        # Workaround: binary-patch 2 bytes in the loaded ublk_drv.ko to
+        # turn the `jb` (loop back to NULL deref) into `nop nop`, which
+        # exits the CPU-search loop on the first iteration, returns
+        # NUMA_NO_NODE, and lets kvzalloc_node fall back to default
+        # allocation. We lose NUMA-aware queue placement on this build
+        # only — same behavior as upstream pre-NUMA-patch.
+        #
+        # Pattern is unique in the .ko: 39 f0 72 d6
+        #   39 f0 = cmp %esi,%eax    (loop bound check)
+        #   72 d6 = jb -0x2a         (back to NULL deref)
+        # Patch: 72 d6 → 90 90 (two NOPs, fall through to NUMA_NO_NODE).
+        #
+        # Drop when Ubuntu ships 6.17.0-1016+ with the call-order fix.
+        run: |
+          uname -r
+          KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
+          if [ ! -f "$KO_SRC" ]; then
+            echo "module not at $KO_SRC — modules-extra not installed?"
+            ls /lib/modules/$(uname -r)/kernel/drivers/block/
+            exit 1
+          fi
+          sudo rmmod ublk_drv 2>/dev/null || true
+          sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          sudo chown $(id -u):$(id -g) /tmp/ublk_drv.ko
+          python3 - <<'PY'
+          import re, sys
+          PATH = "/tmp/ublk_drv.ko"
+          data = bytearray(open(PATH, "rb").read())
+          matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
+          if len(matches) == 0:
+              # Kernel is not affected by the 1015 backport regression
+              # (e.g. running on 1013 or earlier, or a kernel where the
+              # patch hasn't landed). No patch needed.
+              print("buggy pattern not present — kernel not affected, skipping", file=sys.stderr)
+              sys.exit(0)
+          if len(matches) > 1:
+              nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
+              if nop_pattern:
+                  print("module already patched — skipping", file=sys.stderr)
+                  sys.exit(0)
+              print(f"ambiguous: {len(matches)} matches of 39 f0 72 d6", file=sys.stderr)
+              sys.exit(1)
+          off = matches[0].start() + 2
+          data[off:off+2] = b'\x90\x90'
+          open(PATH, "wb").write(bytes(data))
+          print(f"patched offset {hex(off)} (jb -> nop nop)")
+          PY
+          sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
+          sudo depmod -a
       - name: Load kernel modules
         run: |
           sudo modprobe nbd || echo "nbd not available"
           sudo modprobe ublk_drv || echo "ublk_drv not available"
+      - name: Install ublk udev rule
+        run: |
+          sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
+          sudo udevadm control --reload-rules
       - name: Run blktests
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --features blktests --test blktests -- --nocapture
       - name: Kernel logs (on failure)
@@ -161,9 +223,48 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-modules-extra-$(uname -r) fio
+      - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
+        # See blktests job for full bug analysis. Drop when 1016+ ships.
+        run: |
+          uname -r
+          KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
+          if [ ! -f "$KO_SRC" ]; then
+            echo "module not at $KO_SRC — modules-extra not installed?"
+            ls /lib/modules/$(uname -r)/kernel/drivers/block/
+            exit 1
+          fi
+          sudo rmmod ublk_drv 2>/dev/null || true
+          sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          sudo chown $(id -u):$(id -g) /tmp/ublk_drv.ko
+          python3 - <<'PY'
+          import re, sys
+          PATH = "/tmp/ublk_drv.ko"
+          data = bytearray(open(PATH, "rb").read())
+          matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
+          if len(matches) == 0:
+              print("buggy pattern not present — kernel not affected, skipping", file=sys.stderr)
+              sys.exit(0)
+          if len(matches) > 1:
+              nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
+              if nop_pattern:
+                  print("module already patched — skipping", file=sys.stderr)
+                  sys.exit(0)
+              print(f"ambiguous: {len(matches)} matches of 39 f0 72 d6", file=sys.stderr)
+              sys.exit(1)
+          off = matches[0].start() + 2
+          data[off:off+2] = b'\x90\x90'
+          open(PATH, "wb").write(bytes(data))
+          print(f"patched offset {hex(off)}")
+          PY
+          sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
+          sudo depmod -a
       - name: Load kernel modules
         run: |
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+      - name: Install ublk udev rule
+        run: |
+          sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
+          sudo udevadm control --reload-rules
       - name: Report kernel version
         run: uname -r
       - name: zc_glidefs (${{ matrix.transport }})
@@ -207,12 +308,51 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-modules-extra-$(uname -r) fio
+      - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
+        # See blktests job for full bug analysis. Drop when 1016+ ships.
+        run: |
+          uname -r
+          KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
+          if [ ! -f "$KO_SRC" ]; then
+            echo "module not at $KO_SRC — modules-extra not installed?"
+            ls /lib/modules/$(uname -r)/kernel/drivers/block/
+            exit 1
+          fi
+          sudo rmmod ublk_drv 2>/dev/null || true
+          sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          sudo chown $(id -u):$(id -g) /tmp/ublk_drv.ko
+          python3 - <<'PY'
+          import re, sys
+          PATH = "/tmp/ublk_drv.ko"
+          data = bytearray(open(PATH, "rb").read())
+          matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
+          if len(matches) == 0:
+              print("buggy pattern not present — kernel not affected, skipping", file=sys.stderr)
+              sys.exit(0)
+          if len(matches) > 1:
+              nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
+              if nop_pattern:
+                  print("module already patched — skipping", file=sys.stderr)
+                  sys.exit(0)
+              print(f"ambiguous: {len(matches)} matches of 39 f0 72 d6", file=sys.stderr)
+              sys.exit(1)
+          off = matches[0].start() + 2
+          data[off:off+2] = b'\x90\x90'
+          open(PATH, "wb").write(bytes(data))
+          print(f"patched offset {hex(off)}")
+          PY
+          sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
+          sudo depmod -a
       - name: Clippy (ublk)
         run: cargo clippy -p glidefs --features ublk,test-utils --tests --benches
       - name: Load kernel modules
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+      - name: Install ublk udev rule
+        run: |
+          sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
+          sudo udevadm control --reload-rules
       - name: Report kernel version
         run: uname -r
       - name: fio benchmark (${{ matrix.transport }})

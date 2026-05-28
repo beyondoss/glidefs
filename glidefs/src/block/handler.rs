@@ -391,6 +391,33 @@ impl BlockHandler {
 
         for block in start_block..=end_block {
             let idx = block as usize;
+            // Wait for any in-flight backfill claim on this block to finish
+            // its data pwrite (state transitions CLEAN→DIRTY). Without this
+            // wait, our caller's subsequent kernel WRITE_FIXED for the same
+            // block can race the winner's S3 pwrite: WRITE_FIXED lands the
+            // guest bytes, then the winner's full-block pwrite clobbers them
+            // with stale S3 data. Same shape as `backfill_and_write`'s
+            // CLEAN-wait branch — only the gate location differs.
+            //
+            // Bounded by a deadline so a panicking winner can't park us
+            // here forever. On timeout we log + proceed; the kernel
+            // WRITE_FIXED that follows still lands correctly because the
+            // winner's set_present transitioned the block out of
+            // NOT_PRESENT (even if the data pwrite never completed, the
+            // guest's WRITE_FIXED is the source of truth for the bytes the
+            // caller is writing).
+            let clean_deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(5);
+            while self.cache.block_state(idx).is_clean() {
+                if std::time::Instant::now() >= clean_deadline {
+                    tracing::warn!(
+                        block = idx,
+                        "backfill: timed out waiting for prior writer's CLEAN→DIRTY transition; proceeding"
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+            }
             if self.cache.is_block_present(idx) {
                 continue;
             }
@@ -430,7 +457,7 @@ impl BlockHandler {
             if !has_s3_data {
                 continue;
             }
-            // Fetch prior data from S3 and write the full block.
+            // Fetch prior data from S3.
             let block_data = match self.cache.resolve_block_for_backfill(
                 idx,
                 self.clean_cache.as_ref(),
@@ -448,6 +475,15 @@ impl BlockHandler {
             // trigger a flush rotation that invalidates the io_uring
             // registered fd.
             if block_data.iter().all(|&b| b == 0) {
+                continue;
+            }
+            // CAS-gated backfill: only one caller writes the S3 block to
+            // the cache file. Loser skips; their caller's subsequent
+            // `WRITE_FIXED` is correctness-equivalent because the winner
+            // pwrites stale S3 data and the loser's `WRITE_FIXED` is the
+            // *guest's intended new bytes* — both writers are racing to
+            // produce the same logical state.
+            if !self.cache.try_claim_block(idx) {
                 continue;
             }
             self.cache.write(block_start, &block_data)?;
@@ -1154,6 +1190,17 @@ impl BlockHandler {
         for block in start_block..=end_block {
             #[allow(clippy::cast_possible_truncation)]
             let idx = block as usize;
+            // CLEAN means another writer claimed the block (CAS
+            // NOT_PRESENT/SYNCING→CLEAN) but its pwrite of OLD block data
+            // hasn't landed yet. Returning `Some(Ok)` here would let the
+            // inline path race that pwrite with our caller's WRITE_FIXED:
+            // either ordering yields data corruption (sibling-bio race
+            // for blktests block/042). Fall back to the deferred path
+            // whose `backfill_blocks_in_range` has the bounded
+            // CLEAN-wait that correctly serializes this.
+            if self.cache.block_state(idx).is_clean() {
+                return None;
+            }
             if self.cache.is_block_present(idx) {
                 continue;
             }
@@ -2275,4 +2322,5 @@ mod tests {
             "write to new block should succeed after pressure drops"
         );
     }
+
 }

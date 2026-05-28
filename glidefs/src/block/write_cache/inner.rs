@@ -292,6 +292,70 @@ impl HandoffPhase {
 /// Uses lock-free atomics for block states and presence to avoid contention
 /// under high write concurrency. The data file uses positional I/O which is
 /// inherently thread-safe, eliminating all locking on the hot path.
+/// Sparse per-block "promote pwrite in progress" claim, used by
+/// `promote_syncing_blocks` to serialize the pread+pwrite window across
+/// concurrent promoters of the same block without changing the state
+/// machine (state stays SYNCING through the claim so eviction can still
+/// race in; see `pf02_eviction_during_promote_read`).
+///
+/// **Sparse on purpose.** The claim is held only across the pread+pwrite
+/// window (~30–100 µs per block), so at any instant the in-flight set is
+/// bounded by `num_queues × queue_depth` across the device — typically
+/// <256 entries. Storing this as a fixed-size bitmap would cost 1 byte
+/// per block per export (8 MiB per 1 TiB export at 128 KiB blocks); at
+/// the 20k-export fleet scale that's hundreds of GB of allocator-resident
+/// state for an occasionally-held flag. Sparse storage costs O(in-flight),
+/// independent of device size.
+///
+/// Empty cost: `Mutex<HashSet>` ≈ 64 B per export.
+/// Per-claim cost: one short mutex critical section (insert/remove). The
+/// mutex contends only during the promote handshake itself, never on the
+/// data plane.
+pub(crate) struct PromoteClaimBitmap {
+    in_flight: parking_lot::Mutex<std::collections::HashSet<usize>>,
+    released: parking_lot::Condvar,
+}
+
+impl PromoteClaimBitmap {
+    pub(super) fn new() -> Self {
+        Self {
+            in_flight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            released: parking_lot::Condvar::new(),
+        }
+    }
+
+    /// Insert `idx` into the in-flight set. `true` iff this caller's
+    /// insertion was new (i.e., they own the claim).
+    pub(super) fn try_claim(&self, idx: usize) -> bool {
+        self.in_flight.lock().insert(idx)
+    }
+
+    /// Park until another task `release`s `idx` (or `deadline` passes).
+    /// Returns `true` if the claim was actually released; `false` on
+    /// timeout. Real parking via `Condvar`, NOT a busy-spin / sleep
+    /// loop — calling this from a tokio task still blocks the executor
+    /// thread, but only for the actual wait, with no CPU burn.
+    pub(super) fn wait_for_release(&self, idx: usize, deadline: std::time::Instant) -> bool {
+        let mut g = self.in_flight.lock();
+        while g.contains(&idx) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let timeout = deadline.duration_since(now);
+            // Spurious wake-ups are fine — the while-loop re-checks
+            // `contains` and re-arms if needed.
+            let _ = self.released.wait_for(&mut g, timeout);
+        }
+        true
+    }
+
+    pub(super) fn release(&self, idx: usize) {
+        self.in_flight.lock().remove(&idx);
+        self.released.notify_all();
+    }
+}
+
 pub(crate) struct CacheInner {
     /// Configuration
     pub(super) config: WriteCacheConfig,
@@ -326,6 +390,16 @@ pub(crate) struct CacheInner {
     /// Combines block state and presence into a single sparse page table.
     /// State encoding: 0=NotPresent, 1=Clean (transient), 2=Dirty, 3=Syncing
     pub(super) state_map: SparseStateMap,
+
+    /// Side-band per-block "promote pwrite in progress" claim. Held only
+    /// across `promote_syncing_blocks`'s `ff.read_exact_at` →
+    /// `df.write_all_at` window, so two concurrent promoters can't both
+    /// pwrite OLD bytes that race a sibling bio's `WRITE_FIXED` NEW bytes
+    /// (blktests block/042 corruption flake). Orthogonal to the state
+    /// map: `state == SYNCING` is preserved across the pread+pwrite, so
+    /// the flush thread's `transition_syncing_to_not_present` eviction
+    /// can still race through (see `pf02_eviction_during_promote_read`).
+    pub(super) promote_claim: PromoteClaimBitmap,
 
     /// Number of blocks (for bounds checking)
     pub(super) num_blocks: usize,
@@ -876,13 +950,58 @@ impl CacheInner {
                 if valid == 0 {
                     continue;
                 }
-                // Propagate both read and write errors. If reading from
-                // the flushing file fails (SSD error), we must not
-                // silently skip promotion — the active file has zeros for
-                // this block, so a sub-block guest write would leave the
-                // non-written portion as zeros instead of the original
-                // data. Failing the write to the guest is safer than
-                // silent data corruption.
+                // Per-block promote claim. The state CAS stays at the end
+                // (kept idempotent for the eviction-during-promote contract
+                // covered by `pf02_eviction_during_promote_read`), but we
+                // also need to prevent two concurrent promoters from
+                // racing their pwrites: if A's pwrite, A's WRITE_FIXED,
+                // and B's pwrite interleave in that order, B's OLD bytes
+                // clobber A's just-landed NEW bytes — the blktests
+                // block/042 corruption flake.
+                //
+                // The `promote_claim` bitmap is a side-band gate orthogonal
+                // to the state machine: at most one task pwrites per block
+                // at a time, but `state == SYNCING` is preserved across the
+                // pread+pwrite window so the flush thread's
+                // `transition_syncing_to_not_present` can still race
+                // through to NOT_PRESENT.
+                if !self.promote_claim.try_claim(idx) {
+                    // Another promoter holds the claim. Park on the
+                    // condvar until they release — bounded by a deadline
+                    // so a panicking holder can't park us indefinitely.
+                    // Once the claim is released, whatever the prior
+                    // promoter did is visible in the active file, so we
+                    // skip our own pread/pwrite; the caller's subsequent
+                    // pwrite will land on top correctly.
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(5);
+                    if !self.promote_claim.wait_for_release(idx, deadline) {
+                        tracing::warn!(
+                            block = idx,
+                            "promote: timed out waiting for prior promote claim release; proceeding"
+                        );
+                    }
+                    continue;
+                }
+                // We hold the claim. Wrap the rest in a RAII guard so a
+                // panic or early return — including the `?` propagation on
+                // pwrite errors — releases the claim and wakes waiters.
+                // Without this, a panicking holder would park every
+                // subsequent promoter for the full 5 s deadline.
+                struct ClaimGuard<'a> {
+                    claim: &'a PromoteClaimBitmap,
+                    idx: usize,
+                }
+                impl<'a> Drop for ClaimGuard<'a> {
+                    fn drop(&mut self) {
+                        self.claim.release(self.idx);
+                    }
+                }
+                let _guard = ClaimGuard { claim: &self.promote_claim, idx };
+
+                // Propagate errors: silent skip on a flushing-read failure
+                // would leave the active file as zeros for un-covered
+                // bytes of the sibling's WRITE_FIXED.
                 ff.read_exact_at(&mut buf[..valid], offset)?;
 
                 #[cfg(feature = "test-utils")]
@@ -903,13 +1022,12 @@ impl CacheInner {
                     }
                 }
 
+                // Final CAS preserves the original contract: SYNCING→DIRTY
+                // or NOT_PRESENT→DIRTY at the end of promote. Eviction may
+                // have raced (state→NOT_PRESENT) — in that case CAS fails
+                // harmlessly; the pwrite we already landed is still
+                // correct in the active file.
                 if state == SparseBlockState::SYNCING {
-                    // CAS SYNCING→DIRTY immediately after copying data.
-                    // This prevents the flush thread from evicting the block
-                    // (SYNCING→NOT_PRESENT) between here and the caller's
-                    // transition_to_dirty. If the CAS fails, either another
-                    // writer promoted it first (fine) or flush already evicted
-                    // it (the data we just copied is still valid in active).
                     if self
                         .state_map
                         .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
@@ -918,18 +1036,14 @@ impl CacheInner {
                         self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
                         self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                     }
-                } else {
-                    // NOT_PRESENT: block was evicted between pre_write (which
-                    // saw SYNCING and skipped backfill) and now. The flushing
-                    // file still has the data. CAS NOT_PRESENT→DIRTY.
-                    if self
-                        .state_map
-                        .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
-                        .is_ok()
-                    {
-                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
-                    }
+                } else if self
+                    .state_map
+                    .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
+                    .is_ok()
+                {
+                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
                 }
+                // _guard drops here, releasing the claim + waking waiters.
             }
         } else if require_promotion {
             // No flushing file available. If any block in the range needs

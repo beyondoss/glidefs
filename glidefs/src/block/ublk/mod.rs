@@ -988,6 +988,26 @@ impl UblkServer {
         // blocked in the kernel — `spawn_blocking` doesn't cancel on
         // await abandonment, so the wrapping `timeout` is the only
         // way to actually move past it).
+        // After dropping the worker pool and devices we own no userspace
+        // refs on the cdev, but the kernel-side transition runs in
+        // `ublk_ch_release_work_fn` (drivers/block/ublk_drv.c) which
+        // reschedules itself every 1 jiffy until io_uring's bvec
+        // registered-buffer GC drops the last bvec ref — measured ~50 ms
+        // on HZ=1000 Azure 6.17. Returning before that lands creates
+        // a race where the next `add_device` sees `state=LIVE`, falls
+        // through to the fresh-ADD path with the persisted dev_id, hits
+        // `-EEXIST` from `ublk_alloc_dev_number`, ublk-core retries with
+        // the legacy IOC opcode, and the kernel — built without
+        // `CONFIG_BLKDEV_UBLK_LEGACY_OPCODES` — responds `-EOPNOTSUPP`.
+        // Net symptom: `UringIOError(-95)` at `ublk ctrl build`.
+        //
+        // Empirically: 40% failure rate without this wait, 0% with it
+        // (n=50 each, fs_crash_recovery::test_fs_crash_fsync_honored_ublk).
+        // The probe is bounded both per-call (200 ms via `tokio::timeout`,
+        // because `spawn_blocking` doesn't cancel on await abandonment)
+        // and per-server (2 s total across all devices). A stuck probe
+        // logs and we proceed — better to ship the next add_device with a
+        // 200 ms tail-latency hit than to hang shutdown forever.
         let outer_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         for dev_id in dev_ids {
             while std::time::Instant::now() < outer_deadline {

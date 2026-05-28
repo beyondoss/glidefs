@@ -378,6 +378,19 @@ impl NbdDeviceManager {
     ///
     /// Simulates a crash: the device dies but `nbd_devices.json` still has the
     /// old index. Used in tests to prove device path stability across restarts.
+    ///
+    /// Ordering note: cancel and abort the userspace session BEFORE the
+    /// netlink disconnect. The kernel's NBD driver sends `NBD_CMD_DISC` to
+    /// userspace as part of the disconnect handshake, and our session's
+    /// response writer treats `NBD_CMD_DISC` as a *graceful* close — it
+    /// runs `router.drain_export()` which flushes pending packs and the
+    /// volume manifest to S3. A real crash has no opportunity to drain.
+    /// If we let DISC reach a live session here, the drain races with our
+    /// `session_handle.abort()`; on the lose side the manifest upload is
+    /// cancelled mid-flight and recovery sees an empty manifest, returning
+    /// zeros for evicted blocks (root cause of the flaky
+    /// `fs_crash_recovery` "Bad magic number in super-block" e2fsck
+    /// failures: 2026-05-26 investigation).
     #[cfg(feature = "test-utils")]
     #[allow(dead_code)]
     pub async fn crash_disconnect(&mut self, export_name: &str) -> anyhow::Result<()> {
@@ -386,12 +399,14 @@ impl NbdDeviceManager {
         };
         let index = device.dev_index;
         info!(export = %export_name, index, "crash_disconnect: killing kernel device (map preserved)");
-        if let Err(e) = tokio::task::spawn_blocking(move || netlink::disconnect(index)).await? {
-            warn!(export = %export_name, index, error = %e, "netlink disconnect failed");
-        }
+        // Kill the userspace session first so any DISC the kernel emits
+        // during the netlink disconnect lands on a dead socket.
         device.shutdown.cancel();
         device.session_handle.abort();
         let _ = device.session_handle.await;
+        if let Err(e) = tokio::task::spawn_blocking(move || netlink::disconnect(index)).await? {
+            warn!(export = %export_name, index, error = %e, "netlink disconnect failed");
+        }
         // Intentionally NOT calling persist_devices() — the map still has the old index.
         Ok(())
     }
