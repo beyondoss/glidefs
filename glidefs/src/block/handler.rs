@@ -654,11 +654,28 @@ impl BlockHandler {
                     _ if state.is_clean() => {
                         // Another writer claimed this block but hasn't written
                         // the merged data yet. Wait for completion.
+                        //
+                        // `yield_now` rather than `tokio::time::sleep` for the
+                        // same reason as `backfill_blocks_in_range` (see comment
+                        // there): the time-driver path can stall on the CI
+                        // GitHub Azure 6.17.0-1015 runner under the
+                        // zc_glidefs_flush_rotation_deadlock + sibling write
+                        // load. 500k yields ≈ 50–500 ms of cumulative wait
+                        // before we give up and fall through to a re-check.
+                        let mut yields = 0u32;
                         loop {
                             if !self.cache.block_state(idx).is_clean() {
                                 break;
                             }
-                            tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                            if yields >= 500_000 {
+                                tracing::warn!(
+                                    block = idx,
+                                    "backfill_and_write: gave up waiting for CLEAN→DIRTY after 500k yields; proceeding"
+                                );
+                                break;
+                            }
+                            yields += 1;
+                            tokio::task::yield_now().await;
                         }
                         // State changed — re-enter the outer match to handle
                         // whatever it became (DIRTY, SYNCING, or NOT_PRESENT
