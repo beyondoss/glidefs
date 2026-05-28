@@ -116,9 +116,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - name: Install kernel modules + build deps
+      - name: Pin to ublk-working kernel (work around 1015 ublk_drv NULL deref)
+        # linux-azure 6.17.0-1015 has a backport-order regression in
+        # ublk_drv: ublk_ctrl_add_dev() calls ublk_init_queues() before
+        # ublk_add_tag_set(), so the new NUMA-aware code in
+        # ublk_get_queue_numa_node() reads tag_set.map[0].mq_map (still
+        # NULL until ublk_add_tag_set runs) and oopses the io_uring
+        # worker. Upstream Linux has the calls in the correct order.
+        # Drop this step when Ubuntu ships 6.17.0-1016+ with the fix.
         run: |
           sudo apt-get update
+          sudo apt-get install -y \
+            linux-image-6.17.0-1013-azure \
+            linux-modules-extra-6.17.0-1013-azure \
+            linux-headers-6.17.0-1013-azure \
+            kexec-tools
+          sudo kexec -l /boot/vmlinuz-6.17.0-1013-azure \
+            --initrd=/boot/initrd.img-6.17.0-1013-azure \
+            --reuse-cmdline
+          sudo systemctl kexec
+      - name: Wait for kexec target kernel to come up
+        run: |
+          for i in $(seq 1 60); do
+            current=$(uname -r)
+            if [ "$current" = "6.17.0-1013-azure" ]; then
+              echo "kexec succeeded — running on $current"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "kexec timeout — still on $(uname -r)"; exit 1
+      - name: Install kernel modules + build deps
+        run: |
           sudo apt-get install -y linux-modules-extra-$(uname -r) build-essential fio
       - name: Load kernel modules
         run: |
@@ -161,9 +190,32 @@ jobs:
         with:
           workspaces: ". -> target"
           shared-key: "ublk-${{ matrix.transport }}"
-      - name: Install kernel modules + fio
+      - name: Pin to ublk-working kernel (work around 1015 ublk_drv NULL deref)
+        # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
           sudo apt-get update
+          sudo apt-get install -y \
+            linux-image-6.17.0-1013-azure \
+            linux-modules-extra-6.17.0-1013-azure \
+            linux-headers-6.17.0-1013-azure \
+            kexec-tools
+          sudo kexec -l /boot/vmlinuz-6.17.0-1013-azure \
+            --initrd=/boot/initrd.img-6.17.0-1013-azure \
+            --reuse-cmdline
+          sudo systemctl kexec
+      - name: Wait for kexec target kernel to come up
+        run: |
+          for i in $(seq 1 60); do
+            current=$(uname -r)
+            if [ "$current" = "6.17.0-1013-azure" ]; then
+              echo "kexec succeeded — running on $current"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "kexec timeout — still on $(uname -r)"; exit 1
+      - name: Install kernel modules + fio
+        run: |
           sudo apt-get install -y linux-modules-extra-$(uname -r) fio
       - name: Load kernel modules
         run: |
@@ -211,9 +263,32 @@ jobs:
         with:
           workspaces: ". -> target"
           shared-key: "kernel-devices-${{ matrix.transport }}"
-      - name: Install kernel modules + fio
+      - name: Pin to ublk-working kernel (work around 1015 ublk_drv NULL deref)
+        # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
           sudo apt-get update
+          sudo apt-get install -y \
+            linux-image-6.17.0-1013-azure \
+            linux-modules-extra-6.17.0-1013-azure \
+            linux-headers-6.17.0-1013-azure \
+            kexec-tools
+          sudo kexec -l /boot/vmlinuz-6.17.0-1013-azure \
+            --initrd=/boot/initrd.img-6.17.0-1013-azure \
+            --reuse-cmdline
+          sudo systemctl kexec
+      - name: Wait for kexec target kernel to come up
+        run: |
+          for i in $(seq 1 60); do
+            current=$(uname -r)
+            if [ "$current" = "6.17.0-1013-azure" ]; then
+              echo "kexec succeeded — running on $current"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "kexec timeout — still on $(uname -r)"; exit 1
+      - name: Install kernel modules + fio
+        run: |
           sudo apt-get install -y linux-modules-extra-$(uname -r) fio
       - name: Clippy (ublk)
         run: cargo clippy -p glidefs --features ublk,test-utils --tests --benches
