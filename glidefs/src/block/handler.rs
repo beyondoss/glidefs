@@ -391,32 +391,38 @@ impl BlockHandler {
 
         for block in start_block..=end_block {
             let idx = block as usize;
-            // Wait for any in-flight backfill claim on this block to finish
-            // its data pwrite (state transitions CLEAN→DIRTY). Without this
-            // wait, our caller's subsequent kernel WRITE_FIXED for the same
-            // block can race the winner's S3 pwrite: WRITE_FIXED lands the
-            // guest bytes, then the winner's full-block pwrite clobbers them
-            // with stale S3 data. Same shape as `backfill_and_write`'s
-            // CLEAN-wait branch — only the gate location differs.
+            // Wait for any in-flight backfill claim on this block to
+            // finish its data pwrite (state transitions CLEAN→DIRTY).
+            // Without this wait, our caller's subsequent kernel
+            // WRITE_FIXED for the same block can race the winner's S3
+            // pwrite: WRITE_FIXED lands the guest bytes, then the
+            // winner's full-block pwrite clobbers them with stale S3
+            // data. Same shape as `backfill_and_write`'s CLEAN-wait
+            // branch — only the gate location differs.
             //
-            // Bounded by a deadline so a panicking winner can't park us
-            // here forever. On timeout we log + proceed; the kernel
-            // WRITE_FIXED that follows still lands correctly because the
-            // winner's set_present transitioned the block out of
-            // NOT_PRESENT (even if the data pwrite never completed, the
-            // guest's WRITE_FIXED is the source of truth for the bytes the
-            // caller is writing).
-            let clean_deadline = std::time::Instant::now()
-                + std::time::Duration::from_secs(5);
+            // Yield-loop instead of `tokio::time::sleep` because the
+            // latter routes through the time driver, which deadlocked
+            // CI runs of `zc_glidefs_flush_rotation_deadlock` and the
+            // ublk-transport zc_glidefs matrix on the GitHub Azure
+            // 6.17.0-1015 runner (every test stuck >17 min). `yield_now`
+            // is a pure scheduling hint — no timer, no lock, runs
+            // wherever the executor next picks us. 500k iterations is
+            // ~50–500 ms of cumulative wait at sub-microsecond yields;
+            // if we're still CLEAN past that, the winner is genuinely
+            // stuck and we proceed (the kernel WRITE_FIXED still lands
+            // correctly because the winner's set_present already moved
+            // the block out of NOT_PRESENT).
+            let mut yields = 0u32;
             while self.cache.block_state(idx).is_clean() {
-                if std::time::Instant::now() >= clean_deadline {
+                if yields >= 500_000 {
                     tracing::warn!(
                         block = idx,
-                        "backfill: timed out waiting for prior writer's CLEAN→DIRTY transition; proceeding"
+                        "backfill: gave up waiting for prior writer's CLEAN→DIRTY transition after 500k yields; proceeding"
                     );
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                yields += 1;
+                tokio::task::yield_now().await;
             }
             if self.cache.is_block_present(idx) {
                 continue;
@@ -502,15 +508,17 @@ impl BlockHandler {
                 // corruption shape: the top-of-loop wait is necessary
                 // but not sufficient — losers entering AFTER the wait
                 // need to wait again.
+                let mut yields = 0u32;
                 while self.cache.block_state(idx).is_clean() {
-                    if std::time::Instant::now() >= clean_deadline {
+                    if yields >= 500_000 {
                         tracing::warn!(
                             block = idx,
-                            "backfill: timed out waiting for CAS winner's CLEAN→DIRTY after losing CAS; proceeding"
+                            "backfill: gave up waiting for CAS winner's CLEAN→DIRTY after 500k yields; proceeding"
                         );
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                    yields += 1;
+                    tokio::task::yield_now().await;
                 }
                 continue;
             }
