@@ -241,12 +241,15 @@ jobs:
           PATH = "/tmp/ublk_drv.ko"
           data = bytearray(open(PATH, "rb").read())
           matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
-          if len(matches) != 1:
+          if len(matches) == 0:
+              print("buggy pattern not present — kernel not affected, skipping", file=sys.stderr)
+              sys.exit(0)
+          if len(matches) > 1:
               nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
               if nop_pattern:
                   print("module already patched — skipping", file=sys.stderr)
                   sys.exit(0)
-              print(f"expected 1 match of 39 f0 72 d6, found {len(matches)}", file=sys.stderr)
+              print(f"ambiguous: {len(matches)} matches of 39 f0 72 d6", file=sys.stderr)
               sys.exit(1)
           off = matches[0].start() + 2
           data[off:off+2] = b'\x90\x90'
@@ -323,12 +326,15 @@ jobs:
           PATH = "/tmp/ublk_drv.ko"
           data = bytearray(open(PATH, "rb").read())
           matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
-          if len(matches) != 1:
+          if len(matches) == 0:
+              print("buggy pattern not present — kernel not affected, skipping", file=sys.stderr)
+              sys.exit(0)
+          if len(matches) > 1:
               nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
               if nop_pattern:
                   print("module already patched — skipping", file=sys.stderr)
                   sys.exit(0)
-              print(f"expected 1 match of 39 f0 72 d6, found {len(matches)}", file=sys.stderr)
+              print(f"ambiguous: {len(matches)} matches of 39 f0 72 d6", file=sys.stderr)
               sys.exit(1)
           off = matches[0].start() + 2
           data[off:off+2] = b'\x90\x90'
