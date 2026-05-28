@@ -152,6 +152,7 @@ jobs:
           fi
           sudo rmmod ublk_drv 2>/dev/null || true
           sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          sudo chown $(id -u):$(id -g) /tmp/ublk_drv.ko
           python3 - <<'PY'
           import re, sys
           PATH = "/tmp/ublk_drv.ko"
@@ -228,6 +229,7 @@ jobs:
           fi
           sudo rmmod ublk_drv 2>/dev/null || true
           sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          sudo chown $(id -u):$(id -g) /tmp/ublk_drv.ko
           python3 - <<'PY'
           import re, sys
           PATH = "/tmp/ublk_drv.ko"
@@ -309,6 +311,7 @@ jobs:
           fi
           sudo rmmod ublk_drv 2>/dev/null || true
           sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          sudo chown $(id -u):$(id -g) /tmp/ublk_drv.ko
           python3 - <<'PY'
           import re, sys
           PATH = "/tmp/ublk_drv.ko"
