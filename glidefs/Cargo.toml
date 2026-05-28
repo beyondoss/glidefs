@@ -123,6 +123,11 @@ harness = false
 required-features = ["test-utils"]
 
 [[bench]]
+name = "foyer_ssd_read"
+harness = false
+required-features = ["test-utils"]
+
+[[bench]]
 name = "alloc_pattern"
 harness = false
 

@@ -6,6 +6,7 @@ pub mod cache;
 pub mod capacity_monitor;
 pub mod error;
 pub mod flush_scheduler;
+pub mod foyer_engine;
 pub mod handler;
 pub mod content_store;
 pub mod manifest;

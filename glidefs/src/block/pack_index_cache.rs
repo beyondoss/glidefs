@@ -92,22 +92,35 @@ impl PackIndexCache {
         let dir = cache_dir.join("foyer_pack_index_v2");
         std::fs::create_dir_all(&dir)?;
 
-        let inner: HybridCache<PackId, CachedPackIndex> = HybridCacheBuilder::new()
-            .with_name("glidefs-pack-index-cache")
-            .memory(memory_bytes)
-            .with_eviction_config(EvictionConfig::S3Fifo(S3FifoConfig::default()))
-            .with_weighter(|_key: &PackId, value: &CachedPackIndex| {
-                value.0.len() * std::mem::size_of::<PackIndexEntry>()
-            })
-            .storage()
-            .with_engine_config(BlockEngineConfig::new(
-                FsDeviceBuilder::new(&dir)
-                    .with_capacity(ssd_bytes)
-                    .build()?,
-            ))
-            .with_recover_mode(RecoverMode::Quiet)
-            .build()
-            .await?;
+        // Prefer the io_uring I/O engine on Linux (falls back to psync); the
+        // builder closure is reconstructed per attempt because foyer's device and
+        // storage builders are consuming.
+        let inner = crate::block::foyer_engine::build_preferring_uring(
+            "glidefs-pack-index-cache",
+            |engine| {
+                let dir = &dir;
+                async move {
+                    let device = FsDeviceBuilder::new(dir)
+                        .with_capacity(ssd_bytes)
+                        .build()?;
+                    let storage = HybridCacheBuilder::new()
+                        .with_name("glidefs-pack-index-cache")
+                        .memory(memory_bytes)
+                        .with_eviction_config(EvictionConfig::S3Fifo(S3FifoConfig::default()))
+                        .with_weighter(|_key: &PackId, value: &CachedPackIndex| {
+                            value.0.len() * std::mem::size_of::<PackIndexEntry>()
+                        })
+                        .storage()
+                        .with_engine_config(BlockEngineConfig::new(device));
+                    let storage = match engine {
+                        Some(e) => storage.with_io_engine_config(e),
+                        None => storage,
+                    };
+                    storage.with_recover_mode(RecoverMode::Quiet).build().await
+                }
+            },
+        )
+        .await?;
 
         Ok(Self { inner })
     }
