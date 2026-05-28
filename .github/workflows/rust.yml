@@ -116,6 +116,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+      - name: Install kernel modules + build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r) build-essential fio
       - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
         # linux-azure 6.17.0-1015 has a backport-order regression:
         # ublk_ctrl_add_dev() calls ublk_init_queues() *before*
@@ -141,36 +145,32 @@ jobs:
         run: |
           uname -r
           KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
-          [ -f "$KO_SRC" ] || { echo "module not at $KO_SRC"; ls /lib/modules/$(uname -r)/kernel/drivers/block/; exit 0; }
-          # Ensure we don't have ublk_drv currently loaded
+          if [ ! -f "$KO_SRC" ]; then
+            echo "module not at $KO_SRC — modules-extra not installed?"
+            ls /lib/modules/$(uname -r)/kernel/drivers/block/
+            exit 1
+          fi
           sudo rmmod ublk_drv 2>/dev/null || true
-          # Decompress, patch, recompress in place
           sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
           python3 - <<'PY'
           import re, sys
           PATH = "/tmp/ublk_drv.ko"
           data = bytearray(open(PATH, "rb").read())
-          # cmp %esi,%eax ; jb -0x2a
           matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
           if len(matches) != 1:
-              print(f"expected 1 match, found {len(matches)} — module may already be patched or different kernel version", file=sys.stderr)
-              # Check if NOPs already there (idempotent)
               nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
               if nop_pattern:
                   print("module already patched — skipping", file=sys.stderr)
                   sys.exit(0)
+              print(f"expected 1 match of 39 f0 72 d6, found {len(matches)}", file=sys.stderr)
               sys.exit(1)
           off = matches[0].start() + 2
           data[off:off+2] = b'\x90\x90'
           open(PATH, "wb").write(bytes(data))
           print(f"patched offset {hex(off)} (jb -> nop nop)")
           PY
-          # Replace the on-disk module so modprobe picks up the patched copy
           sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
           sudo depmod -a
-      - name: Install kernel modules + build deps
-        run: |
-          sudo apt-get install -y linux-modules-extra-$(uname -r) build-essential fio
       - name: Load kernel modules
         run: |
           sudo modprobe nbd || echo "nbd not available"
@@ -212,12 +212,20 @@ jobs:
         with:
           workspaces: ". -> target"
           shared-key: "ublk-${{ matrix.transport }}"
+      - name: Install kernel modules + fio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r) fio
       - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
         # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
           uname -r
           KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
-          [ -f "$KO_SRC" ] || { echo "module not at $KO_SRC"; ls /lib/modules/$(uname -r)/kernel/drivers/block/; exit 0; }
+          if [ ! -f "$KO_SRC" ]; then
+            echo "module not at $KO_SRC — modules-extra not installed?"
+            ls /lib/modules/$(uname -r)/kernel/drivers/block/
+            exit 1
+          fi
           sudo rmmod ublk_drv 2>/dev/null || true
           sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
           python3 - <<'PY'
@@ -230,7 +238,7 @@ jobs:
               if nop_pattern:
                   print("module already patched — skipping", file=sys.stderr)
                   sys.exit(0)
-              print(f"expected 1 match, found {len(matches)}", file=sys.stderr)
+              print(f"expected 1 match of 39 f0 72 d6, found {len(matches)}", file=sys.stderr)
               sys.exit(1)
           off = matches[0].start() + 2
           data[off:off+2] = b'\x90\x90'
@@ -239,9 +247,6 @@ jobs:
           PY
           sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
           sudo depmod -a
-      - name: Install kernel modules + fio
-        run: |
-          sudo apt-get install -y linux-modules-extra-$(uname -r) fio
       - name: Load kernel modules
         run: |
           sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
@@ -288,12 +293,20 @@ jobs:
         with:
           workspaces: ". -> target"
           shared-key: "kernel-devices-${{ matrix.transport }}"
+      - name: Install kernel modules + fio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r) fio
       - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
         # See blktests job for full bug analysis. Drop when 1016+ ships.
         run: |
           uname -r
           KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
-          [ -f "$KO_SRC" ] || { echo "module not at $KO_SRC"; ls /lib/modules/$(uname -r)/kernel/drivers/block/; exit 0; }
+          if [ ! -f "$KO_SRC" ]; then
+            echo "module not at $KO_SRC — modules-extra not installed?"
+            ls /lib/modules/$(uname -r)/kernel/drivers/block/
+            exit 1
+          fi
           sudo rmmod ublk_drv 2>/dev/null || true
           sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
           python3 - <<'PY'
@@ -306,7 +319,7 @@ jobs:
               if nop_pattern:
                   print("module already patched — skipping", file=sys.stderr)
                   sys.exit(0)
-              print(f"expected 1 match, found {len(matches)}", file=sys.stderr)
+              print(f"expected 1 match of 39 f0 72 d6, found {len(matches)}", file=sys.stderr)
               sys.exit(1)
           off = matches[0].start() + 2
           data[off:off+2] = b'\x90\x90'
@@ -315,9 +328,6 @@ jobs:
           PY
           sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
           sudo depmod -a
-      - name: Install kernel modules + fio
-        run: |
-          sudo apt-get install -y linux-modules-extra-$(uname -r) fio
       - name: Clippy (ublk)
         run: cargo clippy -p glidefs --features ublk,test-utils --tests --benches
       - name: Load kernel modules
