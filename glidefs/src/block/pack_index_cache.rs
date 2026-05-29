@@ -79,18 +79,23 @@ pub struct PackIndexCache {
 
 impl PackIndexCache {
     /// Open the pack index cache with default tier sizes (64MB memory, 2GB SSD).
+    /// Open with default tier sizes and buffered I/O (for ephemeral/CLI use).
     pub async fn open(cache_dir: &Path) -> anyhow::Result<Self> {
-        Self::open_with_sizes(cache_dir, DEFAULT_MEMORY_BYTES, DEFAULT_SSD_BYTES).await
+        Self::open_with_sizes(cache_dir, DEFAULT_MEMORY_BYTES, DEFAULT_SSD_BYTES, false).await
     }
 
-    /// Open with custom tier sizes.
+    /// Open with custom tier sizes. `direct` prefers `O_DIRECT` (falls back to
+    /// buffered if the backing filesystem doesn't support it).
     pub async fn open_with_sizes(
         cache_dir: &Path,
         memory_bytes: usize,
         ssd_bytes: usize,
+        direct: bool,
     ) -> anyhow::Result<Self> {
         let dir = cache_dir.join("foyer_pack_index_v2");
         std::fs::create_dir_all(&dir)?;
+
+        let direct = direct && crate::block::foyer_engine::o_direct_supported(&dir);
 
         // Prefer the io_uring I/O engine on Linux (falls back to psync); the
         // builder closure is reconstructed per attempt because foyer's device and
@@ -102,6 +107,7 @@ impl PackIndexCache {
                 async move {
                     let device = FsDeviceBuilder::new(dir)
                         .with_capacity(ssd_bytes)
+                        .with_direct(direct)
                         .build()?;
                     let storage = HybridCacheBuilder::new()
                         .with_name("glidefs-pack-index-cache")
@@ -303,7 +309,7 @@ mod tests {
 
     /// Small cache sizes for tests (foyer needs real directories).
     async fn open_test_cache(dir: &Path) -> PackIndexCache {
-        PackIndexCache::open_with_sizes(dir, 16 * 1024 * 1024, 64 * 1024 * 1024)
+        PackIndexCache::open_with_sizes(dir, 16 * 1024 * 1024, 64 * 1024 * 1024, false)
             .await
             .expect("failed to open test cache")
     }

@@ -42,12 +42,17 @@ use foyer::{
 
 /// Configuration for the foyer-backed block cache.
 pub struct FoyerCacheConfig {
-    /// Memory tier capacity in bytes.
+    /// Memory tier (L1) capacity in bytes. With `direct`, this is the *only* RAM
+    /// cache, so it should cover the hot working set (an under-sized L1 + O_DIRECT
+    /// pays full media latency on misses).
     pub memory_bytes: usize,
     /// SSD tier capacity in bytes.
     pub ssd_bytes: usize,
     /// Directory for SSD cache files.
     pub ssd_dir: PathBuf,
+    /// Prefer `O_DIRECT` for the SSD tier (bypass the page cache). Falls back to
+    /// buffered if the backing filesystem doesn't support it (e.g. tmpfs).
+    pub direct: bool,
 }
 
 /// Production block cache backed by foyer's HybridCache.
@@ -70,10 +75,21 @@ impl FoyerBlockCache {
         let ssd_dir = &config.ssd_dir;
         let ssd_bytes = config.ssd_bytes;
         let memory_bytes = config.memory_bytes;
+        // O_DIRECT only if requested AND the backing FS supports it (tmpfs etc.
+        // EINVAL), so the neighborly default degrades to buffered instead of
+        // failing to start.
+        let direct = config.direct && super::foyer_engine::o_direct_supported(ssd_dir);
+        if config.direct && !direct {
+            tracing::warn!(
+                dir = %ssd_dir.display(),
+                "clean cache: O_DIRECT unsupported on this filesystem, using buffered I/O"
+            );
+        }
         let inner = super::foyer_engine::build_preferring_uring("glidefs-clean-cache", |engine| {
             async move {
                 let device = FsDeviceBuilder::new(ssd_dir)
                     .with_capacity(ssd_bytes)
+                    .with_direct(direct)
                     .build()?;
                 let storage = HybridCacheBuilder::new()
                     .with_name("glidefs-clean-cache")
@@ -272,6 +288,7 @@ mod tests {
             memory_bytes,
             ssd_bytes,
             ssd_dir: dir.path().to_path_buf(),
+            direct: false,
         })
         .await
         .expect("failed to open foyer cache")
@@ -292,6 +309,27 @@ mod tests {
     async fn test_foyer_get_missing() {
         let cache = open_test_foyer(4 * 1024 * 1024, 16 * 1024 * 1024).await;
         assert!(cache.get(&make_hash(99)).await.is_none());
+    }
+
+    /// `direct: true` must never fail to open — it degrades to buffered I/O on
+    /// filesystems without O_DIRECT support (e.g. tmpfs, common in CI temp dirs).
+    /// This guards the neighborly default from crashing startup.
+    #[tokio::test]
+    async fn test_foyer_direct_falls_back_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FoyerBlockCache::open(FoyerCacheConfig {
+            memory_bytes: 4 * 1024 * 1024,
+            ssd_bytes: 16 * 1024 * 1024,
+            ssd_dir: dir.path().to_path_buf(),
+            direct: true,
+        })
+        .await
+        .expect("direct=true must open (falling back to buffered if unsupported)");
+
+        let hash = make_hash(7);
+        let data = Bytes::from(vec![0xBB; 4096]);
+        cache.insert(hash, data.clone());
+        assert_eq!(cache.get(&hash).await.expect("round-trips"), data);
     }
 
     #[tokio::test]

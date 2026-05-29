@@ -9,8 +9,41 @@
 //! automatic.
 
 use std::future::Future;
+use std::path::Path;
 
 use foyer::{HybridCache, IoEngineConfig, StorageKey, StorageValue};
+
+/// Whether the filesystem backing `dir` supports `O_DIRECT`.
+///
+/// O_DIRECT lets the cache bypass the OS page cache, so it stops double-caching
+/// data foyer already holds and stops evicting co-resident tenants' pages (see
+/// `benches/` measurements). But it `EINVAL`s on filesystems that don't support
+/// it (notably tmpfs, common for `/tmp` cache dirs in dev/CI), so we probe before
+/// committing and let callers fall back to buffered I/O. The probe opens and
+/// removes a tiny file with `O_DIRECT`; the result is used immediately, so TOCTOU
+/// is not a concern.
+pub fn o_direct_supported(dir: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let probe = dir.join(".glidefs_odirect_probe");
+        let ok = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&probe)
+            .is_ok();
+        let _ = std::fs::remove_file(&probe);
+        ok
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        false
+    }
+}
 
 /// Build a foyer [`HybridCache`], preferring the io_uring I/O engine on Linux and
 /// degrading gracefully to foyer's default psync engine.

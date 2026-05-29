@@ -255,6 +255,9 @@ pub struct RouterConfig {
     pub block_size: usize,
     /// Shared block cache for decompressed block data
     pub clean_cache: Arc<dyn BlockCache>,
+    /// Pre-built pack-index cache (with the server's O_DIRECT/sizing policy). When
+    /// `None`, the router opens a buffered, default-sized one (CLI/test path).
+    pub pack_index_cache: Option<Arc<PackIndexCache>>,
     /// Whether to fsync the WAL after each write batch
     pub wal_sync: bool,
     /// Max concurrent S3 pack uploads across all exports (0 = unlimited).
@@ -621,11 +624,14 @@ impl ExportRouter {
             .as_ref()
             .map(|s| Arc::new(tokio::sync::Semaphore::new(s.available_permits())));
 
-        let pack_index_cache = Arc::new(
-            PackIndexCache::open(&config.cache_dir)
-                .await
-                .map_err(|e| RouterError::Manifest(format!("pack index cache: {e}")))?,
-        );
+        let pack_index_cache = match config.pack_index_cache {
+            Some(c) => c,
+            None => Arc::new(
+                PackIndexCache::open(&config.cache_dir)
+                    .await
+                    .map_err(|e| RouterError::Manifest(format!("pack index cache: {e}")))?,
+            ),
+        };
 
         let manifest_cache: foyer::Cache<String, Arc<VolumeManifest>> =
             foyer::Cache::builder(config.manifest_cache_bytes)
@@ -2988,6 +2994,7 @@ impl ExportRouter {
             cache_dir,
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            pack_index_cache: None,
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
@@ -3159,6 +3166,7 @@ mod tests {
             cache_dir: temp.path().to_path_buf(),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+            pack_index_cache: None,
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
@@ -3242,6 +3250,7 @@ mod tests {
             cache_dir: temp_dir.path().to_path_buf(),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            pack_index_cache: None,
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
@@ -4805,6 +4814,7 @@ mod tests {
             cache_dir: temp_dir.path().to_path_buf(),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            pack_index_cache: None,
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
@@ -4843,6 +4853,7 @@ mod tests {
             cache_dir: temp_dir2.path().to_path_buf(),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            pack_index_cache: None,
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
@@ -4892,6 +4903,7 @@ mod tests {
             cache_dir: temp_dir.path().join("parent"),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            pack_index_cache: None,
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
@@ -4923,6 +4935,7 @@ mod tests {
             cache_dir: temp_dir.path().join("child"),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            pack_index_cache: None,
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
@@ -5030,6 +5043,7 @@ mod tests {
             cache_dir: reader_dir.path().to_path_buf(),
             block_size: 128 * 1024,
             clean_cache: Arc::new(SimpleBlockCache::new(256 * 1024 * 1024)),
+            pack_index_cache: None,
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
