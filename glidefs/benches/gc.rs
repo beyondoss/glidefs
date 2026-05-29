@@ -349,11 +349,10 @@ async fn main() {
     //   LIST=3, GET=6, DELETE=10
     // These scale linearly with export count.
     // Real S3 notes:
-    //   - list_with_delimiter for discover_s3_prefixes returns max 1000 entries
-    //     per page; current code makes ONE call — silently truncates at >1000
-    //     exports. Needs pagination fix before this scale is reachable.
-    //   - per_prefix_budget = max_deletes / N_exports rounds to 0 when
-    //     N_exports > max_deletes (default 10000), disabling all deletions.
+    //   - discover_s3_prefixes paginates via list_with_offset, jumping past each
+    //     export subtree, so it scales past the 1000-entries-per-page limit.
+    //   - delete budget is a single shared AtomicUsize(max_deletes) claimed across
+    //     all prefixes, so it caps total deletes globally (never collapses to 0).
     //   - outer loop parallelism is buffer_unordered(16), so wall time ≈
     //     ceil(N_exports/16) * per_prefix_latency_ms.
     struct Projection {
@@ -412,12 +411,6 @@ async fn main() {
         );
     }
     println!("{sep2}");
-    println!();
-    println!("⚠  Bugs that block >1K exports today:");
-    println!("   1. discover_s3_prefixes makes ONE list_with_delimiter call — S3 returns");
-    println!("      max 1000 common_prefixes per page. Exports beyond that are silently skipped.");
-    println!("   2. per_prefix_budget = max_deletes / N_exports → 0 when N_exports > max_deletes,");
-    println!("      disabling all deletions (no-op GC run).");
     println!();
     println!("Pricing: LIST $0.005/1K, GET $0.0004/1K, DELETE free (AWS S3 Standard).");
 }

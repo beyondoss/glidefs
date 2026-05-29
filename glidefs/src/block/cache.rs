@@ -64,20 +64,32 @@ impl FoyerBlockCache {
     pub async fn open(config: FoyerCacheConfig) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&config.ssd_dir)?;
 
-        let inner: HybridCache<Blake3Hash, Bytes> = HybridCacheBuilder::new()
-            .with_name("glidefs-clean-cache")
-            .memory(config.memory_bytes)
-            .with_eviction_config(EvictionConfig::S3Fifo(S3FifoConfig::default()))
-            .with_weighter(|_key: &Blake3Hash, value: &Bytes| value.len())
-            .storage()
-            .with_engine_config(BlockEngineConfig::new(
-                FsDeviceBuilder::new(&config.ssd_dir)
-                    .with_capacity(config.ssd_bytes)
-                    .build()?,
-            ))
-            .with_recover_mode(RecoverMode::Quiet)
-            .build()
-            .await?;
+        // Prefer the io_uring I/O engine on Linux (falls back to psync); the
+        // builder closure is reconstructed per attempt because foyer's device and
+        // storage builders are consuming.
+        let ssd_dir = &config.ssd_dir;
+        let ssd_bytes = config.ssd_bytes;
+        let memory_bytes = config.memory_bytes;
+        let inner = super::foyer_engine::build_preferring_uring("glidefs-clean-cache", |engine| {
+            async move {
+                let device = FsDeviceBuilder::new(ssd_dir)
+                    .with_capacity(ssd_bytes)
+                    .build()?;
+                let storage = HybridCacheBuilder::new()
+                    .with_name("glidefs-clean-cache")
+                    .memory(memory_bytes)
+                    .with_eviction_config(EvictionConfig::S3Fifo(S3FifoConfig::default()))
+                    .with_weighter(|_key: &Blake3Hash, value: &Bytes| value.len())
+                    .storage()
+                    .with_engine_config(BlockEngineConfig::new(device));
+                let storage = match engine {
+                    Some(e) => storage.with_io_engine_config(e),
+                    None => storage,
+                };
+                storage.with_recover_mode(RecoverMode::Quiet).build().await
+            }
+        })
+        .await?;
 
         Ok(Self { inner })
     }
