@@ -95,16 +95,18 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("NBD server configuration is required"))?;
 
-    // Shared clean block cache — foyer HybridCache with memory + SSD tiers
-    let memory_bytes =
-        (settings.cache.memory_size_gb.unwrap_or(1.0) * 1024.0 * 1024.0 * 1024.0) as usize;
-    let ssd_bytes =
-        (settings.cache.ssd_cache_size_gb.unwrap_or(10.0) * 1024.0 * 1024.0 * 1024.0) as usize;
+    // Shared clean block cache — foyer HybridCache with memory + SSD tiers.
+    // O_DIRECT by default (bypass page cache so we don't double-cache or evict
+    // co-resident tenants' RAM); degrades to buffered on filesystems that lack it.
+    let memory_bytes = settings.cache.clean_cache_memory_bytes();
+    let ssd_bytes = settings.cache.clean_cache_ssd_bytes();
+    let direct = settings.cache.use_direct();
     let foyer_dir = cache_dir.join("foyer");
     info!(
-        "Opening clean cache: {}MB memory, {}GB SSD at {}",
+        "Opening clean cache: {}MB memory (L1), {}GB SSD, direct={} at {}",
         memory_bytes / (1024 * 1024),
         ssd_bytes / (1024 * 1024 * 1024),
+        direct,
         foyer_dir.display(),
     );
     let clean_cache: Arc<dyn BlockCache> = Arc::new(
@@ -112,9 +114,22 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
             memory_bytes,
             ssd_bytes,
             ssd_dir: foyer_dir,
+            direct,
         })
         .await
         .context("Failed to open foyer clean cache")?,
+    );
+
+    // Pack-index cache (same O_DIRECT policy + configurable tiers).
+    let pack_index_cache = Arc::new(
+        crate::block::pack_index_cache::PackIndexCache::open_with_sizes(
+            &cache_dir,
+            settings.cache.pack_index_memory_bytes(),
+            settings.cache.pack_index_ssd_bytes(),
+            direct,
+        )
+        .await
+        .context("Failed to open pack index cache")?,
     );
 
     let db_path_for_prewarm = db_path.clone();
@@ -125,6 +140,7 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
             cache_dir,
             block_size: nbd_config.block_size(),
             clean_cache,
+            pack_index_cache: Some(pack_index_cache),
             wal_sync: nbd_config.wal_sync(),
             max_s3_uploads: nbd_config.max_s3_uploads(),
             max_s3_downloads: nbd_config.max_s3_downloads(),

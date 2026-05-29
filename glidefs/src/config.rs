@@ -58,11 +58,82 @@ pub struct CacheConfig {
     #[serde(deserialize_with = "deserialize_expandable_path")]
     pub dir: PathBuf,
     pub disk_size_gb: f64,
+    /// Clean-cache memory tier (L1) in GB. This is a **RAM budget**, not a
+    /// performance dial: with `direct`, L1 is pinned, non-reclaimable host RAM that
+    /// can't be sold to tenants (unlike the page cache, which is elastic and
+    /// reclaimable). The default ([`DEFAULT_L1_BYTES`]) is sized to hold the
+    /// deduplicated shared base (pre-fork/layered, content-addressed → one copy)
+    /// plus a few hot tenants' warm tails — independent of node RAM, since dedup
+    /// makes the working set roughly constant across node sizes. Raise it per-node
+    /// if you knowingly pack more hot tenants; watch the L1 hit-rate metric to
+    /// know if it's right. Blocks beyond L1 fall to the O_DIRECT SSD tier
+    /// (~220 µs) — still ~1000× faster than the S3 miss it replaces.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_size_gb: Option<f64>,
     /// SSD tier capacity for foyer clean cache in GB (default: 10GB).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssd_cache_size_gb: Option<f64>,
+    /// Pack-index cache memory tier in GB (default: 64 MiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_index_memory_size_gb: Option<f64>,
+    /// Pack-index cache SSD tier in GB (default: 2 GiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pack_index_ssd_size_gb: Option<f64>,
+    /// Use `O_DIRECT` for the on-disk cache tiers (default: true). Bypasses the OS
+    /// page cache so the cache doesn't double-cache data or evict co-resident
+    /// tenants' pages. Automatically falls back to buffered I/O on filesystems
+    /// that don't support O_DIRECT (e.g. tmpfs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct: Option<bool>,
+}
+
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// Default clean-cache L1 (memory tier) budget: a flat 2 GiB.
+///
+/// Deliberately a **flat budget, not a fraction of RAM** — every byte of L1 is
+/// pinned, non-reclaimable, non-chargeable host RAM, and a RAM-fraction would
+/// grow that unsellable reservation as nodes get bigger for no benefit. The
+/// working set L1 must hold is set by the *deduplicated* content (one copy of the
+/// shared base) plus a few hot tenants' warm tails — roughly constant regardless
+/// of node size. 2 GiB comfortably covers that common case; operators with more
+/// hot tenants raise `memory_size_gb` and confirm via the L1 hit-rate metric.
+pub const DEFAULT_L1_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+impl CacheConfig {
+    /// Clean-cache memory tier (L1) bytes: explicit override or the default budget.
+    pub fn clean_cache_memory_bytes(&self) -> usize {
+        match self.memory_size_gb {
+            Some(gb) => (gb * GIB) as usize,
+            None => DEFAULT_L1_BYTES,
+        }
+    }
+
+    /// Clean-cache SSD tier bytes (default 10 GiB).
+    pub fn clean_cache_ssd_bytes(&self) -> usize {
+        (self.ssd_cache_size_gb.unwrap_or(10.0) * GIB) as usize
+    }
+
+    /// Pack-index cache memory tier bytes (default 64 MiB).
+    pub fn pack_index_memory_bytes(&self) -> usize {
+        match self.pack_index_memory_size_gb {
+            Some(gb) => (gb * GIB) as usize,
+            None => 64 * 1024 * 1024,
+        }
+    }
+
+    /// Pack-index cache SSD tier bytes (default 2 GiB).
+    pub fn pack_index_ssd_bytes(&self) -> usize {
+        match self.pack_index_ssd_size_gb {
+            Some(gb) => (gb * GIB) as usize,
+            None => 2 * 1024 * 1024 * 1024,
+        }
+    }
+
+    /// Whether to prefer `O_DIRECT` for on-disk cache tiers (default true).
+    pub fn use_direct(&self) -> bool {
+        self.direct.unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -583,6 +654,20 @@ impl Settings {
                 ssd
             );
         }
+        if let Some(mem) = self.cache.pack_index_memory_size_gb {
+            anyhow::ensure!(
+                mem.is_finite() && mem > 0.0,
+                "cache.pack_index_memory_size_gb must be a finite number > 0, got {}",
+                mem
+            );
+        }
+        if let Some(ssd) = self.cache.pack_index_ssd_size_gb {
+            anyhow::ensure!(
+                ssd.is_finite() && ssd > 0.0,
+                "cache.pack_index_ssd_size_gb must be a finite number > 0, got {}",
+                ssd
+            );
+        }
 
         // Storage timeout validation
         if let Some(t) = self.storage.connect_timeout_secs {
@@ -714,6 +799,9 @@ impl Settings {
                 disk_size_gb: 10.0,
                 memory_size_gb: Some(1.0),
                 ssd_cache_size_gb: None,
+                pack_index_memory_size_gb: None,
+                pack_index_ssd_size_gb: None,
+                direct: None,
             },
             storage: StorageConfig {
                 url: "s3://your-bucket/glidefs-data".to_string(),

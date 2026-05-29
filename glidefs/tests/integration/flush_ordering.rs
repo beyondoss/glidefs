@@ -44,6 +44,7 @@ fn create_router_config(s3: Arc<dyn ObjectStore>, dir: &TempDir) -> RouterConfig
         cache_dir: dir.path().to_path_buf(),
         block_size: BLOCK_SIZE,
         clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+        pack_index_cache: None,
         wal_sync: true,
         max_s3_uploads: 0,
         max_s3_downloads: 0,

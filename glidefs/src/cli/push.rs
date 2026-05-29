@@ -163,6 +163,7 @@ async fn load_readonly_handler(
             memory_bytes: 64 * 1024 * 1024,
             ssd_bytes: 256 * 1024 * 1024,
             ssd_dir: foyer_dir,
+            direct: false, // ephemeral CLI cache; buffered is fine
         })
         .await
         .context("failed to open block cache")?,

@@ -293,6 +293,7 @@ pub async fn run_bless_oci(
             memory_bytes: 4 * 1024 * 1024,
             ssd_bytes: 16 * 1024 * 1024,
             ssd_dir: foyer_dir,
+            direct: false, // ephemeral CLI cache; buffered is fine
         })
         .await
         .context("failed to open block cache")?,
