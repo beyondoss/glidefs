@@ -192,6 +192,7 @@ mod blktests {
                     cache_dir: cache_dir.path().to_path_buf(),
                     block_size: 128 * 1024,
                     clean_cache,
+                    pack_index_cache: None,
                     wal_sync: false,
                     max_s3_uploads: 128,
                     max_s3_downloads: 512,
