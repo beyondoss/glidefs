@@ -230,6 +230,7 @@ async fn create_test_router(
             cache_dir: dir.path().to_path_buf(),
             block_size: 131_072, // 128 KB — matches bless default
             clean_cache: Arc::new(SimpleBlockCache::new(64 * 1024 * 1024)),
+            pack_index_cache: None,
             wal_sync: false,
             max_s3_uploads: 0,
             max_s3_downloads: 0,
