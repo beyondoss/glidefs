@@ -13,6 +13,25 @@
 //! under test).
 //!
 //! Run with: `cargo bench --features test-utils --bench foyer_ssd_read`
+//!
+//! ## Buffered vs O_DIRECT, and where the files live
+//!
+//! By default the cache files go in `std::env::temp_dir()`. On most dev/CI hosts
+//! that's **tmpfs (RAM)**, and foyer opens them **buffered** -- so reads are served
+//! from the OS page cache and measure *engine + queue overhead*, not SSD media
+//! latency. That's a real production regime (prod foyer is buffered too: a hot
+//! SSD-cached block also sits in page cache), but it is not the cold path.
+//!
+//! To measure the **cold media path**, point the bench at a real SSD-backed
+//! directory and it will additionally run an **O_DIRECT** variant (page-cache
+//! bypass):
+//!
+//! ```text
+//! GLIDEFS_BENCH_DIR=/path/on/real/ssd cargo bench --features test-utils --bench foyer_ssd_read
+//! ```
+//!
+//! O_DIRECT is only attempted when `GLIDEFS_BENCH_DIR` is set (tmpfs returns
+//! `EINVAL` for O_DIRECT), so the default run stays portable and buffered-only.
 
 use std::path::Path;
 use std::time::Duration;
@@ -24,22 +43,34 @@ use foyer::{
     HybridCacheBuilder, HybridCachePolicy, IoEngineConfig, PsyncIoEngineConfig, RecoverMode,
     S3FifoConfig,
 };
+use futures::future::join_all;
 use rand::Rng;
 use tempfile::TempDir;
 
 use glidefs::block::block_map::{Blake3Hash, blake3_128};
 
 const BLOCK_SIZE: usize = 128 * 1024; // 128 KiB, production block size
-const NUM_BLOCKS: usize = 512; // 64 MiB working set
+const NUM_BLOCKS: usize = 1024; // 128 MiB working set
 const MEMORY_BYTES: usize = 2 * 1024 * 1024; // ~16 blocks -> forces SSD-tier reads
-const SSD_BYTES: usize = 256 * 1024 * 1024; // holds the whole working set
+const SSD_BYTES: usize = 512 * 1024 * 1024; // holds the whole working set
+
+/// In-flight read counts to bench. 1 = latency; higher exercises the io engine's
+/// io_depth (64) and psync's blocking-pool ceiling, where io_uring's inline
+/// submission should pull ahead.
+const CONCURRENCY: &[usize] = &[1, 16, 64];
 
 /// Build a `HybridCache<Blake3Hash, Bytes>` mirroring the clean-cache config
 /// (S3-FIFO eviction, `len` weighter, block engine over an fs device), with the
-/// given I/O engine pinned.
-async fn build_cache(dir: &Path, engine: Box<dyn IoEngineConfig>) -> HybridCache<Blake3Hash, Bytes> {
+/// given I/O engine pinned. `direct = true` opens the device with O_DIRECT
+/// (page-cache bypass); only valid on a real filesystem that supports it.
+async fn build_cache(
+    dir: &Path,
+    engine: Box<dyn IoEngineConfig>,
+    direct: bool,
+) -> HybridCache<Blake3Hash, Bytes> {
     let device = FsDeviceBuilder::new(dir)
         .with_capacity(SSD_BYTES)
+        .with_direct(direct)
         .build()
         .expect("build device");
     HybridCacheBuilder::new()
@@ -119,42 +150,71 @@ fn bench_ssd_read(c: &mut Criterion) {
         Box::new(foyer::UringIoEngineConfig::new()) as Box<dyn IoEngineConfig>
     }));
 
+    // Where cache files live. If GLIDEFS_BENCH_DIR points at a real SSD-backed
+    // filesystem, we create temp dirs there and also run an O_DIRECT (cold media)
+    // variant. Otherwise we fall back to the default temp dir (often tmpfs) and
+    // run buffered-only, since O_DIRECT would EINVAL on tmpfs.
+    let bench_root = std::env::var_os("GLIDEFS_BENCH_DIR");
+    let new_tempdir = || match &bench_root {
+        Some(root) => TempDir::new_in(root).expect("create temp dir in GLIDEFS_BENCH_DIR"),
+        None => TempDir::new().expect("create temp dir"),
+    };
+    // direct=false => buffered (page-cache); direct=true => O_DIRECT (media).
+    let io_modes: &[(&str, bool)] = if bench_root.is_some() {
+        &[("buffered", false), ("direct", true)]
+    } else {
+        &[("buffered", false)]
+    };
+
     let mut group = c.benchmark_group("foyer_ssd_read");
-    group.throughput(Throughput::Bytes(BLOCK_SIZE as u64));
 
     for (name, make_engine) in engines {
-        let dir = TempDir::new().unwrap();
-        let cache = rt.block_on(build_cache(dir.path(), make_engine()));
-        let present = rt.block_on(populate_and_filter(&cache, &blocks));
-        assert!(
-            present.len() >= NUM_BLOCKS / 2,
-            "{name}: only {}/{NUM_BLOCKS} blocks persisted to SSD",
-            present.len()
-        );
+        for &(mode, direct) in io_modes {
+            let dir = new_tempdir();
+            let cache = rt.block_on(build_cache(dir.path(), make_engine(), direct));
+            let present = rt.block_on(populate_and_filter(&cache, &blocks));
+            assert!(
+                present.len() >= NUM_BLOCKS / 2,
+                "{name}/{mode}: only {}/{NUM_BLOCKS} blocks persisted to SSD",
+                present.len()
+            );
 
-        // Measure the pure disk-read path via storage().load(): no memory tier in
-        // the way, so this is exactly the psync-vs-io_uring SSD read we care about.
-        group.bench_function(BenchmarkId::from_parameter(name), |b| {
-            b.to_async(&rt).iter_custom(|iters| {
-                let cache = &cache;
-                let present = &present;
-                async move {
-                    let mut total = Duration::ZERO;
-                    let mut rng = rand::thread_rng();
-                    for _ in 0..iters {
-                        let key = present[rng.gen_range(0..present.len())];
-                        let start = std::time::Instant::now();
-                        let load = cache.storage().load(&key).await.expect("load");
-                        total += start.elapsed();
-                        assert!(matches!(load, foyer::Load::Entry { .. }), "disk miss");
-                    }
-                    total
-                }
-            });
-        });
+            // Measure the pure disk-read path via storage().load(): no memory tier
+            // in the way. At each concurrency level, every timed unit issues `conc`
+            // loads at once.
+            for &conc in CONCURRENCY {
+                group.throughput(Throughput::Bytes((conc * BLOCK_SIZE) as u64));
+                group.bench_function(BenchmarkId::new(format!("{name}-{mode}"), conc), |b| {
+                    b.to_async(&rt).iter_custom(|iters| {
+                        let cache = &cache;
+                        let present = &present;
+                        async move {
+                            let mut total = Duration::ZERO;
+                            let mut rng = rand::thread_rng();
+                            for _ in 0..iters {
+                                let keys: Vec<Blake3Hash> = (0..conc)
+                                    .map(|_| present[rng.gen_range(0..present.len())])
+                                    .collect();
+                                let start = std::time::Instant::now();
+                                let loads =
+                                    join_all(keys.iter().map(|k| cache.storage().load(k))).await;
+                                total += start.elapsed();
+                                for load in loads {
+                                    assert!(
+                                        matches!(load.expect("load"), foyer::Load::Entry { .. }),
+                                        "disk miss"
+                                    );
+                                }
+                            }
+                            total
+                        }
+                    });
+                });
+            }
 
-        // Keep dir alive across the (synchronous) bench above.
-        drop(dir);
+            // Keep dir alive across the (synchronous) benches above.
+            drop(dir);
+        }
     }
     group.finish();
 }
