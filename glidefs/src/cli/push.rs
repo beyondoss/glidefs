@@ -164,6 +164,7 @@ async fn load_readonly_handler(
             ssd_bytes: 256 * 1024 * 1024,
             ssd_dir: foyer_dir,
             direct: false, // ephemeral CLI cache; buffered is fine
+            io_uring: false, // ephemeral CLI cache; psync avoids the idle-spin
         })
         .await
         .context("failed to open block cache")?,

@@ -115,6 +115,7 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
             ssd_bytes,
             ssd_dir: foyer_dir,
             direct,
+            io_uring: settings.cache.use_io_uring(),
         })
         .await
         .context("Failed to open foyer clean cache")?,
@@ -127,6 +128,7 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
             settings.cache.pack_index_memory_bytes(),
             settings.cache.pack_index_ssd_bytes(),
             direct,
+            settings.cache.use_io_uring(),
         )
         .await
         .context("Failed to open pack index cache")?,

@@ -3,10 +3,17 @@
 //! foyer's default psync engine dispatches every SSD-tier read to a tokio
 //! blocking thread (`spawn_blocking` -> `pread`). The io_uring engine submits the
 //! read inline instead, which measures ~25% lower per-read latency / ~37% higher
-//! throughput on cached reads (see `benches/foyer_ssd_read.rs`). We prefer io_uring
-//! on Linux and fall back to psync if io_uring setup fails (e.g. seccomp/gVisor
-//! sandboxes) or on non-Linux platforms. There is no config knob — selection is
-//! automatic.
+//! throughput on cached reads (see `benches/foyer_ssd_read.rs`).
+//!
+//! io_uring is **opt-in** (`[cache] io_uring = true`), defaulting to psync,
+//! because foyer's io_uring engine (`foyer-storage` 0.22.x) busy-polls its
+//! completion ring with no idle backoff — `UringIoEngineShard::run` loops on
+//! `try_recv` + a non-blocking `completion()` drain, so each engine thread pins a
+//! full core whenever the cache is idle, not just under load. It also has an
+//! unfixed upstream use-after-free (foyer-rs/foyer#1286). The throughput win only
+//! materializes under sustained cached-read pressure; enable it per-node when the
+//! cache is hot enough to justify the spinning cores. On non-Linux platforms the
+//! flag is ignored and psync is always used.
 
 use std::future::Future;
 use std::path::Path;
@@ -45,15 +52,17 @@ pub fn o_direct_supported(dir: &Path) -> bool {
     }
 }
 
-/// Build a foyer [`HybridCache`], preferring the io_uring I/O engine on Linux and
-/// degrading gracefully to foyer's default psync engine.
+/// Build a foyer [`HybridCache`]. When `prefer_uring` is set (and on Linux), tries
+/// the io_uring I/O engine first and degrades gracefully to foyer's default psync
+/// engine; otherwise uses psync directly.
 ///
 /// `build` is invoked with the engine config to install: `Some(io_uring)` on the
-/// Linux attempt, or `None` to let foyer use its psync default. It must
+/// Linux io_uring attempt, or `None` to let foyer use its psync default. It must
 /// reconstruct the full builder on each call because foyer's device and storage
 /// builders are consuming, so a failed io_uring attempt can't reuse them.
 pub async fn build_preferring_uring<K, V, F, Fut>(
     name: &str,
+    prefer_uring: bool,
     build: F,
 ) -> anyhow::Result<HybridCache<K, V>>
 where
@@ -63,7 +72,7 @@ where
     Fut: Future<Output = foyer::Result<HybridCache<K, V>>>,
 {
     #[cfg(target_os = "linux")]
-    {
+    if prefer_uring {
         match build(Some(Box::new(foyer::UringIoEngineConfig::new()))).await {
             Ok(cache) => {
                 tracing::debug!(cache = name, "foyer cache using io_uring I/O engine");
@@ -76,6 +85,9 @@ where
             ),
         }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = prefer_uring;
 
     let cache = build(None).await?;
     tracing::debug!(cache = name, "foyer cache using psync I/O engine");

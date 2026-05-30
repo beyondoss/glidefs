@@ -53,6 +53,10 @@ pub struct FoyerCacheConfig {
     /// Prefer `O_DIRECT` for the SSD tier (bypass the page cache). Falls back to
     /// buffered if the backing filesystem doesn't support it (e.g. tmpfs).
     pub direct: bool,
+    /// Prefer foyer's io_uring I/O engine for the SSD tier. Defaults off because
+    /// the engine busy-polls a core when idle (see `super::foyer_engine`); falls
+    /// back to psync if io_uring setup fails or on non-Linux.
+    pub io_uring: bool,
 }
 
 /// Production block cache backed by foyer's HybridCache.
@@ -69,9 +73,9 @@ impl FoyerBlockCache {
     pub async fn open(config: FoyerCacheConfig) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&config.ssd_dir)?;
 
-        // Prefer the io_uring I/O engine on Linux (falls back to psync); the
-        // builder closure is reconstructed per attempt because foyer's device and
-        // storage builders are consuming.
+        // Optionally prefer the io_uring I/O engine on Linux (falls back to
+        // psync); the builder closure is reconstructed per attempt because
+        // foyer's device and storage builders are consuming.
         let ssd_dir = &config.ssd_dir;
         let ssd_bytes = config.ssd_bytes;
         let memory_bytes = config.memory_bytes;
@@ -85,7 +89,7 @@ impl FoyerBlockCache {
                 "clean cache: O_DIRECT unsupported on this filesystem, using buffered I/O"
             );
         }
-        let inner = super::foyer_engine::build_preferring_uring("glidefs-clean-cache", |engine| {
+        let inner = super::foyer_engine::build_preferring_uring("glidefs-clean-cache", config.io_uring, |engine| {
             async move {
                 let device = FsDeviceBuilder::new(ssd_dir)
                     .with_capacity(ssd_bytes)
@@ -289,6 +293,7 @@ mod tests {
             ssd_bytes,
             ssd_dir: dir.path().to_path_buf(),
             direct: false,
+            io_uring: false,
         })
         .await
         .expect("failed to open foyer cache")
@@ -322,6 +327,7 @@ mod tests {
             ssd_bytes: 16 * 1024 * 1024,
             ssd_dir: dir.path().to_path_buf(),
             direct: true,
+            io_uring: false,
         })
         .await
         .expect("direct=true must open (falling back to buffered if unsupported)");
