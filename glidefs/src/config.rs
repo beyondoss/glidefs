@@ -85,6 +85,15 @@ pub struct CacheConfig {
     /// that don't support O_DIRECT (e.g. tmpfs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direct: Option<bool>,
+    /// Use foyer's io_uring I/O engine for the on-disk cache tiers (default:
+    /// false). io_uring submits cache reads/writes through a shared ring with
+    /// fewer syscalls than psync, but its engine thread busy-polls the completion
+    /// ring with no idle backoff — it pins a full core per cache whenever idle,
+    /// not just under load (see `block::foyer_engine`). Only enable on nodes whose
+    /// cache stays hot enough to justify the spinning cores. Falls back to psync
+    /// if io_uring setup fails (seccomp/gVisor) or on non-Linux platforms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io_uring: Option<bool>,
 }
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -133,6 +142,12 @@ impl CacheConfig {
     /// Whether to prefer `O_DIRECT` for on-disk cache tiers (default true).
     pub fn use_direct(&self) -> bool {
         self.direct.unwrap_or(true)
+    }
+
+    /// Whether to prefer foyer's io_uring I/O engine for on-disk cache tiers
+    /// (default false — psync, which doesn't busy-poll when idle).
+    pub fn use_io_uring(&self) -> bool {
+        self.io_uring.unwrap_or(false)
     }
 }
 
@@ -802,6 +817,7 @@ impl Settings {
                 pack_index_memory_size_gb: None,
                 pack_index_ssd_size_gb: None,
                 direct: None,
+                io_uring: None,
             },
             storage: StorageConfig {
                 url: "s3://your-bucket/glidefs-data".to_string(),
