@@ -91,6 +91,7 @@ mod fio_verify {
                 flush_threshold: None,
                 flush_mode: None,
                 transport: None,
+                compaction_cooldown: None,
             };
             router
                 .create_export(config, false, None, None)
@@ -360,6 +361,7 @@ mod fio_verify {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router2
             .create_export(config, false, Some("verify"), None)
@@ -493,6 +495,7 @@ mod fio_verify {
                 flush_threshold: None,
                 flush_mode: None,
                 transport: None,
+                compaction_cooldown: None,
             };
             router2
                 .create_export(config, false, Some("verify"), None)
@@ -603,6 +606,7 @@ mod fio_verify {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router2
             .create_export(config, false, Some("verify"), None)

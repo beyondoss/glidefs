@@ -77,6 +77,7 @@ mod fio_bench {
                 flush_threshold: None,
                 flush_mode: None,
                 transport: None,
+                compaction_cooldown: None,
             };
             router.create_export(config, false, None, None).await.unwrap();
 

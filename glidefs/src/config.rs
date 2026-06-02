@@ -362,6 +362,14 @@ pub struct ExportConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub transport: Option<String>,
 
+    /// Cooldown compaction: defer dead-ratio compaction of a chunk until it has
+    /// been idle (unwritten) for this many flush cycles. Cuts S3 PUT-byte write
+    /// amplification on overwrite-heavy DB volumes (Postgres/SQLite) by not
+    /// repeatedly recompacting still-hot chunks. The pack-count cap still forces
+    /// compaction of a hot chunk eventually. `None`/0 = disabled (compact on
+    /// every dead-ratio crossing, the default). Typical enabled value: 8.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub compaction_cooldown: Option<u64>,
 }
 
 impl ExportConfig {
@@ -393,6 +401,12 @@ impl ExportConfig {
             return 0;
         }
         self.flush_threshold.unwrap_or(global_default)
+    }
+
+    /// Cooldown compaction window in flush cycles. 0 = disabled (current default
+    /// behavior: compact on every dead-ratio crossing).
+    pub fn compaction_cooldown(&self) -> u64 {
+        self.compaction_cooldown.unwrap_or(0)
     }
 }
 
@@ -505,6 +519,7 @@ impl NbdConfig {
                 flush_threshold: None,
                 flush_mode: None,
                 transport: None,
+                compaction_cooldown: None,
             }];
         }
 
@@ -517,6 +532,7 @@ impl NbdConfig {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         }]
     }
 }
@@ -839,6 +855,7 @@ impl Settings {
                         flush_threshold: None,
                         flush_mode: None,
                         transport: None,
+                        compaction_cooldown: None,
                     }],
                     device_name: None,
                     device_size_gb: None,

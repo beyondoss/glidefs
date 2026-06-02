@@ -106,6 +106,7 @@ async fn setup_router_full(
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(config, false, None, None)
@@ -477,6 +478,7 @@ async fn zc_glidefs_multi_device_soak() {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router
             .create_export(cfg, false, None, None)

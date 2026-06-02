@@ -128,6 +128,7 @@ transport_test! {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         let result = server2
             .router

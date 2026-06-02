@@ -791,8 +791,9 @@ async fn test_concurrent_compaction_and_flush() {
     let pic_clone = Arc::clone(&pic);
     let vm_clone = Arc::clone(&vm);
     let compact_cc: Arc<dyn glidefs::block::cache::BlockCache> = cc.clone();
+    let no_cooldown = std::collections::HashMap::new();
     let (compact_result, flush_result) = tokio::join!(
-        compact_if_needed(16, 0.5, &cs, &pic, &vm, &compact_cc),
+        compact_if_needed(16, 0.5, 0, &no_cooldown, &cs, &pic, &vm, &compact_cc),
         async {
             // Small yield to let compaction start first
             tokio::task::yield_now().await;
@@ -1648,7 +1649,7 @@ async fn test_compaction_during_active_writes() {
 
     // Run compaction concurrently
     let compact_cc: Arc<dyn glidefs::block::cache::BlockCache> = cc.clone();
-    let compact_result = compact_if_needed(16, 0.5, &cs, &pic, &vm, &compact_cc).await;
+    let compact_result = compact_if_needed(16, 0.5, 0, &std::collections::HashMap::new(), &cs, &pic, &vm, &compact_cc).await;
 
     write_handle.await.unwrap();
 
@@ -1824,7 +1825,7 @@ async fn test_compaction_dedup_correctness() {
 
     // Compact
     let compact_cc: Arc<dyn glidefs::block::cache::BlockCache> = cc.clone();
-    let results = compact_if_needed(1, 0.5, &cs, &pic, &vm, &compact_cc).await.unwrap();
+    let results = compact_if_needed(1, 0.5, 0, &std::collections::HashMap::new(), &cs, &pic, &vm, &compact_cc).await.unwrap();
     assert!(
         !results.is_empty(),
         "compaction should have run (threshold=1, have {} packs)",
@@ -1925,9 +1926,10 @@ async fn test_concurrent_compaction_flush_no_duplicate_block_refs() {
     let pic_clone = Arc::clone(&pic);
     let vm_clone = Arc::clone(&vm);
     let compact_cc: Arc<dyn glidefs::block::cache::BlockCache> = cc.clone();
+    let no_cooldown = std::collections::HashMap::new();
 
     let (compact_result, flush_result) = tokio::join!(
-        compact_if_needed(16, 0.5, &cs, &pic, &vm, &compact_cc),
+        compact_if_needed(16, 0.5, 0, &no_cooldown, &cs, &pic, &vm, &compact_cc),
         async {
             tokio::task::yield_now().await;
             cache_clone.flush_to_s3(&cs_clone, &pic_clone, &vm_clone).await
@@ -2213,6 +2215,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router1.create_export(config, false, None, None).await.unwrap();
 
@@ -2281,6 +2284,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router2.create_export(config2, false, Some("vol1"), None).await.unwrap();
 
@@ -2559,6 +2563,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router1
             .create_export(config1, false, None, None)
@@ -2615,6 +2620,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router2
             .create_export(config2, false, Some("vol"), None)
@@ -2709,4 +2715,156 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
             &failures[..std::cmp::min(10, failures.len())],
         );
     }
+}
+
+// =============================================================================
+// TEST: COOLDOWN COMPACTION GATE
+// =============================================================================
+
+/// Cooldown compaction defers dead-ratio compaction of a still-hot chunk.
+///
+/// A chunk with dead_ratio > 0.5 but recent writes (age < cooldown) must NOT be
+/// compacted; once it goes idle (age >= cooldown) it compacts. The latest data
+/// must survive both the deferral and the eventual compaction.
+///
+/// (cooldown == 0 = current "compact on every crossing" behavior is already
+/// covered by `test_compaction_dedup_correctness`, which passes cooldown 0.)
+#[tokio::test]
+async fn test_cooldown_compaction_defers_hot_chunk() {
+    use glidefs::block::write_cache::compact::{compact_if_needed, DEFAULT_COMPACTION_THRESHOLD};
+    use std::collections::HashMap;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, _m) =
+        create_cache_with_store(&dir, "cooldown-gate", Arc::clone(&s3)).await;
+
+    // Three flushes overwriting the SAME 100 offsets in chunk 0 with distinct
+    // data → 3 packs, dead_ratio = 200/300 = 0.667 (> 0.5), pack count well
+    // under the cap so the cooldown gate (not the cap) governs.
+    for seed in [0x11u8, 0x22, 0x33] {
+        let data = vec![seed; BLOCK_SIZE];
+        for i in 0..100u64 {
+            cache.write(i * BLOCK_SIZE as u64, &data).unwrap();
+        }
+        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    }
+    let packs = vm.read().chunk_pack_ids(0).unwrap().len();
+    assert!(
+        (2..=DEFAULT_COMPACTION_THRESHOLD).contains(&packs),
+        "want 2..={DEFAULT_COMPACTION_THRESHOLD} packs (cap must not fire), got {packs}"
+    );
+
+    let compact_cc: Arc<dyn glidefs::block::cache::BlockCache> = cc.clone();
+
+    // cooldown enabled, chunk unknown to the age map → treated as age 0 (just
+    // written) → deferred.
+    let r = compact_if_needed(
+        DEFAULT_COMPACTION_THRESHOLD, 0.5, 8, &HashMap::new(),
+        &cs, &pic, &vm, &compact_cc,
+    ).await.unwrap();
+    assert!(r.is_empty(), "unknown chunk (age 0) must defer under cooldown");
+    assert_eq!(vm.read().chunk_pack_ids(0).unwrap().len(), packs);
+
+    // cooldown enabled, chunk hot (age 7 < 8) → deferred.
+    let mut age: HashMap<u32, u64> = HashMap::new();
+    age.insert(0, 7);
+    let r = compact_if_needed(
+        DEFAULT_COMPACTION_THRESHOLD, 0.5, 8, &age, &cs, &pic, &vm, &compact_cc,
+    ).await.unwrap();
+    assert!(r.is_empty(), "age 7 < cooldown 8 must defer");
+    assert_eq!(vm.read().chunk_pack_ids(0).unwrap().len(), packs);
+
+    // chunk cold (age 8 >= 8) → compacts.
+    age.insert(0, 8);
+    let r = compact_if_needed(
+        DEFAULT_COMPACTION_THRESHOLD, 0.5, 8, &age, &cs, &pic, &vm, &compact_cc,
+    ).await.unwrap();
+    assert!(!r.is_empty(), "age 8 >= cooldown 8 must compact");
+    let after = vm.read().chunk_pack_ids(0).unwrap().len();
+    assert!(after < packs, "compaction should reduce packs {packs} -> {after}");
+
+    // Cold-read: the latest data (0x33) must survive deferral + compaction.
+    cache.sync_manifest(&cs, &vm).await.unwrap();
+    drop(cache);
+    let rdir = TempDir::new().unwrap();
+    let (reader, rcs, rpic, rvm, rcc, rm) =
+        create_reader(&rdir, "cooldown-gate", Arc::clone(&s3)).await;
+    let expect = vec![0x33u8; BLOCK_SIZE];
+    for i in 0..100u64 {
+        let got = reader
+            .read(i * BLOCK_SIZE as u64, BLOCK_SIZE, rcc.as_ref(), &rpic, &rvm, &rcs, &rm)
+            .await.unwrap();
+        assert_eq!(got.as_ref(), &expect[..], "block {i} latest data after compaction");
+    }
+}
+
+/// The pack-count cap is an unconditional backstop: a maximally-hot chunk
+/// (age 0) with cooldown enabled must STILL compact once it exceeds the pack
+/// threshold, so a hot chunk's packs can never grow without bound.
+#[tokio::test]
+async fn test_cooldown_pack_cap_overrides_hot_chunk() {
+    use glidefs::block::write_cache::compact::{compact_if_needed, DEFAULT_COMPACTION_THRESHOLD};
+    use std::collections::HashMap;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, cc, _m) =
+        create_cache_with_store(&dir, "cooldown-cap", Arc::clone(&s3)).await;
+
+    // Accumulate threshold+1 distinct packs on block 0 of chunk 0.
+    for n in 0..=(DEFAULT_COMPACTION_THRESHOLD as u8) {
+        cache.write(0, &vec![n.wrapping_add(1); BLOCK_SIZE]).unwrap();
+        cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    }
+    let packs = vm.read().chunk_pack_ids(0).unwrap().len();
+    assert!(packs > DEFAULT_COMPACTION_THRESHOLD, "want > cap packs, got {packs}");
+
+    // Maximally hot (age 0) AND cooldown enabled — the cap must still fire.
+    let compact_cc: Arc<dyn glidefs::block::cache::BlockCache> = cc.clone();
+    let r = compact_if_needed(
+        DEFAULT_COMPACTION_THRESHOLD, 0.5, 8, &HashMap::new(),
+        &cs, &pic, &vm, &compact_cc,
+    ).await.unwrap();
+    assert!(!r.is_empty(), "pack-count cap must override cooldown for a hot chunk");
+    assert!(vm.read().chunk_pack_ids(0).unwrap().len() <= DEFAULT_COMPACTION_THRESHOLD);
+
+    // Latest data survives.
+    let latest = (DEFAULT_COMPACTION_THRESHOLD as u8).wrapping_add(1);
+    cache.sync_manifest(&cs, &vm).await.unwrap();
+    drop(cache);
+    let rdir = TempDir::new().unwrap();
+    let (reader, rcs, rpic, rvm, rcc, rm) =
+        create_reader(&rdir, "cooldown-cap", Arc::clone(&s3)).await;
+    let got = reader
+        .read(0, BLOCK_SIZE, rcc.as_ref(), &rpic, &rvm, &rcs, &rm)
+        .await.unwrap();
+    assert_eq!(got.as_ref(), &vec![latest; BLOCK_SIZE][..]);
+}
+
+/// `FlushStats.touched_chunks` reports exactly the chunks written in a cycle —
+/// the input the scheduler builds the cooldown age map from.
+#[tokio::test]
+async fn test_flush_reports_touched_chunks() {
+    use std::collections::HashSet;
+
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) =
+        create_cache_with_store(&dir, "touched", Arc::clone(&s3)).await;
+
+    let bpc = u64::from(vm.read().blocks_per_chunk()); // 1024 @ 128 KiB
+    // Write into chunk 0 (block 0) and chunk 1 (first block of the next chunk).
+    cache.write(0, &vec![0xA1; BLOCK_SIZE]).unwrap();
+    cache.write(bpc * BLOCK_SIZE as u64, &vec![0xB2; BLOCK_SIZE]).unwrap();
+    let stats = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    assert_eq!(
+        stats.touched_chunks,
+        HashSet::from([0u32, 1u32]),
+        "touched_chunks must list every written chunk",
+    );
+
+    // A flush with nothing dirty touches no chunks.
+    let stats2 = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+    assert!(stats2.touched_chunks.is_empty(), "empty flush touches no chunks");
 }

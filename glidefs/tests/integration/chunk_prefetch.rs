@@ -49,6 +49,7 @@ async fn test_prefetch_chunk_metas_cold_start() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router1
         .create_export(config.clone(), false, None, None)

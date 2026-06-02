@@ -148,6 +148,7 @@ fn test_export_config(name: &str) -> ExportConfig {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     }
 }
 
@@ -1024,6 +1025,7 @@ async fn test_readahead_prefetches_next_pack_index() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(config.clone(), false, None, None)

@@ -51,6 +51,11 @@ pub struct PutExportRequest {
     /// If set (with manifest_name), fork from this specific snapshot sequence.
     #[serde(default)]
     pub snapshot_sequence: Option<u64>,
+    /// Cooldown compaction window in flush cycles (0/unset = disabled). Defers
+    /// dead-ratio compaction of a chunk until it has been idle this many cycles;
+    /// cuts S3 PUT write-amp on overwrite-heavy DB volumes. Typical value: 8.
+    #[serde(default)]
+    pub compaction_cooldown: Option<u64>,
 }
 
 /// Optional request body for POST /api/exports/{name}/snapshot.
@@ -427,6 +432,7 @@ where
                         flush_threshold: put_req.flush_threshold,
                         flush_mode: put_req.flush_mode,
                         transport: put_req.transport,
+                        compaction_cooldown: put_req.compaction_cooldown,
                     };
 
                     let t_handler = Instant::now();
