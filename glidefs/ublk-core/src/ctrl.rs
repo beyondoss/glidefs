@@ -542,11 +542,27 @@ impl UblkJsonManager {
         &mut self.json
     }
 
-    /// Set file permissions for the JSON file
-    fn set_path_permission(path: &Path, mode: u32) -> Result<(), std::io::Error> {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(mode);
-        std::fs::set_permissions(path, permissions)
+    /// Set permissions on a directory we just created, anchored to the inode
+    /// rather than the path string.
+    ///
+    /// `create_dir_all` followed by a path-based `set_permissions` has a
+    /// symlink-swap window: between the `mkdir` and the chmod, an attacker with
+    /// write access to the parent could replace the new directory with a
+    /// symlink, redirecting the chmod onto an arbitrary target. We close that
+    /// window by opening the directory with `O_NOFOLLOW | O_DIRECTORY` (so a
+    /// swapped-in symlink fails the open) and `fchmod`-ing the resulting fd.
+    fn set_dir_permission(path: &Path, mode: u32) -> Result<(), std::io::Error> {
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)?;
+        // SAFETY: `dir` is a valid open directory fd for the duration of the
+        // call; `fchmod` changes the mode of the inode it refers to.
+        let ret = unsafe { libc::fchmod(dir.as_raw_fd(), mode as libc::mode_t) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Flush JSON data to file
@@ -563,8 +579,9 @@ impl UblkJsonManager {
         if let Some(parent_dir) = json_path.parent() {
             std::fs::create_dir_all(parent_dir)?;
             // Chmod after create: 0o777 is intentional (world-accessible device
-            // metadata directory) and must bypass the process umask.
-            Self::set_path_permission(parent_dir, 0o777)?;
+            // metadata directory) and must bypass the process umask. Anchored
+            // to the inode via O_NOFOLLOW to avoid a symlink-swap window.
+            Self::set_dir_permission(parent_dir, 0o777)?;
         }
 
         // Open with mode 0o700 at creation time so the file is never
@@ -2682,7 +2699,11 @@ impl UblkCtrl {
         let mut q_threads = Vec::new();
         let nr_queues = dev.dev_info.nr_hw_queues;
 
-        let (tx, rx) = mpsc::channel();
+        // Bounded fan-in: each of the `nr_queues` threads sends exactly one
+        // `(qid, tid)` tuple, so a capacity of `nr_queues` guarantees no send
+        // ever blocks while keeping the buffer explicitly bounded (no unbounded
+        // accumulation if the receiver stalls).
+        let (tx, rx) = mpsc::sync_channel::<(u16, i32)>(nr_queues as usize);
 
         for q in 0..nr_queues {
             let _dev = Arc::clone(dev);

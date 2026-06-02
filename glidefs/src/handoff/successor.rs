@@ -227,6 +227,9 @@ async fn missing_exports(
 fn connect_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
     use std::os::fd::FromRawFd;
 
+    // SAFETY: plain syscall with constant arguments. The returned `fd` is a
+    // raw owned descriptor that MUST reach exactly one fate: `close(fd)` on
+    // every error path below, or transfer to `from_raw_fd` at the end.
     let fd = unsafe {
         libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK, 0)
     };
@@ -234,6 +237,8 @@ fn connect_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
         return Err(std::io::Error::last_os_error());
     }
 
+    // SAFETY: `sockaddr_un` is a C POD; an all-zero pattern is a valid empty
+    // address that we fill in below.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as u16;
     let path_bytes = path.as_os_str().as_encoded_bytes();
@@ -248,6 +253,8 @@ fn connect_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
         addr.sun_path[i] = *b as libc::c_char;
     }
 
+    // SAFETY: `fd` is the valid socket from above; `addr` is a fully
+    // initialized `sockaddr_un` and the length covers the whole struct.
     let connect_ret = unsafe {
         libc::connect(
             fd,
@@ -260,11 +267,16 @@ fn connect_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
         // completes the connect synchronously for AF_UNIX in practice.
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() != Some(libc::EINPROGRESS) {
+            // SAFETY: `fd` is still owned here and not yet wrapped; close it
+            // to avoid leaking the descriptor on the error path.
             unsafe { libc::close(fd) };
             return Err(err);
         }
     }
 
+    // SAFETY: `fd` is a valid open socket; ownership transfers to the
+    // `UnixDatagram` exactly once here (no surviving error path leaves `fd`
+    // both open and unwrapped).
     let std_sock = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(fd) };
     UnixDatagram::from_std(std_sock)
 }

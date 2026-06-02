@@ -850,7 +850,9 @@ impl WriteCache<Active> {
                     drop(self.inner.flushing_file.lock().take());
                 }
                 let flushing_path = self.inner.config.flushing_path();
-                match std::fs::remove_file(&flushing_path) {
+                // tokio::fs to avoid blocking the executor on the journal
+                // commit that an ext4 unlink can incur.
+                match tokio::fs::remove_file(&flushing_path).await {
                     Ok(()) => {
                         info!("removed orphaned flushing file");
                     }
@@ -903,7 +905,7 @@ impl WriteCache<Active> {
             self.inner.rotation_seq.store(0, Ordering::Release);
             drop(self.inner.flushing_file.lock().take());
             let flushing_path = self.inner.config.flushing_path();
-            match std::fs::remove_file(&flushing_path) {
+            match tokio::fs::remove_file(&flushing_path).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => warn!(error = %e, "failed to remove empty flushing file"),
@@ -1038,9 +1040,9 @@ impl WriteCache<Active> {
             // unrecoverable blocks have already been marked NOT_PRESENT above.
             drop(self.inner.flushing_file.lock().take());
             let flushing_path = self.inner.config.flushing_path();
-            if flushing_path.exists() {
-                let _ = std::fs::remove_file(&flushing_path);
-            }
+            // remove_file on a missing path returns NotFound, which we ignore —
+            // no need for a separate blocking exists() stat.
+            let _ = tokio::fs::remove_file(&flushing_path).await;
             // Only transition blocks whose data was successfully recovered.
             for &idx in &recovered {
                 self.inner.transition_to_dirty(idx);
@@ -1489,8 +1491,8 @@ impl WriteCache<Active> {
         drop(self.inner.flushing_file.lock().take());
         if checkpoint_ok {
             let flushing_path = self.inner.config.flushing_path();
-            if flushing_path.exists()
-                && let Err(e) = std::fs::remove_file(&flushing_path)
+            if let Err(e) = tokio::fs::remove_file(&flushing_path).await
+                && e.kind() != std::io::ErrorKind::NotFound
             {
                 warn!(error = %e, "failed to remove flushing file after atomic flush");
             }
@@ -1570,10 +1572,10 @@ impl WriteCache<Active> {
         // longer needed as a crash-safety net. Delete it so the next flush
         // cycle can rotate the data file.
         let flushing_path = self.inner.config.flushing_path();
-        if flushing_path.exists()
-            && let Err(e) = std::fs::remove_file(&flushing_path)
+        if let Err(e) = tokio::fs::remove_file(&flushing_path).await
+            && e.kind() != std::io::ErrorKind::NotFound
         {
-                warn!(error = %e, "failed to remove flushing file after manifest sync");
+            warn!(error = %e, "failed to remove flushing file after manifest sync");
         }
         Ok(())
     }

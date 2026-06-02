@@ -474,15 +474,30 @@ pub struct RawSqe {
     __pad2: u32,
 }
 
+// `override_sqe!` reinterprets a `&mut io_uring::squeue::Entry` as `&mut RawSqe`
+// to patch fields the builder API doesn't expose. `RawSqe` mirrors the leading
+// fields of the 64-byte io_uring SQE and is intentionally a prefix of it (it
+// omits the trailing union/pad). Soundness requires that `RawSqe` is no LARGER
+// than the real entry, so every field write lands inside the live object — guard
+// that at compile time so an io-uring crate bump that shrinks the SQE fails the
+// build. (Field-offset agreement is maintained by hand against the kernel ABI.)
+const _: () = assert!(
+    std::mem::size_of::<RawSqe>() <= std::mem::size_of::<io_uring::squeue::Entry>(),
+    "RawSqe must not exceed io_uring::squeue::Entry size for override_sqe! to be sound",
+);
+
 #[macro_export]
 macro_rules! override_sqe {
     ($entry:expr, $field:ident, $value:expr) => {
+        // SAFETY: `$entry` is a `&mut io_uring::squeue::Entry`; `RawSqe` mirrors
+        // its `#[repr(C)]` layout and is size-checked against it at module scope.
         unsafe {
             let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
             sqe.$field = $value;
         }
     };
     ($entry:expr, $field:ident, |=, $value:expr) => {
+        // SAFETY: see above — layout-compatible reinterpret of a live `&mut`.
         unsafe {
             let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
             sqe.$field |= $value;
@@ -1493,6 +1508,9 @@ impl UblkQueue {
         };
 
         let mut sqe = opcode::UringCmd16::new(types::Fd(self.cdev_fd), cmd_op)
+            // SAFETY: `transmute` to `[u8; 16]` is size-checked by the compiler
+            // (fails to build if `ublksrv_io_cmd` is not 16 bytes); the struct is
+            // `#[repr(C)]` POD, so every bit pattern is a valid byte array.
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
@@ -1918,6 +1936,9 @@ impl UblkQueue {
         };
 
         let sqe = opcode::UringCmd16::new(types::Fd(self.cdev_fd), cmd_op)
+            // SAFETY: `transmute` to `[u8; 16]` is size-checked by the compiler
+            // (fails to build if `ublksrv_io_cmd` is not 16 bytes); the struct is
+            // `#[repr(C)]` POD, so every bit pattern is a valid byte array.
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
