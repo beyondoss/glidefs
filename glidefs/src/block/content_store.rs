@@ -6,7 +6,7 @@
 use crate::circuit_breaker::CircuitBreaker;
 use futures::StreamExt;
 use object_store::path::Path as ObjectPath;
-use object_store::{GetOptions, GetRange, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, UpdateVersion, WriteMultipart};
+use object_store::{GetOptions, GetRange, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, UpdateVersion};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -608,10 +608,6 @@ impl ContentStore {
         chunk_size: u32,
     ) -> Result<Vec<super::pack::PackIndexEntry>, ContentStoreError> {
         self.check_circuit()?;
-        let _permit = match &self.upload_semaphore {
-            Some(sem) => Some(sem.acquire().await.map_err(|_| ContentStoreError::SemaphoreClosed)?),
-            None => None,
-        };
         let key = format!(
             "{}/chunks/{:04}/{:016x}.pack",
             self.base_path, chunk_idx, pack_id
@@ -640,6 +636,15 @@ impl ContentStore {
                 })?;
             let payload = PutPayload::from(pack_bytes);
             let opts = PutOptions::from(PutMode::Create);
+            // A small pack is exactly one PUT request -> one global write permit.
+            let _permit = match &self.upload_semaphore {
+                Some(sem) => Some(
+                    sem.acquire()
+                        .await
+                        .map_err(|_| ContentStoreError::SemaphoreClosed)?,
+                ),
+                None => None,
+            };
             let result = self.object_store.put_opts(&path, payload, opts).await;
             match &result {
                 Ok(_) => {
@@ -660,8 +665,11 @@ impl ContentStore {
             }
             Ok(entries)
         } else {
-            // Large pack: stream via multipart upload.
-            use super::pack::stream_pack_to_writer;
+            // Large pack: stream via multipart. Each part PUT takes one permit
+            // from the shared upload semaphore (see BoundedMultipart), so total
+            // in-flight PUTs across all packs/exports never exceeds the global
+            // limit — the pack can't fan out into unbounded connections.
+            use super::pack::{BoundedMultipart, stream_pack_to_writer};
 
             let upload = self
                 .object_store
@@ -670,9 +678,10 @@ impl ContentStore {
             self.record_s3_result(&upload);
             let upload = upload?;
 
-            let mut writer = WriteMultipart::new(upload);
-            let entries =
-                stream_pack_to_writer(blocks, chunk_size, &mut writer).map_err(|e| {
+            let mut writer = BoundedMultipart::new(upload, self.upload_semaphore.clone());
+            let entries = stream_pack_to_writer(blocks, chunk_size, &mut writer)
+                .await
+                .map_err(|e| {
                     ContentStoreError::ObjectStore(object_store::Error::Generic {
                         store: "pack-stream",
                         source: Box::new(e),
