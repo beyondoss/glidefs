@@ -355,6 +355,18 @@ jobs:
           sudo udevadm control --reload-rules
       - name: Report kernel version
         run: uname -r
+      - name: Diagnose module-signature enforcement (temporary)
+        if: always()
+        run: |
+          echo "== uname -r =="; uname -r
+          echo "== /proc/cmdline =="; cat /proc/cmdline || true
+          echo "== secure boot state =="; mokutil --sb-state 2>/dev/null || echo "mokutil unavailable"
+          echo "== kernel lockdown =="; cat /sys/kernel/security/lockdown 2>/dev/null || echo "lockdown sysfs unavailable"
+          echo "== module sig_enforce param =="; cat /sys/module/module/parameters/sig_enforce 2>/dev/null || echo "sig_enforce param unavailable"
+          echo "== MODULE_SIG / LOCKDOWN config =="; grep -E 'CONFIG_MODULE_SIG|CONFIG_LOCK_DOWN|CONFIG_SECURITY_LOCKDOWN' /boot/config-"$(uname -r)" 2>/dev/null || echo "no /boot/config file"
+          echo "== modprobe attempt (verbose, non-fatal) =="; sudo modprobe -v ublk_drv 2>&1 || true
+          echo "== /dev/ublk-control present? =="; ls -l /dev/ublk-control 2>/dev/null || echo "absent"
+          echo "== dmesg (sig/lockdown/ublk) =="; sudo dmesg 2>/dev/null | grep -iE 'lockdown|module verification|signature|ublk|PKCS7|EKEYREJECTED' | tail -30 || true
       - name: fio benchmark (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture --test-threads=1
       - name: fio verify (${{ matrix.transport }})
