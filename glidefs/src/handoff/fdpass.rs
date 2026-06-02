@@ -71,6 +71,12 @@ pub fn sendmsg_with_fds(
     };
 
     if !fds.is_empty() {
+        // SAFETY: `cmsg_buf` is sized via `CMSG_LEN(MAX_FDS slots)` and `fds`
+        // is bounded to `MAX_FDS` by the check at the top of the function, so
+        // `CMSG_FIRSTHDR` returns a non-null header that fits within the
+        // buffer and the `data_ptr.add(i)` writes for `i < fds.len()` stay in
+        // bounds. `cmsg_buf` outlives this block. `write_unaligned` is used
+        // because `CMSG_DATA` has no alignment guarantee for `RawFd`.
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msghdr);
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
@@ -85,6 +91,8 @@ pub fn sendmsg_with_fds(
         }
     }
 
+    // SAFETY: `msghdr` and the `iovec`/`cmsg_buf` it points at are all alive
+    // for the duration of this call; `sock_fd` is a valid open socket.
     let sent = unsafe { libc::sendmsg(sock_fd, &msghdr, 0) };
     if sent < 0 {
         return Err(io::Error::last_os_error());
@@ -122,6 +130,9 @@ pub fn recvmsg_with_fds(
         msg_flags: 0,
     };
 
+    // SAFETY: `msghdr` and the buffers it references are alive for the call;
+    // `sock_fd` is a valid open socket. The kernel fills in `msg_controllen`
+    // and the control buffer on return.
     let received = unsafe { libc::recvmsg(sock_fd, &mut msghdr, 0) };
     if received < 0 {
         return Err(io::Error::last_os_error());
@@ -129,6 +140,13 @@ pub fn recvmsg_with_fds(
 
     // Walk cmsg headers to collect fds.
     let mut fds = Vec::new();
+    // SAFETY: `cmsg` is iterated only via the kernel-provided
+    // `CMSG_FIRSTHDR`/`CMSG_NXTHDR` cursors over the control buffer the kernel
+    // just populated, so each header and its `CMSG_DATA` region lie within
+    // `cmsg_buf`. `nfds` is derived from the header's own `cmsg_len`, bounding
+    // the `data_ptr.add(i)` reads. `read_unaligned` handles `CMSG_DATA`'s lack
+    // of alignment guarantee. Each raw fd was just transferred to us by the
+    // kernel, so wrapping it in `OwnedFd` takes sole ownership exactly once.
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msghdr);
         while !cmsg.is_null() {

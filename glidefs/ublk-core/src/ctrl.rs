@@ -20,6 +20,21 @@ const CTRL_PATH: &str = "/dev/ublk-control";
 
 const MAX_BUF_SZ: u32 = 32_u32 << 20;
 
+/// Remove a file, treating "already gone" as success.
+///
+/// Avoids the `exists()`-then-`remove_file()` TOCTOU race: between the check
+/// and the unlink another context (or `del`/`stop` running concurrently) may
+/// remove the file, turning the unconditional `remove_file` into a spurious
+/// error. We unlink unconditionally and only surface errors other than
+/// `NotFound`.
+fn remove_file_if_present<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 // per-thread control uring - thread_local! is already lazy
 //
 std::thread_local! {
@@ -27,16 +42,20 @@ std::thread_local! {
         RefCell::new(None);
 }
 
-// Internal macro versions for backwards compatibility within the crate
+// Internal macro versions for use within the crate. Unlike the public
+// `with_ctrl_ring`/`with_ctrl_ring_mut` convenience accessors (which panic on
+// an uninitialized ring per their documented contract), these yield
+// `Result<T, UblkError>` so library command paths propagate
+// `CtrlRingUninit` instead of unwinding.
 #[macro_export]
 macro_rules! with_ctrl_ring_internal {
     ($closure:expr) => {
         $crate::ctrl::CTRL_URING.with(|cell| {
             let ring_ref = cell.borrow();
             if let Some(ref ring) = *ring_ref {
-                $closure(ring)
+                Ok($closure(ring))
             } else {
-                panic!("Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.")
+                Err($crate::UblkError::CtrlRingUninit)
             }
         })
     };
@@ -48,9 +67,9 @@ macro_rules! with_ctrl_ring_mut_internal {
         $crate::ctrl::CTRL_URING.with(|cell| {
             let mut ring_ref = cell.borrow_mut();
             if let Some(ref mut ring) = *ring_ref {
-                $closure(ring)
+                Ok($closure(ring))
             } else {
-                panic!("Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.")
+                Err($crate::UblkError::CtrlRingUninit)
             }
         })
     };
@@ -98,7 +117,9 @@ pub fn with_ctrl_ring<T, F>(closure: F) -> T
 where
     F: FnOnce(&IoUring<squeue::Entry128>) -> T,
 {
-    with_ctrl_ring_internal!(closure)
+    with_ctrl_ring_internal!(closure).expect(
+        "Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.",
+    )
 }
 
 /// Execute a closure with mutable access to the thread-local control ring
@@ -140,7 +161,9 @@ pub fn with_ctrl_ring_mut<T, F>(closure: F) -> T
 where
     F: FnOnce(&mut IoUring<squeue::Entry128>) -> T,
 {
-    with_ctrl_ring_mut_internal!(closure)
+    with_ctrl_ring_mut_internal!(closure).expect(
+        "Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.",
+    )
 }
 
 /// Initialize the thread-local control ring using a custom closure
@@ -527,11 +550,27 @@ impl UblkJsonManager {
         &mut self.json
     }
 
-    /// Set file permissions for the JSON file
-    fn set_path_permission(path: &Path, mode: u32) -> Result<(), std::io::Error> {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = std::fs::Permissions::from_mode(mode);
-        std::fs::set_permissions(path, permissions)
+    /// Set permissions on a directory we just created, anchored to the inode
+    /// rather than the path string.
+    ///
+    /// `create_dir_all` followed by a path-based `set_permissions` has a
+    /// symlink-swap window: between the `mkdir` and the chmod, an attacker with
+    /// write access to the parent could replace the new directory with a
+    /// symlink, redirecting the chmod onto an arbitrary target. We close that
+    /// window by opening the directory with `O_NOFOLLOW | O_DIRECTORY` (so a
+    /// swapped-in symlink fails the open) and `fchmod`-ing the resulting fd.
+    fn set_dir_permission(path: &Path, mode: u32) -> Result<(), std::io::Error> {
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)?;
+        // SAFETY: `dir` is a valid open directory fd for the duration of the
+        // call; `fchmod` changes the mode of the inode it refers to.
+        let ret = unsafe { libc::fchmod(dir.as_raw_fd(), mode as libc::mode_t) };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Flush JSON data to file
@@ -548,8 +587,9 @@ impl UblkJsonManager {
         if let Some(parent_dir) = json_path.parent() {
             std::fs::create_dir_all(parent_dir)?;
             // Chmod after create: 0o777 is intentional (world-accessible device
-            // metadata directory) and must bypass the process umask.
-            Self::set_path_permission(parent_dir, 0o777)?;
+            // metadata directory) and must bypass the process umask. Anchored
+            // to the inode via O_NOFOLLOW to avoid a symlink-swap window.
+            Self::set_dir_permission(parent_dir, 0o777)?;
         }
 
         // Open with mode 0o700 at creation time so the file is never
@@ -1383,12 +1423,18 @@ impl UblkCtrlInner {
         let f = UblkUringOpFuture::new(0);
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
 
-        unsafe {
+        let pushed = unsafe {
             with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
                 if let Err(e) = ring.submission().push(&sqe) {
                     eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
                 }
             })
+        };
+        if pushed.is_err() {
+            // Ring not initialized on this thread — the SQE was never queued, so
+            // the future will never be completed by a CQE. Complete it inline
+            // with an error code that flows through `ublk_err_to_result`.
+            f.set_result(-libc::ENODEV);
         }
         f
     }
@@ -1417,13 +1463,15 @@ impl UblkCtrlInner {
                 }
             };
             let _ = r.submit_and_wait(to_wait);
-        });
+        })?;
         Ok(token)
     }
 
     /// check one control command and see if it is completed
     ///
     fn poll_cmd(&mut self, token: u64) -> i32 {
+        // On an uninitialized ring, return -ENODEV so the caller's
+        // `ublk_err_to_result` surfaces it as an error instead of looping.
         with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
             let res = match r.completion().next() {
                 Some(cqe) => {
@@ -1438,6 +1486,7 @@ impl UblkCtrlInner {
 
             res
         })
+        .unwrap_or(-libc::ENODEV)
     }
 
     fn ublk_ctrl_need_retry(
@@ -2560,8 +2609,8 @@ impl UblkCtrl {
         let mut ctrl = self.get_inner_mut();
         let rp = ctrl.run_path();
 
-        if ctrl.for_add_dev() && Path::new(&rp).exists() {
-            fs::remove_file(rp)?;
+        if ctrl.for_add_dev() {
+            remove_file_if_present(&rp)?;
         }
         ctrl.stop()
     }
@@ -2590,9 +2639,7 @@ impl UblkCtrl {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.del()?;
-        if Path::new(&ctrl.run_path()).exists() {
-            fs::remove_file(ctrl.run_path())?;
-        }
+        remove_file_if_present(ctrl.run_path())?;
         Ok(0)
     }
 
@@ -2602,9 +2649,7 @@ impl UblkCtrl {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.del_async()?;
-        if Path::new(&ctrl.run_path()).exists() {
-            fs::remove_file(ctrl.run_path())?;
-        }
+        remove_file_if_present(ctrl.run_path())?;
         Ok(0)
     }
 
@@ -2671,7 +2716,11 @@ impl UblkCtrl {
         let mut q_threads = Vec::new();
         let nr_queues = dev.dev_info.nr_hw_queues;
 
-        let (tx, rx) = mpsc::channel();
+        // Bounded fan-in: each of the `nr_queues` threads sends exactly one
+        // `(qid, tid)` tuple, so a capacity of `nr_queues` guarantees no send
+        // ever blocks while keeping the buffer explicitly bounded (no unbounded
+        // accumulation if the receiver stalls).
+        let (tx, rx) = mpsc::sync_channel::<(u16, i32)>(nr_queues as usize);
 
         for q in 0..nr_queues {
             let _dev = Arc::clone(dev);
@@ -2743,9 +2792,20 @@ impl UblkCtrl {
             });
         }
 
-        //device may be deleted from another context, so it is normal
-        //to see -ENOENT failure here
-        let _ = self.stop_dev();
+        // Device may be deleted from another context, so a -ENOENT failure
+        // here is expected and ignored. Any other error is unexpected and
+        // worth logging rather than silently swallowing.
+        match self.stop_dev() {
+            Ok(_) => {}
+            Err(UblkError::UringIOError(e) | UblkError::OtherError(e))
+                if e == -libc::ENOENT => {}
+            Err(e) => {
+                error!(
+                    "dev-{} stop_dev during run failed: {e}",
+                    dev.dev_info.dev_id
+                );
+            }
+        }
 
         Ok(0)
     }

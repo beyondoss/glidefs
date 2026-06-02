@@ -479,11 +479,17 @@ fn bind_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // SAFETY: plain syscall with constant arguments. The returned `fd` is a
+    // raw owned descriptor: from here it MUST reach exactly one of two fates —
+    // `libc::close(fd)` on every error path below, or transfer of ownership to
+    // `UnixDatagram::from_raw_fd` at the end. No path may do both or neither.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_NONBLOCK, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
 
+    // SAFETY: `sockaddr_un` is a C POD; an all-zero bit pattern is a valid,
+    // empty (AF_UNSPEC) address that we fill in below.
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as u16;
     let path_bytes = path.as_os_str().as_encoded_bytes();
@@ -498,6 +504,9 @@ fn bind_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
         addr.sun_path[i] = *b as libc::c_char;
     }
 
+    // SAFETY: `fd` is the valid socket from above; `addr` is a fully
+    // initialized `sockaddr_un` and the length covers the whole struct. On
+    // error we `close(fd)` to avoid leaking the descriptor.
     let bind_ret = unsafe {
         libc::bind(
             fd,
@@ -511,6 +520,7 @@ fn bind_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
         return Err(err);
     }
 
+    // SAFETY: `fd` is the valid bound socket; on error we close it.
     let listen_ret = unsafe { libc::listen(fd, 1) };
     if listen_ret < 0 {
         let err = std::io::Error::last_os_error();
@@ -521,6 +531,9 @@ fn bind_seqpacket(path: &Path) -> std::io::Result<UnixDatagram> {
     // Wrap as tokio UnixDatagram. Tokio's UnixDatagram treats this
     // appropriately for SEQPACKET in practice — the API is identical
     // (recv/send rather than recv_from for connected mode).
+    // SAFETY: `fd` is a valid open socket and ownership is transferred here
+    // exactly once; no error path above reaches this point without having
+    // already closed `fd` and returned.
     let std_sock = unsafe { std::os::unix::net::UnixDatagram::from_raw_fd(fd) };
     UnixDatagram::from_std(std_sock)
 }
@@ -566,8 +579,14 @@ async fn accept_seqpacket(listener: &UnixDatagram) -> std::io::Result<UnixDatagr
     loop {
         listener.ready(Interest::READABLE).await?;
         let listener_fd = listener.as_raw_fd();
+        // SAFETY: `sockaddr_un` is a C POD; zeroing yields a valid buffer the
+        // kernel fills in. `addrlen` is initialized to its capacity.
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         let mut addrlen = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        // SAFETY: `listener_fd` is borrowed from the live `listener` for the
+        // duration of the call; `addr`/`addrlen` are valid out-params. The
+        // returned `connected_fd` is a raw owned descriptor handed to
+        // `from_raw_fd` below exactly once (or never created, on error).
         let connected_fd = unsafe {
             libc::accept4(
                 listener_fd,
@@ -584,6 +603,8 @@ async fn accept_seqpacket(listener: &UnixDatagram) -> std::io::Result<UnixDatagr
             }
             return Err(err);
         }
+        // SAFETY: `connected_fd` is a valid open socket from `accept4`;
+        // ownership transfers to the `UnixDatagram` exactly once here.
         let std_sock = unsafe {
             std::os::unix::net::UnixDatagram::from_raw_fd(connected_fd)
         };

@@ -263,13 +263,16 @@ impl BlockHandler {
 
     /// Check if this handler is readonly.
     pub fn is_readonly(&self) -> bool {
-        self.readonly.load(Ordering::Relaxed)
+        self.readonly.load(Ordering::Acquire)
     }
 
     /// Set the readonly flag.
     /// Used by promote_export to allow writes after migration.
     pub fn set_readonly(&self, readonly: bool) {
-        self.readonly.store(readonly, Ordering::Relaxed);
+        // Release-paired with the Acquire loads in the op gates so the flag
+        // transition is promptly visible to other threads (e.g. weakly-ordered
+        // aarch64 cloud instances), not just on x86's strong ordering.
+        self.readonly.store(readonly, Ordering::Release);
     }
 
     /// True iff a mutating handler previously panicked. While set, every
@@ -277,7 +280,7 @@ impl BlockHandler {
     /// `degraded` for the safety rationale.
     #[inline]
     pub fn is_degraded(&self) -> bool {
-        self.degraded.load(Ordering::Relaxed)
+        self.degraded.load(Ordering::Acquire)
     }
 
     /// Mark this export as degraded after a panic in a mutating handler.
@@ -302,7 +305,7 @@ impl BlockHandler {
     /// Inlined so the happy path is a single atomic load.
     #[inline]
     fn check_not_degraded(&self) -> CommandResult<()> {
-        if self.degraded.load(Ordering::Relaxed) {
+        if self.degraded.load(Ordering::Acquire) {
             Err(CommandError::IoError)
         } else {
             Ok(())
@@ -315,10 +318,10 @@ impl BlockHandler {
     /// Inlined so the happy path is two atomic loads.
     #[inline]
     fn check_writable(&self) -> CommandResult<()> {
-        if self.degraded.load(Ordering::Relaxed) {
+        if self.degraded.load(Ordering::Acquire) {
             return Err(CommandError::IoError);
         }
-        if self.frozen.load(Ordering::Relaxed) {
+        if self.frozen.load(Ordering::Acquire) {
             return Err(CommandError::Frozen);
         }
         Ok(())
@@ -327,7 +330,7 @@ impl BlockHandler {
     /// True iff this handler has been frozen for handoff.
     #[inline]
     pub fn is_frozen(&self) -> bool {
-        self.frozen.load(Ordering::Relaxed)
+        self.frozen.load(Ordering::Acquire)
     }
 
     /// Freeze this handler. After this returns, all mutating ops on this

@@ -474,15 +474,30 @@ pub struct RawSqe {
     __pad2: u32,
 }
 
+// `override_sqe!` reinterprets a `&mut io_uring::squeue::Entry` as `&mut RawSqe`
+// to patch fields the builder API doesn't expose. `RawSqe` mirrors the leading
+// fields of the 64-byte io_uring SQE and is intentionally a prefix of it (it
+// omits the trailing union/pad). Soundness requires that `RawSqe` is no LARGER
+// than the real entry, so every field write lands inside the live object — guard
+// that at compile time so an io-uring crate bump that shrinks the SQE fails the
+// build. (Field-offset agreement is maintained by hand against the kernel ABI.)
+const _: () = assert!(
+    std::mem::size_of::<RawSqe>() <= std::mem::size_of::<io_uring::squeue::Entry>(),
+    "RawSqe must not exceed io_uring::squeue::Entry size for override_sqe! to be sound",
+);
+
 #[macro_export]
 macro_rules! override_sqe {
     ($entry:expr, $field:ident, $value:expr) => {
+        // SAFETY: `$entry` is a `&mut io_uring::squeue::Entry`; `RawSqe` mirrors
+        // its `#[repr(C)]` layout and is size-checked against it at module scope.
         unsafe {
             let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
             sqe.$field = $value;
         }
     };
     ($entry:expr, $field:ident, |=, $value:expr) => {
+        // SAFETY: see above — layout-compatible reinterpret of a live `&mut`.
         unsafe {
             let sqe: &mut $crate::io::RawSqe = std::mem::transmute($entry);
             sqe.$field |= $value;
@@ -575,13 +590,14 @@ impl<'a> UblkIOCtx<'a> {
     /// Available if UBLK_F_USER_COPY is enabled.
     ///
     #[inline(always)]
-    #[allow(arithmetic_overflow)]
     pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
         assert!((offset & !sys::UBLK_IO_BUF_BITS_MASK) == 0);
 
+        // All operands are widened to u64 before shifting (UBLK_QID_OFF=41,
+        // UBLK_TAG_OFF=25), so a 16-bit q_id/tag cannot overflow.
         u64::from(sys::UBLKSRV_IO_BUF_OFFSET)
-            + (((u64::from(q_id) << sys::UBLK_QID_OFF) as u64)
-                | (u64::from(tag) << sys::UBLK_TAG_OFF) as u64
+            + ((u64::from(q_id) << sys::UBLK_QID_OFF)
+                | (u64::from(tag) << sys::UBLK_TAG_OFF)
                 | u64::from(offset))
     }
 
@@ -598,14 +614,16 @@ impl<'a> UblkIOCtx<'a> {
     /// The built userdata is passed to io_uring for parsing io result
     ///
     #[inline(always)]
-    #[allow(arithmetic_overflow)]
     pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
         assert!((tgt_data >> 16) == 0);
 
-        let op = op & 0xff;
+        // Widen to u64 *before* shifting. Shifting the u32 values first
+        // truncates: `tgt_data << 24` overflows u32 whenever `tgt_data` has
+        // any bit in positions 8..16 set (e.g. 0x0100 << 24 loses the high
+        // byte), silently corrupting the packed userdata.
         u64::from(tag)
-            | u64::from(op << 16)
-            | u64::from(tgt_data << 24)
+            | (u64::from(op & 0xff) << 16)
+            | (u64::from(tgt_data) << 24)
             | if is_target_io {
                 UblkUringData::Target as u64
             } else {
@@ -715,6 +733,18 @@ pub struct UblkDev {
     pub(crate) buf_reg_sync: Arc<(Mutex<BufferRegState>, Condvar)>,
 }
 
+// SAFETY: `UblkDev` is shared across the control thread and the per-queue
+// worker threads via `Arc<UblkDev>`. The fields that are not auto-`Send`/`Sync`
+// are:
+//   * `cdev_file` — an owned `fs::File`; the kernel serializes the io_uring
+//     submissions that reference its fd, and we never mutate the `File` itself
+//     after construction, so concurrent `&` access is sound.
+//   * `tgt: UblkTgt` — holds `fds: [i32; 32]` (plain integers, freely shared)
+//     and target params. After `new_with_info` returns, `tgt` is treated as
+//     immutable; queues only read it.
+//   * `buf_reg_sync` — an `Arc<(Mutex<_>, Condvar)>`, already `Send + Sync`.
+// No field hands out interior mutability without its own synchronization, so
+// sharing `&UblkDev` across threads and moving it between them is safe.
 unsafe impl Send for UblkDev {}
 unsafe impl Sync for UblkDev {}
 
@@ -889,14 +919,16 @@ impl UblkDev {
         }
 
         let (lock, cvar) = &*self.buf_reg_sync;
-        let mut state = lock.lock().unwrap();
+        // Recover from poison rather than panicking: `BufferRegState` holds only
+        // counters/flags, which remain valid even if a prior holder panicked.
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
 
         while state.registered_queues < nr_hw_queues {
             // Check for mlock failures
             if state.mlock_failed {
                 return Err(UblkError::OtherError(-libc::EPERM));
             }
-            state = cvar.wait(state).unwrap();
+            state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
         }
 
         // Final check for mlock failures
@@ -910,7 +942,7 @@ impl UblkDev {
     /// Notify that a queue has completed buffer registration
     pub fn notify_buffer_registration_complete(&self, mlock_failed: bool) {
         let (lock, cvar) = &*self.buf_reg_sync;
-        let mut state = lock.lock().unwrap();
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         state.registered_queues += 1;
         if mlock_failed {
             state.mlock_failed = true;
@@ -1478,6 +1510,9 @@ impl UblkQueue {
         };
 
         let mut sqe = opcode::UringCmd16::new(types::Fd(self.cdev_fd), cmd_op)
+            // SAFETY: `transmute` to `[u8; 16]` is size-checked by the compiler
+            // (fails to build if `ublksrv_io_cmd` is not 16 bytes); the struct is
+            // `#[repr(C)]` POD, so every bit pattern is a valid byte array.
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);
@@ -1903,6 +1938,9 @@ impl UblkQueue {
         };
 
         let sqe = opcode::UringCmd16::new(types::Fd(self.cdev_fd), cmd_op)
+            // SAFETY: `transmute` to `[u8; 16]` is size-checked by the compiler
+            // (fails to build if `ublksrv_io_cmd` is not 16 bytes); the struct is
+            // `#[repr(C)]` POD, so every bit pattern is a valid byte array.
             .cmd(unsafe { core::mem::transmute::<sys::ublksrv_io_cmd, [u8; 16]>(io_cmd) })
             .build()
             .user_data(user_data);

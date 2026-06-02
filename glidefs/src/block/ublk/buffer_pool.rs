@@ -62,7 +62,14 @@ pub struct WorkerBufferPool {
     pub backpressure_waits: AtomicU64,
 }
 
-unsafe impl Send for WorkerBufferPool {}
+// NOTE: `WorkerBufferPool` is deliberately NOT `Send`. It contains `RefCell`
+// (no internal synchronization) and a raw `*mut u8` region, and it is only
+// ever held via `Rc` — in the per-thread `WORKER_POOL` thread-local and in
+// `PoolSlot`/`AcquireFut`. `Rc` is itself `!Send`, so every holder is already
+// pinned to its originating worker thread. The futures that touch the pool run
+// on the worker's single-threaded executor (`Executor::spawn` carries no `Send`
+// bound). An `unsafe impl Send` here would contradict the `RefCell` invariant
+// and silently permit a cross-thread move that races `free`/`waiters`.
 
 impl WorkerBufferPool {
     fn new() -> std::io::Result<Self> {

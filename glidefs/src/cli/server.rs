@@ -678,7 +678,19 @@ async fn serve_with_router_inner(
     let shutdown_result = match tokio::time::timeout(shutdown_timeout, async {
         info!("Waiting for servers to exit...");
         for handle in handles {
-            let _ = handle.await;
+            match handle.await {
+                Ok(_) => {}
+                Err(join_err) if join_err.is_panic() => {
+                    // A server task panicked. During an unexpected shutdown
+                    // this is the root cause — surface it instead of dropping
+                    // it on the floor.
+                    warn!(error = %join_err, "server task panicked during shutdown");
+                }
+                Err(join_err) => {
+                    // Cancelled (expected during shutdown) — log at debug.
+                    tracing::debug!(error = %join_err, "server task join error during shutdown");
+                }
+            }
         }
 
         if handoff_succeeded {

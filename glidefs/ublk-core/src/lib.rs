@@ -146,6 +146,9 @@ pub enum UblkError {
     #[error("Invalid input")]
     InvalidVal,
 
+    #[error("control ring not initialized on this thread")]
+    CtrlRingUninit,
+
     #[error("other failure")]
     OtherError(i32),
 }

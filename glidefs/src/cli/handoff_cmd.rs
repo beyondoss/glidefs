@@ -39,7 +39,7 @@ pub async fn run(socket: PathBuf, dry_run: bool) -> Result<()> {
         .write_all(&[req])
         .await
         .context("sending handoff request")?;
-    stream.flush().await.ok();
+    stream.flush().await.context("flushing handoff request")?;
 
     let mut response = [0u8; 1];
     let n = stream

@@ -31,6 +31,10 @@ pub fn inject(point: &str) {
     }
 }
 
+// No-op stub for production builds (feature off). Call sites in
+// successor/predecessor invoke it unconditionally, but they are themselves
+// target/feature-gated, so on some build configurations this stub has no
+// compiled caller — allow dead_code to keep those configs warning-clean.
 #[cfg(not(feature = "test-fault-injection"))]
 #[inline(always)]
 #[allow(dead_code)]

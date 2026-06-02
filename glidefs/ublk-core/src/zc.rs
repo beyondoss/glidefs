@@ -52,6 +52,16 @@ use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use crate::sys;
 use crate::UblkError;
 
+// The FETCH/COMMIT SQEs carry a `ublksrv_io_cmd` punned into the 16-byte
+// `cmd` inline field of `UringCmd16`. That pun is only sound if the bindgen
+// struct is exactly 16 bytes; a kernel-header change or alignment shift would
+// otherwise read/write out of bounds. Guard it at compile time so a layout
+// regression fails the build instead of corrupting SQEs at runtime.
+const _: () = assert!(
+    std::mem::size_of::<sys::ublksrv_io_cmd>() == 16,
+    "ublksrv_io_cmd must be exactly 16 bytes to transmute into UringCmd16::cmd",
+);
+
 /// One data-plane SQE against the auto-registered bio at `buf_index=tag`.
 ///
 /// `buf_offset` is the offset within the kernel-registered bio buffer. For
@@ -243,6 +253,8 @@ fn build_fetch_sqe(qid: u16, tag: u16, result: i32) -> squeue::Entry {
         result,
         addr: 0,
     };
+    // SAFETY: `ublksrv_io_cmd` is exactly 16 bytes (asserted at module scope)
+    // and is `#[repr(C)]` POD — every bit pattern is a valid `[u8; 16]`.
     let cmd_bytes: [u8; 16] = unsafe { std::mem::transmute(cmd) };
     let mut sqe = opcode::UringCmd16::new(types::Fixed(0), sys::UBLK_U_IO_FETCH_REQ)
         .cmd(cmd_bytes)
@@ -266,6 +278,8 @@ fn build_commit_sqe(qid: u16, tag: u16, result: i32) -> squeue::Entry {
         result,
         addr: 0,
     };
+    // SAFETY: `ublksrv_io_cmd` is exactly 16 bytes (asserted at module scope)
+    // and is `#[repr(C)]` POD — every bit pattern is a valid `[u8; 16]`.
     let cmd_bytes: [u8; 16] = unsafe { std::mem::transmute(cmd) };
     let mut sqe = opcode::UringCmd16::new(
         types::Fixed(0),
