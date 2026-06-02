@@ -155,6 +155,7 @@ async fn test_fork_from_snapshot() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(config, false, None, None)
@@ -179,6 +180,7 @@ async fn test_fork_from_snapshot() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(fork_config, false, Some("vm1"), Some(snap1.sequence))
@@ -338,6 +340,7 @@ async fn test_purge_export_deletes_snapshots() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(config, false, None, None)
@@ -515,6 +518,7 @@ async fn test_remove_without_purge_preserves_snapshots() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(config, false, None, None)
@@ -574,6 +578,7 @@ async fn test_snapshot_tag_and_fork() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router.create_export(config, false, None, None).await.unwrap();
 
@@ -596,6 +601,7 @@ async fn test_snapshot_tag_and_fork() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(fork_config, false, Some("setup-abc123"), None)
@@ -643,6 +649,7 @@ async fn test_standalone_tag() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router.create_export(config, false, None, None).await.unwrap();
 
@@ -665,6 +672,7 @@ async fn test_standalone_tag() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(fork_config, false, Some("my-tag"), None)
@@ -1135,6 +1143,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(config, false, None, None)
@@ -1173,6 +1182,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(fork_config, false, Some("vm1"), Some(snap1.sequence))
@@ -1202,6 +1212,7 @@ async fn test_fork_from_snapshot_zero_overwrite_sees_original() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(fork2_config, false, Some("vm1"), Some(_snap2.sequence))
@@ -1424,6 +1435,7 @@ async fn test_fork_parent_deleted_child_survives() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(parent_config, false, None, None)
@@ -1451,6 +1463,7 @@ async fn test_fork_parent_deleted_child_survives() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(child_config, false, Some("parent"), None)
@@ -1508,6 +1521,7 @@ async fn test_fork_parent_deleted_child_survives() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router2
         .create_export(restore_config, false, Some("child"), None)
@@ -1593,6 +1607,7 @@ async fn test_fork_concurrent_parent_write_during_fork() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(config, false, None, None)
@@ -1632,6 +1647,7 @@ async fn test_fork_concurrent_parent_write_during_fork() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(fork_config, false, Some("parent"), None)
@@ -1706,6 +1722,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(config, false, None, None)
@@ -1730,6 +1747,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(fork_config, false, Some("parent"), None)
@@ -1776,6 +1794,7 @@ async fn test_fork_inherit_then_overwrite_all() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router2
         .create_export(restore_config, false, Some("child"), None)
@@ -1834,6 +1853,7 @@ async fn test_fork_from_snapshot_during_active_writes() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(config, false, None, None)
@@ -1869,6 +1889,7 @@ async fn test_fork_from_snapshot_during_active_writes() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(fork_config, false, Some("vm1"), Some(snap.sequence))
@@ -1932,6 +1953,7 @@ async fn test_fork_both_children_from_same_parent() {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     };
     router
         .create_export(parent_config, false, None, None)
@@ -1955,6 +1977,7 @@ async fn test_fork_both_children_from_same_parent() {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router
             .create_export(config, false, Some("parent"), None)

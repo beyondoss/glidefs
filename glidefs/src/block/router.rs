@@ -197,6 +197,10 @@ pub struct ExportState {
     pub s3_prefix: Option<String>,
     /// Transport type: "nbd" or "ublk".
     pub transport: String,
+    /// Cooldown compaction window (flush cycles, 0 = disabled). Retained so a
+    /// resize (remove + recreate) preserves the knob instead of silently
+    /// resetting it.
+    pub compaction_cooldown: u64,
     flush_shutdown_tx: watch::Sender<bool>,
     /// Supervised flush task. `Ok(Ok(()))` = clean exit, `Ok(Err(_))` =
     /// caught panic (already logged + counted by spawn_supervised),
@@ -554,6 +558,7 @@ async fn run_flush_supervisor(
     metrics: Arc<ExportMetrics>,
     flush_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     flush_threshold: usize,
+    compaction_cooldown: u64,
 ) {
     let supervisor_metrics = Arc::clone(&metrics);
     let inner_shutdown_rx = shutdown_rx.clone();
@@ -580,6 +585,7 @@ async fn run_flush_supervisor(
                 inner_metrics,
                 flush_semaphore,
                 flush_threshold,
+                compaction_cooldown,
             )
             .await;
             info!(export = %export_name, "flush scheduler exited");
@@ -1394,8 +1400,34 @@ impl ExportRouter {
         // 0 = manual mode (no auto-flush).
         let flush_threshold = config.flush_threshold_or(self.default_flush_threshold);
 
+        // Cooldown compaction window (flush cycles). 0 = disabled (default).
+        let compaction_cooldown = config.compaction_cooldown();
+
         // Shared notify: write path signals when dirty count crosses flush_threshold
         let flush_notify = Arc::new(Notify::new());
+
+        // Optional block-write tracer for offline analysis (e.g. the
+        // `compaction_sim` / `write_trace_analyze` tools). Enabled by setting
+        // GLIDEFS_WRITE_TRACE_DIR; each export records to <dir>/<name>.trace.
+        // Zero cost when the env var is unset.
+        let write_tracer = std::env::var_os("GLIDEFS_WRITE_TRACE_DIR").and_then(|dir| {
+            let path = std::path::Path::new(&dir).join(format!("{}.trace", config.name));
+            match crate::block::write_trace::WriteTracer::new(
+                &path,
+                block_size as u32,
+                device_size / block_size as u64,
+                &config.name,
+            ) {
+                Ok(t) => {
+                    info!(export = %config.name, path = %path.display(), "block-write tracing enabled");
+                    Some(Arc::new(t))
+                }
+                Err(e) => {
+                    warn!(export = %config.name, path = %path.display(), "failed to open write trace: {e}");
+                    None
+                }
+            }
+        });
 
         // Create handler for block I/O
         let handler = Arc::new(BlockHandler::new(
@@ -1410,7 +1442,7 @@ impl ExportRouter {
             Arc::clone(&self.ssd_utilization),
             Arc::clone(&flush_notify),
             flush_threshold,
-            None, // TODO: wire up write_trace_path from ExportConfig
+            write_tracer,
         ));
 
         // Start flush scheduler for this export, behind an auto-restart
@@ -1438,6 +1470,7 @@ impl ExportRouter {
                 Arc::clone(&metrics),
                 self.flush_semaphore.clone(),
                 flush_threshold,
+                compaction_cooldown,
             ),
         );
 
@@ -1453,6 +1486,7 @@ impl ExportRouter {
             metrics,
             s3_prefix: orig_s3_prefix,
             transport: transport.clone(),
+            compaction_cooldown,
             flush_shutdown_tx,
             flush_handle,
             prefetch_handle,
@@ -2503,7 +2537,7 @@ impl ExportRouter {
     pub async fn resize_export(&self, name: &str, new_size_gb: f64) -> Result<(), RouterError> {
         validate_export_name(name)?;
         // Get current export info from the per-shard guard.
-        let (current_size, readonly, block_size, orig_s3_prefix, transport) = {
+        let (current_size, readonly, block_size, orig_s3_prefix, transport, compaction_cooldown) = {
             let entry = self
                 .exports
                 .get(name)
@@ -2515,6 +2549,7 @@ impl ExportRouter {
                 state.cache.block_size(),
                 state.s3_prefix.clone(),
                 state.transport.clone(),
+                state.compaction_cooldown,
             )
         };
 
@@ -2561,6 +2596,8 @@ impl ExportRouter {
             flush_threshold: None,
             flush_mode: None,
             transport: Some(transport),
+            // Preserve the cooldown knob across resize (0 if it was disabled).
+            compaction_cooldown: (compaction_cooldown != 0).then_some(compaction_cooldown),
         };
 
         self.create_export(config.clone(), readonly, Some(name), None)
@@ -3187,6 +3224,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router.create_export(make("a"), false, None, None).await.unwrap();
         router.create_export(make("b"), false, None, None).await.unwrap();
@@ -3273,6 +3311,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         }
     }
 
@@ -3723,6 +3762,7 @@ mod tests {
                 flush_threshold: None,
                 flush_mode: None,
                 transport: None,
+                compaction_cooldown: None,
             },
             ExportConfig {
                 name: "discover-vol2".to_string(),
@@ -3732,6 +3772,7 @@ mod tests {
                 flush_threshold: None,
                 flush_mode: None,
                 transport: None,
+                compaction_cooldown: None,
             },
             ExportConfig {
                 name: "discover-vol3".to_string(),
@@ -3741,6 +3782,7 @@ mod tests {
                 flush_threshold: None,
                 flush_mode: None,
                 transport: None,
+                compaction_cooldown: None,
             },
         ];
 
@@ -3956,6 +3998,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router
             .create_export(fork_config, false, Some("source"), None)
@@ -3995,6 +4038,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router
             .create_export(fork_config, false, Some("src"), None)
@@ -4047,6 +4091,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router
             .create_export(fork_config, false, Some("src"), None)
@@ -4080,6 +4125,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
 
         let result = router
@@ -4118,6 +4164,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router
             .create_export(b_config, false, Some("a"), None)
@@ -4139,6 +4186,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router
             .create_export(c_config, false, Some("b"), None)
@@ -4257,6 +4305,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router
             .create_export(fork_config, false, Some("parent"), None)
@@ -4555,6 +4604,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: Some("manual".to_string()),
             transport: None,
+            compaction_cooldown: None,
         };
         router.create_export(config, false, None, None).await.unwrap();
 
@@ -4604,6 +4654,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: Some("manual".to_string()),
             transport: None,
+            compaction_cooldown: None,
         };
         router.create_export(config, false, None, None).await.unwrap();
 
@@ -4647,6 +4698,7 @@ mod tests {
             flush_threshold: Some(1000),
             flush_mode: Some("manual".to_string()),
             transport: None,
+            compaction_cooldown: None,
         };
         assert_eq!(
             manual.flush_threshold_or(500),
@@ -4662,6 +4714,7 @@ mod tests {
             flush_threshold: Some(1000),
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         assert_eq!(custom.flush_threshold_or(500), 1000, "export override wins");
 
@@ -4673,12 +4726,46 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         assert_eq!(
             default.flush_threshold_or(500),
             500,
             "falls back to global default"
         );
+    }
+
+    /// The per-export cooldown knob must survive the persistence boundary:
+    /// save_export serializes ExportConfig to export.json in S3, discover_exports
+    /// reads it back on (re)start. A daemon restart must not silently lose it.
+    #[tokio::test]
+    async fn test_compaction_cooldown_persists_across_discover() {
+        let router = ExportRouter::new_for_test().await;
+        let config = ExportConfig {
+            name: "cooldown-export".to_string(),
+            size_gb: 0.01,
+            s3_prefix: None,
+            block_size: None,
+            flush_threshold: None,
+            flush_mode: None,
+            transport: None,
+            compaction_cooldown: Some(8),
+        };
+        router.save_export(&config).await.unwrap();
+
+        // discover_exports reads from S3 (export.json), independent of in-memory
+        // state — i.e. what a fresh daemon would load on restart.
+        let discovered = router.discover_exports().await.unwrap();
+        let found = discovered
+            .iter()
+            .find(|c| c.name == "cooldown-export")
+            .expect("export should be discovered");
+        assert_eq!(
+            found.compaction_cooldown,
+            Some(8),
+            "cooldown must persist across save/discover"
+        );
+        assert_eq!(found.compaction_cooldown(), 8);
     }
 
     // =========================================================================
@@ -4956,6 +5043,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         fork_router
             .create_export(fork_config, false, Some("parent"), None)
@@ -5032,6 +5120,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         }).await.unwrap();
         drop(child);
 
@@ -5065,6 +5154,7 @@ mod tests {
                     flush_threshold: None,
                     flush_mode: None,
                     transport: None,
+                    compaction_cooldown: None,
                 },
                 false,
                 Some("child"),
@@ -5178,6 +5268,7 @@ mod tests {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         router
             .create_export(fork_config, false, Some("parent"), None)

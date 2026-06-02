@@ -325,6 +325,8 @@ pub async fn compact_chunk(
 pub async fn compact_if_needed(
     threshold: usize,
     dead_ratio_threshold: f32,
+    cooldown: u64,
+    chunk_idle_age: &HashMap<u32, u64>,
     content_store: &ContentStore,
     pack_index_cache: &Arc<PackIndexCache>,
     volume_manifest: &Arc<parking_lot::RwLock<VolumeManifest>>,
@@ -342,9 +344,22 @@ pub async fn compact_if_needed(
         let mut candidates = Vec::new();
         for (&idx, entry) in &vm.chunks {
             if entry.packs.len() > threshold {
+                // Pack-count cap: unconditional greedy fallback, independent of
+                // cooldown — a still-hot chunk that piles up packs is still
+                // bounded.
                 compact.push((idx, entry.packs.clone()));
             } else if entry.packs.len() >= 2 {
-                candidates.push((idx, entry.packs.clone()));
+                // Dead-ratio candidate. Cooldown gate (F2FS-style age deferral):
+                // when enabled, defer evaluating a chunk for dead-ratio
+                // compaction until it has been idle (unwritten) for `cooldown`
+                // flush cycles. Skipping here also avoids the candidate's
+                // pack-index fetches in `dead_block_ratio`. A chunk absent from
+                // the age map is treated as age 0 (just written) → deferred.
+                let age_ok = cooldown == 0
+                    || chunk_idle_age.get(&idx).copied().unwrap_or(0) >= cooldown;
+                if age_ok {
+                    candidates.push((idx, entry.packs.clone()));
+                }
             }
         }
         (compact, candidates)

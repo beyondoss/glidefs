@@ -221,6 +221,7 @@ mod blktests {
                     flush_threshold: None,
                     flush_mode: None,
                     transport: None,
+                    compaction_cooldown: None,
                 };
                 router
                     .create_export(nbd_config, false, None, None)
@@ -249,6 +250,7 @@ mod blktests {
                     flush_threshold: None,
                     flush_mode: None,
                     transport: None,
+                    compaction_cooldown: None,
                 };
                 router
                     .create_export(ublk_config, false, None, None)

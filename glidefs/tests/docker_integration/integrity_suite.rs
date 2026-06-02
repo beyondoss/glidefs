@@ -1445,6 +1445,7 @@ async fn fork_chain_integrity() {
             flush_threshold: None,
             flush_mode: None,
             transport: None,
+            compaction_cooldown: None,
         };
         server
             .router
@@ -1552,6 +1553,7 @@ async fn fork_deep_chain_read_through() {
                 flush_threshold: None,
                 flush_mode: None,
                 transport: None,
+                compaction_cooldown: None,
             };
             server
                 .router
@@ -2606,6 +2608,7 @@ async fn soak_mixed_operations() {
                             flush_threshold: None,
                             flush_mode: None,
                             transport: None,
+                            compaction_cooldown: None,
                         };
                         server
                             .router
@@ -2989,6 +2992,7 @@ async fn soak_fork_chain_churn() {
                 flush_threshold: None,
                 flush_mode: None,
                 transport: None,
+                compaction_cooldown: None,
             };
             server
                 .router

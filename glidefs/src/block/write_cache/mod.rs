@@ -87,6 +87,10 @@ pub struct FlushStats {
     pub packs_skipped: usize,
     /// Total bytes uploaded to S3.
     pub bytes_uploaded: u64,
+    /// Chunk indices that gained a pack this flush cycle (i.e. were written).
+    /// Drives the flush scheduler's per-chunk age map for cooldown compaction.
+    /// Empty when no packs were uploaded.
+    pub touched_chunks: std::collections::HashSet<u32>,
 }
 
 /// Result of a snapshot operation.

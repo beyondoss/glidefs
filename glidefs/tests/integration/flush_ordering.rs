@@ -65,6 +65,7 @@ fn test_export_config(name: &str) -> ExportConfig {
         flush_threshold: None,
         flush_mode: None,
         transport: None,
+        compaction_cooldown: None,
     }
 }
 

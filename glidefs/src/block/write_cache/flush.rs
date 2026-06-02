@@ -1370,6 +1370,7 @@ impl WriteCache<Active> {
         if need_sync {
             let mut vm = volume_manifest.write();
             for (chunk_idx, pack_id) in staged_appends {
+                total_stats.touched_chunks.insert(chunk_idx);
                 vm.append_pack(chunk_idx, pack_id);
             }
         }
