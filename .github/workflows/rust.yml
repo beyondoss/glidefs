@@ -156,6 +156,25 @@ jobs:
           python3 - <<'PY'
           import re, sys
           PATH = "/tmp/ublk_drv.ko"
+          MAGIC = b"~Module signature appended~\n"
+          def strip_sig(buf):
+              # Patching the body invalidates the module's appended signature.
+              # A module whose signature is present-but-invalid is rejected with
+              # EKEYREJECTED even when enforcement is OFF (module_sig_check
+              # returns the verify error unconditionally for bad sigs; only a
+              # *missing* sig is tolerated). The runner has sig_enforce=N and no
+              # lockdown, so strip the now-stale sig and the kernel loads the
+              # unsigned patched module (tainted, fine for CI).
+              if bytes(buf[-len(MAGIC):]) != MAGIC:
+                  print("no appended signature to strip", file=sys.stderr)
+                  return buf
+              # sig_len is the last be32 of the 12-byte struct module_signature,
+              # which sits immediately before MAGIC.
+              sig_len = int.from_bytes(buf[-len(MAGIC)-4:-len(MAGIC)], "big")
+              total = sig_len + 12 + len(MAGIC)
+              del buf[-total:]
+              print(f"stripped module signature ({total} bytes)", file=sys.stderr)
+              return buf
           data = bytearray(open(PATH, "rb").read())
           matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
           if len(matches) == 0:
@@ -173,6 +192,7 @@ jobs:
               sys.exit(1)
           off = matches[0].start() + 2
           data[off:off+2] = b'\x90\x90'
+          data = strip_sig(data)
           open(PATH, "wb").write(bytes(data))
           print(f"patched offset {hex(off)} (jb -> nop nop)")
           PY
@@ -239,6 +259,25 @@ jobs:
           python3 - <<'PY'
           import re, sys
           PATH = "/tmp/ublk_drv.ko"
+          MAGIC = b"~Module signature appended~\n"
+          def strip_sig(buf):
+              # Patching the body invalidates the module's appended signature.
+              # A module whose signature is present-but-invalid is rejected with
+              # EKEYREJECTED even when enforcement is OFF (module_sig_check
+              # returns the verify error unconditionally for bad sigs; only a
+              # *missing* sig is tolerated). The runner has sig_enforce=N and no
+              # lockdown, so strip the now-stale sig and the kernel loads the
+              # unsigned patched module (tainted, fine for CI).
+              if bytes(buf[-len(MAGIC):]) != MAGIC:
+                  print("no appended signature to strip", file=sys.stderr)
+                  return buf
+              # sig_len is the last be32 of the 12-byte struct module_signature,
+              # which sits immediately before MAGIC.
+              sig_len = int.from_bytes(buf[-len(MAGIC)-4:-len(MAGIC)], "big")
+              total = sig_len + 12 + len(MAGIC)
+              del buf[-total:]
+              print(f"stripped module signature ({total} bytes)", file=sys.stderr)
+              return buf
           data = bytearray(open(PATH, "rb").read())
           matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
           if len(matches) == 0:
@@ -253,6 +292,7 @@ jobs:
               sys.exit(1)
           off = matches[0].start() + 2
           data[off:off+2] = b'\x90\x90'
+          data = strip_sig(data)
           open(PATH, "wb").write(bytes(data))
           print(f"patched offset {hex(off)}")
           PY
@@ -324,6 +364,25 @@ jobs:
           python3 - <<'PY'
           import re, sys
           PATH = "/tmp/ublk_drv.ko"
+          MAGIC = b"~Module signature appended~\n"
+          def strip_sig(buf):
+              # Patching the body invalidates the module's appended signature.
+              # A module whose signature is present-but-invalid is rejected with
+              # EKEYREJECTED even when enforcement is OFF (module_sig_check
+              # returns the verify error unconditionally for bad sigs; only a
+              # *missing* sig is tolerated). The runner has sig_enforce=N and no
+              # lockdown, so strip the now-stale sig and the kernel loads the
+              # unsigned patched module (tainted, fine for CI).
+              if bytes(buf[-len(MAGIC):]) != MAGIC:
+                  print("no appended signature to strip", file=sys.stderr)
+                  return buf
+              # sig_len is the last be32 of the 12-byte struct module_signature,
+              # which sits immediately before MAGIC.
+              sig_len = int.from_bytes(buf[-len(MAGIC)-4:-len(MAGIC)], "big")
+              total = sig_len + 12 + len(MAGIC)
+              del buf[-total:]
+              print(f"stripped module signature ({total} bytes)", file=sys.stderr)
+              return buf
           data = bytearray(open(PATH, "rb").read())
           matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
           if len(matches) == 0:
@@ -338,6 +397,7 @@ jobs:
               sys.exit(1)
           off = matches[0].start() + 2
           data[off:off+2] = b'\x90\x90'
+          data = strip_sig(data)
           open(PATH, "wb").write(bytes(data))
           print(f"patched offset {hex(off)}")
           PY
@@ -348,25 +408,21 @@ jobs:
       - name: Load kernel modules
         run: |
           sudo modprobe nbd || echo "nbd not available — nbd kernel tests will skip"
-          sudo modprobe ublk_drv || echo "ublk_drv not available — ublk tests will skip"
+          # ublk is required for this job. Fail loudly rather than letting the
+          # tests silently skip (which previously masked the signed-module
+          # rejection for weeks).
+          sudo modprobe ublk_drv
+          if [ ! -e /dev/ublk-control ]; then
+            echo "::error::/dev/ublk-control missing after modprobe ublk_drv"
+            sudo dmesg | grep -iE 'ublk|signature|lockdown' | tail -20 || true
+            exit 1
+          fi
       - name: Install ublk udev rule
         run: |
           sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
           sudo udevadm control --reload-rules
       - name: Report kernel version
         run: uname -r
-      - name: Diagnose module-signature enforcement (temporary)
-        if: always()
-        run: |
-          echo "== uname -r =="; uname -r
-          echo "== /proc/cmdline =="; cat /proc/cmdline || true
-          echo "== secure boot state =="; mokutil --sb-state 2>/dev/null || echo "mokutil unavailable"
-          echo "== kernel lockdown =="; cat /sys/kernel/security/lockdown 2>/dev/null || echo "lockdown sysfs unavailable"
-          echo "== module sig_enforce param =="; cat /sys/module/module/parameters/sig_enforce 2>/dev/null || echo "sig_enforce param unavailable"
-          echo "== MODULE_SIG / LOCKDOWN config =="; grep -E 'CONFIG_MODULE_SIG|CONFIG_LOCK_DOWN|CONFIG_SECURITY_LOCKDOWN' /boot/config-"$(uname -r)" 2>/dev/null || echo "no /boot/config file"
-          echo "== modprobe attempt (verbose, non-fatal) =="; sudo modprobe -v ublk_drv 2>&1 || true
-          echo "== /dev/ublk-control present? =="; ls -l /dev/ublk-control 2>/dev/null || echo "absent"
-          echo "== dmesg (sig/lockdown/ublk) =="; sudo dmesg 2>/dev/null | grep -iE 'lockdown|module verification|signature|ublk|PKCS7|EKEYREJECTED' | tail -30 || true
       - name: fio benchmark (${{ matrix.transport }})
         run: sudo -E env "PATH=$PATH" cargo test -p glidefs --release --features fio-bench --test fio_bench -- --nocapture --test-threads=1
       - name: fio verify (${{ matrix.transport }})
