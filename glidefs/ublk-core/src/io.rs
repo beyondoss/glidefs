@@ -575,13 +575,14 @@ impl<'a> UblkIOCtx<'a> {
     /// Available if UBLK_F_USER_COPY is enabled.
     ///
     #[inline(always)]
-    #[allow(arithmetic_overflow)]
     pub fn ublk_user_copy_pos(q_id: u16, tag: u16, offset: u32) -> u64 {
         assert!((offset & !sys::UBLK_IO_BUF_BITS_MASK) == 0);
 
+        // All operands are widened to u64 before shifting (UBLK_QID_OFF=41,
+        // UBLK_TAG_OFF=25), so a 16-bit q_id/tag cannot overflow.
         u64::from(sys::UBLKSRV_IO_BUF_OFFSET)
-            + (((u64::from(q_id) << sys::UBLK_QID_OFF) as u64)
-                | (u64::from(tag) << sys::UBLK_TAG_OFF) as u64
+            + ((u64::from(q_id) << sys::UBLK_QID_OFF)
+                | (u64::from(tag) << sys::UBLK_TAG_OFF)
                 | u64::from(offset))
     }
 
@@ -598,14 +599,16 @@ impl<'a> UblkIOCtx<'a> {
     /// The built userdata is passed to io_uring for parsing io result
     ///
     #[inline(always)]
-    #[allow(arithmetic_overflow)]
     pub fn build_user_data(tag: u16, op: u32, tgt_data: u32, is_target_io: bool) -> u64 {
         assert!((tgt_data >> 16) == 0);
 
-        let op = op & 0xff;
+        // Widen to u64 *before* shifting. Shifting the u32 values first
+        // truncates: `tgt_data << 24` overflows u32 whenever `tgt_data` has
+        // any bit in positions 8..16 set (e.g. 0x0100 << 24 loses the high
+        // byte), silently corrupting the packed userdata.
         u64::from(tag)
-            | u64::from(op << 16)
-            | u64::from(tgt_data << 24)
+            | (u64::from(op & 0xff) << 16)
+            | (u64::from(tgt_data) << 24)
             | if is_target_io {
                 UblkUringData::Target as u64
             } else {
@@ -715,6 +718,18 @@ pub struct UblkDev {
     pub(crate) buf_reg_sync: Arc<(Mutex<BufferRegState>, Condvar)>,
 }
 
+// SAFETY: `UblkDev` is shared across the control thread and the per-queue
+// worker threads via `Arc<UblkDev>`. The fields that are not auto-`Send`/`Sync`
+// are:
+//   * `cdev_file` — an owned `fs::File`; the kernel serializes the io_uring
+//     submissions that reference its fd, and we never mutate the `File` itself
+//     after construction, so concurrent `&` access is sound.
+//   * `tgt: UblkTgt` — holds `fds: [i32; 32]` (plain integers, freely shared)
+//     and target params. After `new_with_info` returns, `tgt` is treated as
+//     immutable; queues only read it.
+//   * `buf_reg_sync` — an `Arc<(Mutex<_>, Condvar)>`, already `Send + Sync`.
+// No field hands out interior mutability without its own synchronization, so
+// sharing `&UblkDev` across threads and moving it between them is safe.
 unsafe impl Send for UblkDev {}
 unsafe impl Sync for UblkDev {}
 

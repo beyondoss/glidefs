@@ -20,6 +20,21 @@ const CTRL_PATH: &str = "/dev/ublk-control";
 
 const MAX_BUF_SZ: u32 = 32_u32 << 20;
 
+/// Remove a file, treating "already gone" as success.
+///
+/// Avoids the `exists()`-then-`remove_file()` TOCTOU race: between the check
+/// and the unlink another context (or `del`/`stop` running concurrently) may
+/// remove the file, turning the unconditional `remove_file` into a spurious
+/// error. We unlink unconditionally and only surface errors other than
+/// `NotFound`.
+fn remove_file_if_present<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 // per-thread control uring - thread_local! is already lazy
 //
 std::thread_local! {
@@ -2560,8 +2575,8 @@ impl UblkCtrl {
         let mut ctrl = self.get_inner_mut();
         let rp = ctrl.run_path();
 
-        if ctrl.for_add_dev() && Path::new(&rp).exists() {
-            fs::remove_file(rp)?;
+        if ctrl.for_add_dev() {
+            remove_file_if_present(&rp)?;
         }
         ctrl.stop()
     }
@@ -2590,9 +2605,7 @@ impl UblkCtrl {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.del()?;
-        if Path::new(&ctrl.run_path()).exists() {
-            fs::remove_file(ctrl.run_path())?;
-        }
+        remove_file_if_present(ctrl.run_path())?;
         Ok(0)
     }
 
@@ -2602,9 +2615,7 @@ impl UblkCtrl {
         let mut ctrl = self.get_inner_mut();
 
         ctrl.del_async()?;
-        if Path::new(&ctrl.run_path()).exists() {
-            fs::remove_file(ctrl.run_path())?;
-        }
+        remove_file_if_present(ctrl.run_path())?;
         Ok(0)
     }
 
@@ -2743,9 +2754,20 @@ impl UblkCtrl {
             });
         }
 
-        //device may be deleted from another context, so it is normal
-        //to see -ENOENT failure here
-        let _ = self.stop_dev();
+        // Device may be deleted from another context, so a -ENOENT failure
+        // here is expected and ignored. Any other error is unexpected and
+        // worth logging rather than silently swallowing.
+        match self.stop_dev() {
+            Ok(_) => {}
+            Err(UblkError::UringIOError(e) | UblkError::OtherError(e))
+                if e == -libc::ENOENT => {}
+            Err(e) => {
+                error!(
+                    "dev-{} stop_dev during run failed: {e}",
+                    dev.dev_info.dev_id
+                );
+            }
+        }
 
         Ok(0)
     }

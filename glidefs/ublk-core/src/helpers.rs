@@ -14,9 +14,15 @@ pub struct IoBuf<T> {
     mlocked: Cell<bool>,
 }
 
-// Users of IoBuf has to deal with Send & Sync
-unsafe impl<T> Send for IoBuf<T> {}
-unsafe impl<T> Sync for IoBuf<T> {}
+// SAFETY: `IoBuf<T>` owns a single heap allocation it allocated itself and
+// frees on drop; the raw `ptr` is never aliased. It is therefore safe to move
+// across threads (`Send`) and share by `&` (`Sync`) exactly when the contained
+// `T` is itself `Send`/`Sync` — we bound on `T` rather than blanket-impl so an
+// `IoBuf<Rc<_>>` does not silently become thread-safe. `mlocked` is a `Cell`
+// mutated only behind `&mut self` / single-threaded paths, so it does not
+// widen these guarantees.
+unsafe impl<T: Send> Send for IoBuf<T> {}
+unsafe impl<T: Sync> Sync for IoBuf<T> {}
 
 // Explicitly implement RefUnwindSafe and UnwindSafe since Cell<bool> is not RefUnwindSafe
 // This is safe because the mlocked field is only used for tracking state and doesn't
@@ -26,10 +32,19 @@ impl<T> UnwindSafe for IoBuf<T> {}
 
 impl<T> IoBuf<T> {
     pub fn new(size: usize) -> Self {
+        // `alloc` with a zero-sized layout is undefined behavior, so reject
+        // it before allocating rather than after.
+        assert!(size != 0, "IoBuf size must be non-zero");
+
         let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
+        // SAFETY: `layout` has a non-zero size (asserted above).
         let ptr = unsafe { std::alloc::alloc(layout) } as *mut T;
 
-        assert!(size != 0);
+        // `alloc` returns null on allocation failure; dereferencing that null
+        // later (Deref, zero_buf, as_slice, …) would be UB, so abort cleanly.
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
 
         IoBuf {
             ptr,

@@ -683,15 +683,19 @@ impl SequenceNumber {
 
     /// Atomically increment and return the new value.
     ///
-    /// Uses Relaxed ordering because sequence numbers only need to be
-    /// monotonically increasing, not synchronized with other memory.
+    /// Uses `AcqRel` on the successful update (and `Acquire` on the read for
+    /// the retry) so a value advanced by one thread is guaranteed visible to
+    /// the next caller — including across the handoff `advance_to` boundary on
+    /// weakly-ordered targets (aarch64). A purely `Relaxed` counter could let
+    /// a post-handoff write reuse a sequence number `advance_to` already
+    /// skipped past, breaking WAL replay ordering.
     /// Saturates at `u64::MAX` instead of wrapping, which would violate
     /// the monotonicity invariant that WAL replay depends on.
     #[inline]
     pub fn next(&self) -> u64 {
         match self
             .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 if v == u64::MAX {
                     None
                 } else {
@@ -712,7 +716,7 @@ impl SequenceNumber {
     /// Read the current value without incrementing.
     #[inline]
     pub fn current(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.0.load(Ordering::Acquire)
     }
 
     /// Atomically advance the counter to at least `target`. Used by the
@@ -724,7 +728,7 @@ impl SequenceNumber {
     pub fn advance_to(&self, target: u64) {
         let _ = self
             .0
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                 if v < target { Some(target) } else { None }
             });
     }

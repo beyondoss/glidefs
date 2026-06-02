@@ -795,7 +795,7 @@ impl<W: Read + Write + Seek> Writer<W> {
 
             // Track the newly created directory's inode
             let (_, new_ino, _) = self.lookup(&current_path, true)?;
-            current_ino = new_ino.unwrap();
+            current_ino = new_ino.expect("lookup(must_exist=true) returns Err when absent, so child_ino is Some here");
         }
         Ok(())
     }
@@ -870,7 +870,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
 
         let (_, old_ino, _) = self.lookup(oldname, true)?;
-        let old_ino = old_ino.unwrap();
+        let old_ino = old_ino.expect("lookup(must_exist=true) returns Err when absent, so child_ino is Some here");
         let old_file = self.get_inode(old_ino).unwrap();
         if old_file.mode & TYPE_MASK == format::S_IFDIR {
             return Err(io::Error::other(
@@ -899,7 +899,7 @@ impl<W: Read + Write + Seek> Writer<W> {
     pub fn stat(&mut self, name: &str) -> io::Result<File> {
         self.finish_inode()?;
         let (_, node_ino, _) = self.lookup(name, true)?;
-        let node_ino = node_ino.unwrap();
+        let node_ino = node_ino.expect("lookup(must_exist=true) returns Err when absent, so child_ino is Some here");
         let node = self.get_inode(node_ino).unwrap();
         let mut f = File {
             size: node.size,
@@ -935,7 +935,16 @@ impl<W: Read + Write + Seek> Writer<W> {
                     format!("{name}: cannot retrieve link information"),
                 ));
             }
-            f.linkname = String::from_utf8_lossy(&node.data).to_string();
+            let n = (node.size as usize).min(node.data.len());
+            let target = &node.data[..n];
+            // `linkname` is a `String`, so a non-UTF-8 target cannot round-trip
+            // through it. Surface that as an error rather than silently
+            // corrupting the path with U+FFFD replacement characters.
+            f.linkname = std::str::from_utf8(target)
+                .map_err(|e| {
+                    io::Error::other(format!("{name}: symlink target is not valid UTF-8: {e}"))
+                })?
+                .to_string();
         }
         Ok(f)
     }
