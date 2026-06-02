@@ -1040,9 +1040,12 @@ impl WriteCache<Active> {
             // unrecoverable blocks have already been marked NOT_PRESENT above.
             drop(self.inner.flushing_file.lock().take());
             let flushing_path = self.inner.config.flushing_path();
-            // remove_file on a missing path returns NotFound, which we ignore —
-            // no need for a separate blocking exists() stat.
-            let _ = tokio::fs::remove_file(&flushing_path).await;
+            // Synchronous remove: this is the cold takeover-recovery path (runs
+            // once after a flush failure), and it sits in the same lexical scope
+            // as the just-dropped data_file write guard — keeping it sync avoids
+            // an await inside that scope. remove_file on a missing path returns
+            // NotFound, which we ignore.
+            let _ = std::fs::remove_file(&flushing_path);
             // Only transition blocks whose data was successfully recovered.
             for &idx in &recovered {
                 self.inner.transition_to_dirty(idx);
