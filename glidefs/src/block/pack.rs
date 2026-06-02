@@ -34,8 +34,12 @@
 
 use std::io;
 
+use std::sync::Arc;
+
 use bytes::Bytes;
-use object_store::WriteMultipart;
+use object_store::{MultipartUpload, PutPayload};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use super::block_map::Blake3Hash;
 
@@ -190,17 +194,136 @@ pub fn assemble_pack(
     Ok((buf, entries))
 }
 
-/// Stream a v3 pack to a `WriteMultipart` writer.
+/// S3 multipart part size. Must be ≥ 5 MiB (S3 minimum for non-final parts).
+/// Larger parts mean fewer requests (less per-request overhead) at the cost of
+/// more buffered bytes per in-flight part. This is an efficiency knob; it does
+/// not affect the concurrency bound (that's [`BoundedMultipart`]'s semaphore).
+const PART_SIZE: usize = 8 * 1024 * 1024;
+
+/// A multipart uploader that bounds concurrent part PUTs with a **shared**
+/// semaphore.
 ///
-/// Blocks are written to the multipart stream as they're consumed — each
-/// compressed `Vec<u8>` is freed immediately after `writer.put()`. The index
-/// and trailer are appended at the end.
+/// Correctness invariant: every part PUT acquires one permit from the shared
+/// semaphore before being issued and holds it until the request completes. The
+/// permit count is therefore the exact maximum number of simultaneous outbound
+/// S3 write requests **across all packs and exports** — the one quantity the
+/// network and S3 actually see.
+///
+/// This replaces object_store's `WriteMultipart`, which spawns a part-upload
+/// task per chunk with no concurrency limit (per its own docs: "will immediately
+/// start new uploads ... regardless of how many outstanding uploads are already
+/// in progress"). That let a single large pack fan out into ~20 PUTs and, across
+/// concurrent packs, opened hundreds of connections — saturating the uplink into
+/// bufferbloat + packet loss + congestion collapse.
+///
+/// When `sem` is `None` (tests without a configured limit) parts are unbounded.
+pub struct BoundedMultipart {
+    upload: Box<dyn MultipartUpload>,
+    buffer: Vec<u8>,
+    part_size: usize,
+    sem: Option<Arc<Semaphore>>,
+    tasks: JoinSet<object_store::Result<()>>,
+}
+
+impl BoundedMultipart {
+    pub fn new(upload: Box<dyn MultipartUpload>, sem: Option<Arc<Semaphore>>) -> Self {
+        Self::new_with_part_size(upload, sem, PART_SIZE)
+    }
+
+    /// Construct with an explicit part size (tests use a small size to exercise
+    /// multi-part behavior without large allocations).
+    pub fn new_with_part_size(
+        upload: Box<dyn MultipartUpload>,
+        sem: Option<Arc<Semaphore>>,
+        part_size: usize,
+    ) -> Self {
+        Self {
+            upload,
+            buffer: Vec::with_capacity(part_size),
+            part_size,
+            sem,
+            tasks: JoinSet::new(),
+        }
+    }
+
+    /// Append bytes, flushing any full `PART_SIZE` parts.
+    pub async fn write(&mut self, data: &[u8]) -> object_store::Result<()> {
+        self.buffer.extend_from_slice(data);
+        self.flush_full_parts().await
+    }
+
+    /// Append owned bytes (block payloads).
+    pub async fn put(&mut self, data: Bytes) -> object_store::Result<()> {
+        self.buffer.extend_from_slice(&data);
+        self.flush_full_parts().await
+    }
+
+    async fn flush_full_parts(&mut self) -> object_store::Result<()> {
+        while self.buffer.len() >= self.part_size {
+            let rest = self.buffer.split_off(self.part_size);
+            let part = std::mem::replace(&mut self.buffer, rest);
+            self.spawn_part(part).await?;
+        }
+        Ok(())
+    }
+
+    async fn spawn_part(&mut self, bytes: Vec<u8>) -> object_store::Result<()> {
+        // Surface errors from already-finished parts promptly.
+        while let Some(joined) = self.tasks.try_join_next() {
+            joined.expect("part upload task panicked")?;
+        }
+        // Global gate: this awaits here once `limit` parts are already in flight,
+        // applying backpressure to part production (bounds memory too).
+        let permit = match &self.sem {
+            Some(s) => Some(
+                Arc::clone(s)
+                    .acquire_owned()
+                    .await
+                    .expect("upload semaphore unexpectedly closed"),
+            ),
+            None => None,
+        };
+        let fut = self.upload.put_part(PutPayload::from(bytes));
+        self.tasks.spawn(async move {
+            let _permit = permit; // released when this part PUT completes
+            fut.await
+        });
+        Ok(())
+    }
+
+    /// Flush the final partial part, await all parts, and complete the upload.
+    /// On any part error, aborts the multipart upload and returns the error.
+    pub async fn finish(mut self) -> object_store::Result<()> {
+        if !self.buffer.is_empty() {
+            let part = std::mem::take(&mut self.buffer);
+            self.spawn_part(part).await?;
+        }
+        let mut first_err = None;
+        while let Some(joined) = self.tasks.join_next().await {
+            if let Err(e) = joined.expect("part upload task panicked") {
+                first_err.get_or_insert(e);
+            }
+        }
+        if let Some(e) = first_err {
+            let _ = self.upload.abort().await;
+            return Err(e);
+        }
+        self.upload.complete().await?;
+        Ok(())
+    }
+}
+
+/// Stream a v3 pack to a [`BoundedMultipart`] writer.
+///
+/// Blocks are written to the multipart stream as they're consumed. The index
+/// and trailer are appended at the end. Concurrency of the underlying part
+/// uploads is bounded globally by the writer's shared semaphore.
 ///
 /// Returns sorted index entries (for `PackIndexCache` insertion).
-pub fn stream_pack_to_writer(
+pub async fn stream_pack_to_writer(
     mut blocks: Vec<(Blake3Hash, u32, Bytes)>,
     chunk_size: u32,
-    writer: &mut WriteMultipart,
+    writer: &mut BoundedMultipart,
 ) -> io::Result<Vec<PackIndexEntry>> {
     blocks.sort_by_key(|&(_, co, _)| co);
 
@@ -217,7 +340,7 @@ pub fn stream_pack_to_writer(
     header[4..6].copy_from_slice(&PACK_VERSION.to_le_bytes());
     header[6..8].copy_from_slice(&block_count.to_le_bytes());
     header[8..12].copy_from_slice(&chunk_size.to_le_bytes());
-    writer.write(&header);
+    writer.write(&header).await.map_err(io::Error::other)?;
 
     // -- Block Data (zero-copy: each Vec<u8> converted to Bytes) --
     let mut entries = Vec::with_capacity(blocks.len());
@@ -236,7 +359,9 @@ pub fn stream_pack_to_writer(
                 format!("pack data exceeds u32::MAX bytes at block {}", entries.len()),
             )
         })?;
-        writer.put(compressed);
+        // Part concurrency is bounded inside the writer (shared semaphore), so
+        // this naturally applies backpressure when the global limit is reached.
+        writer.put(compressed).await.map_err(io::Error::other)?;
     }
 
     // -- Block Index footer (28 bytes per entry) --
@@ -246,7 +371,7 @@ pub fn stream_pack_to_writer(
         entry_buf[16..20].copy_from_slice(&entry.chunk_offset.to_le_bytes());
         entry_buf[20..24].copy_from_slice(&entry.offset.to_le_bytes());
         entry_buf[24..28].copy_from_slice(&entry.comp_length.to_le_bytes());
-        writer.write(&entry_buf);
+        writer.write(&entry_buf).await.map_err(io::Error::other)?;
     }
 
     // -- Trailer (8 bytes) --
@@ -254,7 +379,7 @@ pub fn stream_pack_to_writer(
     trailer[0..2].copy_from_slice(&block_count.to_le_bytes());
     // [2..4] reserved zeros
     trailer[4..8].copy_from_slice(TRAILER_MAGIC);
-    writer.write(&trailer);
+    writer.write(&trailer).await.map_err(io::Error::other)?;
 
     Ok(entries)
 }
@@ -664,5 +789,152 @@ mod tests {
             content_pack_id(&blocks_at_1),
             "same content at different offsets must produce different IDs"
         );
+    }
+
+    /// Regression guard for the multipart connection explosion. The correctness
+    /// invariant: total in-flight S3 part PUTs — **across all concurrent packs**
+    /// — never exceeds the shared semaphore's permit count.
+    ///
+    /// We run several packs concurrently, all sharing one semaphore, against a
+    /// fake `MultipartUpload` that counts globally-concurrent part uploads. The
+    /// observed peak must not exceed the limit. Without the shared-semaphore
+    /// design this would be (packs × parts-per-pack) — far above the limit.
+    #[tokio::test]
+    async fn stream_pack_bounds_global_inflight_part_uploads() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use async_trait::async_trait;
+        use object_store::{MultipartUpload, PutPayload, PutResult, UploadPart};
+        use tokio::sync::Semaphore;
+
+        #[derive(Debug)]
+        struct Probe {
+            inflight: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl MultipartUpload for Probe {
+            fn put_part(&mut self, _data: PutPayload) -> UploadPart {
+                let inflight = Arc::clone(&self.inflight);
+                let peak = Arc::clone(&self.peak);
+                Box::pin(async move {
+                    let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+            async fn complete(&mut self) -> object_store::Result<PutResult> {
+                Ok(PutResult { e_tag: None, version: None })
+            }
+            async fn abort(&mut self) -> object_store::Result<()> {
+                Ok(())
+            }
+        }
+
+        const LIMIT: usize = 4;
+        const PART: usize = 1024;
+        const PACKS: u32 = 3;
+        const PARTS_PER_PACK: u32 = 6;
+
+        let sem = Arc::new(Semaphore::new(LIMIT));
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for p in 0..PACKS {
+            let sem = Arc::clone(&sem);
+            let inflight = Arc::clone(&inflight);
+            let peak = Arc::clone(&peak);
+            let blocks: Vec<(Blake3Hash, u32, Bytes)> = (0..PARTS_PER_PACK)
+                .map(|i| {
+                    let data = vec![(p * PARTS_PER_PACK + i) as u8; PART];
+                    (blake3_128(&data), i, Bytes::from(data))
+                })
+                .collect();
+            handles.push(tokio::spawn(async move {
+                let probe = Probe { inflight, peak };
+                let mut writer =
+                    BoundedMultipart::new_with_part_size(Box::new(probe), Some(sem), PART);
+                stream_pack_to_writer(blocks, 131072, &mut writer)
+                    .await
+                    .expect("stream pack");
+                writer.finish().await.expect("finish multipart");
+            }));
+        }
+        for h in handles {
+            h.await.expect("upload task");
+        }
+
+        let observed = peak.load(Ordering::SeqCst);
+        // Must reach EXACTLY the limit: there is far more demand
+        // (PACKS * PARTS_PER_PACK parts) than permits, so a correct global
+        // semaphore saturates to LIMIT and never exceeds it. `< LIMIT` would mean
+        // we're over-throttling; `> LIMIT` would mean the bound leaks (the bug).
+        assert_eq!(
+            observed, LIMIT,
+            "global in-flight part PUTs peaked at {observed}; expected to reach \
+             exactly the shared limit of {LIMIT} given {PACKS} packs * \
+             {PARTS_PER_PACK} parts of demand (= {} unbounded)",
+            PACKS * PARTS_PER_PACK
+        );
+    }
+
+    /// The streaming multipart path must produce a byte-identical pack to the
+    /// in-memory `assemble_pack`, even when split across many small parts. Guards
+    /// against the new part-splitting in `BoundedMultipart` corrupting layout or
+    /// ordering. Uses a real object_store multipart upload (`InMemory`).
+    #[tokio::test]
+    async fn bounded_multipart_round_trips_pack_bytes() {
+        use object_store::memory::InMemory;
+        use object_store::path::Path as OPath;
+        use object_store::{ObjectStore, PutMultipartOptions};
+
+        let chunk_size = 131072u32;
+        let blocks: Vec<(Blake3Hash, u32, Bytes)> = (0..8u32)
+            .map(|i| {
+                let data = test_block_data(i as usize, 4096);
+                let comp = lz4_compress(&data);
+                (blake3_128(&data), i, Bytes::from(comp))
+            })
+            .collect();
+
+        // Canonical bytes from the in-memory assembler.
+        let owned: Vec<(Blake3Hash, u32, Vec<u8>)> =
+            blocks.iter().map(|(h, o, b)| (*h, *o, b.to_vec())).collect();
+        let (expected, _) = assemble_pack(owned, chunk_size).unwrap();
+
+        let store = InMemory::new();
+        let path = OPath::from("test.pack");
+        let upload = store
+            .put_multipart_opts(&path, PutMultipartOptions::default())
+            .await
+            .unwrap();
+        // 256-byte parts force many parts for a tiny pack.
+        let mut writer = BoundedMultipart::new_with_part_size(upload, None, 256);
+        let entries = stream_pack_to_writer(blocks, chunk_size, &mut writer)
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let got = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(
+            got.as_ref(),
+            expected.as_slice(),
+            "multipart-streamed pack bytes must equal the canonical assembled pack"
+        );
+
+        // And the reassembled object's index must parse and round-trip data.
+        let index = parse_pack_index(&got).unwrap();
+        assert_eq!(index.entries.len(), entries.len());
+        for entry in &index.entries {
+            let i = entry.chunk_offset as usize;
+            let comp = extract_block(&got, entry.offset, entry.comp_length).unwrap();
+            let data = lz4_decompress(comp).unwrap();
+            assert_eq!(blake3_128(&data), entry.hash, "block {i} hash mismatch");
+        }
     }
 }
