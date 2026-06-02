@@ -1,6 +1,6 @@
-use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 use std::panic::{RefUnwindSafe, UnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn type_of_this<T>(_: &T) -> String {
     std::any::type_name::<T>().to_string()
@@ -11,22 +11,24 @@ pub fn type_of_this<T>(_: &T) -> String {
 pub struct IoBuf<T> {
     ptr: *mut T,
     size: usize,
-    mlocked: Cell<bool>,
+    mlocked: AtomicBool,
 }
 
 // SAFETY: `IoBuf<T>` owns a single heap allocation it allocated itself and
 // frees on drop; the raw `ptr` is never aliased. It is therefore safe to move
 // across threads (`Send`) and share by `&` (`Sync`) exactly when the contained
 // `T` is itself `Send`/`Sync` — we bound on `T` rather than blanket-impl so an
-// `IoBuf<Rc<_>>` does not silently become thread-safe. `mlocked` is a `Cell`
-// mutated only behind `&mut self` / single-threaded paths, so it does not
-// widen these guarantees.
+// `IoBuf<Rc<_>>` does not silently become thread-safe. `mlocked` is an
+// `AtomicBool`, so `mlock`/`munlock` taking `&self` mutate it race-free even
+// when the same `IoBuf` is shared across threads — it does not widen these
+// guarantees.
 unsafe impl<T: Send> Send for IoBuf<T> {}
 unsafe impl<T: Sync> Sync for IoBuf<T> {}
 
-// Explicitly implement RefUnwindSafe and UnwindSafe since Cell<bool> is not RefUnwindSafe
-// This is safe because the mlocked field is only used for tracking state and doesn't
-// affect memory safety across panic boundaries
+// `AtomicBool` is already `RefUnwindSafe`/`UnwindSafe`, but the raw `ptr` is
+// not. The pointer only ever addresses a self-owned allocation and is not
+// observable in a torn state across a panic boundary, so asserting unwind
+// safety here is sound and lets `IoBuf` cross `catch_unwind`.
 impl<T> RefUnwindSafe for IoBuf<T> {}
 impl<T> UnwindSafe for IoBuf<T> {}
 
@@ -49,26 +51,26 @@ impl<T> IoBuf<T> {
         IoBuf {
             ptr,
             size,
-            mlocked: Cell::new(false),
+            mlocked: AtomicBool::new(false),
         }
     }
 
     /// Check if the buffer is currently locked in memory
     pub fn is_mlocked(&self) -> bool {
-        self.mlocked.get()
+        self.mlocked.load(Ordering::Relaxed)
     }
 
     /// Lock the buffer in memory using mlock
     /// Returns true if successful, false otherwise
     pub fn mlock(&self) -> bool {
-        if self.mlocked.get() {
+        if self.mlocked.load(Ordering::Relaxed) {
             return true; // Already locked
         }
 
         let mlock_result = unsafe { libc::mlock(self.ptr as *const libc::c_void, self.size) };
 
         if mlock_result == 0 {
-            self.mlocked.set(true);
+            self.mlocked.store(true, Ordering::Relaxed);
             true
         } else {
             false
@@ -78,14 +80,14 @@ impl<T> IoBuf<T> {
     /// Unlock the buffer from memory using munlock
     /// Returns true if successful, false otherwise
     pub fn munlock(&self) -> bool {
-        if !self.mlocked.get() {
+        if !self.mlocked.load(Ordering::Relaxed) {
             return true; // Already unlocked
         }
 
         let munlock_result = unsafe { libc::munlock(self.ptr as *const libc::c_void, self.size) };
 
         if munlock_result == 0 {
-            self.mlocked.set(false);
+            self.mlocked.store(false, Ordering::Relaxed);
             true
         } else {
             false
@@ -225,8 +227,9 @@ impl<T> DerefMut for IoBuf<T> {
 /// Free buffer with same alloc layout
 impl<T> Drop for IoBuf<T> {
     fn drop(&mut self) {
-        // munlock the buffer if it was mlocked
-        if self.mlocked.get() {
+        // munlock the buffer if it was mlocked. `&mut self` in Drop means no
+        // other thread can observe `mlocked`, so a plain relaxed load suffices.
+        if *self.mlocked.get_mut() {
             unsafe {
                 libc::munlock(self.ptr as *const libc::c_void, self.size);
             }

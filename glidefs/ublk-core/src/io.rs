@@ -919,14 +919,16 @@ impl UblkDev {
         }
 
         let (lock, cvar) = &*self.buf_reg_sync;
-        let mut state = lock.lock().unwrap();
+        // Recover from poison rather than panicking: `BufferRegState` holds only
+        // counters/flags, which remain valid even if a prior holder panicked.
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
 
         while state.registered_queues < nr_hw_queues {
             // Check for mlock failures
             if state.mlock_failed {
                 return Err(UblkError::OtherError(-libc::EPERM));
             }
-            state = cvar.wait(state).unwrap();
+            state = cvar.wait(state).unwrap_or_else(|e| e.into_inner());
         }
 
         // Final check for mlock failures
@@ -940,7 +942,7 @@ impl UblkDev {
     /// Notify that a queue has completed buffer registration
     pub fn notify_buffer_registration_complete(&self, mlock_failed: bool) {
         let (lock, cvar) = &*self.buf_reg_sync;
-        let mut state = lock.lock().unwrap();
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         state.registered_queues += 1;
         if mlock_failed {
             state.mlock_failed = true;

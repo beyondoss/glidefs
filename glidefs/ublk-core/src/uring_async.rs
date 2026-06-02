@@ -49,6 +49,24 @@ impl UblkUringOpFuture {
 
         Ok(Self::new(data))
     }
+
+    /// Complete this future inline with `result`, bypassing the CQE path.
+    ///
+    /// Used when submission fails before the SQE is ever queued (e.g. the
+    /// control ring is not initialized on this thread): no CQE will arrive to
+    /// wake the future, so we store the result directly and wake any waiter.
+    pub fn set_result(&self, result: i32) {
+        MY_SLAB.with(|refcell| {
+            let mut map = refcell.borrow_mut();
+            let key = Self::get_key(self.user_data);
+            if let Some(fd) = map.get_mut(key) {
+                fd.result = Some(result);
+                if let Some(w) = &fd.waker {
+                    w.wake_by_ref();
+                }
+            }
+        });
+    }
 }
 
 impl Future for UblkUringOpFuture {

@@ -85,6 +85,10 @@ pub enum FailurePolicy {
     },
     /// N failures within the window opens the circuit.
     /// Failures older than the window are forgotten.
+    // Retained, documented, and test-covered failure policy (see module docs
+    // and `test_windowed_*`). Production currently wires only `Consecutive`
+    // (router.rs); this variant awaits an edge-proxy caller. dead_code is
+    // allowed until then rather than deleting a complete, tested feature.
     #[allow(dead_code)]
     Windowed {
         /// Number of failures within the window before opening.
@@ -131,6 +135,9 @@ impl CircuitBreakerConfig {
     }
 
     /// Create a config with windowed failure detection.
+    // Constructor for the retained `Windowed` policy above; exercised by tests,
+    // not yet called from production. Justified-dead until an edge-proxy path
+    // adopts windowed detection.
     #[allow(dead_code)]
     pub fn windowed(threshold: u32, window: Duration) -> Self {
         Self {
@@ -149,15 +156,6 @@ impl CircuitBreakerConfig {
     pub fn half_open_permits(mut self, permits: u32) -> Self {
         self.half_open_permits = permits;
         self
-    }
-
-    /// Get the failure threshold from the policy.
-    #[allow(dead_code)]
-    fn threshold(&self) -> u32 {
-        match &self.failure_policy {
-            FailurePolicy::Consecutive { threshold } => *threshold,
-            FailurePolicy::Windowed { threshold, .. } => *threshold,
-        }
     }
 }
 
@@ -512,6 +510,8 @@ impl CircuitBreaker {
     }
 
     /// Reset the circuit breaker to closed state.
+    // Public operational primitive (manual recovery / admin override). Kept on
+    // the API surface deliberately even though no in-tree caller invokes it yet.
     #[allow(dead_code)]
     pub fn reset(&self) {
         self.window_start.store(0, Ordering::Release);
@@ -520,6 +520,9 @@ impl CircuitBreaker {
     }
 
     /// Force the circuit to a specific state (for testing/admin).
+    // Test/admin helper. Callers live in the test module, so under the
+    // `test-utils` feature alone (tests not compiled) this reads as dead —
+    // hence the allow.
     #[cfg(any(test, loom, feature = "test-utils"))]
     #[allow(dead_code)]
     pub fn force_state(&self, new_state: CircuitState) {

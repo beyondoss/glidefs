@@ -42,16 +42,20 @@ std::thread_local! {
         RefCell::new(None);
 }
 
-// Internal macro versions for backwards compatibility within the crate
+// Internal macro versions for use within the crate. Unlike the public
+// `with_ctrl_ring`/`with_ctrl_ring_mut` convenience accessors (which panic on
+// an uninitialized ring per their documented contract), these yield
+// `Result<T, UblkError>` so library command paths propagate
+// `CtrlRingUninit` instead of unwinding.
 #[macro_export]
 macro_rules! with_ctrl_ring_internal {
     ($closure:expr) => {
         $crate::ctrl::CTRL_URING.with(|cell| {
             let ring_ref = cell.borrow();
             if let Some(ref ring) = *ring_ref {
-                $closure(ring)
+                Ok($closure(ring))
             } else {
-                panic!("Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.")
+                Err($crate::UblkError::CtrlRingUninit)
             }
         })
     };
@@ -63,9 +67,9 @@ macro_rules! with_ctrl_ring_mut_internal {
         $crate::ctrl::CTRL_URING.with(|cell| {
             let mut ring_ref = cell.borrow_mut();
             if let Some(ref mut ring) = *ring_ref {
-                $closure(ring)
+                Ok($closure(ring))
             } else {
-                panic!("Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.")
+                Err($crate::UblkError::CtrlRingUninit)
             }
         })
     };
@@ -113,7 +117,9 @@ pub fn with_ctrl_ring<T, F>(closure: F) -> T
 where
     F: FnOnce(&IoUring<squeue::Entry128>) -> T,
 {
-    with_ctrl_ring_internal!(closure)
+    with_ctrl_ring_internal!(closure).expect(
+        "Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.",
+    )
 }
 
 /// Execute a closure with mutable access to the thread-local control ring
@@ -155,7 +161,9 @@ pub fn with_ctrl_ring_mut<T, F>(closure: F) -> T
 where
     F: FnOnce(&mut IoUring<squeue::Entry128>) -> T,
 {
-    with_ctrl_ring_mut_internal!(closure)
+    with_ctrl_ring_mut_internal!(closure).expect(
+        "Control ring not initialized. Call ublk_init_ctrl_task_ring() first or use UblkCtrl constructor.",
+    )
 }
 
 /// Initialize the thread-local control ring using a custom closure
@@ -1415,12 +1423,18 @@ impl UblkCtrlInner {
         let f = UblkUringOpFuture::new(0);
         let sqe = self.ublk_ctrl_prep_cmd(fd, dev_id, data, f.user_data);
 
-        unsafe {
+        let pushed = unsafe {
             with_ctrl_ring_mut_internal!(|ring: &mut IoUring<squeue::Entry128>| {
                 if let Err(e) = ring.submission().push(&sqe) {
                     eprintln!("Warning: Failed to push SQE to submission queue: {:?}", e);
                 }
             })
+        };
+        if pushed.is_err() {
+            // Ring not initialized on this thread — the SQE was never queued, so
+            // the future will never be completed by a CQE. Complete it inline
+            // with an error code that flows through `ublk_err_to_result`.
+            f.set_result(-libc::ENODEV);
         }
         f
     }
@@ -1449,13 +1463,15 @@ impl UblkCtrlInner {
                 }
             };
             let _ = r.submit_and_wait(to_wait);
-        });
+        })?;
         Ok(token)
     }
 
     /// check one control command and see if it is completed
     ///
     fn poll_cmd(&mut self, token: u64) -> i32 {
+        // On an uninitialized ring, return -ENODEV so the caller's
+        // `ublk_err_to_result` surfaces it as an error instead of looping.
         with_ctrl_ring_mut_internal!(|r: &mut IoUring<squeue::Entry128>| {
             let res = match r.completion().next() {
                 Some(cqe) => {
@@ -1470,6 +1486,7 @@ impl UblkCtrlInner {
 
             res
         })
+        .unwrap_or(-libc::ENODEV)
     }
 
     fn ublk_ctrl_need_retry(
