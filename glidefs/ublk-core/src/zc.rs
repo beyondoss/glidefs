@@ -387,6 +387,8 @@ pub fn run_zc_queue(
     let handle = ZcQueueHandle { tx, eventfd_fd };
 
     // mmap the kernel's io_cmd_buf for this queue.
+    // SAFETY: sysconf is a pure query syscall taking a constant name and
+    // touching no userspace memory.
     let page_sz = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     let cmd_buf_sz_raw = (queue_depth as usize) * std::mem::size_of::<sys::ublksrv_io_desc>();
     let cmd_buf_sz = (cmd_buf_sz_raw + page_sz - 1) & !(page_sz - 1);
@@ -396,6 +398,11 @@ pub fn run_zc_queue(
         & !(page_sz - 1);
     let off = libc::off_t::from(sys::UBLKSRV_CMD_BUF_OFFSET)
         + libc::off_t::from(qid) * max_cmd_buf_sz as libc::off_t;
+    // SAFETY: a null `addr` lets the kernel choose the mapping; `cmd_buf_sz`
+    // is the page-rounded size of this queue's io_desc array; `cdev_fd` is a
+    // valid open ublk char-device fd and `off` is the kernel-defined per-queue
+    // command-buffer offset. PROT_READ only — we never write the mapping. The
+    // return value is checked against MAP_FAILED below before any use.
     let io_cmd_buf = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -416,9 +423,16 @@ pub fn run_zc_queue(
         let mut sq = ring.submission();
         for tag in 0..queue_depth {
             let sqe = build_fetch_sqe(qid, tag, -1);
+            // SAFETY: `sqe` is a fully-initialized SQE built by `build_fetch_sqe`
+            // and lives until `sq.push` copies it into the ring; it references no
+            // dangling buffers (FETCH carries only tag metadata). push() only
+            // errors when the submission queue is full, mapped to EAGAIN.
             unsafe { sq.push(&sqe) }.map_err(|_| UblkError::OtherError(-libc::EAGAIN))?;
         }
         let sqe = build_eventfd_poll_sqe(eventfd_fd);
+        // SAFETY: `sqe` is a fully-initialized PollAdd SQE referencing the
+        // caller-owned `eventfd_fd`, which outlives this ring; push() copies it
+        // immediately and only errors on a full queue.
         unsafe { sq.push(&sqe) }.map_err(|_| UblkError::OtherError(-libc::EAGAIN))?;
     }
     ring.submit().map_err(UblkError::IOError)?;
@@ -449,10 +463,17 @@ pub fn run_zc_queue(
         }
         let mut sq = ring.submission();
         for sqe in to_submit {
+            // SAFETY: each `sqe` is a fully-initialized entry produced by
+            // `finalize`/`build_*_sqe` and copied into the ring by push().
+            // Any buffer it references (the per-tag keepalive) is held alive
+            // in `inflight` until the matching completion. A full queue
+            // returns Err, which we recover from below.
             if unsafe { sq.push(sqe) }.is_err() {
                 drop(sq);
                 ring.submit().map_err(UblkError::IOError)?;
                 let mut sq2 = ring.submission();
+                // SAFETY: same as above; after draining the queue via submit()
+                // there is now room, and a second failure is mapped to EAGAIN.
                 unsafe { sq2.push(sqe) }
                     .map_err(|_| UblkError::OtherError(-libc::EAGAIN))?;
                 sq = sq2;
@@ -540,6 +561,9 @@ pub fn run_zc_queue(
             Ok(_) => {}
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
             Err(e) => {
+                // SAFETY: `io_cmd_buf`/`cmd_buf_sz` are the exact base+length
+                // from the successful mmap above and have not been unmapped yet.
+                // We return immediately after, so the mapping is never reused.
                 unsafe { libc::munmap(io_cmd_buf, cmd_buf_sz) };
                 // `wake_fd` is owned by the caller — don't close it here.
                 return Err(UblkError::IOError(e));
@@ -555,6 +579,10 @@ pub fn run_zc_queue(
             if ud_is_eventfd(ud) {
                 // Drain eventfd counter.
                 let mut buf = [0u8; 8];
+                // SAFETY: `eventfd_fd` is a valid open eventfd owned by the
+                // caller; `buf` is a live 8-byte stack buffer and we pass its
+                // exact length, so the kernel writes within bounds. The eventfd
+                // counter read is always 8 bytes; the loop drains until EAGAIN.
                 while unsafe {
                     libc::read(eventfd_fd, buf.as_mut_ptr() as *mut _, 8)
                 } == 8 {}
@@ -632,6 +660,13 @@ pub fn run_zc_queue(
                 // STOP_DEV will eventually flush the queue with ABORTs.
                 continue;
             } else {
+                // SAFETY: `io_cmd_buf` is the live PROT_READ mmap of the
+                // kernel's per-queue io_desc array, sized for `queue_depth`
+                // entries. `tag < queue_depth` (it indexes `inflight`, sized
+                // `queue_depth`), so the offset stays within the mapping and
+                // is naturally aligned for `ublksrv_io_desc`. The descriptor is
+                // populated by the kernel before this FETCH CQE is delivered,
+                // and we only read it.
                 let iod = unsafe {
                     &*((io_cmd_buf as *const u8)
                         .add(tag as usize * std::mem::size_of::<sys::ublksrv_io_desc>())
@@ -687,6 +722,9 @@ pub fn run_zc_queue(
         push_sqes(&mut ring, &to_submit)?;
     }
 
+    // SAFETY: `io_cmd_buf`/`cmd_buf_sz` are the exact base+length returned by
+    // the successful mmap above; this is the sole unmap on the normal exit path
+    // and the mapping is never touched afterward.
     unsafe { libc::munmap(io_cmd_buf, cmd_buf_sz) };
     // `wake_fd` is owned by the caller — don't close it here.
     Ok(())

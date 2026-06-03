@@ -273,7 +273,7 @@ impl<R: Read + Seek> Reader<R> {
         let mut pos = 0usize;
 
         while pos < data.len() {
-            if let Some(entry) = DirEntry::read_from(&data[pos..]) {
+            if let Some(entry) = DirEntry::read_from(&data[pos..])? {
                 let rec_len = entry.rec_len as usize;
                 if entry.name != "." && entry.name != ".." {
                     entries.push(entry);

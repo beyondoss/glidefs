@@ -142,6 +142,8 @@ impl Wal {
             .open(&lockfile_path)?;
 
         let our_pid = std::process::id();
+        // SAFETY: getppid() is an always-succeeds syscall taking no arguments
+        // and touching no userspace memory.
         let our_ppid = unsafe { libc::getppid() } as u32;
         let existing_pid = read_pid_from_lockfile(&lockfile);
 
@@ -207,10 +209,17 @@ impl Wal {
                 // `read_pid_from_lockfile` left the cursor at EOF;
                 // without seeking, write_all would extend the file
                 // with zeros before our PID and parse would fail.
+                //
+                // These must not be swallowed: a silent failure here
+                // (full disk, etc.) leaves the lockfile empty or stale,
+                // so the next opener reads no PID, takes the "stale —
+                // reclaim" path, and double-opens a WAL we are actively
+                // writing. Hold the flock either way, but surface the
+                // error so the caller knows ownership wasn't recorded.
                 use std::io::Write;
-                let _ = lockfile.set_len(0);
-                let _ = (&lockfile).seek(SeekFrom::Start(0));
-                let _ = (&lockfile).write_all(format!("{our_pid}\n").as_bytes());
+                lockfile.set_len(0)?;
+                (&lockfile).seek(SeekFrom::Start(0))?;
+                (&lockfile).write_all(format!("{our_pid}\n").as_bytes())?;
             }
         }
 
@@ -242,6 +251,10 @@ impl Wal {
         // atomically seeks to EOF — a retry would append at the new EOF,
         // leaving a gap of partial data. For regular files, write() of
         // small buffers (< page size) should never short-write.
+        // SAFETY: `self.fd` is a valid open O_APPEND descriptor owned by
+        // `Wal` for its entire lifetime (closed only in `Drop`). The read
+        // guard taken above excludes concurrent `truncate`. `buf`/`buf.len()`
+        // describe a live, initialized slice; the kernel only reads from it.
         let written = unsafe {
             libc::write(
                 self.fd,
@@ -267,6 +280,9 @@ impl Wal {
     /// Thread-safe — fsync/fdatasync operates on kernel state, not userspace buffers.
     /// Uses fdatasync on Linux (skips metadata update), fsync on other platforms.
     pub fn sync(&self) -> io::Result<()> {
+        // SAFETY: `self.fd` is a valid open descriptor owned by `Wal` for its
+        // lifetime; fdatasync/fsync only operate on kernel state for that fd
+        // and take no userspace buffer, so they are safe to call concurrently.
         #[cfg(target_os = "linux")]
         let ret = unsafe { libc::fdatasync(self.fd) };
         #[cfg(not(target_os = "linux"))]
@@ -296,6 +312,9 @@ impl Wal {
     pub fn truncate(&self) -> io::Result<()> {
         let _guard = self.guard.write();
 
+        // SAFETY: `self.fd` is a valid open descriptor owned by `Wal` for its
+        // lifetime. The exclusive write guard taken above excludes all
+        // concurrent appends, so no write() races this truncation.
         let ret = unsafe { libc::ftruncate(self.fd, 0) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
