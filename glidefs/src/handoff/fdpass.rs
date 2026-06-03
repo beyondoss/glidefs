@@ -2,10 +2,9 @@
 //! SCM_RIGHTS file-descriptor passing over a SOCK_SEQPACKET socket.
 //!
 //! Used by the handoff protocol to pass listener fds (NBD TCP / Unix,
-//! HTTP API) from the predecessor process to the successor. Reserved for
-//! Phase 2 — the Phase 1 MVP rebinds listeners in the successor, which
-//! costs a single TCP RST per in-flight client but is operationally
-//! simpler.
+//! HTTP API) from the predecessor process to the successor: the
+//! predecessor ships its listener fds in the `HelloAck` and the successor
+//! adopts them, so in-flight clients are not disconnected across handoff.
 //!
 //! ## Wire format
 //!
@@ -29,7 +28,6 @@ pub const MAX_FDS: usize = 64;
 /// `socket` must be in SEQPACKET mode (set at bind/connect time).
 /// Returns the number of payload bytes sent (= `payload.len()` on success
 /// for a SEQPACKET socket; partial sends are not possible on SEQPACKET).
-#[allow(dead_code)] // Phase 2
 pub fn sendmsg_with_fds(
     socket: &UnixDatagram,
     payload: &[u8],
@@ -49,6 +47,7 @@ pub fn sendmsg_with_fds(
     };
 
     // CMSG buffer: enough for one SCM_RIGHTS with MAX_FDS slots.
+    // SAFETY: `CMSG_LEN` is a pure size computation; it touches no memory.
     let cmsg_len = unsafe { libc::CMSG_LEN((std::mem::size_of::<RawFd>() * MAX_FDS) as u32) };
     let mut cmsg_buf = vec![0u8; cmsg_len as usize];
 
@@ -65,6 +64,7 @@ pub fn sendmsg_with_fds(
         msg_controllen: if fds.is_empty() {
             0
         } else {
+            // SAFETY: `CMSG_LEN` is a pure size computation; it touches no memory.
             unsafe { libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as _ }
         },
         msg_flags: 0,
@@ -104,7 +104,6 @@ pub fn sendmsg_with_fds(
 /// `OwnedFd` so the caller can dup or close them as needed; if the
 /// caller drops the vec without using them, the kernel closes them
 /// (no fd leak).
-#[allow(dead_code)] // Phase 2
 pub fn recvmsg_with_fds(
     socket: &UnixDatagram,
     buf: &mut [u8],
@@ -115,6 +114,7 @@ pub fn recvmsg_with_fds(
         iov_len: buf.len(),
     };
 
+    // SAFETY: `CMSG_SPACE` is a pure size computation; it touches no memory.
     let cmsg_buflen = unsafe {
         libc::CMSG_SPACE((std::mem::size_of::<RawFd>() * MAX_FDS) as u32)
     };

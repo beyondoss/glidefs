@@ -24,7 +24,14 @@ pub fn inject(point: &str) {
                 point,
                 "test-fault-injection: triggering deliberate exit at this state"
             );
-            // Allow logs to flush.
+            // Simulates an abrupt process crash at this state-machine point:
+            // `exit(1)` runs NO destructors — no WAL fdatasync, no File flush,
+            // no graceful socket teardown. That is the intent. The recovery
+            // tests assert the system survives losing whatever was not already
+            // durable here, so anything still buffered must NOT be flushed.
+            // The sleep only gives the async tracing writer a chance to emit
+            // the line above for test diagnostics; it does not flush any
+            // on-disk state the oracle depends on.
             std::thread::sleep(std::time::Duration::from_millis(50));
             std::process::exit(1);
         }

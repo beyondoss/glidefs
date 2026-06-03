@@ -979,10 +979,17 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    /// Parse a directory entry from a buffer. Returns None for empty/padding entries.
-    pub fn read_from(buf: &[u8]) -> Option<Self> {
+    /// Parse a directory entry from a buffer.
+    ///
+    /// Returns `Ok(None)` for empty/padding entries (inode 0 or name_len 0)
+    /// and for a buffer too short to hold the entry. Returns `Err` when a
+    /// real entry carries a name that is not valid UTF-8: ext4 permits
+    /// arbitrary bytes in filenames, but `DirEntry::name` is a `String`, so
+    /// rather than silently dropping the entry (which would make the file
+    /// vanish from the listing) we surface the corruption to the caller.
+    pub fn read_from(buf: &[u8]) -> io::Result<Option<Self>> {
         if buf.len() < DIR_ENTRY_HEADER_SIZE {
-            return None;
+            return Ok(None);
         }
         let inode = le_u32(buf, 0);
         let rec_len = le_u16(buf, 4);
@@ -991,15 +998,20 @@ impl DirEntry {
 
         // Empty entry (inode 0 or name_len 0 = padding)
         if inode == 0 || name_len == 0 {
-            return None;
+            return Ok(None);
         }
 
         let end = DIR_ENTRY_HEADER_SIZE + name_len as usize;
         if buf.len() < end {
-            return None;
+            return Ok(None);
         }
 
-        let name = String::from_utf8(buf[DIR_ENTRY_HEADER_SIZE..end].to_vec()).ok()?;
+        let name = String::from_utf8(buf[DIR_ENTRY_HEADER_SIZE..end].to_vec()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("directory entry for inode {inode} has a non-UTF-8 name"),
+            )
+        })?;
         let file_type = match file_type_raw {
             1 => FileType::Regular,
             2 => FileType::Directory,
@@ -1011,7 +1023,7 @@ impl DirEntry {
             _ => FileType::Unknown,
         };
 
-        Some(DirEntry { inode, rec_len, name_len, file_type, name })
+        Ok(Some(DirEntry { inode, rec_len, name_len, file_type, name }))
     }
 }
 
@@ -1212,5 +1224,42 @@ mod tests {
         let buf = make_test_superblock(100, 0, 200, 0, 0);
         let sb = SuperBlock::read_from(&buf).unwrap();
         assert_eq!(sb.used_blocks(), 0); // saturating_sub prevents underflow
+    }
+
+    /// Build a raw on-disk directory entry: 8-byte header + name bytes.
+    fn make_dir_entry(inode: u32, file_type: u8, name: &[u8]) -> Vec<u8> {
+        let rec_len = (DIR_ENTRY_HEADER_SIZE + name.len()) as u16;
+        let mut buf = Vec::with_capacity(rec_len as usize);
+        buf.extend_from_slice(&inode.to_le_bytes());
+        buf.extend_from_slice(&rec_len.to_le_bytes());
+        buf.push(name.len() as u8);
+        buf.push(file_type);
+        buf.extend_from_slice(name);
+        buf
+    }
+
+    #[test]
+    fn test_dir_entry_valid_utf8_name() {
+        let buf = make_dir_entry(12, 1, b"hello.txt");
+        let entry = DirEntry::read_from(&buf).unwrap().expect("real entry");
+        assert_eq!(entry.inode, 12);
+        assert_eq!(entry.name, "hello.txt");
+    }
+
+    #[test]
+    fn test_dir_entry_padding_returns_none() {
+        // inode 0 = padding/empty slot, not an error.
+        let buf = make_dir_entry(0, 0, b"ignored");
+        assert!(DirEntry::read_from(&buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_dir_entry_non_utf8_name_surfaces_error() {
+        // A real entry (inode != 0) whose name is not valid UTF-8 must NOT be
+        // silently dropped — that would make the file vanish from the listing.
+        // 0xFF, 0xFE are invalid UTF-8 lead bytes.
+        let buf = make_dir_entry(7, 1, &[b'a', 0xFF, 0xFE, b'b']);
+        let err = DirEntry::read_from(&buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

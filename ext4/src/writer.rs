@@ -340,6 +340,40 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.inodes[(i - 1) as usize].as_ref()
     }
 
+    /// Borrow an allocated inode by number, returning an error rather than
+    /// panicking when the slot is empty or out of range.
+    ///
+    /// Every inode reference inside the writer originates from a
+    /// directory-children map the writer itself populated, so a missing slot
+    /// signals internal corruption or a malformed conversion stream. On the
+    /// OCI ingest path (`convert_tar_to_ext4`) the input is attacker-influenced
+    /// tar data; surfacing this as an `InvalidData` error lets the caller
+    /// reject the image instead of aborting the whole process on a panic.
+    fn inode_ref(&self, ino: InodeNumber) -> io::Result<&Inode> {
+        self.get_inode(ino).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("inode {ino} is not allocated"),
+            )
+        })
+    }
+
+    /// Mutable counterpart to [`Self::inode_ref`].
+    fn inode_mut(&mut self, ino: InodeNumber) -> io::Result<&mut Inode> {
+        if ino == 0 || ino as usize > self.inodes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("inode {ino} is not allocated"),
+            ));
+        }
+        self.inodes[(ino - 1) as usize].as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("inode {ino} is not allocated"),
+            )
+        })
+    }
+
     fn root_number(&self) -> InodeNumber {
         format::INODE_ROOT
     }
@@ -394,7 +428,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         let ino: InodeNumber;
         let is_new: bool;
         if let Some(existing_ino) = reuse_ino {
-            let existing = self.inodes[(existing_ino - 1) as usize].as_ref().unwrap();
+            let existing = self.inode_ref(existing_ino)?;
             if existing.flags.contains(InodeFlags::EXTENTS) {
                 return Err(io::Error::other(
                     "cannot overwrite file with non-inline data",
@@ -409,7 +443,7 @@ impl<W: Read + Write + Seek> Writer<W> {
 
         // Preserve children and link_count for directory reuse
         let (children, link_count) = if !is_new {
-            let existing = self.inodes[(ino - 1) as usize].as_ref().unwrap();
+            let existing = self.inode_ref(ino)?;
             (existing.children.clone(), existing.link_count)
         } else if typ == format::S_IFDIR {
             (BTreeMap::new(), 1u32) // directory linked to itself
@@ -493,12 +527,12 @@ impl<W: Read + Write + Seek> Writer<W> {
 
         // Handle block xattrs
         let old_xattr_block = if !is_new {
-            self.inodes[(ino - 1) as usize].as_ref().unwrap().xattr_block
+            self.inode_ref(ino)?.xattr_block
         } else {
             0
         };
         let old_block_count = if !is_new {
-            self.inodes[(ino - 1) as usize].as_ref().unwrap().block_count
+            self.inode_ref(ino)?.block_count
         } else {
             0
         };
@@ -597,7 +631,10 @@ impl<W: Read + Write + Seek> Writer<W> {
                 format!("did not write the right amount: {} != {}", self.data_written, self.data_max),
             ));
         }
-        let has_inline = self.inodes[idx].as_ref().unwrap().flags.contains(InodeFlags::INLINE_DATA);
+        let has_inline = self
+            .inode_ref((idx + 1) as InodeNumber)?
+            .flags
+            .contains(InodeFlags::INLINE_DATA);
         if self.data_max != 0 && !has_inline {
             self.write_extents(idx)?;
         }
@@ -703,7 +740,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             ));
         }
 
-        let inode = self.inodes[idx].as_mut().unwrap();
+        let inode = self.inode_mut((idx + 1) as InodeNumber)?;
         inode.data = data;
         inode.flags |= InodeFlags::EXTENTS;
         inode.block_count += used_blocks;
@@ -724,7 +761,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         };
         let root_ino = self.make_inode(&root_file, None)?;
         // Root is linked to itself
-        self.inodes[(root_ino - 1) as usize].as_mut().unwrap().link_count += 1;
+        self.inode_mut(root_ino)?.link_count += 1;
 
         // Pad to INODE_FIRST - 1, so the next make_inode gets inode INODE_FIRST.
         // (matches Go: append(w.inodes, make([]*inode, inodeFirst-len(w.inodes)-1)...))
@@ -771,14 +808,14 @@ impl<W: Read + Write + Seek> Writer<W> {
             current_path.push('/');
             current_path.push_str(dirname);
 
-            let parent = self.get_inode(current_ino).unwrap();
+            let parent = self.inode_ref(current_ino)?;
             if let Some(&child_ino) = parent.children.get(dirname) {
                 current_ino = child_ino;
                 continue;
             }
 
             // Copy root's metadata for the new directory
-            let root = self.get_inode(root_ino).unwrap();
+            let root = self.inode_ref(root_ino)?;
             let f = File {
                 mode: root.mode,
                 atime: root.atime,
@@ -793,9 +830,13 @@ impl<W: Read + Write + Seek> Writer<W> {
             };
             self.create(&current_path, &f)?;
 
-            // Track the newly created directory's inode
+            // Track the newly created directory's inode. `lookup(must_exist=true)`
+            // returns `Err` when the child is absent, so `new_ino` is `Some` here;
+            // treat the impossible `None` as internal corruption rather than panic.
             let (_, new_ino, _) = self.lookup(&current_path, true)?;
-            current_ino = new_ino.expect("lookup(must_exist=true) returns Err when absent, so child_ino is Some here");
+            current_ino = new_ino.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("{current_path}: lookup returned no inode"))
+            })?;
         }
         Ok(())
     }
@@ -807,7 +848,7 @@ impl<W: Read + Write + Seek> Writer<W> {
 
         let reuse_ino: Option<InodeNumber>;
         if let Some(existing) = existing_ino {
-            let existing_inode = self.get_inode(existing).unwrap();
+            let existing_inode = self.inode_ref(existing)?;
             if existing_inode.is_dir() {
                 if f.mode & TYPE_MASK != format::S_IFDIR {
                     return Err(io::Error::other(
@@ -826,7 +867,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             }
         } else {
             if f.mode & TYPE_MASK == format::S_IFDIR {
-                let dir = self.get_inode(dir_ino).unwrap();
+                let dir = self.inode_ref(dir_ino)?;
                 if dir.link_count >= format::MAX_LINKS {
                     return Err(io::Error::other(
                         format!("{name}: exceeded parent directory maximum link count"),
@@ -840,17 +881,16 @@ impl<W: Read + Write + Seek> Writer<W> {
 
         if existing_ino != Some(child_ino) {
             if let Some(existing) = existing_ino {
-                self.inodes[(existing - 1) as usize].as_mut().unwrap().link_count -= 1;
+                self.inode_mut(existing)?.link_count -= 1;
             }
-            let dir = self.inodes[(dir_ino - 1) as usize].as_mut().unwrap();
-            dir.children.insert(childname, child_ino);
-            self.inodes[(child_ino - 1) as usize].as_mut().unwrap().link_count += 1;
-            if self.inodes[(child_ino - 1) as usize].as_ref().unwrap().is_dir() {
-                self.inodes[(dir_ino - 1) as usize].as_mut().unwrap().link_count += 1;
+            self.inode_mut(dir_ino)?.children.insert(childname, child_ino);
+            self.inode_mut(child_ino)?.link_count += 1;
+            if self.inode_ref(child_ino)?.is_dir() {
+                self.inode_mut(dir_ino)?.link_count += 1;
             }
         }
 
-        if self.inodes[(child_ino - 1) as usize].as_ref().unwrap().mode & TYPE_MASK == format::S_IFREG {
+        if self.inode_ref(child_ino)?.mode & TYPE_MASK == format::S_IFREG {
             self.start_inode(name, child_ino, f.size)?;
         }
         Ok(())
@@ -861,7 +901,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.finish_inode()?;
         let (newdir_ino, existing_ino, newchildname) = self.lookup(newname, false)?;
         if let Some(existing) = existing_ino {
-            let ex = self.get_inode(existing).unwrap();
+            let ex = self.inode_ref(existing)?;
             if ex.is_dir() || ex.link_count < 2 {
                 return Err(io::Error::other(
                     format!("{newname}: cannot orphan existing file or directory"),
@@ -870,8 +910,11 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
 
         let (_, old_ino, _) = self.lookup(oldname, true)?;
-        let old_ino = old_ino.expect("lookup(must_exist=true) returns Err when absent, so child_ino is Some here");
-        let old_file = self.get_inode(old_ino).unwrap();
+        // `lookup(must_exist=true)` errors when absent, so `old_ino` is `Some`.
+        let old_ino = old_ino.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("{oldname}: lookup returned no inode"))
+        })?;
+        let old_file = self.inode_ref(old_ino)?;
         if old_file.mode & TYPE_MASK == format::S_IFDIR {
             return Err(io::Error::other(
                 format!("{newname}: link target cannot be a directory: {oldname}"),
@@ -884,10 +927,10 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
 
         if let Some(existing) = existing_ino {
-            self.inodes[(existing - 1) as usize].as_mut().unwrap().link_count -= 1;
+            self.inode_mut(existing)?.link_count -= 1;
         }
-        self.inodes[(old_ino - 1) as usize].as_mut().unwrap().link_count += 1;
-        self.inodes[(newdir_ino - 1) as usize].as_mut().unwrap().children.insert(newchildname, old_ino);
+        self.inode_mut(old_ino)?.link_count += 1;
+        self.inode_mut(newdir_ino)?.children.insert(newchildname, old_ino);
         Ok(())
     }
 
@@ -899,8 +942,11 @@ impl<W: Read + Write + Seek> Writer<W> {
     pub fn stat(&mut self, name: &str) -> io::Result<File> {
         self.finish_inode()?;
         let (_, node_ino, _) = self.lookup(name, true)?;
-        let node_ino = node_ino.expect("lookup(must_exist=true) returns Err when absent, so child_ino is Some here");
-        let node = self.get_inode(node_ino).unwrap();
+        // `lookup(must_exist=true)` errors when absent, so `node_ino` is `Some`.
+        let node_ino = node_ino.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("{name}: lookup returned no inode"))
+        })?;
+        let node = self.inode_ref(node_ino)?;
         let mut f = File {
             size: node.size,
             mode: node.mode,
@@ -924,7 +970,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             self.seek_block(orig)?;
             get_xattrs(&b[32..], &mut f.xattrs, 32);
         }
-        let node = self.get_inode(node_ino).unwrap();
+        let node = self.inode_ref(node_ino)?;
         if !node.xattr_inline.is_empty() {
             get_xattrs(&node.xattr_inline[4..], &mut f.xattrs, 0);
             f.xattrs.remove("system.data");
@@ -964,12 +1010,17 @@ impl<W: Read + Write + Seek> Writer<W> {
                 ),
             ));
         }
-        let idx = self.cur_inode.unwrap();
-        let has_inline = self.inodes[idx].as_ref().unwrap().flags.contains(InodeFlags::INLINE_DATA);
+        let idx = self.cur_inode.ok_or_else(|| {
+            io::Error::other("write_data called with no inode in progress")
+        })?;
+        let has_inline = self
+            .inode_ref((idx + 1) as InodeNumber)?
+            .flags
+            .contains(InodeFlags::INLINE_DATA);
         if has_inline {
-            let inode = self.inodes[idx].as_mut().unwrap();
             let start = self.data_written as usize;
-            inode.data[start..start + b.len()].copy_from_slice(b);
+            self.inode_mut((idx + 1) as InodeNumber)?.data[start..start + b.len()]
+                .copy_from_slice(b);
             self.data_written += b.len() as i64;
             Ok(b.len())
         } else {
@@ -991,7 +1042,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         let mut left = BLOCK_SIZE as usize;
 
         // Collect entries: ".", "..", then children sorted by (inode_number, name)
-        let dir = self.get_inode(dir_ino).unwrap();
+        let dir = self.inode_ref(dir_ino)?;
         let children: Vec<(String, InodeNumber)> = dir.children.iter()
             .map(|(name, &ino)| (name.clone(), ino))
             .collect();
@@ -1030,9 +1081,11 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.finish_dir_block(left)?;
 
         // Fix up the inode's size
-        let idx = self.cur_inode.unwrap();
+        let idx = self.cur_inode.ok_or_else(|| {
+            io::Error::other("write_directory: no inode in progress")
+        })?;
         let written = self.data_written;
-        self.inodes[idx].as_mut().unwrap().size = written;
+        self.inode_mut((idx + 1) as InodeNumber)?.size = written;
         self.data_max = written;
         Ok(())
     }
@@ -1066,7 +1119,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.write_directory(dir_ino, parent_ino)?;
 
         // Collect children that are directories, sorted by (inode_number, name)
-        let dir = self.get_inode(dir_ino).unwrap();
+        let dir = self.inode_ref(dir_ino)?;
         let mut dir_children: Vec<(String, InodeNumber)> = dir.children.iter()
             .filter_map(|(name, &ino)| {
                 self.get_inode(ino).and_then(|i| {

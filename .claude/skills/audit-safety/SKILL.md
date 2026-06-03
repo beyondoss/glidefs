@@ -170,7 +170,6 @@ A comprehensive checklist for auditing Rust codebases, focused on patterns that 
 - [ ] `#[deny(unused_must_use)]` at crate root
 - [ ] Clippy lints cannot be overridden by local `#[allow]` without review (enforce via CI grep or policy)
 
-
 ---
 
 ## 7. Process and System
@@ -254,8 +253,8 @@ These bugs live at syscall and OS boundaries — Rust's type system cannot preve
 
 ### Trust Boundary Code Loading
 
-- [ ] No library calls that load dynamic modules (NSS lookups, PAM, `dlopen`) *after* crossing a privilege or chroot boundary — an attacker controls the chroot tree and can supply malicious modules
-- [ ] Resolve usernames, group memberships, and hostnames *before* calling `chroot()`, dropping privileges, or entering a sandbox
+- [ ] No library calls that load dynamic modules (NSS lookups, PAM, `dlopen`) _after_ crossing a privilege or chroot boundary — an attacker controls the chroot tree and can supply malicious modules
+- [ ] Resolve usernames, group memberships, and hostnames _before_ calling `chroot()`, dropping privileges, or entering a sandbox
 - [ ] Grep: `rg 'chroot|setuid|setgid' --type rust` — verify all NSS/resolver calls (`get_user_by_name`, `getaddrinfo`, etc.) precede the boundary crossing
 
 ---
@@ -363,8 +362,8 @@ Skip categories that don't apply.
 
 ## Concerns Summary
 
-| # | Gap           | Type                   | Effort   | ICE   |
-| - | ------------- | ---------------------- | -------- | ----- |
+| # | Gap           | Type          | Effort   | ICE   |
+| - | ------------- | ------------- | -------- | ----- |
 | 1 | {description} | {performance} | {effort} | {n.n} |
 
 ## Quick Wins
