@@ -198,6 +198,21 @@ pub async fn run_bless(
     Ok(())
 }
 
+/// Derive a deterministic, stable ext4 filesystem UUID from an OCI manifest
+/// digest.
+///
+/// The manifest digest (`sha256:...`) is content-addressed: the same image
+/// content always resolves to the same digest, so hashing it yields the same
+/// UUID on every bless. We hash rather than slice the digest directly so the
+/// result is uniformly distributed over the 16-byte space, then stamp the
+/// RFC 4122 version (8 = custom) and variant bits so it is a well-formed UUID.
+fn deterministic_uuid(manifest_digest: &str) -> [u8; 16] {
+    let mut uuid = blake3_128(manifest_digest.as_bytes()).0;
+    uuid[6] = (uuid[6] & 0x0f) | 0x80; // version 8 (custom)
+    uuid[8] = (uuid[8] & 0x3f) | 0x80; // variant 1 (RFC 4122)
+    uuid
+}
+
 /// Bless an OCI image into a content-addressed base image.
 ///
 /// Pulls layers from the registry, converts to ext4, writes through
@@ -319,7 +334,12 @@ pub async fn run_bless_oci(
     ));
 
     // --- Pull + ingest OCI image ---
-    let uuid: [u8; 16] = rand::random();
+    // Derive the filesystem UUID deterministically from the resolved manifest
+    // digest so that blessing the same image (same content-addressed manifest)
+    // produces a byte-for-byte identical ext4 image every time. The UUID feeds
+    // the superblock and the directory hash seed, so a random UUID would make
+    // the whole pipeline non-reproducible.
+    let uuid = deterministic_uuid(&resolved.manifest_digest);
     let ingest_opts = IngestOptions {
         writer_options: vec![
             WriterOption::MaximumDiskSize(device_size as i64),
@@ -545,6 +565,31 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::ObjectStore;
+
+    #[test]
+    fn deterministic_uuid_is_stable_and_content_addressed() {
+        let digest = "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        // Same digest → same UUID, every time.
+        assert_eq!(deterministic_uuid(digest), deterministic_uuid(digest));
+
+        // Different digest → different UUID (no collision on a trivial change).
+        let other = "sha256:00000000000000000000000000000000000000000000000000000000deadbeef";
+        assert_ne!(deterministic_uuid(digest), deterministic_uuid(other));
+
+        // Well-formed RFC 4122 v8 UUID: version nibble = 8, variant top bits = 10.
+        let uuid = deterministic_uuid(digest);
+        assert_eq!(uuid[6] & 0xf0, 0x80, "version must be 8");
+        assert_eq!(uuid[8] & 0xc0, 0x80, "variant must be RFC 4122");
+
+        // No randomness leaked in: the value is a pure function of the digest,
+        // so it is reproducible across process runs (regression guard against
+        // reintroducing rand::random()).
+        assert_eq!(
+            deterministic_uuid("sha256:abc"),
+            deterministic_uuid("sha256:abc"),
+        );
+    }
 
     /// Helper: run the bless pipeline directly against an InMemory object store.
     async fn bless_bytes(

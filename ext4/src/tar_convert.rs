@@ -561,4 +561,108 @@ mod tests {
         let result = convert_oci_layers_to_ext4(&mut layers, output, &opts);
         assert!(result.is_ok());
     }
+
+    /// Build a representative multi-layer OCI image: base files, an override,
+    /// a nested directory, a whiteout, and an opaque whiteout. Returns fresh
+    /// tar bytes each call so repeated conversions never share mutable state.
+    fn representative_layers() -> Vec<Vec<u8>> {
+        let layer0 = build_tar_with_dirs(&[
+            TarEntry::Dir("etc/"),
+            TarEntry::File("etc/hostname", b"base-host"),
+            TarEntry::File("etc/passwd", b"root:x:0:0"),
+            TarEntry::Dir("var/"),
+            TarEntry::Dir("var/log/"),
+            TarEntry::File("var/log/old.log", b"stale"),
+            TarEntry::File("readme.txt", b"base readme"),
+        ]);
+        let layer1 = build_tar_with_dirs(&[
+            // Override a base file.
+            TarEntry::File("etc/hostname", b"top-host"),
+            // Delete a base file.
+            TarEntry::Whiteout("etc/.wh.passwd"),
+            // Opaque-whiteout the log dir, then add a new entry.
+            TarEntry::Dir("var/log/"),
+            TarEntry::Whiteout("var/log/.wh..wh..opq"),
+            TarEntry::File("var/log/new.log", b"fresh"),
+            // Add a brand new nested tree.
+            TarEntry::Dir("app/"),
+            TarEntry::File("app/main.bin", b"\x00\x01\x02\x03binary-ish\xff"),
+        ]);
+        vec![layer0, layer1]
+    }
+
+    /// Convert the representative layers with a fixed UUID and return the
+    /// resulting ext4 image bytes.
+    fn convert_with_fixed_uuid() -> Vec<u8> {
+        let raw = representative_layers();
+        let mut layers: Vec<Cursor<Vec<u8>>> = raw.into_iter().map(Cursor::new).collect();
+        let opts = ConvertOptions {
+            convert_backslash: false,
+            writer_options: vec![
+                WriterOption::MaximumDiskSize(64 * 1024 * 1024),
+                // Pinning the UUID is what makes the output reproducible: it
+                // seeds the superblock UUID and the directory hash seed.
+                WriterOption::Uuid([0x42u8; 16]),
+                WriterOption::Journal(1024),
+            ],
+        };
+        let output = Cursor::new(Vec::new());
+        convert_oci_layers_to_ext4(&mut layers, output, &opts)
+            .unwrap()
+            .into_inner()
+    }
+
+    /// The whole OCI→ext4 conversion must be byte-for-byte deterministic when
+    /// the writer options (including UUID) are fixed. This is the invariant the
+    /// `bless` pipeline relies on for content-addressed, reproducible images.
+    #[test]
+    fn test_conversion_is_byte_deterministic() {
+        let a = convert_with_fixed_uuid();
+        let b = convert_with_fixed_uuid();
+        let c = convert_with_fixed_uuid();
+
+        assert_eq!(a.len(), b.len(), "image length must be stable");
+        assert_eq!(a, b, "two conversions of the same input must be byte-identical");
+        assert_eq!(b, c, "conversion must be byte-identical across repeated runs");
+
+        // Sanity: the image actually contains the merged result, not an empty fs.
+        assert_eq!(read_file(&a, "/etc/hostname").unwrap(), b"top-host");
+        assert!(!path_exists(&a, "/etc/passwd"), "whiteout must delete passwd");
+        assert!(!path_exists(&a, "/var/log/old.log"), "opaque whiteout must drop old.log");
+        assert_eq!(read_file(&a, "/var/log/new.log").unwrap(), b"fresh");
+        assert_eq!(read_file(&a, "/app/main.bin").unwrap(), b"\x00\x01\x02\x03binary-ish\xff");
+    }
+
+    /// A different UUID must change the bytes (proving the UUID genuinely flows
+    /// into the image) while everything else stays fixed — so reproducibility
+    /// depends solely on pinning the UUID, which `bless` now derives
+    /// deterministically from the manifest digest.
+    #[test]
+    fn test_uuid_controls_output_bytes() {
+        let with_a = {
+            let raw = representative_layers();
+            let mut layers: Vec<Cursor<Vec<u8>>> = raw.into_iter().map(Cursor::new).collect();
+            let opts = ConvertOptions {
+                convert_backslash: false,
+                writer_options: vec![WriterOption::Uuid([0x11u8; 16])],
+            };
+            convert_oci_layers_to_ext4(&mut layers, Cursor::new(Vec::new()), &opts)
+                .unwrap()
+                .into_inner()
+        };
+        let with_b = {
+            let raw = representative_layers();
+            let mut layers: Vec<Cursor<Vec<u8>>> = raw.into_iter().map(Cursor::new).collect();
+            let opts = ConvertOptions {
+                convert_backslash: false,
+                writer_options: vec![WriterOption::Uuid([0x22u8; 16])],
+            };
+            convert_oci_layers_to_ext4(&mut layers, Cursor::new(Vec::new()), &opts)
+                .unwrap()
+                .into_inner()
+        };
+
+        assert_eq!(with_a.len(), with_b.len(), "only the UUID changed; layout is identical");
+        assert_ne!(with_a, with_b, "the UUID must actually flow into the image bytes");
+    }
 }
