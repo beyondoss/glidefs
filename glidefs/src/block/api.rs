@@ -1005,18 +1005,20 @@ where
                     );
                 }
 
-                // USER_COPY bounce pool: total acquires, fallbacks, and how
-                // many worker pools have been initialized. `exhaust_fallbacks`
-                // > 0 sustained means the pool is undersized for this
-                // workload's concurrent S3-await pattern and the structural
-                // RSS bound is being broken via the malloc fallback path.
+                // USER_COPY bounce pool diagnostics: total acquires, backpressure
+                // waits (transient exhaustion — pool full, futures park, RSS stays
+                // bounded), heap fallbacks (init OOM — pool couldn't be mmap'd, so
+                // the worker serves from elastic heap buffers and the RSS bound is
+                // broken until it recovers), and how many worker pools are live.
                 use std::sync::atomic::Ordering;
                 use crate::block::ublk::buffer_pool::{
-                    GLOBAL_ACQUIRES, GLOBAL_BACKPRESSURE_WAITS, GLOBAL_POOLS_INITIALIZED,
+                    GLOBAL_ACQUIRES, GLOBAL_BACKPRESSURE_WAITS, GLOBAL_HEAP_FALLBACKS,
+                    GLOBAL_POOLS_INITIALIZED,
                 };
                 let acq = GLOBAL_ACQUIRES.load(Ordering::Relaxed);
                 let waits = GLOBAL_BACKPRESSURE_WAITS.load(Ordering::Relaxed);
                 let pools = GLOBAL_POOLS_INITIALIZED.load(Ordering::Relaxed);
+                let heap_fallbacks = GLOBAL_HEAP_FALLBACKS.load(Ordering::Relaxed);
                 let _ = writeln!(
                     output,
                     "# HELP glidefs_ublk_buffer_pool_acquires_total USER_COPY bounce buffers acquired from per-worker pool"
@@ -1038,6 +1040,12 @@ where
                 );
                 let _ = writeln!(output, "# TYPE glidefs_ublk_buffer_pool_workers_initialized gauge");
                 let _ = writeln!(output, "glidefs_ublk_buffer_pool_workers_initialized {pools}");
+                let _ = writeln!(
+                    output,
+                    "# HELP glidefs_ublk_buffer_pool_heap_fallbacks_total USER_COPY I/Os served from a heap buffer because the worker's pool could not be mmap'd (host OOM at worker init). Daemon stays up but RSS is unbounded for that worker. Sustained growth means a worker is stuck degraded — investigate host memory."
+                );
+                let _ = writeln!(output, "# TYPE glidefs_ublk_buffer_pool_heap_fallbacks_total counter");
+                let _ = writeln!(output, "glidefs_ublk_buffer_pool_heap_fallbacks_total {heap_fallbacks}");
             }
             Response::builder()
                 .status(StatusCode::OK)

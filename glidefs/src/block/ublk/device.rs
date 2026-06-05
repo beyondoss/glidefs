@@ -2095,7 +2095,6 @@ async fn io_task_user_copy(
 ) -> Result<(), UblkError> {
     let cdev_fd = q.dev.tgt.fds[0];
     let qid = q.get_qid();
-    let pool = super::buffer_pool::worker_pool();
 
     // Initial fetch — no buffer attached, empty slice.
     q.submit_io_prep_cmd(tag, BufDesc::Slice(&[]), 0, None).await?;
@@ -2120,14 +2119,16 @@ async fn io_task_user_copy(
                 Box::pin(dispatch_cold(op, offset, length, fua, handler)).await
             }
             sys::UBLK_IO_OP_READ | sys::UBLK_IO_OP_WRITE => {
-                // Async-backpressure acquire: if pool is exhausted, this
-                // future parks until a slot is released. Pool size is a
-                // *true* ceiling on total bounce RSS — no malloc fallback,
-                // no possibility of breaking the structural bound under
-                // load. `backpressure_waits` metric exposes how often we
-                // parked, so pool undersizing is observable.
-                let mut slot = pool.acquire().await;
-                let buf: &mut [u8] = slot.as_mut_slice(length as usize);
+                // Acquire a bounce buffer for this I/O. Normal path: a slot
+                // from this worker's pool, parking on backpressure if all
+                // slots are momentarily in flight — pool size is a *true*
+                // ceiling on bounce RSS, and `backpressure_waits` exposes
+                // undersizing. Degraded path: if the pool couldn't be mmap'd
+                // (host OOM at worker init), this hands back a heap buffer so
+                // the daemon keeps serving instead of aborting; the worker
+                // upgrades back to the pool once memory recovers.
+                let mut iobuf = super::buffer_pool::acquire_io_buf(length as usize).await;
+                let buf: &mut [u8] = iobuf.as_mut_slice(length as usize);
 
                 if op == sys::UBLK_IO_OP_WRITE {
                     // Copy WRITE data out of the kernel cmd buffer into ours.
@@ -2176,10 +2177,11 @@ async fn io_task_user_copy(
                         res
                     }
                 }
-                // Slot drops here, releasing back to pool before the
-                // commit-and-fetch await — keeps pool buffers free for any
-                // other tag that wakes up first and triggers the FIFO
-                // waker for the oldest backpressure-parked future.
+                // `iobuf` drops here: a pool slot releases back to the pool
+                // before the commit-and-fetch await — keeping buffers free
+                // for another tag that wakes first and triggers the FIFO
+                // waker for the oldest backpressure-parked future — while a
+                // heap fallback buffer is simply freed.
             }
             _ => -libc::EINVAL,
         };
