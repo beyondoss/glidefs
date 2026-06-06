@@ -6,12 +6,12 @@ Built for microVM storage at [Beyond](https://beyond.dev).
 
 ## How It Works
 
-Guests see a standard block device (NBD or ublk). Writes go to local SSD immediately. A background scheduler packs dirty blocks, compresses with LZ4, and uploads to S3. Reads serve from local cache; misses pull from S3, verify BLAKE3 hashes, and cache locally.
+Guests see a standard block device (NBD or ublk). Writes go to local SSD immediately. A background scheduler packs dirty blocks, compresses them (zstd; codec is detected on read, so legacy LZ4 packs still read), and uploads to S3. Reads serve from local cache; misses pull from S3, verify BLAKE3 hashes, and cache locally.
 
 ```
 Write path:  Guest → NBD/ublk → local SSD pwrite() → return OK      ~5µs
 Read path:   Guest → NBD/ublk → local cache hit → return data       ~500µs
-             Guest → NBD/ublk → cache miss → S3 GET → LZ4 → verify → cache → return   50-300ms
+             Guest → NBD/ublk → cache miss → S3 GET → decompress → verify → cache → return   50-300ms
 ```
 
 ## Core Properties
@@ -461,7 +461,7 @@ At 1,000 blocks/sec with 128KB blocks: ~2% of one core for BLAKE3 hashing, ~128M
 
 ## Key Design Choices
 
-- **128KB blocks** match ZFS recordsize. Each flush creates one LZ4-compressed pack per modified 128MiB chunk.
+- **128KB blocks** match ZFS recordsize. Each flush creates one compressed pack (zstd by default) per modified 128MiB chunk.
 - **BLAKE3-128 hashing** for content addressing and integrity verification. Truncated from 256-bit; 128-bit collision resistance is sufficient for dedup.
 - **Lock-free write path** using `pread`/`pwrite`, atomic block map with CAS, and monotonic sequence numbers.
 - **Typestate pattern** enforces valid lifecycle transitions at compile time. Can't write to a recovering cache.
