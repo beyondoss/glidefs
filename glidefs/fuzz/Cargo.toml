@@ -78,8 +78,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_lz4_decompress"
-path = "fuzz_targets/fuzz_lz4_decompress.rs"
+name = "fuzz_decompress_block"
+path = "fuzz_targets/fuzz_decompress_block.rs"
 test = false
 doc = false
 bench = false

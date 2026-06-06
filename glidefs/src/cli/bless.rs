@@ -72,7 +72,7 @@ pub async fn run_bless(
 
     // --- Stream image: read blocks, upload each chunk as it completes ---
     let (volume_manifest, hot_set_indices, stats) =
-        store_ext4_stream(&content_store, file, device_size).await?;
+        store_ext4_stream(&content_store, file, device_size, crate::block::block_map::COMPRESSION_BLESS).await?;
 
     // --- Upload manifest ---
     let manifest_key = format!("bases/{}", name);
@@ -198,6 +198,8 @@ pub async fn run_bless_oci(
     };
 
     let cache = Arc::new(WriteCache::open_fresh_active(cache_config)?);
+    // Bless is offline + write-once/read-many: use the highest zstd level.
+    cache.set_compression_level(crate::block::block_map::COMPRESSION_BLESS);
 
     let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
         device_size, BLOCK_SIZE,
@@ -502,7 +504,7 @@ mod tests {
         ));
 
         let (volume_manifest, hot_set_indices, stats) =
-            store_ext4_stream(&content_store, std::io::Cursor::new(image_data.to_vec()), device_size)
+            store_ext4_stream(&content_store, std::io::Cursor::new(image_data.to_vec()), device_size, crate::block::block_map::COMPRESSION_BLESS)
                 .await?;
 
         content_store

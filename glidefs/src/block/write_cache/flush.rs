@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, lz4_compress};
+use crate::block::block_map::{Blake3Hash, SparseBlockState, blake3_128, compress_block};
 use crate::block::cache::BlockCache;
 use crate::block::content_store::ContentStore;
 use crate::block::state::{Active, Draining};
@@ -72,6 +72,9 @@ fn compute_flush_batch(
 
     let block_size = inner.config.block_size;
     let device_size = inner.config.device_size;
+    // Codec/level for new packs (read once; the rayon closure captures the Copy
+    // i32 rather than reaching into `inner`). LZ4 by default; production sets zstd.
+    let compression_level = inner.compression_level.load(Ordering::Relaxed);
 
     // Snap the flushing file Arc before entering rayon so workers share it
     // lock-free. Without this, every rayon thread serializes on the Mutex
@@ -153,7 +156,7 @@ fn compute_flush_batch(
 
                 let hash = blake3_128(&chunk_buf);
 
-                let compressed = Some(Bytes::from(lz4_compress(&chunk_buf[..])));
+                let compressed = Some(Bytes::from(compress_block(&chunk_buf[..], compression_level)));
 
                 // Warm clean_cache
                 if let Some(ref cache) = clean_cache {
@@ -244,6 +247,17 @@ fn drain_page_crcs(inner: &CacheInner) -> HashMap<usize, Box<[u32]>> {
 }
 
 impl WriteCache<Active> {
+    /// Set the block compression level/codec used by the flush path.
+    /// `block_map::COMPRESSION_LZ4` selects legacy LZ4; any other value selects
+    /// zstd at that level. Set once after open, before any flush (runtime
+    /// exports use a low zstd level, bless uses a high one). The read path
+    /// always auto-detects, so this only affects newly written packs.
+    pub fn set_compression_level(&self, level: i32) {
+        self.inner
+            .compression_level
+            .store(level, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Flush the local cache file and WAL to durable storage.
     ///
     /// Syncs both the data file and the WAL so that all dirty block metadata

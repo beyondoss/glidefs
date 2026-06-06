@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::block::block_map::{Blake3Hash, SequenceNumber, SparseBlockState, SparseStateMap};
@@ -359,6 +359,14 @@ impl PromoteClaimBitmap {
 pub(crate) struct CacheInner {
     /// Configuration
     pub(super) config: WriteCacheConfig,
+
+    /// Block compression level used by the flush path. `COMPRESSION_LZ4`
+    /// selects legacy LZ4; any other value selects zstd at that level. Defaults
+    /// to zstd-1 (or `GLIDEFS_COMPRESSION_LEVEL`); bless overrides to zstd-19 via
+    /// `WriteCache::set_compression_level`. The read path always auto-detects,
+    /// so legacy LZ4 packs stay readable regardless of this.
+    /// Atomic so it can be set post-construction; set once before any flush.
+    pub(super) compression_level: AtomicI32,
 
     /// Local cache file (data).
     /// Uses positional I/O (pread/pwrite) which is thread-safe. RwLock is

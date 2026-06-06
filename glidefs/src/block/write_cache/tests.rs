@@ -3040,3 +3040,68 @@ async fn test_cross_flush_dedup_cold_read_from_s3() {
     let data = h.read(0, 128 * 1024).await;
     assert!(data.iter().all(|&b| b == 0x42), "cold read from S3 after dedup must return correct data");
 }
+
+/// End-to-end zstd: the production flush path compresses with zstd, uploads to
+/// S3, the block is evicted, and a cold read resolves pack-index → S3 →
+/// `decompress_block`. Asserts BOTH that the stored pack is actually zstd-framed
+/// (codec really switched, not silently LZ4) and that the bytes round-trip.
+/// Existing flush/read tests run at the default LZ4 level, so this is the only
+/// coverage of the real zstd write→read cycle.
+#[tokio::test]
+async fn test_zstd_flush_and_cold_read_from_s3() {
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+    // Pack data begins right after the 16-byte GLPK header, so byte 16 is the
+    // first block's compressed frame.
+    const PACK_HEADER_SIZE: u32 = 16;
+
+    for level in [1i32, 3, 19] {
+        let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+        h.cache.set_compression_level(level);
+
+        // Compressible, level-distinct content.
+        let mut block = vec![0u8; 128 * 1024];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = ((i / 512) as u8).wrapping_add(level as u8);
+        }
+        h.cache.write(0, &block).unwrap();
+        let s = h.flush().await;
+        assert!(s.packs_uploaded > 0, "level {level}: pack uploaded");
+
+        // Prove the stored pack's first block frame is ACTUALLY zstd.
+        let pack_id = h.manifest().chunk_pack_ids(0).expect("chunk 0 has packs")[0];
+        let frame = h
+            .content_store
+            .get_chunk_block(0, pack_id, PACK_HEADER_SIZE, 4)
+            .await
+            .unwrap();
+        assert_eq!(&frame[..], &ZSTD_MAGIC, "level {level}: stored pack must be zstd-framed");
+
+        // Evicted after flush → cold read: pack-index → S3 → decompress_block.
+        let data = h.read(0, 128 * 1024).await;
+        assert_eq!(&data[..], &block[..], "level {level}: cold zstd read-back mismatch");
+    }
+}
+
+/// Mixed-codec across flushes: a chunk written as LZ4 (legacy), then more blocks
+/// appended as zstd, must read back correctly for both — the real migration
+/// scenario where old LZ4 packs and new zstd packs coexist for one volume.
+#[tokio::test]
+async fn test_mixed_codec_across_flushes_cold_read() {
+    let h = V2Harness::with_config(128 * 1024 * 4, 128 * 1024).await;
+
+    // Flush block 0 as legacy LZ4.
+    h.cache.set_compression_level(crate::block::block_map::COMPRESSION_LZ4);
+    let b0 = vec![0xAB; 128 * 1024];
+    h.cache.write(0, &b0).unwrap();
+    assert!(h.flush().await.packs_uploaded > 0);
+
+    // Switch codec and flush block 1 as zstd (simulates a post-upgrade write).
+    h.cache.set_compression_level(19);
+    let b1 = vec![0xCD; 128 * 1024];
+    h.cache.write(128 * 1024, &b1).unwrap();
+    assert!(h.flush().await.packs_uploaded > 0);
+
+    // Both cold-read correctly via per-block codec auto-detection.
+    assert_eq!(&h.read(0, 128 * 1024).await[..], &b0[..], "legacy LZ4 block");
+    assert_eq!(&h.read(128 * 1024, 128 * 1024).await[..], &b1[..], "zstd block");
+}

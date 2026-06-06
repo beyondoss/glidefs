@@ -876,7 +876,7 @@ impl WriteCache<Active> {
         pack_offset: u32,
         comp_length: u32,
     ) -> Result<Bytes, CacheError> {
-        use crate::block::block_map::{blake3_128, lz4_decompress};
+        use crate::block::block_map::{blake3_128, decompress_block};
 
         let fetch_start = std::time::Instant::now();
         let compressed = match content_store
@@ -892,7 +892,7 @@ impl WriteCache<Active> {
             }
         };
 
-        let decompressed = lz4_decompress(&compressed)
+        let decompressed = decompress_block(&compressed)
             .map_err(|e| CacheError::DecompressFailed(e.to_string()))?;
 
         let actual_hash = blake3_128(&decompressed);
@@ -926,7 +926,7 @@ impl WriteCache<Active> {
         clean_cache: &dyn BlockCache,
         metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<HashMap<usize, Bytes>, CacheError> {
-        use crate::block::block_map::{blake3_128, lz4_decompress};
+        use crate::block::block_map::{blake3_128, decompress_block};
 
         if entries.is_empty() {
             return Ok(HashMap::new());
@@ -985,7 +985,7 @@ impl WriteCache<Active> {
                             m.record_s3_read(compressed.len() as u64);
                             m.record_s3_fetch_latency(fetch_start.elapsed());
                         }
-                        let decompressed = lz4_decompress(&compressed)
+                        let decompressed = decompress_block(&compressed)
                             .map_err(|e| CacheError::DecompressFailed(e.to_string()))?;
                         let actual_hash = blake3_128(&decompressed);
                         if actual_hash != expected_hash {
@@ -1030,7 +1030,7 @@ impl WriteCache<Active> {
                     let local_end = local_start + comp_len as usize;
                     let compressed = coalesced.slice(local_start..local_end);
 
-                    let decompressed = lz4_decompress(&compressed)
+                    let decompressed = decompress_block(&compressed)
                         .map_err(|e| CacheError::DecompressFailed(e.to_string()))?;
 
                     let actual_hash = blake3_128(&decompressed);

@@ -771,6 +771,99 @@ pub fn lz4_decompress(
 }
 
 // ============================================================================
+// Codec-agnostic block compression (LZ4 legacy + zstd)
+// ============================================================================
+//
+// New packs are written with zstd; existing LZ4 packs stay readable forever.
+// The codec is detected on read by sniffing the zstd frame magic — no on-disk
+// format change, and per-block self-describing frames survive compaction (which
+// reuses each block's original compressed bytes when merging packs).
+
+/// First 4 bytes of every zstd frame (RFC 8878). An `lz4_compress` block can
+/// never collide: it begins with a u32-LE uncompressed size ≤ 2 MiB, so its
+/// byte[3] is always `0x00`, whereas zstd requires `0xFD`.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Cap on decompressed block size — guards against an adversarial/corrupt frame
+/// claiming a huge size and OOMing the process (matches the LZ4 path's bound).
+const MAX_DECOMPRESSED_SIZE: usize = 2 * 1024 * 1024;
+
+/// Sentinel `compression_level` selecting the legacy LZ4 codec on write. Any
+/// other value selects zstd at that level. The read path always auto-detects,
+/// so this only governs what new packs are written as.
+pub const COMPRESSION_LZ4: i32 = 0;
+
+/// Default zstd level for runtime volume flushes. Level 1 compresses at roughly
+/// LZ4 speed (near cost-neutral on guest-serving hosts) while still ~23% smaller.
+pub const COMPRESSION_RUNTIME_DEFAULT: i32 = 1;
+
+/// zstd level for bless (offline, write-once/read-many). Highest ratio (~37%
+/// smaller than LZ4); slow to compress but bless is offline and decode speed is
+/// ~level-independent, so the most-read data pays only at build time.
+pub const COMPRESSION_BLESS: i32 = 19;
+
+/// Default compression level applied to a freshly-opened cache. zstd-1 unless
+/// overridden by the `GLIDEFS_COMPRESSION_LEVEL` env var (set it to `0` to pin
+/// legacy LZ4, or e.g. `19` for max ratio). zstd is the system default so a
+/// cache-open path that forgets to choose still gets compression rather than
+/// silently falling back to LZ4. bless still overrides to `COMPRESSION_BLESS`.
+pub fn env_default_compression_level() -> i32 {
+    std::env::var("GLIDEFS_COMPRESSION_LEVEL")
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(COMPRESSION_RUNTIME_DEFAULT)
+}
+
+/// Error from `decompress_block`, preserving which codec failed.
+#[derive(Debug)]
+pub enum CompressError {
+    Lz4(lz4_flex::block::DecompressError),
+    Zstd(std::io::Error),
+}
+
+impl std::fmt::Display for CompressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompressError::Lz4(e) => write!(f, "lz4 decompress: {e}"),
+            CompressError::Zstd(e) => write!(f, "zstd decompress: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CompressError {}
+
+/// Compress with zstd at `level`. zstd's bulk compressor only errors on OOM or
+/// internal failure, neither of which is recoverable here.
+#[inline]
+pub fn zstd_compress(data: &[u8], level: i32) -> Vec<u8> {
+    zstd::bulk::compress(data, level).expect("zstd bulk compress (fails only on OOM)")
+}
+
+/// Compress a block with the codec selected by `level`: `COMPRESSION_LZ4`
+/// selects legacy LZ4, any other value selects zstd at that level. Used by all
+/// production write paths (flush, ext4 ingest).
+#[inline]
+pub fn compress_block(data: &[u8], level: i32) -> Vec<u8> {
+    if level == COMPRESSION_LZ4 {
+        lz4_compress(data)
+    } else {
+        zstd_compress(data, level)
+    }
+}
+
+/// Decompress a block, auto-detecting LZ4 vs zstd by frame magic. Used by all
+/// production read paths so mixed-codec packs (during/after migration) read
+/// transparently. Output is capped at `MAX_DECOMPRESSED_SIZE`.
+#[inline]
+pub fn decompress_block(compressed: &[u8]) -> Result<Vec<u8>, CompressError> {
+    if compressed.len() >= 4 && compressed[..4] == ZSTD_MAGIC {
+        zstd::bulk::decompress(compressed, MAX_DECOMPRESSED_SIZE).map_err(CompressError::Zstd)
+    } else {
+        lz4_decompress(compressed).map_err(CompressError::Lz4)
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -905,6 +998,58 @@ mod tests {
         let compressed = lz4_compress(&data);
         let decompressed = lz4_decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    #[test]
+    fn test_zstd_roundtrip() {
+        let mut data = vec![0u8; 131072];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        for level in [1, 3, 19] {
+            let c = compress_block(&data, level);
+            assert!(c.len() < data.len(), "zstd-{level} should shrink");
+            assert_eq!(decompress_block(&c).unwrap(), data, "zstd-{level} roundtrip");
+        }
+    }
+
+    #[test]
+    fn test_codec_autodetect_reads_both() {
+        // The read path must transparently handle LZ4 (legacy) and zstd (new),
+        // detecting the codec from the frame — this is what keeps old packs
+        // readable after the compressor swap.
+        let data: Vec<u8> = (0u32..70000)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+
+        let lz4 = compress_block(&data, COMPRESSION_LZ4);
+        let zstd = compress_block(&data, 3);
+
+        // zstd frames carry the magic; LZ4 size-prefix never does (byte[3]==0).
+        assert_eq!(&zstd[..4], &ZSTD_MAGIC);
+        assert_ne!(&lz4[..4], &ZSTD_MAGIC);
+        assert_eq!(lz4[3], 0, "LZ4 size-prefix high byte is 0, never 0xFD");
+
+        assert_eq!(decompress_block(&lz4).unwrap(), data, "auto-detect LZ4");
+        assert_eq!(decompress_block(&zstd).unwrap(), data, "auto-detect zstd");
+    }
+
+    #[test]
+    fn test_decompress_block_reads_legacy_lz4_helper() {
+        // A block written by the pre-swap `lz4_compress` must still decode.
+        let data = b"legacy pack written before the zstd swap";
+        let legacy = lz4_compress(data);
+        assert_eq!(decompress_block(&legacy).unwrap(), data);
+    }
+
+    #[test]
+    fn test_legacy_lz4_decompress_rejects_zstd_frame() {
+        // Documents the single-shot rollback floor: a pre-swap binary calling
+        // the raw LZ4 decompressor on a new zstd pack must FAIL cleanly (the
+        // zstd magic's high byte 0xFD reads as a >2MiB claimed size → guard
+        // trips), never silently return wrong bytes.
+        let zstd = compress_block(b"written after the swap", 3);
+        assert!(lz4_decompress(&zstd).is_err(), "old LZ4 path must reject a zstd frame, not corrupt");
     }
 
     // ========================================================================
