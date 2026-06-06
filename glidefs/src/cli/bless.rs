@@ -460,7 +460,7 @@ pub async fn run_bless_oci_layered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::block_map::{blake3_128, lz4_decompress};
+    use crate::block::block_map::{blake3_128, decompress_block};
     use crate::block::pack::{extract_block, lookup_block_in_index, parse_pack_index, PackId};
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
@@ -604,7 +604,7 @@ mod tests {
             // Extract and decompress the block from pack
             let compressed =
                 extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
-            let decompressed = lz4_decompress(compressed).unwrap();
+            let decompressed = decompress_block(compressed).unwrap();
 
             assert_eq!(blake3_128(&decompressed), entry.hash);
             assert_eq!(&decompressed[..], original_block);
@@ -799,7 +799,7 @@ mod tests {
                             pie.comp_length,
                         )
                         .unwrap();
-                        let decompressed = lz4_decompress(compressed).unwrap();
+                        let decompressed = decompress_block(compressed).unwrap();
                         assert_eq!(
                             &decompressed[..],
                             original_block,
@@ -843,7 +843,7 @@ mod tests {
 
             let compressed =
                 extract_block(&pack_bytes, pack_offset, comp_length).unwrap();
-            let decompressed = lz4_decompress(compressed).unwrap();
+            let decompressed = decompress_block(compressed).unwrap();
 
             assert_eq!(blake3_128(&decompressed), hash);
             let expected = vec![(offset + 1) as u8; BLOCK_SIZE as usize];
