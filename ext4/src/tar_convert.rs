@@ -14,6 +14,8 @@ use crate::writer::{File, Writer, WriterOption};
 
 const WHITEOUT_PREFIX: &str = ".wh.";
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
+/// overlayfs marks an opaque directory with this xattr (value `"y"`).
+const OVERLAY_OPAQUE_XATTR: &str = "trusted.overlay.opaque";
 
 /// Options for tar-to-ext4 conversion.
 #[derive(Default)]
@@ -88,6 +90,123 @@ where
     fs.close()
 }
 
+/// Convert a single OCI layer into an ext4 image that is a valid **overlayfs
+/// lower layer** — i.e. layers *survive* instead of being flattened.
+///
+/// Unlike [`convert_oci_layers_to_ext4`], this does not merge or drop deletion
+/// markers. Instead it translates OCI whiteouts to the on-disk form overlayfs
+/// understands, so the resulting images can be stacked at runtime:
+///   - `.wh.<name>`        → a character device `0,0` at `<dir>/<name>`
+///   - `.wh..wh..opq`      → `trusted.overlay.opaque=y` xattr on `<dir>`
+///
+/// The output is deterministic for a fixed UUID, so the same layer (addressed
+/// by its digest) always yields byte-identical ext4 — which is what makes
+/// shared layers dedup across images.
+///
+/// `layer` must be a seekable decompressed tar stream (two passes: one to find
+/// opaque directories, one to write).
+pub fn convert_layer_to_ext4<R, W>(
+    mut layer: R,
+    output: W,
+    options: &ConvertOptions,
+) -> io::Result<W>
+where
+    R: Read + Seek,
+    W: Read + Write + Seek,
+{
+    // Pass 1: find directories marked opaque so we can stamp the xattr when we
+    // write the directory entry (the writer is forward-only — xattrs must be set
+    // at create() time).
+    let opaque_dirs = scan_opaque_dirs(&mut layer, options)?;
+    layer.seek(SeekFrom::Start(0))?;
+
+    let mut opaque_xattr = BTreeMap::new();
+    opaque_xattr.insert(OVERLAY_OPAQUE_XATTR.to_string(), b"y".to_vec());
+    let empty_xattrs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+
+    let mut fs = Writer::new(output, &options.writer_options);
+    let mut seen_dirs: HashSet<String> = HashSet::new();
+
+    let mut archive = tar::Archive::new(&mut layer);
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        let (name, link_name) = extract_names(entry.header(), options)?;
+        let normalized = name.trim_end_matches('/').to_string();
+
+        if let Some((dir, file)) = split_dir_file(&name) {
+            // Opaque marker: handled via the directory's xattr, not as a file.
+            if file == OPAQUE_WHITEOUT {
+                continue;
+            }
+            // Plain whiteout: emit an overlayfs char-device deletion marker.
+            if let Some(stripped) = file.strip_prefix(WHITEOUT_PREFIX) {
+                let target = if dir.is_empty() {
+                    stripped.to_string()
+                } else {
+                    format!("{dir}{stripped}")
+                };
+                fs.make_parents(&target)?;
+                let whiteout = File {
+                    mode: format::S_IFCHR, // rdev 0,0 (devmajor/devminor default to 0)
+                    ..Default::default()
+                };
+                fs.create(&target, &whiteout)?;
+                continue;
+            }
+        }
+
+        fs.make_parents(&name)?;
+        let is_dir = entry.header().entry_type() == tar::EntryType::Directory;
+        let extra = if is_dir && opaque_dirs.contains(&normalized) {
+            &opaque_xattr
+        } else {
+            &empty_xattrs
+        };
+        write_tar_entry_inner(&mut fs, &mut entry, &name, &link_name, extra)?;
+        if is_dir {
+            seen_dirs.insert(normalized);
+        }
+    }
+
+    // Opaque directories that had no explicit entry in the tar: synthesize them
+    // so the opaque xattr is recorded. `create()` treats caller xattrs as
+    // authoritative, so this also fixes up dirs auto-created by make_parents.
+    for dir in &opaque_dirs {
+        if seen_dirs.contains(dir) {
+            continue;
+        }
+        fs.make_parents(dir)?;
+        let f = File {
+            mode: format::S_IFDIR | 0o755,
+            xattrs: opaque_xattr.clone(),
+            ..Default::default()
+        };
+        fs.create(dir, &f)?;
+    }
+
+    fs.close()
+}
+
+/// Scan a single layer tar for directories carrying an opaque whiteout.
+fn scan_opaque_dirs<R: Read + Seek>(
+    layer: &mut R,
+    options: &ConvertOptions,
+) -> io::Result<HashSet<String>> {
+    let mut opaque = HashSet::new();
+    layer.seek(SeekFrom::Start(0))?;
+    let mut archive = tar::Archive::new(layer);
+    for entry_result in archive.entries()? {
+        let entry = entry_result?;
+        let (name, _) = extract_names(entry.header(), options)?;
+        if let Some((dir, file)) = split_dir_file(&name)
+            && file == OPAQUE_WHITEOUT
+        {
+            opaque.insert(dir.trim_end_matches('/').to_string());
+        }
+    }
+    Ok(opaque)
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -132,6 +251,18 @@ fn write_tar_entry_with_pax<R: Read, W: Read + Write + Seek>(
     name: &str,
     link_name: &str,
 ) -> io::Result<()> {
+    write_tar_entry_inner(fs, entry, name, link_name, &BTreeMap::new())
+}
+
+/// Write a tar entry, merging `extra_xattrs` on top of any PAX xattrs (used to
+/// stamp `trusted.overlay.opaque` on opaque directories).
+fn write_tar_entry_inner<R: Read, W: Read + Write + Seek>(
+    fs: &mut Writer<W>,
+    entry: &mut tar::Entry<'_, R>,
+    name: &str,
+    link_name: &str,
+    extra_xattrs: &BTreeMap<String, Vec<u8>>,
+) -> io::Result<()> {
     let header = entry.header().clone();
     let entry_type = header.entry_type();
 
@@ -175,6 +306,9 @@ fn write_tar_entry_with_pax<R: Read, W: Read + Write + Seek>(
                 xattrs.insert(attr_name.to_string(), ext.value_bytes().to_vec());
             }
         }
+    }
+    for (k, v) in extra_xattrs {
+        xattrs.insert(k.clone(), v.clone());
     }
 
     let fs_mtime = mtime & 0x3ffffffff;
@@ -631,6 +765,71 @@ mod tests {
         assert!(!path_exists(&a, "/var/log/old.log"), "opaque whiteout must drop old.log");
         assert_eq!(read_file(&a, "/var/log/new.log").unwrap(), b"fresh");
         assert_eq!(read_file(&a, "/app/main.bin").unwrap(), b"\x00\x01\x02\x03binary-ish\xff");
+    }
+
+    /// Overlay-preserving single-layer conversion must keep deletion markers in
+    /// the on-disk form overlayfs understands: char-device `0,0` for `.wh.<f>`
+    /// and `trusted.overlay.opaque=y` for `.wh..wh..opq`.
+    #[test]
+    fn test_layer_overlay_whiteout_and_opaque() {
+        let layer = build_tar_with_dirs(&[
+            TarEntry::Dir("etc/"),
+            TarEntry::File("etc/keep", b"k"),
+            TarEntry::Whiteout("etc/.wh.removed"),
+            TarEntry::Dir("opq/"),
+            TarEntry::Whiteout("opq/.wh..wh..opq"),
+            TarEntry::File("opq/new", b"n"),
+        ]);
+        let opts = ConvertOptions {
+            convert_backslash: false,
+            writer_options: vec![WriterOption::Uuid([0x42u8; 16]), WriterOption::Journal(1024)],
+        };
+        let image = convert_layer_to_ext4(Cursor::new(layer), Cursor::new(Vec::new()), &opts)
+            .unwrap()
+            .into_inner();
+
+        let mut reader = crate::reader::Reader::new(Cursor::new(&image)).unwrap();
+        let entries = reader.walk().unwrap();
+        let by = |p: &str| entries.iter().find(|e| e.path == p);
+
+        assert!(by("etc/keep").is_some(), "normal file preserved");
+        let wh = by("etc/removed").expect("whiteout present as a node");
+        assert_eq!(wh.mode & format::TYPE_MASK, format::S_IFCHR, "whiteout is a char device");
+        assert_eq!((wh.devmajor, wh.devminor), (0, 0), "whiteout rdev is 0,0");
+        let opq = by("opq").expect("opaque dir present");
+        assert_eq!(
+            opq.xattrs.get(OVERLAY_OPAQUE_XATTR).map(Vec::as_slice),
+            Some(b"y".as_slice()),
+            "opaque dir carries trusted.overlay.opaque=y",
+        );
+        // The whiteout marker itself must not survive as a regular file.
+        assert!(by("etc/.wh.removed").is_none());
+        assert!(by("opq/.wh..wh..opq").is_none());
+    }
+
+    /// Single-layer overlay conversion is byte-deterministic for a fixed UUID —
+    /// the property that lets a shared layer dedup across images.
+    #[test]
+    fn test_layer_overlay_is_byte_deterministic() {
+        let opts = ConvertOptions {
+            convert_backslash: false,
+            writer_options: vec![
+                WriterOption::MaximumDiskSize(64 * 1024 * 1024),
+                WriterOption::Uuid([0x7u8; 16]),
+                WriterOption::Journal(1024),
+            ],
+        };
+        let make = || {
+            let layer = build_tar_with_dirs(&[
+                TarEntry::Dir("a/"),
+                TarEntry::File("a/f", b"contents"),
+                TarEntry::Whiteout("a/.wh.gone"),
+            ]);
+            convert_layer_to_ext4(Cursor::new(layer), Cursor::new(Vec::new()), &opts)
+                .unwrap()
+                .into_inner()
+        };
+        assert_eq!(make(), make(), "same layer + same UUID must be byte-identical");
     }
 
     /// A different UUID must change the bytes (proving the UUID genuinely flows

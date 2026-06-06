@@ -1,33 +1,30 @@
 #![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-use bytes::Bytes;
-use crate::block::block_map::{blake3_128, lz4_compress, shared_zero_block, Blake3Hash};
 use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
 use crate::block::content_store::ContentStore;
 use crate::block::handler::BlockHandler;
 use crate::block::manifest::serialize_hot_set;
 use crate::block::metrics::ExportMetrics;
-use crate::block::pack::{content_pack_id, PackId, DEFAULT_FLUSH_THRESHOLD};
+use crate::block::pack::DEFAULT_FLUSH_THRESHOLD;
 use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::{WriteCache, WriteCacheConfig};
 use crate::config::Settings;
+use crate::oci::ext4_store::{deterministic_uuid, store_ext4_stream, BLOCK_SIZE};
 use crate::oci::ingest::IngestOptions;
-use crate::oci::pull::pull_image;
+use crate::oci::layer_store::{
+    ensure_layer_stored, put_image_descriptor, ImageDescriptor,
+};
+use crate::oci::pull::{pull_image, pull_layer_to_tempfile};
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use ext4::writer::WriterOption;
 use oci_registry::{Credentials, RegistryClient};
-use std::collections::HashMap;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::sync::Notify;
 use tracing::info;
-
-/// Fixed block size for the chunked architecture: 128KB.
-const BLOCK_SIZE: u32 = 131_072;
 
 pub async fn run_bless(
     image_path: PathBuf,
@@ -66,92 +63,16 @@ pub async fn run_bless(
     info!(image = %image_path.display(), name = %name, "starting bless");
 
     // --- Read image ---
-    let mut file = std::fs::File::open(&image_path)
+    let file = std::fs::File::open(&image_path)
         .with_context(|| format!("Failed to open image {}", image_path.display()))?;
     let device_size = file.metadata()?.len();
-
-    let volume_manifest_template = VolumeManifest::new(device_size, BLOCK_SIZE);
-    let blocks_per_chunk = volume_manifest_template.blocks_per_chunk();
     let total_blocks = device_size.div_ceil(u64::from(BLOCK_SIZE)) as usize;
 
-    info!(device_size, total_blocks, blocks_per_chunk, "reading image");
+    info!(device_size, total_blocks, "reading image");
 
     // --- Stream image: read blocks, upload each chunk as it completes ---
-    let (_, zero_hash) = shared_zero_block(BLOCK_SIZE as usize);
-    let mut buf = vec![0u8; BLOCK_SIZE as usize];
-
-    let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
-    let mut stats = BlessStats::default();
-    let mut hot_set_indices: Vec<u64> = Vec::new();
-
-    // Current chunk accumulator — flushed when we move to the next chunk.
-    let mut pending_chunk: Option<(u32, Vec<BlockInfo>)> = None;
-    // In-flight S3 upload — overlaps with reading the next chunk.
-    let mut in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>> = None;
-
-    for block_index in 0..total_blocks {
-        let bytes_read = read_full(&mut file, &mut buf)?;
-        if bytes_read < BLOCK_SIZE as usize {
-            buf[bytes_read..].fill(0);
-        }
-
-        let hash = blake3_128(&buf);
-
-        // Skip zero blocks entirely
-        if hash == zero_hash {
-            stats.zero_blocks += 1;
-            continue;
-        }
-
-        // Record non-zero block index for hot set (prefetch at boot)
-        hot_set_indices.push(block_index as u64);
-
-        let chunk_idx = volume_manifest_template.chunk_idx_for_block(block_index as u64);
-        let block_offset = volume_manifest_template.block_offset_in_chunk(block_index as u64);
-
-        stats.unique_blocks += 1;
-
-        let compressed = Bytes::from(lz4_compress(&buf));
-
-        // If we've moved to a new chunk, prepare and upload the previous one.
-        if pending_chunk.as_ref().is_some_and(|(idx, _)| *idx != chunk_idx) {
-            let (completed_idx, blocks) = pending_chunk.take().unwrap();
-            in_flight = start_chunk_upload(
-                &content_store,
-                &mut volume_manifest,
-                &mut stats,
-                in_flight,
-                completed_idx,
-                blocks,
-            )
-            .await?;
-        }
-
-        pending_chunk
-            .get_or_insert_with(|| (chunk_idx, Vec::new()))
-            .1
-            .push(BlockInfo {
-                block_offset,
-                hash,
-                compressed,
-            });
-    }
-
-    // Flush the final chunk.
-    if let Some((chunk_idx, blocks)) = pending_chunk.take() {
-        in_flight = start_chunk_upload(
-            &content_store,
-            &mut volume_manifest,
-            &mut stats,
-            in_flight,
-            chunk_idx,
-            blocks,
-        )
-        .await?;
-    }
-
-    // Wait for last upload.
-    join_upload(&mut volume_manifest, &mut stats, in_flight).await?;
+    let (volume_manifest, hot_set_indices, stats) =
+        store_ext4_stream(&content_store, file, device_size).await?;
 
     // --- Upload manifest ---
     let manifest_key = format!("bases/{}", name);
@@ -196,21 +117,6 @@ pub async fn run_bless(
     println!("  Manifest:        manifests/{}", manifest_key);
 
     Ok(())
-}
-
-/// Derive a deterministic, stable ext4 filesystem UUID from an OCI manifest
-/// digest.
-///
-/// The manifest digest (`sha256:...`) is content-addressed: the same image
-/// content always resolves to the same digest, so hashing it yields the same
-/// UUID on every bless. We hash rather than slice the digest directly so the
-/// result is uniformly distributed over the 16-byte space, then stamp the
-/// RFC 4122 version (8 = custom) and variant bits so it is a well-formed UUID.
-fn deterministic_uuid(manifest_digest: &str) -> [u8; 16] {
-    let mut uuid = blake3_128(manifest_digest.as_bytes()).0;
-    uuid[6] = (uuid[6] & 0x0f) | 0x80; // version 8 (custom)
-    uuid[8] = (uuid[8] & 0x3f) | 0x80; // variant 1 (RFC 4122)
-    uuid
 }
 
 /// Bless an OCI image into a content-addressed base image.
@@ -446,121 +352,104 @@ pub async fn run_bless_oci(
     Ok(())
 }
 
-/// Result of a completed chunk upload.
-struct ChunkUploadResult {
-    chunk_idx: u32,
-    pack_id: PackId,
-    pack_size: u64,
-}
-
-/// Join the previous in-flight upload (if any) and apply its results.
-async fn join_upload(
-    volume_manifest: &mut VolumeManifest,
-    stats: &mut BlessStats,
-    in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>,
-) -> Result<()> {
-    if let Some(handle) = in_flight {
-        let result = handle.await.context("upload task panicked")??;
-        volume_manifest.append_pack(result.chunk_idx, result.pack_id);
-        stats.packs_uploaded += 1;
-        stats.bytes_uploaded += result.pack_size;
-        stats.chunks_written += 1;
-    }
-    Ok(())
-}
-
-/// Dedup + assemble pack (CPU), then spawn S3 upload overlapped with next chunk's reads.
+/// Bless an OCI image as **content-addressed layers** (layers survive).
 ///
-/// Joins the previous in-flight upload before spawning a new one, so at most
-/// one upload is in flight at a time.
-async fn start_chunk_upload(
-    content_store: &Arc<ContentStore>,
-    volume_manifest: &mut VolumeManifest,
-    stats: &mut BlessStats,
-    prev_in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>,
-    chunk_idx: u32,
-    blocks: Vec<BlockInfo>,
-) -> Result<Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>>> {
-    // Share compressed Bytes across duplicate hashes (avoids redundant allocations)
-    // but keep every block offset in the pack index. Two blocks with the same
-    // hash but different chunk_offsets both need entries — otherwise the read
-    // path can't find the second block and returns zeros (BlockLocation::Zero).
-    let mut first_seen: HashMap<Blake3Hash, Bytes> = HashMap::new();
-    let mut pack_blocks: Vec<(Blake3Hash, u32, Bytes)> = Vec::new();
+/// Each layer is converted independently to a deterministic, overlay-preserving
+/// ext4 and stored once under a global `layers/{digest}` namespace; the image is
+/// recorded as an ordered list of layer digests under `images/{name}`. Two
+/// images that share a layer share its storage — the dedup that flattening into
+/// one merged ext4 cannot achieve.
+pub async fn run_bless_oci_layered(
+    image_ref: String,
+    name: String,
+    config_path: PathBuf,
+) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or(tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
 
-    for block in blocks {
-        let compressed = first_seen
-            .entry(block.hash)
-            .or_insert_with(|| block.compressed.clone())
-            .clone();
-        pack_blocks.push((block.hash, block.block_offset, compressed));
-    }
+    let start = Instant::now();
 
-    if pack_blocks.is_empty() {
-        // All-zero chunk — just join previous and move on.
-        join_upload(volume_manifest, stats, prev_in_flight).await?;
-        stats.chunks_written += 1;
-        return Ok(None);
-    }
+    // --- S3 setup ---
+    let settings = Settings::from_file(&config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    let url = settings.storage.url.clone();
+    let env_vars = settings.cloud_provider_env_vars();
+    let (object_store, path_from_url) = parse_url_opts(
+        &url.parse()?,
+        env_vars.into_iter(),
+        Some(settings.storage.connect_timeout()),
+        Some(settings.storage.request_timeout()),
+    )?;
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+    let db_path = path_from_url.to_string();
 
-    // Sort by chunk_offset for canonical ordering before computing the
-    // content-addressed pack ID (same as flush and compaction paths).
-    pack_blocks.sort_by_key(|(_, co, _)| *co);
-    let pack_id = content_pack_id(&pack_blocks);
+    // --- Resolve image ---
+    let registry_client = RegistryClient::new();
+    let image: oci_registry::Reference = image_ref
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid image reference: {e}"))?;
 
-    // Join previous upload before spawning next (keeps at most 1 in flight).
-    join_upload(volume_manifest, stats, prev_in_flight).await?;
+    info!(image = %image_ref, name = %name, "resolving OCI image (layered)");
+    let resolved = registry_client
+        .resolve(&image, &Credentials::Anonymous)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve image: {e}"))?;
 
-    // Spawn streaming S3 upload — runs concurrently with next chunk's disk reads.
-    let cs = Arc::clone(content_store);
-    let handle = tokio::spawn(async move {
-        let entries = cs
-            .stream_chunk_pack(chunk_idx, pack_id, pack_blocks, BLOCK_SIZE)
+    // --- Store each layer once (content-addressed) ---
+    let mut layer_digests = Vec::with_capacity(resolved.layers.len());
+    let mut layer_sizes = Vec::with_capacity(resolved.layers.len());
+    let mut total_stored: u64 = 0;
+    let mut reused = 0usize;
+
+    for (i, layer) in resolved.layers.iter().enumerate() {
+        info!(layer = i, digest = %layer.digest, size = layer.size, "ensuring layer");
+        let decompressed =
+            pull_layer_to_tempfile(&registry_client, &image, layer, &Credentials::Anonymous)
+                .await
+                .with_context(|| format!("pull layer {}", layer.digest))?;
+        let stored = ensure_layer_stored(&object_store, &db_path, &layer.digest, decompressed)
             .await
-            .context("Failed to stream chunk pack")?;
-        let pack_size = entries.iter().map(|e| u64::from(e.comp_length)).sum::<u64>();
-        Ok(ChunkUploadResult {
-            chunk_idx,
-            pack_id,
-            pack_size,
-        })
-    });
-
-    Ok(Some(handle))
-}
-
-/// Block info accumulated during the image scan.
-struct BlockInfo {
-    block_offset: u32,
-    hash: Blake3Hash,
-    compressed: Bytes,
-}
-
-#[derive(Default)]
-struct BlessStats {
-    zero_blocks: usize,
-    unique_blocks: usize,
-    packs_uploaded: usize,
-    bytes_uploaded: u64,
-    chunks_written: usize,
-}
-
-/// Read exactly buf.len() bytes, or fewer at EOF.
-fn read_full(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut total = 0;
-    while total < buf.len() {
-        match file.read(&mut buf[total..])? {
-            0 => break,
-            n => total += n,
+            .with_context(|| format!("store layer {}", layer.digest))?;
+        if stored.already_present {
+            reused += 1;
         }
+        total_stored += stored.stored_bytes;
+        layer_digests.push(layer.digest.clone());
+        layer_sizes.push(layer.size as u64);
     }
-    Ok(total)
+
+    // --- Record the image descriptor ---
+    let descriptor = ImageDescriptor {
+        image_ref: image_ref.clone(),
+        config_digest: resolved.manifest.config.digest.clone(),
+        layers: layer_digests,
+        layer_sizes,
+    };
+    put_image_descriptor(&object_store, &db_path, &name, &descriptor)
+        .await
+        .context("write image descriptor")?;
+
+    let elapsed = start.elapsed();
+    println!("Blessed '{}' from OCI image (layered) successfully:", name);
+    println!("  Image:           {}", image_ref);
+    println!("  Layers:          {}", resolved.layers.len());
+    println!("  Layers reused:   {} (already stored)", reused);
+    println!("  Bytes uploaded:  {:.1} MB", total_stored as f64 / 1e6);
+    println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
+    println!("  Descriptor:      images/{}", name);
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::block_map::lz4_decompress;
+    use crate::block::block_map::{blake3_128, lz4_decompress};
     use crate::block::pack::{extract_block, lookup_block_in_index, parse_pack_index, PackId};
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
@@ -596,80 +485,16 @@ mod tests {
         content_store: &ContentStore,
         name: &str,
         image_data: &[u8],
-    ) -> Result<BlessStats> {
+    ) -> Result<crate::oci::ext4_store::StoreStats> {
         let device_size = image_data.len() as u64;
-        let vm_template = VolumeManifest::new(device_size, BLOCK_SIZE);
-        let total_blocks = device_size.div_ceil(BLOCK_SIZE as u64) as usize;
-        let (_, zero_hash) = shared_zero_block(BLOCK_SIZE as usize);
-
         let content_store = Arc::new(ContentStore::new(
             content_store.object_store().clone(),
             content_store.base_path(),
         ));
-        let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
-        let mut stats = BlessStats::default();
-        let mut hot_set_indices: Vec<u64> = Vec::new();
-        let mut pending_chunk: Option<(u32, Vec<BlockInfo>)> = None;
-        let mut in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>> = None;
 
-        for block_index in 0..total_blocks {
-            let start = block_index * BLOCK_SIZE as usize;
-            let end = (start + BLOCK_SIZE as usize).min(image_data.len());
-            let mut buf = vec![0u8; BLOCK_SIZE as usize];
-            buf[..end - start].copy_from_slice(&image_data[start..end]);
-
-            let hash = blake3_128(&buf);
-
-            if hash == zero_hash {
-                stats.zero_blocks += 1;
-                continue;
-            }
-
-            hot_set_indices.push(block_index as u64);
-
-            let chunk_idx = vm_template.chunk_idx_for_block(block_index as u64);
-            let block_offset = vm_template.block_offset_in_chunk(block_index as u64);
-
-            stats.unique_blocks += 1;
-
-            let compressed = Bytes::from(lz4_compress(&buf));
-
-            if pending_chunk.as_ref().is_some_and(|(idx, _)| *idx != chunk_idx) {
-                let (completed_idx, blocks) = pending_chunk.take().unwrap();
-                in_flight = start_chunk_upload(
-                    &content_store,
-                    &mut volume_manifest,
-                    &mut stats,
-                    in_flight,
-                    completed_idx,
-                    blocks,
-                )
+        let (volume_manifest, hot_set_indices, stats) =
+            store_ext4_stream(&content_store, std::io::Cursor::new(image_data.to_vec()), device_size)
                 .await?;
-            }
-
-            pending_chunk
-                .get_or_insert_with(|| (chunk_idx, Vec::new()))
-                .1
-                .push(BlockInfo {
-                    block_offset,
-                    hash,
-                    compressed,
-                });
-        }
-
-        if let Some((chunk_idx, blocks)) = pending_chunk.take() {
-            in_flight = start_chunk_upload(
-                &content_store,
-                &mut volume_manifest,
-                &mut stats,
-                in_flight,
-                chunk_idx,
-                blocks,
-            )
-            .await?;
-        }
-
-        join_upload(&mut volume_manifest, &mut stats, in_flight).await?;
 
         content_store
             .put_manifest(&format!("bases/{}", name), volume_manifest.serialize()?, None)

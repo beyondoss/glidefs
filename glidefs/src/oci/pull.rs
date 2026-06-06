@@ -80,7 +80,7 @@ pub async fn pull_image(
 }
 
 /// Download and decompress a single layer to a seekable temp file.
-async fn pull_layer_to_tempfile(
+pub async fn pull_layer_to_tempfile(
     client: &oci_registry::RegistryClient,
     image: &Reference,
     layer: &OciDescriptor,

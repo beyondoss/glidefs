@@ -34,6 +34,11 @@ use crate::parse_object_store::parse_url_opts;
 pub struct GcState {
     /// Pack key ("{chunk_idx:04}/{pack_id:016x}") -> first-seen-dead ISO 8601 timestamp.
     pub(crate) dead_packs: HashMap<String, String>,
+    /// Layer digest (hex) -> first-seen-dead ISO 8601 timestamp. A layer is dead
+    /// when no `images/*` descriptor references it. `#[serde(default)]` so old
+    /// state files (without this field) still load.
+    #[serde(default)]
+    pub(crate) dead_layers: HashMap<String, String>,
 }
 
 /// Format a composite key for a (chunk_idx, pack_id) pair.
@@ -88,6 +93,11 @@ impl GcState {
         Self::is_key_eligible(&self.dead_packs, &key, grace_period)
     }
 
+    /// Whether an unreferenced layer has been dead long enough to delete.
+    fn is_layer_eligible(&self, digest_hex: &str, grace_period: Duration) -> bool {
+        Self::is_key_eligible(&self.dead_layers, digest_hex, grace_period)
+    }
+
     fn is_key_eligible(map: &HashMap<String, String>, key: &str, grace_period: Duration) -> bool {
         if let Some(ts_str) = map.get(key)
             && let Ok(ts) = ts_str.parse::<DateTime<Utc>>()
@@ -111,6 +121,12 @@ struct GcStateDelta {
     revived_packs: Vec<String>,
     /// Packs successfully deleted
     deleted_packs: Vec<String>,
+    /// Layers (by hex digest) newly seen as dead: (digest, timestamp)
+    newly_dead_layers: Vec<(String, String)>,
+    /// Layers that became live again (referenced by an image descriptor)
+    revived_layers: Vec<String>,
+    /// Layers successfully deleted
+    deleted_layers: Vec<String>,
 }
 
 impl GcState {
@@ -123,6 +139,15 @@ impl GcState {
         }
         for key in delta.deleted_packs {
             self.dead_packs.remove(&key);
+        }
+        for (digest, ts) in delta.newly_dead_layers {
+            self.dead_layers.entry(digest).or_insert(ts);
+        }
+        for digest in delta.revived_layers {
+            self.dead_layers.remove(&digest);
+        }
+        for digest in delta.deleted_layers {
+            self.dead_layers.remove(&digest);
         }
     }
 }
@@ -142,6 +167,11 @@ struct GcStats {
     eligible_for_deletion: usize,
     packs_deleted: usize,
     snapshots_checked: usize,
+    // Shared-layer pool (layered OCI bless).
+    live_layers: usize,
+    dead_layers_found: usize,
+    eligible_layers: usize,
+    layers_deleted: usize,
 }
 
 impl GcStats {
@@ -155,6 +185,10 @@ impl GcStats {
         self.eligible_for_deletion += other.eligible_for_deletion;
         self.packs_deleted += other.packs_deleted;
         self.snapshots_checked += other.snapshots_checked;
+        self.live_layers += other.live_layers;
+        self.dead_layers_found += other.dead_layers_found;
+        self.eligible_layers += other.eligible_layers;
+        self.layers_deleted += other.layers_deleted;
     }
 }
 
@@ -233,6 +267,10 @@ pub async fn run_gc(
     println!("Dead packs found:        {}", stats.dead_found);
     println!("Eligible for deletion:   {}", stats.eligible_for_deletion);
     println!("Packs deleted:           {}", stats.packs_deleted);
+    println!("Live layers:             {}", stats.live_layers);
+    println!("Dead layers found:       {}", stats.dead_layers_found);
+    println!("Eligible layers:         {}", stats.eligible_layers);
+    println!("Layers deleted:          {}", stats.layers_deleted);
 
     Ok(())
 }
@@ -282,7 +320,150 @@ async fn gc_orchestrate(
         state.apply_delta(delta);
         stats.merge(prefix_stats);
     }
+
+    // Reconcile the shared layer pool (layered OCI bless). Layers live outside
+    // `exports/`, so the per-prefix pass above never touches them; they are
+    // ref-counted by `images/*` descriptors instead.
+    let (layer_delta, layer_stats) =
+        reconcile_layers(object_store, db_path, state, grace_period, &budget, dry_run).await?;
+    state.apply_delta(layer_delta);
+    stats.merge(layer_stats);
+
     Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Shared layer-pool reconciliation (layered OCI bless)
+// ---------------------------------------------------------------------------
+
+/// Normalize an OCI digest to its hex form (the `layers/{hex}` path segment).
+fn digest_hex(digest: &str) -> &str {
+    digest.strip_prefix("sha256:").unwrap_or(digest)
+}
+
+/// Reconcile the global `layers/` pool: a layer is live iff some `images/*`
+/// descriptor references its digest. Unreferenced layers are marked dead and,
+/// after the grace period, their whole subtree is deleted.
+///
+/// The grace period is what makes this safe against the layered-bless write race
+/// (layers are uploaded *before* the image descriptor): a freshly stored layer
+/// briefly looks unreferenced, but the descriptor lands within seconds — long
+/// before any sane grace period elapses — so the layer is revived, not deleted.
+async fn reconcile_layers(
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    db_path: &str,
+    state: &GcState,
+    grace_period: Duration,
+    budget: &AtomicUsize,
+    dry_run: bool,
+) -> Result<(GcStateDelta, GcStats)> {
+    let live = collect_referenced_layers(object_store, db_path).await?;
+    let present = list_layer_digests(object_store, db_path).await?;
+
+    let mut delta = GcStateDelta::default();
+    let mut stats = GcStats::default();
+
+    for digest in present {
+        if live.contains(&digest) {
+            stats.live_layers += 1;
+            // Referenced again — clear any stale dead mark.
+            if state.dead_layers.contains_key(&digest) {
+                delta.revived_layers.push(digest);
+            }
+            continue;
+        }
+
+        // Unreferenced layer.
+        stats.dead_layers_found += 1;
+        if state.is_layer_eligible(&digest, grace_period) {
+            if dry_run {
+                stats.eligible_layers += 1;
+                continue;
+            }
+            // One budget slot per layer keeps a single run's churn bounded.
+            if !try_claim_delete_slot(budget) {
+                continue;
+            }
+            let deleted = delete_layer_subtree(object_store, db_path, &digest).await?;
+            info!(layer = %digest, objects = deleted, "deleted orphaned layer");
+            stats.layers_deleted += 1;
+            delta.deleted_layers.push(digest);
+        } else if !state.dead_layers.contains_key(&digest) {
+            delta
+                .newly_dead_layers
+                .push((digest, Utc::now().to_rfc3339()));
+        }
+    }
+
+    Ok((delta, stats))
+}
+
+/// Collect the set of layer digests (hex) referenced by any `images/*` descriptor.
+async fn collect_referenced_layers(
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    db_path: &str,
+) -> Result<HashSet<String>> {
+    let names = crate::oci::layer_store::list_image_descriptors(object_store, db_path)
+        .await
+        .context("list image descriptors")?;
+    let mut live = HashSet::new();
+    for name in names {
+        if let Some(desc) =
+            crate::oci::layer_store::get_image_descriptor(object_store, db_path, &name)
+                .await
+                .with_context(|| format!("read image descriptor {name}"))?
+        {
+            for layer in &desc.layers {
+                live.insert(digest_hex(layer).to_string());
+            }
+        }
+    }
+    Ok(live)
+}
+
+/// List the layer digests (hex) physically present under `{db_path}/layers/`.
+async fn list_layer_digests(
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    db_path: &str,
+) -> Result<HashSet<String>> {
+    let prefix_str = format!("{}/layers/", db_path.trim_end_matches('/'));
+    let prefix = ObjectPath::from(prefix_str.clone());
+    let mut digests = HashSet::new();
+    let mut stream = object_store.list(Some(&prefix));
+    while let Some(result) = stream.next().await {
+        let meta = result?;
+        let path_str = meta.location.to_string();
+        if let Some(rel) = path_str.strip_prefix(&prefix_str)
+            && let Some(slash) = rel.find('/')
+        {
+            digests.insert(rel[..slash].to_string());
+        }
+    }
+    Ok(digests)
+}
+
+/// Delete every object under `{db_path}/layers/{digest}/`. Returns the count.
+async fn delete_layer_subtree(
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    db_path: &str,
+    digest_hex: &str,
+) -> Result<usize> {
+    let prefix_str = format!("{}/layers/{}/", db_path.trim_end_matches('/'), digest_hex);
+    let prefix = ObjectPath::from(prefix_str);
+    let mut deleted = 0usize;
+    let mut stream = object_store.list(Some(&prefix));
+    let mut paths = Vec::new();
+    while let Some(result) = stream.next().await {
+        paths.push(result?.location);
+    }
+    for path in paths {
+        match object_store.delete(&path).await {
+            Ok(()) => deleted += 1,
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(e).context("delete layer object"),
+        }
+    }
+    Ok(deleted)
 }
 
 /// Atomically claim one delete slot from the shared budget.
@@ -1097,6 +1278,139 @@ mod tests {
         assert!(state
             .dead_packs
             .contains_key(&pack_key(chunk_idx, dead_pack)));
+    }
+
+    #[tokio::test]
+    async fn test_gc_layer_pool_keeps_referenced_reaps_orphans() {
+        use crate::oci::layer_store::{
+            ensure_layer_stored, layer_base_path, put_image_descriptor, ImageDescriptor,
+        };
+
+        fn tiny_tar(marker: u8) -> Vec<u8> {
+            let mut b = tar::Builder::new(Vec::new());
+            let data = vec![marker; 4096];
+            let mut h = tar::Header::new_gnu();
+            h.set_path("file").unwrap();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_cksum();
+            b.append(&h, &data[..]).unwrap();
+            b.into_inner().unwrap()
+        }
+        async fn count(store: &Arc<dyn object_store::ObjectStore>, prefix: &str) -> usize {
+            let p = ObjectPath::from(prefix.to_string());
+            store
+                .list(Some(&p))
+                .filter_map(|r| async move { r.ok() })
+                .count()
+                .await
+        }
+
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = "test";
+        let keep = format!("sha256:{}", "aa".repeat(32));
+        let orphan = format!("sha256:{}", "bb".repeat(32));
+
+        ensure_layer_stored(&s3, db, &keep, std::io::Cursor::new(tiny_tar(1)))
+            .await
+            .unwrap();
+        ensure_layer_stored(&s3, db, &orphan, std::io::Cursor::new(tiny_tar(2)))
+            .await
+            .unwrap();
+
+        // An image references only `keep`.
+        put_image_descriptor(
+            &s3,
+            db,
+            "img",
+            &ImageDescriptor {
+                image_ref: "img:latest".into(),
+                config_digest: "sha256:cfg".into(),
+                layers: vec![keep.clone()],
+                layer_sizes: vec![4096],
+            },
+        )
+        .await
+        .unwrap();
+
+        let budget = AtomicUsize::new(100);
+        let mut state = GcState::default();
+
+        // Run 1 (grace 0): orphan is first seen dead → marked, not yet deleted.
+        let (delta, stats) =
+            reconcile_layers(&s3, db, &state, Duration::ZERO, &budget, false).await.unwrap();
+        assert_eq!(stats.live_layers, 1, "keep is referenced");
+        assert_eq!(stats.dead_layers_found, 1, "orphan unreferenced");
+        assert_eq!(stats.layers_deleted, 0, "first sighting is never deleted");
+        state.apply_delta(delta);
+
+        // Run 2: orphan now past (zero) grace → deleted; keep survives.
+        let (delta, stats) =
+            reconcile_layers(&s3, db, &state, Duration::ZERO, &budget, false).await.unwrap();
+        assert_eq!(stats.layers_deleted, 1);
+        state.apply_delta(delta);
+
+        assert!(count(&s3, &layer_base_path(db, &keep)).await > 0, "referenced layer kept");
+        assert_eq!(count(&s3, &layer_base_path(db, &orphan)).await, 0, "orphan reaped");
+    }
+
+    #[tokio::test]
+    async fn test_gc_layer_revived_when_image_added() {
+        use crate::oci::layer_store::{ensure_layer_stored, put_image_descriptor, ImageDescriptor};
+
+        fn tiny_tar() -> Vec<u8> {
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_path("file").unwrap();
+            h.set_size(8);
+            h.set_mode(0o644);
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_cksum();
+            b.append(&h, &b"contents"[..]).unwrap();
+            b.into_inner().unwrap()
+        }
+
+        let s3: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let db = "test";
+        let digest = format!("sha256:{}", "cc".repeat(32));
+        ensure_layer_stored(&s3, db, &digest, std::io::Cursor::new(tiny_tar()))
+            .await
+            .unwrap();
+
+        let budget = AtomicUsize::new(100);
+        let mut state = GcState::default();
+
+        // No image yet → layer marked dead.
+        let (delta, _) =
+            reconcile_layers(&s3, db, &state, Duration::ZERO, &budget, false).await.unwrap();
+        state.apply_delta(delta);
+        assert!(state.dead_layers.contains_key(&"cc".repeat(32)));
+
+        // An image now references it → revived (dead mark cleared), never deleted.
+        put_image_descriptor(
+            &s3,
+            db,
+            "img",
+            &ImageDescriptor {
+                image_ref: "img:latest".into(),
+                config_digest: "sha256:cfg".into(),
+                layers: vec![digest.clone()],
+                layer_sizes: vec![8],
+            },
+        )
+        .await
+        .unwrap();
+
+        let (delta, stats) =
+            reconcile_layers(&s3, db, &state, Duration::ZERO, &budget, false).await.unwrap();
+        state.apply_delta(delta);
+        assert_eq!(stats.live_layers, 1);
+        assert_eq!(stats.layers_deleted, 0);
+        assert!(
+            !state.dead_layers.contains_key(&"cc".repeat(32)),
+            "layer must be revived once referenced"
+        );
     }
 
     #[tokio::test]
