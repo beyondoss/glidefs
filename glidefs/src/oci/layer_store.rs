@@ -152,7 +152,7 @@ pub async fn ensure_layer_stored<R: Read + Seek>(
 
     // Stream the ext4 into content-addressed packs + manifest under layers/{digest}.
     let (volume_manifest, _hot_set, stats) =
-        store_ext4_stream(&content_store, ext4_tmp, device_size).await?;
+        store_ext4_stream(&content_store, ext4_tmp, device_size, crate::block::block_map::COMPRESSION_BLESS).await?;
     content_store
         .put_manifest(LAYER_MANIFEST_NAME, volume_manifest.serialize()?, None)
         .await

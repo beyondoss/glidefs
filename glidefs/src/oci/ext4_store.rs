@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 
-use crate::block::block_map::{blake3_128, lz4_compress, shared_zero_block, Blake3Hash};
+use crate::block::block_map::{blake3_128, compress_block, shared_zero_block, Blake3Hash};
 use crate::block::content_store::ContentStore;
 use crate::block::pack::{content_pack_id, PackId};
 use crate::block::volume_manifest::VolumeManifest;
@@ -62,6 +62,8 @@ pub async fn store_ext4_stream<R: Read>(
     content_store: &Arc<ContentStore>,
     mut source: R,
     device_size: u64,
+    // Block compression level (`block_map::COMPRESSION_LZ4` = LZ4, else zstd level).
+    level: i32,
 ) -> Result<(VolumeManifest, Vec<u64>, StoreStats)> {
     let vm_template = VolumeManifest::new(device_size, BLOCK_SIZE);
     let total_blocks = device_size.div_ceil(u64::from(BLOCK_SIZE)) as usize;
@@ -90,7 +92,7 @@ pub async fn store_ext4_stream<R: Read>(
         let chunk_idx = vm_template.chunk_idx_for_block(block_index as u64);
         let block_offset = vm_template.block_offset_in_chunk(block_index as u64);
         stats.unique_blocks += 1;
-        let compressed = Bytes::from(lz4_compress(&buf));
+        let compressed = Bytes::from(compress_block(&buf, level));
 
         if pending_chunk.as_ref().is_some_and(|(idx, _)| *idx != chunk_idx) {
             let (completed_idx, blocks) = pending_chunk.take().unwrap();

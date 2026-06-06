@@ -497,7 +497,10 @@ pub fn extract_block(pack_data: &[u8], offset: u32, comp_length: u32) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::block_map::{blake3_128, lz4_compress, lz4_decompress};
+    use crate::block::block_map::{
+        blake3_128, compress_block, decompress_block, lz4_compress, lz4_decompress,
+        COMPRESSION_LZ4,
+    };
 
     /// Helper: generate deterministic test data for block `i`.
     fn test_block_data(i: usize, size: usize) -> Vec<u8> {
@@ -539,6 +542,38 @@ mod tests {
             assert_eq!(hash, originals[i].0, "hash mismatch at block {i}");
             assert_eq!(decompressed, originals[i].1, "data mismatch at block {i}");
             assert_eq!(entry.offset, entries[entry.chunk_offset as usize].offset);
+        }
+    }
+
+    #[test]
+    fn test_pack_round_trip_mixed_codec() {
+        // Compaction reuses each block's ORIGINAL compressed bytes when merging
+        // packs, so a single pack can legitimately hold both LZ4- and zstd-framed
+        // blocks. The read path must auto-detect per block.
+        let chunk_size: u32 = 131072;
+        let block_count = 8;
+        let mut blocks = Vec::with_capacity(block_count);
+        let mut originals = Vec::with_capacity(block_count);
+        for i in 0..block_count {
+            let data = test_block_data(i, chunk_size as usize);
+            let hash = blake3_128(&data);
+            // Alternate codecs block-by-block.
+            let level = if i % 2 == 0 { COMPRESSION_LZ4 } else { 3 };
+            let compressed = compress_block(&data, level);
+            originals.push((hash, data));
+            blocks.push((hash, i as u32, compressed));
+        }
+
+        let (pack_bytes, _entries) = assemble_pack(blocks, chunk_size).unwrap();
+        let index = parse_pack_index(&pack_bytes).unwrap();
+        assert_eq!(index.entries.len(), block_count);
+
+        for entry in &index.entries {
+            let i = entry.chunk_offset as usize;
+            let compressed = extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
+            let decompressed = decompress_block(compressed).unwrap();
+            assert_eq!(blake3_128(&decompressed), originals[i].0, "hash mismatch at block {i}");
+            assert_eq!(decompressed, originals[i].1, "data mismatch at block {i}");
         }
     }
 

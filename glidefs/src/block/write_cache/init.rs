@@ -328,6 +328,11 @@ impl WriteCache<Initializing> {
 
         let inner = Arc::new(CacheInner {
             config,
+            // Default codec: zstd-1, or GLIDEFS_COMPRESSION_LEVEL if set. bless
+            // overrides to a high level via WriteCache::set_compression_level.
+            compression_level: std::sync::atomic::AtomicI32::new(
+                crate::block::block_map::env_default_compression_level(),
+            ),
             data_file: Arc::new(parking_lot::RwLock::new(data_file)),
             flushing_file: parking_lot::Mutex::new(None),
             state_map,
@@ -416,6 +421,11 @@ impl WriteCache<Initializing> {
 
         let inner = Arc::new(CacheInner {
             config,
+            // Default codec: zstd-1, or GLIDEFS_COMPRESSION_LEVEL if set. bless
+            // overrides to a high level via WriteCache::set_compression_level.
+            compression_level: std::sync::atomic::AtomicI32::new(
+                crate::block::block_map::env_default_compression_level(),
+            ),
             data_file: Arc::new(parking_lot::RwLock::new(data_file)),
             flushing_file: parking_lot::Mutex::new(None),
             state_map,

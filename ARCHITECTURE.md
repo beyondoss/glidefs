@@ -1,6 +1,6 @@
 # GlideFS Architecture
 
-Takes block I/O commands (read/write/flush/write_zeroes) from a Linux kernel block device (`/dev/nbdN` or `/dev/ublkbN`), serves reads from a tiered cache (local SSD → in-memory Foyer → SSD Foyer → S3), buffers writes to local SSD (~5µs), and asynchronously uploads dirty blocks to S3 as LZ4-compressed, content-addressed packs. Transport-agnostic: NBD (default, cross-platform) and ublk (Linux 6.0+, io_uring-based, opt-in via `--features ublk`).
+Takes block I/O commands (read/write/flush/write_zeroes) from a Linux kernel block device (`/dev/nbdN` or `/dev/ublkbN`), serves reads from a tiered cache (local SSD → in-memory Foyer → SSD Foyer → S3), buffers writes to local SSD (~5µs), and asynchronously uploads dirty blocks to S3 as compressed (zstd by default; legacy LZ4 packs still read via codec auto-detection), content-addressed packs. Transport-agnostic: NBD (default, cross-platform) and ublk (Linux 6.0+, io_uring-based, opt-in via `--features ublk`).
 
 ## Data Flow
 
@@ -82,7 +82,7 @@ WriteCache ──► is_present(block_idx)?
                                   └── ContentStore::get_chunk_block(chunk_idx, pack_id, offset, comp_length)
                                       ├── S3 error → EIO to guest (block stays NOT_PRESENT; next read retries)
                                       ├── BLAKE3 mismatch → HashMismatch error → EIO to guest
-                                      └── OK → LZ4 decompress → verify BLAKE3 → insert CleanCache → return
+                                      └── OK → decompress (zstd or legacy LZ4, auto-detected) → verify BLAKE3 → insert CleanCache → return
 ```
 
 Multi-block reads fan out with `futures::future::try_join_all()`. Sequential access (3+ consecutive chunk accesses) triggers prefetch of the next pack boundary to hide S3 latency. (`readahead.rs`)
@@ -109,7 +109,7 @@ For each chunk (one pack per chunk per flush cycle):
     │   ├── pread block from SSD
     │   ├── CRC32 verify from SparseCrcMap (if available)
     │   ├── Skip zero blocks (well-known hash sentinel)
-    │   ├── BLAKE3-128 hash → LZ4 compress
+    │   ├── BLAKE3-128 hash → compress (zstd by default; per-cache level)
     │   └── Collect into Vec<(hash, chunk_offset, compressed)>
     ├── ContentStore::stream_chunk_pack():
     │   ├── WriteMultipart::new(put_multipart_opts(...))   ← streaming S3 upload
@@ -155,7 +155,7 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 | Export | A virtual block device served over a transport, with its own cache and S3 prefix | Not a filesystem — raw blocks only |
 | Block | Fixed-size unit of data (default 128 KB to match ZFS recordsize) | Not variable-sized |
 | Volume Chunk | 128 MiB range of blocks (1,024 blocks of 128 KB = 1 ext4 block group). The unit of pack scoping, compaction, and metadata management. | Not a 128 KB block — "chunk" means 128 MiB range. Aligns with ext4 block groups, bounding database scatter to 2–3 chunks per flush |
-| Pack | GLPK S3 object containing LZ4-compressed blocks scoped to one volume chunk. Footer-indexed: header + block data + index footer + GLIX trailer. | Not cross-chunk |
+| Pack | GLPK S3 object containing compressed blocks scoped to one volume chunk (zstd by default; legacy LZ4 packs still read via per-block codec auto-detection). Footer-indexed: header + block data + index footer + GLIX trailer. | Not cross-chunk |
 | PackId | 8-byte random `u64` identifying one pack within its chunk. Hex string in S3 key. | Not a UUID. Collision-safe: birthday bound ~4.3 billion per chunk, and chunks see hundreds of IDs over their lifetime |
 | VolumeManifest (GLVM) | Binary file mapping `chunk_idx → [pack_id, ...]`. Sparse: only written chunks appear. The root of an export's metadata. CRC32-protected. | Not the full block index — pack IDs point to self-describing packs that contain the block-level index |
 | ChunkEntry | `Vec<PackId>` for one chunk, ordered oldest-to-newest. After compaction: single entry. | Not block-level index — that lives in each pack's embedded index |
@@ -220,7 +220,7 @@ The write path avoids all locks. Three techniques make this possible:
 Every block is identified by its BLAKE3-128 hash (16 bytes, truncated from 256-bit), computed at flush time (not on the write path). This enables:
 
 - **Within-batch deduplication**: During flush, zero blocks and within-batch duplicates are deduplicated (seen_hashes set). Two blocks at different `chunk_offsets` with the same hash each get their own index entry — required for the read path to resolve them by position.
-- **Integrity verification**: Read path verifies hash after S3 fetch and LZ4 decompression.
+- **Integrity verification**: Read path verifies the hash after S3 fetch and decompression (codec auto-detected: zstd or legacy LZ4).
 - **Sparse manifests**: VolumeManifest only stores chunks that have been written — a 500 GB export with 2 GB of data has a tiny manifest.
 
 The well-known hash of a 128 KB zero block (`zero_block_hash()`) lets the flush path skip blocks that are all-zeros — they're deduplicated without storage or S3 interaction. (`block_map.rs`)
@@ -272,6 +272,38 @@ A lock-free circuit breaker protects against S3 outages. All mutable state is pa
 
 Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N failures within a time window). Only connectivity errors count — business logic errors (404, etc.) don't trip the breaker. (`circuit_breaker.rs`)
 
+## Deduplication Model
+
+Dedup happens in three places, at three different granularities, and they don't behave the same way. Knowing which is which explains what actually shares storage and what doesn't.
+
+| Tier | Addressed by | Granularity | What it dedups |
+|------|--------------|-------------|----------------|
+| **Lineage (CoW)** | manifest reference | block (pack-id list) | A fork/snapshot inherits the parent's manifest and shares the parent's packs (same `s3_prefix`). This is the **primary** cross-volume dedup — but only *along ancestry*. |
+| **Host clean cache** | **content** (BLAKE3-128) | 128 KiB block | Host-global, shared across all exports. Two *unrelated* volumes that read a byte-identical block resolve to **one resident copy** in RAM/SSD. No lineage, no opt-in. |
+| **S3 packs** | **position** (chunk + offset) | pack | A pack lays blocks out in `chunk_offset` order. Dedup is limited to: zero blocks (skipped), cross-flush re-writes of the *same (offset, content)* (`blocks_cross_deduped`), identical *whole* packs within a prefix (`head_chunk_pack`), and OCI `--layered` (whole layers by digest, global `layers/{digest}`). |
+
+### The addressing asymmetry (and why it's deliberate)
+
+**S3 is position-addressed; the host cache is content-addressed.** That is a design choice matched to each tier's access pattern, not an inconsistency:
+
+- **S3 (cold, bulk):** consecutive logical blocks sit contiguous in a pack, so a multi-block read is **one ranged GET** and a flush is **one PUT**. S3 bills per request, so locality and batching dominate cost. Content-addressing each block would scatter consecutive blocks by hash → N random GETs, N× requests, no batching.
+- **Host cache (hot, random-access):** there is no locality concern in RAM, and memory is scarce, so **dedup is density**. Content-addressing is the right primitive.
+
+Content-addressing and range-read locality are fundamentally opposed (this is the same tension that rules out content-defined chunking here). So each tier picks the axis that matters for it.
+
+### Consequences (the things this implies)
+
+- **Cross-lineage content overlap is *not* deduped in S3** — only the host cache (per-host, hot set) and OCI `--layered` (whole shared base layers) catch it. Two independently-blessed images in different prefixes store their shared bytes twice in S3.
+- **Within a rootfs, identical content at different offsets is stored once per offset in S3** (position-addressed). Zeros (skipped) and hardlinks (shared extents) — the bulk of intra-image duplication — are already neutralized; what remains is non-hardlinked identical files, usually small. The host cache dedups all of it on read regardless.
+- **`WriterOption::AlignData` helps the cache, not intra-rootfs S3.** Aligning a file to the block grid makes it produce identical *block hashes* at stable offsets, which the content-addressed cache exploits and which lets *whole packs* match across deterministic re-blesses. It does **not** dedup those blocks within a rootfs in S3, because packs are position-addressed.
+- **More S3 dedup is only available at pack/layer granularity** (`--layered`, or a future global content-addressed pack store), never sub-pack block dedup — that would break range reads. A global pack store's cost is GC: pack liveness is O(all manifests), whereas layer liveness is O(images) — which is why `--layered` exists and finer-grained global dedup doesn't.
+
+### Compression
+
+Blocks are compressed independently at flush time via `block_map::compress_block(data, level)`. The default is **zstd-1** for runtime exports (~LZ4 compress cost, ~23% smaller) and **zstd-19** for `bless` (offline, write-once/read-many; ~37% smaller, and zstd decode is ~level-independent so the most-read data pays only at build time). `GLIDEFS_COMPRESSION_LEVEL` overrides the default; `0` pins legacy LZ4.
+
+The read path (`decompress_block`) detects the codec per block by sniffing the zstd frame magic, so **legacy LZ4 packs remain readable forever** — there was no on-disk format change. A pack may even hold both codecs (compaction reuses each block's original compressed bytes). `content_pack_id` mixes the compressed bytes, so a zstd pack simply gets a new id; cross-flush dedup keys on the *uncompressed* BLAKE3 hash and is codec-independent. Compression is orthogonal to dedup — it shrinks stored/transferred bytes without changing what shares.
+
 ## File Rotation & Eviction
 
 Local SSD is a bounded write-back buffer, not a persistent cache. After each flush to S3, blocks are evicted (SYNCING→NOT_PRESENT) and the flushing file is deleted. SSD footprint per export: `(dirty + syncing) × block_size` — only blocks modified since the last flush consume local space.
@@ -298,7 +330,7 @@ After flush:   {name}.cache          ← active
 6. Swap `data_file` handle (new active file goes into the RwLock)
 7. Store old handle in `flushing_file: Mutex<Option<Arc<SyncFile>>>`
 8. Release write lock (~15µs total hold time)
-9. `compute_flush_batch` reads from `flushing_file` (rayon parallel: pread + CRC32 + BLAKE3 + LZ4)
+9. `compute_flush_batch` reads from `flushing_file` (rayon parallel: pread + CRC32 + BLAKE3 + compress)
 10. Stream GLPK v3 packs to S3
 11. Finalize: CAS SYNCING→NOT_PRESENT (evict), copy skipped blocks flushing→active
 12. `flushing_active.store(false)`, drop flushing_file, `unlink("{name}.flushing")`
@@ -496,7 +528,7 @@ Self-describing S3 object. Each pack is scoped to one volume chunk. The block in
 │   chunk_size: u32 LE  _reserved: [u8; 4]                   │
 ├────────────────────────────────────────────────────────────┤
 │ Block Data (immediately after header)                      │
-│   [LZ4-compressed blocks, concatenated]                    │
+│   [compressed blocks (zstd default; legacy LZ4 reads too)] │
 │   Offsets in index are absolute from pack start            │
 ├────────────────────────────────────────────────────────────┤
 │ Block Index footer (28 bytes × block_count)                │
@@ -622,7 +654,7 @@ Every layer has a verification mechanism. The goal: corruption is detected befor
 
 | Layer | What's Protected | Hash/Check | When Verified | On Failure |
 |-------|-----------------|------------|---------------|------------|
-| S3 packs | Block data in transit/at rest | BLAKE3-128 | Read path: after S3 fetch + LZ4 decompress | `HashMismatch` error |
+| S3 packs | Block data in transit/at rest | BLAKE3-128 | Read path: after S3 fetch + decompress (zstd/LZ4) | `HashMismatch` error |
 | Clean cache (Foyer) | Cached blocks on SSD/memory | BLAKE3-128 | Background scrubber | Evict from cache → re-fetch from S3 |
 | VolumeManifest | Chunk pack list root | CRC32 trailer | On deserialization | Reject manifest |
 | GLPK pack | Block index + data | BLAKE3-128 per block | On block read from S3 | `HashMismatch` error |
@@ -755,7 +787,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 
 **What the system verifies (rejects if invalid):**
 
-- Block data integrity: BLAKE3-128 verified on every S3 fetch + LZ4 decompress
+- Block data integrity: BLAKE3-128 verified on every S3 fetch + decompress (zstd/LZ4)
 - Manifest integrity: CRC32 trailer verified on every deserialization
 - WAL integrity: CRC32 per entry, replay stops at first corrupt entry
 - Dirty block integrity: CRC32 verified at flush time before uploading to S3
@@ -833,7 +865,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/pack_index_cache.rs` | `PackIndexCache`: Foyer HybridCache keyed by `PackId`; `lookup_block`, `insert_entries`, `known_hashes` |
 | `block/content_store.rs` | S3 typed I/O: `stream_chunk_pack` (WriteMultipart), `get_chunk_block`, `get_pack_index` (suffix-read), manifests, snapshots |
 | `block/manifest.rs` | S3 key helpers: `manifest_s3_key`, `snapshot_s3_key` |
-| `block/block_map.rs` | `SparseStateMap`, `SparseCrcMap`, `Blake3Hash`, `blake3_128`, `lz4_compress`, `lz4_decompress` |
+| `block/block_map.rs` | `SparseStateMap`, `SparseCrcMap`, `Blake3Hash`, `blake3_128`; block codec: `compress_block`/`decompress_block` (zstd + legacy-LZ4 auto-detect), `zstd_compress`, `lz4_compress`/`lz4_decompress` |
 | `block/cache.rs` | `BlockCache` trait (CleanCache) + Foyer implementation |
 
 ### Background & Observability

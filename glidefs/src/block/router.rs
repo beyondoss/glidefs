@@ -1308,6 +1308,10 @@ impl ExportRouter {
             (Arc::new(cache), volume_manifest)
         };
 
+        // Runtime exports keep the cache's default codec (zstd-1, or whatever
+        // GLIDEFS_COMPRESSION_LEVEL sets fleet-wide); only bless overrides it.
+        // The read path auto-detects, so existing LZ4 packs stay readable.
+
         // Record any recovery issues in metrics
         let rw = cache.recovery_warning_count();
         if rw > 0 {
@@ -1842,6 +1846,8 @@ impl ExportRouter {
             block_size: self.block_size,
             wal_sync: false,
         })?);
+        // Bless is offline + write-once/read-many: use the highest zstd level.
+        cache.set_compression_level(crate::block::block_map::COMPRESSION_BLESS);
 
         #[allow(clippy::cast_possible_truncation)]
         let block_size_u32 = self.block_size as u32; // block_size typically 4096, fits in u32

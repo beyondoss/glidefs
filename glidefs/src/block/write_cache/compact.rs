@@ -240,7 +240,7 @@ pub async fn compact_chunk(
                     // S3 data could become the sole copy after GC deletes the
                     // original packs. The decompress+hash cost is acceptable
                     // since compaction is not latency-sensitive.
-                    let decompressed = crate::block::block_map::lz4_decompress(&compressed)
+                    let decompressed = crate::block::block_map::decompress_block(&compressed)
                         .map_err(|e| CacheError::DecompressFailed(format!(
                             "compaction: chunk {} pack {:016x} offset {}: {}",
                             chunk_idx, pid, pack_offset, e

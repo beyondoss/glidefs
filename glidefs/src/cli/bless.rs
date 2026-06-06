@@ -72,7 +72,7 @@ pub async fn run_bless(
 
     // --- Stream image: read blocks, upload each chunk as it completes ---
     let (volume_manifest, hot_set_indices, stats) =
-        store_ext4_stream(&content_store, file, device_size).await?;
+        store_ext4_stream(&content_store, file, device_size, crate::block::block_map::COMPRESSION_BLESS).await?;
 
     // --- Upload manifest ---
     let manifest_key = format!("bases/{}", name);
@@ -198,6 +198,8 @@ pub async fn run_bless_oci(
     };
 
     let cache = Arc::new(WriteCache::open_fresh_active(cache_config)?);
+    // Bless is offline + write-once/read-many: use the highest zstd level.
+    cache.set_compression_level(crate::block::block_map::COMPRESSION_BLESS);
 
     let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
         device_size, BLOCK_SIZE,
@@ -458,7 +460,7 @@ pub async fn run_bless_oci_layered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::block_map::{blake3_128, lz4_decompress};
+    use crate::block::block_map::{blake3_128, decompress_block};
     use crate::block::pack::{extract_block, lookup_block_in_index, parse_pack_index, PackId};
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
@@ -502,7 +504,7 @@ mod tests {
         ));
 
         let (volume_manifest, hot_set_indices, stats) =
-            store_ext4_stream(&content_store, std::io::Cursor::new(image_data.to_vec()), device_size)
+            store_ext4_stream(&content_store, std::io::Cursor::new(image_data.to_vec()), device_size, crate::block::block_map::COMPRESSION_BLESS)
                 .await?;
 
         content_store
@@ -602,7 +604,7 @@ mod tests {
             // Extract and decompress the block from pack
             let compressed =
                 extract_block(&pack_bytes, entry.offset, entry.comp_length).unwrap();
-            let decompressed = lz4_decompress(compressed).unwrap();
+            let decompressed = decompress_block(compressed).unwrap();
 
             assert_eq!(blake3_128(&decompressed), entry.hash);
             assert_eq!(&decompressed[..], original_block);
@@ -797,7 +799,7 @@ mod tests {
                             pie.comp_length,
                         )
                         .unwrap();
-                        let decompressed = lz4_decompress(compressed).unwrap();
+                        let decompressed = decompress_block(compressed).unwrap();
                         assert_eq!(
                             &decompressed[..],
                             original_block,
@@ -841,7 +843,7 @@ mod tests {
 
             let compressed =
                 extract_block(&pack_bytes, pack_offset, comp_length).unwrap();
-            let decompressed = lz4_decompress(compressed).unwrap();
+            let decompressed = decompress_block(compressed).unwrap();
 
             assert_eq!(blake3_128(&decompressed), hash);
             let expected = vec![(offset + 1) as u8; BLOCK_SIZE as usize];

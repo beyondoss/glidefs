@@ -6,13 +6,25 @@ Built for microVM storage at [Beyond](https://beyond.dev).
 
 ## How It Works
 
-Guests see a standard block device (NBD or ublk). Writes go to local SSD immediately. A background scheduler packs dirty blocks, compresses with LZ4, and uploads to S3. Reads serve from local cache; misses pull from S3, verify BLAKE3 hashes, and cache locally.
+Guests see a standard block device (NBD or ublk). Writes go to local SSD immediately. A background scheduler packs dirty blocks, compresses them (zstd; codec is detected on read, so legacy LZ4 packs still read), and uploads to S3. Reads serve from local cache; misses pull from S3, verify BLAKE3 hashes, and cache locally.
 
 ```
 Write path:  Guest → NBD/ublk → local SSD pwrite() → return OK      ~5µs
 Read path:   Guest → NBD/ublk → local cache hit → return data       ~500µs
-             Guest → NBD/ublk → cache miss → S3 GET → LZ4 → verify → cache → return   50-300ms
+             Guest → NBD/ublk → cache miss → S3 GET → decompress → verify → cache → return   50-300ms
 ```
+
+## Core Properties
+
+- **Write-back over object storage.** Writes acknowledge against local NVMe (~5µs) and sync to S3 asynchronously as compressed, content-addressed packs. The durable copy is S3; latency is local.
+- **Copy-on-write volumes.** Forks and snapshots are manifest operations — O(metadata), no data copied — so a 500 GB volume forks in milliseconds (see [Deployments](#deployments)).
+- **Position-addressed in S3, content-addressed in cache.** In S3 a block is located by position — its offset within a (content-named) pack within a chunk — which keeps consecutive blocks contiguous so a multi-block read is one ranged GET. The host cache locates blocks by BLAKE3-128 content hash. The two tiers optimize opposite things on purpose: range-read/request economics in S3, dedup density in cache.
+- **Content-addressed host cache.** That cache is shared across every export on the node, so identical blocks from unrelated volumes occupy a single resident copy — regardless of lineage.
+- **Deterministic images.** `bless` produces byte-identical ext4 for identical input, and large file payloads are aligned to the block grid, so identical content hashes identically and is stored/cached once.
+- **Bounded local cache.** Local SSD is a write-back buffer sized to the working set, not the volume; evicted blocks are re-fetched from S3 and BLAKE3-verified.
+- **Standard block device.** Exposed as NBD or ublk — no guest cooperation, no custom filesystem.
+
+Deduplication spans three tiers at three granularities (lineage CoW, the content-addressed host cache, and position-addressed S3 packs); see [ARCHITECTURE.md → Deduplication Model](ARCHITECTURE.md#deduplication-model).
 
 ## Install
 
@@ -449,7 +461,7 @@ At 1,000 blocks/sec with 128KB blocks: ~2% of one core for BLAKE3 hashing, ~128M
 
 ## Key Design Choices
 
-- **128KB blocks** match ZFS recordsize. Each flush creates one LZ4-compressed pack per modified 128MiB chunk.
+- **128KB blocks** match ZFS recordsize. Each flush creates one compressed pack (zstd by default) per modified 128MiB chunk.
 - **BLAKE3-128 hashing** for content addressing and integrity verification. Truncated from 256-bit; 128-bit collision resistance is sufficient for dedup.
 - **Lock-free write path** using `pread`/`pwrite`, atomic block map with CAS, and monotonic sequence numbers.
 - **Typestate pattern** enforces valid lifecycle transitions at compile time. Can't write to a recovering cache.
