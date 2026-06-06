@@ -1819,9 +1819,11 @@ impl ExportRouter {
             .await
             .map_err(|e| RouterError::OciPull(format!("failed to resolve image: {e}")))?;
 
-        // Estimate device size: compressed × 3, next power-of-2, min 64 MiB.
+        // Estimate device size: compressed × 4, next power-of-2, min 64 MiB.
+        // The ×4 (vs ×3) leaves headroom for block-grid alignment padding, which
+        // inflates the logical ext4 with holes/zeros the block store drops.
         let total_compressed: u64 = resolved.layers.iter().map(|l| l.size as u64).sum();
-        let estimated = (total_compressed * 3).max(64 * 1024 * 1024);
+        let estimated = (total_compressed * 4).max(64 * 1024 * 1024);
         let device_size = estimated.next_power_of_two();
 
         info!(
@@ -1885,6 +1887,9 @@ impl ExportRouter {
                 WriterOption::MaximumDiskSize(device_size as i64),
                 WriterOption::Uuid(uuid),
                 WriterOption::Journal(1024), // 4 MiB journal
+                // Align large file payloads to the dedup block grid (the volume
+                // block size) so the same file dedups across blessed images.
+                WriterOption::AlignData { align: block_size_u32, min_size: block_size_u32 },
             ],
         };
 
