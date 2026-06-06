@@ -1,6 +1,8 @@
 pub mod block_adapter;
 pub mod export;
+pub mod ext4_store;
 pub mod ingest;
+pub mod layer_store;
 pub mod pull;
 pub mod push;
 

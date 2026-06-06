@@ -1076,6 +1076,7 @@ mod integrity_suite;
 mod live_migration;
 mod multi_export;
 mod oci_distribution;
+mod oci_layer_dedup;
 mod oci_push;
 mod persistence;
 mod range_reads;

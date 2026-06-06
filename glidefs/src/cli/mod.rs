@@ -35,10 +35,16 @@ pub enum Commands {
         /// OCI image reference, e.g. "docker.io/library/ubuntu:24.04" (mutually exclusive with --image)
         #[arg(long, required_unless_present = "image", conflicts_with = "image")]
         oci: Option<String>,
+        /// Store OCI layers as separate content-addressed artifacts (layers
+        /// survive) so layers shared across images dedup in storage, instead of
+        /// flattening into one merged ext4. Only valid with --oci.
+        #[arg(long, requires = "oci")]
+        layered: bool,
         /// Base image name (e.g., "ubuntu-22.04-node20-v3")
         #[arg(long)]
         name: String,
-        /// S3 prefix (export namespace) to write the blessed image into
+        /// S3 prefix (export namespace) to write the blessed image into.
+        /// Ignored with --layered (layer artifacts use a global namespace).
         #[arg(long)]
         s3_prefix: String,
         /// Config file (for storage URL + credentials)
