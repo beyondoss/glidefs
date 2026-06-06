@@ -143,30 +143,32 @@ Comparison ignores atime, ctime (volatile), inode_number (internal), and links_c
 
 ## On-Disk Layout
 
+The writer uses `flex_bg`, so per-group metadata is **not** interleaved per
+group — all inode tables and bitmaps are clustered at the end of the image,
+after the data region:
+
 ```
 Byte 0                          Block 0 (4096 bytes)
 ├─ [0..1024)    zeros           (boot sector area)
-├─ [1024..2048) SuperBlock      (1024 bytes)
+├─ [1024..2048) SuperBlock      (primary, 1024 bytes)
 └─ [2048..4096) zeros
 
-Block 1                         Group Descriptor Table
-├─ 128 × GroupDescriptor        (32 bytes each = 4096 bytes)
-└─ (repeated if >128 groups)
+Block 1 .. 1+gd_blocks          Group Descriptor Table (primary)
+└─ GroupDescriptor × groups     (32 bytes each)
 
-Block gd_end .. gd_end+N        Inode Table (per group)
-├─ 16 inodes per block          (256 bytes each)
-└─ N blocks = ceil(inodes_per_group / 16)
+Data region (streamed forward, may contain reserved holes):
+├─ lost+found, file data, directory blocks, xattr blocks, extent index blocks
+├─ Journal (optional)           contiguous run, placed via reserve_contiguous
+└─ ⟂ reserved holes at sparse_super group starts (block 32768, 98304, …):
+     backup superblock + GDT copy — never claimed by data
 
-Block inode_end .. data_start   Block Bitmap + Inode Bitmap
-├─ block_bitmap: 1 block        (1 bit per block in group)
-└─ inode_bitmap: 1 block        (1 bit per inode in group)
-
-Block data_start .. end         Data Blocks
-├─ Directory blocks             (packed dir entries)
-├─ File data blocks             (streamed content)
-├─ xattr blocks                 (for large xattr sets)
-└─ Extent index blocks          (for very large files)
+Trailing metadata (flex_bg, all groups clustered, reserve_contiguous-placed):
+├─ Inode Table                  groups × inodes_per_group × 256 bytes
+└─ Block + Inode Bitmaps        2 blocks per group
 ```
+
+The superblock and primary GDT are written last (seek back to block 0/1) at
+`close()`, after the layout is known.
 
 ## Inode Number Allocation
 
@@ -197,21 +199,57 @@ The 60-byte `inode.data` area holds:
 
 Each extent covers at most `MAX_BLOCKS_PER_EXTENT = 0x8000` (32,768) blocks = 128 MiB. Adjacent same-physical-run blocks are merged into one extent.
 
-### Extent Building (writer.rs:write_extent)
+### Extent Building (writer.rs:write_file_data, physical_runs, write_extents)
+
+File data is streamed forward, but it is **not** always one contiguous run: the
+allocator skips blocks reserved for block-group metadata (see below), so a file
+spanning such a block is split into multiple extents.
 
 ```
-on each data write:
-  extend current_extent if blocks are contiguous
-  else:
-    flush current_extent to inode.data (if fits in 4 entries)
-    or to pending extent_index_block (depth 2)
-    start new extent
+write(&[u8]) → write_file_data:
+  on first byte: skip any reserved block at pos, record data_start_block
+  stream data, jumping over reserved regions (write up to the next reserved
+    block, seek past it, continue) — pos advances over the skipped blocks
 
-on finish_inode:
-  flush last extent
-  if depth==2: write extent_index_block to disk
-  seek to inode slot, write inode
+finish_inode → write_extents:
+  runs   = physical_runs(data_start_block, end_block)   // non-reserved spans
+  leaves = split each run into ≤ MAX_BLOCKS_PER_EXTENT extents (logical offset
+           accumulates over data blocks only, excluding reserved gaps)
+  emit:
+    ≤4 leaves            → inline in inode.data (depth 0)
+    ≤4×EXTENTS_PER_BLOCK → one index level (depth 1), leaf blocks skip reserved
+    else                 → error (file too large)
 ```
+
+A file that crosses no reserved block yields exactly one run — identical output
+to a plain contiguous writer. `block_count` counts data + extent-tree blocks
+only, never the reserved gaps.
+
+### Block-Group Metadata Reservation (writer.rs:is_reserved_block, has_super_backup)
+
+With the `sparse_super` feature, block groups 0, 1, and every power of 3, 5, and
+7 hold a **backup superblock + group-descriptor copy** in their first
+`1 + gd_blocks` blocks (e.g. block 32768 for group 1, 98304 for group 3). The
+kernel reserves these regardless of whether valid backup content is written, so
+**file or metadata data must never claim them** — an overlapping extent is a
+multiply-claimed block that `e2fsck` and the kernel reject (the file reads back
+as "Structure needs cleaning"). Group 0's reservation is skipped at `init()`.
+
+The allocator keeps everything off these blocks:
+
+- **File data** fragments around them (`write_file_data` / `physical_runs`).
+- **Contiguous close()-time structures** — the journal inode, the flex_bg inode
+  table, and the bitmaps — can't fragment (they're single extents or located by
+  group-descriptor offsets), so `reserve_contiguous(n)` instead places the whole
+  run *past* any reserved region it would straddle. The skipped lead-in blocks
+  become free holes.
+- **Padding holes** (from alignment and from `reserve_contiguous`) are recorded
+  in `free_holes` and cleared from the otherwise-dense block bitmap in `close()`.
+
+This was a real, latent corruption bug for any image larger than one block group
+(>128 MiB): the linear allocator wrote straight through block 32768. It was
+hidden because the in-crate reader is lenient; the real `e2fsck` and a kernel
+loop-mount catch it (see Testing).
 
 ## xattr Storage Strategy
 
@@ -290,11 +328,12 @@ Directory entries reference inode numbers. Hard links and `link()` calls can ass
 
 GlideFS content-addresses blocks with BLAKE3. If two nodes generate the same OCI layer, they must produce byte-identical ext4 images or they'll compute different hashes and store duplicate data. Determinism requires:
 - No uninitialized bytes (zero all padding)
-- No random UUIDs (UUID is all-zeros)
+- A deterministic UUID — `WriterOption::Uuid` set to a content-derived value (e.g. the manifest digest), or all-zeros if unset. Never random.
 - No timestamps (`mtime=0`, `wtime=0` in superblock)
 - Sorted directory entries (by inode number, then name)
 - Sorted xattr entries
 - `BTreeMap` for all child/xattr collections
+- A content-addressed layout: file→block placement (including reserved-block skips and any alignment padding) is a pure function of the input, so the same tar always lands the same bytes in the same blocks.
 
 ### Why port from hcsshim instead of using an existing crate?
 
@@ -306,13 +345,13 @@ hcsshim's `compactext4` is the reference implementation for OCI-compatible ext4 
 
 The port preserves the same on-disk layout, making images identical to those produced by the Go implementation.
 
-### Why no journal?
+### Why is the journal optional?
 
-Container layer images are read-only once mounted by the overlay filesystem. A journal adds ~128 MiB of overhead for no benefit. The `HAS_JOURNAL` compat feature is intentionally absent.
+The journal is off by default in the writer: a container layer mounted read-only through overlay never needs one. But a blessed base image that backs a *mutable* volume does, so bless enables `WriterOption::Journal(1024)` (4 MiB). When enabled, the journal is inode 8 with the `HAS_JOURNAL` feature; `s_journal_uuid` stays zero because it identifies an *external* journal device (a non-zero value makes the kernel/e2fsck abort searching for one). When disabled, `HAS_JOURNAL` is absent.
 
 ### Why no checksums?
 
-`METADATA_CSUM` and `GDT_CSUM` are not enabled. Checksums require the UUID as a seed, but a zero UUID makes all checksums trivially zero — enabling the feature would silently produce invalid checksums. Since images are content-addressed externally, internal ext4 checksums are redundant.
+`METADATA_CSUM` and `GDT_CSUM` are not enabled. Metadata checksums are seeded by the UUID and would have to be recomputed for every structure; since images are content-addressed externally (BLAKE3 over the bytes) and validated against the real `e2fsck`/kernel in tests, internal ext4 checksums are redundant.
 
 ## Package Structure
 
@@ -320,7 +359,7 @@ Container layer images are read-only once mounted by the overlay filesystem. A j
 |------|---------|
 | `mod.rs` | Re-exports public API: `Writer`, `Reader`, `File`, `WriterOption`, `convert_tar_to_ext4` |
 | `format.rs` | On-disk binary structures: `SuperBlock`, `GroupDescriptor`, `ParsedInode`, `ExtentHeader/Leaf/Index`, `DirEntry`, xattr helpers. Both serialization (`write_to`) and deserialization (`read_from`, `get_xattrs`) for shared on-disk types. |
-| `writer.rs` | Core filesystem builder. Manages inode lifecycle, block allocation, extent tree construction, xattr packing, directory serialization, superblock finalization. |
+| `writer.rs` | Core filesystem builder. Manages inode lifecycle, reserved-block-aware allocation (data fragments around backup-superblock blocks; contiguous structures use `reserve_contiguous`), extent tree construction, optional alignment + free-hole accounting, xattr packing, directory serialization, journal, superblock finalization. |
 | `reader.rs` | ext4 image parser. Reads superblock, group descriptors, inode table, extent trees, directory entries, and xattrs. Exports via `walk()` and `to_tar()`. |
 | `tar_convert.rs` | tar→ext4 bridge. Maps tar entry types to writer operations, handles OCI whiteouts and PAX xattrs. |
 | `diff.rs` | Incremental export: diffs two ext4 snapshots and produces an OCI-compatible delta tar layer with whiteout markers for deletions. |
@@ -332,6 +371,9 @@ Container layer images are read-only once mounted by the overlay filesystem. A j
 |--------|---------|--------|
 | `WriterOption::InlineData` | disabled | Store files ≤136 bytes inside the inode instead of allocating data blocks. Reduces image size for layers with many small files (e.g., config files, scripts). |
 | `WriterOption::MaximumDiskSize(n)` | 16 GiB | Maximum filesystem size. Controls the number of block groups pre-allocated in the group descriptor table. Range: 0..16 TiB. |
+| `WriterOption::Uuid([u8;16])` | all-zeros | Filesystem UUID, written to the superblock and used as the directory-hash seed. Callers that content-address the image pass a deterministic (e.g. manifest-derived) UUID so the same input yields the same bytes. |
+| `WriterOption::Journal(blocks)` | none | Create an internal jbd2 journal of `blocks` 4 KiB blocks (e.g. 1024 = 4 MiB) as inode 8, set the `HAS_JOURNAL` feature. `s_journal_uuid` is left **zero** (it names an *external* journal device; a non-zero value makes the kernel/e2fsck abort looking for one). bless enables this. |
+| `WriterOption::AlignData { align, min_size }` | disabled | Start the data of every regular file ≥ `min_size` on an `align`-byte boundary, padding the gap with a (free) hole. Aligning large payloads to the downstream dedup block grid makes the same file produce the same blocks regardless of upstream churn, so content-addressed dedup survives. Metadata-aware: composes with reserved-block skipping. |
 
 ## Limits
 
@@ -398,6 +440,20 @@ Three test tiers in `tests.rs`:
 | `test_ext4_fsck_inline_data` | Inline data validated by e2fsck |
 
 Run without Docker: `cargo test --features test-utils --lib` and `cargo test --features test-utils --test integration`
+
+**Filesystem-validity harness** (`tests/fsck_validity.rs`) — gates correctness on kernel-grade oracles, not the in-crate reader (which is lenient and once hid a multi-group corruption bug). Skips cleanly where `e2fsck` is absent.
+
+| Test | What it covers |
+|------|---------------|
+| `fsck_single_group_clean` / `fsck_multi_group_clean` | `e2fsck -fn` clean for single- and multi-group images |
+| `fsck_multi_group_aligned_clean` | aligned build is e2fsck-clean (padding marked free, aligned starts dodge reserved blocks) |
+| `content_survives_fragmentation` | files split around reserved blocks read back byte-exact (right logical order) |
+| `fsck_journal_straddles_group_boundary` | journal must not straddle a backup superblock (sweeps 120–136 MiB) |
+| `fsck_inode_table_straddles_boundary` | inode table must not straddle a backup superblock (many-file workloads) |
+| `fuzz_multigroup_validity_and_content` | random multi-group filesets: e2fsck-clean + byte-exact, both align modes (`EXT4_FUZZ_SEEDS` to scale) |
+| `kernel_mount_content` | opt-in (`EXT4_MOUNT_TEST=1`): real loop-mount, every file byte-exact vs known input |
+
+All tests build with `Journal(1024)` to match the production bless config.
 
 ## Failure Modes
 

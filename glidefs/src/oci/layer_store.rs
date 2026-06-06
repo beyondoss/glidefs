@@ -28,7 +28,7 @@ use object_store::{ObjectStore, PutPayload};
 use serde::{Deserialize, Serialize};
 
 use crate::block::content_store::ContentStore;
-use crate::oci::ext4_store::{deterministic_uuid, store_ext4_stream};
+use crate::oci::ext4_store::{deterministic_uuid, store_ext4_stream, BLOCK_SIZE};
 
 /// Manifest name for a stored layer (its sole VolumeManifest).
 const LAYER_MANIFEST_NAME: &str = "layer";
@@ -92,7 +92,10 @@ impl ImageDescriptor {
 /// Zero blocks past the real content are skipped at store time, so oversizing
 /// costs nothing in storage.
 fn layer_device_size(tar_len: u64) -> u64 {
-    (tar_len.saturating_mul(2).max(64 * 1024 * 1024)).next_power_of_two()
+    // ×3 (not ×2): extra headroom for block-grid alignment padding, which
+    // inflates the logical ext4. The padding is holes/zeros dropped by the
+    // block store, so it costs address space, not stored bytes.
+    (tar_len.saturating_mul(3).max(64 * 1024 * 1024)).next_power_of_two()
 }
 
 /// Ensure a single OCI layer is stored as a content-addressed ext4 artifact.
@@ -137,6 +140,9 @@ pub async fn ensure_layer_stored<R: Read + Seek>(
             WriterOption::MaximumDiskSize(device_size as i64),
             WriterOption::Uuid(deterministic_uuid(digest)),
             WriterOption::Journal(1024), // 4 MiB journal — same as bless
+            // Align large file payloads to the dedup block grid (the volume's
+            // 128 KiB block size) so the same file dedups across layers/images.
+            WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
         ],
     };
     let mut ext4_tmp = tempfile::tempfile().context("layer ext4 tempfile")?;
