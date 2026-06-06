@@ -971,7 +971,10 @@ fn test_journal_roundtrip() {
             "HAS_JOURNAL flag not set"
         );
         assert_eq!(sb.journal_inum, format::INODE_JOURNAL, "journal_inum should be 8");
-        assert_eq!(sb.journal_uuid, uuid, "journal_uuid should match filesystem uuid");
+        // s_journal_uuid identifies an EXTERNAL journal device; for an internal
+        // journal it must be zero, or the kernel/e2fsck search for a nonexistent
+        // external journal and abort ("Can't find external journal").
+        assert_eq!(sb.journal_uuid, [0u8; 16], "journal_uuid must be zero for an internal journal");
         assert_ne!(sb.journal_blocks[0], 0, "journal_blocks backup should be populated");
     }
 

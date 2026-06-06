@@ -66,6 +66,21 @@ pub enum WriterOption {
     /// Create an internal journal with the given size in 4 KiB blocks.
     /// Typical values: 1024 (4 MiB), 4096 (16 MiB), 16384 (64 MiB).
     Journal(u32),
+    /// Start the data of every regular file at least `min_size` bytes large on
+    /// an `align`-byte boundary (padding the gap with a hole). Aligning large
+    /// file payloads to the downstream dedup block grid makes the same file
+    /// produce the same blocks regardless of what was written before it, so
+    /// content-addressed dedup survives unrelated upstream churn. `align` must
+    /// be a power of two; `align == 0` disables (the default).
+    ///
+    /// KNOWN LIMITATION (do not enable in production yet): the current pad is
+    /// not metadata-aware. Padding can land a file's data on an ext4 block-group
+    /// reserved block (e.g. the backup superblock at block `blocks_per_group`),
+    /// producing an extent the *kernel* rejects ("invalid extent entries"),
+    /// even though the in-crate reader accepts it. A correct implementation must
+    /// skip group-metadata blocks when aligning. Verified via `dedup_probe` +
+    /// `e2fsck`/loop-mount.
+    AlignData { align: u32, min_size: u32 },
 }
 
 // ---- Internal inode ----
@@ -233,6 +248,15 @@ pub struct Writer<W: Read + Write + Seek> {
     gd_blocks: u32,
     uuid: [u8; 16],
     journal_blocks: u32,
+    /// Boundary (bytes) for large-file data alignment; 0 = disabled.
+    data_align: i64,
+    /// Minimum file size (bytes) that triggers data alignment.
+    data_align_min: i64,
+    /// Physical block where the in-progress file's data begins. File data skips
+    /// blocks reserved for block-group metadata (backup superblocks + GDT), so
+    /// the data is generally non-contiguous and `pos - data_written` no longer
+    /// locates the start — this does.
+    data_start_block: u32,
 }
 
 impl<W: Read + Write + Seek> Writer<W> {
@@ -251,6 +275,9 @@ impl<W: Read + Write + Seek> Writer<W> {
             gd_blocks: 0,
             uuid: [0u8; 16],
             journal_blocks: 0,
+            data_align: 0,
+            data_align_min: 0,
+            data_start_block: 0,
         };
         for opt in opts {
             match opt {
@@ -268,6 +295,11 @@ impl<W: Read + Write + Seek> Writer<W> {
                 }
                 WriterOption::Uuid(u) => w.uuid = *u,
                 WriterOption::Journal(blocks) => w.journal_blocks = *blocks,
+                WriterOption::AlignData { align, min_size } => {
+                    debug_assert!(*align == 0 || align.is_power_of_two());
+                    w.data_align = i64::from(*align);
+                    w.data_align_min = i64::from(*min_size);
+                }
             }
         }
         w
@@ -329,6 +361,101 @@ impl<W: Read + Write + Seek> Writer<W> {
             self.write_zeros(BLOCK_SIZE as i64 - rem)?;
         }
         Ok(())
+    }
+
+    // ---- block-group metadata reservation ----
+    //
+    // ext4's sparse_super layout reserves the first `1 + gd_blocks` blocks of
+    // certain groups (0, 1, and powers of 3/5/7) for a backup superblock + a
+    // group-descriptor copy. Group 0's reservation is skipped at init(); the
+    // interior ones (block 32768, 98304, ...) sit in the middle of the data
+    // region. File data must not be written onto them, or the kernel rejects the
+    // extent as overlapping a system zone (multiply-claimed block).
+
+    /// Number of reserved blocks at the start of a backup group.
+    fn group_reserve(&self) -> u32 {
+        1 + self.gd_blocks
+    }
+
+    /// Is physical block `b` reserved for an interior block-group backup?
+    fn is_reserved_block(&self, b: u32) -> bool {
+        let g = b / BLOCKS_PER_GROUP;
+        if g == 0 {
+            return false; // group 0's primary metadata is handled by init()'s seek
+        }
+        (b % BLOCKS_PER_GROUP) < self.group_reserve() && has_super_backup(g)
+    }
+
+    /// Smallest reserved block >= `from`, or None if none up to the max device.
+    fn next_reserved_block_ge(&self, from: u32) -> Option<u32> {
+        let max_group = (self.max_disk_size / (i64::from(BLOCKS_PER_GROUP) * BLOCK_SIZE as i64)) as u32 + 1;
+        let mut g = from / BLOCKS_PER_GROUP;
+        while g <= max_group {
+            if g >= 1 && has_super_backup(g) {
+                let rstart = g * BLOCKS_PER_GROUP;
+                let rend = rstart + self.group_reserve();
+                let cand = from.max(rstart);
+                if cand < rend {
+                    return Some(cand);
+                }
+            }
+            g += 1;
+        }
+        None
+    }
+
+    /// If `pos` sits at the start of a reserved region, seek past it.
+    fn skip_reserved_at_pos(&mut self) -> io::Result<()> {
+        while self.pos % BLOCK_SIZE as i64 == 0 && self.is_reserved_block(self.block()) {
+            let g = self.block() / BLOCKS_PER_GROUP;
+            let region_end = g * BLOCKS_PER_GROUP + self.group_reserve();
+            self.seek_block(region_end)?;
+        }
+        Ok(())
+    }
+
+    /// Write file data, skipping reserved block-group metadata regions. Records
+    /// the file's first data block on the first call.
+    fn write_file_data(&mut self, b: &[u8]) -> io::Result<usize> {
+        if self.data_written == 0 {
+            self.skip_reserved_at_pos()?;
+            self.data_start_block = self.block();
+        }
+        let mut off = 0usize;
+        while off < b.len() {
+            self.skip_reserved_at_pos()?;
+            let cur = self.block();
+            let limit = match self.next_reserved_block_ge(cur) {
+                // next_reserved >= cur, and cur is not reserved, so r > cur.
+                Some(r) => i64::from(r) * BLOCK_SIZE as i64 - self.pos,
+                None => i64::MAX,
+            };
+            let take = ((b.len() - off) as i64).min(limit) as usize;
+            let w = self.write_bytes(&b[off..off + take])?;
+            off += w;
+            if w < take {
+                break; // short write
+            }
+        }
+        Ok(off)
+    }
+
+    /// The contiguous, non-reserved physical runs covering [start, end).
+    fn physical_runs(&self, start: u32, end: u32) -> Vec<(u32, u32)> {
+        let mut runs = Vec::new();
+        let mut b = start;
+        while b < end {
+            if self.is_reserved_block(b) {
+                b += 1;
+                continue;
+            }
+            let run_start = b;
+            // Jump to the next reserved block (or end) rather than stepping.
+            let next_res = self.next_reserved_block_ge(b).unwrap_or(end).min(end);
+            b = next_res;
+            runs.push((run_start, b - run_start));
+        }
+        runs
     }
 
     // ---- inode management ----
@@ -615,6 +742,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.cur_inode = Some((ino - 1) as usize);
         self.data_written = 0;
         self.data_max = size;
+        self.data_start_block = 0;
         Ok(())
     }
 
@@ -645,64 +773,72 @@ impl<W: Read + Write + Seek> Writer<W> {
     }
 
     fn write_extents(&mut self, idx: usize) -> io::Result<()> {
-        let start = self.pos - self.data_written;
-        if start % BLOCK_SIZE as i64 != 0 {
-            return Err(io::Error::other(
-                "data start position is not block-aligned",
-            ));
-        }
+        // Flush the partial final data block, then resolve the file's physical
+        // layout. Data skips reserved block-group metadata, so it may be split
+        // across several contiguous runs; `data_start_block` (not
+        // `pos - data_written`) locates the start.
         self.next_block()?;
+        let start_block = self.data_start_block;
+        let end_block = self.block();
+        let runs = self.physical_runs(start_block, end_block);
 
-        let start_block = (start / BLOCK_SIZE as i64) as u32;
-        let blocks = self.block() - start_block;
-        let mut used_blocks = blocks;
+        // Flatten runs into extent leaves, each at most MAX_BLOCKS_PER_EXTENT.
+        // For an unfragmented file this yields exactly the same leaves the old
+        // contiguous arithmetic produced.
+        let mut leaves: Vec<(u32, u32, u32)> = Vec::new(); // (logical, phys, len)
+        let mut logical = 0u32;
+        for (phys, len) in &runs {
+            let mut o = 0u32;
+            while o < *len {
+                let l = (*len - o).min(MAX_BLOCKS_PER_EXTENT);
+                leaves.push((logical, phys + o, l));
+                logical += l;
+                o += l;
+            }
+        }
+        let mut used_blocks = logical; // data blocks (reserved gaps excluded)
 
         const EXTENT_NODE_SIZE: u32 = 12;
         const EXTENTS_PER_BLOCK: u32 = (BLOCK_SIZE as u32) / EXTENT_NODE_SIZE - 1;
 
-        let extents = if blocks == 0 { 0 } else { blocks.div_ceil(MAX_BLOCKS_PER_EXTENT) };
+        let n_ext = leaves.len() as u32;
         let mut data = Vec::new();
 
-        if extents == 0 {
+        if n_ext == 0 {
             // Nothing to do
-        } else if extents <= 4 {
-            // Fits in inode directly
-            write_extent_header_to_vec(&mut data, extents as u16, 4, 0);
-            for i in 0..extents {
-                let block_offset = i * MAX_BLOCKS_PER_EXTENT;
-                let mut length = blocks - block_offset;
-                if length > MAX_BLOCKS_PER_EXTENT {
-                    length = MAX_BLOCKS_PER_EXTENT;
-                }
-                write_extent_leaf_to_vec(&mut data, block_offset, length as u16, start_block + block_offset);
+        } else if n_ext <= 4 {
+            // Fits in the inode directly.
+            write_extent_header_to_vec(&mut data, n_ext as u16, 4, 0);
+            for (lblk, phys, len) in &leaves {
+                write_extent_leaf_to_vec(&mut data, *lblk, *len as u16, *phys);
             }
-            // Pad to 4 extents worth
-            let padding = (4 - extents) * EXTENT_NODE_SIZE;
+            let padding = (4 - n_ext) * EXTENT_NODE_SIZE;
             data.extend(std::iter::repeat_n(0u8, padding as usize));
-        } else if extents <= 4 * EXTENTS_PER_BLOCK {
-            let extent_blocks = extents.div_ceil(EXTENTS_PER_BLOCK);
-            used_blocks += extent_blocks;
+        } else if n_ext <= 4 * EXTENTS_PER_BLOCK {
+            let extent_blocks = n_ext.div_ceil(EXTENTS_PER_BLOCK);
 
-            // Root: index nodes
+            // Root: index nodes pointing at leaf blocks.
             write_extent_header_to_vec(&mut data, extent_blocks as u16, 4, 1);
-            // We'll fill in the index nodes after writing the leaf blocks
             let index_start = data.len();
             data.resize(index_start + 4 * EXTENT_NODE_SIZE as usize, 0);
 
             for i in 0..extent_blocks {
+                // Extent-tree blocks must avoid reserved metadata too.
+                self.skip_reserved_at_pos()?;
                 let leaf_block = self.block();
-                // Fill in the index node
+                used_blocks += 1;
+
+                let first = (i * EXTENTS_PER_BLOCK) as usize;
+                let extents_in_block = (n_ext - i * EXTENTS_PER_BLOCK).min(EXTENTS_PER_BLOCK);
+
+                // Index node: logical offset of this leaf block's first extent.
                 let idx_off = index_start + (i * EXTENT_NODE_SIZE) as usize;
-                let block_off = i * EXTENTS_PER_BLOCK * MAX_BLOCKS_PER_EXTENT;
-                data[idx_off..idx_off + 4].copy_from_slice(&block_off.to_le_bytes());
+                data[idx_off..idx_off + 4].copy_from_slice(&leaves[first].0.to_le_bytes());
                 data[idx_off + 4..idx_off + 8].copy_from_slice(&leaf_block.to_le_bytes());
                 // idx_off + 8..12 stays zero (leaf_high + unused)
 
-                let extents_in_block = (extents - i * EXTENTS_PER_BLOCK).min(EXTENTS_PER_BLOCK);
                 let mut leaf_buf = vec![0u8; BLOCK_SIZE as usize];
                 let mut leaf_pos = 0usize;
-
-                // Write extent header
                 leaf_buf[leaf_pos..leaf_pos + 2].copy_from_slice(&format::EXTENT_HEADER_MAGIC.to_le_bytes());
                 leaf_pos += 2;
                 leaf_buf[leaf_pos..leaf_pos + 2].copy_from_slice(&(extents_in_block as u16).to_le_bytes());
@@ -714,21 +850,15 @@ impl<W: Read + Write + Seek> Writer<W> {
                 leaf_buf[leaf_pos..leaf_pos + 4].copy_from_slice(&0u32.to_le_bytes()); // generation
                 leaf_pos += 4;
 
-                let offset = i * EXTENTS_PER_BLOCK * MAX_BLOCKS_PER_EXTENT;
-                for j in 0..extents_in_block {
-                    let block_off2 = offset + j * MAX_BLOCKS_PER_EXTENT;
-                    let mut length = blocks - block_off2;
-                    if length > MAX_BLOCKS_PER_EXTENT {
-                        length = MAX_BLOCKS_PER_EXTENT;
-                    }
-                    let start = start_block + block_off2;
-                    leaf_buf[leaf_pos..leaf_pos + 4].copy_from_slice(&block_off2.to_le_bytes());
+                for j in 0..extents_in_block as usize {
+                    let (lblk, phys, len) = leaves[first + j];
+                    leaf_buf[leaf_pos..leaf_pos + 4].copy_from_slice(&lblk.to_le_bytes());
                     leaf_pos += 4;
-                    leaf_buf[leaf_pos..leaf_pos + 2].copy_from_slice(&(length as u16).to_le_bytes());
+                    leaf_buf[leaf_pos..leaf_pos + 2].copy_from_slice(&(len as u16).to_le_bytes());
                     leaf_pos += 2;
                     leaf_buf[leaf_pos..leaf_pos + 2].copy_from_slice(&0u16.to_le_bytes()); // start_high
                     leaf_pos += 2;
-                    leaf_buf[leaf_pos..leaf_pos + 4].copy_from_slice(&start.to_le_bytes());
+                    leaf_buf[leaf_pos..leaf_pos + 4].copy_from_slice(&phys.to_le_bytes());
                     leaf_pos += 4;
                 }
 
@@ -892,6 +1022,18 @@ impl<W: Read + Write + Seek> Writer<W> {
 
         if self.inode_ref(child_ino)?.mode & TYPE_MASK == format::S_IFREG {
             self.start_inode(name, child_ino, f.size)?;
+            // Align the start of large file payloads to the dedup block grid.
+            // Done before any data is written (data_written == 0), so the
+            // file's first data block — recorded as `pos - data_written` in
+            // write_extents — lands on the boundary. The padded gap is a hole
+            // (zeros), which the downstream block store drops for free.
+            if self.data_align > 0 && f.size >= self.data_align_min {
+                let align = self.data_align;
+                let rem = self.pos % align;
+                if rem != 0 {
+                    self.write_zeros(align - rem)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1024,7 +1166,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             self.data_written += b.len() as i64;
             Ok(b.len())
         } else {
-            let n = self.write_bytes(b)?;
+            let n = self.write_file_data(b)?;
             self.data_written += n as i64;
             Ok(n)
         }
@@ -1478,7 +1620,12 @@ impl<W: Read + Write + Seek> Writer<W> {
                 | format::RoCompatFeature::HUGE_FILE
                 | format::RoCompatFeature::EXTRA_ISIZE,
             uuid: self.uuid,
-            journal_uuid: self.uuid,
+            // s_journal_uuid identifies an *external* journal device. We only
+            // ever use an internal journal (inode 8) or none, so this must stay
+            // zero — a non-zero value makes the kernel and e2fsck search for an
+            // external journal and abort ("Can't find external journal"). The
+            // journal's own jbd2 superblock still carries the fs UUID.
+            journal_uuid: [0u8; 16],
             journal_inum: if self.journal_blocks > 0 { format::INODE_JOURNAL } else { 0 },
             hash_seed: [
                 u32::from_le_bytes(self.uuid[0..4].try_into().unwrap()),
@@ -1580,6 +1727,29 @@ fn best_group_count(blocks: u32, inodes: u32) -> (u32, u32) {
         ipg += INODES_PER_GROUP_INCREMENT;
     }
     (best_groups, best_ipg)
+}
+
+/// Does block group `g` hold a backup superblock + group-descriptor copy?
+/// With the sparse_super feature, backups live in groups 0, 1, and every power
+/// of 3, 5, and 7. The kernel/e2fsck reserve those blocks regardless of whether
+/// valid backup content is written, so file data must never claim them.
+fn has_super_backup(g: u32) -> bool {
+    if g <= 1 {
+        return true;
+    }
+    for base in [3u32, 5, 7] {
+        let mut p = base;
+        while p < g {
+            match p.checked_mul(base) {
+                Some(n) => p = n,
+                None => break,
+            }
+        }
+        if p == g {
+            return true;
+        }
+    }
+    false
 }
 
 fn write_extent_header_to_vec(buf: &mut Vec<u8>, entries: u16, max: u16, depth: u16) {
