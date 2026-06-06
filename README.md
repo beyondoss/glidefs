@@ -14,6 +14,18 @@ Read path:   Guest → NBD/ublk → local cache hit → return data       ~500µ
              Guest → NBD/ublk → cache miss → S3 GET → LZ4 → verify → cache → return   50-300ms
 ```
 
+## Core Properties
+
+- **Write-back over object storage.** Writes acknowledge against local NVMe (~5µs) and sync to S3 asynchronously as compressed, content-addressed packs. The durable copy is S3; latency is local.
+- **Copy-on-write volumes.** Forks and snapshots are manifest operations — O(metadata), no data copied — so a 500 GB volume forks in milliseconds (see [Deployments](#deployments)).
+- **Position-addressed in S3, content-addressed in cache.** In S3 a block is located by position — its offset within a (content-named) pack within a chunk — which keeps consecutive blocks contiguous so a multi-block read is one ranged GET. The host cache locates blocks by BLAKE3-128 content hash. The two tiers optimize opposite things on purpose: range-read/request economics in S3, dedup density in cache.
+- **Content-addressed host cache.** That cache is shared across every export on the node, so identical blocks from unrelated volumes occupy a single resident copy — regardless of lineage.
+- **Deterministic images.** `bless` produces byte-identical ext4 for identical input, and large file payloads are aligned to the block grid, so identical content hashes identically and is stored/cached once.
+- **Bounded local cache.** Local SSD is a write-back buffer sized to the working set, not the volume; evicted blocks are re-fetched from S3 and BLAKE3-verified.
+- **Standard block device.** Exposed as NBD or ublk — no guest cooperation, no custom filesystem.
+
+Deduplication spans three tiers at three granularities (lineage CoW, the content-addressed host cache, and position-addressed S3 packs); see [ARCHITECTURE.md → Deduplication Model](ARCHITECTURE.md#deduplication-model).
+
 ## Install
 
 ```sh

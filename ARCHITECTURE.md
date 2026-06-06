@@ -272,6 +272,36 @@ A lock-free circuit breaker protects against S3 outages. All mutable state is pa
 
 Two failure policies: **Consecutive** (N failures in a row) and **Windowed** (N failures within a time window). Only connectivity errors count — business logic errors (404, etc.) don't trip the breaker. (`circuit_breaker.rs`)
 
+## Deduplication Model
+
+Dedup happens in three places, at three different granularities, and they don't behave the same way. Knowing which is which explains what actually shares storage and what doesn't.
+
+| Tier | Addressed by | Granularity | What it dedups |
+|------|--------------|-------------|----------------|
+| **Lineage (CoW)** | manifest reference | block (pack-id list) | A fork/snapshot inherits the parent's manifest and shares the parent's packs (same `s3_prefix`). This is the **primary** cross-volume dedup — but only *along ancestry*. |
+| **Host clean cache** | **content** (BLAKE3-128) | 128 KiB block | Host-global, shared across all exports. Two *unrelated* volumes that read a byte-identical block resolve to **one resident copy** in RAM/SSD. No lineage, no opt-in. |
+| **S3 packs** | **position** (chunk + offset) | pack | A pack lays blocks out in `chunk_offset` order. Dedup is limited to: zero blocks (skipped), cross-flush re-writes of the *same (offset, content)* (`blocks_cross_deduped`), identical *whole* packs within a prefix (`head_chunk_pack`), and OCI `--layered` (whole layers by digest, global `layers/{digest}`). |
+
+### The addressing asymmetry (and why it's deliberate)
+
+**S3 is position-addressed; the host cache is content-addressed.** That is a design choice matched to each tier's access pattern, not an inconsistency:
+
+- **S3 (cold, bulk):** consecutive logical blocks sit contiguous in a pack, so a multi-block read is **one ranged GET** and a flush is **one PUT**. S3 bills per request, so locality and batching dominate cost. Content-addressing each block would scatter consecutive blocks by hash → N random GETs, N× requests, no batching.
+- **Host cache (hot, random-access):** there is no locality concern in RAM, and memory is scarce, so **dedup is density**. Content-addressing is the right primitive.
+
+Content-addressing and range-read locality are fundamentally opposed (this is the same tension that rules out content-defined chunking here). So each tier picks the axis that matters for it.
+
+### Consequences (the things this implies)
+
+- **Cross-lineage content overlap is *not* deduped in S3** — only the host cache (per-host, hot set) and OCI `--layered` (whole shared base layers) catch it. Two independently-blessed images in different prefixes store their shared bytes twice in S3.
+- **Within a rootfs, identical content at different offsets is stored once per offset in S3** (position-addressed). Zeros (skipped) and hardlinks (shared extents) — the bulk of intra-image duplication — are already neutralized; what remains is non-hardlinked identical files, usually small. The host cache dedups all of it on read regardless.
+- **`WriterOption::AlignData` helps the cache, not intra-rootfs S3.** Aligning a file to the block grid makes it produce identical *block hashes* at stable offsets, which the content-addressed cache exploits and which lets *whole packs* match across deterministic re-blesses. It does **not** dedup those blocks within a rootfs in S3, because packs are position-addressed.
+- **More S3 dedup is only available at pack/layer granularity** (`--layered`, or a future global content-addressed pack store), never sub-pack block dedup — that would break range reads. A global pack store's cost is GC: pack liveness is O(all manifests), whereas layer liveness is O(images) — which is why `--layered` exists and finer-grained global dedup doesn't.
+
+### Compression
+
+Blocks are compressed independently at flush time (`block_map::lz4_compress`, currently LZ4). Because `content_pack_id` mixes the compressed bytes, the compressor is part of a pack's identity: changing it changes pack-ids (a one-time re-bless) and a dedup domain must use a consistent codec. Compression is orthogonal to dedup — it shrinks the stored/transferred bytes without changing what shares.
+
 ## File Rotation & Eviction
 
 Local SSD is a bounded write-back buffer, not a persistent cache. After each flush to S3, blocks are evicted (SYNCING→NOT_PRESENT) and the flushing file is deleted. SSD footprint per export: `(dirty + syncing) × block_size` — only blocks modified since the last flush consume local space.
