@@ -36,7 +36,10 @@ use ext4::writer::WriterOption;
 use glidefs::block::block_map::{Blake3Hash, blake3_128, lz4_compress};
 
 const GRID: usize = 128 * 1024; // production BLOCK_SIZE — the dedup window size
-const ALIGN_THRESHOLD: u32 = 16 * 1024; // align files >= 16 KiB; pack smaller ones
+// align files >= threshold; pack smaller ones. Override with DEDUP_ALIGN_THRESHOLD.
+fn align_threshold() -> u32 {
+    std::env::var("DEDUP_ALIGN_THRESHOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(16 * 1024)
+}
 
 // ---- shared image plumbing (mirrors bless: deterministic, content-addressed) ----
 
@@ -103,7 +106,7 @@ fn build_ext4(img: &Image, align: bool) -> File {
         writer_options.push(WriterOption::Journal(1024));
     }
     if align {
-        writer_options.push(WriterOption::AlignData { align: GRID as u32, min_size: ALIGN_THRESHOLD });
+        writer_options.push(WriterOption::AlignData { align: GRID as u32, min_size: align_threshold() });
     }
     let opts = ConvertOptions { convert_backslash: false, writer_options };
     let out = tempfile::tempfile().expect("tempfile");

@@ -171,10 +171,13 @@ pub async fn run_bless_oci(
         .await
         .map_err(|e| anyhow::anyhow!("failed to resolve image: {e}"))?;
 
-    // Estimate device size: sum compressed layer sizes × 3 (decompression + ext4 overhead).
-    // Round up to next power-of-2 MiB boundary. Minimum 64 MiB.
+    // Estimate device size: sum compressed layer sizes × 4 (decompression + ext4
+    // overhead + block-grid alignment headroom). Round up to next power-of-2.
+    // Minimum 64 MiB. The ×4 (vs ×3) covers the logical inflation from aligning
+    // large files to the dedup block grid; that padding is holes/zeros which the
+    // block store drops, so it costs address space, not stored bytes.
     let total_compressed: u64 = resolved.layers.iter().map(|l| l.size as u64).sum();
-    let estimated = (total_compressed * 3).max(64 * 1024 * 1024);
+    let estimated = (total_compressed * 4).max(64 * 1024 * 1024);
     let device_size = estimated.next_power_of_two();
 
     info!(
@@ -251,6 +254,12 @@ pub async fn run_bless_oci(
             WriterOption::MaximumDiskSize(device_size as i64),
             WriterOption::Uuid(uuid),
             WriterOption::Journal(1024), // 4 MiB journal
+            // Align large file payloads to the dedup block grid (the volume's
+            // 128 KiB block size) so the same file produces the same blocks
+            // across images and the host's content-addressed cache + S3 packs
+            // dedup it. Only files >= one full block are aligned, bounding the
+            // padding. See dedup_probe / fsck_validity for the validation.
+            WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
         ],
     };
 

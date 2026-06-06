@@ -313,3 +313,73 @@ fn fuzz_multigroup_validity_and_content() {
         }
     }
 }
+
+/// Privileged kernel-mount content check: loop-mount the image with the REAL
+/// Linux ext4 driver and verify every file's bytes against the known input —
+/// the strongest oracle, independent of both the writer and the in-crate reader.
+/// Opt-in (needs root / passwordless sudo + loop devices), so it skips by
+/// default and runs in a privileged/nightly job:
+///   EXT4_MOUNT_TEST=1 cargo test -p ext4 --test fsck_validity kernel_mount
+#[test]
+fn kernel_mount_content() {
+    if std::env::var("EXT4_MOUNT_TEST").is_err() {
+        eprintln!("SKIP: set EXT4_MOUNT_TEST=1 to run the privileged kernel-mount check");
+        return;
+    }
+    let sudo_ok = Command::new("sudo")
+        .args(["-n", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sudo_ok {
+        eprintln!("SKIP: passwordless sudo not available for mount");
+        return;
+    }
+
+    // Multi-group fileset (~180 MiB) with known deterministic content.
+    let files: Vec<(String, usize)> = vec![
+        ("data/a.bin".into(), 50 * 1024 * 1024),
+        ("data/b.bin".into(), 50 * 1024 * 1024),
+        ("small/x".into(), 4096),
+        ("data/c.bin".into(), 50 * 1024 * 1024),
+        ("data/d.bin".into(), 30 * 1024 * 1024),
+    ];
+
+    for align in [None, Some((128 * 1024u32, 128 * 1024u32))] {
+        let img = build_image(&files, align);
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&img).unwrap();
+        tmp.flush().unwrap();
+        let mnt = tempfile::tempdir().unwrap();
+
+        let mounted = Command::new("sudo")
+            .args(["-n", "mount", "-o", "ro,loop"])
+            .arg(tmp.path())
+            .arg(mnt.path())
+            .status()
+            .expect("spawn mount");
+        assert!(mounted.success(), "kernel mount failed (align={align:?})");
+
+        // Read every file through the kernel and compare to known input. Collect
+        // the result first so we always unmount, even on mismatch.
+        let mut err: Option<String> = None;
+        for (i, (path, size)) in files.iter().enumerate() {
+            match std::fs::read(mnt.path().join(path)) {
+                Ok(got) if got.len() == *size && got == content(i as u64, *size) => {}
+                Ok(got) => {
+                    err = Some(format!("{path}: kernel read mismatch (len {} vs {size})", got.len()));
+                    break;
+                }
+                Err(e) => {
+                    err = Some(format!("{path}: kernel read failed: {e}"));
+                    break;
+                }
+            }
+        }
+
+        let _ = Command::new("sudo").args(["-n", "umount"]).arg(mnt.path()).status();
+        if let Some(e) = err {
+            panic!("kernel-mount content check failed (align={align:?}): {e}");
+        }
+    }
+}
