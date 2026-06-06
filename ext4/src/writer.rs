@@ -257,6 +257,11 @@ pub struct Writer<W: Read + Write + Seek> {
     /// the data is generally non-contiguous and `pos - data_written` no longer
     /// locates the start — this does.
     data_start_block: u32,
+    /// Unreferenced free block ranges created by data alignment padding. The
+    /// block bitmap assumes a densely packed data region; these holes must be
+    /// cleared from it so the filesystem is consistent. Empty unless alignment
+    /// is enabled.
+    free_holes: Vec<(u32, u32)>,
 }
 
 impl<W: Read + Write + Seek> Writer<W> {
@@ -278,6 +283,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             data_align: 0,
             data_align_min: 0,
             data_start_block: 0,
+            free_holes: Vec::new(),
         };
         for opt in opts {
             match opt {
@@ -438,6 +444,23 @@ impl<W: Read + Write + Seek> Writer<W> {
             }
         }
         Ok(off)
+    }
+
+    /// Record [start, end) as free holes, excluding reserved metadata blocks
+    /// (which stay marked used — they hold backup superblocks, not free space).
+    fn record_free_hole(&mut self, start: u32, end: u32) {
+        let mut b = start;
+        while b < end {
+            if self.is_reserved_block(b) {
+                b += 1;
+                continue;
+            }
+            let run_start = b;
+            b = self.next_reserved_block_ge(b).unwrap_or(end).min(end);
+            if b > run_start {
+                self.free_holes.push((run_start, b - run_start));
+            }
+        }
     }
 
     /// The contiguous, non-reserved physical runs covering [start, end).
@@ -1022,16 +1045,20 @@ impl<W: Read + Write + Seek> Writer<W> {
 
         if self.inode_ref(child_ino)?.mode & TYPE_MASK == format::S_IFREG {
             self.start_inode(name, child_ino, f.size)?;
-            // Align the start of large file payloads to the dedup block grid.
-            // Done before any data is written (data_written == 0), so the
-            // file's first data block — recorded as `pos - data_written` in
-            // write_extents — lands on the boundary. The padded gap is a hole
-            // (zeros), which the downstream block store drops for free.
+            // Align the start of large file payloads to the dedup block grid, so
+            // the same file produces the same blocks regardless of upstream
+            // churn. The padded gap is unreferenced free space; record it so the
+            // block bitmap marks it free (reserved metadata blocks within the
+            // gap stay used). write_file_data then skips any reserved block at
+            // the aligned position before recording data_start_block.
             if self.data_align > 0 && f.size >= self.data_align_min {
                 let align = self.data_align;
                 let rem = self.pos % align;
                 if rem != 0 {
+                    let pad_start = self.block();
                     self.write_zeros(align - rem)?;
+                    let pad_end = self.block();
+                    self.record_free_hole(pad_start, pad_end);
                 }
             }
         }
@@ -1510,6 +1537,8 @@ impl<W: Read + Write + Seek> Writer<W> {
         let inode_table_size_per_group = inodes_per_group * INODE_SIZE as u32 / BLOCK_SIZE as u32;
         let mut total_used_blocks: u32 = 0;
         let mut total_used_inodes: u32 = 0;
+        // Alignment padding holes to clear from the otherwise-dense bitmap.
+        let free_holes = std::mem::take(&mut self.free_holes);
 
         for g in 0..groups {
             let mut bitmap_buf = vec![0u8; BLOCK_SIZE as usize * 2];
@@ -1540,6 +1569,23 @@ impl<W: Read + Write + Seek> Writer<W> {
                 for j in (disk_size % BLOCKS_PER_GROUP)..BLOCKS_PER_GROUP {
                     bitmap_buf[(j / 8) as usize] |= 1 << (j % 8);
                     used_block_count += 1;
+                }
+            }
+            // Clear alignment padding holes: the bitmap is dense by default, but
+            // these blocks are unreferenced free space.
+            let gstart = g * BLOCKS_PER_GROUP;
+            for &(hstart, hlen) in &free_holes {
+                let lo = hstart.max(gstart);
+                let hi = (hstart + hlen).min(gstart + BLOCKS_PER_GROUP);
+                let mut b = lo;
+                while b < hi {
+                    let j = b - gstart;
+                    let mask = 1u8 << (j % 8);
+                    if bitmap_buf[(j / 8) as usize] & mask != 0 {
+                        bitmap_buf[(j / 8) as usize] &= !mask;
+                        used_block_count -= 1;
+                    }
+                    b += 1;
                 }
             }
 

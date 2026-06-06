@@ -8,6 +8,7 @@
 //!
 //! Run with: `cargo test -p ext4 --test fsck_validity -- --include-ignored`
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -43,12 +44,13 @@ fn content(seed: u64, len: usize) -> Vec<u8> {
 /// production path, write it to a temp file, and run `e2fsck -fn` on it.
 /// Returns Ok(()) if e2fsck reports a clean filesystem (exit 0), else Err(report).
 fn build_and_fsck(files: &[(&str, usize)], align: Option<(u32, u32)>) -> Result<(), String> {
-    let Some(e2fsck) = find_e2fsck() else {
-        eprintln!("SKIP: e2fsck not installed");
-        return Ok(());
-    };
+    let owned: Vec<(String, usize)> = files.iter().map(|(p, s)| ((*p).to_string(), *s)).collect();
+    e2fsck_clean(&build_image(&owned, align))
+}
 
-    // 1. Synthesize a tar stream.
+/// Build a real ext4 image (production convert path) from `(path, size)` files,
+/// each filled with the deterministic `content(index, size)`.
+fn build_image(files: &[(String, usize)], align: Option<(u32, u32)>) -> Vec<u8> {
     let mut tar = tar::Builder::new(Vec::new());
     for (i, (path, size)) in files.iter().enumerate() {
         let data = content(i as u64, *size);
@@ -58,42 +60,81 @@ fn build_and_fsck(files: &[(&str, usize)], align: Option<(u32, u32)>) -> Result<
         h.set_mtime(0);
         h.set_entry_type(tar::EntryType::Regular);
         h.set_cksum();
-        tar.append_data(&mut h, path, &data[..]).map_err(|e| format!("tar append: {e}"))?;
+        tar.append_data(&mut h, path, &data[..]).unwrap();
     }
-    let tar_bytes = tar.into_inner().map_err(|e| format!("tar finish: {e}"))?;
+    let tar_bytes = tar.into_inner().unwrap();
 
-    // 2. Convert to a real ext4 image (same code bless uses).
     let mut writer_options = vec![
-        WriterOption::MaximumDiskSize(2 * 1024 * 1024 * 1024),
+        WriterOption::MaximumDiskSize(4 * 1024 * 1024 * 1024),
         WriterOption::Uuid([0x11; 16]),
     ];
     if let Some((a, m)) = align {
         writer_options.push(WriterOption::AlignData { align: a, min_size: m });
     }
     let opts = ConvertOptions { convert_backslash: false, writer_options };
+    let mut img: Vec<u8> = Vec::new();
+    convert_tar_to_ext4(std::io::Cursor::new(tar_bytes), std::io::Cursor::new(&mut img), &opts)
+        .unwrap();
+    img
+}
 
-    let tmp = tempfile::NamedTempFile::new().map_err(|e| format!("tmp: {e}"))?;
-    let out = tmp.reopen().map_err(|e| format!("reopen: {e}"))?;
-    convert_tar_to_ext4(std::io::Cursor::new(tar_bytes), out, &opts)
-        .map_err(|e| format!("convert: {e}"))?;
-    tmp.as_file().sync_all().ok();
-
-    // 3. The oracle: e2fsck -fn. Exit 0 == clean.
+/// The oracle: run `e2fsck -fn` on the image. Ok == clean (exit 0). Skips
+/// (returns Ok) when e2fsck is not installed.
+fn e2fsck_clean(img: &[u8]) -> Result<(), String> {
+    let Some(e2fsck) = find_e2fsck() else {
+        eprintln!("SKIP: e2fsck not installed");
+        return Ok(());
+    };
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| format!("tmp: {e}"))?;
+    tmp.write_all(img).map_err(|e| format!("write: {e}"))?;
+    tmp.flush().ok();
     let output = Command::new(&e2fsck)
         .args(["-fn"])
         .arg(tmp.path())
         .output()
         .map_err(|e| format!("spawn e2fsck: {e}"))?;
-    let code = output.status.code().unwrap_or(-1);
-    if code == 0 {
+    if output.status.code() == Some(0) {
         Ok(())
     } else {
-        let mut report = format!("e2fsck exit={code} (nonzero = filesystem errors)\n");
+        let mut report = format!("e2fsck exit={:?} (nonzero = filesystem errors)\n", output.status.code());
         report.push_str(&String::from_utf8_lossy(&output.stdout));
         // Trim the giant bitmap-difference dumps to keep failures readable.
-        let trimmed: String = report.lines().take(40).collect::<Vec<_>>().join("\n");
-        Err(trimmed)
+        Err(report.lines().take(30).collect::<Vec<_>>().join("\n"))
     }
+}
+
+/// Read every file back via the reader (which assembles from the on-disk extent
+/// tree) and assert byte-exact equality with the known input — catches any
+/// logical-ordering bug introduced by fragmentation around reserved blocks.
+fn content_matches(img: &[u8], files: &[(String, usize)]) -> Result<(), String> {
+    let mut want: std::collections::HashMap<String, (u64, usize)> = std::collections::HashMap::new();
+    for (i, (p, s)) in files.iter().enumerate() {
+        want.insert(p.trim_start_matches('/').to_string(), (i as u64, *s));
+    }
+    let mut reader =
+        ext4::reader::Reader::new(std::io::Cursor::new(img)).map_err(|e| format!("reader: {e}"))?;
+    let entries = reader.walk().map_err(|e| format!("walk: {e}"))?;
+    let mut checked = 0;
+    for e in entries {
+        if (e.mode & 0xF000) != 0x8000 {
+            continue;
+        }
+        let path = e.path.trim_start_matches('/').to_string();
+        let Some(&(idx, size)) = want.get(&path) else { continue };
+        let inode = reader.read_inode(e.inode_number).map_err(|e| format!("{path}: inode: {e}"))?;
+        let got = reader.read_data(&inode).map_err(|e| format!("{path}: read: {e}"))?;
+        if got.len() != size {
+            return Err(format!("{path}: size {} != {size}", got.len()));
+        }
+        if got != content(idx, size) {
+            return Err(format!("{path}: CONTENT MISMATCH (fragmentation reordered bytes)"));
+        }
+        checked += 1;
+    }
+    if checked != files.len() {
+        return Err(format!("read back {checked}/{} files", files.len()));
+    }
+    Ok(())
 }
 
 /// Baseline: a single-block-group filesystem (< 128 MiB) must be e2fsck-clean.
@@ -114,10 +155,10 @@ fn fsck_single_group_clean() {
 }
 
 /// A filesystem that crosses a block-group boundary (> 128 MiB) must be
-/// e2fsck-clean. It currently is NOT: the writer's linear allocator places file
-/// data on the Group 1 backup superblock / group descriptors (block 32768+),
-/// producing multiply-claimed blocks the kernel rejects. Un-ignore once the
-/// allocator reserves group metadata.
+/// e2fsck-clean. Regression for the original corruption: the linear allocator
+/// used to place file data on the Group 1 backup superblock / group descriptors
+/// (block 32768+), producing multiply-claimed blocks. The group-aware allocator
+/// now skips those reserved blocks and fragments files around them.
 #[test]
 fn fsck_multi_group_clean() {
     // ~160 MiB of file data guarantees crossing into block group 1 (32768 blocks
@@ -202,7 +243,6 @@ fn content_survives_fragmentation() {
 /// must skip reserved blocks). Captures both the metadata-collision and the
 /// padding-bitmap issues found via e2fsck.
 #[test]
-#[ignore = "KNOWN BUG: alignment padding marked used + lands on group metadata; needs metadata-aware align"]
 fn fsck_multi_group_aligned_clean() {
     let files = &[
         ("data/a.bin", 40 * 1024 * 1024),
@@ -212,5 +252,64 @@ fn fsck_multi_group_aligned_clean() {
     ];
     if let Err(report) = build_and_fsck(files, Some((128 * 1024, 16 * 1024))) {
         panic!("aligned multi-group image is not e2fsck-clean:\n{report}");
+    }
+}
+
+/// Property fuzzer: random multi-group filesets must be e2fsck-clean AND read
+/// back byte-exact — both unaligned and aligned. Seeds are deterministic so any
+/// failure reproduces verbatim (the panic prints the seed and fileset). This is
+/// the generalized gate: it sweeps the size/position space where the original
+/// data-on-backup-superblock and alignment-bitmap bugs lived. Crank coverage
+/// with `EXT4_FUZZ_SEEDS=64 cargo test -p ext4 --test fsck_validity fuzz`.
+#[test]
+fn fuzz_multigroup_validity_and_content() {
+    if find_e2fsck().is_none() {
+        eprintln!("SKIP: e2fsck not installed");
+        return;
+    }
+    let seeds: u64 = std::env::var("EXT4_FUZZ_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+
+    for seed in 0..seeds {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // Random fileset with a deliberate mix: small files (below the align
+        // threshold), medium, and large (which straddle group boundaries).
+        let nfiles = 4 + (next() % 10) as usize;
+        let mut files: Vec<(String, usize)> = Vec::new();
+        let mut total: u64 = 0;
+        for k in 0..nfiles {
+            let size = match next() % 10 {
+                0..=3 => 1 + (next() % (64 * 1024)) as usize,
+                4..=6 => 4096 + (next() % (8 * 1024 * 1024)) as usize,
+                _ => 8 * 1024 * 1024 + (next() % (40 * 1024 * 1024)) as usize,
+            };
+            files.push((format!("d/s{seed}_f{k}.bin"), size));
+            total += size as u64;
+        }
+        // Guarantee at least one block-group boundary (128 MiB) is crossed so the
+        // reserved-block / fragmentation paths are always exercised.
+        if total < 160 * 1024 * 1024 {
+            let pad = (160 * 1024 * 1024 - total) as usize + 4 * 1024 * 1024;
+            files.push((format!("d/s{seed}_big.bin"), pad));
+        }
+
+        for align in [None, Some((128 * 1024u32, 16 * 1024u32))] {
+            let img = build_image(&files, align);
+            if let Err(e) = e2fsck_clean(&img) {
+                panic!("seed={seed} align={align:?} NOT e2fsck-clean:\n{e}\nfiles={files:?}");
+            }
+            if let Err(e) = content_matches(&img, &files) {
+                panic!("seed={seed} align={align:?} content error: {e}\nfiles={files:?}");
+            }
+        }
     }
 }
