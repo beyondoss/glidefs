@@ -857,10 +857,57 @@ pub fn compress_block(data: &[u8], level: i32) -> Vec<u8> {
 #[inline]
 pub fn decompress_block(compressed: &[u8]) -> Result<Vec<u8>, CompressError> {
     if compressed.len() >= 4 && compressed[..4] == ZSTD_MAGIC {
-        zstd::bulk::decompress(compressed, MAX_DECOMPRESSED_SIZE).map_err(CompressError::Zstd)
+        zstd_decompress(compressed, MAX_DECOMPRESSED_SIZE).map_err(CompressError::Zstd)
     } else {
         lz4_decompress(compressed).map_err(CompressError::Lz4)
     }
+}
+
+/// Decompress a zstd frame into a **fallibly-allocated, right-sized** buffer,
+/// bounded by `max_size`.
+///
+/// `zstd::bulk::decompress(_, cap)` allocates `Vec::with_capacity(cap)`
+/// *infallibly* on every call: without the crate's `experimental` feature it
+/// can't read the frame's content size, so it always reserves the full cap. On
+/// any read path that is two bugs at once:
+///
+///   1. **Abort surface.** Under host memory pressure that `Vec::with_capacity`
+///      routes failure through `handle_alloc_error` → `SIGABRT`, taking down the
+///      daemon (and storage for every VM) instead of failing one read. With a
+///      2 MiB cap this is the `memory allocation of 2097152 bytes failed` crash.
+///   2. **Over-allocation.** Real payloads are far smaller than the cap, but
+///      every decode reserves the whole cap regardless — churn on hot paths.
+///
+/// We read the frame's declared content size (one-shot `zstd::bulk::compress`
+/// records it in the header), clamp it to `max_size`, and `try_reserve_exact`
+/// so a genuine OOM returns `Err` — the caller fails that operation instead of
+/// aborting. The cap is still enforced two ways: an absent/oversized declared
+/// size clamps to `max_size`, and `decompress_to_buffer` errors rather than
+/// growing past the buffer's capacity, so a corrupt or adversarial frame can
+/// neither OOM nor overflow us.
+pub(crate) fn zstd_decompress(
+    compressed: &[u8],
+    max_size: usize,
+) -> Result<Vec<u8>, std::io::Error> {
+    // Declared decompressed size from the frame header, if present and sane.
+    let declared = zstd::zstd_safe::get_frame_content_size(compressed)
+        .ok()
+        .flatten()
+        .map(|n| n as usize)
+        .filter(|&n| n <= max_size);
+    let capacity = declared.unwrap_or(max_size);
+
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(capacity).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "zstd decompress buffer allocation failed (host OOM) — failing operation instead of aborting",
+        )
+    })?;
+
+    let mut dec = zstd::bulk::Decompressor::new()?;
+    dec.decompress_to_buffer(compressed, &mut buf)?;
+    Ok(buf)
 }
 
 // ============================================================================

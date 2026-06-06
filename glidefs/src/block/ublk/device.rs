@@ -2127,7 +2127,22 @@ async fn io_task_user_copy(
                 // (host OOM at worker init), this hands back a heap buffer so
                 // the daemon keeps serving instead of aborting; the worker
                 // upgrades back to the pool once memory recovers.
-                let mut iobuf = super::buffer_pool::acquire_io_buf(length as usize).await;
+                //
+                // `None` is the doubly-degraded case: no pool *and* the heap
+                // fallback couldn't be committed (host critically OOM). Fail
+                // just this one I/O with EIO — the daemon stays up serving
+                // every other tag and VM; the kernel retries the I/O. The
+                // alternative, an infallible alloc, would SIGABRT the whole
+                // daemon and take down storage host-wide.
+                let Some(mut iobuf) = super::buffer_pool::acquire_io_buf(length as usize).await
+                else {
+                    tracing::error!(
+                        qid, tag, length,
+                        "bounce buffer alloc failed (host OOM) — failing this I/O with EIO",
+                    );
+                    q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), -libc::EIO).await?;
+                    continue;
+                };
                 let buf: &mut [u8] = iobuf.as_mut_slice(length as usize);
 
                 if op == sys::UBLK_IO_OP_WRITE {
