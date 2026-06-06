@@ -463,6 +463,30 @@ impl<W: Read + Write + Seek> Writer<W> {
         }
     }
 
+    /// Position the cursor so the next `n` blocks form a single contiguous run
+    /// that contains no reserved block-group metadata, and return that start
+    /// block. Used for structures that must be contiguous (journal inode, the
+    /// flex_bg inode table, bitmaps) — unlike file data, they can't be
+    /// fragmented around a reserved block, so instead we skip the whole run past
+    /// any reserved region it would straddle. Skipped data blocks become free
+    /// holes; the reserved blocks stay used. `n` is always << a block group, so
+    /// at most one interior backup region is ever in the way.
+    fn reserve_contiguous(&mut self, n: u32) -> io::Result<u32> {
+        loop {
+            self.skip_reserved_at_pos()?;
+            let start = self.block();
+            match self.next_reserved_block_ge(start) {
+                Some(r) if r < start + n => {
+                    let g = r / BLOCKS_PER_GROUP;
+                    let region_end = g * BLOCKS_PER_GROUP + self.group_reserve();
+                    self.record_free_hole(start, r);
+                    self.seek_block(region_end)?;
+                }
+                _ => return Ok(start),
+            }
+        }
+    }
+
     /// The contiguous, non-reserved physical runs covering [start, end).
     fn physical_runs(&self, start: u32, end: u32) -> Vec<(u32, u32)> {
         let mut runs = Vec::new();
@@ -1316,7 +1340,10 @@ impl<W: Read + Write + Seek> Writer<W> {
     /// journal blocks. The superblock is updated in close() to set
     /// HAS_JOURNAL, journal_inum, and the journal_blocks backup.
     fn write_journal(&mut self) -> io::Result<()> {
-        let journal_start = self.block();
+        // The journal is one contiguous extent; keep it clear of reserved
+        // block-group metadata (a straddle would make inode 8 multiply-claim the
+        // backup superblock).
+        let journal_start = self.reserve_contiguous(self.journal_blocks)?;
 
         // Write JBD2 v2 superblock (first block of journal)
         // All multi-byte fields are big-endian per JBD2 spec.
@@ -1510,14 +1537,21 @@ impl<W: Read + Write + Seek> Writer<W> {
             self.write_journal()?;
         }
 
-        // Write the inode table
-        let inode_table_offset = self.block();
-        let (groups, inodes_per_group) = best_group_count(inode_table_offset, self.inodes.len() as u32);
+        // Write the inode table. It is contiguous and located via per-group
+        // descriptors (inode_table_low + g * size_per_group), so it must avoid
+        // reserved block-group metadata. Reserve a clean run sized for the group
+        // count; padding the start can bump the count by one group, so reserve a
+        // one-group margin and recompute against the final offset.
+        let n_inodes = self.inodes.len() as u32;
+        let (g0, ipg0) = best_group_count(self.block(), n_inodes);
+        let itspg0 = ipg0 * INODE_SIZE as u32 / BLOCK_SIZE as u32;
+        let inode_table_offset = self.reserve_contiguous((g0 + 1) * itspg0 + 2)?;
+        let (groups, inodes_per_group) = best_group_count(inode_table_offset, n_inodes);
         self.write_inode_table(groups * inodes_per_group * INODE_SIZE as u32)?;
 
-        // Write bitmaps
-        let bitmap_offset = self.block();
+        // Write bitmaps (also contiguous and GD-located).
         let bitmap_size = groups * 2;
+        let bitmap_offset = self.reserve_contiguous(bitmap_size)?;
         let valid_data_size = bitmap_offset + bitmap_size;
         let mut disk_size = valid_data_size;
         let min_size = (groups - 1) * BLOCKS_PER_GROUP + 1;

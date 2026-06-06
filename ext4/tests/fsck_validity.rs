@@ -67,6 +67,11 @@ fn build_image(files: &[(String, usize)], align: Option<(u32, u32)>) -> Vec<u8> 
     let mut writer_options = vec![
         WriterOption::MaximumDiskSize(4 * 1024 * 1024 * 1024),
         WriterOption::Uuid([0x11; 16]),
+        // Match the production bless config: an internal 4 MiB journal. The
+        // journal (and inode table / dir blocks) are written at close() and can
+        // land near a block-group backup-superblock boundary, so exercising it
+        // is part of validating the reserved-block handling.
+        WriterOption::Journal(1024),
     ];
     if let Some((a, m)) = align {
         writer_options.push(WriterOption::AlignData { align: a, min_size: m });
@@ -252,6 +257,58 @@ fn fsck_multi_group_aligned_clean() {
     ];
     if let Err(report) = build_and_fsck(files, Some((128 * 1024, 16 * 1024))) {
         panic!("aligned multi-group image is not e2fsck-clean:\n{report}");
+    }
+}
+
+/// Targeted sweep of the block-group boundary (block 32768 == 128 MiB). With a
+/// journal enabled (production config), the journal — and the inode table / dir
+/// blocks — are written at close() and can land straddling the Group 1 backup
+/// superblock. Sweep data sizes that push those close()-time structures across
+/// the boundary; every one must be e2fsck-clean. Regression for reserved-block
+/// handling of NON-file-data writes.
+#[test]
+fn fsck_journal_straddles_group_boundary() {
+    if find_e2fsck().is_none() {
+        eprintln!("SKIP: e2fsck not installed");
+        return;
+    }
+    // 120..136 MiB in 1 MiB steps: data ends near block 32768, so the trailing
+    // journal (1024 blocks = 4 MiB) and inode table cross the boundary.
+    for mib in 120..=136 {
+        let files = vec![(format!("data/blob_{mib}.bin"), mib * 1024 * 1024)];
+        for align in [None, Some((128 * 1024u32, 128 * 1024u32))] {
+            let img = build_image(&files, align);
+            if let Err(e) = e2fsck_clean(&img) {
+                panic!("{mib} MiB align={align:?} NOT e2fsck-clean:\n{e}");
+            }
+            if let Err(e) = content_matches(&img, &files) {
+                panic!("{mib} MiB align={align:?} content error: {e}");
+            }
+        }
+    }
+}
+
+/// Many files whose data ends near block 32768 make the flex_bg inode table
+/// large enough to straddle the Group 1 backup superblock. The inode table is
+/// contiguous and pointed at by per-group descriptors, so it must also dodge
+/// reserved blocks. Regression for inode-table/bitmap reserved-block handling.
+#[test]
+fn fsck_inode_table_straddles_boundary() {
+    if find_e2fsck().is_none() {
+        eprintln!("SKIP: e2fsck not installed");
+        return;
+    }
+    // N one-block files put data just below block 32768 while the inode table
+    // (N/16 blocks) crosses it. Sweep a few counts so one reliably straddles.
+    for n in [30_500usize, 31_000, 31_500] {
+        let files: Vec<(String, usize)> =
+            (0..n).map(|i| (format!("d{}/f{i}.bin", i % 256), 4096)).collect();
+        for align in [None, Some((128 * 1024u32, 128 * 1024u32))] {
+            let img = build_image(&files, align);
+            if let Err(e) = e2fsck_clean(&img) {
+                panic!("inode-table straddle n={n} align={align:?} NOT e2fsck-clean:\n{e}");
+            }
+        }
     }
 }
 
