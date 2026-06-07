@@ -195,6 +195,9 @@ pub struct Writer<W: Read + Write + Seek> {
     /// in this order, so the boot working set forms one tight, coalesce-friendly
     /// run at the front of the image. Empty = natural DFS order.
     priority: Vec<String>,
+    /// Where to create the file-content spool. `None` = system temp dir (which
+    /// may be tmpfs/RAM); set to real disk to keep memory bounded.
+    spool_dir: Option<std::path::PathBuf>,
 }
 
 impl<W: Read + Write + Seek> Writer<W> {
@@ -203,6 +206,7 @@ impl<W: Read + Write + Seek> Writer<W> {
         let mut data_align = 0usize;
         let mut data_align_min = 0usize;
         let mut priority = Vec::new();
+        let mut spool_dir = None;
         for o in opts {
             match o {
                 WriterOption::Uuid(u) => uuid = *u,
@@ -212,6 +216,7 @@ impl<W: Read + Write + Seek> Writer<W> {
                     data_align_min = *min_size as usize;
                 }
                 WriterOption::PriorityOrder(paths) => priority = paths.clone(),
+                WriterOption::SpoolDir(dir) => spool_dir = Some(dir.clone()),
                 _ => {}
             }
         }
@@ -226,6 +231,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             data_align,
             data_align_min,
             priority,
+            spool_dir,
         }
     }
 
@@ -387,7 +393,13 @@ impl<W: Read + Write + Seek> Write for Writer<W> {
         let spool = match &mut self.spool {
             Some(f) => f,
             None => {
-                self.spool = Some(tempfile::tempfile()?);
+                // Spool into the configured dir (real disk) when given, else the
+                // system temp dir (which may be tmpfs/RAM).
+                let f = match &self.spool_dir {
+                    Some(dir) => tempfile::tempfile_in(dir)?,
+                    None => tempfile::tempfile()?,
+                };
+                self.spool = Some(f);
                 self.spool.as_mut().unwrap()
             }
         };

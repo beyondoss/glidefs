@@ -91,6 +91,11 @@ pub enum WriterOption {
     /// applied to them) so no holes break fetch coalescing; the unprioritized
     /// remainder still honors [`WriterOption::AlignData`] for at-rest dedup.
     PriorityOrder(Vec<String>),
+    /// Directory the EROFS writer spools file contents into (bounded-memory
+    /// assembly). Defaults to the system temp dir, which on some hosts is tmpfs
+    /// (RAM) — point this at real disk to keep peak memory actually bounded.
+    /// EROFS writer only; the ext4 writer streams and ignores it.
+    SpoolDir(std::path::PathBuf),
 }
 
 // ---- Internal inode ----
@@ -316,9 +321,9 @@ impl<W: Read + Write + Seek> Writer<W> {
                     w.data_align = i64::from(*align);
                     w.data_align_min = i64::from(*min_size);
                 }
-                // Cold-start file ordering is an EROFS-writer concern; the ext4
-                // writer has its own block allocator and ignores it.
-                WriterOption::PriorityOrder(_) => {}
+                // EROFS-writer concerns; the ext4 writer streams + has its own
+                // block allocator, so it ignores both.
+                WriterOption::PriorityOrder(_) | WriterOption::SpoolDir(_) => {}
             }
         }
         w

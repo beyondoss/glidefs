@@ -25,6 +25,22 @@ use std::time::Instant;
 use tokio::sync::Notify;
 use tracing::info;
 
+/// A disk-backed scratch directory for bless. The WriteCache cache file, the
+/// two-pass probe image, and the EROFS content spool can each be ~image-sized,
+/// so they must NOT land on a tmpfs `/tmp` (RAM). Prefers `$GLIDEFS_BLESS_WORKDIR`,
+/// then `/var/tmp` (FHS persistent temp, normally real disk) if writable, else
+/// falls back to the system temp dir.
+fn bless_scratch_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("GLIDEFS_BLESS_WORKDIR") {
+        return PathBuf::from(d);
+    }
+    let var_tmp = std::path::Path::new("/var/tmp");
+    if var_tmp.is_dir() && tempfile::tempfile_in(var_tmp).is_ok() {
+        return var_tmp.to_path_buf();
+    }
+    std::env::temp_dir()
+}
+
 pub async fn run_bless(
     image_path: PathBuf,
     name: String,
@@ -545,8 +561,9 @@ pub async fn run_bless_oci(
         "estimated device size"
     );
 
-    // --- Create temporary export infrastructure ---
-    let temp_dir = tempfile::TempDir::new().context("failed to create temp dir")?;
+    // --- Create temporary export infrastructure (disk-backed scratch so the
+    // WriteCache cache file doesn't balloon RAM via tmpfs /tmp). ---
+    let temp_dir = tempfile::TempDir::new_in(bless_scratch_dir()).context("failed to create temp dir")?;
     let cache_config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: format!("bless-oci-{}", name),
@@ -784,8 +801,11 @@ pub async fn run_bless_oci_erofs(
         );
     }
 
-    // --- Volume infrastructure (mirrors run_bless_oci) ---
-    let temp_dir = tempfile::TempDir::new().context("failed to create temp dir")?;
+    // --- Volume infrastructure (mirrors run_bless_oci). All bless scratch (the
+    // WriteCache cache file, the probe image, the EROFS spool) goes on a
+    // disk-backed dir so big images don't balloon RAM via tmpfs /tmp. ---
+    let scratch = bless_scratch_dir();
+    let temp_dir = tempfile::TempDir::new_in(&scratch).context("failed to create temp dir")?;
     let cache = Arc::new(WriteCache::open_fresh_active(WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: format!("bless-erofs-{}", name),
@@ -838,6 +858,7 @@ pub async fn run_bless_oci_erofs(
 
     let priority: Vec<String> = if let Some(cmd) = run_cmd {
         info!("two-pass: building probe image (pass 1)");
+        let scratch1 = scratch.clone();
         let (probe, layers_back) = tokio::task::spawn_blocking(
             move || -> Result<(tempfile::NamedTempFile, Vec<std::fs::File>)> {
                 let opts = ext4::tar_convert::ConvertOptions {
@@ -845,9 +866,10 @@ pub async fn run_bless_oci_erofs(
                     writer_options: vec![
                         WriterOption::Uuid(uuid),
                         WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
+                        WriterOption::SpoolDir(scratch1.clone()),
                     ],
                 };
-                let tmp = tempfile::NamedTempFile::new().context("probe tempfile")?;
+                let tmp = tempfile::NamedTempFile::new_in(&scratch1).context("probe tempfile")?;
                 ext4::convert_oci_layers_to_erofs(&mut layer_files, tmp.reopen()?, &opts)
                     .map_err(|e| anyhow::anyhow!("probe convert failed: {e}"))?;
                 Ok((tmp, layer_files))
@@ -866,6 +888,7 @@ pub async fn run_bless_oci_erofs(
 
     let rt = tokio::runtime::Handle::current();
     let handler_for_write = Arc::clone(&handler);
+    let scratch2 = scratch.clone();
     info!("merging layers into EROFS (final, pass 2)");
     let prefetch_len = tokio::task::spawn_blocking(move || -> Result<u64> {
         let mut writer_options = vec![
@@ -873,6 +896,7 @@ pub async fn run_bless_oci_erofs(
             // Align large file payloads to the dedup block grid (cross-image
             // dedup); EROFS has no reserved blocks so this is always safe.
             WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
+            WriterOption::SpoolDir(scratch2.clone()),
         ];
         if !priority.is_empty() {
             writer_options.push(WriterOption::PriorityOrder(priority));
