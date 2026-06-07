@@ -73,13 +73,12 @@ pub enum WriterOption {
     /// content-addressed dedup survives unrelated upstream churn. `align` must
     /// be a power of two; `align == 0` disables (the default).
     ///
-    /// KNOWN LIMITATION (do not enable in production yet): the current pad is
-    /// not metadata-aware. Padding can land a file's data on an ext4 block-group
-    /// reserved block (e.g. the backup superblock at block `blocks_per_group`),
-    /// producing an extent the *kernel* rejects ("invalid extent entries"),
-    /// even though the in-crate reader accepts it. A correct implementation must
-    /// skip group-metadata blocks when aligning. Verified via `dedup_probe` +
-    /// `e2fsck`/loop-mount.
+    /// Metadata-aware: the aligned position and the data that follows skip ext4
+    /// block-group reserved blocks (backup superblocks + GDT), so the kernel
+    /// accepts the extents (`is_reserved_block` / `skip_reserved_at_pos` /
+    /// `write_file_data`). The padded gap is recorded as free space, minus those
+    /// reserved blocks. Safe in production; `bless` enables it for every image it
+    /// builds from layers. Verified via `dedup_probe` + `e2fsck`/loop-mount.
     AlignData { align: u32, min_size: u32 },
     /// Lay these paths' inodes and data out FIRST, contiguously, in the given
     /// order — the boot/cold-start working set ("prioritized files", à la
