@@ -660,7 +660,7 @@ async fn reconcile_prefix(
                     {
                         r.to_string()
                     }
-                    // skip sidecars (.boot-set, legacy .hot-set) + non-manifest entries
+                    // skip legacy sidecars (.boot-set, .hot-set) + non-manifest entries
                     _ => return Ok(None),
                 };
                 let response = match store.get(&meta.location).await {

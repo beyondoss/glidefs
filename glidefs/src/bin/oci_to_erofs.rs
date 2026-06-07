@@ -45,28 +45,13 @@ fn main() {
     // The padding is holes (zeros) the block layer never stores. EROFS has no
     // interleaved group metadata, so this is always structurally safe.
     const GRID: u32 = 128 * 1024;
-    let mut writer_options = vec![
+    let writer_options = vec![
         WriterOption::Uuid([0u8; 16]),
         WriterOption::AlignData { align: GRID, min_size: 16 * 1024 },
     ];
-    // Optional cold-start priority list: GLIDEFS_EROFS_PRIORITY=<file>, one
-    // in-image path per line in access order (e.g. derived from a boot trace).
-    // These files are laid out tight at the front so the boot working set is one
-    // coalesce-friendly fetch.
-    if let Some(pf) = std::env::var_os("GLIDEFS_EROFS_PRIORITY") {
-        let txt = std::fs::read_to_string(&pf).expect("read priority file");
-        let paths: Vec<String> = txt
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(String::from)
-            .collect();
-        eprintln!("priority list: {} paths", paths.len());
-        writer_options.push(WriterOption::PriorityOrder(paths));
-    }
     let opts = ConvertOptions { convert_backslash: false, writer_options };
     let t = std::time::Instant::now();
-    let (mut fs, prefetch_len) = ext4::convert_oci_layers_to_erofs_with_prefetch(
+    let mut fs = ext4::convert_oci_layers_to_erofs(
         &mut layers,
         tempfile::tempfile().unwrap(),
         &opts,
@@ -77,10 +62,4 @@ fn main() {
     fs.read_to_end(&mut buf).unwrap();
     std::fs::write(&out, &buf).expect("write out");
     eprintln!("built {out} ({} bytes) in {} ms", buf.len(), t.elapsed().as_millis());
-    // The boot working set occupies [0, prefetch_len); bless persists this in the
-    // volume manifest (prefetch_len) so the server warms it on device open.
-    eprintln!(
-        "prefetch_len: {prefetch_len} bytes ({:.1} MiB) — boot working set for warm-on-open",
-        prefetch_len as f64 / (1024.0 * 1024.0)
-    );
 }

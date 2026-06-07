@@ -209,10 +209,6 @@ pub struct BlockHandler {
     /// Optional write trace recorder. Zero cost when None.
     write_tracer: Option<Arc<WriteTracer>>,
 
-    /// Optional read trace recorder — captures the guest's read pattern (the
-    /// boot working set) for trace-guided prefetch. Zero cost when None.
-    read_tracer: Option<Arc<WriteTracer>>,
-
     /// Test-only: sync points for deterministic interleaving tests.
     #[cfg(feature = "test-utils")]
     backfill_sync: Option<Arc<BackfillSyncPoints>>,
@@ -257,18 +253,9 @@ impl BlockHandler {
             flush_notify,
             flush_threshold,
             write_tracer,
-            read_tracer: None,
             #[cfg(feature = "test-utils")]
             backfill_sync: None,
         }
-    }
-
-    /// Attach a read tracer (records the guest's read pattern → boot working set).
-    /// Set at device open by the router when `GLIDEFS_READ_TRACE_DIR` is set.
-    #[must_use]
-    pub fn with_read_tracer(mut self, tracer: Option<Arc<WriteTracer>>) -> Self {
-        self.read_tracer = tracer;
-        self
     }
 
     /// Attach sync points for deterministic interleaving tests.
@@ -806,9 +793,6 @@ impl BlockHandler {
         ) as u32;
 
         self.metrics.record_guest_read(u64::from(clamped_len));
-        if let Some(ref tracer) = self.read_tracer {
-            tracer.record(offset, u64::from(clamped_len), super::write_trace::TraceOp::Read);
-        }
 
         let data = self
             .cache
@@ -871,9 +855,6 @@ impl BlockHandler {
         ) as u32;
 
         self.metrics.record_guest_read(u64::from(clamped_len));
-        if let Some(ref tracer) = self.read_tracer {
-            tracer.record(offset, u64::from(clamped_len), super::write_trace::TraceOp::Read);
-        }
 
         // Fast path: all blocks present on local SSD → pread directly into
         // caller buffer. Zero allocation, zero memcpy.
@@ -1516,59 +1497,9 @@ impl BlockHandler {
         Ok(plan)
     }
 
-    /// Record the boot working-set extent `[0, len)` in the volume manifest so a
-    /// future device open warms it (see [`prefetch_warm`](Self::prefetch_warm)).
-    /// `0` clears the hint. The value is persisted on the next manifest sync.
-    /// This is the connector the image-build/bless path calls after writing a
-    /// prioritized EROFS image (its `prefetch_len` comes from the writer).
-    pub fn set_prefetch_len(&self, len: u64) {
-        self.volume_manifest.write().prefetch_len = (len > 0).then_some(len);
-    }
-
     /// Read-only access to this export's metrics (cache hits/misses, S3 ops).
     pub fn metrics(&self) -> &ExportMetrics {
         &self.metrics
-    }
-
-    /// The persisted boot-prefetch extent, if any (loaded from the manifest).
-    pub fn prefetch_len(&self) -> Option<u64> {
-        self.volume_manifest.read().prefetch_len
-    }
-
-    /// Warm the clean cache with the DATA of a bounded boot working set (a
-    /// trace-captured block list). The universal, format-agnostic prefetch:
-    /// works for any base (ext4 or EROFS), stays bounded (preserves lazy
-    /// loading), and coalesces contiguous runs into single S3 GETs.
-    pub async fn prefetch_warm_blocks(&self, blocks: &[u64]) {
-        self.cache
-            .prefetch_data_blocks(
-                blocks,
-                self.clean_cache.as_ref(),
-                &self.pack_index_cache,
-                &self.volume_manifest,
-                &self.content_store,
-                &self.metrics,
-            )
-            .await;
-    }
-
-    /// Warm the clean cache with the boot working set's DATA: the first `len`
-    /// bytes (the trace-ordered priority region). After this resolves, the
-    /// guest's first reads over that range are cache hits instead of S3 GETs.
-    /// Best-effort and idempotent; intended to be spawned as a background task
-    /// on device open. Unlike readahead/index prefetch (pack indices only),
-    /// this fetches and decompresses the actual blocks.
-    pub async fn prefetch_warm(&self, len: u64) {
-        self.cache
-            .prefetch_data_range(
-                len,
-                self.clean_cache.as_ref(),
-                &self.pack_index_cache,
-                &self.volume_manifest,
-                &self.content_store,
-                &self.metrics,
-            )
-            .await;
     }
 
     /// Trigger sequential readahead detection and prefetch.

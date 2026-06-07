@@ -370,8 +370,8 @@ impl<W: Read + Write + Seek> Writer<W> {
 
     /// Like [`close`](Self::close) but also returns the **prefetch length**: the
     /// byte extent `[0, len)` covering the metadata region plus the contiguous
-    /// priority (boot working set) data run. Callers (bless) persist this in the
-    /// volume manifest so the server warms exactly the boot set on device open.
+    /// priority data run. Callers (bless) persist this in the volume manifest so
+    /// the server warms exactly the priority region on device open.
     /// `0` when no `PriorityOrder` was given (no hint).
     pub fn close_with_prefetch(mut self) -> io::Result<(W, u64)> {
         // serialize() streams the image directly into `self.out`.

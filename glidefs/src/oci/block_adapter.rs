@@ -374,15 +374,14 @@ mod tests {
     }
 
     /// END-TO-END layout-at-scale: serve a realistically-sized EROFS image built
-    /// with BOTH grid alignment (dedup) AND cold-start priority ordering (holes +
-    /// reordered data + a multi-grid-block file + a long tail of inline small
-    /// files) over a REAL ublk device + the in-kernel `erofs` driver, and verify
-    /// every file reads back byte-exact. Tiny images can't expose layout bugs
-    /// that only appear with alignment holes, reordered priority runs, and
+    /// with grid alignment (dedup) — holes + a multi-grid-block file + a long
+    /// tail of inline small files — over a REAL ublk device + the in-kernel
+    /// `erofs` driver, and verify every file reads back byte-exact. Tiny images
+    /// can't expose layout bugs that only appear with alignment holes and
     /// multi-block files — this is the test that does.
     #[cfg(feature = "ublk")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn erofs_aligned_prioritized_served_over_ublk() {
+    async fn erofs_aligned_served_over_ublk() {
         use std::process::Command;
         use std::sync::Arc;
 
@@ -412,7 +411,7 @@ mod tests {
         let smalls: Vec<(String, Vec<u8>)> =
             (0..40).map(|i| (format!("etc/f{i:02}"), payload(1000 + i, 1500 + i as usize * 7))).collect();
 
-        let (image, prefetch_len) = tokio::task::spawn_blocking({
+        let image = tokio::task::spawn_blocking({
             let big = big.clone();
             let med1 = med1.clone();
             let med2 = med2.clone();
@@ -447,35 +446,27 @@ mod tests {
                 b.append(&hl, &[][..]).unwrap();
                 let layer = b.into_inner().unwrap();
 
-                // Alignment for dedup + priority order for cold start: big.bin and
-                // a couple of boot files are pulled to the front, packed tight.
+                // Grid alignment for cross-image dedup: large file payloads snap
+                // to the 128 KiB block grid (holes the block layer never stores).
                 let opts = ext4::tar_convert::ConvertOptions {
                     convert_backslash: false,
                     writer_options: vec![
                         ext4::writer::WriterOption::Uuid([3u8; 16]),
                         ext4::writer::WriterOption::AlignData { align: GRID, min_size: 16 * 1024 },
-                        ext4::writer::WriterOption::PriorityOrder(vec![
-                            "big.bin".into(),
-                            "bin/run".into(),
-                            "etc/f00".into(),
-                        ]),
                     ],
                 };
                 let mut layers = vec![Cursor::new(layer)];
-                ext4::convert_oci_layers_to_erofs_with_prefetch(
+                ext4::convert_oci_layers_to_erofs(
                     &mut layers,
                     Cursor::new(Vec::new()),
                     &opts,
                 )
-                .map(|(c, p)| (c.into_inner(), p))
+                .map(|c| c.into_inner())
                 .unwrap()
             }
         })
         .await
         .unwrap();
-
-        assert!(prefetch_len >= big.len() as u64, "prefetch extent must cover big.bin");
-        assert!(prefetch_len < image.len() as u64, "prefetch extent must be a prefix");
 
         // Device large enough for the aligned (hole-inflated) image.
         let device = (image.len() as u64 + GRID as u64).next_power_of_two().max(32 * 1024 * 1024);
@@ -496,7 +487,7 @@ mod tests {
         let handler = Arc::new(handler);
         let mut server = crate::block::ublk::UblkServer::new();
         let dev = server
-            .add_device("erofs-aligned-prio", Arc::clone(&handler))
+            .add_device("erofs-aligned", Arc::clone(&handler))
             .await
             .expect("register ublk device");
 
@@ -508,10 +499,10 @@ mod tests {
                 .arg(mnt.path())
                 .status()
                 .expect("spawn mount");
-            assert!(m.success(), "kernel erofs mount of aligned+prioritized image failed");
+            assert!(m.success(), "kernel erofs mount of aligned image failed");
 
             let rd = |p: &str| std::fs::read(mnt.path().join(p)).unwrap();
-            assert_eq!(rd("big.bin"), big, "multi-grid priority file must read byte-exact");
+            assert_eq!(rd("big.bin"), big, "multi-grid file must read byte-exact");
             assert_eq!(rd("biglink"), big, "symlink to big file resolves + reads exact");
             assert_eq!(rd("lib/med1.so"), med1, "aligned medium file 1 byte-exact");
             assert_eq!(rd("lib/med2.so"), med2, "aligned medium file 2 byte-exact");
@@ -522,7 +513,7 @@ mod tests {
             }
             let _ = Command::new("umount").arg(mnt.path()).status();
         }));
-        server.remove_device("erofs-aligned-prio").await.ok();
+        server.remove_device("erofs-aligned").await.ok();
         if let Err(e) = result {
             let _ = Command::new("umount").arg(mnt.path()).status();
             std::panic::resume_unwind(e);

@@ -231,7 +231,7 @@ async fn bless_image_to_s3(
     }
 
     // Save manifest as base (index warming on fork comes from the manifest's
-    // pack list; the boot set is captured at runtime — no `.hot-set` artifact).
+    // pack list; no sidecar artifact is written).
     let manifest_key = format!("bases/{}", name);
     content_store
         .put_manifest(&manifest_key, volume_manifest.serialize().unwrap(), None)

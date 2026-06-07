@@ -351,13 +351,13 @@ fn erofs_alignment_recovers_dedup_under_churn() {
 }
 
 /// Cold-start priority ordering: files named in `PriorityOrder` are laid out
-/// FIRST and contiguously, so the boot working set is one coalesce-friendly run
+/// FIRST and contiguously, so the priority region is one coalesce-friendly run
 /// instead of being scattered across the image. We prove it by content offset:
 /// a priority file created LAST must nonetheless land EARLIER in the image than a
 /// non-priority file created first — the layout order, not creation order, wins.
 /// Also asserts determinism and `fsck.erofs` validity.
 #[test]
-fn erofs_priority_order_places_boot_set_first() {
+fn erofs_priority_order_places_priority_file_first() {
     use ext4::erofs::Writer;
     use ext4::File;
 

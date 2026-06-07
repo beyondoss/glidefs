@@ -93,9 +93,10 @@ where
 
 /// Like [`convert_oci_layers_to_erofs`] but also returns the **prefetch length**
 /// — the leading byte extent `[0, len)` covering the metadata region plus the
-/// contiguous priority (boot working set) data run (0 when no
+/// contiguous priority data run (0 when no
 /// [`WriterOption::PriorityOrder`](crate::writer::WriterOption) was given).
-/// Persist this in the volume manifest so the server warms the boot set on open.
+/// Persist this in the volume manifest so the server warms the priority region
+/// on open.
 pub fn convert_oci_layers_to_erofs_with_prefetch<R, W>(
     layers: &mut [R],
     output: W,

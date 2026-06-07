@@ -25,9 +25,9 @@ use std::time::Instant;
 use tokio::sync::Notify;
 use tracing::info;
 
-/// A disk-backed scratch directory for bless. The WriteCache cache file, the
-/// two-pass probe image, and the EROFS content spool can each be ~image-sized,
-/// so they must NOT land on a tmpfs `/tmp` (RAM). Prefers `$GLIDEFS_BLESS_WORKDIR`,
+/// A disk-backed scratch directory for bless. The WriteCache cache file and the
+/// EROFS content spool can each be ~image-sized, so they must NOT land on a
+/// tmpfs `/tmp` (RAM). Prefers `$GLIDEFS_BLESS_WORKDIR`,
 /// then `/var/tmp` (FHS persistent temp, normally real disk) if writable, else
 /// falls back to the system temp dir.
 fn bless_scratch_dir() -> PathBuf {
@@ -127,383 +127,18 @@ pub async fn run_bless(
     Ok(())
 }
 
-/// Convert a captured read trace into a base's boot SET and upload it.
-///
-/// Closes the trace→boot-set→upload loop: the read tracer
-/// (`GLIDEFS_READ_TRACE_DIR`) records what a real boot touches; this turns that
-/// bounded set into the `.boot-set` artifact the server data-prefetches on fork
-/// open. Idempotent — re-running overwrites the boot set.
-pub async fn run_make_boot_set(
-    trace: PathBuf,
-    name: String,
-    s3_prefix: String,
-    max_blocks: usize,
-    config_path: PathBuf,
-) -> Result<()> {
-    use crate::block::manifest::serialize_block_list;
-    use crate::block::write_trace::{boot_set_from_trace, read_header};
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or(tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
-    let trace_bytes = std::fs::read(&trace)
-        .with_context(|| format!("read trace {}", trace.display()))?;
-    let header = read_header(&trace_bytes)
-        .ok_or_else(|| anyhow::anyhow!("not a valid GLIDETRC trace: {}", trace.display()))?;
-    // The trace's block size must match the volume's (128 KiB) so block indices
-    // line up; refuse a mismatched trace rather than upload a wrong boot set.
-    anyhow::ensure!(
-        header.block_size == BLOCK_SIZE,
-        "trace block_size {} != volume block_size {BLOCK_SIZE}; capture the trace on a {BLOCK_SIZE}-byte-block export",
-        header.block_size,
-    );
-
-    let boot_set = boot_set_from_trace(&trace_bytes, max_blocks);
-    anyhow::ensure!(
-        !boot_set.is_empty(),
-        "trace contains no read ops — nothing to prefetch (was the workload actually exercised?)"
-    );
-
-    // S3 setup (same shape as run_bless).
-    let settings = Settings::from_file(&config_path)
-        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
-    let env_vars = settings.cloud_provider_env_vars();
-    let (object_store, path_from_url) = parse_url_opts(
-        &settings.storage.url.parse()?,
-        env_vars.into_iter(),
-        Some(settings.storage.connect_timeout()),
-        Some(settings.storage.request_timeout()),
-    )?;
-    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
-    let base = format!("{}/exports/{}", path_from_url, s3_prefix);
-    let content_store = ContentStore::new(Arc::clone(&object_store), &base);
-
-    content_store
-        .put_boot_set(&name, serialize_block_list(&boot_set))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to upload boot set: {e}"))?;
-
-    println!("Uploaded boot set for '{}':", name);
-    println!("  Trace:           {}", trace.display());
-    println!("  Boot-set blocks: {} ({:.1} MiB)", boot_set.len(), boot_set.len() as f64 * BLOCK_SIZE as f64 / (1024.0 * 1024.0));
-    println!("  Artifact:        manifests/bases/{}.boot-set", name);
-    Ok(())
-}
-
-/// The container's runnable command (Entrypoint ++ Cmd) from its OCI config
-/// blob, used to exercise the image during auto-profiling. None if the config
-/// has neither (nothing meaningful to boot).
-fn oci_run_command(config: &[u8]) -> Option<Vec<String>> {
-    let v: serde_json::Value = serde_json::from_slice(config).ok()?;
-    let cfg = v.get("config")?;
-    let mut cmd = Vec::new();
-    let strs = |k: &str| -> Vec<String> {
-        cfg.get(k)
-            .and_then(|x| x.as_array())
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-            .unwrap_or_default()
-    };
-    cmd.extend(strs("Entrypoint"));
-    cmd.extend(strs("Cmd"));
-    (!cmd.is_empty()).then_some(cmd)
-}
-
-/// The image's environment (`config.Env`, `KEY=val` strings) — notably `PATH`,
-/// without which a relative entrypoint like `python3` won't exec in the chroot.
-fn oci_env(config: &[u8]) -> Vec<String> {
-    serde_json::from_slice::<serde_json::Value>(config)
-        .ok()
-        .and_then(|v| {
-            v.get("config")?.get("Env")?.as_array().map(|a| {
-                a.iter().filter_map(|s| s.as_str().map(String::from)).collect()
-            })
-        })
-        .unwrap_or_default()
-}
-
-/// Profile by FILE PATH (for two-pass priority layout): loop-mount the built
-/// image, run `run_cmd` once in a chroot under `strace -e openat`, and return the
-/// in-image paths it opened, in first-touch order. These feed
-/// `WriterOption::PriorityOrder` so pass 2 lays the boot working set contiguously
-/// at the front. Best-effort: empty on any failure (no root, no strace, mount or
-/// run fails) → pass 2 just falls back to natural order.
-async fn profile_file_paths(
-    image_path: &std::path::Path,
-    fs_type: &str,
-    run_cmd: &[String],
-    env: &[String],
-    timeout_secs: u32,
-) -> Vec<String> {
-    let image = image_path.to_path_buf();
-    let fs_type = fs_type.to_string();
-    let run_cmd = run_cmd.to_vec();
-    let env = env.to_vec();
-    tokio::task::spawn_blocking(move || -> Vec<String> {
-        use std::process::Command;
-        let Ok(mnt) = tempfile::TempDir::new() else { return vec![] };
-        let mnt = mnt.path();
-        let strace_out = mnt.parent().unwrap_or(mnt).join("glidefs-prof.strace");
-        let _ = std::fs::remove_file(&strace_out);
-
-        let mounted = Command::new("mount")
-            .args(["-t", &fs_type, "-o", "ro,loop"])
-            .arg(&image)
-            .arg(mnt)
-            .status();
-        if !matches!(mounted, Ok(s) if s.success()) {
-            return vec![]; // not root / loop unsupported / bad image
-        }
-        let _ = Command::new("mount").args(["--bind", "/proc"]).arg(mnt.join("proc")).status();
-        let _ = Command::new("mount").args(["--bind", "/dev"]).arg(mnt.join("dev")).status();
-
-        // strace -f -e openat -o OUT  timeout -sKILL N  chroot MNT  <cmd...>
-        let mut c = Command::new("strace");
-        c.args(["-f", "-e", "trace=openat", "-o"]).arg(&strace_out);
-        c.arg("timeout").args(["--signal=KILL", &timeout_secs.to_string(), "chroot"]).arg(mnt);
-        c.args(&run_cmd);
-        c.env_clear();
-        for kv in &env {
-            if let Some((k, v)) = kv.split_once('=') {
-                c.env(k, v);
-            }
-        }
-        let _ = c.status(); // non-zero / killed is fine — we want the opens
-
-        // Canonicalize the opened paths to real in-image paths WHILE mounted
-        // (resolves `..` and symlinks so they match the writer's path table).
-        let mut seen = std::collections::HashSet::new();
-        let mut paths = Vec::new();
-        if let Ok(trace) = std::fs::read_to_string(&strace_out) {
-            for line in trace.lines() {
-                let Some(p) = parse_openat_path(line) else { continue };
-                if p.starts_with("/proc") || p.starts_with("/dev") || p.starts_with("/sys") {
-                    continue;
-                }
-                let host = mnt.join(p.trim_start_matches('/'));
-                let Ok(real) = std::fs::canonicalize(&host) else { continue };
-                let Ok(rel) = real.strip_prefix(mnt) else { continue };
-                if rel.as_os_str().is_empty() || !real.is_file() {
-                    continue;
-                }
-                let rel = rel.to_string_lossy().into_owned();
-                if seen.insert(rel.clone()) {
-                    paths.push(rel);
-                }
-            }
-        }
-        let _ = Command::new("umount").arg(mnt.join("dev")).status();
-        let _ = Command::new("umount").arg(mnt.join("proc")).status();
-        let _ = Command::new("umount").arg(mnt).status();
-        let _ = std::fs::remove_file(&strace_out);
-        paths
-    })
-    .await
-    .unwrap_or_default()
-}
-
-/// Extract the path from a successful `openat(..., "PATH", ...) = <fd>=0` strace
-/// line. `None` for non-openat lines or failed opens (`= -1 ...`).
-fn parse_openat_path(line: &str) -> Option<&str> {
-    let rest = line.split_once("openat(")?.1;
-    let q1 = rest.find('"')?;
-    let after = &rest[q1 + 1..];
-    let q2 = after.find('"')?;
-    let path = &after[..q2];
-    // success = the line ends with `= <non-negative number>` (fd), not `= -1`.
-    let ret = line.rsplit_once('=')?.1.trim();
-    let ok = ret.split_whitespace().next().and_then(|n| n.parse::<i64>().ok()).is_some_and(|n| n >= 0);
-    ok.then_some(path)
-}
-
-/// Auto-profile a freshly-blessed base: serve it through GlideFS over a ublk
-/// device, kernel-mount it (`fs_type`), run `run_cmd` once in a chroot while a
-/// read tracer records the blocks the kernel actually fetches, and turn that
-/// into a bounded boot set. Format-agnostic (ext4 or erofs — the kernel mounts
-/// either; the tracer sees block reads regardless).
-///
-/// Best-effort: returns `None` (with a warning) if anything is missing (no root,
-/// no ublk, mount/run fails). The base is fully valid without a boot set — this
-/// only adds warm-on-open. Requires the `ublk` feature; without it, a no-op.
-#[cfg(feature = "ublk")]
-#[allow(clippy::too_many_arguments)]
-async fn profile_boot_set(
-    content_store: Arc<ContentStore>,
-    volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
-    pack_index_cache: Arc<PackIndexCache>,
-    device_size: u64,
-    fs_type: &str,
-    run_cmd: &[String],
-    env: &[String],
-    base_name: &str,
-    max_blocks: usize,
-) -> Option<Vec<u64>> {
-    use crate::block::ublk::UblkServer;
-    use crate::block::write_trace::{boot_set_from_trace, WriteTracer};
-
-    if !std::path::Path::new("/dev/ublk-control").exists() {
-        info!("auto-profile: /dev/ublk-control absent (need root + ublk) — skipping boot set");
-        return None;
-    }
-    let tmp = tempfile::TempDir::new().ok()?;
-    let rtrace_path = tmp.path().join("boot.rtrace");
-    let tracer = Arc::new(
-        WriteTracer::new(&rtrace_path, BLOCK_SIZE, device_size / u64::from(BLOCK_SIZE), base_name).ok()?,
-    );
-
-    // Fresh, cold, read-only serving handler over the just-drained store: reads
-    // resolve through the manifest → packs exactly as a real fork would.
-    let cache = Arc::new(
-        WriteCache::open_fresh_active(WriteCacheConfig {
-            cache_dir: tmp.path().to_path_buf(),
-            device_name: format!("profile-{base_name}"),
-            device_size,
-            block_size: BLOCK_SIZE as usize,
-            wal_sync: false,
-        })
-        .ok()?,
-    );
-    let foyer_dir = tmp.path().join("foyer");
-    std::fs::create_dir_all(&foyer_dir).ok()?;
-    let clean: Arc<dyn BlockCache> = Arc::new(
-        FoyerBlockCache::open(FoyerCacheConfig {
-            memory_bytes: 64 * 1024 * 1024,
-            ssd_bytes: 256 * 1024 * 1024,
-            ssd_dir: foyer_dir,
-            direct: false,
-            io_uring: false,
-        })
-        .await
-        .ok()?,
-    );
-    let handler = Arc::new(
-        BlockHandler::new(
-            cache,
-            content_store,
-            clean,
-            pack_index_cache,
-            volume_manifest,
-            device_size,
-            true,
-            Arc::new(ExportMetrics::new()),
-            Arc::new(AtomicU64::new(0f64.to_bits())),
-            Arc::new(Notify::const_new()),
-            DEFAULT_FLUSH_THRESHOLD,
-            None,
-        )
-        .with_read_tracer(Some(Arc::clone(&tracer))),
-    );
-
-    let dev_name = format!("profile-{base_name}").replace('/', "-");
-    let mut server = UblkServer::new();
-    let dev = match server.add_device(&dev_name, Arc::clone(&handler)).await {
-        Ok(d) => d,
-        Err(e) => {
-            info!(error = %e, "auto-profile: ublk add_device failed — skipping boot set");
-            return None;
-        }
-    };
-
-    // Mount + run in a blocking section while ublk serves I/O in the background.
-    let fs_type = fs_type.to_string();
-    let run_cmd = run_cmd.to_vec();
-    let env = env.to_vec();
-    let mnt = tempfile::TempDir::new().ok()?;
-    let mnt_path = mnt.path().to_path_buf();
-    let ran = tokio::task::spawn_blocking(move || {
-        use std::process::Command;
-        let mnt = &mnt_path;
-        let m = Command::new("mount")
-            .args(["-t", &fs_type, "-o", "ro"])
-            .arg(&dev)
-            .arg(mnt)
-            .status();
-        if !matches!(m, Ok(s) if s.success()) {
-            return Err(format!("mount -t {fs_type} {} failed: {m:?}", dev.display()));
-        }
-        // Best-effort pseudo-filesystems so the entrypoint can start.
-        let _ = Command::new("mount").args(["--bind", "/proc"]).arg(mnt.join("proc")).status();
-        let _ = Command::new("mount").args(["--bind", "/dev"]).arg(mnt.join("dev")).status();
-        // Run the workload once under a hard timeout (long-running servers are
-        // killed after their startup reads — that IS the boot working set). Use
-        // the image's own environment (PATH etc.) so a relative entrypoint execs.
-        let mut chroot = Command::new("timeout");
-        chroot.args(["--signal=KILL", "12", "chroot"]).arg(mnt);
-        chroot.args(&run_cmd);
-        chroot.env_clear();
-        for kv in &env {
-            if let Some((k, v)) = kv.split_once('=') {
-                chroot.env(k, v);
-            }
-        }
-        let _ = chroot.status(); // failures/non-zero are fine; we want the reads
-        let _ = Command::new("umount").arg(mnt.join("dev")).status();
-        let _ = Command::new("umount").arg(mnt.join("proc")).status();
-        let _ = Command::new("umount").arg(mnt).status();
-        Ok(())
-    })
-    .await;
-
-    // ALWAYS tear down the ublk device, even if the blocking task panicked —
-    // otherwise the device (and any mount) leaks.
-    server.remove_device(&dev_name).await.ok();
-    tracer.finish();
-
-    match ran {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            info!("auto-profile: {e} — skipping boot set");
-            return None;
-        }
-        Err(e) => {
-            info!("auto-profile: profiling task panicked ({e}) — skipping boot set");
-            return None;
-        }
-    }
-    let bytes = std::fs::read(&rtrace_path).ok()?;
-    let boot_set = boot_set_from_trace(&bytes, max_blocks);
-    if boot_set.is_empty() {
-        info!("auto-profile: workload read nothing — skipping boot set");
-        return None;
-    }
-    Some(boot_set)
-}
-
-#[cfg(not(feature = "ublk"))]
-#[allow(clippy::too_many_arguments)]
-async fn profile_boot_set(
-    _content_store: Arc<ContentStore>,
-    _volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
-    _pack_index_cache: Arc<PackIndexCache>,
-    _device_size: u64,
-    _fs_type: &str,
-    _run_cmd: &[String],
-    _env: &[String],
-    _base_name: &str,
-    _max_blocks: usize,
-) -> Option<Vec<u64>> {
-    info!("auto-profile: built without the `ublk` feature — skipping boot set");
-    None
-}
-
 /// Bless an OCI image into a content-addressed base image.
 ///
 /// Pulls layers from the registry, converts to ext4, writes through
 /// BlockHandler → WriteCache, drains to S3, and saves the manifest as a base.
-/// (Boot prefetch is driven by the manifest's packs + a runtime boot set, so no
-/// sidecar is written here.)
+/// (Boot prefetch is driven by the manifest's packs, so no sidecar is written
+/// here.)
 pub async fn run_bless_oci(
     image_ref: String,
     name: String,
     s3_prefix: String,
-    profile: bool,
     config_path: PathBuf,
 ) -> Result<()> {
-    use crate::block::manifest::serialize_block_list;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -676,8 +311,7 @@ pub async fn run_bless_oci(
     }
 
     // --- Save manifest as base. Index warming on fork comes from the manifest's
-    // pack list; the boot working set is captured at runtime (read trace → boot
-    // set), so no `.hot-set` artifact is written. ---
+    // pack list; no sidecar artifact is written. ---
     let manifest_key = format!("bases/{}", name);
     let manifest_data = volume_manifest.read().serialize()?;
     content_store
@@ -685,45 +319,12 @@ pub async fn run_bless_oci(
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
 
-    // --- Auto-profile: boot the ext4 rootfs once, capture its reads → boot set. ---
-    let mut boot_set_blocks = 0usize;
-    if profile {
-        match oci_run_command(&resolved.config) {
-            Some(cmd) => {
-                info!(?cmd, "auto-profiling boot set");
-                if let Some(bs) = profile_boot_set(
-                    Arc::clone(&content_store),
-                    Arc::clone(&volume_manifest),
-                    Arc::clone(&pack_index_cache),
-                    device_size,
-                    "ext4",
-                    &cmd,
-                    &oci_env(&resolved.config),
-                    &name,
-                    4096,
-                )
-                .await
-                {
-                    boot_set_blocks = bs.len();
-                    if let Err(e) =
-                        content_store.put_boot_set(&name, serialize_block_list(&bs)).await
-                    {
-                        info!("auto-profile: boot set upload failed: {e}");
-                        boot_set_blocks = 0;
-                    }
-                }
-            }
-            None => info!("auto-profile: image has no entrypoint/cmd — skipping boot set"),
-        }
-    }
-
     let elapsed = start.elapsed();
 
     println!("Blessed '{}' from OCI image successfully:", name);
     println!("  Image:           {}", image_ref);
     println!("  Layers:          {}", resolved.layers.len());
     println!("  Device size:     {:.1} MB", device_size as f64 / 1e6);
-    println!("  Boot set:        {} blocks (auto-profiled; 0 = skipped/unavailable)", boot_set_blocks);
     println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
     println!("  Manifest:        manifests/{}", manifest_key);
 
@@ -742,10 +343,8 @@ pub async fn run_bless_oci_erofs(
     image_ref: String,
     name: String,
     s3_prefix: String,
-    profile: bool,
     config_path: PathBuf,
 ) -> Result<()> {
-    use crate::block::manifest::serialize_block_list;
     use crate::oci::BlockAdapter;
 
     tracing_subscriber::fmt()
@@ -845,93 +444,33 @@ pub async fn run_bless_oci_erofs(
         None,
     ));
 
-    // --- TWO-PASS (default; skipped with --no-profile): build a throwaway probe
-    // image, boot it to
-    // learn which files the workload actually reads, then rebuild with those
-    // ordered FIRST (`PriorityOrder`) so the boot working set is one contiguous,
-    // coalesce-friendly run at the front. Otherwise a single pass. The
-    // BlockAdapter sink uses block_on, so the final convert runs on a blocking
-    // thread. `_ = serialize_block_list` (kept for make-boot-set parity). ---
-    let _ = serialize_block_list;
+    // --- Merge layers into the final EROFS image. The BlockAdapter sink uses
+    // block_on, so the convert runs on a blocking thread. ---
     let uuid = deterministic_uuid(&resolved.manifest_digest);
-    let run_cmd = if profile { oci_run_command(&resolved.config) } else { None };
-    let env = oci_env(&resolved.config);
-
-    let priority: Vec<String> = if let Some(cmd) = run_cmd {
-        info!("two-pass: building probe image (pass 1)");
-        let scratch1 = scratch.clone();
-        // Build the throwaway probe image. This is best-effort: the closure ALWAYS
-        // hands `layer_files` back (success or failure) so a probe-build error
-        // degrades to "no priority order" instead of aborting the bless. The layer
-        // readers are rewound at the start of every convert (tar_convert.rs), so
-        // pass 2 reuses them regardless of where pass 1 left their positions.
-        let (probe_result, layers_back) = tokio::task::spawn_blocking(
-            move || -> (Result<tempfile::NamedTempFile>, Vec<std::fs::File>) {
-                let build = (|| -> Result<tempfile::NamedTempFile> {
-                    let opts = ext4::tar_convert::ConvertOptions {
-                        convert_backslash: false,
-                        writer_options: vec![
-                            WriterOption::Uuid(uuid),
-                            WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
-                            WriterOption::SpoolDir(scratch1.clone()),
-                        ],
-                    };
-                    let tmp =
-                        tempfile::NamedTempFile::new_in(&scratch1).context("probe tempfile")?;
-                    ext4::convert_oci_layers_to_erofs(&mut layer_files, tmp.reopen()?, &opts)
-                        .map_err(|e| anyhow::anyhow!("probe convert failed: {e}"))?;
-                    Ok(tmp)
-                })();
-                (build, layer_files)
-            },
-        )
-        .await?;
-        layer_files = layers_back;
-        match probe_result {
-            Ok(probe) => {
-                info!(?cmd, "two-pass: booting probe to capture hot files");
-                let paths = profile_file_paths(probe.path(), "erofs", &cmd, &env, 12).await;
-                info!(files = paths.len(), "two-pass: captured priority files");
-                paths // probe NamedTempFile is dropped (deleted) here
-            }
-            Err(e) => {
-                info!("auto-profile: probe build failed ({e}) — building without priority order");
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    let priority_count = priority.len();
-
     let rt = tokio::runtime::Handle::current();
     let handler_for_write = Arc::clone(&handler);
     let scratch2 = scratch.clone();
-    info!("merging layers into EROFS (final, pass 2)");
-    let prefetch_len = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let mut writer_options = vec![
-            WriterOption::Uuid(uuid),
-            // Align large file payloads to the dedup block grid (cross-image
-            // dedup); EROFS has no reserved blocks so this is always safe.
-            WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
-            WriterOption::SpoolDir(scratch2.clone()),
-        ];
-        if !priority.is_empty() {
-            writer_options.push(WriterOption::PriorityOrder(priority));
-        }
-        let opts = ext4::tar_convert::ConvertOptions { convert_backslash: false, writer_options };
-        let (_sink, prefetch_len) = ext4::convert_oci_layers_to_erofs_with_prefetch(
+    info!("merging layers into EROFS");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let opts = ext4::tar_convert::ConvertOptions {
+            convert_backslash: false,
+            writer_options: vec![
+                WriterOption::Uuid(uuid),
+                // Align large file payloads to the dedup block grid (cross-image
+                // dedup); EROFS has no reserved blocks so this is always safe.
+                WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
+                WriterOption::SpoolDir(scratch2.clone()),
+            ],
+        };
+        ext4::convert_oci_layers_to_erofs(
             &mut layer_files,
             BlockAdapter::new(&handler_for_write, rt),
             &opts,
         )
         .map_err(|e| anyhow::anyhow!("erofs conversion failed: {e}"))?;
-        Ok(prefetch_len)
+        Ok(())
     })
     .await??;
-    // With a priority list, prefetch_len is the contiguous boot region the server
-    // warms on open; 0 otherwise (no profile, or profiling found nothing).
-    handler.set_prefetch_len(prefetch_len);
 
     // --- Drain to S3 ---
     info!("draining to S3");
@@ -951,19 +490,16 @@ pub async fn run_bless_oci_erofs(
 
     // --- Save manifest as base ---
     let manifest_key = format!("bases/{}", name);
+    let manifest_data = volume_manifest.read().serialize()?;
     content_store
-        .put_manifest(&manifest_key, volume_manifest.read().serialize()?, None)
+        .put_manifest(&manifest_key, manifest_data, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
 
     println!("Blessed '{}' from OCI image as read-only EROFS:", name);
-    println!(
-        "  Priority files:  {priority_count} (two-pass; 0 = --no-profile or profiling unavailable)"
-    );
     println!("  Image:           {}", image_ref);
     println!("  Layers:          {}", resolved.layers.len());
     println!("  Device size:     {:.1} MB", device_size as f64 / 1e6);
-    println!("  Prefetch extent: {:.1} MB (0 = no priority list at bless)", prefetch_len as f64 / 1e6);
     println!("  Elapsed:         {:.1}s", start.elapsed().as_secs_f64());
     println!("  Manifest:        manifests/{}  (mount read-only)", manifest_key);
     Ok(())
@@ -1071,267 +607,6 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::ObjectStore;
-
-    #[test]
-    fn parse_openat_path_handles_success_and_failure() {
-        assert_eq!(
-            parse_openat_path(r#"openat(AT_FDCWD, "/lib/libc.so.6", O_RDONLY) = 3"#),
-            Some("/lib/libc.so.6")
-        );
-        // failed open (ENOENT) → None
-        assert_eq!(
-            parse_openat_path(r#"openat(AT_FDCWD, "/nope", O_RDONLY) = -1 ENOENT (x)"#),
-            None
-        );
-        // pid-prefixed, with flags after the path
-        assert_eq!(
-            parse_openat_path(r#"[pid 42] openat(AT_FDCWD, "/a/b", O_RDONLY|O_CLOEXEC) = 4"#),
-            Some("/a/b")
-        );
-        assert_eq!(parse_openat_path("read(3, ...) = 10"), None);
-    }
-
-    /// Decompress a skopeo `dir:` image's layers to temp files (gzip/zstd/plain).
-    fn load_oci_layers(dir: &std::path::Path) -> (Vec<std::fs::File>, Vec<u8>) {
-        use std::io::{Read, Seek, SeekFrom};
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
-        let layers = manifest["layers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| {
-                let d = l["digest"].as_str().unwrap();
-                let blob = dir.join(d.strip_prefix("sha256:").unwrap_or(d));
-                let mut f = std::fs::File::open(&blob).unwrap();
-                let mut magic = [0u8; 4];
-                f.read_exact(&mut magic).unwrap();
-                f.seek(SeekFrom::Start(0)).unwrap();
-                let mut out = tempfile::tempfile().unwrap();
-                if magic[0] == 0x1f && magic[1] == 0x8b {
-                    std::io::copy(&mut flate2::read::GzDecoder::new(f), &mut out).unwrap();
-                } else if magic == [0x28, 0xb5, 0x2f, 0xfd] {
-                    std::io::copy(&mut zstd::Decoder::new(f).unwrap(), &mut out).unwrap();
-                } else {
-                    std::io::copy(&mut f, &mut out).unwrap();
-                }
-                out.seek(SeekFrom::Start(0)).unwrap();
-                out
-            })
-            .collect();
-        let config = std::fs::read(
-            dir.join(manifest["config"]["digest"].as_str().unwrap().strip_prefix("sha256:").unwrap()),
-        )
-        .unwrap();
-        (layers, config)
-    }
-
-    /// REAL smoke test of TWO-PASS profiling: build a python image as EROFS to a
-    /// file, loop-mount it and run the real entrypoint under strace
-    /// (`profile_file_paths`), then rebuild with `PriorityOrder(captured paths)`
-    /// and confirm a non-trivial contiguous priority region results. Needs root +
-    /// strace + /tmp/oci/py312.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn two_pass_profile_captures_paths_and_orders_them() {
-        use std::io::{Seek, SeekFrom};
-        // Effective UID == 0 via /proc (avoids an unsafe libc::geteuid call —
-        // the crate denies unsafe). Uid line is: real effective saved fsuid.
-        let is_root = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("Uid:"))
-                    .and_then(|l| l.split_whitespace().nth(2).map(|u| u == "0"))
-            })
-            .unwrap_or(false);
-        let img_dir = std::path::Path::new("/tmp/oci/py312");
-        if !is_root || !img_dir.exists() {
-            eprintln!("SKIP: two-pass profiling needs root + /tmp/oci/py312");
-            return;
-        }
-        let (mut layers, config) = load_oci_layers(img_dir);
-        let cmd = oci_run_command(&config).expect("entrypoint");
-        let env = oci_env(&config);
-
-        // Pass 1: build EROFS to a temp file.
-        let probe = tokio::task::spawn_blocking(move || {
-            let opts = ext4::tar_convert::ConvertOptions {
-                convert_backslash: false,
-                writer_options: vec![
-                    WriterOption::Uuid([0u8; 16]),
-                    WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
-                ],
-            };
-            let tmp = tempfile::NamedTempFile::new().unwrap();
-            ext4::convert_oci_layers_to_erofs(&mut layers, tmp.reopen().unwrap(), &opts).unwrap();
-            (tmp, layers)
-        })
-        .await
-        .unwrap();
-        let (probe_file, mut layers) = probe;
-
-        // THE THING UNDER TEST: loop-mount + strace the real entrypoint.
-        let paths = profile_file_paths(probe_file.path(), "erofs", &cmd, &env, 12).await;
-        eprintln!("two-pass captured {} files; first few: {:?}", paths.len(), &paths[..paths.len().min(6)]);
-        assert!(!paths.is_empty(), "profiling must capture opened files");
-        assert!(
-            paths.iter().any(|p| p.contains("python") || p.contains("libc") || p.contains("encodings")),
-            "captured paths should include python/libc runtime files: {paths:?}"
-        );
-
-        // Pass 2: rebuild with those files prioritized; confirm a real priority
-        // region (prefetch_len covers the captured hot files, not the whole image).
-        for l in &mut layers {
-            l.seek(SeekFrom::Start(0)).unwrap();
-        }
-        let prefetch_len = tokio::task::spawn_blocking(move || {
-            let opts = ext4::tar_convert::ConvertOptions {
-                convert_backslash: false,
-                writer_options: vec![
-                    WriterOption::Uuid([0u8; 16]),
-                    WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
-                    WriterOption::PriorityOrder(paths),
-                ],
-            };
-            let (cur, plen) = ext4::convert_oci_layers_to_erofs_with_prefetch(
-                &mut layers,
-                std::io::Cursor::new(Vec::new()),
-                &opts,
-            )
-            .unwrap();
-            (cur.into_inner().len() as u64, plen)
-        })
-        .await
-        .unwrap();
-        let (image_len, prefetch_len) = prefetch_len;
-        eprintln!("two-pass: prefetch region {} MiB of {} MiB image", prefetch_len / 1048576, image_len / 1048576);
-        assert!(prefetch_len > 0, "priority ordering must yield a non-zero prefetch region");
-        assert!(prefetch_len < image_len, "prefetch region must be a prefix, not the whole image");
-    }
-
-    /// REAL smoke test of the auto-profiler: build a real python image as EROFS
-    /// into a glidefs volume, then run `profile_boot_set` — which serves it over
-    /// a ublk device, kernel-mounts it, chroots and runs python, and captures the
-    /// blocks read — and assert it yields a sane, bounded boot set. This is the
-    /// exact path `bless --oci --erofs` takes automatically. Needs root + ublk +
-    /// a skopeo `dir:` python image at /tmp/oci/py312.
-    #[cfg(feature = "ublk")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn auto_profile_produces_a_real_boot_set() {
-        use crate::block::handler::BlockHandler;
-        use crate::block::pack_index_cache::PackIndexCache;
-        use crate::block::write_cache::{WriteCache, WriteCacheConfig};
-        use crate::oci::BlockAdapter;
-        use std::io::{Read, Seek, SeekFrom};
-        use std::sync::atomic::AtomicU64;
-
-        let img_dir = std::path::Path::new("/tmp/oci/py312");
-        if !std::path::Path::new("/dev/ublk-control").exists() || !img_dir.exists() {
-            eprintln!("SKIP: need /dev/ublk-control (root+ublk) and a skopeo dir at /tmp/oci/py312");
-            return;
-        }
-
-        // Decompress the image's layers to temp files.
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(img_dir.join("manifest.json")).unwrap()).unwrap();
-        let mut layers: Vec<std::fs::File> = manifest["layers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| {
-                let d = l["digest"].as_str().unwrap();
-                let blob = img_dir.join(d.strip_prefix("sha256:").unwrap_or(d));
-                let mut f = std::fs::File::open(&blob).unwrap();
-                let mut magic = [0u8; 4];
-                f.read_exact(&mut magic).unwrap();
-                f.seek(SeekFrom::Start(0)).unwrap();
-                let mut out = tempfile::tempfile().unwrap();
-                if magic[0] == 0x1f && magic[1] == 0x8b {
-                    std::io::copy(&mut flate2::read::GzDecoder::new(f), &mut out).unwrap();
-                } else if magic == [0x28, 0xb5, 0x2f, 0xfd] {
-                    std::io::copy(&mut zstd::Decoder::new(f).unwrap(), &mut out).unwrap();
-                } else {
-                    std::io::copy(&mut f, &mut out).unwrap();
-                }
-                out.seek(SeekFrom::Start(0)).unwrap();
-                out
-            })
-            .collect();
-
-        // Build the EROFS into a glidefs volume (InMemory store), drain to S3.
-        let store = Arc::new(InMemory::new());
-        let cs = Arc::new(ContentStore::new(store.clone(), "test/exports/smoke"));
-        let device_size = 512 * 1024 * 1024u64;
-        let temp = tempfile::TempDir::new().unwrap();
-        let cache = Arc::new(
-            WriteCache::open_fresh_active(WriteCacheConfig {
-                cache_dir: temp.path().to_path_buf(),
-                device_name: "smoke".into(),
-                device_size,
-                block_size: BLOCK_SIZE as usize,
-                wal_sync: false,
-            })
-            .unwrap(),
-        );
-        let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(device_size, BLOCK_SIZE)));
-        let pic = Arc::new(PackIndexCache::open(temp.path()).await.unwrap());
-        let clean: Arc<dyn BlockCache> = Arc::new(
-            FoyerBlockCache::open(FoyerCacheConfig {
-                memory_bytes: 64 * 1024 * 1024,
-                ssd_bytes: 256 * 1024 * 1024,
-                ssd_dir: { let d = temp.path().join("f"); std::fs::create_dir_all(&d).unwrap(); d },
-                direct: false,
-                io_uring: false,
-            })
-            .await
-            .unwrap(),
-        );
-        let handler = Arc::new(BlockHandler::new(
-            Arc::clone(&cache), Arc::clone(&cs), Arc::clone(&clean), Arc::clone(&pic),
-            Arc::clone(&vm), device_size, false, Arc::new(ExportMetrics::new()),
-            Arc::new(AtomicU64::new(0f64.to_bits())), Arc::new(Notify::const_new()),
-            DEFAULT_FLUSH_THRESHOLD, None,
-        ));
-        let rt = tokio::runtime::Handle::current();
-        let hw = Arc::clone(&handler);
-        tokio::task::spawn_blocking(move || {
-            let opts = ext4::tar_convert::ConvertOptions {
-                convert_backslash: false,
-                writer_options: vec![
-                    WriterOption::Uuid([0u8; 16]),
-                    WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
-                ],
-            };
-            ext4::convert_oci_layers_to_erofs(&mut layers, BlockAdapter::new(&hw, rt), &opts).unwrap();
-        })
-        .await
-        .unwrap();
-        for _ in 0..100 {
-            if cache.flush_to_s3(&cs, &pic, &vm).await.unwrap().blocks_claimed == 0 { break; }
-        }
-
-        // THE THING UNDER TEST: auto-profile using the image's REAL entrypoint
-        // and env (exactly what `bless --oci` does), NOT a hardcoded command.
-        let config = std::fs::read(img_dir.join(
-            manifest["config"]["digest"].as_str().unwrap().strip_prefix("sha256:").unwrap(),
-        ))
-        .unwrap();
-        let cmd = oci_run_command(&config).expect("image must expose an entrypoint/cmd");
-        let env = oci_env(&config);
-        eprintln!("real entrypoint: {cmd:?}  ({} env vars incl PATH)", env.len());
-        let boot_set = profile_boot_set(
-            Arc::clone(&cs), Arc::clone(&vm), Arc::clone(&pic),
-            device_size, "erofs", &cmd, &env, "py312-smoke", 4096,
-        )
-        .await
-        .expect("auto-profile should produce a boot set (root + ublk + real entrypoint)");
-
-        eprintln!("auto-profiled boot set: {} blocks ({:.1} MiB)", boot_set.len(), boot_set.len() as f64 * BLOCK_SIZE as f64 / 1048576.0);
-        assert!(!boot_set.is_empty(), "boot set must be non-empty");
-        assert!(boot_set.len() < (device_size / u64::from(BLOCK_SIZE)) as usize / 2, "must be bounded, not the whole image");
-        // The metadata region (low blocks) is always touched at mount/boot.
-        assert!(boot_set.iter().any(|&b| b < 64), "boot set should include low/metadata blocks");
-    }
 
     #[test]
     fn deterministic_uuid_is_stable_and_content_addressed() {
@@ -1471,7 +746,7 @@ mod tests {
         let l1 = mk(&[("etc/os", b"top"), ("app/run", b"hi")]);
         let rt = tokio::runtime::Handle::current();
         let hw = Arc::clone(&handler);
-        let prefetch_len = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let opts = ext4::tar_convert::ConvertOptions {
                 convert_backslash: false,
                 writer_options: vec![
@@ -1480,12 +755,10 @@ mod tests {
                 ],
             };
             let mut layers = vec![Cursor::new(l0), Cursor::new(l1)];
-            let (_s, p) = ext4::convert_oci_layers_to_erofs_with_prefetch(
+            ext4::convert_oci_layers_to_erofs(
                 &mut layers, BlockAdapter::new(&hw, rt), &opts,
             ).unwrap();
-            p
         }).await.unwrap();
-        handler.set_prefetch_len(prefetch_len);
 
         // Drain to S3 + persist manifest, then read back the EROFS superblock
         // through a fresh cold handler over the same store.
@@ -1493,7 +766,8 @@ mod tests {
             let s = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
             if s.blocks_claimed == 0 { break; }
         }
-        cs.put_manifest("bases/erofs-test", vm.read().serialize().unwrap(), None).await.unwrap();
+        let manifest_data = vm.read().serialize().unwrap();
+        cs.put_manifest("bases/erofs-test", manifest_data, None).await.unwrap();
 
         let cold_temp = tempfile::TempDir::new().unwrap();
         let cold_cache = Arc::new(

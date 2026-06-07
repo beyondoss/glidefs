@@ -465,38 +465,11 @@ impl ContentStore {
         Ok(names)
     }
 
-    /// Upload a boot SET (trace-captured boot working set: a bounded block list).
-    /// Bounded and safe to DATA-prefetch on open. Producer: `glidefs
-    /// make-boot-set` (the trace→boot-set→upload loop).
-    pub async fn put_boot_set(&self, name: &str, data: Vec<u8>) -> Result<(), ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/manifests/bases/{}.boot-set", self.base_path, name);
-        let path = ObjectPath::from(key);
-        let result = self.object_store.put(&path, PutPayload::from(data)).await;
-        self.record_s3_result(&result);
-        result?;
-        debug!(name = %name, "uploaded boot set");
-        Ok(())
-    }
-
-    /// Download a boot set from S3. Returns None if not found.
-    pub async fn get_boot_set(&self, name: &str) -> Result<Option<Vec<u8>>, ContentStoreError> {
-        self.check_circuit()?;
-        let key = format!("{}/manifests/bases/{}.boot-set", self.base_path, name);
-        let path = ObjectPath::from(key);
-        let result = self.object_store.get(&path).await;
-        self.record_s3_result(&result);
-        match result {
-            Ok(response) => Ok(Some(response.bytes().await?.to_vec())),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     /// List all manifest names under `manifests/` (not just bases).
     ///
     /// Returns paths relative to `manifests/`, e.g. `"vm1"`, `"bases/ubuntu-22.04"`.
-    /// Filters out sidecar artifacts (`.boot-set`, and legacy `.hot-set`).
+    /// Filters out legacy sidecar artifacts (`.boot-set`, `.hot-set`) that older
+    /// builds may have left in the bucket — they are no longer produced.
     pub async fn list_all_manifests(&self) -> Result<Vec<String>, ContentStoreError> {
         self.check_circuit()?;
         let prefix_str = format!("{}/manifests/", self.base_path);
@@ -859,37 +832,6 @@ mod tests {
             .expect("manifest should exist");
 
         assert_eq!(got, data);
-    }
-
-    /// Closes the producer loop: a real read trace → `boot_set_from_trace` →
-    /// `put_boot_set` → `get_boot_set` → `deserialize_block_list` yields exactly
-    /// the blocks the trace's reads touched, in first-touch order. This is what
-    /// `glidefs make-boot-set` does; the device-open path consumes the result.
-    #[tokio::test]
-    async fn boot_set_producer_round_trips_from_a_real_trace() {
-        use crate::block::manifest::{deserialize_block_list, serialize_block_list};
-        use crate::block::write_trace::{boot_set_from_trace, TraceOp, WriteTracer};
-
-        let bs = 131072u32; // 128 KiB
-        let dir = tempfile::TempDir::new().unwrap();
-        let tpath = dir.path().join("vm.rtrace");
-        let tracer = WriteTracer::new(&tpath, bs, 1024, "vm").unwrap();
-        // A boot reads blocks 9, then 2,3 (one multi-block read), then 9 again.
-        tracer.record(9 * u64::from(bs), u64::from(bs), TraceOp::Read);
-        tracer.record(2 * u64::from(bs), 2 * u64::from(bs), TraceOp::Read);
-        tracer.record(0, u64::from(bs), TraceOp::Write); // ignored
-        tracer.record(9 * u64::from(bs), u64::from(bs), TraceOp::Read);
-        tracer.finish();
-
-        let bytes = std::fs::read(&tpath).unwrap();
-        let boot_set = boot_set_from_trace(&bytes, 4096);
-        assert_eq!(boot_set, vec![9, 2, 3], "first-touch order, reads only, deduped");
-
-        // Upload + read back through the store (what make-boot-set / the server do).
-        let store = test_store("img");
-        store.put_boot_set("ubuntu", serialize_block_list(&boot_set)).await.unwrap();
-        let got = store.get_boot_set("ubuntu").await.unwrap().expect("boot set should exist");
-        assert_eq!(deserialize_block_list(&got).unwrap(), boot_set);
     }
 
     #[tokio::test]

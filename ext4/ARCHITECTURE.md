@@ -154,7 +154,7 @@ Image B (target) ─► walk() ──► iterate entries
 | Determinism | Same inputs → byte-identical output, every run | Not just "reproducible build" — includes inode slot layout, dir entry order, all padding bytes |
 | nid | EROFS inode number = `byte_offset / 32` | Not an ext4 inode number — EROFS inodes are 32 bytes, not 256 |
 | FLAT_INLINE | EROFS layout: full blocks in data region + sub-block tail inline after the inode | Not FLAT_PLAIN, which has no inline tail (used when tail+inode would cross a 4 KiB boundary) |
-| Priority region | The contiguous leading byte range `[0, prefetch_len)` of an EROFS image covering the boot working set | Not the hot set — that was every non-zero block; this is trace-derived and bounded |
+| Priority region | The contiguous leading byte range `[0, prefetch_len)` of an EROFS image covering the priority-ordered boot files | Not the hot set — that was every non-zero block; this is the bounded two-pass priority run |
 | Spool | Temp file on real disk (`/var/tmp`) where EROFS file content accumulates during ingest | Not in-memory — specifically avoids tmpfs so peak RAM stays bounded |
 
 ## On-Disk Layouts
@@ -437,7 +437,7 @@ Three tiers verify correctness from different angles:
 | `erofs_merge_fsck` | `fsck.erofs` clean on a representative multi-layer OCI merge |
 | `erofs_merge_kernel_mount` | Real kernel mount (`EROFS_MOUNT_TEST=1`): override/whiteout/opaque/symlink/hardlink all correct |
 | `erofs_alignment_recovers_dedup_under_churn` | 0/4 → 4/4 blocks dedup when 37 extra files are added (proves the grid-alignment claim) |
-| `erofs_priority_order_places_boot_set_first` | Priority file (created last) lands before non-priority file (created first); fsck-clean |
+| `erofs_priority_order_places_priority_file_first` | Priority file (created last) lands before non-priority file (created first); fsck-clean |
 | `erofs_priority_order_edge_cases` | Missing paths skipped; dirs/symlinks in list handled; tight packing; determinism |
 | `erofs_xattrs` | user.*, security.capability, trusted.overlay.opaque round-trip via fsck + getfattr |
 | `erofs_served_over_real_ublk_kernel_mount` | Real ublk device + kernel erofs mount over glidefs BlockHandler; content correct |

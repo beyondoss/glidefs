@@ -47,20 +47,6 @@ pub enum Commands {
         /// ext4 (which VMs fork-and-write).
         #[arg(long, requires = "oci", conflicts_with = "layered")]
         erofs: bool,
-        /// Disable auto-profiling. By DEFAULT, after building the image bless
-        /// boots it ONCE in a sandbox (ublk + kernel mount + chroot the
-        /// entrypoint, ≤12 s), captures the blocks it reads, and records a boot
-        /// set so future forks warm those on open — this is what makes cold
-        /// starts fast. Profiling is best-effort: if it can't run (no root, no
-        /// `ublk` feature, no entrypoint, or it reads nothing) bless logs a
-        /// warning and produces a perfectly valid image with no boot set —
-        /// nothing fails. Pass `--no-profile` to skip the profiling boot
-        /// entirely: use it for reproducible builds (profiling makes image bytes
-        /// vary run-to-run) or to keep bless fast in benchmarks. With it, boot
-        /// sets can still be produced later from runtime traces via
-        /// `glidefs make-boot-set`.
-        #[arg(long = "no-profile", requires = "oci")]
-        no_profile: bool,
         /// Base image name (e.g., "ubuntu-22.04-node20-v3")
         #[arg(long)]
         name: String,
@@ -69,31 +55,6 @@ pub enum Commands {
         #[arg(long)]
         s3_prefix: String,
         /// Config file (for storage URL + credentials)
-        #[arg(short, long)]
-        config: PathBuf,
-    },
-    /// Build and upload a base's boot SET from a captured read trace.
-    ///
-    /// Profiling flow: run a fork of the base with `GLIDEFS_READ_TRACE_DIR=<dir>`
-    /// set, boot the workload once (this records `<dir>/<export>.rtrace`), then
-    /// run this command to convert that trace into the bounded boot working set
-    /// and upload it. Future forks of the base then data-prefetch exactly those
-    /// blocks on open (warm-on-open), instead of paying S3 round-trips lazily.
-    MakeBootSet {
-        /// Path to the captured read trace (`<export>.rtrace`).
-        #[arg(long)]
-        trace: PathBuf,
-        /// Base image name to attach the boot set to (e.g. "ubuntu-22.04").
-        #[arg(long)]
-        name: String,
-        /// S3 prefix (export namespace) the base lives in.
-        #[arg(long)]
-        s3_prefix: String,
-        /// Cap on boot-set size in 128 KiB blocks (bounds the prefetch so it
-        /// can never pull the whole image). Default 4096 (= 512 MiB).
-        #[arg(long, default_value_t = 4096)]
-        max_blocks: usize,
-        /// Config file (for storage URL + credentials).
         #[arg(short, long)]
         config: PathBuf,
     },

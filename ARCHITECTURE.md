@@ -166,7 +166,6 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 | Drain | Flush all dirty blocks to S3 so the export can be stopped or migrated | Not a delete — S3 data is preserved |
 | Clean Cache | Read-through Foyer HybridCache (memory + SSD tiers) for blocks fetched from S3 | Not the write cache (dirty blocks on local SSD) |
 | Circuit Breaker | Lock-free S3 failure detector that fast-fails requests during outages | Not a retry mechanism — it prevents retries |
-| Boot Set | Bounded list of block indices a real boot actually touched (captured from a runtime read trace), DATA-prefetched into the clean cache on fork open. Stored at `…​.boot-set`. | Not "every non-zero block" — that would pull the whole image and defeat lazy loading. Index warming (all packs) comes from the manifest, not this. |
 | Bless | CLI command that converts a raw disk image into a content-addressed base image in S3 | Not a runtime operation — offline image preparation |
 | Snapshot | An explicit, versioned copy of an export's VolumeManifest stored at a stable S3 key. Never overwritten by background syncs. Pinned in S3 until explicitly deleted. | Not the same as a background `sync_manifest` — background syncs update `manifests/{name}` and do NOT create versioned snapshot keys |
 | Fork | A new export whose VolumeManifest is copied from a parent's. The fork starts with an empty local SparseStateMap; unwritten blocks resolve through VolumeManifest → PackIndexCache → S3. | Not a full copy — parent pack files are never duplicated |
@@ -182,7 +181,6 @@ Each pack is self-describing — the block index is a footer (trailer → index 
     ├── manifests/{export_name}                  ← VolumeManifest GLVM (chunk_idx → [pack_ids])
     ├── manifests/{tag_name}                     ← Named manifest tag (same format, arbitrary name)
     ├── manifests/bases/{image_name}             ← Blessed base image VolumeManifest (glidefs bless)
-    ├── manifests/bases/{image_name}.boot-set    ← Boot set: bounded trace-captured block list (data-prefetched on fork open)
     ├── snapshots/{export_name}/{sequence:020}   ← Versioned VolumeManifest (zero-padded sequence)
     └── chunks/{chunk_idx:04}/
         └── {pack_id:016x}.pack                 ← GLPK pack (self-describing: header+index+data)
@@ -644,12 +642,9 @@ Ring buffer (4 entries) tracks recent chunk accesses. When 3+ consecutive chunks
 
 ### Boot Prefetch on Fork Open
 
-When a fork is created from a base manifest, the router spawns one background task (stored in `ExportState`, aborted on teardown) that warms two tiers — both bounded, neither pulling the whole image:
+When a fork is created from a base manifest, the router spawns one background task (stored in `ExportState`, aborted on teardown) that **index-warms** the export — bounded, never pulling the whole image: it fetches this export's pack indices from its **own VolumeManifest** (the real chunk indices via `all_pack_ids`/`chunks.keys()`). One fetch per pack (bounded by pack count), so even a lazily-read tail block costs one S3 GET (data) instead of two (index + data). This is the same mechanism as startup `prefetch_chunk_metas`.
 
-1. **Index warm** — fetch this export's pack indices from its **own VolumeManifest** (the real chunk indices via `all_pack_ids`/`chunks.keys()`). One fetch per pack (bounded by pack count), so even a lazily-read tail block costs one S3 GET (data) instead of two (index + data). This is the same mechanism as startup `prefetch_chunk_metas`.
-2. **Data warm** — if a `.boot-set` (trace-captured bounded block list) exists, `prefetch_data_blocks` fetches exactly those blocks' data into the CleanCache (coalescing contiguous runs into single ranged GETs), so the guest's boot reads are cache hits. EROFS prioritized images additionally carry a contiguous `prefetch_len` region warmed the same way.
-
-There is no `.hot-set` artifact: it was a list of *every* non-zero block fed to a chunk-index API (a no-op for any image past chunk 0 — see `volume_manifest::block_index_is_not_chunk_index`), and data-prefetching it would have negated lazy loading. The boot set is produced from a runtime read trace (`GLIDEFS_READ_TRACE_DIR` → `write_trace::boot_set_from_trace`), not at bless. (`router.rs:create_export`, `write_cache/read.rs:prefetch_chunks/prefetch_data_blocks`)
+There is no data prefetch and no `.hot-set` artifact: the hot set was a list of *every* non-zero block fed to a chunk-index API (a no-op for any image past chunk 0 — see `volume_manifest::block_index_is_not_chunk_index`), and data-prefetching it would have negated lazy loading. (`router.rs:create_export`, `write_cache/read.rs:prefetch_chunks`)
 
 ## Data Integrity
 
@@ -695,7 +690,7 @@ CRC32 is stored in `crc_map: SparseCrcMap` on `CacheInner` — a lock-free two-l
 
 ### Bless Pipeline
 
-`glidefs bless` reads a raw disk image sequentially, processes one 128 MiB volume chunk at a time (streaming — never accumulates the full image). For each chunk: deduplicates 128 KB blocks by hash, then `stream_chunk_pack()` uploads the chunk as a GLPK pack via `WriteMultipart` — the previous chunk's upload runs concurrently with the next chunk's disk reads (one upload in flight at a time). Builds a GLVM VolumeManifest from the uploaded pack IDs. Output: VolumeManifest at `exports/{s3_prefix}/manifests/bases/{name}`. (Index warming on fork comes from this manifest; the boot set is captured at runtime, so bless writes no prefetch sidecar.) `bless --oci` ingests OCI layers into **ext4** (writable bases); `bless --oci --erofs` instead emits a read-only **EROFS** rootfs for the overlay/immutable case. (`cli/bless.rs`)
+`glidefs bless` reads a raw disk image sequentially, processes one 128 MiB volume chunk at a time (streaming — never accumulates the full image). For each chunk: deduplicates 128 KB blocks by hash, then `stream_chunk_pack()` uploads the chunk as a GLPK pack via `WriteMultipart` — the previous chunk's upload runs concurrently with the next chunk's disk reads (one upload in flight at a time). Builds a GLVM VolumeManifest from the uploaded pack IDs. Output: VolumeManifest at `exports/{s3_prefix}/manifests/bases/{name}`. (Index warming on fork comes from this manifest; bless writes no prefetch sidecar.) `bless --oci` ingests OCI layers into **ext4** (writable bases); `bless --oci --erofs` instead emits a read-only **EROFS** rootfs for the overlay/immutable case. (`cli/bless.rs`)
 
 ## Management API
 
@@ -869,7 +864,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/volume_manifest.rs` | Binary GLVM: `VolumeManifest`, `ChunkEntry`, `append_pack`, `replace_packs`, `all_pack_ids`, CRC32 |
 | `block/pack_index_cache.rs` | `PackIndexCache`: Foyer HybridCache keyed by `PackId`; `lookup_block`, `insert_entries`, `known_hashes` |
 | `block/content_store.rs` | S3 typed I/O: `stream_chunk_pack` (WriteMultipart), `get_chunk_block`, `get_pack_index` (suffix-read), manifests, snapshots |
-| `block/manifest.rs` | S3 key helpers (`manifest_s3_key`, `snapshot_s3_key`) + block-list codec (`serialize_block_list`/`deserialize_block_list`, used for the boot set) |
+| `block/manifest.rs` | S3 key helpers (`manifest_s3_key`, `snapshot_s3_key`) |
 | `block/block_map.rs` | `SparseStateMap`, `SparseCrcMap`, `Blake3Hash`, `blake3_128`; block codec: `compress_block`/`decompress_block` (zstd + legacy-LZ4 auto-detect), `zstd_compress`, `lz4_compress`/`lz4_decompress` |
 | `block/cache.rs` | `BlockCache` trait (CleanCache) + Foyer implementation |
 
@@ -880,7 +875,7 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | `block/scrubber.rs` | Background hash verification for CleanCache entries; evicts mismatches for re-fetch from S3 |
 | `block/readahead.rs` | Sequential read detection (ring buffer) and pack index prefetch |
 | `block/capacity_monitor.rs` | `statvfs` polling every 5s; warns ≥80%, pressure-flushes dirtiest exports ≥90% |
-| `block/write_trace.rs` | Optional binary trace recorder (GLIDETRC format): every write/zero (`GLIDEFS_WRITE_TRACE_DIR`) or read (`GLIDEFS_READ_TRACE_DIR`) with µs timestamps; zero cost when disabled. `boot_set_from_trace` derives the bounded boot set from a read trace. |
+| `block/write_trace.rs` | Optional binary trace recorder (GLIDETRC format): every write/trim/zero (`GLIDEFS_WRITE_TRACE_DIR`) with µs timestamps, for offline analysis; zero cost when disabled. |
 | `block/metrics.rs` | Per-export Prometheus metrics (counters, gauges, histograms) |
 | `block/api.rs` | HTTP REST API handlers |
 | `block/error.rs` | `NBDError` and `Result` type aliases |

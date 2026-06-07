@@ -9,7 +9,6 @@ use crate::block::content_store::ContentStore;
 use crate::block::flush_scheduler::flush_scheduler;
 use crate::block::handler::BlockHandler;
 use crate::block::pack_index_cache::PackIndexCache;
-use crate::block::manifest::deserialize_block_list;
 use crate::block::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::block::state::Active;
 use crate::block::volume_manifest::VolumeManifest;
@@ -1278,55 +1277,23 @@ impl ExportRouter {
             }
         }
 
-        // Boot prefetch on device open (forked exports only). Two tiers, both
-        // driven by data that already exists — NO `.hot-set` artifact:
-        //   1. INDEX warm: fetch this export's pack indices from its OWN manifest
-        //      (the real chunk indices), so even lazily-read tail blocks cost one
-        //      S3 GET (data) instead of two (index + data). Cheap — one fetch per
-        //      pack, bounded by pack count.
-        //   2. DATA warm: prefetch the trace-captured boot SET (bounded block
-        //      list) and/or the contiguous `prefetch_len` priority region, so the
-        //      guest's boot reads are cache hits. Bounded → lazy loading intact.
-        // The JoinHandle is stored in ExportState so teardown can abort it.
-        let prefetch_handle = if let Some(manifest_name) = manifest_name {
-            // Strip the bless namespace prefix to get the artifact base name.
-            let boot_set_name = manifest_name.strip_prefix("bases/").unwrap_or(manifest_name).to_string();
+        // Index warm on device open (forked exports only): fetch this export's
+        // pack indices from its OWN manifest (the real chunk indices), so even a
+        // lazily-read tail block costs one S3 GET (data) instead of two (index +
+        // data). Cheap — one fetch per pack, bounded by pack count. The
+        // JoinHandle is stored in ExportState so teardown can abort it.
+        let prefetch_handle = if manifest_name.is_some() {
             let cache_clone = Arc::clone(&cache);
             let cmc = Arc::clone(&pack_index_cache);
             let vm = Arc::clone(&volume_manifest);
             let cs = Arc::clone(&content_store);
-            let clean_cache_clone = Arc::clone(&clean_cache);
-            let metrics_clone = Arc::clone(&metrics);
-            let prefetch_len = volume_manifest.read().prefetch_len;
             // The manifest's REAL chunk indices (NOT block indices — see
             // volume_manifest::block_index_is_not_chunk_index).
             let chunk_indices: Vec<u64> =
                 volume_manifest.read().chunks.keys().map(|&c| u64::from(c)).collect();
 
             Some(spawn_supervised("boot-prefetch", async move {
-                // Tier 1: index warm from the manifest's real chunks.
                 cache_clone.prefetch_chunks(&chunk_indices, &cmc, &vm, &cs).await;
-                // Tier 2a: contiguous priority region (EROFS prioritized images).
-                if let Some(plen) = prefetch_len {
-                    info!(prefetch_len = plen, "warming priority data region");
-                    cache_clone
-                        .prefetch_data_range(plen, clean_cache_clone.as_ref(), &cmc, &vm, &cs, &metrics_clone)
-                        .await;
-                }
-                // Tier 2b: universal trace-captured boot set (any base).
-                match cs.get_boot_set(&boot_set_name).await {
-                    Ok(Some(d)) => match deserialize_block_list(&d) {
-                        Ok(blocks) => {
-                            info!(blocks = blocks.len(), "warming trace-captured boot set");
-                            cache_clone
-                                .prefetch_data_blocks(&blocks, clean_cache_clone.as_ref(), &cmc, &vm, &cs, &metrics_clone)
-                                .await;
-                        }
-                        Err(e) => warn!("failed to deserialize boot set: {e}"),
-                    },
-                    Ok(None) => {}
-                    Err(e) => warn!("failed to fetch boot set: {e}"),
-                }
                 info!("boot prefetch complete");
             }))
         } else {
@@ -1366,46 +1333,21 @@ impl ExportRouter {
             }
         });
 
-        // Optional read tracer (GLIDEFS_READ_TRACE_DIR): records the guest's
-        // read pattern so the captured boot working set can drive trace-guided
-        // data prefetch. Same format as the write trace; reads are op=Read.
-        let read_tracer = std::env::var_os("GLIDEFS_READ_TRACE_DIR").and_then(|dir| {
-            let path = std::path::Path::new(&dir).join(format!("{}.rtrace", config.name));
-            match crate::block::write_trace::WriteTracer::new(
-                &path,
-                block_size as u32,
-                device_size / block_size as u64,
-                &config.name,
-            ) {
-                Ok(t) => {
-                    info!(export = %config.name, path = %path.display(), "block-read tracing enabled");
-                    Some(Arc::new(t))
-                }
-                Err(e) => {
-                    warn!(export = %config.name, path = %path.display(), "failed to open read trace: {e}");
-                    None
-                }
-            }
-        });
-
         // Create handler for block I/O
-        let handler = Arc::new(
-            BlockHandler::new(
-                Arc::clone(&cache),
-                Arc::clone(&content_store),
-                Arc::clone(&clean_cache),
-                Arc::clone(&pack_index_cache),
-                Arc::clone(&volume_manifest),
-                device_size,
-                readonly,
-                Arc::clone(&metrics),
-                Arc::clone(&self.ssd_utilization),
-                Arc::clone(&flush_notify),
-                flush_threshold,
-                write_tracer,
-            )
-            .with_read_tracer(read_tracer),
-        );
+        let handler = Arc::new(BlockHandler::new(
+            Arc::clone(&cache),
+            Arc::clone(&content_store),
+            Arc::clone(&clean_cache),
+            Arc::clone(&pack_index_cache),
+            Arc::clone(&volume_manifest),
+            device_size,
+            readonly,
+            Arc::clone(&metrics),
+            Arc::clone(&self.ssd_utilization),
+            Arc::clone(&flush_notify),
+            flush_threshold,
+            write_tracer,
+        ));
 
         // Start flush scheduler for this export, behind an auto-restart
         // supervisor. A bare `spawn_supervised(flush_scheduler)` would
@@ -1901,8 +1843,7 @@ impl ExportRouter {
         }
 
         // --- Save manifest as a base. Index warming on fork is driven by the
-        // manifest's pack list; the boot working set is captured at runtime
-        // (read trace → boot set), so no `.hot-set` artifact is written here. ---
+        // manifest's pack list, so no sidecar artifact is written here. ---
         let manifest_key = format!("bases/{}", name);
         let manifest_data = volume_manifest
             .read()
