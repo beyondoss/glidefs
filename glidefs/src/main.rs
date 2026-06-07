@@ -105,6 +105,15 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        cli::Commands::MakeBootSet {
+            trace,
+            name,
+            s3_prefix,
+            max_blocks,
+            config,
+        } => {
+            cli::bless::run_make_boot_set(trace, name, s3_prefix, max_blocks, config).await?;
+        }
         cli::Commands::Push {
             manifest,
             image,

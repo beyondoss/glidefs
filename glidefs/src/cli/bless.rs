@@ -111,6 +111,74 @@ pub async fn run_bless(
     Ok(())
 }
 
+/// Convert a captured read trace into a base's boot SET and upload it.
+///
+/// Closes the trace→boot-set→upload loop: the read tracer
+/// (`GLIDEFS_READ_TRACE_DIR`) records what a real boot touches; this turns that
+/// bounded set into the `.boot-set` artifact the server data-prefetches on fork
+/// open. Idempotent — re-running overwrites the boot set.
+pub async fn run_make_boot_set(
+    trace: PathBuf,
+    name: String,
+    s3_prefix: String,
+    max_blocks: usize,
+    config_path: PathBuf,
+) -> Result<()> {
+    use crate::block::manifest::serialize_block_list;
+    use crate::block::write_trace::{boot_set_from_trace, read_header};
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or(tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let trace_bytes = std::fs::read(&trace)
+        .with_context(|| format!("read trace {}", trace.display()))?;
+    let header = read_header(&trace_bytes)
+        .ok_or_else(|| anyhow::anyhow!("not a valid GLIDETRC trace: {}", trace.display()))?;
+    // The trace's block size must match the volume's (128 KiB) so block indices
+    // line up; refuse a mismatched trace rather than upload a wrong boot set.
+    anyhow::ensure!(
+        header.block_size == BLOCK_SIZE,
+        "trace block_size {} != volume block_size {BLOCK_SIZE}; capture the trace on a {BLOCK_SIZE}-byte-block export",
+        header.block_size,
+    );
+
+    let boot_set = boot_set_from_trace(&trace_bytes, max_blocks);
+    anyhow::ensure!(
+        !boot_set.is_empty(),
+        "trace contains no read ops — nothing to prefetch (was the workload actually exercised?)"
+    );
+
+    // S3 setup (same shape as run_bless).
+    let settings = Settings::from_file(&config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    let env_vars = settings.cloud_provider_env_vars();
+    let (object_store, path_from_url) = parse_url_opts(
+        &settings.storage.url.parse()?,
+        env_vars.into_iter(),
+        Some(settings.storage.connect_timeout()),
+        Some(settings.storage.request_timeout()),
+    )?;
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+    let base = format!("{}/exports/{}", path_from_url, s3_prefix);
+    let content_store = ContentStore::new(Arc::clone(&object_store), &base);
+
+    content_store
+        .put_boot_set(&name, serialize_block_list(&boot_set))
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to upload boot set: {e}"))?;
+
+    println!("Uploaded boot set for '{}':", name);
+    println!("  Trace:           {}", trace.display());
+    println!("  Boot-set blocks: {} ({:.1} MiB)", boot_set.len(), boot_set.len() as f64 * BLOCK_SIZE as f64 / (1024.0 * 1024.0));
+    println!("  Artifact:        manifests/bases/{}.boot-set", name);
+    Ok(())
+}
+
 /// Bless an OCI image into a content-addressed base image.
 ///
 /// Pulls layers from the registry, converts to ext4, writes through

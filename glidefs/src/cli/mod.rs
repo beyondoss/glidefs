@@ -58,6 +58,31 @@ pub enum Commands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Build and upload a base's boot SET from a captured read trace.
+    ///
+    /// Profiling flow: run a fork of the base with `GLIDEFS_READ_TRACE_DIR=<dir>`
+    /// set, boot the workload once (this records `<dir>/<export>.rtrace`), then
+    /// run this command to convert that trace into the bounded boot working set
+    /// and upload it. Future forks of the base then data-prefetch exactly those
+    /// blocks on open (warm-on-open), instead of paying S3 round-trips lazily.
+    MakeBootSet {
+        /// Path to the captured read trace (`<export>.rtrace`).
+        #[arg(long)]
+        trace: PathBuf,
+        /// Base image name to attach the boot set to (e.g. "ubuntu-22.04").
+        #[arg(long)]
+        name: String,
+        /// S3 prefix (export namespace) the base lives in.
+        #[arg(long)]
+        s3_prefix: String,
+        /// Cap on boot-set size in 128 KiB blocks (bounds the prefetch so it
+        /// can never pull the whole image). Default 4096 (= 512 MiB).
+        #[arg(long, default_value_t = 4096)]
+        max_blocks: usize,
+        /// Config file (for storage URL + credentials).
+        #[arg(short, long)]
+        config: PathBuf,
+    },
     /// Push a GlideFS volume to an OCI registry as a container image
     Push {
         /// S3 manifest to export (e.g., "bases/ubuntu-24.04" or "my-vm")
