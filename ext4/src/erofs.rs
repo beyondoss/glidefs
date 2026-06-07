@@ -729,13 +729,17 @@ impl<W: Read + Write + Seek> Writer<W> {
                 self.write_out_at(t0, &bytes, &mut max_written)?;
             }
             // full data blocks (the last may be partial under the FLAT_PLAIN
-            // fallback, so write at most data_len bytes), streamed block-by-block.
+            // fallback, so write at most data_len bytes). The data region is
+            // contiguous, so stream it in COPY_BUF-sized chunks (bounded memory,
+            // far fewer syscalls than per-block) — block boundaries don't matter
+            // for a plain byte copy.
             if nfull > 0 {
+                const COPY_BUF: usize = 1 << 20; // 1 MiB streaming window
                 let base = self.nodes[idx].blkaddr as usize * BLK;
                 let total = data_len.min(nfull * BLK);
                 let mut w = 0;
                 while w < total {
-                    let chunk = (total - w).min(BLK);
+                    let chunk = (total - w).min(COPY_BUF);
                     let bytes = match &src {
                         Src::Mem(v) => v[w..w + chunk].to_vec(),
                         Src::Spool(off) => self.read_spool(off + w as u64, chunk)?,
