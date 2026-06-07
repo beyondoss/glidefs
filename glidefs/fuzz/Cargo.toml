@@ -71,13 +71,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "fuzz_hot_set"
-path = "fuzz_targets/fuzz_hot_set.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "fuzz_decompress_block"
 path = "fuzz_targets/fuzz_decompress_block.rs"
 test = false
