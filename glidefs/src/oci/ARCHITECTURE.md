@@ -266,12 +266,19 @@ overlayfs (the kernel driver used by container runtimes) represents file deletio
 
 Directory opaque whiteouts (`.wh..wh..opq`) set `trusted.overlay.opaque=y` xattr on the directory, matching overlayfs's convention exactly.
 
-### Why deterministic ext4 over squashfs, erofs, or raw tar
+### Two output formats: ext4 (writable) and EROFS (read-only)
 
-1. **Kernel-native, no FUSE**: ext4 is mounted directly; no userspace daemon needed at runtime
-2. **Writable via NBD**: ext4 can be mounted read-write over GlideFS's NBD block device, enabling in-place modification without re-ingesting
-3. **Content deduplication**: determinism means the same layer always produces the same pack hashes; cross-node and cross-time deduplication works transparently
-4. **Microsoft precedent**: the writer is ported from [hcsshim/pkg/compactext4](https://github.com/microsoft/hcsshim), a production system used by Windows containers
+The merge can target either filesystem; the choice is about **how the base is used**, not which is "better":
+
+| | ext4 (default) | EROFS (`bless --oci --erofs`) |
+|---|---|---|
+| Mutability | read-**write** | read-**only** |
+| Use case | VM bases that fork-and-write in place (CoW) | immutable container/OCI rootfs; writes go to an **overlay upper** |
+| Mount | kernel-native, no FUSE | kernel-native, no FUSE (in-kernel `erofs` over ublk) |
+| Determinism / dedup | yes (same layer → same pack hashes) | yes, **plus** large-file payloads grid-aligned for stronger cross-image block dedup (EROFS has no reserved blocks, so alignment is always safe) |
+| Writer origin | ported from [hcsshim/compactext4](https://github.com/microsoft/hcsshim) | hand-rolled (`ext4/src/erofs.rs`) |
+
+Both are kernel-native with no userspace daemon. Pick ext4 when the base must be writable; pick EROFS for an immutable rootfs that's overlaid at runtime (the format is read-only **by design** — container image layers are immutable, so this is the correct representation, and it's more compact: no journal, compact inodes, inline tails). `--layered` is a third option (per-layer content-addressed blobs that survive for overlay stacking).
 
 ### Why inline data
 

@@ -1,8 +1,10 @@
 #![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-//! Manifest utility functions and hot set format.
+//! Manifest utility functions and the block-list (boot set) format.
 //!
-//! The legacy binary Manifest format (v2) has been replaced by VolumeManifest (JSON).
-//! This module retains S3 key helpers and the boot hot set format.
+//! The legacy binary Manifest format (v2) has been replaced by VolumeManifest.
+//! This module retains S3 key helpers and a small codec for a list of u64 block
+//! indices — used to persist the trace-captured **boot set** that the server
+//! data-prefetches on device open.
 
 /// Generate S3 key for a manifest: "manifests/{name}"
 pub fn manifest_s3_key(name: &str) -> String {
@@ -17,55 +19,41 @@ pub fn snapshot_s3_key(name: &str, sequence: u64) -> String {
 }
 
 // ============================================================================
-// Boot Hot Set — list of chunk indices needed during boot
+// Block-list codec — persists a list of u64 block indices (the boot set).
 // ============================================================================
 
-const HOT_SET_MAGIC: &[u8; 4] = b"GLHS";
+const BLOCK_LIST_MAGIC: &[u8; 4] = b"GLHS";
 
-/// Serialize a hot set (list of block indices) into binary format.
-pub fn serialize_hot_set(chunks: &[u64]) -> Vec<u8> {
-    let mut data = Vec::with_capacity(8 + chunks.len() * 8);
-    data.extend_from_slice(HOT_SET_MAGIC);
-    data.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
-    for &chunk in chunks {
-        data.extend_from_slice(&chunk.to_le_bytes());
+/// Serialize a list of block indices into binary format.
+pub fn serialize_block_list(blocks: &[u64]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8 + blocks.len() * 8);
+    data.extend_from_slice(BLOCK_LIST_MAGIC);
+    data.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    for &b in blocks {
+        data.extend_from_slice(&b.to_le_bytes());
     }
     data
 }
 
-/// Deserialize a hot set from binary format.
-pub fn deserialize_hot_set(data: &[u8]) -> anyhow::Result<Vec<u64>> {
+/// Deserialize a block-index list from binary format.
+pub fn deserialize_block_list(data: &[u8]) -> anyhow::Result<Vec<u64>> {
     if data.len() < 8 {
-        anyhow::bail!("hot set too small");
+        anyhow::bail!("block list too small");
     }
-    if &data[..4] != HOT_SET_MAGIC {
-        anyhow::bail!("invalid hot set magic");
+    if &data[..4] != BLOCK_LIST_MAGIC {
+        anyhow::bail!("invalid block list magic");
     }
     let count = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let expected_len = 8 + count * 8;
     if data.len() < expected_len {
-        anyhow::bail!(
-            "hot set truncated: expected {} bytes, got {}",
-            expected_len,
-            data.len()
-        );
+        anyhow::bail!("block list truncated: expected {} bytes, got {}", expected_len, data.len());
     }
-    let mut chunks = Vec::with_capacity(count);
+    let mut blocks = Vec::with_capacity(count);
     for i in 0..count {
         let offset = 8 + i * 8;
-        let chunk = u64::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
-        ]);
-        chunks.push(chunk);
+        blocks.push(u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()));
     }
-    Ok(chunks)
+    Ok(blocks)
 }
 
 #[cfg(test)]
@@ -78,29 +66,22 @@ mod tests {
     }
 
     #[test]
-    fn test_hot_set_round_trip_empty() {
+    fn test_block_list_round_trip_empty() {
         let indices: Vec<u64> = vec![];
-        let data = serialize_hot_set(&indices);
-        let decoded = deserialize_hot_set(&data).unwrap();
-        assert_eq!(decoded, indices);
+        assert_eq!(deserialize_block_list(&serialize_block_list(&indices)).unwrap(), indices);
     }
 
     #[test]
-    fn test_hot_set_round_trip() {
+    fn test_block_list_round_trip() {
         let indices = vec![0, 5, 42, 1000, u64::MAX];
-        let data = serialize_hot_set(&indices);
-        let decoded = deserialize_hot_set(&data).unwrap();
-        assert_eq!(decoded, indices);
+        assert_eq!(deserialize_block_list(&serialize_block_list(&indices)).unwrap(), indices);
     }
 
     #[test]
-    fn test_hot_set_binary_format() {
-        let indices = vec![1, 2];
-        let data = serialize_hot_set(&indices);
-        // Header: 4 bytes magic + 4 bytes count + 2 * 8 bytes
+    fn test_block_list_binary_format() {
+        let data = serialize_block_list(&[1, 2]);
         assert_eq!(data.len(), 8 + 2 * 8);
         assert_eq!(&data[..4], b"GLHS");
-        let count = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        assert_eq!(count, 2);
+        assert_eq!(u32::from_le_bytes([data[4], data[5], data[6], data[7]]), 2);
     }
 }

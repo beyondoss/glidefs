@@ -1,4 +1,9 @@
-#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+// Truncating casts here are block-index → `usize`/`u32` (the u32 block-number is
+// a deliberate on-disk format invariant, shared with `page_crcs`), `u64` lengths
+// → `usize`, and CRC `finalize() → u32`, all lossless on the 64-bit targets
+// GlideFS runs on. Scoped to this one lint so `cast_possible_wrap` /
+// `cast_sign_loss` stay active and catch genuinely new sign/wrap mistakes.
+#![allow(clippy::cast_possible_truncation)]
 use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
@@ -412,7 +417,12 @@ pub(crate) struct CacheInner {
     /// Number of blocks (for bounds checking)
     pub(super) num_blocks: usize,
 
-    /// Statistics
+    /// Dirty/syncing block counters. These are not pure telemetry: the flush
+    /// scheduler reads `dirty_block_count` cross-thread to decide whether to
+    /// run a flush cycle (see `flush_scheduler.rs`, `handler.rs`). Publishing
+    /// RMWs use `Release` and gating loads use `Acquire` so a thread that
+    /// observes the bumped count also observes the block-state transition that
+    /// preceded it — the standard message-passing pairing.
     pub(super) dirty_block_count: AtomicU64,
     pub(super) syncing_block_count: AtomicU64,
 
@@ -831,12 +841,12 @@ impl CacheInner {
         match self.state_map.transition_to_dirty(idx) {
             DirtyTransition::AlreadyDirty => false,
             DirtyTransition::FromCleanOrNotPresent => {
-                self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                self.dirty_block_count.fetch_add(1, Ordering::Release);
                 true
             }
             DirtyTransition::FromSyncing => {
-                self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-                self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                self.syncing_block_count.fetch_sub(1, Ordering::Release);
+                self.dirty_block_count.fetch_add(1, Ordering::Release);
                 true
             }
         }
@@ -849,8 +859,8 @@ impl CacheInner {
     #[inline]
     pub(super) fn transition_dirty_to_syncing(&self, idx: usize) -> bool {
         if self.state_map.transition_dirty_to_syncing(idx) {
-            self.dirty_block_count.fetch_sub(1, Ordering::Relaxed);
-            self.syncing_block_count.fetch_add(1, Ordering::Relaxed);
+            self.dirty_block_count.fetch_sub(1, Ordering::Release);
+            self.syncing_block_count.fetch_add(1, Ordering::Release);
             true
         } else {
             false
@@ -866,7 +876,7 @@ impl CacheInner {
     #[inline]
     pub(super) fn transition_syncing_to_not_present(&self, idx: usize) -> bool {
         if self.state_map.transition_syncing_to_not_present(idx) {
-            self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
+            self.syncing_block_count.fetch_sub(1, Ordering::Release);
             true
         } else {
             false
@@ -1041,15 +1051,15 @@ impl CacheInner {
                         .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
                         .is_ok()
                     {
-                        self.syncing_block_count.fetch_sub(1, Ordering::Relaxed);
-                        self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                        self.syncing_block_count.fetch_sub(1, Ordering::Release);
+                        self.dirty_block_count.fetch_add(1, Ordering::Release);
                     }
                 } else if self
                     .state_map
                     .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
                     .is_ok()
                 {
-                    self.dirty_block_count.fetch_add(1, Ordering::Relaxed);
+                    self.dirty_block_count.fetch_add(1, Ordering::Release);
                 }
                 // _guard drops here, releasing the claim + waking waiters.
             }

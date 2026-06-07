@@ -115,6 +115,25 @@ fn build_ext4(img: &Image, align: bool) -> File {
     fs
 }
 
+/// Build a merged **EROFS** image (the glid(ero)fs format) from the same layers,
+/// via the hand-rolled writer. Deterministic UUID from the image seed so shared
+/// content is byte-identical across images (the dedup property). `align` snaps
+/// large file payloads to the 128 KiB dedup grid (holes are free).
+fn build_erofs(img: &Image, align: bool) -> File {
+    let mut layers: Vec<File> =
+        img.layer_blobs.iter().map(|p| decompress_layer(p).expect("decompress")).collect();
+    let mut writer_options = vec![WriterOption::Uuid(deterministic_uuid(&img.seed))];
+    if align {
+        writer_options
+            .push(WriterOption::AlignData { align: GRID as u32, min_size: align_threshold() });
+    }
+    let opts = ConvertOptions { convert_backslash: false, writer_options };
+    let out = tempfile::tempfile().expect("tempfile");
+    let mut fs = ext4::convert_oci_layers_to_erofs(&mut layers, out, &opts).expect("convert erofs");
+    fs.seek(SeekFrom::Start(0)).unwrap();
+    fs
+}
+
 fn is_zero(d: &[u8]) -> bool {
     let (p, c, s) = unsafe { d.align_to::<u64>() };
     p.iter().all(|&b| b == 0) && c.iter().all(|&w| w == 0) && s.iter().all(|&b| b == 0)
@@ -343,6 +362,133 @@ fn main() {
         let captured = if ceil > 0 { 100.0 * saved as f64 / ceil as f64 } else { 0.0 };
         println!("  CDC ceiling would save {} — ALIGNED captures {:.0}% of it.", human(ceil), captured);
     }
+
+    // =====================================================================
+    // EROFS vs ext4 — the glid(ero)fs format, same real images + real block_map.
+    // Fixed 128 KiB grid == what foyer dedups; store-union == S3/cache bytes.
+    // =====================================================================
+    println!("\n================ EROFS vs ext4 (glid(ero)fs format) ================");
+    let mut erofs_maps: Vec<HashMap<Blake3Hash, usize>> = Vec::new();
+    let mut erofs_aligned_maps: Vec<HashMap<Blake3Hash, usize>> = Vec::new();
+    for (i, img) in images.iter().enumerate() {
+        let t = std::time::Instant::now();
+        let e = read_all(build_erofs(img, false));
+        let build_ms = t.elapsed().as_millis();
+        let ea = read_all(build_erofs(img, true));
+        let mut em = HashMap::new();
+        let mut eam = HashMap::new();
+        let (mut r, mut z) = (0u64, 0u64);
+        fixed_grid_units(&e, &mut em, &mut r, &mut z);
+        let (mut r2, mut z2) = (0u64, 0u64);
+        fixed_grid_units(&ea, &mut eam, &mut r2, &mut z2);
+        let ext4_stored: u64 = fixed_maps[i].values().map(|&v| v as u64).sum();
+        let erofs_stored: u64 = em.values().map(|&v| v as u64).sum();
+        let erofs_a_stored: u64 = eam.values().map(|&v| v as u64).sum();
+        println!(
+            "  {:14} image: ext4 {:>10} / EROFS {:>10}  |  stored(foyer): ext4 {:>10} / EROFS {:>10} / EROFS+align {:>10}  |  build {} ms",
+            img.name,
+            human(unaligned[i].len() as u64),
+            human(e.len() as u64),
+            human(ext4_stored),
+            human(erofs_stored),
+            human(erofs_a_stored),
+            build_ms,
+        );
+        erofs_maps.push(em);
+        erofs_aligned_maps.push(eam);
+    }
+    let erofs_union = union_stored(&erofs_maps.iter().collect::<Vec<_>>());
+    let erofs_aligned_union = union_stored(&erofs_aligned_maps.iter().collect::<Vec<_>>());
+    println!("\n  --- whole-set store-union (foyer/S3 bytes for all {} images) ---", images.len());
+    println!("  ext4 (TODAY) : {}", human(fixed_union));
+    println!("  EROFS        : {}", human(erofs_union));
+    println!("  EROFS+align  : {}  <- large-file payloads snapped to the 128 KiB grid", human(erofs_aligned_union));
+    if erofs_union > 0 {
+        let saved = erofs_union.saturating_sub(erofs_aligned_union);
+        println!(
+            "  align saves {} vs plain EROFS ({:.1}%) on the merged image",
+            human(saved),
+            100.0 * saved as f64 / erofs_union as f64
+        );
+    }
+    if fixed_union > 0 {
+        let d = fixed_union as i64 - erofs_union as i64;
+        println!(
+            "  EROFS is {} {} than ext4 ({:.1}%)",
+            human(d.unsigned_abs()),
+            if d >= 0 { "SMALLER" } else { "larger" },
+            100.0 * d.unsigned_abs() as f64 / fixed_union as f64,
+        );
+    }
+
+    // =====================================================================
+    // Per-layer EROFS blobs — the actual rest-dedup design: each layer is its
+    // own byte-identical EROFS, so a layer SHARED across images is stored once.
+    // (The merged image above does NOT dedup across images; this is why.)
+    // =====================================================================
+    println!("\n================ Per-layer EROFS blobs (rest-dedup design) ================");
+    let mut layer_union: HashMap<Blake3Hash, usize> = HashMap::new();
+    let mut layer_aligned_union: HashMap<Blake3Hash, usize> = HashMap::new();
+    let mut layer_each: u64 = 0u64;
+    let mut n_layers = 0usize;
+    let mut uniq_digests: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let build_layer_blob = |blob: &Path, digest: &str, align: bool| -> Vec<u8> {
+        let mut dec = decompress_layer(blob).expect("decompress");
+        let mut writer_options = vec![WriterOption::Uuid(deterministic_uuid(digest))];
+        if align {
+            writer_options
+                .push(WriterOption::AlignData { align: GRID as u32, min_size: align_threshold() });
+        }
+        let opts = ConvertOptions { convert_backslash: false, writer_options };
+        let out = tempfile::tempfile().expect("tempfile");
+        let fs = ext4::convert_layer_to_erofs(&mut dec, out, &opts).expect("layer erofs");
+        read_all(fs)
+    };
+    for img in &images {
+        for blob in &img.layer_blobs {
+            let digest = blob.file_name().unwrap().to_string_lossy().into_owned();
+            uniq_digests.insert(digest.clone());
+            let bytes = build_layer_blob(blob, &digest, false);
+            let mut m = HashMap::new();
+            let (mut r, mut z) = (0u64, 0u64);
+            fixed_grid_units(&bytes, &mut m, &mut r, &mut z);
+            layer_each += m.values().map(|&v| v as u64).sum::<u64>();
+            for (h, &s) in &m {
+                layer_union.entry(*h).or_insert(s);
+            }
+            let abytes = build_layer_blob(blob, &digest, true);
+            let mut am = HashMap::new();
+            let (mut ar, mut az) = (0u64, 0u64);
+            fixed_grid_units(&abytes, &mut am, &mut ar, &mut az);
+            for (h, &s) in &am {
+                layer_aligned_union.entry(*h).or_insert(s);
+            }
+            n_layers += 1;
+        }
+    }
+    let layer_union_bytes: u64 = layer_union.values().map(|&v| v as u64).sum();
+    let layer_aligned_bytes: u64 = layer_aligned_union.values().map(|&v| v as u64).sum();
+    println!(
+        "  {} layer instances across {} images ({} unique digests)",
+        n_layers,
+        images.len(),
+        uniq_digests.len()
+    );
+    println!("  store-each (every layer separately): {}", human(layer_each));
+    println!("  store-union (shared layers ONCE):    {}", human(layer_union_bytes));
+    println!("  store-union + grid-align:            {}", human(layer_aligned_bytes));
+    println!("\n  >>> STORAGE-AT-REST for the whole image set <<<");
+    println!("    ext4 merged (ships today)  : {}", human(fixed_union));
+    println!("    EROFS merged               : {}", human(erofs_union));
+    println!("    EROFS merged + grid-align  : {}", human(erofs_aligned_union));
+    println!(
+        "    EROFS per-layer blobs      : {}   <- the rest-dedup design",
+        human(layer_union_bytes)
+    );
+    println!(
+        "    EROFS per-layer + align    : {}   <- + large-file grid alignment",
+        human(layer_aligned_bytes)
+    );
 
     // =====================================================================
     // Padding cost + round-trip validity of the aligned images.

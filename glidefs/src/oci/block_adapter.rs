@@ -119,11 +119,16 @@ mod tests {
 
     /// Create a test BlockHandler with 1 MiB device, 4 KiB blocks.
     async fn test_handler() -> (BlockHandler, TempDir) {
+        test_handler_sized(1024 * 1024).await
+    }
+
+    /// Create a test BlockHandler with a custom device size (4 KiB blocks).
+    async fn test_handler_sized(device_size: u64) -> (BlockHandler, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let config = WriteCacheConfig {
             cache_dir: temp_dir.path().to_path_buf(),
             device_name: "block-adapter-test".to_string(),
-            device_size: 1024 * 1024,
+            device_size,
             block_size: 4096,
             wal_sync: false,
         };
@@ -134,7 +139,7 @@ mod tests {
             Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await.unwrap());
         let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
-            1024 * 1024,
+            device_size,
             4096,
         )));
         let metrics = Arc::new(ExportMetrics::new());
@@ -147,7 +152,7 @@ mod tests {
             clean_cache,
             pack_index_cache,
             volume_manifest,
-            1024 * 1024,
+            device_size,
             false,
             metrics,
             Arc::new(AtomicU64::new(0f64.to_bits())),
@@ -214,6 +219,314 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A merged EROFS image (the glid(ero)fs format) must store into a real
+    /// glidefs volume through the production `BlockAdapter` sink and read back
+    /// byte-exact — proving GlideFS can serve EROFS images, not just ext4.
+    #[tokio::test]
+    async fn erofs_image_stores_and_reads_back_byte_exact() {
+        let (handler, _temp) = test_handler().await;
+        let rt = tokio::runtime::Handle::current();
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::Cursor;
+            let mk = |entries: &[(&str, &[u8])]| -> Vec<u8> {
+                let mut b = tar::Builder::new(Vec::new());
+                for (p, d) in entries {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_path(p).unwrap();
+                    h.set_size(d.len() as u64);
+                    h.set_mode(0o644);
+                    h.set_entry_type(tar::EntryType::Regular);
+                    h.set_cksum();
+                    b.append(&h, *d).unwrap();
+                }
+                b.into_inner().unwrap()
+            };
+            let l0 = mk(&[("etc/os", b"base"), ("bin/sh", b"#!/bin/sh\n")]);
+            let l1 = mk(&[("etc/os", b"top"), ("app/run", b"hi")]);
+            let opts = ext4::tar_convert::ConvertOptions {
+                convert_backslash: false,
+                writer_options: vec![ext4::writer::WriterOption::Uuid([9u8; 16])],
+            };
+
+            // Reference: the same merged EROFS built in memory.
+            let ref_img = {
+                let mut layers = vec![Cursor::new(l0.clone()), Cursor::new(l1.clone())];
+                ext4::convert_oci_layers_to_erofs(&mut layers, Cursor::new(Vec::new()), &opts)
+                    .unwrap()
+                    .into_inner()
+            };
+            assert_eq!(&ref_img[1024..1028], &[0xe2, 0xe1, 0xf5, 0xe0], "EROFS magic");
+
+            // Write the merged EROFS straight into the glidefs volume.
+            let mut layers = vec![Cursor::new(l0), Cursor::new(l1)];
+            let mut adapter = ext4::convert_oci_layers_to_erofs(
+                &mut layers,
+                BlockAdapter::new(&handler, rt),
+                &opts,
+            )
+            .unwrap();
+            adapter.flush().unwrap();
+
+            // Read the whole device back; compare the image prefix byte-for-byte.
+            adapter.seek(SeekFrom::Start(0)).unwrap();
+            let mut buf = vec![0u8; 1024 * 1024];
+            adapter.read_exact(&mut buf).unwrap();
+            assert_eq!(
+                &buf[..ref_img.len()],
+                &ref_img[..],
+                "EROFS image must round-trip byte-exact through glidefs storage"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    /// END-TO-END on the homelab: serve a merged EROFS image (the glid(ero)fs
+    /// format) over a REAL ublk block device and mount it with the in-kernel
+    /// `erofs` driver — no daemon — then verify the overlay-merged content. This
+    /// exercises the full production serve path: kernel EROFS → ublk → glidefs
+    /// BlockHandler → cache/ContentStore. Requires the `ublk` feature + root +
+    /// `/dev/ublk-control`.
+    #[cfg(feature = "ublk")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn erofs_served_over_real_ublk_kernel_mount() {
+        use std::process::Command;
+        use std::sync::Arc;
+
+        if !std::path::Path::new("/dev/ublk-control").exists() {
+            eprintln!("SKIP: /dev/ublk-control not present");
+            return;
+        }
+
+        let (handler, _temp) = test_handler().await;
+        let rt = tokio::runtime::Handle::current();
+
+        // Build a merged EROFS from two overlay layers and write it into the
+        // glidefs volume through the production BlockAdapter sink.
+        let handler = tokio::task::spawn_blocking(move || {
+            use std::io::Cursor;
+            let mk = |entries: &[(&str, &[u8])]| -> Vec<u8> {
+                let mut b = tar::Builder::new(Vec::new());
+                for (p, d) in entries {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_path(p).unwrap();
+                    h.set_size(d.len() as u64);
+                    h.set_mode(0o644);
+                    h.set_entry_type(tar::EntryType::Regular);
+                    h.set_cksum();
+                    b.append(&h, *d).unwrap();
+                }
+                b.into_inner().unwrap()
+            };
+            let l0 = mk(&[("etc/hello", b"from-base"), ("bin/run", b"#!/bin/sh\n")]);
+            let l1 = mk(&[("etc/hello", b"from-top"), ("app/data", b"payload")]);
+            let opts = ext4::tar_convert::ConvertOptions {
+                convert_backslash: false,
+                writer_options: vec![ext4::writer::WriterOption::Uuid([5u8; 16])],
+            };
+            let mut layers = vec![Cursor::new(l0), Cursor::new(l1)];
+            {
+                let mut a = ext4::convert_oci_layers_to_erofs(
+                    &mut layers,
+                    BlockAdapter::new(&handler, rt),
+                    &opts,
+                )
+                .unwrap();
+                a.flush().unwrap();
+            }
+            handler
+        })
+        .await
+        .unwrap();
+
+        // Serve it over a real ublk block device.
+        let handler = Arc::new(handler);
+        let mut server = crate::block::ublk::UblkServer::new();
+        let dev = server
+            .add_device("erofs-serve-test", Arc::clone(&handler))
+            .await
+            .expect("register ublk device");
+        eprintln!("serving glid(ero)fs EROFS over real ublk device {}", dev.display());
+
+        let mnt = tempfile::tempdir().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let m = Command::new("mount")
+                .args(["-t", "erofs", "-o", "ro"])
+                .arg(&dev)
+                .arg(mnt.path())
+                .status()
+                .expect("spawn mount");
+            assert!(m.success(), "in-kernel erofs mount over ublk failed");
+            let read = |p: &str| std::fs::read_to_string(mnt.path().join(p)).unwrap();
+            assert_eq!(read("etc/hello"), "from-top", "overlay override served over ublk");
+            assert_eq!(read("app/data"), "payload");
+            assert_eq!(read("bin/run"), "#!/bin/sh\n");
+            let _ = Command::new("umount").arg(mnt.path()).status();
+        }));
+        server.remove_device("erofs-serve-test").await.ok();
+        if let Err(e) = result {
+            let _ = Command::new("umount").arg(mnt.path()).status();
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    /// END-TO-END layout-at-scale: serve a realistically-sized EROFS image built
+    /// with BOTH grid alignment (dedup) AND cold-start priority ordering (holes +
+    /// reordered data + a multi-grid-block file + a long tail of inline small
+    /// files) over a REAL ublk device + the in-kernel `erofs` driver, and verify
+    /// every file reads back byte-exact. Tiny images can't expose layout bugs
+    /// that only appear with alignment holes, reordered priority runs, and
+    /// multi-block files — this is the test that does.
+    #[cfg(feature = "ublk")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn erofs_aligned_prioritized_served_over_ublk() {
+        use std::process::Command;
+        use std::sync::Arc;
+
+        if !std::path::Path::new("/dev/ublk-control").exists() {
+            eprintln!("SKIP: /dev/ublk-control not present");
+            return;
+        }
+
+        const GRID: u32 = 128 * 1024;
+        // Deterministic, high-entropy payload (non-zero so blocks aren't holes).
+        fn payload(seed: u64, len: usize) -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        }
+
+        // Expected contents, built once so we can verify reads against them.
+        let big = payload(0xB16, 1_500_000); // ~1.5 MB → spans many 128 KiB grids
+        let med1 = payload(0x111, 200 * 1024);
+        let med2 = payload(0x222, 200 * 1024);
+        let smalls: Vec<(String, Vec<u8>)> =
+            (0..40).map(|i| (format!("etc/f{i:02}"), payload(1000 + i, 1500 + i as usize * 7))).collect();
+
+        let (image, prefetch_len) = tokio::task::spawn_blocking({
+            let big = big.clone();
+            let med1 = med1.clone();
+            let med2 = med2.clone();
+            let smalls = smalls.clone();
+            move || {
+                use std::io::Cursor;
+                let mut b = tar::Builder::new(Vec::new());
+                let mut add = |path: &str, data: &[u8], mode: u32| {
+                    let mut h = tar::Header::new_gnu();
+                    h.set_path(path).unwrap();
+                    h.set_size(data.len() as u64);
+                    h.set_mode(mode);
+                    h.set_entry_type(tar::EntryType::Regular);
+                    h.set_cksum();
+                    b.append(&h, data).unwrap();
+                };
+                add("big.bin", &big, 0o644);
+                add("lib/med1.so", &med1, 0o644);
+                add("lib/med2.so", &med2, 0o644);
+                add("bin/run", b"#!/bin/sh\necho hi\n", 0o755);
+                for (p, d) in &smalls {
+                    add(p, d, 0o644);
+                }
+                // A symlink to the big file (read content through it too).
+                let mut hl = tar::Header::new_gnu();
+                hl.set_path("biglink").unwrap();
+                hl.set_size(0);
+                hl.set_mode(0o777);
+                hl.set_entry_type(tar::EntryType::Symlink);
+                hl.set_link_name("big.bin").unwrap();
+                hl.set_cksum();
+                b.append(&hl, &[][..]).unwrap();
+                let layer = b.into_inner().unwrap();
+
+                // Alignment for dedup + priority order for cold start: big.bin and
+                // a couple of boot files are pulled to the front, packed tight.
+                let opts = ext4::tar_convert::ConvertOptions {
+                    convert_backslash: false,
+                    writer_options: vec![
+                        ext4::writer::WriterOption::Uuid([3u8; 16]),
+                        ext4::writer::WriterOption::AlignData { align: GRID, min_size: 16 * 1024 },
+                        ext4::writer::WriterOption::PriorityOrder(vec![
+                            "big.bin".into(),
+                            "bin/run".into(),
+                            "etc/f00".into(),
+                        ]),
+                    ],
+                };
+                let mut layers = vec![Cursor::new(layer)];
+                ext4::convert_oci_layers_to_erofs_with_prefetch(
+                    &mut layers,
+                    Cursor::new(Vec::new()),
+                    &opts,
+                )
+                .map(|(c, p)| (c.into_inner(), p))
+                .unwrap()
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(prefetch_len >= big.len() as u64, "prefetch extent must cover big.bin");
+        assert!(prefetch_len < image.len() as u64, "prefetch extent must be a prefix");
+
+        // Device large enough for the aligned (hole-inflated) image.
+        let device = (image.len() as u64 + GRID as u64).next_power_of_two().max(32 * 1024 * 1024);
+        let (handler, _temp) = test_handler_sized(device).await;
+        let rt = tokio::runtime::Handle::current();
+
+        // Write the image into the glidefs volume through the production sink.
+        let handler = tokio::task::spawn_blocking(move || {
+            let mut a = BlockAdapter::new(&handler, rt);
+            a.write_all(&image).unwrap();
+            a.flush().unwrap();
+            handler
+        })
+        .await
+        .unwrap();
+
+        // Serve over real ublk + mount with the in-kernel erofs driver.
+        let handler = Arc::new(handler);
+        let mut server = crate::block::ublk::UblkServer::new();
+        let dev = server
+            .add_device("erofs-aligned-prio", Arc::clone(&handler))
+            .await
+            .expect("register ublk device");
+
+        let mnt = tempfile::tempdir().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let m = Command::new("mount")
+                .args(["-t", "erofs", "-o", "ro"])
+                .arg(&dev)
+                .arg(mnt.path())
+                .status()
+                .expect("spawn mount");
+            assert!(m.success(), "kernel erofs mount of aligned+prioritized image failed");
+
+            let rd = |p: &str| std::fs::read(mnt.path().join(p)).unwrap();
+            assert_eq!(rd("big.bin"), big, "multi-grid priority file must read byte-exact");
+            assert_eq!(rd("biglink"), big, "symlink to big file resolves + reads exact");
+            assert_eq!(rd("lib/med1.so"), med1, "aligned medium file 1 byte-exact");
+            assert_eq!(rd("lib/med2.so"), med2, "aligned medium file 2 byte-exact");
+            assert_eq!(rd("bin/run"), b"#!/bin/sh\necho hi\n");
+            // Every inline small file (the long tail) must be intact.
+            for (p, d) in &smalls {
+                assert_eq!(&rd(p), d, "small file {p} must read byte-exact");
+            }
+            let _ = Command::new("umount").arg(mnt.path()).status();
+        }));
+        server.remove_device("erofs-aligned-prio").await.ok();
+        if let Err(e) = result {
+            let _ = Command::new("umount").arg(mnt.path()).status();
+            std::panic::resume_unwind(e);
+        }
     }
 
     #[tokio::test]

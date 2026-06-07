@@ -26,7 +26,7 @@ impl WriteCache<Recovering> {
     /// SSD readability issues surface at the first flush cycle (CRC pre-pass).
     #[instrument(skip(self))]
     pub async fn finish_recovery(self) -> Result<WriteCache<Active>, CacheError> {
-        let dirty_count = self.inner.dirty_block_count.load(Ordering::Relaxed);
+        let dirty_count = self.inner.dirty_block_count.load(Ordering::Acquire);
 
         if dirty_count == 0 {
             info!("no dirty blocks, recovery complete");

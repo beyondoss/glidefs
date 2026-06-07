@@ -41,6 +41,11 @@ pub enum TraceOp {
     Write = 0,
     Trim = 1,
     WriteZeroes = 2,
+    /// Guest read. Used by the read tracer to capture the *boot working set* —
+    /// the bounded set of blocks a workload actually touches — so the server can
+    /// data-prefetch exactly those on the next cold open instead of the whole
+    /// image. (`WriteTracer` is a general block-I/O tracer despite the name.)
+    Read = 3,
 }
 
 /// Records block-level I/O to a binary trace file.
@@ -75,10 +80,16 @@ impl WriteTracer {
         writer.write_all(&block_size.to_le_bytes())?;
         writer.write_all(&device_blocks.to_le_bytes())?;
 
-        let now_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
+        // A node with a rolled-back clock (bad RTC / NTP step) can report
+        // `now < UNIX_EPOCH`; treat that as t=0 rather than panicking at
+        // export-attach time. `as_micros()` is u128 — saturate into u64.
+        let now_us = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
         writer.write_all(&now_us.to_le_bytes())?;
 
         let mut name_buf = [0u8; 32];
@@ -107,7 +118,7 @@ impl WriteTracer {
         let block_start = (offset / u64::from(self.block_size)) as u32;
         let block_end = ((offset + length).div_ceil(u64::from(self.block_size))) as u32;
         let span = (block_end - block_start) as u16;
-        let elapsed_us = self.start.elapsed().as_micros() as u64;
+        let elapsed_us = u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         let mut buf = [0u8; 16];
         buf[0..4].copy_from_slice(&block_start.to_le_bytes());
@@ -173,7 +184,10 @@ pub fn read_header(data: &[u8]) -> Option<TraceHeader> {
 
     let name_bytes = &data[32..64];
     let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
-    let export_name = String::from_utf8_lossy(&name_bytes[..end]).to_string();
+    // Reject non-UTF-8 names rather than lossily replacing bytes: a U+FFFD
+    // substitution would round-trip as a *different* export name and could
+    // mis-attribute the trace to the wrong volume. A corrupt header → None.
+    let export_name = std::str::from_utf8(&name_bytes[..end]).ok()?.to_string();
 
     Some(TraceHeader {
         version,
@@ -182,6 +196,32 @@ pub fn read_header(data: &[u8]) -> Option<TraceHeader> {
         start_time_us,
         export_name,
     })
+}
+
+/// Extract the **boot working set** from a read trace: the distinct block
+/// indices touched by `Read` ops, in first-touch order, capped at `max_blocks`.
+///
+/// First-touch order is what makes a downstream layout/prefetch contiguous-and-
+/// coalescing-friendly (the same ordering eStargz/Nydus use). The cap bounds the
+/// prefetch so it can never devolve into "download the whole image". `op == Read`
+/// is `TraceOp::Read as u16` (3).
+pub fn boot_set_from_trace(data: &[u8], max_blocks: usize) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
+    let mut order = Vec::new();
+    for e in iter_entries(data) {
+        if e.op != TraceOp::Read as u16 {
+            continue;
+        }
+        for b in e.block_index..e.block_index.saturating_add(u32::from(e.span.max(1))) {
+            if seen.insert(b) {
+                order.push(u64::from(b));
+                if order.len() >= max_blocks {
+                    return order;
+                }
+            }
+        }
+    }
+    order
 }
 
 /// Iterate trace entries from a memory-mapped or loaded file.
@@ -241,6 +281,26 @@ mod tests {
         // Timestamps should be monotonically increasing
         assert!(entries[1].elapsed_us >= entries[0].elapsed_us);
         assert!(entries[2].elapsed_us >= entries[1].elapsed_us);
+    }
+
+    #[test]
+    fn boot_set_extracts_reads_in_first_touch_order_bounded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("r.trace");
+        let t = WriteTracer::new(&path, 131072, 1024, "x").unwrap();
+        // Interleave reads + writes; only reads count, in first-touch order.
+        t.record(131072 * 5, 131072, TraceOp::Read); // block 5
+        t.record(0, 131072, TraceOp::Write); // ignored (write)
+        t.record(131072 * 2, 131072 * 2, TraceOp::Read); // blocks 2,3 (span 2)
+        t.record(131072 * 5, 131072, TraceOp::Read); // block 5 again → dedup
+        t.record(131072 * 9, 131072, TraceOp::Read); // block 9
+        t.finish();
+
+        let data = std::fs::read(&path).unwrap();
+        // First-touch order: 5, then 2,3, then 9.
+        assert_eq!(boot_set_from_trace(&data, 100), vec![5, 2, 3, 9]);
+        // Cap is respected.
+        assert_eq!(boot_set_from_trace(&data, 2), vec![5, 2]);
     }
 
     #[test]

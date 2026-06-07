@@ -51,9 +51,10 @@ pub struct StoreStats {
 /// Stream an ext4 byte source into content-addressed packs + a `VolumeManifest`
 /// under `content_store`'s base path.
 ///
-/// Returns the manifest, the non-zero block indices (hot set), and upload stats.
-/// The caller owns persisting the manifest / hot set under whatever name it
-/// chooses.
+/// Returns the manifest and upload stats. The caller owns persisting the
+/// manifest under whatever name it chooses. (Index warming on fork comes from
+/// the manifest's pack list; the boot working set is captured at runtime, so no
+/// "hot set" is produced here.)
 ///
 /// `source` is read for exactly `ceil(device_size / BLOCK_SIZE)` blocks; bytes
 /// past EOF are treated as zero (so an ext4 image smaller than `device_size`
@@ -64,7 +65,7 @@ pub async fn store_ext4_stream<R: Read>(
     device_size: u64,
     // Block compression level (`block_map::COMPRESSION_LZ4` = LZ4, else zstd level).
     level: i32,
-) -> Result<(VolumeManifest, Vec<u64>, StoreStats)> {
+) -> Result<(VolumeManifest, StoreStats)> {
     let vm_template = VolumeManifest::new(device_size, BLOCK_SIZE);
     let total_blocks = device_size.div_ceil(u64::from(BLOCK_SIZE)) as usize;
     let (_, zero_hash) = shared_zero_block(BLOCK_SIZE as usize);
@@ -72,7 +73,6 @@ pub async fn store_ext4_stream<R: Read>(
 
     let mut volume_manifest = VolumeManifest::new(device_size, BLOCK_SIZE);
     let mut stats = StoreStats::default();
-    let mut hot_set_indices: Vec<u64> = Vec::new();
     let mut pending_chunk: Option<(u32, Vec<BlockInfo>)> = None;
     let mut in_flight: Option<tokio::task::JoinHandle<Result<ChunkUploadResult>>> = None;
 
@@ -88,7 +88,6 @@ pub async fn store_ext4_stream<R: Read>(
             continue;
         }
 
-        hot_set_indices.push(block_index as u64);
         let chunk_idx = vm_template.chunk_idx_for_block(block_index as u64);
         let block_offset = vm_template.block_offset_in_chunk(block_index as u64);
         stats.unique_blocks += 1;
@@ -130,7 +129,7 @@ pub async fn store_ext4_stream<R: Read>(
     }
 
     join_upload(&mut volume_manifest, &mut stats, in_flight).await?;
-    Ok((volume_manifest, hot_set_indices, stats))
+    Ok((volume_manifest, stats))
 }
 
 /// Result of a completed chunk upload.

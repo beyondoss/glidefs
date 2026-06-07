@@ -465,31 +465,31 @@ impl ContentStore {
         Ok(names)
     }
 
-    /// Upload a boot hot set to S3.
-    pub async fn put_hot_set(&self, name: &str, data: Vec<u8>) -> Result<(), ContentStoreError> {
+    /// Upload a boot SET (trace-captured boot working set: a bounded block list).
+    /// Bounded and safe to DATA-prefetch on open. Producer side of the runtime
+    /// trace→boot-set loop (the read-trace→boot-set tool is the only caller; for
+    /// now it's exercised by the prefetch integration tests).
+    #[allow(dead_code)]
+    pub async fn put_boot_set(&self, name: &str, data: Vec<u8>) -> Result<(), ContentStoreError> {
         self.check_circuit()?;
-        let key = format!("{}/manifests/bases/{}.hot-set", self.base_path, name);
+        let key = format!("{}/manifests/bases/{}.boot-set", self.base_path, name);
         let path = ObjectPath::from(key);
-        let payload = PutPayload::from(data);
-        let result = self.object_store.put(&path, payload).await;
+        let result = self.object_store.put(&path, PutPayload::from(data)).await;
         self.record_s3_result(&result);
         result?;
-        debug!(name = %name, "uploaded hot set");
+        debug!(name = %name, "uploaded boot set");
         Ok(())
     }
 
-    /// Download a boot hot set from S3. Returns None if not found.
-    pub async fn get_hot_set(&self, name: &str) -> Result<Option<Vec<u8>>, ContentStoreError> {
+    /// Download a boot set from S3. Returns None if not found.
+    pub async fn get_boot_set(&self, name: &str) -> Result<Option<Vec<u8>>, ContentStoreError> {
         self.check_circuit()?;
-        let key = format!("{}/manifests/bases/{}.hot-set", self.base_path, name);
+        let key = format!("{}/manifests/bases/{}.boot-set", self.base_path, name);
         let path = ObjectPath::from(key);
         let result = self.object_store.get(&path).await;
         self.record_s3_result(&result);
         match result {
-            Ok(response) => {
-                let bytes = response.bytes().await?;
-                Ok(Some(bytes.to_vec()))
-            }
+            Ok(response) => Ok(Some(response.bytes().await?.to_vec())),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -498,7 +498,7 @@ impl ContentStore {
     /// List all manifest names under `manifests/` (not just bases).
     ///
     /// Returns paths relative to `manifests/`, e.g. `"vm1"`, `"bases/ubuntu-22.04"`.
-    /// Filters out `.hot-set` files.
+    /// Filters out sidecar artifacts (`.boot-set`, and legacy `.hot-set`).
     pub async fn list_all_manifests(&self) -> Result<Vec<String>, ContentStoreError> {
         self.check_circuit()?;
         let prefix_str = format!("{}/manifests/", self.base_path);
@@ -516,7 +516,7 @@ impl ContentStore {
             let path_str = meta.location.to_string();
             // Extract path relative to manifests/
             if let Some(relative) = path_str.strip_prefix(&prefix_str) {
-                if relative.ends_with(".hot-set") {
+                if relative.ends_with(".hot-set") || relative.ends_with(".boot-set") {
                     continue;
                 }
                 if !relative.is_empty() {

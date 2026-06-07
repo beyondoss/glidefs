@@ -81,6 +81,17 @@ pub enum WriterOption {
     /// skip group-metadata blocks when aligning. Verified via `dedup_probe` +
     /// `e2fsck`/loop-mount.
     AlignData { align: u32, min_size: u32 },
+    /// Lay these paths' inodes and data out FIRST, contiguously, in the given
+    /// order — the boot/cold-start working set ("prioritized files", à la
+    /// eStargz). Co-accessed files packed densely at the front collapse a
+    /// scattered cold read into one coalesced, read-ahead-friendly fetch from the
+    /// backing store, slashing cold-start round-trips. Paths not present are
+    /// skipped. EROFS writer only (the ext4 writer ignores it).
+    ///
+    /// Prioritized files are packed *tight* (alignment is intentionally NOT
+    /// applied to them) so no holes break fetch coalescing; the unprioritized
+    /// remainder still honors [`WriterOption::AlignData`] for at-rest dedup.
+    PriorityOrder(Vec<String>),
 }
 
 // ---- Internal inode ----
@@ -306,6 +317,9 @@ impl<W: Read + Write + Seek> Writer<W> {
                     w.data_align = i64::from(*align);
                     w.data_align_min = i64::from(*min_size);
                 }
+                // Cold-start file ordering is an EROFS-writer concern; the ext4
+                // writer has its own block allocator and ignores it.
+                WriterOption::PriorityOrder(_) => {}
             }
         }
         w
@@ -1745,6 +1759,27 @@ impl<W: Read + Write + Seek> io::Write for Writer<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.f.flush()
+    }
+}
+
+/// A filesystem-image sink the OCI layer-merge driver targets, abstracting over
+/// the ext4 [`Writer`] and the EROFS writer so one merge implementation feeds
+/// both. Regular-file data is written via the [`io::Write`] impl after `create`.
+pub trait FsSink: io::Write {
+    fn make_parents(&mut self, name: &str) -> io::Result<()>;
+    fn create(&mut self, name: &str, f: &File) -> io::Result<()>;
+    fn link(&mut self, oldname: &str, newname: &str) -> io::Result<()>;
+}
+
+impl<W: Read + Write + Seek> FsSink for Writer<W> {
+    fn make_parents(&mut self, name: &str) -> io::Result<()> {
+        Writer::make_parents(self, name)
+    }
+    fn create(&mut self, name: &str, f: &File) -> io::Result<()> {
+        Writer::create(self, name, f)
+    }
+    fn link(&mut self, oldname: &str, newname: &str) -> io::Result<()> {
+        Writer::link(self, oldname, newname)
     }
 }
 

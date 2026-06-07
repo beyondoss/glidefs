@@ -246,6 +246,103 @@ impl V2Harness {
     }
 }
 
+/// Serving-side data prefetch: `prefetch_data_range` warms the clean cache with
+/// the actual boot working set so the guest's first reads are cache hits, not S3
+/// round-trips. Proven cold→warm: a FRESH cache (no local blocks) over a store
+/// that already holds flushed packs must (a) hit S3 during prefetch, then (b)
+/// serve the same range from the clean cache with ZERO additional S3 reads.
+#[tokio::test]
+async fn prefetch_data_range_warms_clean_cache_cold_to_hot() {
+    use crate::block::cache::SimpleBlockCache;
+    use crate::block::content_store::ContentStore;
+    use crate::block::metrics::ExportMetrics;
+
+    let bs = 4096usize;
+    let device = 8 * 1024 * 1024u64;
+    let nblocks = 64usize; // 256 KiB boot set
+    let len = (nblocks * bs) as u64;
+
+    // One shared object store; a shared manifest (as a device open would load).
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(device, bs as u32)));
+
+    // --- Writer side: write distinct non-zero blocks at the front, flush. ---
+    let dir_a = TempDir::new().unwrap();
+    let cs_a = ContentStore::new(Arc::clone(&object_store), "warm-test");
+    let pic_a = Arc::new(PackIndexCache::open(dir_a.path()).await.unwrap());
+    let cache_a = WriteCache::<Initializing>::open(WriteCacheConfig {
+        cache_dir: dir_a.path().to_path_buf(),
+        device_name: "writer".to_string(),
+        device_size: device,
+        block_size: bs,
+        wal_sync: false,
+    })
+    .unwrap()
+    .finish_recovery()
+    .await
+    .unwrap();
+    for i in 0..nblocks {
+        let mut b = vec![0u8; bs];
+        for (j, x) in b.iter_mut().enumerate() {
+            *x = (((i * 7 + j) % 251) + 1) as u8; // non-zero, distinct
+        }
+        cache_a.write((i * bs) as u64, &b).unwrap();
+    }
+    let (stats, _) = cache_a
+        .flush_packs(&cs_a, &pic_a, &manifest, None)
+        .await
+        .unwrap();
+    assert!(stats.packs_uploaded > 0, "writer must upload packs");
+    cache_a.sync_manifest(&cs_a, &manifest).await.unwrap();
+
+    // --- Cold reader: brand-new cache (no local data), fresh clean + index
+    // caches, same object store + manifest (as a fresh device open sees). ---
+    let dir_b = TempDir::new().unwrap();
+    let cs_b = ContentStore::new(Arc::clone(&object_store), "warm-test");
+    let pic_b = Arc::new(PackIndexCache::open(dir_b.path()).await.unwrap());
+    let clean = SimpleBlockCache::new(64 * 1024 * 1024);
+    let cold = WriteCache::<Initializing>::open(WriteCacheConfig {
+        cache_dir: dir_b.path().to_path_buf(),
+        device_name: "cold".to_string(),
+        device_size: device,
+        block_size: bs,
+        wal_sync: false,
+    })
+    .unwrap()
+    .finish_recovery()
+    .await
+    .unwrap();
+    let m = ExportMetrics::new();
+
+    // Warm the boot working set.
+    cold.prefetch_data_range(len, &clean, &pic_b, &manifest, &cs_b, &m).await;
+    let s3_after_prefetch = m.s3_read_ops.load(Ordering::Relaxed);
+    assert!(
+        s3_after_prefetch > 0,
+        "prefetch on a cold cache must fetch the boot set from S3"
+    );
+
+    // Now the guest's first reads of that range: must be served from the clean
+    // cache with NO further S3 reads.
+    let hits_before = m.cache_hits.load(Ordering::Relaxed);
+    let data = cold
+        .read(0, len as usize, &clean, &pic_b, &manifest, &cs_b, &m)
+        .await
+        .unwrap();
+    assert_eq!(data.len(), len as usize);
+    assert_eq!(
+        m.s3_read_ops.load(Ordering::Relaxed),
+        s3_after_prefetch,
+        "post-prefetch read must hit the warmed clean cache, not S3"
+    );
+    assert!(
+        m.cache_hits.load(Ordering::Relaxed) > hits_before,
+        "post-prefetch read must register clean-cache hits"
+    );
+    // Sanity: the warmed data is the real content (first block byte 1).
+    assert_eq!(data[0], 1);
+}
+
 #[tokio::test]
 async fn test_flush_end_to_end() {
     let h = V2Harness::new().await;

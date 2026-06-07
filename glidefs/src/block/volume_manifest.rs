@@ -19,6 +19,16 @@ pub const GLVM_MAGIC: &[u8; 4] = b"GLVM";
 /// Volume manifest version 5 (v5: pack_count widened from u8 to u16).
 pub const VOLUME_MANIFEST_VERSION: u16 = 5;
 
+/// Version 6 adds an 8-byte `prefetch_len` trailer (before the CRC). Written
+/// ONLY when a prefetch hint is present; manifests without one stay byte-for-byte
+/// v5, so existing exports see zero churn. A v6-aware daemon reads both.
+///
+/// DEPLOY-ORDER CAVEAT: once any export persists a v6 manifest, an older daemon
+/// that predates this constant will reject it with [`VolumeManifestError::
+/// UnsupportedVersion`]. Roll out the v6-aware binary to every node that may
+/// serve an export BEFORE enabling prefetch hints for it.
+pub const VOLUME_MANIFEST_VERSION_PREFETCH: u16 = 6;
+
 /// Default chunk size for v4: 128 MiB (= 1 ext4 block group).
 pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024 * 1024;
 
@@ -48,6 +58,11 @@ pub struct VolumeManifest {
     /// Sparse map: chunk_idx → ordered pack list.
     /// Only written chunks appear. Absent = all-zero / unwritten.
     pub chunks: BTreeMap<u32, ChunkEntry>,
+    /// Cold-start prefetch hint: the boot working set lives in the first
+    /// `prefetch_len` bytes (the trace-ordered priority region). On device open
+    /// the server warms `[0, prefetch_len)` into the clean cache so the guest's
+    /// first reads are cache hits. `None` = no hint (legacy / non-prioritized).
+    pub prefetch_len: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +89,7 @@ impl VolumeManifest {
             chunk_size: DEFAULT_CHUNK_SIZE,
             block_size,
             chunks: BTreeMap::new(),
+            prefetch_len: None,
         }
     }
 
@@ -224,12 +240,20 @@ impl VolumeManifest {
             .values()
             .map(|e| 4 + 2 + e.packs.len() * 8) // chunk_idx + pack_count(u16) + packs
             .sum();
-        let total = GLVM_HEADER_SIZE + entries_size + 4; // +4 for CRC32
+        // v6 appends an 8-byte prefetch_len trailer; only emitted when set, so
+        // manifests without a hint are byte-identical to v5 (no churn).
+        let prefetch_trailer = if self.prefetch_len.is_some() { 8 } else { 0 };
+        let version = if self.prefetch_len.is_some() {
+            VOLUME_MANIFEST_VERSION_PREFETCH
+        } else {
+            VOLUME_MANIFEST_VERSION
+        };
+        let total = GLVM_HEADER_SIZE + entries_size + prefetch_trailer + 4; // +4 for CRC32
         let mut buf = Vec::with_capacity(total);
 
         // Header (32 bytes).
         buf.extend_from_slice(GLVM_MAGIC); // 4
-        buf.extend_from_slice(&VOLUME_MANIFEST_VERSION.to_le_bytes()); // 2
+        buf.extend_from_slice(&version.to_le_bytes()); // 2
         buf.extend_from_slice(&(self.chunks.len() as u32).to_le_bytes()); // 4
         // chunk_size: truncate to u32 (128 MiB fits)
         buf.extend_from_slice(&(self.chunk_size as u32).to_le_bytes()); // 4
@@ -250,6 +274,11 @@ impl VolumeManifest {
             for &pack_id in &entry.packs {
                 buf.extend_from_slice(&pack_id.to_le_bytes());
             }
+        }
+
+        // v6 prefetch_len trailer (before CRC, covered by it).
+        if let Some(len) = self.prefetch_len {
+            buf.extend_from_slice(&len.to_le_bytes());
         }
 
         // CRC32 trailer.
@@ -282,9 +311,10 @@ impl VolumeManifest {
             return Err(VolumeManifestError::BadMagic);
         }
         let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
-        if version != VOLUME_MANIFEST_VERSION {
+        if version != VOLUME_MANIFEST_VERSION && version != VOLUME_MANIFEST_VERSION_PREFETCH {
             return Err(VolumeManifestError::UnsupportedVersion(u32::from(version)));
         }
+        let has_prefetch = version == VOLUME_MANIFEST_VERSION_PREFETCH;
         let chunk_count = u32::from_le_bytes(data[6..10].try_into().unwrap()) as usize;
         let chunk_size = u64::from(u32::from_le_bytes(data[10..14].try_into().unwrap()));
         let block_size = u32::from_le_bytes(data[14..18].try_into().unwrap());
@@ -320,11 +350,22 @@ impl VolumeManifest {
             chunks.insert(chunk_idx, ChunkEntry { packs });
         }
 
+        // v6 prefetch_len trailer sits between the last chunk entry and the CRC.
+        let prefetch_len = if has_prefetch {
+            if pos + 8 > crc_offset {
+                return Err(VolumeManifestError::TooShort);
+            }
+            Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
+        } else {
+            None
+        };
+
         Ok(VolumeManifest {
             size: device_size,
             chunk_size,
             block_size,
             chunks,
+            prefetch_len,
         })
     }
 }
@@ -332,6 +373,114 @@ impl VolumeManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Without a prefetch hint, output stays byte-identical v5 (zero churn for
+    /// existing exports) and round-trips to `None`.
+    #[test]
+    fn prefetch_none_stays_v5_and_roundtrips() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 0xdead_beef);
+        let bytes = m.serialize().unwrap();
+        // version field is bytes [4..6]
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            VOLUME_MANIFEST_VERSION,
+            "no hint must still be written as v5"
+        );
+        let back = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.prefetch_len, None);
+        assert_eq!(back, m);
+    }
+
+    /// With a prefetch hint, output is v6 and the value round-trips; a v6-aware
+    /// reader handles both formats.
+    #[test]
+    fn prefetch_some_is_v6_and_roundtrips() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 1);
+        m.append_pack(0, 2);
+        m.append_pack(3, 9);
+        m.prefetch_len = Some(11 * 1024 * 1024);
+        let bytes = m.serialize().unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            VOLUME_MANIFEST_VERSION_PREFETCH,
+            "a hint must be written as v6"
+        );
+        let back = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.prefetch_len, Some(11 * 1024 * 1024));
+        assert_eq!(back, m);
+    }
+
+    /// Format stability: the v6 trailer is purely additive — a v6 manifest is
+    /// exactly 8 bytes longer than the identical v5 one, and those 8 bytes are
+    /// the LE `prefetch_len` sitting right before the CRC32.
+    #[test]
+    fn prefetch_trailer_is_additive_8_bytes() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 0x1122_3344_5566_7788);
+        let v5 = m.serialize().unwrap();
+        m.prefetch_len = Some(0x0123_4567_89ab_cdef);
+        let v6 = m.serialize().unwrap();
+        assert_eq!(v6.len(), v5.len() + 8, "v6 adds exactly 8 bytes");
+        // The 8 bytes before the 4-byte CRC are the prefetch_len.
+        let trailer = &v6[v6.len() - 12..v6.len() - 4];
+        assert_eq!(u64::from_le_bytes(trailer.try_into().unwrap()), 0x0123_4567_89ab_cdef);
+    }
+
+    /// A v6 manifest whose prefetch trailer was truncated must be rejected, not
+    /// silently read as v5 or read with garbage. (CRC would also catch it, but we
+    /// reject on the length check first.)
+    #[test]
+    fn truncated_v6_trailer_is_rejected() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 1);
+        m.prefetch_len = Some(999);
+        let mut bytes = m.serialize().unwrap();
+        // Drop 4 bytes from the middle of the trailer (keep CRC length valid-ish):
+        // remove the prefetch trailer entirely but keep header claiming v6.
+        bytes.drain(bytes.len() - 12..bytes.len() - 4); // remove the 8 trailer bytes
+        let err = VolumeManifest::deserialize(&bytes);
+        assert!(err.is_err(), "truncated v6 must not deserialize");
+    }
+
+    /// An unknown future version is rejected.
+    #[test]
+    fn unknown_version_rejected() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 1);
+        let mut bytes = m.serialize().unwrap();
+        bytes[4..6].copy_from_slice(&7u16.to_le_bytes()); // forge version 7
+        // recompute CRC so we exercise the version check, not the CRC check
+        let crc_off = bytes.len() - 4;
+        let crc = crc_fast::crc32_iscsi(&bytes[..crc_off]);
+        bytes[crc_off..].copy_from_slice(&crc.to_le_bytes());
+        match VolumeManifest::deserialize(&bytes) {
+            Err(VolumeManifestError::UnsupportedVersion(7)) => {}
+            other => panic!("expected UnsupportedVersion(7), got {other:?}"),
+        }
+    }
+
+    /// Regression guard for the bug that motivated dropping the `.hot-set`
+    /// artifact: a *block* index is NOT a *chunk* index. The old boot prefetch
+    /// stored block indices but fed them to `prefetch_chunks` (which expects
+    /// chunk indices), so with 1024 blocks/chunk a hot-set entry like block 5000
+    /// addressed "chunk 5000" — which doesn't exist → the prefetch was a no-op.
+    /// Index warming must come from the manifest's real chunk indices instead.
+    #[test]
+    fn block_index_is_not_chunk_index() {
+        let m = VolumeManifest::new(8 * 1024 * 1024 * 1024, 131072); // 128 KiB blocks
+        assert_eq!(m.blocks_per_chunk(), 1024); // 128 MiB / 128 KiB
+        // A block deep in the image maps to a small chunk index, NOT itself.
+        assert_eq!(m.chunk_idx_for_block(5000), 4); // 5000 * 128KiB / 128MiB = 4
+        assert_ne!(m.chunk_idx_for_block(5000), 5000);
+        // Only block indices < blocks_per_chunk (all in chunk 0) coincidentally
+        // map a value that is also a valid chunk index — which is why the old
+        // code "worked" for tiny single-chunk images and silently did nothing
+        // for the rest.
+        assert_eq!(m.chunk_idx_for_block(1023), 0);
+        assert_eq!(m.chunk_idx_for_block(1024), 1);
+    }
 
     #[test]
     fn test_v4_new_manifest() {

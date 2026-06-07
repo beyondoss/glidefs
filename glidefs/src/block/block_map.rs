@@ -1,4 +1,8 @@
-#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+// Truncating casts here are block-index/page arithmetic: `u64 → usize` (lossless
+// on the 64-bit targets GlideFS runs on) and small-range values like
+// `(idx % ENTRIES_PER_BYTE) * 2`. Scoped to this one lint so `cast_possible_wrap`
+// and `cast_sign_loss` stay active and catch genuinely new sign/wrap mistakes.
+#![allow(clippy::cast_possible_truncation)]
 //! Block state tracking and content-addressed hashing.
 //!
 //! This module provides:

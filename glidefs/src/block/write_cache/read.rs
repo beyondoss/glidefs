@@ -1099,7 +1099,8 @@ impl WriteCache<Active> {
         Ok(())
     }
 
-    /// Batch warm the PackIndexCache for multiple chunks (boot hot set prefetch).
+    /// Batch warm the PackIndexCache for the given chunk indices (boot index
+    /// prefetch). Callers pass the manifest's REAL chunk indices.
     pub async fn prefetch_chunks(
         &self,
         chunk_indices: &[u64],
@@ -1121,6 +1122,93 @@ impl WriteCache<Active> {
                     .await;
             })
             .await;
+    }
+
+    /// Warm the clean cache with the actual DATA of `[0, len)` — the trace-ordered
+    /// boot working set. Unlike `prefetch_chunk` (which only warms pack *indices*),
+    /// this drives the full read path so decompressed blocks land in the clean
+    /// cache; the guest's first reads then hit cache instead of S3. Best-effort:
+    /// a failed sub-read is logged and skipped, never propagated. Reads in bounded
+    /// steps to cap peak memory; the read path coalesces adjacent blocks per pack.
+    pub async fn prefetch_data_range(
+        &self,
+        len: u64,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) {
+        const STEP: u64 = 4 * 1024 * 1024; // 4 MiB read window
+        let mut off = 0u64;
+        while off < len {
+            let n = STEP.min(len - off) as usize;
+            match self
+                .read(
+                    off,
+                    n,
+                    clean_cache,
+                    pack_index_cache,
+                    volume_manifest,
+                    content_store,
+                    metrics,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(off, n, error = %e, "boot data prefetch read failed");
+                    break;
+                }
+            }
+            off += n as u64;
+        }
+    }
+
+    /// Warm the clean cache with the DATA of a bounded, possibly-scattered set of
+    /// blocks — the trace-captured boot working set. This is the universal,
+    /// format-agnostic prefetch: it works for any base (ext4 or EROFS) given the
+    /// blocks a real boot actually touched, and — unlike prefetching the full
+    /// "hot set" (every non-zero block) — it stays bounded, preserving lazy
+    /// loading. Adjacent block indices are coalesced into one ranged read so a
+    /// contiguous run (e.g. an EROFS priority region) costs a single S3 GET.
+    /// Best-effort: a failed run is logged and skipped.
+    pub async fn prefetch_data_blocks(
+        &self,
+        blocks: &[u64],
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+        let bs = self.block_size() as u64;
+        let mut sorted: Vec<u64> = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        // Coalesce consecutive block indices into [start_block, run_len) ranges.
+        let mut i = 0;
+        while i < sorted.len() {
+            let start = sorted[i];
+            let mut end = start;
+            while i + 1 < sorted.len() && sorted[i + 1] == end + 1 {
+                end = sorted[i + 1];
+                i += 1;
+            }
+            i += 1;
+            let off = start * bs;
+            let len = ((end - start + 1) * bs) as usize;
+            if let Err(e) = self
+                .read(off, len, clean_cache, pack_index_cache, volume_manifest, content_store, metrics)
+                .await
+            {
+                warn!(off, len, error = %e, "boot-set data prefetch read failed");
+            }
+        }
     }
 }
 
