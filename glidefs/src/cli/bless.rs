@@ -197,6 +197,19 @@ fn oci_run_command(config: &[u8]) -> Option<Vec<String>> {
     (!cmd.is_empty()).then_some(cmd)
 }
 
+/// The image's environment (`config.Env`, `KEY=val` strings) — notably `PATH`,
+/// without which a relative entrypoint like `python3` won't exec in the chroot.
+fn oci_env(config: &[u8]) -> Vec<String> {
+    serde_json::from_slice::<serde_json::Value>(config)
+        .ok()
+        .and_then(|v| {
+            v.get("config")?.get("Env")?.as_array().map(|a| {
+                a.iter().filter_map(|s| s.as_str().map(String::from)).collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// Auto-profile a freshly-blessed base: serve it through GlideFS over a ublk
 /// device, kernel-mount it (`fs_type`), run `run_cmd` once in a chroot while a
 /// read tracer records the blocks the kernel actually fetches, and turn that
@@ -215,6 +228,7 @@ async fn profile_boot_set(
     device_size: u64,
     fs_type: &str,
     run_cmd: &[String],
+    env: &[String],
     base_name: &str,
     max_blocks: usize,
 ) -> Option<Vec<u64>> {
@@ -287,6 +301,7 @@ async fn profile_boot_set(
     // Mount + run in a blocking section while ublk serves I/O in the background.
     let fs_type = fs_type.to_string();
     let run_cmd = run_cmd.to_vec();
+    let env = env.to_vec();
     let mnt = tempfile::TempDir::new().ok()?;
     let mnt_path = mnt.path().to_path_buf();
     let ran = tokio::task::spawn_blocking(move || {
@@ -304,25 +319,40 @@ async fn profile_boot_set(
         let _ = Command::new("mount").args(["--bind", "/proc"]).arg(mnt.join("proc")).status();
         let _ = Command::new("mount").args(["--bind", "/dev"]).arg(mnt.join("dev")).status();
         // Run the workload once under a hard timeout (long-running servers are
-        // killed after their startup reads — that IS the boot working set).
+        // killed after their startup reads — that IS the boot working set). Use
+        // the image's own environment (PATH etc.) so a relative entrypoint execs.
         let mut chroot = Command::new("timeout");
         chroot.args(["--signal=KILL", "12", "chroot"]).arg(mnt);
         chroot.args(&run_cmd);
+        chroot.env_clear();
+        for kv in &env {
+            if let Some((k, v)) = kv.split_once('=') {
+                chroot.env(k, v);
+            }
+        }
         let _ = chroot.status(); // failures/non-zero are fine; we want the reads
         let _ = Command::new("umount").arg(mnt.join("dev")).status();
         let _ = Command::new("umount").arg(mnt.join("proc")).status();
         let _ = Command::new("umount").arg(mnt).status();
         Ok(())
     })
-    .await
-    .ok()?;
+    .await;
 
+    // ALWAYS tear down the ublk device, even if the blocking task panicked —
+    // otherwise the device (and any mount) leaks.
     server.remove_device(&dev_name).await.ok();
     tracer.finish();
 
-    if let Err(e) = ran {
-        info!("auto-profile: {e} — skipping boot set");
-        return None;
+    match ran {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            info!("auto-profile: {e} — skipping boot set");
+            return None;
+        }
+        Err(e) => {
+            info!("auto-profile: profiling task panicked ({e}) — skipping boot set");
+            return None;
+        }
     }
     let bytes = std::fs::read(&rtrace_path).ok()?;
     let boot_set = boot_set_from_trace(&bytes, max_blocks);
@@ -342,6 +372,7 @@ async fn profile_boot_set(
     _device_size: u64,
     _fs_type: &str,
     _run_cmd: &[String],
+    _env: &[String],
     _base_name: &str,
     _max_blocks: usize,
 ) -> Option<Vec<u64>> {
@@ -556,6 +587,7 @@ pub async fn run_bless_oci(
                     device_size,
                     "ext4",
                     &cmd,
+                    &oci_env(&resolved.config),
                     &name,
                     4096,
                 )
@@ -764,6 +796,7 @@ pub async fn run_bless_oci_erofs(
                     device_size,
                     "erofs",
                     &cmd,
+                    &oci_env(&resolved.config),
                     &name,
                     4096,
                 )
@@ -997,14 +1030,21 @@ mod tests {
             if cache.flush_to_s3(&cs, &pic, &vm).await.unwrap().blocks_claimed == 0 { break; }
         }
 
-        // THE THING UNDER TEST: auto-profile by booting python in the image.
-        let cmd = vec!["/usr/local/bin/python3".to_string(), "-c".to_string(), "import json,os,sys".to_string()];
+        // THE THING UNDER TEST: auto-profile using the image's REAL entrypoint
+        // and env (exactly what `bless --oci` does), NOT a hardcoded command.
+        let config = std::fs::read(img_dir.join(
+            manifest["config"]["digest"].as_str().unwrap().strip_prefix("sha256:").unwrap(),
+        ))
+        .unwrap();
+        let cmd = oci_run_command(&config).expect("image must expose an entrypoint/cmd");
+        let env = oci_env(&config);
+        eprintln!("real entrypoint: {cmd:?}  ({} env vars incl PATH)", env.len());
         let boot_set = profile_boot_set(
             Arc::clone(&cs), Arc::clone(&vm), Arc::clone(&pic),
-            device_size, "erofs", &cmd, "py312-smoke", 4096,
+            device_size, "erofs", &cmd, &env, "py312-smoke", 4096,
         )
         .await
-        .expect("auto-profile should produce a boot set (root + ublk + python)");
+        .expect("auto-profile should produce a boot set (root + ublk + real entrypoint)");
 
         eprintln!("auto-profiled boot set: {} blocks ({:.1} MiB)", boot_set.len(), boot_set.len() as f64 * BLOCK_SIZE as f64 / 1048576.0);
         assert!(!boot_set.is_empty(), "boot set must be non-empty");
