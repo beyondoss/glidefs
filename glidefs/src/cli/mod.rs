@@ -47,6 +47,14 @@ pub enum Commands {
         /// ext4 (which VMs fork-and-write).
         #[arg(long, requires = "oci", conflicts_with = "layered")]
         erofs: bool,
+        /// Disable auto-profiling. By default `--oci` bless boots the image once
+        /// in a sandbox (ublk + kernel mount + chroot the entrypoint), captures
+        /// the blocks it reads, and uploads a boot set so future forks warm those
+        /// on open. Auto-profiling is best-effort — it needs root + the `ublk`
+        /// feature and silently falls back to no boot set if unavailable; the
+        /// base is valid either way. Use this to skip it entirely.
+        #[arg(long, requires = "oci")]
+        no_profile: bool,
         /// Base image name (e.g., "ubuntu-22.04-node20-v3")
         #[arg(long)]
         name: String,

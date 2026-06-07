@@ -179,6 +179,176 @@ pub async fn run_make_boot_set(
     Ok(())
 }
 
+/// The container's runnable command (Entrypoint ++ Cmd) from its OCI config
+/// blob, used to exercise the image during auto-profiling. None if the config
+/// has neither (nothing meaningful to boot).
+fn oci_run_command(config: &[u8]) -> Option<Vec<String>> {
+    let v: serde_json::Value = serde_json::from_slice(config).ok()?;
+    let cfg = v.get("config")?;
+    let mut cmd = Vec::new();
+    let strs = |k: &str| -> Vec<String> {
+        cfg.get(k)
+            .and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+    cmd.extend(strs("Entrypoint"));
+    cmd.extend(strs("Cmd"));
+    (!cmd.is_empty()).then_some(cmd)
+}
+
+/// Auto-profile a freshly-blessed base: serve it through GlideFS over a ublk
+/// device, kernel-mount it (`fs_type`), run `run_cmd` once in a chroot while a
+/// read tracer records the blocks the kernel actually fetches, and turn that
+/// into a bounded boot set. Format-agnostic (ext4 or erofs — the kernel mounts
+/// either; the tracer sees block reads regardless).
+///
+/// Best-effort: returns `None` (with a warning) if anything is missing (no root,
+/// no ublk, mount/run fails). The base is fully valid without a boot set — this
+/// only adds warm-on-open. Requires the `ublk` feature; without it, a no-op.
+#[cfg(feature = "ublk")]
+#[allow(clippy::too_many_arguments)]
+async fn profile_boot_set(
+    content_store: Arc<ContentStore>,
+    volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
+    pack_index_cache: Arc<PackIndexCache>,
+    device_size: u64,
+    fs_type: &str,
+    run_cmd: &[String],
+    base_name: &str,
+    max_blocks: usize,
+) -> Option<Vec<u64>> {
+    use crate::block::ublk::UblkServer;
+    use crate::block::write_trace::{boot_set_from_trace, WriteTracer};
+
+    if !std::path::Path::new("/dev/ublk-control").exists() {
+        info!("auto-profile: /dev/ublk-control absent (need root + ublk) — skipping boot set");
+        return None;
+    }
+    let tmp = tempfile::TempDir::new().ok()?;
+    let rtrace_path = tmp.path().join("boot.rtrace");
+    let tracer = Arc::new(
+        WriteTracer::new(&rtrace_path, BLOCK_SIZE, device_size / u64::from(BLOCK_SIZE), base_name).ok()?,
+    );
+
+    // Fresh, cold, read-only serving handler over the just-drained store: reads
+    // resolve through the manifest → packs exactly as a real fork would.
+    let cache = Arc::new(
+        WriteCache::open_fresh_active(WriteCacheConfig {
+            cache_dir: tmp.path().to_path_buf(),
+            device_name: format!("profile-{base_name}"),
+            device_size,
+            block_size: BLOCK_SIZE as usize,
+            wal_sync: false,
+        })
+        .ok()?,
+    );
+    let foyer_dir = tmp.path().join("foyer");
+    std::fs::create_dir_all(&foyer_dir).ok()?;
+    let clean: Arc<dyn BlockCache> = Arc::new(
+        FoyerBlockCache::open(FoyerCacheConfig {
+            memory_bytes: 64 * 1024 * 1024,
+            ssd_bytes: 256 * 1024 * 1024,
+            ssd_dir: foyer_dir,
+            direct: false,
+            io_uring: false,
+        })
+        .await
+        .ok()?,
+    );
+    let handler = Arc::new(
+        BlockHandler::new(
+            cache,
+            content_store,
+            clean,
+            pack_index_cache,
+            volume_manifest,
+            device_size,
+            true,
+            Arc::new(ExportMetrics::new()),
+            Arc::new(AtomicU64::new(0f64.to_bits())),
+            Arc::new(Notify::const_new()),
+            DEFAULT_FLUSH_THRESHOLD,
+            None,
+        )
+        .with_read_tracer(Some(Arc::clone(&tracer))),
+    );
+
+    let dev_name = format!("profile-{base_name}").replace('/', "-");
+    let mut server = UblkServer::new();
+    let dev = match server.add_device(&dev_name, Arc::clone(&handler)).await {
+        Ok(d) => d,
+        Err(e) => {
+            info!(error = %e, "auto-profile: ublk add_device failed — skipping boot set");
+            return None;
+        }
+    };
+
+    // Mount + run in a blocking section while ublk serves I/O in the background.
+    let fs_type = fs_type.to_string();
+    let run_cmd = run_cmd.to_vec();
+    let mnt = tempfile::TempDir::new().ok()?;
+    let mnt_path = mnt.path().to_path_buf();
+    let ran = tokio::task::spawn_blocking(move || {
+        use std::process::Command;
+        let mnt = &mnt_path;
+        let m = Command::new("mount")
+            .args(["-t", &fs_type, "-o", "ro"])
+            .arg(&dev)
+            .arg(mnt)
+            .status();
+        if !matches!(m, Ok(s) if s.success()) {
+            return Err(format!("mount -t {fs_type} {} failed: {m:?}", dev.display()));
+        }
+        // Best-effort pseudo-filesystems so the entrypoint can start.
+        let _ = Command::new("mount").args(["--bind", "/proc"]).arg(mnt.join("proc")).status();
+        let _ = Command::new("mount").args(["--bind", "/dev"]).arg(mnt.join("dev")).status();
+        // Run the workload once under a hard timeout (long-running servers are
+        // killed after their startup reads — that IS the boot working set).
+        let mut chroot = Command::new("timeout");
+        chroot.args(["--signal=KILL", "12", "chroot"]).arg(mnt);
+        chroot.args(&run_cmd);
+        let _ = chroot.status(); // failures/non-zero are fine; we want the reads
+        let _ = Command::new("umount").arg(mnt.join("dev")).status();
+        let _ = Command::new("umount").arg(mnt.join("proc")).status();
+        let _ = Command::new("umount").arg(mnt).status();
+        Ok(())
+    })
+    .await
+    .ok()?;
+
+    server.remove_device(&dev_name).await.ok();
+    tracer.finish();
+
+    if let Err(e) = ran {
+        info!("auto-profile: {e} — skipping boot set");
+        return None;
+    }
+    let bytes = std::fs::read(&rtrace_path).ok()?;
+    let boot_set = boot_set_from_trace(&bytes, max_blocks);
+    if boot_set.is_empty() {
+        info!("auto-profile: workload read nothing — skipping boot set");
+        return None;
+    }
+    Some(boot_set)
+}
+
+#[cfg(not(feature = "ublk"))]
+#[allow(clippy::too_many_arguments)]
+async fn profile_boot_set(
+    _content_store: Arc<ContentStore>,
+    _volume_manifest: Arc<parking_lot::RwLock<VolumeManifest>>,
+    _pack_index_cache: Arc<PackIndexCache>,
+    _device_size: u64,
+    _fs_type: &str,
+    _run_cmd: &[String],
+    _base_name: &str,
+    _max_blocks: usize,
+) -> Option<Vec<u64>> {
+    info!("auto-profile: built without the `ublk` feature — skipping boot set");
+    None
+}
+
 /// Bless an OCI image into a content-addressed base image.
 ///
 /// Pulls layers from the registry, converts to ext4, writes through
@@ -189,8 +359,10 @@ pub async fn run_bless_oci(
     image_ref: String,
     name: String,
     s3_prefix: String,
+    profile: bool,
     config_path: PathBuf,
 ) -> Result<()> {
+    use crate::block::manifest::serialize_block_list;
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -371,12 +543,44 @@ pub async fn run_bless_oci(
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
 
+    // --- Auto-profile: boot the ext4 rootfs once, capture its reads → boot set. ---
+    let mut boot_set_blocks = 0usize;
+    if profile {
+        match oci_run_command(&resolved.config) {
+            Some(cmd) => {
+                info!(?cmd, "auto-profiling boot set");
+                if let Some(bs) = profile_boot_set(
+                    Arc::clone(&content_store),
+                    Arc::clone(&volume_manifest),
+                    Arc::clone(&pack_index_cache),
+                    device_size,
+                    "ext4",
+                    &cmd,
+                    &name,
+                    4096,
+                )
+                .await
+                {
+                    boot_set_blocks = bs.len();
+                    if let Err(e) =
+                        content_store.put_boot_set(&name, serialize_block_list(&bs)).await
+                    {
+                        info!("auto-profile: boot set upload failed: {e}");
+                        boot_set_blocks = 0;
+                    }
+                }
+            }
+            None => info!("auto-profile: image has no entrypoint/cmd — skipping boot set"),
+        }
+    }
+
     let elapsed = start.elapsed();
 
     println!("Blessed '{}' from OCI image successfully:", name);
     println!("  Image:           {}", image_ref);
     println!("  Layers:          {}", resolved.layers.len());
     println!("  Device size:     {:.1} MB", device_size as f64 / 1e6);
+    println!("  Boot set:        {} blocks (auto-profiled; 0 = skipped/unavailable)", boot_set_blocks);
     println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
     println!("  Manifest:        manifests/{}", manifest_key);
 
@@ -395,8 +599,10 @@ pub async fn run_bless_oci_erofs(
     image_ref: String,
     name: String,
     s3_prefix: String,
+    profile: bool,
     config_path: PathBuf,
 ) -> Result<()> {
+    use crate::block::manifest::serialize_block_list;
     use crate::oci::BlockAdapter;
 
     tracing_subscriber::fmt()
@@ -538,16 +744,46 @@ pub async fn run_bless_oci_erofs(
         }
     }
 
-    // --- Save manifest as base (index warming on fork = manifest pack list;
-    // boot set captured at runtime → no `.hot-set` artifact). ---
-    let _ = &pack_index_cache;
+    // --- Save manifest as base ---
     let manifest_key = format!("bases/{}", name);
     content_store
         .put_manifest(&manifest_key, volume_manifest.read().serialize()?, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
 
+    // --- Auto-profile: boot the image once, capture its reads → boot set. ---
+    let mut boot_set_blocks = 0usize;
+    if profile {
+        match oci_run_command(&resolved.config) {
+            Some(cmd) => {
+                info!(?cmd, "auto-profiling boot set");
+                if let Some(bs) = profile_boot_set(
+                    Arc::clone(&content_store),
+                    Arc::clone(&volume_manifest),
+                    Arc::clone(&pack_index_cache),
+                    device_size,
+                    "erofs",
+                    &cmd,
+                    &name,
+                    4096,
+                )
+                .await
+                {
+                    boot_set_blocks = bs.len();
+                    if let Err(e) =
+                        content_store.put_boot_set(&name, serialize_block_list(&bs)).await
+                    {
+                        info!("auto-profile: boot set upload failed: {e}");
+                        boot_set_blocks = 0;
+                    }
+                }
+            }
+            None => info!("auto-profile: image has no entrypoint/cmd — skipping boot set"),
+        }
+    }
+
     println!("Blessed '{}' from OCI image as read-only EROFS:", name);
+    println!("  Boot set:        {} blocks (auto-profiled; 0 = skipped/unavailable)", boot_set_blocks);
     println!("  Image:           {}", image_ref);
     println!("  Layers:          {}", resolved.layers.len());
     println!("  Device size:     {:.1} MB", device_size as f64 / 1e6);
@@ -659,6 +895,123 @@ mod tests {
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjectPath;
     use object_store::ObjectStore;
+
+    /// REAL smoke test of the auto-profiler: build a real python image as EROFS
+    /// into a glidefs volume, then run `profile_boot_set` — which serves it over
+    /// a ublk device, kernel-mounts it, chroots and runs python, and captures the
+    /// blocks read — and assert it yields a sane, bounded boot set. This is the
+    /// exact path `bless --oci --erofs` takes automatically. Needs root + ublk +
+    /// a skopeo `dir:` python image at /tmp/oci/py312.
+    #[cfg(feature = "ublk")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auto_profile_produces_a_real_boot_set() {
+        use crate::block::handler::BlockHandler;
+        use crate::block::pack_index_cache::PackIndexCache;
+        use crate::block::write_cache::{WriteCache, WriteCacheConfig};
+        use crate::oci::BlockAdapter;
+        use std::io::{Read, Seek, SeekFrom};
+        use std::sync::atomic::AtomicU64;
+
+        let img_dir = std::path::Path::new("/tmp/oci/py312");
+        if !std::path::Path::new("/dev/ublk-control").exists() || !img_dir.exists() {
+            eprintln!("SKIP: need /dev/ublk-control (root+ublk) and a skopeo dir at /tmp/oci/py312");
+            return;
+        }
+
+        // Decompress the image's layers to temp files.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(img_dir.join("manifest.json")).unwrap()).unwrap();
+        let mut layers: Vec<std::fs::File> = manifest["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                let d = l["digest"].as_str().unwrap();
+                let blob = img_dir.join(d.strip_prefix("sha256:").unwrap_or(d));
+                let mut f = std::fs::File::open(&blob).unwrap();
+                let mut magic = [0u8; 4];
+                f.read_exact(&mut magic).unwrap();
+                f.seek(SeekFrom::Start(0)).unwrap();
+                let mut out = tempfile::tempfile().unwrap();
+                if magic[0] == 0x1f && magic[1] == 0x8b {
+                    std::io::copy(&mut flate2::read::GzDecoder::new(f), &mut out).unwrap();
+                } else if magic == [0x28, 0xb5, 0x2f, 0xfd] {
+                    std::io::copy(&mut zstd::Decoder::new(f).unwrap(), &mut out).unwrap();
+                } else {
+                    std::io::copy(&mut f, &mut out).unwrap();
+                }
+                out.seek(SeekFrom::Start(0)).unwrap();
+                out
+            })
+            .collect();
+
+        // Build the EROFS into a glidefs volume (InMemory store), drain to S3.
+        let store = Arc::new(InMemory::new());
+        let cs = Arc::new(ContentStore::new(store.clone(), "test/exports/smoke"));
+        let device_size = 512 * 1024 * 1024u64;
+        let temp = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(
+            WriteCache::open_fresh_active(WriteCacheConfig {
+                cache_dir: temp.path().to_path_buf(),
+                device_name: "smoke".into(),
+                device_size,
+                block_size: BLOCK_SIZE as usize,
+                wal_sync: false,
+            })
+            .unwrap(),
+        );
+        let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(device_size, BLOCK_SIZE)));
+        let pic = Arc::new(PackIndexCache::open(temp.path()).await.unwrap());
+        let clean: Arc<dyn BlockCache> = Arc::new(
+            FoyerBlockCache::open(FoyerCacheConfig {
+                memory_bytes: 64 * 1024 * 1024,
+                ssd_bytes: 256 * 1024 * 1024,
+                ssd_dir: { let d = temp.path().join("f"); std::fs::create_dir_all(&d).unwrap(); d },
+                direct: false,
+                io_uring: false,
+            })
+            .await
+            .unwrap(),
+        );
+        let handler = Arc::new(BlockHandler::new(
+            Arc::clone(&cache), Arc::clone(&cs), Arc::clone(&clean), Arc::clone(&pic),
+            Arc::clone(&vm), device_size, false, Arc::new(ExportMetrics::new()),
+            Arc::new(AtomicU64::new(0f64.to_bits())), Arc::new(Notify::const_new()),
+            DEFAULT_FLUSH_THRESHOLD, None,
+        ));
+        let rt = tokio::runtime::Handle::current();
+        let hw = Arc::clone(&handler);
+        tokio::task::spawn_blocking(move || {
+            let opts = ext4::tar_convert::ConvertOptions {
+                convert_backslash: false,
+                writer_options: vec![
+                    WriterOption::Uuid([0u8; 16]),
+                    WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
+                ],
+            };
+            ext4::convert_oci_layers_to_erofs(&mut layers, BlockAdapter::new(&hw, rt), &opts).unwrap();
+        })
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            if cache.flush_to_s3(&cs, &pic, &vm).await.unwrap().blocks_claimed == 0 { break; }
+        }
+
+        // THE THING UNDER TEST: auto-profile by booting python in the image.
+        let cmd = vec!["/usr/local/bin/python3".to_string(), "-c".to_string(), "import json,os,sys".to_string()];
+        let boot_set = profile_boot_set(
+            Arc::clone(&cs), Arc::clone(&vm), Arc::clone(&pic),
+            device_size, "erofs", &cmd, "py312-smoke", 4096,
+        )
+        .await
+        .expect("auto-profile should produce a boot set (root + ublk + python)");
+
+        eprintln!("auto-profiled boot set: {} blocks ({:.1} MiB)", boot_set.len(), boot_set.len() as f64 * BLOCK_SIZE as f64 / 1048576.0);
+        assert!(!boot_set.is_empty(), "boot set must be non-empty");
+        assert!(boot_set.len() < (device_size / u64::from(BLOCK_SIZE)) as usize / 2, "must be bounded, not the whole image");
+        // The metadata region (low blocks) is always touched at mount/boot.
+        assert!(boot_set.iter().any(|&b| b < 64), "boot set should include low/metadata blocks");
+    }
 
     #[test]
     fn deterministic_uuid_is_stable_and_content_addressed() {
