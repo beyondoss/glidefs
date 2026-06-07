@@ -47,16 +47,20 @@ pub enum Commands {
         /// ext4 (which VMs fork-and-write).
         #[arg(long, requires = "oci", conflicts_with = "layered")]
         erofs: bool,
-        /// Opt in to auto-profiling: after building the image, boot it ONCE in a
-        /// sandbox (ublk + kernel mount + chroot the entrypoint, ≤12 s), capture
-        /// the blocks it reads, and upload a boot set so future forks warm those
-        /// on open. EXPENSIVE and intrusive — adds a profiling boot to bless,
-        /// needs root + the `ublk` feature, and runs the image's entrypoint as
-        /// root. Off by default; best-effort (skips with a warning if it can't
-        /// run). Without it, bless is unchanged and boot sets come from runtime
-        /// traces via `glidefs make-boot-set`.
-        #[arg(long, requires = "oci")]
-        profile: bool,
+        /// Disable auto-profiling. By DEFAULT, after building the image bless
+        /// boots it ONCE in a sandbox (ublk + kernel mount + chroot the
+        /// entrypoint, ≤12 s), captures the blocks it reads, and records a boot
+        /// set so future forks warm those on open — this is what makes cold
+        /// starts fast. Profiling is best-effort: if it can't run (no root, no
+        /// `ublk` feature, no entrypoint, or it reads nothing) bless logs a
+        /// warning and produces a perfectly valid image with no boot set —
+        /// nothing fails. Pass `--no-profile` to skip the profiling boot
+        /// entirely: use it for reproducible builds (profiling makes image bytes
+        /// vary run-to-run) or to keep bless fast in benchmarks. With it, boot
+        /// sets can still be produced later from runtime traces via
+        /// `glidefs make-boot-set`.
+        #[arg(long = "no-profile", requires = "oci")]
+        no_profile: bool,
         /// Base image name (e.g., "ubuntu-22.04-node20-v3")
         #[arg(long)]
         name: String,

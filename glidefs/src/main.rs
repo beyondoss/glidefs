@@ -89,11 +89,13 @@ async fn main() -> Result<()> {
             oci,
             layered,
             erofs,
-            profile,
+            no_profile,
             name,
             s3_prefix,
             config,
         } => {
+            // Auto-profiling is ON by default; --no-profile opts out.
+            let profile = !no_profile;
             if let Some(image_path) = image {
                 cli::bless::run_bless(image_path, name, s3_prefix, config).await?;
             } else if let Some(image_ref) = oci {

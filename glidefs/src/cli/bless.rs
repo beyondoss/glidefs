@@ -845,7 +845,8 @@ pub async fn run_bless_oci_erofs(
         None,
     ));
 
-    // --- TWO-PASS (when --profile): build a throwaway probe image, boot it to
+    // --- TWO-PASS (default; skipped with --no-profile): build a throwaway probe
+    // image, boot it to
     // learn which files the workload actually reads, then rebuild with those
     // ordered FIRST (`PriorityOrder`) so the boot working set is one contiguous,
     // coalesce-friendly run at the front. Otherwise a single pass. The
@@ -859,28 +860,45 @@ pub async fn run_bless_oci_erofs(
     let priority: Vec<String> = if let Some(cmd) = run_cmd {
         info!("two-pass: building probe image (pass 1)");
         let scratch1 = scratch.clone();
-        let (probe, layers_back) = tokio::task::spawn_blocking(
-            move || -> Result<(tempfile::NamedTempFile, Vec<std::fs::File>)> {
-                let opts = ext4::tar_convert::ConvertOptions {
-                    convert_backslash: false,
-                    writer_options: vec![
-                        WriterOption::Uuid(uuid),
-                        WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
-                        WriterOption::SpoolDir(scratch1.clone()),
-                    ],
-                };
-                let tmp = tempfile::NamedTempFile::new_in(&scratch1).context("probe tempfile")?;
-                ext4::convert_oci_layers_to_erofs(&mut layer_files, tmp.reopen()?, &opts)
-                    .map_err(|e| anyhow::anyhow!("probe convert failed: {e}"))?;
-                Ok((tmp, layer_files))
+        // Build the throwaway probe image. This is best-effort: the closure ALWAYS
+        // hands `layer_files` back (success or failure) so a probe-build error
+        // degrades to "no priority order" instead of aborting the bless. The layer
+        // readers are rewound at the start of every convert (tar_convert.rs), so
+        // pass 2 reuses them regardless of where pass 1 left their positions.
+        let (probe_result, layers_back) = tokio::task::spawn_blocking(
+            move || -> (Result<tempfile::NamedTempFile>, Vec<std::fs::File>) {
+                let build = (|| -> Result<tempfile::NamedTempFile> {
+                    let opts = ext4::tar_convert::ConvertOptions {
+                        convert_backslash: false,
+                        writer_options: vec![
+                            WriterOption::Uuid(uuid),
+                            WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
+                            WriterOption::SpoolDir(scratch1.clone()),
+                        ],
+                    };
+                    let tmp =
+                        tempfile::NamedTempFile::new_in(&scratch1).context("probe tempfile")?;
+                    ext4::convert_oci_layers_to_erofs(&mut layer_files, tmp.reopen()?, &opts)
+                        .map_err(|e| anyhow::anyhow!("probe convert failed: {e}"))?;
+                    Ok(tmp)
+                })();
+                (build, layer_files)
             },
         )
-        .await??;
+        .await?;
         layer_files = layers_back;
-        info!(?cmd, "two-pass: booting probe to capture hot files");
-        let paths = profile_file_paths(probe.path(), "erofs", &cmd, &env, 12).await;
-        info!(files = paths.len(), "two-pass: captured priority files");
-        paths // probe NamedTempFile is dropped (deleted) here
+        match probe_result {
+            Ok(probe) => {
+                info!(?cmd, "two-pass: booting probe to capture hot files");
+                let paths = profile_file_paths(probe.path(), "erofs", &cmd, &env, 12).await;
+                info!(files = paths.len(), "two-pass: captured priority files");
+                paths // probe NamedTempFile is dropped (deleted) here
+            }
+            Err(e) => {
+                info!("auto-profile: probe build failed ({e}) — building without priority order");
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
@@ -940,7 +958,7 @@ pub async fn run_bless_oci_erofs(
 
     println!("Blessed '{}' from OCI image as read-only EROFS:", name);
     println!(
-        "  Priority files:  {priority_count} (two-pass; 0 = no --profile or profiling unavailable)"
+        "  Priority files:  {priority_count} (two-pass; 0 = --no-profile or profiling unavailable)"
     );
     println!("  Image:           {}", image_ref);
     println!("  Layers:          {}", resolved.layers.len());
