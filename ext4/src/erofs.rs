@@ -135,9 +135,14 @@ struct Node {
     devmajor: u32,
     devminor: u32,
     xattrs: BTreeMap<String, Vec<u8>>,
-    /// Regular-file contents (buffered). v1 buffers in memory; streaming large
-    /// files is a follow-up.
+    /// Small inline content held in RAM: a symlink's target bytes. Regular-file
+    /// contents are NOT here — they're spooled to disk (see `spool`) so peak
+    /// memory stays bounded regardless of file/image size. Empty for regular
+    /// files and directories (dir bodies are recomputed at serialize time).
     data: Vec<u8>,
+    /// Regular-file contents spooled to the writer's temp file: `(offset, len)`.
+    /// `None` for dirs, symlinks, and empty/zero-length regular files.
+    spool: Option<(u64, u64)>,
     /// name -> child node index (directories only).
     children: BTreeMap<String, usize>,
     nlink: u32,
@@ -158,6 +163,7 @@ impl Node {
             devminor: 0,
             xattrs: BTreeMap::new(),
             data: Vec::new(),
+            spool: None,
             children: BTreeMap::new(),
             nlink: 0,
             nid: 0,
@@ -176,6 +182,10 @@ pub struct Writer<W: Read + Write + Seek> {
     uuid: [u8; 16],
     /// Index of the regular file currently being written (for `Write`).
     current: Option<usize>,
+    /// Disk spool for regular-file contents (lazily created on first write) and
+    /// its append cursor. Keeps peak RAM bounded; auto-deleted on drop.
+    spool: Option<std::fs::File>,
+    spool_pos: u64,
     /// Align each large regular file's data region start to this many bytes
     /// (the downstream dedup-block grid), padding the gap with holes. 0 = off.
     data_align: usize,
@@ -211,6 +221,8 @@ impl<W: Read + Write + Seek> Writer<W> {
             nodes: vec![root],
             uuid,
             current: None,
+            spool: None,
+            spool_pos: 0,
             data_align,
             data_align_min,
             priority,
@@ -280,6 +292,9 @@ impl<W: Read + Write + Seek> Writer<W> {
             n.xattrs = f.xattrs.clone();
             if !is_dir {
                 n.data.clear();
+                // Drop any previously-spooled content (a later layer overriding
+                // an earlier file); fresh content will re-spool via `write`.
+                n.spool = None;
                 if mode & S_IFMT == S_IFLNK {
                     n.data = f.linkname.clone().into_bytes();
                 }
@@ -299,6 +314,7 @@ impl<W: Read + Write + Seek> Writer<W> {
             devminor: f.devminor,
             xattrs: f.xattrs.clone(),
             data: Vec::new(),
+            spool: None,
             children: BTreeMap::new(),
             nlink: 0,
             nid: 0,
@@ -352,9 +368,8 @@ impl<W: Read + Write + Seek> Writer<W> {
     /// volume manifest so the server warms exactly the boot set on device open.
     /// `0` when no `PriorityOrder` was given (no hint).
     pub fn close_with_prefetch(mut self) -> io::Result<(W, u64)> {
-        let (image, prefetch_len) = self.serialize()?;
-        self.out.seek(SeekFrom::Start(0))?;
-        self.out.write_all(&image)?;
+        // serialize() streams the image directly into `self.out`.
+        let prefetch_len = self.serialize()?;
         self.out.flush()?;
         Ok((self.out, prefetch_len))
     }
@@ -362,9 +377,29 @@ impl<W: Read + Write + Seek> Writer<W> {
 
 impl<W: Read + Write + Seek> Write for Writer<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(idx) = self.current {
-            self.nodes[idx].data.extend_from_slice(buf);
+        let Some(idx) = self.current else { return Ok(buf.len()) };
+        if buf.is_empty() {
+            return Ok(0);
         }
+        // Append to the on-disk spool (lazily created). All writes for a single
+        // file are consecutive (the driver finishes one file before create()ing
+        // the next), so each file occupies one contiguous spool range.
+        let spool = match &mut self.spool {
+            Some(f) => f,
+            None => {
+                self.spool = Some(tempfile::tempfile()?);
+                self.spool.as_mut().unwrap()
+            }
+        };
+        spool.seek(SeekFrom::Start(self.spool_pos))?;
+        spool.write_all(buf)?;
+        let start = self.spool_pos;
+        self.spool_pos += buf.len() as u64;
+        let n = &mut self.nodes[idx];
+        n.spool = Some(match n.spool {
+            Some((off, len)) => (off, len + buf.len() as u64),
+            None => (start, buf.len() as u64),
+        });
         Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -476,8 +511,10 @@ impl<W: Read + Write + Seek> Writer<W> {
             let data_len = if n.is_dir() {
                 // length-only encode with placeholder nids
                 self.encode_dir(idx, 0, parent_of[idx] as u64).len()
+            } else if let Some((_, len)) = n.spool {
+                len as usize // regular file: spooled content length
             } else {
-                n.data.len()
+                n.data.len() // symlink target (or empty)
             };
             let xattr_isize = encode_xattrs(&n.xattrs).len();
             let mut nfull = data_len / BLK;
@@ -533,9 +570,10 @@ impl<W: Read + Write + Seek> Writer<W> {
         (order, prio_set)
     }
 
-    /// Returns the serialized image and the prefetch length (boot working-set
-    /// byte extent `[0, len)`; 0 when no `PriorityOrder` was given).
-    fn serialize(&mut self) -> io::Result<(Vec<u8>, u64)> {
+    /// Stream the image into `self.out` (bounded memory — never materializes the
+    /// whole image or any file's content in RAM). Returns the prefetch length
+    /// (boot working-set byte extent `[0, len)`; 0 when no `PriorityOrder`).
+    fn serialize(&mut self) -> io::Result<u64> {
         let (order, prio_set) = self.layout_order();
 
         // parent map (for ".." nid). Root's parent is itself.
@@ -638,49 +676,110 @@ impl<W: Read + Write + Seek> Writer<W> {
         };
         let total_blocks = next_blk.max(data_region_start_blk).max(1);
 
-        // --- Pass 3: serialize ---
-        let mut img = vec![0u8; total_blocks * BLK];
-        self.write_superblock(&mut img, total_blocks, self.nodes[0].nid);
+        // --- Pass 3: stream the image directly into `self.out`, never holding
+        // the whole image (or any file's contents) in RAM. Holes — the reserved
+        // prefix, alignment gaps, and sub-block padding — are not written; a
+        // fresh seekable sink reads them back as zero (`Cursor` zero-fills on
+        // write-past-end; sparse files / zeroed block devices read holes as 0).
+        let mut max_written: u64 = 0;
+        let sb = self.superblock_bytes(total_blocks, self.nodes[0].nid);
+        self.write_out_at(SUPER_OFFSET as usize, &sb, &mut max_written)?;
 
         for &idx in &order {
-            // re-encode dir data now that nids are known (same length as facts)
-            let data: Vec<u8> = if self.nodes[idx].is_dir() {
-                let self_nid = self.nodes[idx].nid;
-                let parent_nid = self.nodes[parent_of[idx]].nid;
-                self.encode_dir(idx, self_nid, parent_nid)
-            } else {
-                self.nodes[idx].data.clone()
-            };
-            debug_assert_eq!(data.len(), facts[idx].data_len);
-
             let nfull = facts[idx].nfull;
             let tail = facts[idx].tail;
+            let data_len = facts[idx].data_len;
             let meta_off = (self.nodes[idx].nid as usize) * ISLOT;
-            self.write_inode(&mut img, idx, meta_off, &facts[idx]);
 
-            // inline xattrs, then the inline tail, right after the inode header
+            // inode header, then inline xattrs.
+            let inode = self.inode_bytes(idx, &facts[idx]);
+            self.write_out_at(meta_off, &inode, &mut max_written)?;
             let xa = encode_xattrs(&self.nodes[idx].xattrs);
             if !xa.is_empty() {
-                let x0 = meta_off + ISLOT;
-                img[x0..x0 + xa.len()].copy_from_slice(&xa);
+                self.write_out_at(meta_off + ISLOT, &xa, &mut max_written)?;
             }
+
+            // Data source: a dir body (recomputed now that nids are known) or a
+            // symlink target live in RAM (both small); regular-file content is
+            // read back from the on-disk spool in <= BLK chunks.
+            enum Src {
+                Mem(Vec<u8>),
+                Spool(u64),
+            }
+            let src = if self.nodes[idx].is_dir() {
+                let self_nid = self.nodes[idx].nid;
+                let parent_nid = self.nodes[parent_of[idx]].nid;
+                Src::Mem(self.encode_dir(idx, self_nid, parent_nid))
+            } else if let Some((off, _)) = self.nodes[idx].spool {
+                Src::Spool(off)
+            } else {
+                Src::Mem(self.nodes[idx].data.clone())
+            };
+            if let Src::Mem(ref v) = src {
+                debug_assert_eq!(v.len(), data_len);
+            }
+
+            // inline tail (sub-block remainder), right after the xattrs.
             if tail > 0 {
                 let t0 = meta_off + ISLOT + facts[idx].xattr_isize;
-                img[t0..t0 + tail].copy_from_slice(&data[nfull * BLK..]);
+                let bytes = match &src {
+                    Src::Mem(v) => v[nfull * BLK..].to_vec(),
+                    Src::Spool(off) => self.read_spool(off + (nfull * BLK) as u64, tail)?,
+                };
+                self.write_out_at(t0, &bytes, &mut max_written)?;
             }
-            // full blocks in the data region (last may be partial under the
-            // FLAT_PLAIN fallback, so copy at most data.len() bytes).
+            // full data blocks (the last may be partial under the FLAT_PLAIN
+            // fallback, so write at most data_len bytes), streamed block-by-block.
             if nfull > 0 {
                 let base = self.nodes[idx].blkaddr as usize * BLK;
-                let n = data.len().min(nfull * BLK);
-                img[base..base + n].copy_from_slice(&data[..n]);
+                let total = data_len.min(nfull * BLK);
+                let mut w = 0;
+                while w < total {
+                    let chunk = (total - w).min(BLK);
+                    let bytes = match &src {
+                        Src::Mem(v) => v[w..w + chunk].to_vec(),
+                        Src::Spool(off) => self.read_spool(off + w as u64, chunk)?,
+                    };
+                    self.write_out_at(base + w, &bytes, &mut max_written)?;
+                    w += chunk;
+                }
             }
         }
 
-        Ok((img, prefetch_len))
+        // Guarantee the output is exactly `total_blocks * BLK` bytes: the final
+        // block may end in a sub-block hole nothing wrote (the gap is < BLK).
+        let end = (total_blocks * BLK) as u64;
+        if max_written < end {
+            let pad = vec![0u8; (end - max_written) as usize];
+            self.out.seek(SeekFrom::Start(max_written))?;
+            self.out.write_all(&pad)?;
+        }
+
+        Ok(prefetch_len)
     }
 
-    fn write_inode(&self, img: &mut [u8], idx: usize, off: usize, fact: &Layout) {
+    /// Read `len` bytes at `off` from the spool file (regular-file content).
+    fn read_spool(&mut self, off: u64, len: usize) -> io::Result<Vec<u8>> {
+        let spool = self
+            .spool
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "spool file missing"))?;
+        spool.seek(SeekFrom::Start(off))?;
+        let mut buf = vec![0u8; len];
+        spool.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Write `bytes` at byte `offset` in the output, tracking the high-water mark.
+    fn write_out_at(&mut self, offset: usize, bytes: &[u8], max_written: &mut u64) -> io::Result<()> {
+        self.out.seek(SeekFrom::Start(offset as u64))?;
+        self.out.write_all(bytes)?;
+        *max_written = (*max_written).max(offset as u64 + bytes.len() as u64);
+        Ok(())
+    }
+
+    /// Build the 32-byte compact inode for node `idx` (placed at its nid offset).
+    fn inode_bytes(&self, idx: usize, fact: &Layout) -> [u8; ISLOT] {
         let n = &self.nodes[idx];
         let datalayout = if fact.tail > 0 || fact.data_len == 0 {
             LAYOUT_FLAT_INLINE
@@ -701,48 +800,42 @@ impl<W: Read + Write + Seek> Writer<W> {
             }
         };
 
-        let w16 = |img: &mut [u8], o: usize, v: u16| img[o..o + 2].copy_from_slice(&v.to_le_bytes());
-        let w32 = |img: &mut [u8], o: usize, v: u32| img[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let mut b = [0u8; ISLOT];
+        let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
 
         let icount = if fact.xattr_isize == 0 {
             0u16
         } else {
             ((fact.xattr_isize - 12) / 4 + 1) as u16
         };
-        w16(img, off, i_format);
-        w16(img, off + 0x02, icount); // i_xattr_icount
-        w16(img, off + 0x04, n.mode);
-        w16(img, off + 0x06, n.nlink as u16);
-        w32(img, off + 0x08, fact.data_len as u32); // i_size
-        w32(img, off + 0x0C, 0); // reserved
-        w32(img, off + 0x10, i_u);
-        w32(img, off + 0x14, (n.nid as u32).wrapping_add(1)); // i_ino (informational)
-        w16(img, off + 0x18, n.uid as u16);
-        w16(img, off + 0x1A, n.gid as u16);
-        w32(img, off + 0x1C, 0); // reserved2
+        w16(&mut b, 0x00, i_format);
+        w16(&mut b, 0x02, icount); // i_xattr_icount
+        w16(&mut b, 0x04, n.mode);
+        w16(&mut b, 0x06, n.nlink as u16);
+        w32(&mut b, 0x08, fact.data_len as u32); // i_size
+        w32(&mut b, 0x10, i_u);
+        w32(&mut b, 0x14, (n.nid as u32).wrapping_add(1)); // i_ino (informational)
+        w16(&mut b, 0x18, n.uid as u16);
+        w16(&mut b, 0x1A, n.gid as u16);
+        b
     }
 
-    fn write_superblock(&self, img: &mut [u8], total_blocks: usize, root_nid: u64) {
-        let sb = SUPER_OFFSET as usize;
-        let w16 = |img: &mut [u8], o: usize, v: u16| img[o..o + 2].copy_from_slice(&v.to_le_bytes());
-        let w32 = |img: &mut [u8], o: usize, v: u32| img[o..o + 4].copy_from_slice(&v.to_le_bytes());
-        let w64 = |img: &mut [u8], o: usize, v: u64| img[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    /// Build the 128-byte superblock (placed at `SUPER_OFFSET`).
+    fn superblock_bytes(&self, total_blocks: usize, root_nid: u64) -> [u8; SB_SIZE] {
+        let mut b = [0u8; SB_SIZE];
+        let w16 = |b: &mut [u8], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |b: &mut [u8], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        let w64 = |b: &mut [u8], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
 
-        w32(img, sb + 0x00, MAGIC);
-        w32(img, sb + 0x04, 0); // checksum (sb_csum feature not set)
-        w32(img, sb + 0x08, 0); // feature_compat (no csum/mtime in v1)
-        img[sb + 0x0C] = BLKSZBITS;
-        img[sb + 0x0D] = 0; // sb_extslots
-        w16(img, sb + 0x0E, root_nid as u16);
-        w64(img, sb + 0x10, self.nodes.len() as u64); // inos
-        w64(img, sb + 0x18, 0); // build_time
-        w32(img, sb + 0x20, 0); // build_time_nsec
-        w32(img, sb + 0x24, total_blocks as u32); // blocks
-        w32(img, sb + 0x28, 0); // meta_blkaddr
-        w32(img, sb + 0x2C, 0); // xattr_blkaddr
-        img[sb + 0x30..sb + 0x40].copy_from_slice(&self.uuid);
-        // volume_name (0x40..0x50) left zero
-        w32(img, sb + 0x50, 0); // feature_incompat
+        w32(&mut b, 0x00, MAGIC);
+        b[0x0C] = BLKSZBITS;
+        w16(&mut b, 0x0E, root_nid as u16);
+        w64(&mut b, 0x10, self.nodes.len() as u64); // inos
+        w32(&mut b, 0x24, total_blocks as u32); // blocks
+        b[0x30..0x40].copy_from_slice(&self.uuid);
+        // checksum, features, timestamps, meta/xattr_blkaddr, volume_name = 0
+        b
     }
 }
 

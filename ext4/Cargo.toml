@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 bitflags = "2"
 tar = "0.4"
+# Spool file contents to disk during EROFS assembly so peak memory is bounded
+# (independent of image size) instead of buffering every file in RAM.
+tempfile = "3.21"
 
 [dev-dependencies]
 tempfile = "3.21"
