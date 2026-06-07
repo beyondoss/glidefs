@@ -291,6 +291,7 @@ mod tests {
     /// BlockHandler → cache/ContentStore. Requires the `ublk` feature + root +
     /// `/dev/ublk-control`.
     #[cfg(feature = "ublk")]
+    #[allow(unsafe_code)] // libc::geteuid() for the root-required skip guard
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn erofs_served_over_real_ublk_kernel_mount() {
         use std::process::Command;
@@ -298,6 +299,13 @@ mod tests {
 
         if !std::path::Path::new("/dev/ublk-control").exists() {
             eprintln!("SKIP: /dev/ublk-control not present");
+            return;
+        }
+        // Registering a ublk device needs CAP_SYS_ADMIN. The plain `cargo test`
+        // lib step runs unprivileged (only the sudo'd CI steps are root), so skip
+        // rather than fail — same convention as the zc_glidefs harness.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: not root — ublk device registration needs privilege");
             return;
         }
 
@@ -380,6 +388,7 @@ mod tests {
     /// can't expose layout bugs that only appear with alignment holes and
     /// multi-block files — this is the test that does.
     #[cfg(feature = "ublk")]
+    #[allow(unsafe_code)] // libc::geteuid() for the root-required skip guard
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn erofs_aligned_served_over_ublk() {
         use std::process::Command;
@@ -387,6 +396,13 @@ mod tests {
 
         if !std::path::Path::new("/dev/ublk-control").exists() {
             eprintln!("SKIP: /dev/ublk-control not present");
+            return;
+        }
+        // Registering a ublk device needs CAP_SYS_ADMIN. The plain `cargo test`
+        // lib step runs unprivileged (only the sudo'd CI steps are root), so skip
+        // rather than fail — same convention as the zc_glidefs harness.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP: not root — ublk device registration needs privilege");
             return;
         }
 
