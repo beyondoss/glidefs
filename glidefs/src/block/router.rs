@@ -686,7 +686,7 @@ impl ExportRouter {
         &self.clean_cache
     }
 
-    /// Pre-warm the base manifest and hot set caches for a given S3 prefix.
+    /// Pre-warm the base manifest cache for a given S3 prefix.
     ///
     /// Lists all `bases/*` manifests under `{s3_prefix}/manifests/` and loads
     /// them into memory. Call after router construction (e.g. after
@@ -2805,7 +2805,7 @@ impl ExportRouter {
             ..
         } = state;
 
-        // 0. Abort the hot-set prefetch task (if running) to release Arc clones.
+        // 0. Abort the boot-prefetch task (if running) to release Arc clones.
         if let Some(handle) = prefetch_handle {
             handle.abort();
             let _ = handle.await;

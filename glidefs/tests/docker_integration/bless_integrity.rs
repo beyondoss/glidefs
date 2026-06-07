@@ -29,7 +29,6 @@ use rand::{Rng, SeedableRng};
 
 use glidefs::block::block_map::{blake3_128, lz4_compress, shared_zero_block};
 use glidefs::block::content_store::ContentStore;
-use glidefs::block::manifest::serialize_hot_set;
 use glidefs::block::pack::content_pack_id;
 use glidefs::block::volume_manifest::VolumeManifest;
 
@@ -188,7 +187,6 @@ async fn bless_image_to_s3(
     let (_, zero_hash) = shared_zero_block(BLOCK_SIZE);
 
     let mut volume_manifest = VolumeManifest::new(device_size, block_size);
-    let mut hot_set_indices: Vec<u64> = Vec::new();
     let mut zero_blocks = 0usize;
     let mut nonzero_blocks = 0usize;
 
@@ -210,7 +208,6 @@ async fn bless_image_to_s3(
         }
 
         nonzero_blocks += 1;
-        hot_set_indices.push(block_index as u64);
 
         let chunk_idx = vm_template.chunk_idx_for_block(block_index as u64);
         let block_offset = vm_template.block_offset_in_chunk(block_index as u64);
@@ -233,19 +230,13 @@ async fn bless_image_to_s3(
         volume_manifest.append_pack(chunk_idx, pack_id);
     }
 
-    // Save manifest as base
+    // Save manifest as base (index warming on fork comes from the manifest's
+    // pack list; the boot set is captured at runtime — no `.hot-set` artifact).
     let manifest_key = format!("bases/{}", name);
     content_store
         .put_manifest(&manifest_key, volume_manifest.serialize().unwrap(), None)
         .await
         .expect("manifest upload failed");
-
-    // Save hot set
-    let hot_set_data = serialize_hot_set(&hot_set_indices);
-    content_store
-        .put_hot_set(name, hot_set_data)
-        .await
-        .expect("hot set upload failed");
 
     (nonzero_blocks, zero_blocks)
 }

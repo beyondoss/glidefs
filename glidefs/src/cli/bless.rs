@@ -1116,8 +1116,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_pass_profile_captures_paths_and_orders_them() {
         use std::io::{Seek, SeekFrom};
+        // Effective UID == 0 via /proc (avoids an unsafe libc::geteuid call —
+        // the crate denies unsafe). Uid line is: real effective saved fsuid.
+        let is_root = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("Uid:"))
+                    .and_then(|l| l.split_whitespace().nth(2).map(|u| u == "0"))
+            })
+            .unwrap_or(false);
         let img_dir = std::path::Path::new("/tmp/oci/py312");
-        if unsafe { libc::geteuid() } != 0 || !img_dir.exists() {
+        if !is_root || !img_dir.exists() {
             eprintln!("SKIP: two-pass profiling needs root + /tmp/oci/py312");
             return;
         }

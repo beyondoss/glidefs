@@ -1556,7 +1556,7 @@ impl BlockHandler {
     /// bytes (the trace-ordered priority region). After this resolves, the
     /// guest's first reads over that range are cache hits instead of S3 GETs.
     /// Best-effort and idempotent; intended to be spawned as a background task
-    /// on device open. Unlike readahead/hot-set prefetch (pack indices only),
+    /// on device open. Unlike readahead/index prefetch (pack indices only),
     /// this fetches and decompresses the actual blocks.
     pub async fn prefetch_warm(&self, len: u64) {
         self.cache
