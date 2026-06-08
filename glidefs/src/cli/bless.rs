@@ -508,15 +508,14 @@ pub async fn run_bless_oci_erofs(
         None,
     ));
 
-    // --- Determine the boot working set so the EROFS layout places it
-    // contiguously at the front of the image; a contiguous boot set warms in ONE
-    // range GET on device open instead of the scattered demand faults a default
-    // DFS layout costs (research-bootset: 4.5–30× faster cold boot). Two
-    // producers: `--profile` RUNS the image once and captures the real boot set
-    // (covers dlopen'd libs + data that static analysis misses), unioned with —
-    // and otherwise falling back to — the static ELF-closure derivation. Empty
-    // ⇒ default layout. Both run inside the convert's blocking task (they share
-    // `layer_files`). ---
+    // --- Reorder the boot working set to the front of the EROFS layout. We use
+    // the STATIC ELF-closure derivation (no execution) for the reorder even under
+    // `--profile`: the reorder's only job is layout (a contiguous boot region +
+    // the range-warm fallback / a readahead-friendly lazy tail), and the precise
+    // device-open warm comes from the EXACT block-level capture done once after
+    // drain (see below). Deriving the reorder paths statically avoids RUNNING the
+    // image a second time just to pick the layout order — one profiled run total.
+    // Empty ⇒ default DFS layout. ---
     let uuid = deterministic_uuid(&resolved.manifest_digest);
     let rt = tokio::runtime::Handle::current();
     let handler_for_write = Arc::clone(&handler);
@@ -524,12 +523,7 @@ pub async fn run_bless_oci_erofs(
     let config_bytes = resolved.config.clone();
     info!(profile, "deriving boot set + merging layers into EROFS");
     let prefetch_len = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let boot_paths = crate::oci::boot_set::select_boot_paths(
-            &config_bytes,
-            &mut layer_files,
-            profile,
-            &scratch2,
-        );
+        let boot_paths = crate::oci::boot_set::derive_boot_paths(&config_bytes, &mut layer_files);
         if !boot_paths.is_empty() {
             info!(count = boot_paths.len(), "boot set ready; EROFS will reorder it first");
         }
