@@ -983,12 +983,27 @@ impl BlockHandler {
         // read-modify-write. ublk dispatches one guest's sub-block writes to a
         // single block across multiple queues concurrently; without this lock
         // two backfill→merge→write sequences race and clobber each other's pages
-        // (stateright-verified). Different blocks hash to different shards and
-        // stay parallel. Held until the end of `write()`.
+        // (stateright-verified — stateright-model/src/faithful.rs). Different
+        // blocks hash to different shards and stay parallel. Held to end of write.
+        //
+        // Bypassed under `backfill_sync`: those tests deliberately pause a writer
+        // *inside* the RMW via gates to exercise the fine-grained cache/promote
+        // interleaving. The coarse lock (held across the whole RMW) would block a
+        // second writer at entry — before it can reach its gate — deadlocking the
+        // harness. The lock itself is covered by the stateright model + the
+        // fio_verify suite, so bypassing it for those inner-machinery tests is safe.
         let block_size = self.cache.block_size() as u64;
         let start_block = offset / block_size;
         let end_block = (offset + data.len() as u64 - 1) / block_size;
-        let _write_guards = self.lock_write_range(start_block, end_block).await;
+        #[cfg(feature = "test-utils")]
+        let serialize = self.backfill_sync.is_none();
+        #[cfg(not(feature = "test-utils"))]
+        let serialize = true;
+        let _write_guards = if serialize {
+            self.lock_write_range(start_block, end_block).await
+        } else {
+            Vec::new()
+        };
 
         // Backfill NOT_PRESENT blocks that receive sub-block writes.
         //
