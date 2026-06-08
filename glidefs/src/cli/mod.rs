@@ -40,6 +40,13 @@ pub enum Commands {
         /// flattening into one merged ext4. Only valid with --oci.
         #[arg(long, requires = "oci")]
         layered: bool,
+        /// Build the merged image as read-only EROFS instead of ext4 — the
+        /// correct format for an immutable container/OCI rootfs served daemonless
+        /// (kernel `erofs` over ublk; writes go to an overlay upper). Only valid
+        /// with --oci; the consumer must mount it read-only. Default is writable
+        /// ext4 (which VMs fork-and-write).
+        #[arg(long, requires = "oci", conflicts_with = "layered")]
+        erofs: bool,
         /// Base image name (e.g., "ubuntu-22.04-node20-v3")
         #[arg(long)]
         name: String,

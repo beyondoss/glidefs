@@ -31,6 +31,13 @@
 //!    cached: a later I/O retries the `mmap`, so a worker that lost the startup
 //!    race to a transient memory spike upgrades back to the bounded fast path
 //!    on its own once the host recovers.
+//!
+//! The heap fallback itself allocates **fallibly** ([`try_alloc_zeroed`]): if
+//! the host is so starved that even the `vec` can't be committed,
+//! [`acquire_io_buf`] returns `None` and the caller fails that *one* I/O with
+//! `EIO` — the daemon never aborts. An infallible `vec![0u8; len]` here would
+//! call `handle_alloc_error` → `SIGABRT`, killing storage for every VM on the
+//! host. `GLOBAL_HEAP_ALLOC_FAILURES` counts these single-I/O failures.
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::VecDeque;
@@ -50,6 +57,11 @@ pub static GLOBAL_POOLS_INITIALIZED: AtomicU64 = AtomicU64::new(0);
 /// worker's pool could not be `mmap`'d (init OOM). Sustained non-zero growth
 /// means a worker is stuck in the degraded, unbounded-RSS path — alert on it.
 pub static GLOBAL_HEAP_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Count of I/Os failed with `EIO` because even the heap fallback buffer could
+/// not be allocated (host so memory-starved that `try_reserve` failed). The
+/// daemon stays up and fails only the single starved I/O; the kernel retries.
+/// Any non-zero value means the host is critically out of memory — page hard.
+pub static GLOBAL_HEAP_ALLOC_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Slots per worker. 256 × 128 KB = 32 MB per worker.
 const POOL_SLOTS: usize = 256;
@@ -339,20 +351,46 @@ impl IoBuf {
     }
 }
 
+/// Fallibly allocate a zeroed `len`-byte heap buffer.
+///
+/// Unlike `vec![0u8; len]` — which routes an allocation failure through
+/// `handle_alloc_error` and **aborts the process** (`SIGABRT`, "memory
+/// allocation of N bytes failed") — this reserves capacity with
+/// [`Vec::try_reserve_exact`] and returns `None` on `ENOMEM`. The subsequent
+/// `resize` cannot reallocate (capacity already ≥ `len`), so it cannot abort.
+/// This is the difference between failing one I/O and killing the daemon.
+fn try_alloc_zeroed(len: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).ok()?;
+    v.resize(len, 0);
+    Some(v)
+}
+
 /// Acquire a `len`-byte bounce buffer for the calling worker.
 ///
 /// Fast path: a slot from this worker's pool, parking on backpressure if all
 /// slots are momentarily in flight. Fallback: if the pool can't be created
-/// (init OOM, see [`worker_pool`]), a heap buffer — counted in
-/// `GLOBAL_HEAP_FALLBACKS` so sustained degradation is alertable. Never panics;
-/// always yields a usable buffer.
-pub async fn acquire_io_buf(len: usize) -> IoBuf {
+/// (init OOM, see [`worker_pool`]), a fallibly-allocated heap buffer — counted
+/// in `GLOBAL_HEAP_FALLBACKS` so sustained degradation is alertable.
+///
+/// Returns `None` only in the doubly-degraded case where the pool is absent
+/// *and* even the heap fallback can't be committed (host critically OOM). The
+/// caller must fail that single I/O with `EIO` — never abort. This is the
+/// per-I/O sibling of the init-path fix: neither `mmap` nor `vec` failure may
+/// take down storage for every VM on the host.
+pub async fn acquire_io_buf(len: usize) -> Option<IoBuf> {
     match worker_pool() {
-        Some(pool) => IoBuf::Pooled(pool.acquire().await),
-        None => {
-            GLOBAL_HEAP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-            IoBuf::Heap(vec![0u8; len])
-        }
+        Some(pool) => Some(IoBuf::Pooled(pool.acquire().await)),
+        None => match try_alloc_zeroed(len) {
+            Some(v) => {
+                GLOBAL_HEAP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                Some(IoBuf::Heap(v))
+            }
+            None => {
+                GLOBAL_HEAP_ALLOC_FAILURES.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        },
     }
 }
 
@@ -366,6 +404,22 @@ mod tests {
         const VTABLE: RawWakerVTable =
             RawWakerVTable::new(|_| RawWaker::new(std::ptr::null(), &VTABLE), |_| {}, |_| {}, |_| {});
         unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    #[test]
+    fn try_alloc_zeroed_succeeds_and_zeroes() {
+        let v = try_alloc_zeroed(SLOT_SIZE).expect("normal-size alloc should succeed");
+        assert_eq!(v.len(), SLOT_SIZE);
+        assert!(v.iter().all(|&b| b == 0), "buffer must be zero-filled");
+    }
+
+    #[test]
+    fn try_alloc_zeroed_returns_none_on_impossible_size() {
+        // A request near usize::MAX cannot be committed; `try_reserve_exact`
+        // must return Err and we must surface `None` rather than abort. This
+        // is the property that keeps a host-OOM I/O from SIGABRT-ing the
+        // daemon — the whole point of the fallback being fallible.
+        assert!(try_alloc_zeroed(usize::MAX - 4096).is_none());
     }
 
     #[test]

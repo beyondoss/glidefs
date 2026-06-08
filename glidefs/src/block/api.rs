@@ -1012,13 +1012,14 @@ where
                 // broken until it recovers), and how many worker pools are live.
                 use std::sync::atomic::Ordering;
                 use crate::block::ublk::buffer_pool::{
-                    GLOBAL_ACQUIRES, GLOBAL_BACKPRESSURE_WAITS, GLOBAL_HEAP_FALLBACKS,
-                    GLOBAL_POOLS_INITIALIZED,
+                    GLOBAL_ACQUIRES, GLOBAL_BACKPRESSURE_WAITS, GLOBAL_HEAP_ALLOC_FAILURES,
+                    GLOBAL_HEAP_FALLBACKS, GLOBAL_POOLS_INITIALIZED,
                 };
                 let acq = GLOBAL_ACQUIRES.load(Ordering::Relaxed);
                 let waits = GLOBAL_BACKPRESSURE_WAITS.load(Ordering::Relaxed);
                 let pools = GLOBAL_POOLS_INITIALIZED.load(Ordering::Relaxed);
                 let heap_fallbacks = GLOBAL_HEAP_FALLBACKS.load(Ordering::Relaxed);
+                let heap_alloc_failures = GLOBAL_HEAP_ALLOC_FAILURES.load(Ordering::Relaxed);
                 let _ = writeln!(
                     output,
                     "# HELP glidefs_ublk_buffer_pool_acquires_total USER_COPY bounce buffers acquired from per-worker pool"
@@ -1046,6 +1047,12 @@ where
                 );
                 let _ = writeln!(output, "# TYPE glidefs_ublk_buffer_pool_heap_fallbacks_total counter");
                 let _ = writeln!(output, "glidefs_ublk_buffer_pool_heap_fallbacks_total {heap_fallbacks}");
+                let _ = writeln!(
+                    output,
+                    "# HELP glidefs_ublk_buffer_pool_heap_alloc_failures_total USER_COPY I/Os failed with EIO because neither the per-worker pool nor the heap fallback could be allocated (host critically OOM). The daemon stays up and fails only the single starved I/O instead of aborting. Any non-zero value means the host is out of memory — page hard."
+                );
+                let _ = writeln!(output, "# TYPE glidefs_ublk_buffer_pool_heap_alloc_failures_total counter");
+                let _ = writeln!(output, "glidefs_ublk_buffer_pool_heap_alloc_failures_total {heap_alloc_failures}");
             }
             Response::builder()
                 .status(StatusCode::OK)

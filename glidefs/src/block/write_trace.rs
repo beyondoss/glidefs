@@ -75,10 +75,16 @@ impl WriteTracer {
         writer.write_all(&block_size.to_le_bytes())?;
         writer.write_all(&device_blocks.to_le_bytes())?;
 
-        let now_us = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
+        // A node with a rolled-back clock (bad RTC / NTP step) can report
+        // `now < UNIX_EPOCH`; treat that as t=0 rather than panicking at
+        // export-attach time. `as_micros()` is u128 — saturate into u64.
+        let now_us = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros(),
+        )
+        .unwrap_or(u64::MAX);
         writer.write_all(&now_us.to_le_bytes())?;
 
         let mut name_buf = [0u8; 32];
@@ -107,7 +113,7 @@ impl WriteTracer {
         let block_start = (offset / u64::from(self.block_size)) as u32;
         let block_end = ((offset + length).div_ceil(u64::from(self.block_size))) as u32;
         let span = (block_end - block_start) as u16;
-        let elapsed_us = self.start.elapsed().as_micros() as u64;
+        let elapsed_us = u64::try_from(self.start.elapsed().as_micros()).unwrap_or(u64::MAX);
 
         let mut buf = [0u8; 16];
         buf[0..4].copy_from_slice(&block_start.to_le_bytes());
@@ -173,7 +179,10 @@ pub fn read_header(data: &[u8]) -> Option<TraceHeader> {
 
     let name_bytes = &data[32..64];
     let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(32);
-    let export_name = String::from_utf8_lossy(&name_bytes[..end]).to_string();
+    // Reject non-UTF-8 names rather than lossily replacing bytes: a U+FFFD
+    // substitution would round-trip as a *different* export name and could
+    // mis-attribute the trace to the wrong volume. A corrupt header → None.
+    let export_name = std::str::from_utf8(&name_bytes[..end]).ok()?.to_string();
 
     Some(TraceHeader {
         version,

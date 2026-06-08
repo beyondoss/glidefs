@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
             image,
             oci,
             layered,
+            erofs,
             name,
             s3_prefix,
             config,
@@ -97,6 +98,8 @@ async fn main() -> Result<()> {
             } else if let Some(image_ref) = oci {
                 if layered {
                     cli::bless::run_bless_oci_layered(image_ref, name, config).await?;
+                } else if erofs {
+                    cli::bless::run_bless_oci_erofs(image_ref, name, s3_prefix, config).await?;
                 } else {
                     cli::bless::run_bless_oci(image_ref, name, s3_prefix, config).await?;
                 }

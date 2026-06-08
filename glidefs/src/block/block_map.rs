@@ -1,4 +1,8 @@
-#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+// Truncating casts here are block-index/page arithmetic: `u64 → usize` (lossless
+// on the 64-bit targets GlideFS runs on) and small-range values like
+// `(idx % ENTRIES_PER_BYTE) * 2`. Scoped to this one lint so `cast_possible_wrap`
+// and `cast_sign_loss` stay active and catch genuinely new sign/wrap mistakes.
+#![allow(clippy::cast_possible_truncation)]
 //! Block state tracking and content-addressed hashing.
 //!
 //! This module provides:
@@ -857,10 +861,57 @@ pub fn compress_block(data: &[u8], level: i32) -> Vec<u8> {
 #[inline]
 pub fn decompress_block(compressed: &[u8]) -> Result<Vec<u8>, CompressError> {
     if compressed.len() >= 4 && compressed[..4] == ZSTD_MAGIC {
-        zstd::bulk::decompress(compressed, MAX_DECOMPRESSED_SIZE).map_err(CompressError::Zstd)
+        zstd_decompress(compressed, MAX_DECOMPRESSED_SIZE).map_err(CompressError::Zstd)
     } else {
         lz4_decompress(compressed).map_err(CompressError::Lz4)
     }
+}
+
+/// Decompress a zstd frame into a **fallibly-allocated, right-sized** buffer,
+/// bounded by `max_size`.
+///
+/// `zstd::bulk::decompress(_, cap)` allocates `Vec::with_capacity(cap)`
+/// *infallibly* on every call: without the crate's `experimental` feature it
+/// can't read the frame's content size, so it always reserves the full cap. On
+/// any read path that is two bugs at once:
+///
+///   1. **Abort surface.** Under host memory pressure that `Vec::with_capacity`
+///      routes failure through `handle_alloc_error` → `SIGABRT`, taking down the
+///      daemon (and storage for every VM) instead of failing one read. With a
+///      2 MiB cap this is the `memory allocation of 2097152 bytes failed` crash.
+///   2. **Over-allocation.** Real payloads are far smaller than the cap, but
+///      every decode reserves the whole cap regardless — churn on hot paths.
+///
+/// We read the frame's declared content size (one-shot `zstd::bulk::compress`
+/// records it in the header), clamp it to `max_size`, and `try_reserve_exact`
+/// so a genuine OOM returns `Err` — the caller fails that operation instead of
+/// aborting. The cap is still enforced two ways: an absent/oversized declared
+/// size clamps to `max_size`, and `decompress_to_buffer` errors rather than
+/// growing past the buffer's capacity, so a corrupt or adversarial frame can
+/// neither OOM nor overflow us.
+pub(crate) fn zstd_decompress(
+    compressed: &[u8],
+    max_size: usize,
+) -> Result<Vec<u8>, std::io::Error> {
+    // Declared decompressed size from the frame header, if present and sane.
+    let declared = zstd::zstd_safe::get_frame_content_size(compressed)
+        .ok()
+        .flatten()
+        .map(|n| n as usize)
+        .filter(|&n| n <= max_size);
+    let capacity = declared.unwrap_or(max_size);
+
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(capacity).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "zstd decompress buffer allocation failed (host OOM) — failing operation instead of aborting",
+        )
+    })?;
+
+    let mut dec = zstd::bulk::Decompressor::new()?;
+    dec.decompress_to_buffer(compressed, &mut buf)?;
+    Ok(buf)
 }
 
 // ============================================================================
@@ -875,6 +926,32 @@ mod tests {
 
     static ZERO_BLOCK_HASH_128K: LazyLock<Blake3Hash> =
         LazyLock::new(|| blake3_128(&[0u8; 131072]));
+
+    /// zstd_decompress must byte-exactly reproduce the input across the sizes the
+    /// pack-index Code path (level-1 bulk compress) actually uses, and agree with
+    /// the stock `zstd::bulk::decompress`. A short/wrong decode here silently
+    /// drops pack-index entries (no hash check on the index) → blocks read as zero.
+    #[test]
+    fn zstd_decompress_roundtrips_all_sizes() {
+        for &size in &[0usize, 1, 7, 31, 64, 100, 1000, 4096, 32 * 1024, 200 * 1024, 1024 * 1024] {
+            // Deterministic mixed-entropy payload (like extent-encoded indices).
+            let mut x: u64 = 0x1234_5678 ^ size as u64 | 1;
+            let raw: Vec<u8> = (0..size)
+                .map(|i| {
+                    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                    if i % 5 == 0 { 0 } else { (x >> 24) as u8 }
+                })
+                .collect();
+            let compressed = zstd::bulk::compress(&raw, 1).unwrap();
+            let out = zstd_decompress(&compressed, 1024 * 1024)
+                .unwrap_or_else(|e| panic!("size {size}: zstd_decompress errored: {e}"));
+            assert_eq!(out.len(), raw.len(), "size {size}: length mismatch");
+            assert_eq!(out, raw, "size {size}: content mismatch");
+            // Must agree with the stock decompressor it replaced.
+            let stock = zstd::bulk::decompress(&compressed, 1024 * 1024).unwrap();
+            assert_eq!(out, stock, "size {size}: disagrees with zstd::bulk::decompress");
+        }
+    }
 
     #[test]
     fn test_blake3_deterministic() {

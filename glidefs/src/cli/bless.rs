@@ -2,7 +2,6 @@
 use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
 use crate::block::content_store::ContentStore;
 use crate::block::handler::BlockHandler;
-use crate::block::manifest::serialize_hot_set;
 use crate::block::metrics::ExportMetrics;
 use crate::block::pack::DEFAULT_FLUSH_THRESHOLD;
 use crate::block::pack_index_cache::PackIndexCache;
@@ -25,6 +24,22 @@ use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::sync::Notify;
 use tracing::info;
+
+/// A disk-backed scratch directory for bless. The WriteCache cache file and the
+/// EROFS content spool can each be ~image-sized, so they must NOT land on a
+/// tmpfs `/tmp` (RAM). Prefers `$GLIDEFS_BLESS_WORKDIR`,
+/// then `/var/tmp` (FHS persistent temp, normally real disk) if writable, else
+/// falls back to the system temp dir.
+fn bless_scratch_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("GLIDEFS_BLESS_WORKDIR") {
+        return PathBuf::from(d);
+    }
+    let var_tmp = std::path::Path::new("/var/tmp");
+    if var_tmp.is_dir() && tempfile::tempfile_in(var_tmp).is_ok() {
+        return var_tmp.to_path_buf();
+    }
+    std::env::temp_dir()
+}
 
 pub async fn run_bless(
     image_path: PathBuf,
@@ -71,22 +86,15 @@ pub async fn run_bless(
     info!(device_size, total_blocks, "reading image");
 
     // --- Stream image: read blocks, upload each chunk as it completes ---
-    let (volume_manifest, hot_set_indices, stats) =
+    let (volume_manifest, stats) =
         store_ext4_stream(&content_store, file, device_size, crate::block::block_map::COMPRESSION_BLESS).await?;
 
-    // --- Upload manifest ---
+    // --- Upload manifest as a base ---
     let manifest_key = format!("bases/{}", name);
     content_store
         .put_manifest(&manifest_key, volume_manifest.serialize()?, None)
         .await
         .context("Failed to upload manifest")?;
-
-    // --- Upload hot set (block indices needed at boot for prefetching) ---
-    let hot_set_data = serialize_hot_set(&hot_set_indices);
-    content_store
-        .put_hot_set(&name, hot_set_data)
-        .await
-        .context("Failed to upload hot set")?;
 
     let elapsed = start.elapsed();
 
@@ -122,8 +130,9 @@ pub async fn run_bless(
 /// Bless an OCI image into a content-addressed base image.
 ///
 /// Pulls layers from the registry, converts to ext4, writes through
-/// BlockHandler → WriteCache, drains to S3, then generates a hot set
-/// and saves the manifest as a base.
+/// BlockHandler → WriteCache, drains to S3, and saves the manifest as a base.
+/// (Boot prefetch is driven by the manifest's packs, so no sidecar is written
+/// here.)
 pub async fn run_bless_oci(
     image_ref: String,
     name: String,
@@ -187,8 +196,9 @@ pub async fn run_bless_oci(
         "estimated device size"
     );
 
-    // --- Create temporary export infrastructure ---
-    let temp_dir = tempfile::TempDir::new().context("failed to create temp dir")?;
+    // --- Create temporary export infrastructure (disk-backed scratch so the
+    // WriteCache cache file doesn't balloon RAM via tmpfs /tmp). ---
+    let temp_dir = tempfile::TempDir::new_in(bless_scratch_dir()).context("failed to create temp dir")?;
     let cache_config = WriteCacheConfig {
         cache_dir: temp_dir.path().to_path_buf(),
         device_name: format!("bless-oci-{}", name),
@@ -300,49 +310,8 @@ pub async fn run_bless_oci(
         );
     }
 
-    // --- Generate hot set from VolumeManifest ---
-    let hot_set = {
-        // Collect chunk data under the read lock, then release before awaiting.
-        let (blocks_per_chunk, chunk_packs): (u64, Vec<(u32, Vec<u64>)>) = {
-            let vm = volume_manifest.read();
-            let bpc = u64::from(vm.blocks_per_chunk());
-            let cp = vm
-                .chunks
-                .iter()
-                .map(|(&idx, entry)| (idx, entry.packs.clone()))
-                .collect();
-            (bpc, cp)
-        };
-
-        let mut indices: Vec<u64> = Vec::new();
-        for (chunk_idx, packs) in &chunk_packs {
-            for &pack_id in packs {
-                match pack_index_cache.get_entries(pack_id).await {
-                    Some(entries) => {
-                        for e in entries.iter() {
-                            let global_block = u64::from(*chunk_idx) * blocks_per_chunk + u64::from(e.chunk_offset);
-                            indices.push(global_block);
-                        }
-                    }
-                    None => {
-                        tracing::warn!(pack_id, chunk_idx, "pack index missing from cache, hot set may be incomplete");
-                    }
-                }
-            }
-        }
-
-        indices.sort_unstable();
-        indices.dedup();
-        indices
-    };
-
-    let hot_set_data = serialize_hot_set(&hot_set);
-    content_store
-        .put_hot_set(&name, hot_set_data)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to upload hot set: {e}"))?;
-
-    // --- Save manifest as base ---
+    // --- Save manifest as base. Index warming on fork comes from the manifest's
+    // pack list; no sidecar artifact is written. ---
     let manifest_key = format!("bases/{}", name);
     let manifest_data = volume_manifest.read().serialize()?;
     content_store
@@ -356,10 +325,183 @@ pub async fn run_bless_oci(
     println!("  Image:           {}", image_ref);
     println!("  Layers:          {}", resolved.layers.len());
     println!("  Device size:     {:.1} MB", device_size as f64 / 1e6);
-    println!("  Hot set blocks:  {}", hot_set.len());
     println!("  Elapsed:         {:.1}s", elapsed.as_secs_f64());
     println!("  Manifest:        manifests/{}", manifest_key);
 
+    Ok(())
+}
+
+/// Bless an OCI image into a **read-only EROFS** base — the correct format for
+/// an immutable container/OCI rootfs served daemonless (kernel `erofs` over
+/// ublk; the guest's writes go to an overlay upper, never into the image).
+///
+/// Same pipeline as [`run_bless_oci`] (pull → write into a volume → drain → hot
+/// set + manifest), but it merges the layers into a deterministic, grid-aligned
+/// EROFS image (via the hand-rolled writer) instead of ext4. The image is
+/// content-addressed and dedups across images; the consumer mounts it read-only.
+pub async fn run_bless_oci_erofs(
+    image_ref: String,
+    name: String,
+    s3_prefix: String,
+    config_path: PathBuf,
+) -> Result<()> {
+    use crate::oci::BlockAdapter;
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or(tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let start = Instant::now();
+
+    // --- S3 setup ---
+    let settings = Settings::from_file(&config_path)
+        .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+    let url = settings.storage.url.clone();
+    let env_vars = settings.cloud_provider_env_vars();
+    let (object_store, path_from_url) = parse_url_opts(
+        &url.parse()?,
+        env_vars.into_iter(),
+        Some(settings.storage.connect_timeout()),
+        Some(settings.storage.request_timeout()),
+    )?;
+    let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
+    let db_path = path_from_url.to_string();
+    let base = format!("{}/exports/{}", db_path, s3_prefix);
+    let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), &base));
+
+    // --- Resolve image + estimate device size (same headroom as ext4 path) ---
+    let registry_client = RegistryClient::new();
+    let image: oci_registry::Reference = image_ref
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid image reference: {e}"))?;
+    info!(image = %image_ref, name = %name, "resolving OCI image (erofs)");
+    let resolved = registry_client
+        .resolve(&image, &Credentials::Anonymous)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to resolve image: {e}"))?;
+
+    let total_compressed: u64 = resolved.layers.iter().map(|l| l.size as u64).sum();
+    let device_size = (total_compressed * 4).max(64 * 1024 * 1024).next_power_of_two();
+
+    // --- Pull every layer to a decompressed temp file (the EROFS merge needs
+    // all layers seekable up front, bottom-to-top). ---
+    info!(layers = resolved.layers.len(), "pulling layers");
+    let mut layer_files: Vec<std::fs::File> = Vec::with_capacity(resolved.layers.len());
+    for (i, layer) in resolved.layers.iter().enumerate() {
+        info!(layer = i, digest = %layer.digest, "pulling layer");
+        layer_files.push(
+            pull_layer_to_tempfile(&registry_client, &image, layer, &Credentials::Anonymous)
+                .await
+                .with_context(|| format!("pull layer {}", layer.digest))?,
+        );
+    }
+
+    // --- Volume infrastructure (mirrors run_bless_oci). All bless scratch (the
+    // WriteCache cache file, the probe image, the EROFS spool) goes on a
+    // disk-backed dir so big images don't balloon RAM via tmpfs /tmp. ---
+    let scratch = bless_scratch_dir();
+    let temp_dir = tempfile::TempDir::new_in(&scratch).context("failed to create temp dir")?;
+    let cache = Arc::new(WriteCache::open_fresh_active(WriteCacheConfig {
+        cache_dir: temp_dir.path().to_path_buf(),
+        device_name: format!("bless-erofs-{}", name),
+        device_size,
+        block_size: BLOCK_SIZE as usize,
+        wal_sync: false,
+    })?);
+    cache.set_compression_level(crate::block::block_map::COMPRESSION_BLESS);
+    let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+        device_size, BLOCK_SIZE,
+    )));
+    let pack_index_cache = Arc::new(PackIndexCache::open(temp_dir.path()).await?);
+    let foyer_dir = temp_dir.path().join("foyer");
+    std::fs::create_dir_all(&foyer_dir)?;
+    let clean_cache: Arc<dyn BlockCache> = Arc::new(
+        FoyerBlockCache::open(FoyerCacheConfig {
+            memory_bytes: 4 * 1024 * 1024,
+            ssd_bytes: 16 * 1024 * 1024,
+            ssd_dir: foyer_dir,
+            direct: false,
+            io_uring: false,
+        })
+        .await?,
+    );
+    let handler = Arc::new(BlockHandler::new(
+        Arc::clone(&cache),
+        Arc::clone(&content_store),
+        Arc::clone(&clean_cache),
+        Arc::clone(&pack_index_cache),
+        Arc::clone(&volume_manifest),
+        device_size,
+        false,
+        Arc::new(ExportMetrics::new()),
+        Arc::new(AtomicU64::new(0f64.to_bits())),
+        Arc::new(Notify::const_new()),
+        DEFAULT_FLUSH_THRESHOLD,
+        None,
+    ));
+
+    // --- Merge layers into the final EROFS image. The BlockAdapter sink uses
+    // block_on, so the convert runs on a blocking thread. ---
+    let uuid = deterministic_uuid(&resolved.manifest_digest);
+    let rt = tokio::runtime::Handle::current();
+    let handler_for_write = Arc::clone(&handler);
+    let scratch2 = scratch.clone();
+    info!("merging layers into EROFS");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let opts = ext4::tar_convert::ConvertOptions {
+            convert_backslash: false,
+            writer_options: vec![
+                WriterOption::Uuid(uuid),
+                // Align large file payloads to the dedup block grid (cross-image
+                // dedup); EROFS has no reserved blocks so this is always safe.
+                WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
+                WriterOption::SpoolDir(scratch2.clone()),
+            ],
+        };
+        ext4::convert_oci_layers_to_erofs(
+            &mut layer_files,
+            BlockAdapter::new(&handler_for_write, rt),
+            &opts,
+        )
+        .map_err(|e| anyhow::anyhow!("erofs conversion failed: {e}"))?;
+        Ok(())
+    })
+    .await??;
+
+    // --- Drain to S3 ---
+    info!("draining to S3");
+    for i in 0..100 {
+        let stats = cache
+            .flush_to_s3(&content_store, &pack_index_cache, &volume_manifest)
+            .await
+            .map_err(|e| anyhow::anyhow!("flush failed: {e}"))?;
+        if stats.blocks_claimed == 0 {
+            info!(iterations = i + 1, "drain complete");
+            break;
+        }
+        if i == 99 {
+            anyhow::bail!("drain did not converge");
+        }
+    }
+
+    // --- Save manifest as base ---
+    let manifest_key = format!("bases/{}", name);
+    let manifest_data = volume_manifest.read().serialize()?;
+    content_store
+        .put_manifest(&manifest_key, manifest_data, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
+
+    println!("Blessed '{}' from OCI image as read-only EROFS:", name);
+    println!("  Image:           {}", image_ref);
+    println!("  Layers:          {}", resolved.layers.len());
+    println!("  Device size:     {:.1} MB", device_size as f64 / 1e6);
+    println!("  Elapsed:         {:.1}s", start.elapsed().as_secs_f64());
+    println!("  Manifest:        manifests/{}  (mount read-only)", manifest_key);
     Ok(())
 }
 
@@ -503,19 +645,13 @@ mod tests {
             content_store.base_path(),
         ));
 
-        let (volume_manifest, hot_set_indices, stats) =
+        let (volume_manifest, stats) =
             store_ext4_stream(&content_store, std::io::Cursor::new(image_data.to_vec()), device_size, crate::block::block_map::COMPRESSION_BLESS)
                 .await?;
 
         content_store
             .put_manifest(&format!("bases/{}", name), volume_manifest.serialize()?, None)
             .await?;
-
-        let hot_set_data = serialize_hot_set(&hot_set_indices);
-        content_store
-            .put_hot_set(name, hot_set_data)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
 
         Ok(stats)
     }
@@ -552,6 +688,106 @@ mod tests {
         let path = ObjectPath::from(key);
         let response = store.get(&path).await.unwrap();
         response.bytes().await.unwrap().to_vec()
+    }
+
+    /// The EROFS-bless assembly (convert layers → write into the volume via
+    /// BlockAdapter → drain to S3 → manifest) must produce a base that, read back
+    /// cold from S3, is a valid EROFS image. Covers everything in
+    /// `run_bless_oci_erofs` except the network pull.
+    #[tokio::test]
+    async fn test_bless_oci_erofs_assembly_reads_back() {
+        use crate::block::handler::BlockHandler;
+        use crate::block::pack_index_cache::PackIndexCache;
+        use crate::block::write_cache::{WriteCache, WriteCacheConfig};
+        use crate::oci::BlockAdapter;
+        use std::io::Cursor;
+        use std::sync::atomic::AtomicU64;
+
+        let store = Arc::new(InMemory::new());
+        let cs = Arc::new(ContentStore::new(store.clone(), "test"));
+        let device_size = 16 * 1024 * 1024u64;
+        let temp = tempfile::TempDir::new().unwrap();
+
+        let cache = Arc::new(
+            WriteCache::open_fresh_active(WriteCacheConfig {
+                cache_dir: temp.path().to_path_buf(),
+                device_name: "erofs-bless-test".into(),
+                device_size,
+                block_size: BLOCK_SIZE as usize,
+                wal_sync: false,
+            })
+            .unwrap(),
+        );
+        let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(device_size, BLOCK_SIZE)));
+        let pic = Arc::new(PackIndexCache::open(temp.path()).await.unwrap());
+        let clean: Arc<dyn BlockCache> = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+        let handler = Arc::new(BlockHandler::new(
+            Arc::clone(&cache), Arc::clone(&cs), Arc::clone(&clean), Arc::clone(&pic),
+            Arc::clone(&vm), device_size, false, Arc::new(ExportMetrics::new()),
+            Arc::new(AtomicU64::new(0f64.to_bits())), Arc::new(Notify::const_new()),
+            DEFAULT_FLUSH_THRESHOLD, None,
+        ));
+
+        // Two overlay layers → merged EROFS, written into the volume.
+        let mk = |entries: &[(&str, &[u8])]| -> Vec<u8> {
+            let mut b = tar::Builder::new(Vec::new());
+            for (p, d) in entries {
+                let mut h = tar::Header::new_gnu();
+                h.set_path(p).unwrap();
+                h.set_size(d.len() as u64);
+                h.set_mode(0o644);
+                h.set_entry_type(tar::EntryType::Regular);
+                h.set_cksum();
+                b.append(&h, *d).unwrap();
+            }
+            b.into_inner().unwrap()
+        };
+        let l0 = mk(&[("etc/os", b"base"), ("bin/sh", b"#!/bin/sh\n")]);
+        let l1 = mk(&[("etc/os", b"top"), ("app/run", b"hi")]);
+        let rt = tokio::runtime::Handle::current();
+        let hw = Arc::clone(&handler);
+        tokio::task::spawn_blocking(move || {
+            let opts = ext4::tar_convert::ConvertOptions {
+                convert_backslash: false,
+                writer_options: vec![
+                    WriterOption::Uuid([5u8; 16]),
+                    WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
+                ],
+            };
+            let mut layers = vec![Cursor::new(l0), Cursor::new(l1)];
+            ext4::convert_oci_layers_to_erofs(
+                &mut layers, BlockAdapter::new(&hw, rt), &opts,
+            ).unwrap();
+        }).await.unwrap();
+
+        // Drain to S3 + persist manifest, then read back the EROFS superblock
+        // through a fresh cold handler over the same store.
+        for _ in 0..100 {
+            let s = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
+            if s.blocks_claimed == 0 { break; }
+        }
+        let manifest_data = vm.read().serialize().unwrap();
+        cs.put_manifest("bases/erofs-test", manifest_data, None).await.unwrap();
+
+        let cold_temp = tempfile::TempDir::new().unwrap();
+        let cold_cache = Arc::new(
+            WriteCache::open_fresh_active(WriteCacheConfig {
+                cache_dir: cold_temp.path().to_path_buf(),
+                device_name: "erofs-cold".into(),
+                device_size, block_size: BLOCK_SIZE as usize, wal_sync: false,
+            }).unwrap(),
+        );
+        let cold_clean: Arc<dyn BlockCache> = Arc::new(crate::block::cache::SimpleBlockCache::new(64 * 1024 * 1024));
+        let cold = Arc::new(BlockHandler::new(
+            cold_cache, Arc::clone(&cs), cold_clean,
+            Arc::new(PackIndexCache::open(cold_temp.path()).await.unwrap()),
+            Arc::clone(&vm), device_size, true, Arc::new(ExportMetrics::new()),
+            Arc::new(AtomicU64::new(0f64.to_bits())), Arc::new(Notify::const_new()),
+            DEFAULT_FLUSH_THRESHOLD, None,
+        ));
+        // EROFS superblock magic lives at byte 1024 (block 0).
+        let blk0 = cold.read(0, BLOCK_SIZE).await.unwrap();
+        assert_eq!(&blk0[1024..1028], &[0xe2, 0xe1, 0xf5, 0xe0], "served EROFS magic");
     }
 
     #[tokio::test]
@@ -668,31 +904,6 @@ mod tests {
         let entries = fetch_pack_index(&store, "test", 0, pack_ids[0]).await;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].chunk_offset, 0);
-    }
-
-    #[tokio::test]
-    async fn test_bless_generates_hot_set() {
-        use crate::block::manifest::deserialize_hot_set;
-
-        let (_, cs) = test_store();
-
-        // 4-block image: block 0 has data, blocks 1-2 are zero, block 3 has data
-        let mut image = vec![0u8; 4 * BLOCK_SIZE as usize];
-        image[..BLOCK_SIZE as usize].fill(0xAA);
-        image[3 * BLOCK_SIZE as usize..4 * BLOCK_SIZE as usize].fill(0xBB);
-
-        bless_bytes(&cs, "hot-test", &image).await.unwrap();
-
-        // Fetch and verify hot set
-        let hot_set_data = cs
-            .get_hot_set("hot-test")
-            .await
-            .unwrap()
-            .expect("hot set should exist");
-        let hot_set = deserialize_hot_set(&hot_set_data).unwrap();
-
-        // Only block indices 0 and 3 are non-zero
-        assert_eq!(hot_set, vec![0, 3]);
     }
 
     #[tokio::test]

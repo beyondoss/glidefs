@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use crate::format;
-use crate::writer::{File, Writer, WriterOption};
+use crate::writer::{File, FsSink, Writer, WriterOption};
 
 const WHITEOUT_PREFIX: &str = ".wh.";
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
@@ -69,25 +69,68 @@ where
     R: Read + Seek,
     W: Read + Write + Seek,
 {
+    let mut fs = Writer::new(output, &options.writer_options);
+    merge_layers(layers, &mut fs, options)?;
+    fs.close()
+}
+
+/// Merge multiple OCI layers into a single **EROFS** filesystem image.
+///
+/// Identical overlay semantics to [`convert_oci_layers_to_ext4`] (bottom-to-top,
+/// higher layers win, `.wh.` deletes, `.wh..wh..opq` makes a dir opaque) but
+/// emits the read-only EROFS format GlideFS serves as a daemonless block device.
+pub fn convert_oci_layers_to_erofs<R, W>(
+    layers: &mut [R],
+    output: W,
+    options: &ConvertOptions,
+) -> io::Result<W>
+where
+    R: Read + Seek,
+    W: Read + Write + Seek,
+{
+    Ok(convert_oci_layers_to_erofs_with_prefetch(layers, output, options)?.0)
+}
+
+/// Like [`convert_oci_layers_to_erofs`] but also returns the **prefetch length**
+/// — the leading byte extent `[0, len)` covering the metadata region plus the
+/// contiguous priority data run (0 when no
+/// [`WriterOption::PriorityOrder`](crate::writer::WriterOption) was given).
+/// Persist this in the volume manifest so the server warms the priority region
+/// on open.
+pub fn convert_oci_layers_to_erofs_with_prefetch<R, W>(
+    layers: &mut [R],
+    output: W,
+    options: &ConvertOptions,
+) -> io::Result<(W, u64)>
+where
+    R: Read + Seek,
+    W: Read + Write + Seek,
+{
+    let mut fs = crate::erofs::Writer::new(output, &options.writer_options);
+    merge_layers(layers, &mut fs, options)?;
+    fs.close_with_prefetch()
+}
+
+/// Drive the OCI whiteout-aware merge into any [`FsSink`] (ext4 or EROFS).
+fn merge_layers<R, S>(layers: &mut [R], fs: &mut S, options: &ConvertOptions) -> io::Result<()>
+where
+    R: Read + Seek,
+    S: FsSink,
+{
     if layers.is_empty() {
-        let fs = Writer::new(output, &options.writer_options);
-        return fs.close();
+        return Ok(());
     }
-
-    // Phase 1: Build ownership map (scan top-to-bottom).
+    // Phase 1: ownership map (scan top-to-bottom).
     let merge = build_ownership_map(layers, options)?;
-
-    // Phase 2: Reset all readers to start.
+    // Phase 2: reset all readers.
     for layer in layers.iter_mut() {
         layer.seek(SeekFrom::Start(0))?;
     }
-
-    // Phase 3: Stream entries bottom-to-top into a single ext4 Writer.
-    let mut fs = Writer::new(output, &options.writer_options);
+    // Phase 3: stream entries bottom-to-top into the sink.
     for (layer_idx, layer) in layers.iter_mut().enumerate() {
-        write_layer_entries(&mut fs, layer, layer_idx, &merge, options)?;
+        write_layer_entries(fs, layer, layer_idx, &merge, options)?;
     }
-    fs.close()
+    Ok(())
 }
 
 /// Convert a single OCI layer into an ext4 image that is a valid **overlayfs
@@ -106,13 +149,42 @@ where
 /// `layer` must be a seekable decompressed tar stream (two passes: one to find
 /// opaque directories, one to write).
 pub fn convert_layer_to_ext4<R, W>(
-    mut layer: R,
+    layer: R,
     output: W,
     options: &ConvertOptions,
 ) -> io::Result<W>
 where
     R: Read + Seek,
     W: Read + Write + Seek,
+{
+    let mut fs = Writer::new(output, &options.writer_options);
+    write_single_layer(layer, &mut fs, options)?;
+    fs.close()
+}
+
+/// EROFS variant of [`convert_layer_to_ext4`]: emit a single OCI layer as an
+/// overlay-preserving, deterministic **EROFS** image — the per-layer blob form
+/// that is byte-identical across images and therefore dedups in storage.
+pub fn convert_layer_to_erofs<R, W>(
+    layer: R,
+    output: W,
+    options: &ConvertOptions,
+) -> io::Result<W>
+where
+    R: Read + Seek,
+    W: Read + Write + Seek,
+{
+    let mut fs = crate::erofs::Writer::new(output, &options.writer_options);
+    write_single_layer(layer, &mut fs, options)?;
+    fs.close()
+}
+
+/// Shared body: write one OCI layer into `fs`, preserving overlay whiteouts
+/// (`.wh.<f>` → char-device 0,0; `.wh..wh..opq` → `trusted.overlay.opaque=y`).
+fn write_single_layer<R, S>(mut layer: R, fs: &mut S, options: &ConvertOptions) -> io::Result<()>
+where
+    R: Read + Seek,
+    S: FsSink,
 {
     // Pass 1: find directories marked opaque so we can stamp the xattr when we
     // write the directory entry (the writer is forward-only — xattrs must be set
@@ -124,7 +196,6 @@ where
     opaque_xattr.insert(OVERLAY_OPAQUE_XATTR.to_string(), b"y".to_vec());
     let empty_xattrs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
-    let mut fs = Writer::new(output, &options.writer_options);
     let mut seen_dirs: HashSet<String> = HashSet::new();
 
     let mut archive = tar::Archive::new(&mut layer);
@@ -162,7 +233,7 @@ where
         } else {
             &empty_xattrs
         };
-        write_tar_entry_inner(&mut fs, &mut entry, &name, &link_name, extra)?;
+        write_tar_entry_inner(fs, &mut entry, &name, &link_name, extra)?;
         if is_dir {
             seen_dirs.insert(normalized);
         }
@@ -184,7 +255,7 @@ where
         fs.create(dir, &f)?;
     }
 
-    fs.close()
+    Ok(())
 }
 
 /// Scan a single layer tar for directories carrying an opaque whiteout.
@@ -245,8 +316,8 @@ fn is_whiteout(name: &str) -> bool {
 /// Write a single tar entry with PAX xattr support.
 ///
 /// This variant takes a `tar::Entry` directly so it can extract PAX extensions.
-fn write_tar_entry_with_pax<R: Read, W: Read + Write + Seek>(
-    fs: &mut Writer<W>,
+fn write_tar_entry_with_pax<R: Read, S: FsSink>(
+    fs: &mut S,
     entry: &mut tar::Entry<'_, R>,
     name: &str,
     link_name: &str,
@@ -256,8 +327,8 @@ fn write_tar_entry_with_pax<R: Read, W: Read + Write + Seek>(
 
 /// Write a tar entry, merging `extra_xattrs` on top of any PAX xattrs (used to
 /// stamp `trusted.overlay.opaque` on opaque directories).
-fn write_tar_entry_inner<R: Read, W: Read + Write + Seek>(
-    fs: &mut Writer<W>,
+fn write_tar_entry_inner<R: Read, S: FsSink>(
+    fs: &mut S,
     entry: &mut tar::Entry<'_, R>,
     name: &str,
     link_name: &str,
@@ -419,8 +490,8 @@ fn is_child_of(path: &str, dir: &str) -> bool {
 }
 
 /// Write entries from a single layer, skipping those owned by other layers or deleted.
-fn write_layer_entries<R: Read, W: Read + Write + Seek>(
-    fs: &mut Writer<W>,
+fn write_layer_entries<R: Read, S: FsSink>(
+    fs: &mut S,
     layer: R,
     layer_idx: usize,
     merge: &LayerMerge,

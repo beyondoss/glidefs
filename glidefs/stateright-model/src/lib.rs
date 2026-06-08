@@ -10,6 +10,16 @@
 //!
 //! Run: `cd stateright-model && cargo test --release`
 
+//! NOTE ON FIDELITY: this model's write phase orders `set_present` BEFORE
+//! promote, whereas the real code (write.rs:145 then :158) promotes FIRST.
+//! That simplification (audit item D1 in MODEL_AUDIT.md) masks the stale-promote
+//! data-loss class, so the AUTHORITATIVE model for the write/flush data-loss
+//! race is `src/faithful.rs` (correct order + sub-block writes + the verified
+//! fix). This model remains useful for the cross-flush dedup and crash-recovery
+//! properties it checks faithfully.
+
+mod faithful;
+
 use stateright::*;
 use std::fmt;
 

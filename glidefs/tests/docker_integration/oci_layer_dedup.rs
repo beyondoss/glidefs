@@ -272,7 +272,7 @@ async fn merged_stored_bytes(
         Arc::clone(object_store),
         &format!("{db_path}/exports/{name}"),
     ));
-    let (_vm, _hot, stats) =
+    let (_vm, stats) =
         store_ext4_stream(&cs, Cursor::new(ext4), device_size, glidefs::block::block_map::COMPRESSION_BLESS)
             .await
             .unwrap();

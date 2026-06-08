@@ -384,12 +384,16 @@ impl WriteCache<Active> {
             }
         }
 
-        // Coalesced S3 fetch for NeedsFetch blocks
+        // Cold fetch via the shared pack-window prefetch (+ per-block fallback):
+        // one range GET per touched pack covers the scattered working set. Same
+        // helper used by `read()` and `resolve_block` so every cold path — ZC and
+        // user_copy, single- and multi-block — gets identical, tested behavior.
         if !fetch_entries.is_empty() {
-            let fetched = Self::fetch_coalesced(
+            let fetched = Self::fetch_with_window(
                 &fetch_entries,
                 content_store,
                 clean_cache,
+                pack_index_cache,
                 Some(metrics),
             )
             .await?;
@@ -552,10 +556,11 @@ impl WriteCache<Active> {
         }
 
         if !fetch_entries.is_empty() {
-            let fetched = Self::fetch_coalesced(
+            let fetched = Self::fetch_with_window(
                 &fetch_entries,
                 content_store,
                 clean_cache,
+                pack_index_cache,
                 Some(metrics),
             )
             .await?;
@@ -849,19 +854,148 @@ impl WriteCache<Active> {
                 pack_offset,
                 comp_length,
             } => {
-                Self::fetch_single_block(
+                let mut fetched = Self::fetch_with_window(
+                    &[(0, pack_id, chunk_idx, expected_hash, pack_offset, comp_length)],
                     content_store,
                     clean_cache,
+                    pack_index_cache,
                     metrics,
-                    chunk_idx,
-                    pack_id,
-                    expected_hash,
-                    pack_offset,
-                    comp_length,
                 )
-                .await
+                .await?;
+                // fetch_with_window always returns the requested block or errors
+                // (every leftover goes through fetch_coalesced, which is
+                // complete-or-Err). A missing entry would be a logic bug — fail
+                // loud (the kernel retries the I/O) rather than silently serving
+                // zeros, which a guest reads as data corruption.
+                fetched.remove(&0).ok_or_else(|| {
+                    CacheError::DecompressFailed(format!(
+                        "resolve_block: fetch returned no data for block {block_index}"
+                    ))
+                })
             }
         }
+    }
+
+    /// Cold-miss fetch with pack-window prefetch — the single implementation
+    /// shared by EVERY cold read path (single-block `resolve_block`, multi-block
+    /// `read()`, and the zero-copy `resolve_read_plan_cold`). This is the fix for
+    /// serial S3 round-trips on cold start: a boot faults hundreds of scattered
+    /// 128 KiB blocks one at a time, and at ~50 ms/GET that serializes into
+    /// seconds. But the S3 pack is dense and POSITIONAL (blocks sorted by
+    /// `chunk_offset`, stored back-to-back) and a boot's working set is clustered
+    /// within it. So for each pack a miss touches we pull a large CONTIGUOUS
+    /// WINDOW (anchored at the lowest requested offset) in ONE range GET and cache
+    /// every block in it; the following scattered faults then hit cache. Returns
+    /// the requested blocks keyed by caller index. Bounded over-fetch = the
+    /// window. Falls back to per-block coalesced fetch for packs with no cached
+    /// index, a ≤1-block window (nothing to amortize), a transient GET error, or
+    /// a request landing past the window.
+    ///
+    /// `entries`: `(caller_index, pack_id, chunk_idx, expected_hash, pack_offset, comp_length)`.
+    async fn fetch_with_window(
+        entries: &[(usize, PackId, u32, crate::block::block_map::Blake3Hash, u32, u32)],
+        content_store: &ContentStore,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        metrics: Option<&super::super::metrics::ExportMetrics>,
+    ) -> Result<HashMap<usize, Bytes>, CacheError> {
+        use crate::block::block_map::{blake3_128, decompress_block, Blake3Hash};
+        const WINDOW: u32 = 32 * 1024 * 1024; // 32 MiB of pack bytes per GET
+
+        let mut out: HashMap<usize, Bytes> = HashMap::new();
+        // (index, pack_id, chunk_idx, hash, offset, comp_len) for per-block fallback.
+        let mut leftover: Vec<(usize, PackId, u32, Blake3Hash, u32, u32)> = Vec::new();
+
+        // Group misses by pack.
+        let mut by_pack: HashMap<(u32, PackId), Vec<(usize, Blake3Hash, u32, u32)>> = HashMap::new();
+        for &(i, pack_id, chunk_idx, hash, pack_offset, comp_length) in entries {
+            by_pack
+                .entry((chunk_idx, pack_id))
+                .or_default()
+                .push((i, hash, pack_offset, comp_length));
+        }
+
+        for ((chunk_idx, pack_id), reqs) in by_pack {
+            let idx_entries = match pack_index_cache.get_entries(pack_id).await {
+                Some(e) if !e.is_empty() => e,
+                _ => {
+                    for &(i, h, off, cl) in &reqs {
+                        leftover.push((i, pack_id, chunk_idx, h, off, cl));
+                    }
+                    continue;
+                }
+            };
+            let win_start = reqs.iter().map(|t| t.2).min().unwrap_or(0);
+            let win_end = win_start.saturating_add(WINDOW);
+            let mut in_win: Vec<&crate::block::pack::PackIndexEntry> = idx_entries
+                .iter()
+                .filter(|e| e.offset >= win_start && e.offset < win_end)
+                .collect();
+            if in_win.len() <= 1 {
+                for &(i, h, off, cl) in &reqs {
+                    leftover.push((i, pack_id, chunk_idx, h, off, cl));
+                }
+                continue;
+            }
+            in_win.sort_by_key(|e| e.offset);
+            let range_start = in_win.first().unwrap().offset;
+            let last = in_win.last().unwrap();
+            let range_len = last.offset + last.comp_length - range_start;
+
+            let pack_bytes = match content_store
+                .get_chunk_block(chunk_idx, pack_id, range_start, range_len)
+                .await
+            {
+                Ok(b) => b,
+                Err(_) => {
+                    for &(i, h, off, cl) in &reqs {
+                        leftover.push((i, pack_id, chunk_idx, h, off, cl));
+                    }
+                    continue;
+                }
+            };
+            if let Some(m) = metrics {
+                m.record_s3_read(pack_bytes.len() as u64);
+            }
+
+            let want: HashMap<Blake3Hash, usize> = reqs.iter().map(|t| (t.1, t.0)).collect();
+            let mut satisfied: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for e in in_win {
+                let s = (e.offset - range_start) as usize;
+                let end = s + e.comp_length as usize;
+                if end > pack_bytes.len() {
+                    continue;
+                }
+                let decomp = match decompress_block(&pack_bytes.slice(s..end)) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                if blake3_128(&decomp) != e.hash {
+                    continue;
+                }
+                let data = Bytes::from(decomp);
+                clean_cache.insert(e.hash, data.clone());
+                if let Some(&i) = want.get(&e.hash) {
+                    out.insert(i, data);
+                    satisfied.insert(i);
+                }
+            }
+            // Any requested block the window didn't cover → per-block fallback.
+            for &(i, h, off, cl) in &reqs {
+                if !satisfied.contains(&i) {
+                    leftover.push((i, pack_id, chunk_idx, h, off, cl));
+                }
+            }
+        }
+
+        if !leftover.is_empty() {
+            let fetched =
+                Self::fetch_coalesced(&leftover, content_store, clean_cache, metrics).await?;
+            for (i, data) in fetched {
+                out.insert(i, data);
+            }
+        }
+        Ok(out)
     }
 
     /// Fetch, decompress, verify, and cache a single block from S3.
@@ -1099,7 +1233,8 @@ impl WriteCache<Active> {
         Ok(())
     }
 
-    /// Batch warm the PackIndexCache for multiple chunks (boot hot set prefetch).
+    /// Batch warm the PackIndexCache for the given chunk indices (boot index
+    /// prefetch). Callers pass the manifest's REAL chunk indices.
     pub async fn prefetch_chunks(
         &self,
         chunk_indices: &[u64],
@@ -1122,5 +1257,6 @@ impl WriteCache<Active> {
             })
             .await;
     }
+
 }
 

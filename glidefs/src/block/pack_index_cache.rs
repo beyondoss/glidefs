@@ -57,7 +57,12 @@ impl Code for CachedPackIndex {
         reader
             .read_to_end(&mut compressed)
             .map_err(foyer::Error::io_error)?;
-        let raw = zstd::bulk::decompress(&compressed, 1024 * 1024)
+        // Fallible, right-sized decode. `zstd::bulk::decompress` would do an
+        // infallible `Vec::with_capacity(1 MiB)` here — on the block-read path
+        // (SSD-tier index hit) that aborts the daemon under memory pressure
+        // instead of failing the one lookup. `zstd_decompress` try_reserves the
+        // frame's real size so OOM surfaces as a decode error (cache miss).
+        let raw = super::block_map::zstd_decompress(&compressed, 1024 * 1024)
             .map_err(foyer::Error::io_error)?;
         extent_decode(&raw)
             .map(|v| CachedPackIndex(Arc::from(v)))

@@ -276,13 +276,17 @@ impl WriteCache<Active> {
     }
 
     /// Get the number of dirty blocks pending sync.
+    ///
+    /// `Acquire` pairs with the `Release` RMWs on `dirty_block_count`: the flush
+    /// scheduler gates on this value cross-thread, so observing the bumped count
+    /// must also observe the block-state transition that produced it.
     pub fn dirty_block_count(&self) -> u64 {
-        self.inner.dirty_block_count.load(Ordering::Relaxed)
+        self.inner.dirty_block_count.load(Ordering::Acquire)
     }
 
     /// Get the number of blocks currently being synced.
     pub fn syncing_block_count(&self) -> u64 {
-        self.inner.syncing_block_count.load(Ordering::Relaxed)
+        self.inner.syncing_block_count.load(Ordering::Acquire)
     }
 
     /// Number of CRC entries pending drain. Indicates queue memory pressure —
@@ -392,7 +396,7 @@ impl WriteCache<Active> {
                     {
                         self.inner
                             .dirty_block_count
-                            .fetch_add(1, Ordering::Relaxed);
+                            .fetch_add(1, Ordering::Release);
                     }
             }
         }
@@ -498,7 +502,7 @@ impl WriteCache<Active> {
             );
             self.inner
                 .dirty_block_count
-                .fetch_add(1, Ordering::Relaxed);
+                .fetch_add(1, Ordering::Release);
             recovered += 1;
         }
         drop(df_guard);

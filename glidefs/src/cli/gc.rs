@@ -653,8 +653,15 @@ async fn reconcile_prefix(
                     .map_err(|e| anyhow::anyhow!("failed to list manifests: {}", e))?;
                 let path_str = meta.location.to_string();
                 let name = match path_str.strip_prefix(&prefix) {
-                    Some(r) if !r.is_empty() && !r.ends_with(".hot-set") => r.to_string(),
-                    _ => return Ok(None), // skip .hot-set and non-manifest entries
+                    Some(r)
+                        if !r.is_empty()
+                            && !r.ends_with(".boot-set")
+                            && !r.ends_with(".hot-set") =>
+                    {
+                        r.to_string()
+                    }
+                    // skip legacy sidecars (.boot-set, .hot-set) + non-manifest entries
+                    _ => return Ok(None),
                 };
                 let response = match store.get(&meta.location).await {
                     Ok(r) => r,

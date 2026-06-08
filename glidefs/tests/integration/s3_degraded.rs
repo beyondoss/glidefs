@@ -415,8 +415,16 @@ async fn test_s3_slow_downloads_bounded_latency() {
     )
     .await;
 
-    // Read should complete within a bounded time (not hang forever)
-    // With 500ms delay, 5 reads should finish well under 30s timeout
+    // Read should complete within a bounded time (not hang forever).
+    //
+    // Pack-window prefetch changes the shape here: the 5 blocks were flushed
+    // back-to-back into one positional pack, so the FIRST cold read pulls the
+    // whole window in ONE slow S3 GET (paying the ~500ms delay) and caches every
+    // block; reads 1..5 are then served from that cache. So we assert (a) the
+    // slow GET is genuinely applied on the cold read — no bypass, (b) prefetch
+    // collapses the 5 serial round-trips into ~one (total ≪ 5×500ms), and
+    // (c) nothing hangs and all data is correct.
+    let mut total = Duration::ZERO;
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         for i in 0..5usize {
             let start = Instant::now();
@@ -433,22 +441,36 @@ async fn test_s3_slow_downloads_bounded_latency() {
                 .await
                 .unwrap();
             let elapsed = start.elapsed();
+            total += elapsed;
             assert!(
                 data.iter().all(|&b| b == (i as u8) + 1),
                 "block {i} data mismatch with slow GET"
             );
-            // Each read should take at least 400ms (delay) but less than 10s
-            assert!(
-                elapsed >= Duration::from_millis(400),
-                "block {i} read too fast ({elapsed:?}), delay not applied?"
-            );
+            if i == 0 {
+                // First (cold) read hits the slow window GET — delay must apply.
+                assert!(
+                    elapsed >= Duration::from_millis(400),
+                    "block {i} (cold) read too fast ({elapsed:?}), slow GET bypassed?"
+                );
+            }
+            // No individual read should hang regardless of cache state.
             assert!(
                 elapsed < Duration::from_secs(10),
                 "block {i} read too slow ({elapsed:?}), potential hang"
             );
         }
+        total
     })
     .await;
+
+    // 5 serial 500ms GETs would be ≥ 2.5s; prefetch makes one GET serve all five.
+    if let Ok(t) = result {
+        assert!(
+            t < Duration::from_secs(2),
+            "all 5 reads took {t:?}; pack-window prefetch should collapse them into ~one slow GET, \
+             not five serial round-trips"
+        );
+    }
 
     assert!(
         result.is_ok(),

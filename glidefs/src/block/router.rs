@@ -9,7 +9,6 @@ use crate::block::content_store::ContentStore;
 use crate::block::flush_scheduler::flush_scheduler;
 use crate::block::handler::BlockHandler;
 use crate::block::pack_index_cache::PackIndexCache;
-use crate::block::manifest::deserialize_hot_set;
 use crate::block::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::block::state::Active;
 use crate::block::volume_manifest::VolumeManifest;
@@ -40,9 +39,6 @@ use tracing::{debug, error, info, trace, warn};
 /// volumes — see `VolumeManifest::size_estimate` for the math.
 pub const DEFAULT_MANIFEST_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Maximum number of entries in the hot set cache. Hot sets are small
-/// (a few KiB each), so count-based capping is fine.
-const MAX_HOT_SET_CACHE_ENTRIES: usize = 64;
 
 /// Encodes a base-manifest key for the foyer manifest cache.
 fn base_manifest_cache_key(s3_prefix: &str, manifest_name: &str) -> String {
@@ -206,7 +202,7 @@ pub struct ExportState {
     /// caught panic (already logged + counted by spawn_supervised),
     /// `Err(JoinError)` = aborted or unwind-after-catch (rare).
     flush_handle: JoinHandle<Result<(), task::Panicked>>,
-    /// Background hot-set prefetch task (if spawned). Aborted on teardown
+    /// Background boot-prefetch task (if spawned). Aborted on teardown
     /// to release Arc references to cache/content_store/etc.
     prefetch_handle: Option<JoinHandle<Result<(), task::Panicked>>>,
 }
@@ -372,11 +368,6 @@ pub struct ExportRouter {
     /// for tiny base-set fleets, broken once snapshot churn or large
     /// volumes (10TB+) entered the mix.
     manifest_cache: foyer::Cache<String, Arc<VolumeManifest>>,
-
-    /// Bounded cache for boot hot sets (immutable, paired with base manifests).
-    /// Key: "{s3_prefix}:{hot_set_name}" → parsed block indices.
-    /// Arc-wrapped so it can be shared with background prefetch tasks.
-    hot_set_cache: Arc<parking_lot::Mutex<HashMap<String, Arc<Vec<u64>>>>>,
 
     /// In-flight OCI bless tasks: "{s3_prefix}/{name}" → status.
     /// Entries exist only while in-flight. Removed on completion or failure.
@@ -683,7 +674,6 @@ impl ExportRouter {
             #[cfg(all(target_os = "linux", feature = "ublk"))]
             ublk_server,
             manifest_cache,
-            hot_set_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             bless_tasks: RwLock::new(HashMap::new()),
             #[cfg(test)]
             _test_temp_dir: None,
@@ -695,7 +685,7 @@ impl ExportRouter {
         &self.clean_cache
     }
 
-    /// Pre-warm the base manifest and hot set caches for a given S3 prefix.
+    /// Pre-warm the base manifest cache for a given S3 prefix.
     ///
     /// Lists all `bases/*` manifests under `{s3_prefix}/manifests/` and loads
     /// them into memory. Call after router construction (e.g. after
@@ -727,18 +717,16 @@ impl ExportRouter {
         info!(
             count = bases.len(),
             s3_prefix = %s3_prefix,
-            "pre-warming base manifest and hot set caches"
+            "pre-warming base manifest caches"
         );
 
-        // Fetch all base manifests + hot sets concurrently.
+        // Fetch all base manifests concurrently.
         let cs = Arc::new(cs);
         stream::iter(bases)
             .for_each_concurrent(8, |manifest_name| {
                 let cs = Arc::clone(&cs);
                 async move {
                     let cache_key = base_manifest_cache_key(s3_prefix, &manifest_name);
-
-                    // Manifest
                     if self.manifest_cache.get(&cache_key).is_none() {
                         match cs.get_manifest(&manifest_name).await {
                             Ok(Some((data, _etag))) => match VolumeManifest::deserialize(&data) {
@@ -757,44 +745,13 @@ impl ExportRouter {
                             ),
                         }
                     }
-
-                    // Hot set
-                    let hot_set_name = manifest_name
-                        .strip_prefix("bases/")
-                        .unwrap_or(&manifest_name);
-                    let hot_cache_key = format!("{}:{}", s3_prefix, hot_set_name);
-
-                    if !self.hot_set_cache.lock().contains_key(&hot_cache_key) {
-                        match cs.get_hot_set(hot_set_name).await {
-                            Ok(Some(data)) => match deserialize_hot_set(&data) {
-                                Ok(chunks) => {
-                                    let mut cache_map = self.hot_set_cache.lock();
-                                    if cache_map.len() < MAX_HOT_SET_CACHE_ENTRIES {
-                                        cache_map.insert(hot_cache_key, Arc::new(chunks));
-                                    }
-                                }
-                                Err(e) => warn!(
-                                    hot_set = %hot_set_name,
-                                    "prewarm: failed to deserialize hot set: {}", e
-                                ),
-                            },
-                            Ok(None) => debug!(hot_set = %hot_set_name, "prewarm: no hot set found"),
-                            Err(e) => warn!(
-                                hot_set = %hot_set_name,
-                                "prewarm: failed to fetch hot set: {}", e
-                            ),
-                        }
-                    }
                 }
             })
             .await;
 
-        let hot_set_count = self.hot_set_cache.lock().len();
-        let manifest_bytes = self.manifest_cache.usage();
         info!(
-            manifest_cache_bytes = manifest_bytes,
-            hot_sets = hot_set_count,
-            "base cache pre-warm complete"
+            manifest_cache_bytes = self.manifest_cache.usage(),
+            "base manifest cache pre-warm complete"
         );
     }
 
@@ -1320,82 +1277,25 @@ impl ExportRouter {
             }
         }
 
-        // Boot hot set prefetch: warm the clean cache before the VM reads.
-        // On cache hit, spawn prefetch immediately. On cache miss, the S3
-        // fetch is done inside the spawned task so it doesn't block fork creation.
-        // The JoinHandle is stored in ExportState so teardown can abort it,
-        // releasing Arc references to cache/content_store/etc.
-        let prefetch_handle = if let Some(manifest_name) = manifest_name {
-            let hot_set_name = manifest_name
-                .strip_prefix("bases/")
-                .unwrap_or(manifest_name);
-
-            let is_base = manifest_name.starts_with("bases/");
-            let hot_cache_key = format!("{}:{}", s3_prefix, hot_set_name);
-
-            let cached_hot_set = if is_base {
-                self.hot_set_cache.lock().get(&hot_cache_key).cloned()
-            } else {
-                None
-            };
-
+        // Index warm on device open (forked exports only): fetch this export's
+        // pack indices from its OWN manifest (the real chunk indices), so even a
+        // lazily-read tail block costs one S3 GET (data) instead of two (index +
+        // data). Cheap — one fetch per pack, bounded by pack count. The
+        // JoinHandle is stored in ExportState so teardown can abort it.
+        let prefetch_handle = if manifest_name.is_some() {
             let cache_clone = Arc::clone(&cache);
             let cmc = Arc::clone(&pack_index_cache);
             let vm = Arc::clone(&volume_manifest);
             let cs = Arc::clone(&content_store);
+            // The manifest's REAL chunk indices (NOT block indices — see
+            // volume_manifest::block_index_is_not_chunk_index).
+            let chunk_indices: Vec<u64> =
+                volume_manifest.read().chunks.keys().map(|&c| u64::from(c)).collect();
 
-            if let Some(chunks) = cached_hot_set {
-                debug!(hot_set = %hot_set_name, "hot set cache hit");
-                info!(chunks = chunks.len(), "prefetching boot hot set");
-                // Supervised: fire-and-forget prefetch. A panic logs +
-                // counts but does not propagate. Caller awaits the
-                // JoinHandle in some paths — the inner Result is the
-                // unit-or-Panicked outcome of the wrapped future.
-                Some(spawn_supervised("hot-set-prefetch", async move {
-                    cache_clone
-                        .prefetch_chunks(&chunks, &cmc, &vm, &cs)
-                        .await;
-                    info!("boot hot set prefetch complete");
-                }))
-            } else {
-                let hot_set_name = hot_set_name.to_string();
-                let hot_set_cache = Arc::clone(&self.hot_set_cache);
-                Some(spawn_supervised("hot-set-prefetch", async move {
-                    let chunks = match cs.get_hot_set(&hot_set_name).await {
-                        Ok(Some(data)) => match deserialize_hot_set(&data) {
-                            Ok(chunks) => {
-                                let chunks = Arc::new(chunks);
-                                if is_base {
-                                    let mut cache_map = hot_set_cache.lock();
-                                    if cache_map.len() < MAX_HOT_SET_CACHE_ENTRIES {
-                                        cache_map.insert(hot_cache_key, Arc::clone(&chunks));
-                                    }
-                                }
-                                Some(chunks)
-                            }
-                            Err(e) => {
-                                warn!("failed to deserialize hot set: {}", e);
-                                None
-                            }
-                        },
-                        Ok(None) => {
-                            debug!("no hot set found for '{}'", hot_set_name);
-                            None
-                        }
-                        Err(e) => {
-                            warn!("failed to fetch hot set: {}", e);
-                            None
-                        }
-                    };
-                    if let Some(chunks) = chunks {
-                        info!(chunks = chunks.len(), "prefetching boot hot set");
-                        cache_clone
-                            .prefetch_chunks(&chunks, &cmc, &vm, &cs)
-                            .await;
-                        info!("boot hot set prefetch complete");
-                    }
-                }))
-            }
+            Some(spawn_supervised("boot-prefetch", async move {
+                cache_clone.prefetch_chunks(&chunk_indices, &cmc, &vm, &cs).await;
+                info!("boot prefetch complete");
+            }))
         } else {
             None
         };
@@ -1792,7 +1692,6 @@ impl ExportRouter {
         insecure: bool,
     ) -> Result<(), RouterError> {
         use crate::block::handler::BlockHandler;
-        use crate::block::manifest::serialize_hot_set;
         use crate::block::metrics::ExportMetrics;
         use crate::block::pack::DEFAULT_FLUSH_THRESHOLD;
         use crate::block::write_cache::{WriteCache, WriteCacheConfig};
@@ -1943,53 +1842,8 @@ impl ExportRouter {
             });
         }
 
-        // --- Generate hot set ---
-        let hot_set = {
-            let (blocks_per_chunk, chunk_packs): (u64, Vec<(u32, Vec<u64>)>) = {
-                let vm = volume_manifest.read();
-                let bpc = u64::from(vm.blocks_per_chunk());
-                let cp = vm
-                    .chunks
-                    .iter()
-                    .map(|(&idx, entry)| (idx, entry.packs.clone()))
-                    .collect();
-                (bpc, cp)
-            };
-
-            let mut indices: Vec<u64> = Vec::new();
-            for (chunk_idx, packs) in &chunk_packs {
-                for &pack_id in packs {
-                    match self.pack_index_cache.get_entries(pack_id).await {
-                        Some(entries) => {
-                            for e in entries.iter() {
-                                let global_block =
-                                    u64::from(*chunk_idx) * blocks_per_chunk + u64::from(e.chunk_offset);
-                                indices.push(global_block);
-                            }
-                        }
-                        None => {
-                            warn!(
-                                pack_id,
-                                chunk_idx,
-                                "pack index missing from cache, hot set may be incomplete"
-                            );
-                        }
-                    }
-                }
-            }
-
-            indices.sort_unstable();
-            indices.dedup();
-            indices
-        };
-
-        let hot_set_data = serialize_hot_set(&hot_set);
-        content_store
-            .put_hot_set(name, hot_set_data)
-            .await
-            .map_err(RouterError::ContentStore)?;
-
-        // --- Save manifest ---
+        // --- Save manifest as a base. Index warming on fork is driven by the
+        // manifest's pack list, so no sidecar artifact is written here. ---
         let manifest_key = format!("bases/{}", name);
         let manifest_data = volume_manifest
             .read()
@@ -2006,7 +1860,6 @@ impl ExportRouter {
             s3_prefix = %s3_prefix,
             layers = resolved.layers.len(),
             device_size,
-            hot_set_blocks = hot_set.len(),
             elapsed_secs = elapsed.as_secs_f64(),
             "bless OCI complete"
         );
@@ -2893,7 +2746,7 @@ impl ExportRouter {
             ..
         } = state;
 
-        // 0. Abort the hot-set prefetch task (if running) to release Arc clones.
+        // 0. Abort the boot-prefetch task (if running) to release Arc clones.
         if let Some(handle) = prefetch_handle {
             handle.abort();
             let _ = handle.await;
