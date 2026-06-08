@@ -30,13 +30,24 @@ pub const DEFAULT_MAX_LAYER_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// All layers are downloaded and decompressed to temp files, then merged into
 /// a single ext4 filesystem using OCI layer semantics (topmost layer wins,
 /// whiteouts delete lower-layer entries).
+/// How to produce a non-EROFS base's precise boot set during `pull_image`.
+/// `None` (passed as no `BootSet`) emits nothing.
+pub struct BootSet {
+    /// Run the image once and capture its REAL boot set (fanotify); else use the
+    /// static ELF-closure seed. Profiling needs root + an arch-compatible
+    /// entrypoint and falls back to static on failure.
+    pub profile: bool,
+    /// Scratch dir for the profile run (rootfs extraction). Unused when `!profile`.
+    pub scratch: std::path::PathBuf,
+}
+
 pub async fn pull_image(
     client: &oci_registry::RegistryClient,
     image: &Reference,
     auth: &Credentials,
     handler: Arc<BlockHandler>,
     options: IngestOptions,
-    emit_boot_set: bool,
+    boot_set: Option<BootSet>,
 ) -> Result<(ResolvedImage, Vec<u64>), PullError> {
     let resolved = client.resolve(image, auth).await?;
 
@@ -59,18 +70,24 @@ pub async fn pull_image(
         layer_files.push(file);
     }
 
-    // Merge all layers into a single ext4 filesystem. When asked, statically
-    // derive the boot working set (ELF closure) so the writer reports where it
-    // placed those files; ext4 can't reorder them contiguously (unlike EROFS),
-    // so the server precisely warms their scattered device blocks at open.
+    // Merge all layers into a single ext4 filesystem. When a boot set is
+    // requested, select its paths (profiled real boot, or the static ELF-closure
+    // seed) and hand them to the writer as PriorityOrder; ext4 can't reorder them
+    // contiguously (unlike EROFS), so it instead REPORTS where it placed them and
+    // the server precisely warms those scattered device blocks at open.
     let writer_options = options.writer_options.clone();
     let config = resolved.config.clone();
     let boot_blocks = tokio::task::spawn_blocking(move || -> io::Result<Vec<u64>> {
         let rt = tokio::runtime::Handle::current();
         let adapter = super::BlockAdapter::new(&handler, rt);
         let mut writer_options = writer_options;
-        if emit_boot_set {
-            let boot_paths = crate::oci::boot_set::derive_boot_paths(&config, &mut layer_files);
+        if let Some(bs) = &boot_set {
+            let boot_paths = crate::oci::boot_set::select_boot_paths(
+                &config,
+                &mut layer_files,
+                bs.profile,
+                &bs.scratch,
+            );
             if !boot_paths.is_empty() {
                 writer_options.push(ext4::writer::WriterOption::PriorityOrder(boot_paths));
             }

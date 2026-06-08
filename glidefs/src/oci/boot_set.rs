@@ -22,8 +22,55 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+/// Select the boot working set: when `profile` is set, RUN the image once and
+/// capture the REAL boot set via fanotify (covers dlopen'd libraries + config/
+/// data the static ELF closure can't see — measured: static covers only ~33% of
+/// an interpreter's real boot), unioned with the static closure as a backstop;
+/// otherwise just the static derivation. Best-effort — any profiling failure
+/// logs and falls back to static. `scratch` is used only when profiling.
+///
+/// The single producer for BOTH the EROFS reorder (paths → `PriorityOrder`) and
+/// the non-EROFS precise warm (paths → device blocks via the ext4 writer).
+pub fn select_boot_paths<R: Read + Seek>(
+    config: &[u8],
+    layers: &mut [R],
+    profile: bool,
+    scratch: &Path,
+) -> Vec<String> {
+    if !profile {
+        return derive_boot_paths(config, layers);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let timeout = std::env::var("GLIDEFS_PROFILE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map_or(std::time::Duration::from_secs(30), std::time::Duration::from_secs);
+        match crate::oci::boot_capture::capture_boot_paths(config, layers, scratch, timeout) {
+            Ok(captured) if !captured.is_empty() => {
+                info!(count = captured.len(), "captured boot set via runtime profiling");
+                // Union with the static closure — backstops any library the timed
+                // run happened not to open.
+                let mut seen: HashSet<String> = captured.iter().cloned().collect();
+                let mut paths = captured;
+                for p in derive_boot_paths(config, layers) {
+                    if seen.insert(p.clone()) {
+                        paths.push(p);
+                    }
+                }
+                return paths;
+            }
+            Ok(_) => warn!("runtime profiling captured nothing; falling back to static boot set"),
+            Err(e) => warn!(error = %e, "runtime profiling failed; falling back to static boot set"),
+        }
+    }
+    let _ = scratch;
+    derive_boot_paths(config, layers)
+}
 
 /// Per-file ELF cache budget (skip any single file larger than this).
 const MAX_ELF_BYTES: u64 = 128 * 1024 * 1024;

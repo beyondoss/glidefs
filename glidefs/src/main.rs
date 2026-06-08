@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
                     cli::bless::run_bless_oci_erofs(image_ref, name, s3_prefix, profile, config)
                         .await?;
                 } else {
-                    cli::bless::run_bless_oci(image_ref, name, s3_prefix, config).await?;
+                    cli::bless::run_bless_oci(image_ref, name, s3_prefix, profile, config).await?;
                 }
             }
         }

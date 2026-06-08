@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::info;
 
 /// A disk-backed scratch directory for bless. The WriteCache cache file and the
 /// EROFS content spool can each be ~image-sized, so they must NOT land on a
@@ -137,6 +137,7 @@ pub async fn run_bless_oci(
     image_ref: String,
     name: String,
     s3_prefix: String,
+    profile: bool,
     config_path: PathBuf,
 ) -> Result<()> {
     tracing_subscriber::fmt()
@@ -277,16 +278,17 @@ pub async fn run_bless_oci(
 
     info!("pulling and ingesting layers");
 
-    // emit_boot_set = true: derive the static ELF-closure boot set and capture
-    // where the ext4 writer placed it, so the server can precisely warm those
-    // scattered device blocks at open (ext4 cannot reorder them into a prefix).
+    // Emit the precise boot set: with --profile, the REAL boot set (fanotify
+    // capture); otherwise the static ELF-closure seed. The ext4 writer reports
+    // where it placed those files so the server precisely warms their scattered
+    // device blocks at open (ext4 cannot reorder them into a prefix like EROFS).
     let (_resolved, boot_blocks) = pull_image(
         &registry_client,
         &image,
         &Credentials::Anonymous,
         Arc::clone(&handler),
         ingest_opts,
-        true,
+        Some(crate::oci::pull::BootSet { profile, scratch: bless_scratch_dir() }),
     )
     .await
     .map_err(|e| anyhow::anyhow!("pull failed: {e}"))?;
@@ -344,48 +346,6 @@ pub async fn run_bless_oci(
     println!("  Manifest:        manifests/{}", manifest_key);
 
     Ok(())
-}
-
-/// Select the EROFS boot set. With `profile`, RUN the image once and capture the
-/// real boot working set via fanotify (covers dlopen'd libraries + config/data
-/// that static ELF analysis cannot see), unioned with the static closure as a
-/// backstop; otherwise just the static derivation. Best-effort — any profiling
-/// failure logs and falls back to static, so bless never fails over this.
-fn derive_boot_set(
-    config: &[u8],
-    layers: &mut [std::fs::File],
-    profile: bool,
-    scratch: &std::path::Path,
-) -> Vec<String> {
-    if !profile {
-        return crate::oci::boot_set::derive_boot_paths(config, layers);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let timeout = std::env::var("GLIDEFS_PROFILE_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map_or(std::time::Duration::from_secs(30), std::time::Duration::from_secs);
-        match crate::oci::boot_capture::capture_boot_paths(config, layers, scratch, timeout) {
-            Ok(captured) if !captured.is_empty() => {
-                info!(count = captured.len(), "captured boot set via runtime profiling");
-                // Union with the static closure — backstops any library the
-                // timed run happened not to open.
-                let mut seen: std::collections::HashSet<String> =
-                    captured.iter().cloned().collect();
-                let mut paths = captured;
-                for p in crate::oci::boot_set::derive_boot_paths(config, layers) {
-                    if seen.insert(p.clone()) {
-                        paths.push(p);
-                    }
-                }
-                return paths;
-            }
-            Ok(_) => warn!("runtime profiling captured nothing; falling back to static boot set"),
-            Err(e) => warn!(error = %e, "runtime profiling failed; falling back to static boot set"),
-        }
-    }
-    crate::oci::boot_set::derive_boot_paths(config, layers)
 }
 
 /// Bless an OCI image into a **read-only EROFS** base — the correct format for
@@ -520,7 +480,12 @@ pub async fn run_bless_oci_erofs(
     let config_bytes = resolved.config.clone();
     info!(profile, "deriving boot set + merging layers into EROFS");
     let prefetch_len = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let boot_paths = derive_boot_set(&config_bytes, &mut layer_files, profile, &scratch2);
+        let boot_paths = crate::oci::boot_set::select_boot_paths(
+            &config_bytes,
+            &mut layer_files,
+            profile,
+            &scratch2,
+        );
         if !boot_paths.is_empty() {
             info!(count = boot_paths.len(), "boot set ready; EROFS will reorder it first");
         }

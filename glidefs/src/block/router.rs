@@ -1853,13 +1853,18 @@ impl ExportRouter {
 
         info!("pulling and ingesting layers");
 
+        // Static boot set only: server-side bless never RUNS the untrusted image
+        // (no --profile); operators get the profiled boot set via the CLI.
         let (_pulled, boot_blocks) = pull_image(
             &registry_client,
             &image,
             &credentials,
             Arc::clone(&handler),
             ingest_opts,
-            true,
+            Some(crate::oci::pull::BootSet {
+                profile: false,
+                scratch: std::env::temp_dir(),
+            }),
         )
         .await
         .map_err(|e| RouterError::OciPull(format!("pull failed: {e}")))?;

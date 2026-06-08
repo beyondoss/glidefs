@@ -1066,6 +1066,67 @@ async fn prefetch_precise_warm_real() {
         a.0, a.1, b.0, b.1, b.2,
     );
 
+    // END-TO-END vs the REAL boot oracle (a boot_profile capture): how much of the
+    // real boot does the stored .boot-set actually cover, and does warming it cut
+    // total cold-boot work vs plain readahead — including the demand-fault tail of
+    // blocks the .boot-set missed? This is the coverage question (cf. the EROFS
+    // P1 study), which replaying the .boot-set against itself cannot answer.
+    if let Ok(tracef) = std::env::var("GLIDEFS_WARM_TRACE") {
+        let trace: Vec<u64> = std::fs::read_to_string(&tracef)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        let win = 32 * 1024 * 1024;
+        let bset: std::collections::HashSet<u64> = blocks.iter().copied().collect();
+        let covered = trace.iter().filter(|b| bset.contains(b)).count();
+
+        let run = |warm: bool| {
+            let store = Arc::clone(&store);
+            let base = base.clone();
+            let mdata = mdata.clone();
+            let blocks = blocks.clone();
+            let trace = trace.clone();
+            let name = name.clone();
+            async move {
+                let latency = Arc::new(LatencyStore::new(store, Duration::ZERO, 0));
+                let cs = ContentStore::new(Arc::clone(&latency) as Arc<dyn ObjectStore>, &base);
+                let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::deserialize(&mdata).unwrap()));
+                let dir = TempDir::new().unwrap();
+                let cache = WriteCache::open_fresh_active(WriteCacheConfig {
+                    cache_dir: dir.path().to_path_buf(),
+                    device_name: format!("{name}-e2e"),
+                    device_size,
+                    block_size: block_size as usize,
+                    wal_sync: false,
+                })
+                .unwrap();
+                let clean: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(512 * 1024 * 1024));
+                let pic = Arc::new(PackIndexCache::open(TempDir::new().unwrap().path()).await.unwrap());
+                let metrics = ExportMetrics::new();
+                cache.set_readahead_window_bytes(win);
+                latency.reset();
+                if warm {
+                    cache.prefetch_data_blocks(&blocks, clean.as_ref(), &pic, &vm, &cs, &metrics).await;
+                }
+                for &bk in &trace {
+                    cache.read(bk * block_size as u64, block_size as usize, clean.as_ref(), &pic, &vm, &cs, &metrics).await.unwrap();
+                }
+                (latency.gets(), latency.bytes() as f64 / (1024.0 * 1024.0))
+            }
+        };
+        let base_arm = run(false).await;
+        let warm_arm = run(true).await;
+        println!(
+            "ORACLE end-to-end ({} real boot blocks, .boot-set covers {:.0}%):\n  \
+             readahead-only      : {} GET(s), {:.1} MiB\n  \
+             precise-warm + tail : {} GET(s), {:.1} MiB",
+            trace.len(),
+            100.0 * covered as f64 / trace.len() as f64,
+            base_arm.0, base_arm.1, warm_arm.0, warm_arm.1,
+        );
+    }
+
     // The precise warm fetches the EXACT boot bytes (no window over-fetch) and
     // leaves the whole set hot. Over-fetch ratio must be ~1.0 and << readahead's.
     assert!(b.1 <= boot_mib * 1.10 + 0.5, "precise warm must not over-fetch: {:.1} MiB for {:.1} MiB boot set", b.1, boot_mib);

@@ -48,12 +48,13 @@ pub enum Commands {
         #[arg(long, requires = "oci", conflicts_with = "layered")]
         erofs: bool,
         /// Capture the boot working set by RUNNING the image once at bless time
-        /// (chroot + fanotify), so EROFS lays the *real* boot set — including
-        /// dlopen'd libraries and config/data files that static analysis can't
-        /// see — contiguously at the front. Requires root + an arch-compatible
-        /// entrypoint; falls back to static derivation on any failure. Only valid
-        /// with --erofs. Default off (static ELF-closure derivation).
-        #[arg(long, requires = "erofs")]
+        /// (chroot + fanotify), so the *real* boot set — including dlopen'd
+        /// libraries and config/data files static analysis can't see — drives the
+        /// EROFS reorder (contiguous prefix) or the non-EROFS precise warm
+        /// (scattered block list). Requires root + an arch-compatible entrypoint;
+        /// falls back to static ELF-closure derivation on any failure. Only valid
+        /// with --oci. Default off (static derivation).
+        #[arg(long, requires = "oci")]
         profile: bool,
         /// Base image name (e.g., "ubuntu-22.04-node20-v3")
         #[arg(long)]
