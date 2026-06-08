@@ -278,17 +278,24 @@ pub async fn run_bless_oci(
 
     info!("pulling and ingesting layers");
 
-    // Emit the precise boot set: with --profile, the REAL boot set (fanotify
-    // capture); otherwise the static ELF-closure seed. The ext4 writer reports
-    // where it placed those files so the server precisely warms their scattered
-    // device blocks at open (ext4 cannot reorder them into a prefix like EROFS).
-    let (_resolved, boot_blocks) = pull_image(
+    // Emit the precise boot set. Best result (ublk builds + --profile): block-
+    // level capture AFTER drain (serves the image + read-trace → exact blocks
+    // incl. ext4 metadata, ~100% coverage). The ext4 writer's fanotify+writer map
+    // (file-data only, ~79%) is the no-ublk fallback; static ELF closure is the
+    // no-profile/no-root floor. So skip the in-ingest fanotify run when we'll
+    // block-capture (avoids running the image twice).
+    let block_capture = profile && cfg!(feature = "ublk");
+    let pull_boot = crate::oci::pull::BootSet {
+        profile: profile && !block_capture,
+        scratch: bless_scratch_dir(),
+    };
+    let (_resolved, mut boot_blocks) = pull_image(
         &registry_client,
         &image,
         &Credentials::Anonymous,
         Arc::clone(&handler),
         ingest_opts,
-        Some(crate::oci::pull::BootSet { profile, scratch: bless_scratch_dir() }),
+        Some(pull_boot),
     )
     .await
     .map_err(|e| anyhow::anyhow!("pull failed: {e}"))?;
@@ -326,6 +333,43 @@ pub async fn run_bless_oci(
         .put_manifest(&manifest_key, manifest_data, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
+
+    // Upgrade the boot set to the EXACT block-level capture when possible: serve
+    // the just-blessed image, run the entrypoint under a read tracer, record the
+    // device blocks the kernel actually fetched (file data AND fs metadata). This
+    // closes the ~21% metadata gap the writer-mapped set leaves. Best-effort —
+    // a no-ublk build / capture failure keeps the fallback `boot_blocks`.
+    if block_capture {
+        let (mut argv, env, _wd) = crate::oci::boot_set::run_command(&resolved.config);
+        if let Ok(cmd) = std::env::var("GLIDEFS_PROFILE_CMD") {
+            if !cmd.trim().is_empty() {
+                argv = vec!["/bin/sh".into(), "-c".into(), cmd];
+            }
+        }
+        let timeout = std::env::var("GLIDEFS_PROFILE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map_or(std::time::Duration::from_secs(30), std::time::Duration::from_secs);
+        if let Some(exact) = crate::oci::boot_capture_served::capture_boot_blocks_served(
+            Arc::clone(&content_store),
+            Arc::clone(&volume_manifest),
+            device_size,
+            BLOCK_SIZE,
+            "ext4",
+            &argv,
+            &env,
+            &name,
+            timeout,
+            200_000,
+        )
+        .await
+        {
+            info!(blocks = exact.len(), "captured exact boot blocks via block-level profiling");
+            boot_blocks = exact;
+        } else {
+            info!("block-level profiling unavailable/failed; using fallback boot set");
+        }
+    }
 
     if !boot_blocks.is_empty() {
         let data = crate::block::manifest::serialize_block_list(&boot_blocks);
