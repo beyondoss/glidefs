@@ -1277,23 +1277,48 @@ impl ExportRouter {
             }
         }
 
-        // Index warm on device open (forked exports only): fetch this export's
-        // pack indices from its OWN manifest (the real chunk indices), so even a
-        // lazily-read tail block costs one S3 GET (data) instead of two (index +
-        // data). Cheap — one fetch per pack, bounded by pack count. The
-        // JoinHandle is stored in ExportState so teardown can abort it.
+        // Boot prefetch on device open (forked exports only). Two tiers, both
+        // driven by the export's OWN manifest — no sidecar artifact:
+        //   1. INDEX warm: fetch this export's pack indices (the real chunk
+        //      indices) so even a lazily-read tail block costs one S3 GET (data)
+        //      instead of two (index + data). Cheap — one fetch per pack.
+        //   2. DATA warm: if the manifest carries a `prefetch_len` (EROFS images
+        //      blessed with a build-time `PriorityOrder` boot-set reorder), warm
+        //      the contiguous `[0, prefetch_len)` priority region into the clean
+        //      cache. Because the boot set was laid out contiguously at bless,
+        //      this is ONE range GET and the guest's boot reads are cache hits.
+        //      Bounded by prefetch_len → the lazy tail still faults on demand.
+        // The JoinHandle is stored in ExportState so teardown can abort it.
         let prefetch_handle = if manifest_name.is_some() {
             let cache_clone = Arc::clone(&cache);
             let cmc = Arc::clone(&pack_index_cache);
             let vm = Arc::clone(&volume_manifest);
             let cs = Arc::clone(&content_store);
+            let clean_cache_clone = Arc::clone(&clean_cache);
+            let metrics_clone = Arc::clone(&metrics);
+            let prefetch_len = volume_manifest.read().prefetch_len;
             // The manifest's REAL chunk indices (NOT block indices — see
             // volume_manifest::block_index_is_not_chunk_index).
             let chunk_indices: Vec<u64> =
                 volume_manifest.read().chunks.keys().map(|&c| u64::from(c)).collect();
 
             Some(spawn_supervised("boot-prefetch", async move {
+                // Tier 1: index warm from the manifest's real chunks.
                 cache_clone.prefetch_chunks(&chunk_indices, &cmc, &vm, &cs).await;
+                // Tier 2: contiguous priority data region (EROFS boot-set reorder).
+                if let Some(plen) = prefetch_len {
+                    info!(prefetch_len = plen, "warming priority data region");
+                    cache_clone
+                        .prefetch_data_range(
+                            plen,
+                            clean_cache_clone.as_ref(),
+                            &cmc,
+                            &vm,
+                            &cs,
+                            &metrics_clone,
+                        )
+                        .await;
+                }
                 info!("boot prefetch complete");
             }))
         } else {

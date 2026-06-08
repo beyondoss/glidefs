@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::sync::Notify;
-use tracing::info;
+use tracing::{info, warn};
 
 /// A disk-backed scratch directory for bless. The WriteCache cache file and the
 /// EROFS content spool can each be ~image-sized, so they must NOT land on a
@@ -339,10 +339,53 @@ pub async fn run_bless_oci(
 /// set + manifest), but it merges the layers into a deterministic, grid-aligned
 /// EROFS image (via the hand-rolled writer) instead of ext4. The image is
 /// content-addressed and dedups across images; the consumer mounts it read-only.
+/// Select the EROFS boot set. With `profile`, RUN the image once and capture the
+/// real boot working set via fanotify (covers dlopen'd libraries + config/data
+/// that static ELF analysis cannot see), unioned with the static closure as a
+/// backstop; otherwise just the static derivation. Best-effort — any profiling
+/// failure logs and falls back to static, so bless never fails over this.
+fn derive_boot_set(
+    config: &[u8],
+    layers: &mut [std::fs::File],
+    profile: bool,
+    scratch: &std::path::Path,
+) -> Vec<String> {
+    if !profile {
+        return crate::oci::boot_set::derive_boot_paths(config, layers);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let timeout = std::env::var("GLIDEFS_PROFILE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map_or(std::time::Duration::from_secs(30), std::time::Duration::from_secs);
+        match crate::oci::boot_capture::capture_boot_paths(config, layers, scratch, timeout) {
+            Ok(captured) if !captured.is_empty() => {
+                info!(count = captured.len(), "captured boot set via runtime profiling");
+                // Union with the static closure — backstops any library the
+                // timed run happened not to open.
+                let mut seen: std::collections::HashSet<String> =
+                    captured.iter().cloned().collect();
+                let mut paths = captured;
+                for p in crate::oci::boot_set::derive_boot_paths(config, layers) {
+                    if seen.insert(p.clone()) {
+                        paths.push(p);
+                    }
+                }
+                return paths;
+            }
+            Ok(_) => warn!("runtime profiling captured nothing; falling back to static boot set"),
+            Err(e) => warn!(error = %e, "runtime profiling failed; falling back to static boot set"),
+        }
+    }
+    crate::oci::boot_set::derive_boot_paths(config, layers)
+}
+
 pub async fn run_bless_oci_erofs(
     image_ref: String,
     name: String,
     s3_prefix: String,
+    profile: bool,
     config_path: PathBuf,
 ) -> Result<()> {
     use crate::oci::BlockAdapter;
@@ -444,33 +487,56 @@ pub async fn run_bless_oci_erofs(
         None,
     ));
 
-    // --- Merge layers into the final EROFS image. The BlockAdapter sink uses
-    // block_on, so the convert runs on a blocking thread. ---
+    // --- Determine the boot working set so the EROFS layout places it
+    // contiguously at the front of the image; a contiguous boot set warms in ONE
+    // range GET on device open instead of the scattered demand faults a default
+    // DFS layout costs (research-bootset: 4.5–30× faster cold boot). Two
+    // producers: `--profile` RUNS the image once and captures the real boot set
+    // (covers dlopen'd libs + data that static analysis misses), unioned with —
+    // and otherwise falling back to — the static ELF-closure derivation. Empty
+    // ⇒ default layout. Both run inside the convert's blocking task (they share
+    // `layer_files`). ---
     let uuid = deterministic_uuid(&resolved.manifest_digest);
     let rt = tokio::runtime::Handle::current();
     let handler_for_write = Arc::clone(&handler);
     let scratch2 = scratch.clone();
-    info!("merging layers into EROFS");
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let config_bytes = resolved.config.clone();
+    info!(profile, "deriving boot set + merging layers into EROFS");
+    let prefetch_len = tokio::task::spawn_blocking(move || -> Result<u64> {
+        let boot_paths = derive_boot_set(&config_bytes, &mut layer_files, profile, &scratch2);
+        if !boot_paths.is_empty() {
+            info!(count = boot_paths.len(), "boot set ready; EROFS will reorder it first");
+        }
+        let mut writer_options = vec![
+            WriterOption::Uuid(uuid),
+            // Align large file payloads to the dedup block grid (cross-image
+            // dedup); EROFS has no reserved blocks so this is always safe.
+            WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
+            WriterOption::SpoolDir(scratch2.clone()),
+        ];
+        // The boot set is laid first and contiguously; its byte extent comes
+        // back as the prefetch length the server warms on open.
+        if !boot_paths.is_empty() {
+            writer_options.push(WriterOption::PriorityOrder(boot_paths));
+        }
         let opts = ext4::tar_convert::ConvertOptions {
             convert_backslash: false,
-            writer_options: vec![
-                WriterOption::Uuid(uuid),
-                // Align large file payloads to the dedup block grid (cross-image
-                // dedup); EROFS has no reserved blocks so this is always safe.
-                WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
-                WriterOption::SpoolDir(scratch2.clone()),
-            ],
+            writer_options,
         };
-        ext4::convert_oci_layers_to_erofs(
+        let (_, prefetch_len) = ext4::convert_oci_layers_to_erofs_with_prefetch(
             &mut layer_files,
             BlockAdapter::new(&handler_for_write, rt),
             &opts,
         )
         .map_err(|e| anyhow::anyhow!("erofs conversion failed: {e}"))?;
-        Ok(())
+        Ok(prefetch_len)
     })
     .await??;
+    // Persist the boot-set extent so device open warms `[0, prefetch_len)`.
+    if prefetch_len > 0 {
+        volume_manifest.write().prefetch_len = Some(prefetch_len);
+        info!(prefetch_len, "recorded EROFS boot-set prefetch length");
+    }
 
     // --- Drain to S3 ---
     info!("draining to S3");

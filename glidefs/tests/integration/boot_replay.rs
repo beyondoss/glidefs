@@ -796,6 +796,172 @@ async fn real_trace_study() {
     }
 }
 
+/// END-TO-END proof of the wired EROFS boot-set warm: open a REAL blessed image
+/// cold (manifest carries the build-time `prefetch_len`), run the ACTUAL
+/// device-open warm — `prefetch_chunks` (tier-1 index warm) then
+/// `prefetch_data_range([0, prefetch_len))` (tier-2 data warm) — against the real
+/// object store wrapped in the GET counter, and assert the contiguous boot-set
+/// region costs ~1 data GET (the reorder's whole point). This is the runtime
+/// counterpart to the build-side bless: it exercises router.rs's exact warm path.
+///   GLIDEFS_REAL_CONFIG=research-bootset/repro-config.toml \
+///   GLIDEFS_WARM_NAME=nginx-bootset GLIDEFS_REAL_PREFIX=prof \
+///   cargo test --features test-utils --test integration \
+///     boot_replay::prefetch_warm_real -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "needs a configured object store + a blessed EROFS image with a prefetch_len"]
+async fn prefetch_warm_real() {
+    use glidefs::config::Settings;
+    use glidefs::parse_object_store::parse_url_opts;
+
+    let Ok(cfg_path) = std::env::var("GLIDEFS_REAL_CONFIG") else {
+        eprintln!("set GLIDEFS_REAL_CONFIG / GLIDEFS_WARM_NAME [/ GLIDEFS_REAL_PREFIX]");
+        return;
+    };
+    let name = std::env::var("GLIDEFS_WARM_NAME").unwrap_or_else(|_| "nginx-bootset".into());
+    let prefix = std::env::var("GLIDEFS_REAL_PREFIX").unwrap_or_else(|_| "prof".into());
+
+    let settings = Settings::from_file(std::path::Path::new(&cfg_path)).unwrap();
+    let (store, path_from_url) = parse_url_opts(
+        &settings.storage.url.parse().unwrap(),
+        settings.cloud_provider_env_vars().into_iter(),
+        Some(settings.storage.connect_timeout()),
+        Some(settings.storage.request_timeout()),
+    )
+    .unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::from(store);
+    let base = format!("{path_from_url}/exports/{prefix}");
+    let latency = Arc::new(LatencyStore::new(Arc::clone(&store), Duration::ZERO, 0));
+    let content_store = ContentStore::new(Arc::clone(&latency) as Arc<dyn ObjectStore>, &base);
+
+    let mkey = format!("bases/{name}");
+    let (data, _e) = content_store.get_manifest(&mkey).await.unwrap().expect("manifest");
+    let vm = VolumeManifest::deserialize(&data).unwrap();
+    let prefetch_len = vm.prefetch_len.expect("image must carry a build-time prefetch_len");
+    let (device_size, block_size) = (vm.size, vm.block_size);
+    let chunk_indices: Vec<u64> = vm.chunks.keys().map(|&c| u64::from(c)).collect();
+    println!(
+        "\nimage={name} device={:.1}MiB prefetch_len={:.2}MiB ({:.1}% of image) chunks={}",
+        device_size as f64 / (1024.0 * 1024.0),
+        prefetch_len as f64 / (1024.0 * 1024.0),
+        100.0 * prefetch_len as f64 / device_size as f64,
+        chunk_indices.len(),
+    );
+    let vm = Arc::new(parking_lot::RwLock::new(vm));
+
+    let dir = TempDir::new().unwrap();
+    let cache = WriteCache::open_fresh_active(WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: name.clone(),
+        device_size,
+        block_size: block_size as usize,
+        wal_sync: false,
+    })
+    .unwrap();
+    let clean: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(512 * 1024 * 1024));
+    let metrics = ExportMetrics::new();
+    let pic_dir = TempDir::new().unwrap();
+    let pic = Arc::new(PackIndexCache::open(pic_dir.path()).await.unwrap());
+
+    // Tier 1: index warm (router does this first; it's the baseline mechanism).
+    cache.prefetch_chunks(&chunk_indices, &pic, &vm, &content_store).await;
+
+    // Tier 2: the new data warm — measure ONLY its GETs.
+    latency.reset();
+    cache
+        .prefetch_data_range(prefetch_len, clean.as_ref(), &pic, &vm, &content_store, &metrics)
+        .await;
+    let warm_gets = latency.gets();
+    let warm_mib = latency.bytes() as f64 / (1024.0 * 1024.0);
+
+    // The whole contiguous boot region must now be hot: a re-read of [0, prefetch_len)
+    // costs ZERO additional GETs.
+    latency.reset();
+    let mut off = 0u64;
+    while off < prefetch_len {
+        let n = (4 * 1024 * 1024).min(prefetch_len - off) as usize;
+        cache.read(off, n, clean.as_ref(), &pic, &vm, &content_store, &metrics).await.unwrap();
+        off += n as u64;
+    }
+    let reread_gets = latency.gets();
+
+    println!(
+        "boot-set warm: {warm_gets} GET(s), {warm_mib:.2} MiB fetched; re-read of region: {reread_gets} GET(s)"
+    );
+
+    // END-TO-END vs the REAL boot oracle (a `boot_profile`-captured block list):
+    // compare plain readahead against (static warm + readahead tail). This is the
+    // honest win number — it includes the demand-fault tail of boot reads the
+    // static derivation did NOT cover (config/data files, dlopen'd .so).
+    if let Ok(tracef) = std::env::var("GLIDEFS_WARM_TRACE") {
+        let trace: Vec<u64> = std::fs::read_to_string(&tracef)
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        let win = 32 * 1024 * 1024;
+        let bs = block_size as u64;
+
+        // Arm A — baseline: cold cache, production readahead, replay the oracle.
+        let dir_a = TempDir::new().unwrap();
+        let cache_a = WriteCache::open_fresh_active(WriteCacheConfig {
+            cache_dir: dir_a.path().to_path_buf(),
+            device_name: format!("{name}-base"),
+            device_size,
+            block_size: block_size as usize,
+            wal_sync: false,
+        })
+        .unwrap();
+        let clean_a: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(512 * 1024 * 1024));
+        cache_a.set_readahead_window_bytes(win);
+        latency.reset();
+        for &b in &trace {
+            cache_a.read(b * bs, block_size as usize, clean_a.as_ref(), &pic, &vm, &content_store, &metrics).await.unwrap();
+        }
+        let (base_gets, base_mib) = (latency.gets(), latency.bytes() as f64 / (1024.0 * 1024.0));
+
+        // Arm B — static boot-set: cold cache, warm [0,prefetch_len) once, then
+        // replay the oracle under readahead (only the uncovered tail still faults).
+        let dir_b = TempDir::new().unwrap();
+        let cache_b = WriteCache::open_fresh_active(WriteCacheConfig {
+            cache_dir: dir_b.path().to_path_buf(),
+            device_name: format!("{name}-warm"),
+            device_size,
+            block_size: block_size as usize,
+            wal_sync: false,
+        })
+        .unwrap();
+        let clean_b: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(512 * 1024 * 1024));
+        cache_b.set_readahead_window_bytes(win);
+        latency.reset();
+        cache_b.prefetch_data_range(prefetch_len, clean_b.as_ref(), &pic, &vm, &content_store, &metrics).await;
+        for &b in &trace {
+            cache_b.read(b * bs, block_size as usize, clean_b.as_ref(), &pic, &vm, &content_store, &metrics).await.unwrap();
+        }
+        let (warm_total_gets, warm_total_mib) = (latency.gets(), latency.bytes() as f64 / (1024.0 * 1024.0));
+        let covered = trace.iter().filter(|&&b| b * bs < prefetch_len).count();
+        println!(
+            "ORACLE end-to-end ({} boot blocks, {:.0}% covered by static set):\n  \
+             readahead-only : {base_gets} GET(s), {base_mib:.1} MiB\n  \
+             static warm+tail: {warm_total_gets} GET(s), {warm_total_mib:.1} MiB",
+            trace.len(),
+            100.0 * covered as f64 / trace.len() as f64,
+        );
+        drop((dir_a, dir_b));
+    }
+    drop(dir);
+
+    // The reorder's guarantee: the contiguous boot set warms in a tiny, bounded
+    // number of range GETs (one 32 MiB pack window covers a ~20 MiB region), and
+    // is fully cached afterward.
+    let max_gets = prefetch_len.div_ceil(32 * 1024 * 1024) + 1;
+    assert!(warm_gets >= 1, "warm should fetch the region");
+    assert!(
+        warm_gets <= max_gets,
+        "contiguous boot set must warm in ~1 GET/pack-window: got {warm_gets} (max {max_gets})"
+    );
+    assert_eq!(reread_gets, 0, "boot region must be fully cached after warm");
+}
+
 /// LAYERED-image study: replay each layer's captured boot trace against THAT
 /// layer's own ext4 manifest (layered images are N shared, immutable layer
 /// blobs — reorder is impossible, so the candidates are readahead vs a

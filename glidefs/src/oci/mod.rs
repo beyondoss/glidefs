@@ -1,4 +1,7 @@
 pub mod block_adapter;
+#[cfg(target_os = "linux")]
+pub mod boot_capture;
+pub mod boot_set;
 pub mod export;
 pub mod ext4_store;
 pub mod ingest;

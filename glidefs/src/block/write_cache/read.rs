@@ -1266,5 +1266,49 @@ impl WriteCache<Active> {
             .await;
     }
 
+    /// Warm the clean cache with the actual DATA of `[0, len)` — the EROFS
+    /// build-time priority region (the metadata region plus the contiguous
+    /// boot working-set data run laid down first by `WriterOption::PriorityOrder`).
+    /// Unlike [`prefetch_chunk`](Self::prefetch_chunk) (which warms only pack
+    /// *indices*), this drives the full read path so decompressed blocks land in
+    /// the clean cache; the guest's first boot reads then hit cache instead of
+    /// S3. Because the region is contiguous and positional, the read path's
+    /// pack-window coalescing collapses it into a single range GET. Best-effort:
+    /// a failed sub-read is logged and skipped, never propagated. Reads in
+    /// bounded steps to cap peak memory.
+    pub async fn prefetch_data_range(
+        &self,
+        len: u64,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) {
+        const STEP: u64 = 4 * 1024 * 1024; // 4 MiB read window
+        let mut off = 0u64;
+        while off < len {
+            let n = STEP.min(len - off) as usize;
+            match self
+                .read(
+                    off,
+                    n,
+                    clean_cache,
+                    pack_index_cache,
+                    volume_manifest,
+                    content_store,
+                    metrics,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(off, n, error = %e, "boot data prefetch read failed");
+                    break;
+                }
+            }
+            off += n as u64;
+        }
+    }
 }
 
