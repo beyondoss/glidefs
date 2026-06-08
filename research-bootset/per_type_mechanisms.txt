@@ -94,3 +94,33 @@ PARALLEL PRECISE WARM for both. warm-window catastrophic as always (951-1666 MiB
   layered→ parallel precise warm/coalesced (1.5×, per-layer local)  [not reorderable]
   btrfs  → parallel precise warm        (5.6×; CoW scatters most)   [not reorderable]
   f2fs   → parallel precise warm        (1.8×; log-structured local)[not reorderable]
+
+## CHURN EXPERIMENT — does locality survive writes? (ext4 vs btrfs vs f2fs, fresh vs churned)
+Same rootfs, 1 GB images, identical churn (4 rounds: create 100 files/delete 70% to fragment
+free space + atomic-replace cp+mv of ~600 boot files/round = realistic package-update churn),
+re-blessed + re-profiled. RTT=40ms, 100 MiB/s, conc=32. over-fetch = readahead bytes / boot bytes.
+
+fs     state   readahead(GET/ms)  over-fetch   warm-precise(ms)   reorder(ms)
+ext4   fresh    7 /  678          1.55×         349                125
+ext4   churn   10 / 2068 (3.0×↑)  6.4×          354 (flat)         130
+btrfs  fresh    9 / 2631          7.3×          410                151
+btrfs  churn   10 / 3270 (1.2×↑)  9.0×          412 (flat)         153
+f2fs   fresh    6 /  828          2.0×          348                124
+f2fs   churn    8 / 2674 (3.2×↑)  7.9×          389 (flat)         124
+
+## CONCLUSIONS
+1. f2fs's locality is a WRITE-ONCE artifact. Fresh f2fs (2.0×) ≈ ext4 (1.55×) << btrfs (7.3×),
+   but CHURN destroys it: f2fs → 7.9× over-fetch, as bad as btrfs (9.0×). Under churn ALL three
+   converge to ~6-9× readahead over-fetch — the filesystem choice WASHES OUT. So "f2fs good for
+   a writable/churning position-based blockstore" is FALSE; true only for write-once bases
+   (where EROFS+reorder dominates anyway). The log-append + free-space-fragmentation scatters
+   the boot set in churn-order, not boot-order; f2fs GC compacts by validity, not affinity, so
+   it does not restore boot locality.
+2. THE DURABLE LEVER IS THE MECHANISM, NOT THE FS. warm-precise and reorder are CHURN-IMMUNE
+   (349→354, 410→412, 348→389 ms; reorder ~constant) because they fetch the EXACT boot blocks
+   (byte count fixed regardless of scatter) or re-collocate at bless. readahead degrades up to
+   3.2× under churn → the warm's win over readahead GROWS with churn: ext4 1.9×→5.8×,
+   f2fs 2.4×→6.9×, btrfs 6.4×→7.9×.
+3. DESIGN: for a writable/churning blockstore, do NOT rely on guest-FS layout (it all rots) —
+   rely on the precise warm (fragmentation-immune). FS choice matters only for fresh/write-once
+   images: prefer f2fs/ext4 over btrfs there; for read-only rootfs, EROFS+reorder wins outright.
