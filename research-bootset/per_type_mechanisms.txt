@@ -69,3 +69,28 @@ layered  python_layered     4 /  36.8 /  528       218 / 7.2 / 352            N/
              so the warm's job is mainly killing over-fetch. 218 tiny GETs argues for per-layer
              coalescing (each layer's boot blocks sit in 1 pack) over pure per-block precise.
 - ALL non-EROFS: never use naive parallel 32MiB-window warm (races → 9-23s).
+
+## EXTENSION — btrfs + f2fs (flashfs) on-disk filesystems (RTT=40ms, 100 MiB/s, conc=32)
+Built mount-free (mkfs.btrfs --rootdir --shrink; mkfs.f2fs + sload.f2fs), blessed via
+`bless --image` (raw path), profiled with mount -t btrfs / -t f2fs. Same python startup workload.
+
+type   image          boot   readahead(GET/ms)  warm-precise(GET/MiB/ms)  warm-window(MiB/ms)  reorder(MiB/ms)  warm-win
+btrfs  python_btrfs   31.0M  8 / 2284           234 / 9.0 / 410           1666.5 / 16785        11.2 / 152       5.6× (reorder 15×)
+f2fs   python_f2fs    29.1M  4 /  614           223 / 6.8 / 348            951.6 /  9596         8.4 / 124        1.8× (reorder 4.9×)
+
+## NEW INSIGHT — filesystem layout drives how scattered the boot set is (within packs):
+- btrfs (copy-on-write, B-trees): SCATTERS the boot set badly within its packs → readahead
+  over-fetches ~6.3× (≈196 MiB to serve 31 MiB), the WORST of any type measured → warm-precise
+  wins 5.6×, a reorder would win 15×.
+- f2fs / "flashfs" (log-structured, flash-optimized): better write locality → readahead
+  over-fetches only ~2× → warm-precise wins 1.8×.
+Both are NON-reorderable by our bless (only EROFS reorders) ⇒ shippable mechanism = runtime
+PARALLEL PRECISE WARM for both. warm-window catastrophic as always (951-1666 MiB).
+
+## Per-type mechanism — COMPLETE (6 fs types proven)
+  EROFS  → build-time reorder           (1 GET, 4.5-30×)            [reorderable]
+  ext4   → parallel precise warm        (2.2×)                      [not reorderable]
+  raw    → parallel precise warm        (1.7×)                      [not reorderable]
+  layered→ parallel precise warm/coalesced (1.5×, per-layer local)  [not reorderable]
+  btrfs  → parallel precise warm        (5.6×; CoW scatters most)   [not reorderable]
+  f2fs   → parallel precise warm        (1.8×; log-structured local)[not reorderable]
