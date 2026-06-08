@@ -267,8 +267,14 @@ pub async fn compact_chunk(
         blocks_for_pack.push(result?);
     }
 
-    // 4. Stream new GLPK v3 base pack to S3
-    // Sort by chunk_offset for deterministic content-addressed pack ID.
+    // 4. Stream new GLPK v3 base pack to S3.
+    // Sort by chunk_offset for deterministic content-addressed pack ID. NB: the
+    // pack is positional BY CONSTRUCTION — `pack::stream_pack_to_writer` /
+    // `assemble_pack` re-sort by chunk_offset and the index is binary-searched by
+    // chunk_offset, so a boot-set reorder cannot be done here; it must happen
+    // where chunk_offset is assigned (the FS writer, i.e. EROFS) or via an opt-in
+    // pack-writer change that decouples data order from index order. For
+    // writable/non-EROFS volumes, the runtime precise warm is the cold-read lever.
     blocks_for_pack.sort_by_key(|&(_, co, _)| co);
     let base_pack_id = crate::block::pack::content_pack_id(&blocks_for_pack);
     let index_entries = content_store

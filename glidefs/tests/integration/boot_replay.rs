@@ -1004,6 +1004,65 @@ fn hodges_lehmann(a: &[f64], b: &[f64]) -> f64 {
 // Tests
 // ============================================================================
 
+/// Experiment 2 finding (regression guard): GLPK packs are POSITIONAL BY
+/// CONSTRUCTION. `pack::stream_pack_to_writer`/`assemble_pack` sort blocks by
+/// `chunk_offset` and the index is binary-searched by `chunk_offset`
+/// (`pack_index_cache.rs`, `pack.rs`). So a block's pack offset is a function of
+/// its `chunk_offset` (= device LBA), and compaction CANNOT reorder the boot set
+/// into a contiguous front — the layout follows the guest filesystem's LBA
+/// layout. This documents why boot-set reorder must happen at FS-build time
+/// (EROFS), and why writable/non-EROFS volumes rely on the runtime precise warm
+/// instead. (Boot-order compaction is *feasible* but needs an opt-in pack-writer
+/// change that decouples data order from the chunk_offset-sorted index.)
+#[tokio::test]
+async fn packs_are_positional_by_construction() {
+    use glidefs::block::write_cache::compact::compact_chunk;
+
+    let s3 = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let scattered: [u64; 4] = [900, 300, 700, 100]; // written out of offset order
+    let device_size = 1024 * BLOCK as u64;
+    let cache = WriteCache::open_fresh_active(WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: "compact".to_string(),
+        device_size,
+        block_size: BLOCK,
+        wal_sync: false,
+    })
+    .unwrap();
+    let content_store = ContentStore::new(Arc::clone(&s3) as Arc<dyn ObjectStore>, "test");
+    let pic_dir = TempDir::new().unwrap();
+    let pic = Arc::new(PackIndexCache::open(pic_dir.path()).await.unwrap());
+    let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(device_size, BLOCK as u32)));
+    let clean: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
+
+    for &b in &scattered {
+        cache.write(b * BLOCK as u64, &block_data(b)).unwrap();
+    }
+    cache.write(500 * BLOCK as u64, &block_data(500)).unwrap();
+    cache.flush_to_s3(&content_store, &pic, &vm).await.unwrap();
+    cache.write(300 * BLOCK as u64, &block_data(30030)).unwrap(); // 2nd pack for chunk 0
+    cache.flush_to_s3(&content_store, &pic, &vm).await.unwrap();
+
+    let pack_ids = vm.read().chunk_pack_ids(0).map(|p| p.to_vec()).unwrap();
+    assert!(pack_ids.len() >= 2);
+    let blocks_per_chunk = vm.read().blocks_per_chunk();
+    let res = compact_chunk(0, &pack_ids, blocks_per_chunk, &content_store, &pic, &vm, &clean)
+        .await
+        .unwrap();
+
+    // The compacted pack's offsets are MONOTONIC in chunk_offset — positional,
+    // regardless of write/access order. There is no way to front-load a boot set.
+    let mut entries = pic.get_entries(res.new_pack_id).await.expect("index").to_vec();
+    entries.sort_by_key(|e| e.chunk_offset);
+    let mut prev = 0u32;
+    for e in &entries {
+        assert!(e.offset >= prev, "pack not positional: offset {} after {}", e.offset, prev);
+        prev = e.offset;
+    }
+    eprintln!("packs_are_positional: {} entries, offsets monotonic in chunk_offset ✓", entries.len());
+}
+
 /// Fast smoke test: a few trials, asserts the harness invariants hold.
 ///
 /// Heavy-scatter regime: a 4 GiB device (chunk = 128 MiB = 1024 blocks) with 32

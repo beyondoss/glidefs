@@ -124,3 +124,33 @@ f2fs   churn    8 / 2674 (3.2×↑)  7.9×          389 (flat)         124
 3. DESIGN: for a writable/churning blockstore, do NOT rely on guest-FS layout (it all rots) —
    rely on the precise warm (fragmentation-immune). FS choice matters only for fresh/write-once
    images: prefer f2fs/ext4 over btrfs there; for read-only rootfs, EROFS+reorder wins outright.
+
+## REAL-WORKLOAD CHURN (correction): pip install/upgrade/uninstall cycles, not random dd
+The prior churn used random dd junk + random 70% delete — ADVERSARIAL (shreds free space,
+violates "blocks that live together die together"). Real workloads bulk-allocate/free with
+locality. Re-ran with real pip churn (install flask/requests/… → force-reinstall → install+
+uninstall extras), boot workload imports the installed packages. RTT=40ms,100MiB/s,conc=32.
+over-fetch = readahead bytes / boot bytes.
+
+fs     state      readahead(GET/ms)  over-fetch   warm-precise(ms)   reorder(ms)
+ext4   pkgfresh    8 / 1048          1.7×          556                181
+ext4   pkgchurn    6 / 1668          3.3×          556 (flat)         182
+btrfs  pkgfresh    8 / 2566          4.5×          619                212
+btrfs  pkgchurn   15 / 3231          5.2×          660 (flat)         213
+f2fs   pkgfresh    8 / 1323          2.1×          589                173
+f2fs   pkgchurn   11 / 2117          3.3×          631 (flat)         176
+
+## CORRECTED CONCLUSIONS
+1. Real churn is MUCH gentler than adversarial: f2fs 2.1×→3.3× over-fetch (NOT →7.9×); ext4
+   1.7×→3.3×; btrfs 4.5×→5.2×. The "live together die together" locality of real bulk
+   allocate/free IS preserved — my earlier "churn destroys f2fs's edge" was an artifact of the
+   adversarial random-delete fragmenter. Truth lies between fresh and adversarial.
+2. The f2fs hypothesis is PARTIALLY VINDICATED: under realistic churn f2fs ≈ ext4 (both ~3.3×)
+   and BOTH clearly beat btrfs (5.2×). btrfs's CoW scatters the boot set worst, fresh AND
+   churned, regardless of workload. So for a position-based store: prefer f2fs/ext4, avoid
+   btrfs — and that ranking SURVIVES realistic churn (unlike under adversarial churn where they
+   converged).
+3. The warm is STILL the durable lever: warm-precise is churn-immune (556→556, 619→660,
+   589→631 ms; reorder flat ~175-213) so it wins 3.0-4.9× over readahead even under real churn;
+   the margin is largest for btrfs (4.9×) and smaller for ext4/f2fs (3.0-3.4×) since their
+   preserved locality keeps readahead more competitive.
