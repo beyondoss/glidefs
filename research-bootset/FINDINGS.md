@@ -33,9 +33,28 @@ readahead GETs due to WITHIN-pack scatter.
 4. Only trivially small single-pack images (busybox) see no benefit (1.0x tie). -> ship the
    boot-set for real images; skip it for tiny single-pack bases.
 
+## BEST MECHANISM PER TYPE (empirically established — see per_type_mechanisms.txt)
+The choice hinges on ONE binary property: can `bless` reorder the image layout? EROFS yes
+(PriorityOrder); ext4/raw/layered no. Two mechanism classes, both proven:
+
+- **EROFS → build-time reorder** (contiguous prefix, 1 GET): 60-150ms, guaranteed 1 RTT
+  regardless of scatter. Best overall. Proven on real images.
+- **ext4 / raw / layered → runtime parallel PRECISE warm** of the captured boot block list
+  (fetch EXACT blocks concurrently at device open, window=0, zero over-fetch): 2-11x over
+  readahead (python_full 4471→409ms; ext4 770→349ms). Behind reorder only by the RTT-wave
+  count `ceil(blocks/concurrency)`; since GET/byte counts are concurrency-independent, a high
+  warm fan-out (>=128) closes it to ~near-reorder. Proven on ext4; raw/layered are the SAME
+  block-level warm (provenance-agnostic) so they inherit it.
+- **Tiny single-pack (busybox): readahead already ~optimal** (59ms); reorder/warm marginal.
+
+**CRITICAL negative result:** do NOT build the ext4/raw warm as a parallel 32MiB-window-
+coalesced fetch — concurrent reads race and pull overlapping windows → 872-2261 MiB fetched
+for a ~10 MiB boot set, 9-23s (~20x WORSE than readahead). Warm the PRECISE blocks only.
+
 ## Remaining (implementation, not fact-finding)
-- Production derivation Phase 2 (map boot blocks -> file paths for PriorityOrder; the
-  profiler already produces the block set + the profiler IS the production source).
-- Production wiring Phase 3: EROFS PriorityOrder->prefetch_len->bounded prefix warm (the
-  measured win); ext4 runtime bounded block-list warm.
-- ext4 scatter expected identical (same directory layout); delivery differs (runtime warm).
+- Phase 2 derivation: map boot blocks -> file paths for PriorityOrder (EROFS); the profiler
+  already produces the block set and IS the production source.
+- Phase 3 wiring: EROFS PriorityOrder->prefetch_len->bounded 1-GET prefix warm; ext4/raw/layered
+  bounded parallel PRECISE block-list warm on device open (NOT window-coalesced).
+- Optional confirmatory bless+profile of a raw image (≈ext4) and a layered image (needs a small
+  profiler tweak to serve images/<name>); mechanism is already determined by reorderability.

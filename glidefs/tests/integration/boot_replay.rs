@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt};
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
@@ -633,6 +633,66 @@ async fn run_trial_real(
     }
 }
 
+/// Runtime PARALLEL warm of the boot block list — the ext4/raw/layered delivery
+/// (these can't reorder). Issues all boot-block fetches concurrently with a fixed
+/// `concurrency` cap (models a real S3 client), `window` controls precise (0) vs
+/// coalesced (32 MiB) per-block fetch. Returns GETs/bytes and the WALL — which,
+/// unlike the optimistic 1-RTT model, includes the real concurrency waves.
+#[allow(clippy::too_many_arguments)]
+async fn run_warm_parallel(
+    store: Arc<dyn ObjectStore>,
+    base: &str,
+    name: &str,
+    device_size: u64,
+    block_size: u32,
+    trace: &[u64],
+    window: u32,
+    concurrency: usize,
+    pic: &Arc<PackIndexCache>,
+    rtt: Duration,
+    throughput: u64,
+) -> TrialResult {
+    let latency = Arc::new(LatencyStore::new(Arc::clone(&store), rtt, throughput));
+    let content_store = ContentStore::new(Arc::clone(&latency) as Arc<dyn ObjectStore>, base);
+    let (data, _e) = content_store.get_manifest(&format!("bases/{name}")).await.unwrap().expect("manifest");
+    let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::deserialize(&data).unwrap()));
+    let dir = TempDir::new().unwrap();
+    let cache = WriteCache::open_fresh_active(WriteCacheConfig {
+        cache_dir: dir.path().to_path_buf(),
+        device_name: name.to_string(),
+        device_size,
+        block_size: block_size as usize,
+        wal_sync: false,
+    })
+    .unwrap();
+    let clean: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(512 * 1024 * 1024));
+    let metrics = ExportMetrics::new();
+    cache.set_readahead_window_bytes(window);
+
+    latency.reset();
+    let start = Instant::now();
+    futures::stream::iter(trace.iter().copied())
+        .map(|b| {
+            let cache = &cache;
+            let clean = clean.as_ref();
+            let vm = &vm;
+            let cs = &content_store;
+            let metrics = &metrics;
+            async move {
+                cache
+                    .read(b * block_size as u64, block_size as usize, clean, pic, vm, cs, metrics)
+                    .await
+                    .unwrap();
+            }
+        })
+        .buffer_unordered(concurrency)
+        .collect::<Vec<()>>()
+        .await;
+    let wall = start.elapsed();
+    drop(dir);
+    TrialResult { wall, prefetch_gets: 0, prefetch_bytes: 0, demand_gets: latency.gets(), demand_bytes: latency.bytes() }
+}
+
 /// Real-image boot-set study. Replays `boot_profile`-captured traces against the
 /// real blessed images to measure the ACTUAL readahead GET count (the decisive
 /// number). Opt in:
@@ -667,17 +727,23 @@ async fn real_trace_study() {
 
     let rtt_ms = std::env::var("GLIDEFS_REAL_RTT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(40u64);
     let rtt = Duration::from_millis(rtt_ms);
-    // Build-independent model time of a boot: #GETs round-trips + bytes/throughput.
-    // (Debug-build CPU pollutes measured wall; the latency model is what matters.)
-    let model_ms = |gets: u64, bytes: u64| -> f64 {
-        gets as f64 * rtt_ms as f64 + (bytes as f64 / throughput as f64) * 1000.0
-    };
+    let conc: usize = std::env::var("GLIDEFS_REAL_CONCURRENCY").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+    // Serial cost (reactive boot reads / readahead): one RTT per GET in sequence.
+    let serial_ms = |gets: u64, bytes: u64| gets as f64 * rtt_ms as f64 + (bytes as f64 / throughput as f64) * 1000.0;
+    // Parallel cost (a proactive warm with a concurrency cap): GETs run in
+    // ceil(gets/conc) waves; bytes still stream at throughput.
+    let par_ms = |gets: u64, bytes: u64| (gets as f64 / conc as f64).ceil() * rtt_ms as f64 + (bytes as f64 / throughput as f64) * 1000.0;
     let win = 32u64 * 1024 * 1024;
 
-    println!("\n=== REAL boot-set study (base={base}, RTT={rtt_ms}ms, {} MiB/s) ===", throughput / (1024 * 1024));
+    println!("\n=== PER-TYPE mechanism study (base={base}, RTT={rtt_ms}ms, {} MiB/s, warm concurrency={conc}) ===", throughput / (1024 * 1024));
+    println!("  Candidate mechanisms (all on the real image+trace; GETs/bytes EXACT, time = cost model):");
+    println!("    readahead   = 32MiB pack-window, reactive/serial            (today's baseline, any type)");
+    println!("    warm-precise= parallel warm of EXACT boot blocks            (ext4/raw/layered delivery)");
+    println!("    warm-window = parallel warm, 32MiB-coalesced per pack       (ext4/raw alt — over-fetches)");
+    println!("    reorder     = build-time contiguous prefix, 1 GET           (EROFS delivery)");
     println!(
-        "{:<13} {:>5} {:>6} | {:>5} {:>7} | {:>5} {:>7} {:>8} | {:>5} {:>7} {:>8} | {:>6}",
-        "image", "blks", "MiB", "dmnd", "d_ms", "reada", "rd_MiB", "rd_ms", "boot", "bs_MiB", "bs_ms", "win×"
+        "{:<16} {:>5} {:>6} | {:>6} {:>7} | {:>5} {:>7} {:>7} | {:>5} {:>7} {:>7} | {:>5} {:>7} {:>7}",
+        "image", "blks", "MiB", "rd_GET", "rd_ms", "wpGET", "wp_MiB", "wp_ms", "wwGET", "ww_MiB", "ww_ms", "reGET", "re_MiB", "re_ms"
     );
     for spec in images.split(',').filter(|s| !s.is_empty()) {
         let (name, tracef) = spec.split_once(':').expect("name:tracefile");
@@ -691,20 +757,20 @@ async fn real_trace_study() {
         let (data, _e) = cs.get_manifest(&format!("bases/{name}")).await.unwrap().expect("manifest");
         let vm = VolumeManifest::deserialize(&data).unwrap();
         let (device_size, block_size) = (vm.size, vm.block_size);
+        let boot_mib = trace.len() as f64 * block_size as f64 / (1024.0 * 1024.0);
 
-        // Pre-warm the shared pack-index cache (index-warm-on-open baseline).
         let pic_dir = TempDir::new().unwrap();
         let pic = Arc::new(PackIndexCache::open(pic_dir.path()).await.unwrap());
         let _ = run_trial_real(Arc::clone(&store), &base, name, device_size, block_size, &trace, 0, &pic, Duration::ZERO, 0).await;
 
-        let demand = run_trial_real(Arc::clone(&store), &base, name, device_size, block_size, &trace, 0, &pic, rtt, throughput).await;
+        // Baseline: reactive readahead (serial during boot).
         let reada = run_trial_real(Arc::clone(&store), &base, name, device_size, block_size, &trace, win as u32, &pic, rtt, throughput).await;
+        // ext4/raw delivery A: parallel warm of EXACT blocks (window=0 → precise).
+        let wp = run_warm_parallel(Arc::clone(&store), &base, name, device_size, block_size, &trace, 0, conc, &pic, rtt, throughput).await;
+        // ext4/raw delivery B: parallel warm, 32MiB-coalesced (window) per pack.
+        let ww = run_warm_parallel(Arc::clone(&store), &base, name, device_size, block_size, &trace, win as u32, conc, &pic, rtt, throughput).await;
 
-        let boot_bytes = trace.len() as u64 * u64::from(block_size);
-        let boot_mib = boot_bytes as f64 / (1024.0 * 1024.0);
-
-        // Empirical boot-set arm: read the real boot blocks, lay them contiguous
-        // in a fresh image (real compression), and measure the reordered fetch.
+        // EROFS delivery: measured contiguous reorder (1 GET).
         let contents = read_blocks_content(Arc::clone(&store), &base, name, device_size, block_size, &trace, &pic).await;
         let s3_re = Arc::new(InMemory::new());
         build_image_from_contents(Arc::clone(&s3_re), "reord", &contents).await;
@@ -714,14 +780,14 @@ async fn real_trace_study() {
         prewarm_index(&s3_re, "reord", contents.len() as u64, &front, &pic_re).await;
         let bs = run_trial(&s3_re, "reord", contents.len() as u64, &front, &[], Arm::Readahead, &pic_re, rtt, throughput).await;
 
-        let _ = win; // analytic bound retained in comments; we report the measured arm
+        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
         println!(
-            "{:<13} {:>5} {:>6.1} | {:>5} {:>7.0} | {:>5} {:>7.1} {:>8.0} | {:>5} {:>7.1} {:>8.0} | {:>5.1}×",
+            "{:<16} {:>5} {:>6.1} | {:>6} {:>7.0} | {:>5} {:>7.1} {:>7.0} | {:>5} {:>7.1} {:>7.0} | {:>5} {:>7.1} {:>7.0}",
             name, trace.len(), boot_mib,
-            demand.demand_gets, model_ms(demand.demand_gets, demand.demand_bytes),
-            reada.demand_gets, reada.demand_bytes as f64 / (1024.0 * 1024.0), model_ms(reada.demand_gets, reada.demand_bytes),
-            bs.demand_gets, bs.demand_bytes as f64 / (1024.0 * 1024.0), model_ms(bs.demand_gets, bs.demand_bytes),
-            model_ms(reada.demand_gets, reada.demand_bytes) / model_ms(bs.demand_gets, bs.demand_bytes).max(1.0),
+            reada.demand_gets, serial_ms(reada.demand_gets, reada.demand_bytes),
+            wp.demand_gets, mib(wp.demand_bytes), par_ms(wp.demand_gets, wp.demand_bytes),
+            ww.demand_gets, mib(ww.demand_bytes), par_ms(ww.demand_gets, ww.demand_bytes),
+            bs.demand_gets, mib(bs.demand_bytes), serial_ms(bs.demand_gets, bs.demand_bytes),
         );
     }
 }
