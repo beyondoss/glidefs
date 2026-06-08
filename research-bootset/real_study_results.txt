@@ -1,0 +1,26 @@
+=== REAL boot-set study (base=prof/exports/prof, RTT=40ms, 100 MiB/s) ===
+GET counts + bytes are EXACT (measured on the real read path against real blessed
+images with real boot traces). boot-set arm is MEASURED (real reordered image, real
+compression). Wall (ms) = build-independent latency model: GETs*RTT + bytes/throughput.
+
+image          blks    MiB |  dmnd    d_ms | reada  rd_MiB    rd_ms |  boot  bs_MiB    bs_ms |   win×
+busybox          37    4.6 |    31    1257 |     1     1.9       59 |     1     2.0       60 |   1.0×
+nginx            78    9.8 |    72    2904 |     4    47.9      639 |     1     3.0       70 |   9.2×
+python_slim     199   24.9 |   193    7793 |     4    41.8      578 |     1     9.0      130 |   4.5×
+node_slim       355   44.4 |   349   14104 |     9   102.7     1387 |     1    17.6      216 |   6.4×
+python_full     248   31.0 |   242    9769 |    15   387.1     4471 |     1    11.0      150 |  29.8×
+node_full       348   43.5 |   342   13823 |    13   309.3     3613 |     1    17.4      214 |  16.9×
+
+Scatter (from boot_profile, boot set vs image pack layout):
+  busybox     : 1 of 1 packs
+  nginx       : 2 of 2 packs
+  python_slim : 1 of 1 packs (but 4 readahead GETs — within-pack scatter)
+  node_slim   : 2 of 2 packs (9 readahead GETs — within-pack scatter)
+  python_full : 7 of 9 packs (complete boot set, 90s profile)
+  node_full   : 5 of 9 packs (TRUNCATED at 90s timeout — conservative; real set larger)
+
+Notes:
+- node_full boot trace was cut off by the profile timeout (node cold-boots slowly through
+  ublk→S3); its 16.9× is therefore a LOWER bound.
+- boot-set MiB < boot set MiB because the reordered run is re-compressed; readahead rd_MiB is
+  the actual S3 transfer (compressed) and is dominated by over-fetch of non-boot blocks.

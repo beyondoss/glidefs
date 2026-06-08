@@ -149,6 +149,11 @@ name = "ublk_cleanup"
 path = "src/bin/ublk_cleanup.rs"
 required-features = ["ublk"]
 
+[[bin]]
+name = "boot_profile"
+path = "src/bin/boot_profile.rs"
+required-features = ["ublk"]
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"

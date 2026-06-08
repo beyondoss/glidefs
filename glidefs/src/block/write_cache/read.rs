@@ -395,6 +395,7 @@ impl WriteCache<Active> {
                 clean_cache,
                 pack_index_cache,
                 Some(metrics),
+                self.inner.readahead_window_bytes.load(Ordering::Relaxed),
             )
             .await?;
             for (i, data) in fetched {
@@ -562,6 +563,7 @@ impl WriteCache<Active> {
                 clean_cache,
                 pack_index_cache,
                 Some(metrics),
+                self.inner.readahead_window_bytes.load(Ordering::Relaxed),
             )
             .await?;
             for (i, data) in fetched {
@@ -860,6 +862,7 @@ impl WriteCache<Active> {
                     clean_cache,
                     pack_index_cache,
                     metrics,
+                    self.inner.readahead_window_bytes.load(Ordering::Relaxed),
                 )
                 .await?;
                 // fetch_with_window always returns the requested block or errors
@@ -898,9 +901,14 @@ impl WriteCache<Active> {
         clean_cache: &dyn BlockCache,
         pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
         metrics: Option<&super::super::metrics::ExportMetrics>,
+        window: u32,
     ) -> Result<HashMap<usize, Bytes>, CacheError> {
         use crate::block::block_map::{blake3_128, decompress_block, Blake3Hash};
-        const WINDOW: u32 = 32 * 1024 * 1024; // 32 MiB of pack bytes per GET
+        // Pack bytes pulled per cold-miss GET. Production default is
+        // `DEFAULT_READAHEAD_WINDOW_BYTES` (32 MiB); the boot-set replay harness
+        // sweeps it via `WriteCache::set_readahead_window_bytes`. `window == 0`
+        // yields an empty in-window set → every request falls through to the
+        // per-block coalesced fetch (pure demand, no speculative over-fetch).
 
         let mut out: HashMap<usize, Bytes> = HashMap::new();
         // (index, pack_id, chunk_idx, hash, offset, comp_len) for per-block fallback.
@@ -926,7 +934,7 @@ impl WriteCache<Active> {
                 }
             };
             let win_start = reqs.iter().map(|t| t.2).min().unwrap_or(0);
-            let win_end = win_start.saturating_add(WINDOW);
+            let win_end = win_start.saturating_add(window);
             let mut in_win: Vec<&crate::block::pack::PackIndexEntry> = idx_entries
                 .iter()
                 .filter(|e| e.offset >= win_start && e.offset < win_end)

@@ -333,6 +333,9 @@ impl WriteCache<Initializing> {
             compression_level: std::sync::atomic::AtomicI32::new(
                 crate::block::block_map::env_default_compression_level(),
             ),
+            readahead_window_bytes: std::sync::atomic::AtomicU32::new(
+                super::inner::DEFAULT_READAHEAD_WINDOW_BYTES,
+            ),
             data_file: Arc::new(parking_lot::RwLock::new(data_file)),
             flushing_file: parking_lot::Mutex::new(None),
             state_map,
@@ -425,6 +428,9 @@ impl WriteCache<Initializing> {
             // overrides to a high level via WriteCache::set_compression_level.
             compression_level: std::sync::atomic::AtomicI32::new(
                 crate::block::block_map::env_default_compression_level(),
+            ),
+            readahead_window_bytes: std::sync::atomic::AtomicU32::new(
+                super::inner::DEFAULT_READAHEAD_WINDOW_BYTES,
             ),
             data_file: Arc::new(parking_lot::RwLock::new(data_file)),
             flushing_file: parking_lot::Mutex::new(None),

@@ -258,6 +258,18 @@ impl WriteCache<Active> {
             .store(level, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Set the pack-window readahead size (bytes) for the cold-miss fetch path.
+    /// `0` disables the window (pure demand fetch — the cold-floor arm of the
+    /// boot-set replay experiment); the production default is
+    /// [`crate::block::write_cache::inner::DEFAULT_READAHEAD_WINDOW_BYTES`]
+    /// (32 MiB). Used by the boot-set replay harness to sweep the
+    /// accuracy↔coverage tradeoff; not for production tuning.
+    pub fn set_readahead_window_bytes(&self, bytes: u32) {
+        self.inner
+            .readahead_window_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Flush the local cache file and WAL to durable storage.
     ///
     /// Syncs both the data file and the WAL so that all dirty block metadata

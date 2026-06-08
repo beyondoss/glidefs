@@ -1,0 +1,1051 @@
+warning: unexpected `cfg` condition name: `loom`
+  --> glidefs/src/circuit_breaker.rs:70:7
+   |
+70 | #[cfg(loom)]
+   |       ^^^^ help: found config with similar value: `feature = "loom"`
+   |
+   = help: expected names are: `docsrs`, `feature`, `test`, and `tokio_unstable` and 31 more
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: requested on the command line with `-W unexpected-cfgs`
+
+warning: unexpected `cfg` condition name: `loom`
+  --> glidefs/src/circuit_breaker.rs:73:11
+   |
+73 | #[cfg(not(loom))]
+   |           ^^^^ help: found config with similar value: `feature = "loom"`
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+   --> glidefs/src/circuit_breaker.rs:572:21
+    |
+572 | #[cfg(all(test, not(loom)))]
+    |                     ^^^^ help: found config with similar value: `feature = "loom"`
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+   --> glidefs/src/circuit_breaker.rs:962:7
+    |
+962 | #[cfg(loom)]
+    |       ^^^^ help: found config with similar value: `feature = "loom"`
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+   --> glidefs/src/circuit_breaker.rs:526:21
+    |
+526 |     #[cfg(any(test, loom, feature = "test-utils"))]
+    |                     ^^^^ help: found config with similar value: `feature = "loom"`
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+  --> glidefs/src/block/sync.rs:18:7
+   |
+18 | #[cfg(loom)]
+   |       ^^^^ help: found config with similar value: `feature = "loom"`
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+  --> glidefs/src/block/sync.rs:21:11
+   |
+21 | #[cfg(not(loom))]
+   |           ^^^^ help: found config with similar value: `feature = "loom"`
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+  --> glidefs/src/block/sync.rs:24:7
+   |
+24 | #[cfg(loom)]
+   |       ^^^^ help: found config with similar value: `feature = "loom"`
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+  --> glidefs/src/block/sync.rs:27:11
+   |
+27 | #[cfg(not(loom))]
+   |           ^^^^ help: found config with similar value: `feature = "loom"`
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `loom`
+  --> glidefs/src/block/sync.rs:37:7
+   |
+37 | #[cfg(loom)]
+   |       ^^^^ help: found config with similar value: `feature = "loom"`
+   |
+   = help: consider using a Cargo feature instead
+   = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+            [lints.rust]
+            unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+   = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(loom)");` to the top of the `build.rs`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unused import: `Context`
+  --> glidefs/src/handoff/strategy/crh.rs:20:14
+   |
+20 | use anyhow::{Context, Result};
+   |              ^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `persisted_max_seq` is never read
+    --> glidefs/src/block/write_cache/inner.rs:1309:42
+     |
+1309 |         let mut persisted_max_seq: u64 = 0;
+     |                                          ^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `CacheInner` is more private than the item `flush::<impl WriteCache<Active>>::test_inner`
+   --> glidefs/src/block/write_cache/flush.rs:657:5
+    |
+657 |     pub fn test_inner(&self) -> Arc<CacheInner> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `flush::<impl WriteCache<Active>>::test_inner` is reachable at visibility `pub`
+    |
+note: but type `CacheInner` is only usable at visibility `pub(crate)`
+   --> glidefs/src/block/write_cache/inner.rs:368:1
+    |
+368 | pub(crate) struct CacheInner {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: method `check_writable` is never used
+   --> glidefs/src/block/handler.rs:347:8
+    |
+237 | impl BlockHandler {
+    | ----------------- method in this implementation
+...
+347 |     fn check_writable(&self) -> CommandResult<()> {
+    |        ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `cache_dir_path` is never used
+    --> glidefs/src/block/router.rs:2001:19
+     |
+ 596 | impl ExportRouter {
+     | ----------------- method in this implementation
+...
+2001 |     pub(crate) fn cache_dir_path(&self) -> &std::path::Path {
+     |                   ^^^^^^^^^^^^^^
+
+warning: method `set_manifest_etag` is never used
+   --> glidefs/src/block/write_cache/flush.rs:358:19
+    |
+249 | impl WriteCache<Active> {
+    | ----------------------- method in this implementation
+...
+358 |     pub(crate) fn set_manifest_etag(&self, etag: Option<String>) {
+    |                   ^^^^^^^^^^^^^^^^^
+
+warning: method `as_raw_fd_for_ublk_zc` is never used
+   --> glidefs/src/block/write_cache/inner.rs:113:16
+    |
+ 60 |     impl SyncFile {
+    |     ------------- method in this implementation
+...
+113 |         pub fn as_raw_fd_for_ublk_zc(&self) -> std::os::unix::io::RawFd {
+    |                ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `fetch_single_block` is never used
+    --> glidefs/src/block/write_cache/read.rs:1011:14
+     |
+  78 | impl WriteCache<Active> {
+     | ----------------------- associated function in this implementation
+...
+1011 |     async fn fetch_single_block(
+     |              ^^^^^^^^^^^^^^^^^^
+
+warning: function `run_predecessor_handoff` is never used
+   --> glidefs/src/cli/server.rs:743:10
+    |
+743 | async fn run_predecessor_handoff(
+    |          ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `glidefs` (lib) generated 19 warnings (run `cargo fix --lib -p glidefs` to apply 1 suggestion)
+warning: unused import: `glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD`
+  --> glidefs/tests/integration/interleaving.rs:16:5
+   |
+16 | use glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `AtomicBool`
+    --> glidefs/tests/integration/interleaving.rs:1545:29
+     |
+1545 |     use std::sync::atomic::{AtomicBool, AtomicU32};
+     |                             ^^^^^^^^^^
+
+warning: unused import: `AtomicU32`
+    --> glidefs/tests/integration/interleaving.rs:1698:41
+     |
+1698 |     use std::sync::atomic::{AtomicBool, AtomicU32};
+     |                                         ^^^^^^^^^
+
+warning: unused import: `glidefs::block::cache::SimpleBlockCache`
+  --> glidefs/tests/integration/interleaving_read_flush.rs:12:5
+   |
+12 | use glidefs::block::cache::SimpleBlockCache;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `FlushStep`
+  --> glidefs/tests/integration/interleaving_read_flush.rs:16:22
+   |
+16 |     FlushSyncPoints, FlushStep,
+   |                      ^^^^^^^^^
+
+warning: unused import: `glidefs::block::handler::BlockHandler`
+   --> glidefs/tests/integration/flush_safety.rs:991:9
+    |
+991 |     use glidefs::block::handler::BlockHandler;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `cc1`
+  --> glidefs/tests/integration/interleaving.rs:88:33
+   |
+88 |     let (cache1, cs1, pic, vm1, cc1, m1) =
+   |                                 ^^^ help: if this is intentional, prefix it with an underscore: `_cc1`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m1`
+  --> glidefs/tests/integration/interleaving.rs:88:38
+   |
+88 |     let (cache1, cs1, pic, vm1, cc1, m1) =
+   |                                      ^^ help: if this is intentional, prefix it with an underscore: `_m1`
+
+warning: unused variable: `m2`
+   --> glidefs/tests/integration/interleaving.rs:104:39
+    |
+104 |     let (cache2, cs2, pic2, vm2, cc2, m2) =
+    |                                       ^^ help: if this is intentional, prefix it with an underscore: `_m2`
+
+warning: unused variable: `cc`
+   --> glidefs/tests/integration/interleaving.rs:565:30
+    |
+565 |     let (cache, cs, pic, vm, cc, _m) =
+    |                              ^^ help: if this is intentional, prefix it with an underscore: `_cc`
+
+warning: unused variable: `s3`
+   --> glidefs/tests/integration/interleaving.rs:726:51
+    |
+726 | async fn recover_cache(dir: &TempDir, name: &str, s3: Arc<dyn ObjectStore>) -> Arc<WriteCache<Active>> {
+    |                                                   ^^ help: if this is intentional, prefix it with an underscore: `_s3`
+
+warning: unused variable: `cs`
+   --> glidefs/tests/integration/interleaving.rs:915:17
+    |
+915 |     let (cache, cs, pic, vm, _cc, _m) =
+    |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `pic`
+   --> glidefs/tests/integration/interleaving.rs:915:21
+    |
+915 |     let (cache, cs, pic, vm, _cc, _m) =
+    |                     ^^^ help: if this is intentional, prefix it with an underscore: `_pic`
+
+warning: unused variable: `vm`
+   --> glidefs/tests/integration/interleaving.rs:915:26
+    |
+915 |     let (cache, cs, pic, vm, _cc, _m) =
+    |                          ^^ help: if this is intentional, prefix it with an underscore: `_vm`
+
+warning: unused variable: `cs`
+    --> glidefs/tests/integration/interleaving.rs:1243:21
+     |
+1243 |         let (cache, cs, pic, vm, _cc, _m) =
+     |                     ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `pic`
+    --> glidefs/tests/integration/interleaving.rs:1243:25
+     |
+1243 |         let (cache, cs, pic, vm, _cc, _m) =
+     |                         ^^^ help: if this is intentional, prefix it with an underscore: `_pic`
+
+warning: unused variable: `vm`
+    --> glidefs/tests/integration/interleaving.rs:1243:30
+     |
+1243 |         let (cache, cs, pic, vm, _cc, _m) =
+     |                              ^^ help: if this is intentional, prefix it with an underscore: `_vm`
+
+warning: unused variable: `cs`
+    --> glidefs/tests/integration/interleaving.rs:1338:17
+     |
+1338 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `pic`
+    --> glidefs/tests/integration/interleaving.rs:1338:21
+     |
+1338 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                     ^^^ help: if this is intentional, prefix it with an underscore: `_pic`
+
+warning: unused variable: `vm`
+    --> glidefs/tests/integration/interleaving.rs:1338:26
+     |
+1338 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                          ^^ help: if this is intentional, prefix it with an underscore: `_vm`
+
+warning: unused variable: `cs`
+    --> glidefs/tests/integration/interleaving.rs:1440:17
+     |
+1440 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `pic`
+    --> glidefs/tests/integration/interleaving.rs:1440:21
+     |
+1440 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                     ^^^ help: if this is intentional, prefix it with an underscore: `_pic`
+
+warning: unused variable: `vm`
+    --> glidefs/tests/integration/interleaving.rs:1440:26
+     |
+1440 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                          ^^ help: if this is intentional, prefix it with an underscore: `_vm`
+
+warning: unused variable: `cc`
+    --> glidefs/tests/integration/interleaving.rs:1480:33
+     |
+1480 |     let (cache, _cs, _pic, _vm, cc, m) =
+     |                                 ^^ help: if this is intentional, prefix it with an underscore: `_cc`
+
+warning: unused variable: `m`
+    --> glidefs/tests/integration/interleaving.rs:1480:37
+     |
+1480 |     let (cache, _cs, _pic, _vm, cc, m) =
+     |                                     ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: unused variable: `cc`
+    --> glidefs/tests/integration/interleaving.rs:1522:30
+     |
+1522 |     let (cache, cs, pic, vm, cc, m) =
+     |                              ^^ help: if this is intentional, prefix it with an underscore: `_cc`
+
+warning: unused variable: `m`
+    --> glidefs/tests/integration/interleaving.rs:1522:34
+     |
+1522 |     let (cache, cs, pic, vm, cc, m) =
+     |                                  ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: unused variable: `cs`
+    --> glidefs/tests/integration/interleaving.rs:2114:17
+     |
+2114 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `cs`
+    --> glidefs/tests/integration/interleaving.rs:2188:17
+     |
+2188 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `stats`
+    --> glidefs/tests/integration/interleaving.rs:2237:10
+     |
+2237 |     let (stats, _) = flush_handle.await.unwrap().unwrap();
+     |          ^^^^^ help: if this is intentional, prefix it with an underscore: `_stats`
+
+warning: unused variable: `cs`
+    --> glidefs/tests/integration/interleaving.rs:2259:17
+     |
+2259 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `pic`
+    --> glidefs/tests/integration/interleaving.rs:2259:21
+     |
+2259 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                     ^^^ help: if this is intentional, prefix it with an underscore: `_pic`
+
+warning: unused variable: `vm`
+    --> glidefs/tests/integration/interleaving.rs:2259:26
+     |
+2259 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                          ^^ help: if this is intentional, prefix it with an underscore: `_vm`
+
+warning: unused variable: `cs`
+    --> glidefs/tests/integration/interleaving.rs:2567:17
+     |
+2567 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `cs`
+    --> glidefs/tests/integration/interleaving.rs:2621:17
+     |
+2621 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `cs`
+    --> glidefs/tests/integration/interleaving.rs:2677:17
+     |
+2677 |     let (cache, cs, pic, vm, _cc, _m) =
+     |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `cs`
+  --> glidefs/tests/integration/interleaving_read_flush.rs:31:17
+   |
+31 |     let (cache, cs, pic, vm, cc, m) =
+   |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `m`
+  --> glidefs/tests/integration/interleaving_read_flush.rs:31:34
+   |
+31 |     let (cache, cs, pic, vm, cc, m) =
+   |                                  ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: unused variable: `cs`
+   --> glidefs/tests/integration/interleaving_read_flush.rs:100:17
+    |
+100 |     let (cache, cs, pic, vm, cc, m) =
+    |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `m`
+   --> glidefs/tests/integration/interleaving_read_flush.rs:100:34
+    |
+100 |     let (cache, cs, pic, vm, cc, m) =
+    |                                  ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: unused variable: `cs2`
+   --> glidefs/tests/integration/interleaving_read_flush.rs:185:18
+    |
+185 |     let (cache2, cs2, pic2, vm2, cc2, m2) =
+    |                  ^^^ help: if this is intentional, prefix it with an underscore: `_cs2`
+
+warning: unused variable: `m2`
+   --> glidefs/tests/integration/interleaving_read_flush.rs:185:39
+    |
+185 |     let (cache2, cs2, pic2, vm2, cc2, m2) =
+    |                                       ^^ help: if this is intentional, prefix it with an underscore: `_m2`
+
+warning: unused variable: `cs`
+   --> glidefs/tests/integration/interleaving_read_flush.rs:286:17
+    |
+286 |     let (cache, cs, pic, vm, _cc, _m) =
+    |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `cs`
+   --> glidefs/tests/integration/interleaving_read_flush.rs:559:17
+    |
+559 |     let (cache, cs, pic, vm, _cc, _m) =
+    |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `cs`
+   --> glidefs/tests/integration/interleaving_read_flush.rs:610:17
+    |
+610 |     let (cache, cs, pic, vm, cc, m) =
+    |                 ^^ help: if this is intentional, prefix it with an underscore: `_cs`
+
+warning: unused variable: `m`
+   --> glidefs/tests/integration/interleaving_read_flush.rs:610:34
+    |
+610 |     let (cache, cs, pic, vm, cc, m) =
+    |                                  ^ help: if this is intentional, prefix it with an underscore: `_m`
+
+warning: method `total_bytes` is never used
+   --> glidefs/tests/integration/boot_replay.rs:353:8
+    |
+348 | impl TrialResult {
+    | ---------------- method in this implementation
+...
+353 |     fn total_bytes(&self) -> u64 {
+    |        ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::io::Write`
+ --> glidefs/src/bin/test_lseek.rs:3:5
+  |
+3 | use std::io::Write;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `glidefs` (test "integration") generated 47 warnings (run `cargo fix --test "integration" -p glidefs` to apply 46 suggestions)
+warning: `glidefs` (bin "test_lseek") generated 1 warning
+warning: field `zero_blocks` is never read
+   --> glidefs/src/bin/oci_dedup_measure.rs:151:5
+    |
+145 | struct ImageBlocks {
+    |        ----------- field in this struct
+...
+151 |     zero_blocks: usize,
+    |     ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `glidefs` (bin "oci_dedup_measure") generated 1 warning
+warning: unused imports: `FlushGateEvent`, `FlushStep`, `FlushSyncPoints`, `PromoteGateEvent`, `PromoteStep`, `PromoteSyncPoints`, `ReadGateEvent`, `ReadStep`, and `ReadSyncPoints`
+  --> glidefs/src/block/write_cache/mod.rs:48:5
+   |
+48 |     FlushSyncPoints, FlushStep, FlushGateEvent,
+   |     ^^^^^^^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^^^^^
+49 |     PromoteSyncPoints, PromoteStep, PromoteGateEvent,
+   |     ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+50 |     ReadSyncPoints, ReadStep, ReadGateEvent,
+   |     ^^^^^^^^^^^^^^  ^^^^^^^^  ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Context`
+  --> glidefs/src/handoff/strategy/crh.rs:20:14
+   |
+20 | use anyhow::{Context, Result};
+   |              ^^^^^^^
+
+warning: function `run_predecessor_handoff` is never used
+   --> glidefs/src/cli/server.rs:743:10
+    |
+743 | async fn run_predecessor_handoff(
+    |          ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `new` is never used
+    --> glidefs/src/block/api.rs:1100:12
+     |
+1095 | impl ApiServer {
+     | -------------- associated function in this implementation
+...
+1100 |     pub fn new(router: Arc<ExportRouter>, addr: SocketAddr) -> Self {
+     |            ^^^
+
+warning: method `advance_to` is never used
+   --> glidefs/src/block/block_map.rs:732:12
+    |
+682 | impl SequenceNumber {
+    | ------------------- method in this implementation
+...
+732 |     pub fn advance_to(&self, target: u64) {
+    |            ^^^^^^^^^^
+
+warning: variant `Frozen` is never constructed
+  --> glidefs/src/block/error.rs:47:5
+   |
+31 | pub enum CommandError {
+   |          ------------ variant in this enum
+...
+47 |     Frozen,
+   |     ^^^^^^
+   |
+   = note: `CommandError` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: variant `PostFetchRecheck` is never constructed
+  --> glidefs/src/block/handler.rs:45:5
+   |
+39 | pub enum BackfillStep {
+   |          ------------ variant in this enum
+...
+45 |     PostFetchRecheck,
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `BackfillStep` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `writer_id`, `step`, `block_idx`, and `block_state` are never read
+  --> glidefs/src/block/handler.rs:58:9
+   |
+57 | pub struct BackfillEvent {
+   |            ------------- fields in this struct
+58 |     pub writer_id: u64,
+   |         ^^^^^^^^^
+59 |     pub step: BackfillStep,
+   |         ^^^^
+60 |     pub block_idx: usize,
+   |         ^^^^^^^^^
+61 |     /// Block state at the time of the event.
+62 |     pub block_state: u8,
+   |         ^^^^^^^^^^^
+   |
+   = note: `BackfillEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: associated items `new` and `release` are never used
+   --> glidefs/src/block/handler.rs:86:12
+    |
+ 84 | impl BackfillSyncPoints {
+    | ----------------------- associated items in this implementation
+ 85 |     /// Create a new sync point controller. Returns (controller, event_receiver).
+ 86 |     pub fn new() -> (
+    |            ^^^
+...
+108 |     pub fn release(&self, writer_id: u64) {
+    |            ^^^^^^^
+
+warning: methods `with_backfill_sync`, `is_degraded`, `check_writable`, `is_frozen`, `block_size`, and `metrics` are never used
+    --> glidefs/src/block/handler.rs:286:12
+     |
+ 237 | impl BlockHandler {
+     | ----------------- methods in this implementation
+...
+ 286 |     pub fn with_backfill_sync(mut self, sync: Arc<BackfillSyncPoints>) -> Self {
+     |            ^^^^^^^^^^^^^^^^^^
+...
+ 309 |     pub fn is_degraded(&self) -> bool {
+     |            ^^^^^^^^^^^
+...
+ 347 |     fn check_writable(&self) -> CommandResult<()> {
+     |        ^^^^^^^^^^^^^^
+...
+ 359 |     pub fn is_frozen(&self) -> bool {
+     |            ^^^^^^^^^
+...
+ 389 |     pub fn block_size(&self) -> usize {
+     |            ^^^^^^^^^^
+...
+1573 |     pub fn metrics(&self) -> &ExportMetrics {
+     |            ^^^^^^^
+
+warning: method `head_chunk_pack` is never used
+   --> glidefs/src/block/content_store.rs:509:18
+    |
+ 66 | impl ContentStore {
+    | ----------------- method in this implementation
+...
+509 |     pub async fn head_chunk_pack(
+    |                  ^^^^^^^^^^^^^^^
+
+warning: method `set_manifest_pending` is never used
+   --> glidefs/src/block/metrics.rs:533:12
+    |
+399 | impl ExportMetrics {
+    | ------------------ method in this implementation
+...
+533 |     pub fn set_manifest_pending(&self, pending: bool) {
+    |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `NBD_FLAG_SEND_TRIM` is never used
+  --> glidefs/src/block/protocol.rs:22:11
+   |
+22 | pub const NBD_FLAG_SEND_TRIM: u16 = 1 << 5;
+   |           ^^^^^^^^^^^^^^^^^^
+
+warning: methods `cache_dir_path`, `shutdown_devices`, and `stop_flush_schedulers` are never used
+    --> glidefs/src/block/router.rs:2001:19
+     |
+ 596 | impl ExportRouter {
+     | ----------------- methods in this implementation
+...
+2001 |     pub(crate) fn cache_dir_path(&self) -> &std::path::Path {
+     |                   ^^^^^^^^^^^^^^
+...
+2124 |     pub async fn shutdown_devices(&self) -> Result<(), RouterError> {
+     |                  ^^^^^^^^^^^^^^^^
+...
+2701 |     pub async fn stop_flush_schedulers(&self) {
+     |                  ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated functions `new_tcp` and `new_unix` are never used
+   --> glidefs/src/block/server.rs:211:12
+    |
+204 | impl NBDServer {
+    | -------------- associated functions in this implementation
+...
+211 |     pub fn new_tcp(router: Arc<ExportRouter>, socket: SocketAddr) -> Self {
+    |            ^^^^^^^
+...
+254 |     pub fn new_unix(router: Arc<ExportRouter>, socket_path: impl Into<std::path::PathBuf>) -> Self {
+    |            ^^^^^^^^
+
+warning: fields `crc_entries_drained` and `crc_unique_blocks` are never read
+  --> glidefs/src/block/write_cache/mod.rs:77:9
+   |
+55 | pub struct FlushStats {
+   |            ---------- fields in this struct
+...
+77 |     pub crc_entries_drained: usize,
+   |         ^^^^^^^^^^^^^^^^^^^
+...
+80 |     pub crc_unique_blocks: usize,
+   |         ^^^^^^^^^^^^^^^^^
+   |
+   = note: `FlushStats` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: multiple methods are never used
+   --> glidefs/src/block/write_cache/flush.rs:267:12
+    |
+249 | impl WriteCache<Active> {
+    | ----------------------- methods in this implementation
+...
+267 |     pub fn set_readahead_window_bytes(&self, bytes: u32) {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+306 |     pub fn pending_crc_count(&self) -> usize {
+    |            ^^^^^^^^^^^^^^^^^
+...
+358 |     pub(crate) fn set_manifest_etag(&self, etag: Option<String>) {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+374 |     pub fn replay_wal_tail(&self) -> Result<usize, super::CacheError> {
+    |            ^^^^^^^^^^^^^^^
+...
+454 |     pub fn recover_pending_flush_file(&self) -> Result<usize, super::CacheError> {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+651 |     pub fn test_rotate_and_snapshot(&self) -> Result<Vec<usize>, CacheError> {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+657 |     pub fn test_inner(&self) -> Arc<CacheInner> {
+    |            ^^^^^^^^^^
+...
+663 |     pub fn transition_syncing_to_not_present(&self, block_idx: usize) -> bool {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+669 |     pub fn set_flush_sync(&self, sp: std::sync::Arc<super::inner::FlushSyncPoints>) {
+    |            ^^^^^^^^^^^^^^
+...
+675 |     pub fn set_promote_sync(&self, sp: std::sync::Arc<super::inner::PromoteSyncPoints>) {
+    |            ^^^^^^^^^^^^^^^^
+...
+681 |     pub fn set_read_sync(&self, sp: std::sync::Arc<super::inner::ReadSyncPoints>) {
+    |            ^^^^^^^^^^^^^
+
+warning: fields `step` and `block_count` are never read
+   --> glidefs/src/block/write_cache/inner.rs:555:9
+    |
+554 | pub struct FlushGateEvent {
+    |            -------------- fields in this struct
+555 |     pub step: FlushStep,
+    |         ^^^^
+556 |     pub block_count: usize,
+    |         ^^^^^^^^^^^
+    |
+    = note: `FlushGateEvent` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: associated function `new` is never used
+   --> glidefs/src/block/write_cache/inner.rs:561:12
+    |
+560 | impl FlushSyncPoints {
+    | -------------------- associated function in this implementation
+561 |     pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<FlushGateEvent>, tokio::sync::mpsc::UnboundedSender<()>) {
+    |            ^^^
+
+warning: fields `step` and `block_idx` are never read
+   --> glidefs/src/block/write_cache/inner.rs:591:9
+    |
+590 | pub struct PromoteGateEvent {
+    |            ---------------- fields in this struct
+591 |     pub step: PromoteStep,
+    |         ^^^^
+592 |     pub block_idx: usize,
+    |         ^^^^^^^^^
+    |
+    = note: `PromoteGateEvent` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: variants `AfterRecheck` and `BeforePread` are never constructed
+   --> glidefs/src/block/write_cache/inner.rs:606:5
+    |
+604 | pub enum ReadStep {
+    |          -------- variants in this enum
+605 |     AfterStateCheck,   // R3: after locate_block state check
+606 |     AfterRecheck,      // R4: after sync_read_local_block re-check
+    |     ^^^^^^^^^^^^
+607 |     BeforePread,       // R2/R5: before pread from active or flushing file
+    |     ^^^^^^^^^^^
+    |
+    = note: `ReadStep` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `step`, `block_idx`, and `block_state` are never read
+   --> glidefs/src/block/write_cache/inner.rs:613:9
+    |
+612 | pub struct ReadGateEvent {
+    |            ------------- fields in this struct
+613 |     pub step: ReadStep,
+    |         ^^^^
+614 |     pub block_idx: usize,
+    |         ^^^^^^^^^
+615 |     pub block_state: u8,
+    |         ^^^^^^^^^^^
+    |
+    = note: `ReadGateEvent` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: associated function `new` is never used
+   --> glidefs/src/block/write_cache/inner.rs:620:12
+    |
+619 | impl ReadSyncPoints {
+    | ------------------- associated function in this implementation
+620 |     pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<ReadGateEvent>, tokio::sync::mpsc::UnboundedSender<()>) {
+    |            ^^^
+
+warning: associated function `new` is never used
+   --> glidefs/src/block/write_cache/inner.rs:634:12
+    |
+633 | impl PromoteSyncPoints {
+    | ---------------------- associated function in this implementation
+634 |     pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<PromoteGateEvent>, std::sync::mpsc::SyncSender<()>) {
+    |            ^^^
+
+warning: method `shutdown` is never used
+   --> glidefs/src/block/nbd/mod.rs:449:18
+    |
+ 72 | impl NbdDeviceManager {
+    | --------------------- method in this implementation
+...
+449 |     pub async fn shutdown(self) -> anyhow::Result<()> {
+    |                  ^^^^^^^^
+
+warning: field `digest` is never read
+  --> glidefs/src/oci/layer_store.rs:58:9
+   |
+57 | pub struct StoredLayer {
+   |            ----------- field in this struct
+58 |     pub digest: String,
+   |         ^^^^^^
+   |
+   = note: `StoredLayer` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: function `panic_count` is never used
+  --> glidefs/src/task.rs:34:8
+   |
+34 | pub fn panic_count() -> u64 {
+   |        ^^^^^^^^^^^
+
+warning: methods `get_handler_sync`, `take_ublk_server`, and `recover_handoff_devices` are never used
+   --> glidefs/src/handoff/coordinator.rs:52:12
+    |
+ 34 | impl HandoffCoordinator {
+    | ----------------------- methods in this implementation
+...
+ 52 |     pub fn get_handler_sync(&self, name: &str) -> Option<Arc<BlockHandler>> {
+    |            ^^^^^^^^^^^^^^^^
+...
+410 |     pub async fn take_ublk_server(&self) -> Result<(), RouterError> {
+    |                  ^^^^^^^^^^^^^^^^
+...
+414 |     pub async fn recover_handoff_devices(
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `len` and `is_empty` are never used
+  --> glidefs/src/handoff/listener_registry.rs:70:12
+   |
+45 | impl ListenerRegistry {
+   | --------------------- methods in this implementation
+...
+70 |     pub fn len(&self) -> usize {
+   |            ^^^
+...
+75 |     pub fn is_empty(&self) -> bool {
+   |            ^^^^^^^^
+
+warning: multiple variants are never constructed
+  --> glidefs/src/handoff/metrics.rs:21:5
+   |
+19 | pub enum HandoffOutcomeKind {
+   |          ------------------ variants in this enum
+20 |     Succeeded,
+21 |     AbortedVersionMismatch,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+22 |     AbortedNoCommonStrategy,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+23 |     AbortedExportMismatch,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+24 |     AbortedWarmingFailed,
+   |     ^^^^^^^^^^^^^^^^^^^^
+25 |     AbortedFreezeFailed,
+   |     ^^^^^^^^^^^^^^^^^^^
+26 |     AbortedOther,
+   |     ^^^^^^^^^^^^
+27 |     RevivedAfterSuccessorCrash,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+28 |     RevivedAfterTimeout,
+   |     ^^^^^^^^^^^^^^^^^^^
+29 |     Failed,
+   |     ^^^^^^
+   |
+   = note: `HandoffOutcomeKind` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: fields `recovered_count` and `duration` are never read
+  --> glidefs/src/handoff/predecessor.rs:42:17
+   |
+42 |     Succeeded { recovered_count: usize, duration: std::time::Duration },
+   |     ---------   ^^^^^^^^^^^^^^^         ^^^^^^^^
+   |     |
+   |     fields in this variant
+   |
+   = note: `HandoffOutcome` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `reason` and `duration` are never read
+  --> glidefs/src/handoff/predecessor.rs:44:15
+   |
+44 |     Aborted { reason: String, duration: std::time::Duration },
+   |     -------   ^^^^^^          ^^^^^^^^
+   |     |
+   |     fields in this variant
+   |
+   = note: `HandoffOutcome` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `duration` is never read
+  --> glidefs/src/handoff/predecessor.rs:46:32
+   |
+46 |     RevivedFromFailedHandoff { duration: std::time::Duration },
+   |     ------------------------   ^^^^^^^^
+   |     |
+   |     field in this variant
+   |
+   = note: `HandoffOutcome` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `coord` is never read
+  --> glidefs/src/handoff/strategy/mod.rs:45:9
+   |
+43 | pub struct PredecessorCutoverCtx {
+   |            --------------------- field in this struct
+44 |     /// Same as the Linux variant minus the ublk-specific fields.
+45 |     pub coord: Arc<crate::handoff::HandoffCoordinator>,
+   |         ^^^^^
+
+warning: fields `coord` and `exports` are never read
+  --> glidefs/src/handoff/strategy/mod.rs:52:9
+   |
+49 | pub struct SuccessorTakeoverCtx {
+   |            -------------------- fields in this struct
+...
+52 |     pub coord: Arc<crate::handoff::HandoffCoordinator>,
+   |         ^^^^^
+...
+55 |     pub exports: Vec<ExportSnapshot>,
+   |         ^^^^^^^
+
+warning: method `get_handler` is never used
+  --> glidefs/src/handoff/strategy/mod.rs:94:8
+   |
+67 | pub trait CutoverStrategy: Send + Sync {
+   |           --------------- method in this trait
+...
+94 |     fn get_handler(
+   |        ^^^^^^^^^^^
+
+warning: fields `coord` and `recovered_count` are never read
+  --> glidefs/src/handoff/successor.rs:36:9
+   |
+35 | pub struct TakeoverResult {
+   |            -------------- fields in this struct
+36 |     pub coord: Arc<HandoffCoordinator>,
+   |         ^^^^^
+37 |     pub recovered_count: usize,
+   |         ^^^^^^^^^^^^^^^
+
+warning: `glidefs` (bin "glidefs") generated 50 warnings (13 duplicates) (run `cargo fix --bin "glidefs" -p glidefs` to apply 2 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running tests/integration/mod.rs (target/debug/deps/integration-253bde3682bc827d)
+
+running 1 test
+
+=== Boot-set cold-replay study (n=25/arm) ===
+
+-- scatter_stride=1 rtt=5ms --
+  demand-only      boot p50=  245.7ms p95=  250.0ms  gets(med)=   32
+  readahead(32M)   boot p50=   49.4ms p95=   49.7ms  gets(med)=    1
+  boot-set         boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-49.2ms
+
+-- scatter_stride=1 rtt=20ms --
+  demand-only      boot p50=  727.4ms p95=  730.9ms  gets(med)=   32
+  readahead(32M)   boot p50=   64.4ms p95=   64.9ms  gets(med)=    1
+  boot-set         boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.3ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-64.3ms
+test boot_replay::full_study has been running for over 60 seconds
+
+-- scatter_stride=1 rtt=40ms --
+  demand-only      boot p50= 1368.4ms p95= 1370.8ms  gets(med)=   32
+  readahead(32M)   boot p50=   84.5ms p95=   85.0ms  gets(med)=    1
+  boot-set         boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-84.4ms
+
+-- scatter_stride=8 rtt=5ms --
+  demand-only      boot p50=  245.1ms p95=  247.0ms  gets(med)=   32
+  readahead(32M)   boot p50=   49.3ms p95=   49.6ms  gets(med)=    1
+  boot-set         boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-49.1ms
+
+-- scatter_stride=8 rtt=20ms --
+  demand-only      boot p50=  726.4ms p95=  731.5ms  gets(med)=   32
+  readahead(32M)   boot p50=   64.4ms p95=   64.8ms  gets(med)=    1
+  boot-set         boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.3ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-64.3ms
+
+-- scatter_stride=8 rtt=40ms --
+  demand-only      boot p50= 1368.0ms p95= 1371.4ms  gets(med)=   32
+  readahead(32M)   boot p50=   84.5ms p95=   84.9ms  gets(med)=    1
+  boot-set         boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-84.3ms
+
+-- scatter_stride=1024 rtt=5ms --
+  demand-only      boot p50=  245.0ms p95=  249.3ms  gets(med)=   32
+  readahead(32M)   boot p50=  245.6ms p95=  251.9ms  gets(med)=   32
+  boot-set         boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=   32
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-245.5ms
+
+-- scatter_stride=1024 rtt=20ms --
+  demand-only      boot p50=  726.6ms p95=  732.1ms  gets(med)=   32
+  readahead(32M)   boot p50=  725.9ms p95=  729.8ms  gets(med)=   32
+  boot-set         boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=   32
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-725.7ms
+
+-- scatter_stride=1024 rtt=40ms --
+  demand-only      boot p50= 1367.6ms p95= 1369.6ms  gets(med)=   32
+  readahead(32M)   boot p50= 1368.4ms p95= 1370.3ms  gets(med)=   32
+  boot-set         boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=   32
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-1368.2ms
+test boot_replay::full_study ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 221 filtered out; finished in 266.71s
+
