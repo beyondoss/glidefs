@@ -1365,8 +1365,17 @@ impl WriteCache<Active> {
         metrics: &super::super::metrics::ExportMetrics,
     ) {
         use futures::stream::{self, StreamExt};
-        const CONCURRENCY: usize = 64; // overlap the scattered runs
+        const CONCURRENCY: usize = 128; // overlap the runs; the warm is I/O-bound
         const MAX_WARM_BLOCKS: usize = 8192; // 1 GiB ceiling; preserves lazy tail
+        // Gap-coalescing knob: merge runs separated by <= MAX_GAP blocks into one
+        // range GET, trading the gap's bytes for a saved round-trip. MEASURED
+        // net-NEGATIVE at this concurrency: a real boot set is ~50-70 runs < 128,
+        // so it already warms in ONE concurrency wave (1 RTT) — merging can't save
+        // a wave, it only adds gap bytes (ext4 python: 69→21 GETs but 7.3→14.9
+        // MiB → 113→189 ms). So keep it 0 (exact, zero over-fetch); concurrency,
+        // not coalescing, hides the round-trips. Only worth >0 if a boot set ever
+        // exceeds CONCURRENCY runs (then fewer-but-fatter GETs cut wave count).
+        const MAX_GAP: u64 = 0;
 
         let mut sorted: Vec<u64> = blocks.to_vec();
         sorted.sort_unstable();
@@ -1376,16 +1385,20 @@ impl WriteCache<Active> {
             sorted.truncate(MAX_WARM_BLOCKS);
         }
 
-        // Coalesce sorted blocks into contiguous [start, count) runs.
+        // Coalesce sorted blocks into [start, span) runs, joining runs whose gap
+        // is <= MAX_GAP. `span` includes the merged gaps; prefetch_run fetches the
+        // written ones and skips holes.
         let mut runs: Vec<(u64, usize)> = Vec::new();
         let mut i = 0;
         while i < sorted.len() {
             let start = sorted[i];
+            let mut end = sorted[i];
             let mut j = i + 1;
-            while j < sorted.len() && sorted[j] == sorted[j - 1] + 1 {
+            while j < sorted.len() && sorted[j] <= end + MAX_GAP + 1 {
+                end = sorted[j];
                 j += 1;
             }
-            runs.push((start, j - i));
+            runs.push((start, (end - start + 1) as usize));
             i = j;
         }
 
