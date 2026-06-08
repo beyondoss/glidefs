@@ -2362,6 +2362,81 @@ async fn test_promote_syncing_blocks_silent_skip_when_ff_none() {
     drop(df);
 }
 
+/// Regression test for the stale-promote data-loss race.
+///
+/// The flushing file is an authoritative data source ONLY for SYNCING blocks
+/// (claimed by the CURRENT flush's rotation). A block evicted by an EARLIER
+/// flush is NOT_PRESENT with its real data in S3, and the *current* flushing
+/// file holds only sparse zeros at its offset. `promote_syncing_blocks` used to
+/// promote those zeros into the active file and mark the block DIRTY — masking
+/// the real data, which the next flush then packed as zeros (a cold-read-as-zero
+/// corruption that `fio --verify` and fsck catch). Found via
+/// `fio_verify_random_cold_wake` (failing block hit this path 3×); that test
+/// only reproduces probabilistically, so this pins the exact interleaving.
+///
+/// Unlike `test_promote_syncing_blocks_silent_skip_when_ff_none` (flushing file
+/// GONE), here the flushing file EXISTS but does not contain the block's data.
+#[tokio::test]
+async fn test_promote_does_not_zero_not_present_when_ff_stale() {
+    let block_size = 128 * 1024usize;
+    // 2 blocks: block 0 is the victim, block 1 only exists to produce a fresh
+    // flushing generation that does NOT contain block 0's data.
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    // Block 0 gets real data, is flushed (rotated → SYNCING), then evicted to
+    // NOT_PRESENT (its data now "in S3"); the flushing file from that generation
+    // is checkpointed away — exactly the post-flush steady state.
+    h.cache.write(0, &vec![0xAA_u8; block_size]).unwrap();
+    let snap = h.cache.rotate_and_snapshot().unwrap();
+    assert_eq!(snap, vec![0]);
+    assert!(h.cache.inner.transition_syncing_to_not_present(0));
+    h.cache.inner.flushing_active.store(false, Ordering::Release);
+    drop(h.cache.inner.flushing_file.lock().take());
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::NOT_PRESENT);
+
+    // A NEW flush begins on an unrelated block: block 1 is written and rotated.
+    // The resulting flushing file holds 0xBB at block 1 and SPARSE ZEROS at
+    // block 0 — block 0 was not part of this generation.
+    h.cache.write(block_size as u64, &vec![0xBB_u8; block_size]).unwrap();
+    let snap2 = h.cache.rotate_and_snapshot().unwrap();
+    assert_eq!(snap2, vec![1], "only block 1 is claimed by this flush");
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::NOT_PRESENT);
+    assert!(h.cache.inner.flushing_file.lock().is_some(), "flushing file exists");
+
+    // require_promotion=true (the ublk backfill safety net): promote must NOT
+    // trust the stale zeros — it must return BlockEvicted so the caller refetches
+    // block 0 from S3, the authoritative source.
+    {
+        let df = h.cache.inner.data_file.read();
+        let result = h.cache.inner.promote_syncing_blocks(&df, 0, 0, true);
+        assert!(
+            matches!(result, Err(super::CacheError::BlockEvicted)),
+            "stale NOT_PRESENT promote (zeros in flushing) must return BlockEvicted, got: {result:?}"
+        );
+        // The block must NOT have been claimed DIRTY with zeros.
+        assert_eq!(
+            h.cache.inner.state_map.get(0),
+            SparseBlockState::NOT_PRESENT,
+            "block 0 must stay NOT_PRESENT — not promoted-to-zeros"
+        );
+    }
+
+    // require_promotion=false (plain write path): promote must skip block 0
+    // (leave it NOT_PRESENT) rather than write zeros + mark it DIRTY.
+    {
+        let df = h.cache.inner.data_file.read();
+        let result = h.cache.inner.promote_syncing_blocks(&df, 0, 0, false);
+        assert!(result.is_ok(), "require_promotion=false must skip, not error");
+        assert_eq!(
+            h.cache.inner.state_map.get(0),
+            SparseBlockState::NOT_PRESENT,
+            "block 0 must stay NOT_PRESENT — promote must not zero+claim it"
+        );
+        // Active file at block 0 must not have been overwritten with zeros and
+        // claimed; it stays sparse and the block is still recoverable from S3.
+    }
+}
+
 /// Regression test: post-rotation zero-write must survive crash recovery.
 ///
 /// Scenario:

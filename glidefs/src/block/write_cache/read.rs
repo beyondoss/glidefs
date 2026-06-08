@@ -862,9 +862,16 @@ impl WriteCache<Active> {
                     metrics,
                 )
                 .await?;
-                Ok(fetched
-                    .remove(&0)
-                    .unwrap_or_else(|| self.inner.zero_block_bytes.clone()))
+                // fetch_with_window always returns the requested block or errors
+                // (every leftover goes through fetch_coalesced, which is
+                // complete-or-Err). A missing entry would be a logic bug — fail
+                // loud (the kernel retries the I/O) rather than silently serving
+                // zeros, which a guest reads as data corruption.
+                fetched.remove(&0).ok_or_else(|| {
+                    CacheError::DecompressFailed(format!(
+                        "resolve_block: fetch returned no data for block {block_index}"
+                    ))
+                })
             }
         }
     }

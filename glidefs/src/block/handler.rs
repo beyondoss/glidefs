@@ -209,10 +209,30 @@ pub struct BlockHandler {
     /// Optional write trace recorder. Zero cost when None.
     write_tracer: Option<Arc<WriteTracer>>,
 
+    /// Per-block write serialization (sharded async locks).
+    ///
+    /// ublk runs multiple I/O queues, so a single guest's sub-block (4 KiB)
+    /// writes to ONE 128 KiB block are dispatched CONCURRENTLY across queues —
+    /// i.e. multiple `backfill_and_write` calls run on the same block at once.
+    /// Without serialization, two backfill→merge→write sequences to the same
+    /// block race: each reads/reconstructs the full block and writes it, and the
+    /// later pwrite clobbers the other's pages (a data-loss class proven by the
+    /// stateright model — `stateright-model/src/faithful.rs`). Holding the
+    /// block's shard lock across the whole read-modify-write serializes
+    /// same-block writes while leaving DIFFERENT-block writes fully parallel
+    /// (sharded by block index). The shard count >> queue count, so collisions
+    /// between unrelated blocks are rare.
+    block_write_locks: Box<[tokio::sync::Mutex<()>]>,
+
     /// Test-only: sync points for deterministic interleaving tests.
     #[cfg(feature = "test-utils")]
     backfill_sync: Option<Arc<BackfillSyncPoints>>,
 }
+
+/// Number of shards for per-block write serialization. Power of two so the
+/// shard index is a cheap mask. Far larger than any realistic ublk queue count,
+/// so two distinct blocks rarely contend.
+const WRITE_LOCK_SHARDS: usize = 2048;
 
 impl BlockHandler {
     /// Create a new block handler.
@@ -253,6 +273,9 @@ impl BlockHandler {
             flush_notify,
             flush_threshold,
             write_tracer,
+            block_write_locks: (0..WRITE_LOCK_SHARDS)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
             #[cfg(feature = "test-utils")]
             backfill_sync: None,
         }
@@ -895,6 +918,29 @@ impl BlockHandler {
         Ok(length as usize)
     }
 
+    /// Acquire the per-block write locks covering `[start_block, end_block]`.
+    ///
+    /// Shards are acquired in ascending order so two writers whose ranges share
+    /// a block serialize on that block's shard without any lock-ordering
+    /// deadlock. Single-block writes (the ublk common case) take exactly one
+    /// lock. The guards must be held across the entire read-modify-write.
+    async fn lock_write_range(
+        &self,
+        start_block: u64,
+        end_block: u64,
+    ) -> Vec<tokio::sync::MutexGuard<'_, ()>> {
+        let mut shards: Vec<usize> = (start_block..=end_block)
+            .map(|b| (b as usize) & (WRITE_LOCK_SHARDS - 1))
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        let mut guards = Vec::with_capacity(shards.len());
+        for shard in shards {
+            guards.push(self.block_write_locks[shard].lock().await);
+        }
+        guards
+    }
+
     /// Write data to the cache.
     ///
     /// Writes go to local SSD immediately. S3 sync happens in background.
@@ -932,6 +978,17 @@ impl BlockHandler {
         }
 
         self.metrics.record_guest_write(data.len() as u64);
+
+        // Serialize concurrent writes to the same block(s) for the whole
+        // read-modify-write. ublk dispatches one guest's sub-block writes to a
+        // single block across multiple queues concurrently; without this lock
+        // two backfill→merge→write sequences race and clobber each other's pages
+        // (stateright-verified). Different blocks hash to different shards and
+        // stay parallel. Held until the end of `write()`.
+        let block_size = self.cache.block_size() as u64;
+        let start_block = offset / block_size;
+        let end_block = (offset + data.len() as u64 - 1) / block_size;
+        let _write_guards = self.lock_write_range(start_block, end_block).await;
 
         // Backfill NOT_PRESENT blocks that receive sub-block writes.
         //

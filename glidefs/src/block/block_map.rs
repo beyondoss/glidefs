@@ -927,6 +927,32 @@ mod tests {
     static ZERO_BLOCK_HASH_128K: LazyLock<Blake3Hash> =
         LazyLock::new(|| blake3_128(&[0u8; 131072]));
 
+    /// zstd_decompress must byte-exactly reproduce the input across the sizes the
+    /// pack-index Code path (level-1 bulk compress) actually uses, and agree with
+    /// the stock `zstd::bulk::decompress`. A short/wrong decode here silently
+    /// drops pack-index entries (no hash check on the index) → blocks read as zero.
+    #[test]
+    fn zstd_decompress_roundtrips_all_sizes() {
+        for &size in &[0usize, 1, 7, 31, 64, 100, 1000, 4096, 32 * 1024, 200 * 1024, 1024 * 1024] {
+            // Deterministic mixed-entropy payload (like extent-encoded indices).
+            let mut x: u64 = 0x1234_5678 ^ size as u64 | 1;
+            let raw: Vec<u8> = (0..size)
+                .map(|i| {
+                    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                    if i % 5 == 0 { 0 } else { (x >> 24) as u8 }
+                })
+                .collect();
+            let compressed = zstd::bulk::compress(&raw, 1).unwrap();
+            let out = zstd_decompress(&compressed, 1024 * 1024)
+                .unwrap_or_else(|e| panic!("size {size}: zstd_decompress errored: {e}"));
+            assert_eq!(out.len(), raw.len(), "size {size}: length mismatch");
+            assert_eq!(out, raw, "size {size}: content mismatch");
+            // Must agree with the stock decompressor it replaced.
+            let stock = zstd::bulk::decompress(&compressed, 1024 * 1024).unwrap();
+            assert_eq!(out, stock, "size {size}: disagrees with zstd::bulk::decompress");
+        }
+    }
+
     #[test]
     fn test_blake3_deterministic() {
         let data = b"the quick brown fox jumps over the lazy dog";

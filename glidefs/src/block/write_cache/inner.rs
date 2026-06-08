@@ -1022,6 +1022,35 @@ impl CacheInner {
                 // bytes of the sibling's WRITE_FIXED.
                 ff.read_exact_at(&mut buf[..valid], offset)?;
 
+                // The flushing file is only an authoritative data source for
+                // SYNCING blocks — those were claimed (DIRTY→SYNCING) by the
+                // CURRENT flush's rotation, so their bytes are in it. A
+                // NOT_PRESENT block is different: it may have been evicted by an
+                // EARLIER flush, in which case its real data is in S3 and THIS
+                // flushing generation holds only sparse zeros at its offset.
+                // Promoting those zeros into the active file masks the real data,
+                // and the next flush packs the zeros — silent data loss (a
+                // cold-read-as-zero that fsck/CRC verify catches as corruption).
+                //
+                // So never promote a NOT_PRESENT block whose flushing-file data is
+                // all zeros: its bytes aren't reliably here. Route the caller to
+                // the S3 backfill path (BlockEvicted), which fetches the
+                // authoritative block — the evicting flush uploaded its pack and
+                // recorded it in the manifest before transitioning it to
+                // NOT_PRESENT, so S3 has the current data (zero or not). A
+                // genuinely-zero just-evicted block costs one redundant S3 fetch;
+                // a stale one is rescued from corruption.
+                if state == SparseBlockState::NOT_PRESENT
+                    && buf[..valid].iter().all(|&b| b == 0)
+                {
+                    if require_promotion {
+                        return Err(super::CacheError::BlockEvicted);
+                    }
+                    // Best-effort (plain write): leave NOT_PRESENT so set_present
+                    // + the caller's write reconstruct it; don't write zeros.
+                    continue;
+                }
+
                 #[cfg(feature = "test-utils")]
                 {
                     let sp = self.promote_sync.lock().clone();
