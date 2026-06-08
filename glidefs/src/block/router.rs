@@ -1309,11 +1309,40 @@ impl ExportRouter {
                 volume_manifest.read().chunks.keys().map(|&c| u64::from(c)).collect();
 
             Some(spawn_supervised("boot-prefetch", async move {
-                // Tier 1: index warm from the manifest's real chunks.
+                // Tier 1: index warm from the manifest's real chunks, so the data
+                // warm's per-pack index lookups don't each cost a GET.
                 cache_clone.prefetch_chunks(&chunk_indices, &cmc, &vm, &cs).await;
-                // Tier 2a: contiguous priority data region (EROFS boot-set reorder).
-                if let Some(plen) = prefetch_len {
-                    info!(prefetch_len = plen, "warming priority data region");
+                // Tier 2: DATA warm. Prefer the `.boot-set` — a PRECISE-COALESCED
+                // warm of the exact boot blocks (zero over-fetch), for ANY base
+                // including EROFS once its exact blocks are captured at bless. Fall
+                // back to the contiguous `[0, prefetch_len)` range warm for EROFS
+                // bases that carry only the reorder hint (no captured block list).
+                let boot_set = match cs.get_boot_set(&boot_set_name).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("failed to fetch boot set: {e}");
+                        None
+                    }
+                };
+                if let Some(data) = boot_set {
+                    match crate::block::manifest::deserialize_block_list(&data) {
+                        Ok(blocks) => {
+                            info!(blocks = blocks.len(), "warming precise boot block set (coalesced)");
+                            cache_clone
+                                .prefetch_data_blocks(
+                                    &blocks,
+                                    clean_cache_clone.as_ref(),
+                                    &cmc,
+                                    &vm,
+                                    &cs,
+                                    &metrics_clone,
+                                )
+                                .await;
+                        }
+                        Err(e) => warn!("failed to parse boot set: {e}"),
+                    }
+                } else if let Some(plen) = prefetch_len {
+                    info!(prefetch_len = plen, "warming priority data region (range fallback)");
                     cache_clone
                         .prefetch_data_range(
                             plen,
@@ -1324,28 +1353,6 @@ impl ExportRouter {
                             &metrics_clone,
                         )
                         .await;
-                } else {
-                    // Tier 2b: precise scattered warm (non-EROFS `.boot-set`).
-                    match cs.get_boot_set(&boot_set_name).await {
-                        Ok(Some(data)) => match crate::block::manifest::deserialize_block_list(&data) {
-                            Ok(blocks) => {
-                                info!(blocks = blocks.len(), "warming precise boot block set");
-                                cache_clone
-                                    .prefetch_data_blocks(
-                                        &blocks,
-                                        clean_cache_clone.as_ref(),
-                                        &cmc,
-                                        &vm,
-                                        &cs,
-                                        &metrics_clone,
-                                    )
-                                    .await;
-                            }
-                            Err(e) => warn!("failed to parse boot set: {e}"),
-                        },
-                        Ok(None) => {}
-                        Err(e) => warn!("failed to fetch boot set: {e}"),
-                    }
                 }
                 info!("boot prefetch complete");
             }))

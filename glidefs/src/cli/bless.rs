@@ -588,6 +588,48 @@ pub async fn run_bless_oci_erofs(
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
 
+    // --- Precise-coalesced warm for EROFS too: with --profile, capture the EXACT
+    // boot blocks of the reordered image (serve -t erofs + read-trace) and store
+    // them as a `.boot-set`. The reorder already made the boot set contiguous, so
+    // these coalesce into a handful of exact range GETs — cutting the range warm's
+    // over-fetch (~4.4×) while keeping its low GET count. The manifest's
+    // `prefetch_len` stays as the range-warm fallback when no block list exists. ---
+    if profile {
+        let (mut argv, env, _wd) = crate::oci::boot_set::run_command(&resolved.config);
+        if let Ok(cmd) = std::env::var("GLIDEFS_PROFILE_CMD") {
+            if !cmd.trim().is_empty() {
+                argv = vec!["/bin/sh".into(), "-c".into(), cmd];
+            }
+        }
+        let timeout = std::env::var("GLIDEFS_PROFILE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map_or(std::time::Duration::from_secs(30), std::time::Duration::from_secs);
+        if let Some(blocks) = crate::oci::boot_capture_served::capture_boot_blocks_served(
+            Arc::clone(&content_store),
+            Arc::clone(&volume_manifest),
+            device_size,
+            BLOCK_SIZE,
+            "erofs",
+            &argv,
+            &env,
+            &name,
+            timeout,
+            200_000,
+        )
+        .await
+        {
+            let data = crate::block::manifest::serialize_block_list(&blocks);
+            content_store
+                .put_boot_set(&name, data)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to upload boot set: {e}"))?;
+            info!(blocks = blocks.len(), "stored precise (coalesced) boot set for EROFS base");
+        } else {
+            info!("EROFS block-level profiling unavailable/failed; using prefetch_len range warm");
+        }
+    }
+
     println!("Blessed '{}' from OCI image as read-only EROFS:", name);
     println!("  Image:           {}", image_ref);
     println!("  Layers:          {}", resolved.layers.len());

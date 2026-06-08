@@ -1338,19 +1338,23 @@ impl WriteCache<Active> {
         }
     }
 
-    /// Warm the clean cache with the DATA of a bounded, SCATTERED set of blocks —
-    /// the precise boot working set of a non-EROFS base (ext4/raw/btrfs/f2fs),
-    /// which cannot reorder its layout into a contiguous prefix. Fetches EXACTLY
-    /// those blocks (window = 0, zero over-fetch) and in PARALLEL (a high
-    /// concurrency cap), so the many scattered round-trips overlap instead of
-    /// serializing. This is the writable counterpart to `prefetch_data_range`'s
-    /// contiguous-prefix warm. Best-effort: a failed block is logged and skipped.
+    /// Warm the clean cache with the DATA of a bounded boot working set — the
+    /// precise warm for any base that cannot reorder into a contiguous prefix
+    /// (ext4/raw/btrfs/f2fs), and also the EROFS warm once its exact boot blocks
+    /// are captured. PRECISE-COALESCED: the block list is sorted and contiguous
+    /// runs are fetched as single range GETs (exact bytes, ZERO over-fetch), with
+    /// runs issued in PARALLEL so the scattered round-trips overlap. Best-effort.
     ///
-    /// MUST NOT 32 MiB-window-coalesce: concurrent windowed fetches race before
-    /// the cache populates and pull overlapping windows, blowing a ~10 MiB boot
-    /// set up to 900 MiB-2.3 GiB (the measured "warm-window" catastrophe). The
-    /// list is already bounded at bless; `MAX_WARM_BLOCKS` is a defensive cap so
-    /// the lazy tail still faults on demand.
+    /// "Coalesced" here means joining ADJACENT boot blocks into one range GET —
+    /// not the 32 MiB pack-window: a window pulls unrequested bytes and, fetched
+    /// concurrently before the cache fills, races into 900 MiB-2.3 GiB of
+    /// over-fetch (the "warm-window" catastrophe). Run-coalescing has none of
+    /// that — it fetches exactly the boot blocks, just in fewer requests
+    /// (measured: a 213-block boot set is 72 runs → 72 GETs, not 213).
+    ///
+    /// `MAX_WARM_BLOCKS` bounds the warm so the lazy tail still faults on demand.
+    /// Callers should warm pack indices first (`prefetch_chunks`) so per-pack
+    /// index lookups don't add a GET per run.
     pub async fn prefetch_data_blocks(
         &self,
         blocks: &[u64],
@@ -1361,32 +1365,85 @@ impl WriteCache<Active> {
         metrics: &super::super::metrics::ExportMetrics,
     ) {
         use futures::stream::{self, StreamExt};
-        const CONCURRENCY: usize = 64; // overlap the scattered per-block GETs
+        const CONCURRENCY: usize = 64; // overlap the scattered runs
         const MAX_WARM_BLOCKS: usize = 8192; // 1 GiB ceiling; preserves lazy tail
 
-        let n = blocks.len().min(MAX_WARM_BLOCKS);
-        if n < blocks.len() {
-            warn!(total = blocks.len(), capped = n, "boot block list exceeds warm cap; truncating");
+        let mut sorted: Vec<u64> = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() > MAX_WARM_BLOCKS {
+            warn!(total = sorted.len(), capped = MAX_WARM_BLOCKS, "boot block list exceeds warm cap; truncating");
+            sorted.truncate(MAX_WARM_BLOCKS);
         }
 
-        stream::iter(blocks[..n].iter().copied())
-            .for_each_concurrent(CONCURRENCY, |b| async move {
+        // Coalesce sorted blocks into contiguous [start, count) runs.
+        let mut runs: Vec<(u64, usize)> = Vec::new();
+        let mut i = 0;
+        while i < sorted.len() {
+            let start = sorted[i];
+            let mut j = i + 1;
+            while j < sorted.len() && sorted[j] == sorted[j - 1] + 1 {
+                j += 1;
+            }
+            runs.push((start, j - i));
+            i = j;
+        }
+
+        stream::iter(runs)
+            .for_each_concurrent(CONCURRENCY, |(start, count)| async move {
                 if let Err(e) = self
-                    .resolve_block_windowed(
-                        b as usize,
+                    .prefetch_run(
+                        start,
+                        count,
                         clean_cache,
                         pack_index_cache,
                         volume_manifest,
                         content_store,
-                        Some(metrics),
-                        0, // precise: fetch exactly this block, no window over-fetch
+                        metrics,
                     )
                     .await
                 {
-                    warn!(block = b, error = %e, "boot block precise warm failed");
+                    warn!(start, count, error = %e, "boot run precise warm failed");
                 }
             })
             .await;
+    }
+
+    /// Warm one contiguous run `[start, start+count)` precisely: locate each
+    /// block, then fetch the still-needed ones with `window = 0`, which coalesces
+    /// same-pack adjacent blocks into a single range GET (exact bytes, no
+    /// over-fetch). Blocks already local/cached/zero are skipped.
+    #[allow(clippy::too_many_arguments)] // mirrors the read-path resolver's deps
+    async fn prefetch_run(
+        &self,
+        start: u64,
+        count: usize,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) -> Result<(), CacheError> {
+        let mut entries = Vec::with_capacity(count);
+        for k in 0..count {
+            let block = (start as usize) + k;
+            if let BlockLocation::NeedsFetch {
+                pack_id,
+                chunk_idx,
+                expected_hash,
+                pack_offset,
+                comp_length,
+            } = self
+                .locate_block(block, clean_cache, pack_index_cache, volume_manifest, content_store, Some(metrics))
+                .await?
+            {
+                entries.push((k, pack_id, chunk_idx, expected_hash, pack_offset, comp_length));
+            }
+        }
+        if !entries.is_empty() {
+            Self::fetch_with_window(&entries, content_store, clean_cache, pack_index_cache, Some(metrics), 0).await?;
+        }
+        Ok(())
     }
 }
 

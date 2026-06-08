@@ -1049,6 +1049,10 @@ async fn prefetch_precise_warm_real() {
         let clean: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(512 * 1024 * 1024));
         let pic = Arc::new(PackIndexCache::open(TempDir::new().unwrap().path()).await.unwrap());
         let metrics = ExportMetrics::new();
+        // Tier-1 index warm first (the router does this before the data warm), so
+        // per-pack index lookups don't add a GET per run to the measurement.
+        let chunk_indices: Vec<u64> = vm.read().chunks.keys().map(|&c| u64::from(c)).collect();
+        cache.prefetch_chunks(&chunk_indices, &pic, &vm, &content_store).await;
         latency.reset();
         cache.prefetch_data_blocks(&blocks, clean.as_ref(), &pic, &vm, &content_store, &metrics).await;
         let after = (latency.gets(), latency.bytes() as f64 / (1024.0 * 1024.0));
