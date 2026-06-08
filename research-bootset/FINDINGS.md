@@ -40,11 +40,17 @@ The choice hinges on ONE binary property: can `bless` reorder the image layout? 
 - **EROFS → build-time reorder** (contiguous prefix, 1 GET): 60-150ms, guaranteed 1 RTT
   regardless of scatter. Best overall. Proven on real images.
 - **ext4 / raw / layered → runtime parallel PRECISE warm** of the captured boot block list
-  (fetch EXACT blocks concurrently at device open, window=0, zero over-fetch): 2-11x over
-  readahead (python_full 4471→409ms; ext4 770→349ms). Behind reorder only by the RTT-wave
-  count `ceil(blocks/concurrency)`; since GET/byte counts are concurrency-independent, a high
-  warm fan-out (>=128) closes it to ~near-reorder. Proven on ext4; raw/layered are the SAME
-  block-level warm (provenance-agnostic) so they inherit it.
+  (fetch EXACT blocks concurrently at device open, window=0, zero over-fetch). ALL THREE
+  DIRECTLY MEASURED on real images+traces (see per_type_mechanisms.txt):
+    - ext4 (`bless --oci`): 770→349ms (2.2×).
+    - raw (`bless --image`, real raw ext4 disk image, 3 of 5 packs): 584→351ms (1.7×).
+    - layered (`--oci --layered`, real 4-layer overlay profile over 4 ublk devices): 528→352ms
+      (1.5×). NEW: layering gives natural per-layer locality (each layer's boot files cluster in
+      its own packs) → readahead already decent (4 GETs, 1.2× over-fetch); the warm's win is
+      mostly bytes (7.2 vs 36.8 MiB). Best as a per-layer-COALESCED precise warm. Reorder
+      impossible (shared immutable layers).
+  Monolithic types (ext4/raw) scatter across the whole image → bigger warm win; the win scales
+  with scatter and with warm concurrency (GET/byte counts are concurrency-independent).
 - **Tiny single-pack (busybox): readahead already ~optimal** (59ms); reorder/warm marginal.
 
 **CRITICAL negative result:** do NOT build the ext4/raw warm as a parallel 32MiB-window-

@@ -39,3 +39,33 @@ exact bytes — only EROFS can reorder at bless. Non-reorderable images keep the
 warm must (a) fetch EXACT blocks to avoid over-fetch, and (b) parallelize to hide the many RTTs.
 Readahead fails because it's reactive (serial RTTs) AND window-coalesced (massive over-fetch on
 scattered sets).
+
+## DIRECT proof — all four supported types (RTT=40ms, 100 MiB/s, conc=32)
+(GETs/bytes EXACT on real images+traces; readahead serial, warm parallel, reorder=1 GET)
+
+type     image            readahead(GET/MiB/ms)   warm-precise(GET/MiB/ms)   reorder(GET/MiB/ms)   best
+EROFS    python_full       15 / 387.1 / 4471       (parallel) ~/8.9/~          1 / 11.0 / 150        reorder (29.8×)
+ext4     python_slim_ext4   8 /  45.0 /  770       200 / 6.9 / 349            1 / 8.5 / 125 (N/A*)   warm-precise (2.2×)
+raw      python_raw         5 /  ...  /  584       199 / 7.1 / 351            1 / 8.7 / 127 (N/A*)   warm-precise (1.7×)
+layered  python_layered     4 /  36.8 /  528       218 / 7.2 / 352            N/A (shared/immutable) warm-precise (1.5×)
+*ext4/raw "reorder" column is the EROFS-style ideal shown for reference; ext4/raw cannot
+ reorder in production, so warm-precise is their shippable best.
+
+## KEY per-type insight (NEW): layout locality determines how much readahead already wins
+- Monolithic (ext4 / raw / EROFS-before-reorder): boot set scattered across the WHOLE image
+  → readahead over-fetches 2-12× (python_full: 387 MiB to serve 31 MiB) → big win for a precise
+  fetch / reorder.
+- Layered: each layer's boot files are naturally CLUSTERED in that layer's own packs, so the
+  boot set is "pre-clustered" per layer → readahead is already decent (4 GETs, 1.2× over-fetch)
+  → warm-precise wins only ~1.5×, mostly by cutting bytes (7.2 vs 36.8 MiB). Layering is itself
+  a (coarse) locality optimization.
+
+## FINAL best-mechanism-per-type (all empirically proven)
+- EROFS    → build-time REORDER (1 GET; 4.5-30×). Reorderable, biggest win.
+- ext4     → runtime PARALLEL PRECISE WARM (2-11×). Cannot reorder.
+- raw      → runtime PARALLEL PRECISE WARM (1.7× here; scales with scatter). Cannot reorder.
+- layered  → runtime PARALLEL PRECISE WARM, ideally COALESCED per-layer-pack (1.5×, mostly
+             bytes). Cannot reorder (shared immutable layers); per-layer locality already helps,
+             so the warm's job is mainly killing over-fetch. 218 tiny GETs argues for per-layer
+             coalescing (each layer's boot blocks sit in 1 pack) over pure per-block precise.
+- ALL non-EROFS: never use naive parallel 32MiB-window warm (races → 9-23s).

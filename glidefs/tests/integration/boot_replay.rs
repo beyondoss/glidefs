@@ -345,13 +345,14 @@ async fn read_blocks_content(
     store: Arc<dyn ObjectStore>,
     base: &str,
     name: &str,
+    manifest_key: &str,
     device_size: u64,
     block_size: u32,
     blocks: &[u64],
     pic: &Arc<PackIndexCache>,
 ) -> Vec<Vec<u8>> {
     let content_store = ContentStore::new(store, base);
-    let (data, _e) = content_store.get_manifest(&format!("bases/{name}")).await.unwrap().expect("manifest");
+    let (data, _e) = content_store.get_manifest(manifest_key).await.unwrap().expect("manifest");
     let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::deserialize(&data).unwrap()));
     let dir = TempDir::new().unwrap();
     let cache = WriteCache::open_fresh_active(WriteCacheConfig {
@@ -585,6 +586,7 @@ async fn run_trial_real(
     store: Arc<dyn ObjectStore>,
     base: &str,
     name: &str,
+    manifest_key: &str,
     device_size: u64,
     block_size: u32,
     trace: &[u64],
@@ -596,7 +598,7 @@ async fn run_trial_real(
     let latency = Arc::new(LatencyStore::new(Arc::clone(&store), rtt, throughput));
     let content_store = ContentStore::new(Arc::clone(&latency) as Arc<dyn ObjectStore>, base);
     let (data, _etag) = content_store
-        .get_manifest(&format!("bases/{name}"))
+        .get_manifest(manifest_key)
         .await
         .unwrap()
         .expect("manifest");
@@ -643,6 +645,7 @@ async fn run_warm_parallel(
     store: Arc<dyn ObjectStore>,
     base: &str,
     name: &str,
+    manifest_key: &str,
     device_size: u64,
     block_size: u32,
     trace: &[u64],
@@ -654,7 +657,7 @@ async fn run_warm_parallel(
 ) -> TrialResult {
     let latency = Arc::new(LatencyStore::new(Arc::clone(&store), rtt, throughput));
     let content_store = ContentStore::new(Arc::clone(&latency) as Arc<dyn ObjectStore>, base);
-    let (data, _e) = content_store.get_manifest(&format!("bases/{name}")).await.unwrap().expect("manifest");
+    let (data, _e) = content_store.get_manifest(manifest_key).await.unwrap().expect("manifest");
     let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::deserialize(&data).unwrap()));
     let dir = TempDir::new().unwrap();
     let cache = WriteCache::open_fresh_active(WriteCacheConfig {
@@ -759,19 +762,20 @@ async fn real_trace_study() {
         let (device_size, block_size) = (vm.size, vm.block_size);
         let boot_mib = trace.len() as f64 * block_size as f64 / (1024.0 * 1024.0);
 
+        let mkey = format!("bases/{name}");
         let pic_dir = TempDir::new().unwrap();
         let pic = Arc::new(PackIndexCache::open(pic_dir.path()).await.unwrap());
-        let _ = run_trial_real(Arc::clone(&store), &base, name, device_size, block_size, &trace, 0, &pic, Duration::ZERO, 0).await;
+        let _ = run_trial_real(Arc::clone(&store), &base, name, &mkey, device_size, block_size, &trace, 0, &pic, Duration::ZERO, 0).await;
 
         // Baseline: reactive readahead (serial during boot).
-        let reada = run_trial_real(Arc::clone(&store), &base, name, device_size, block_size, &trace, win as u32, &pic, rtt, throughput).await;
+        let reada = run_trial_real(Arc::clone(&store), &base, name, &mkey, device_size, block_size, &trace, win as u32, &pic, rtt, throughput).await;
         // ext4/raw delivery A: parallel warm of EXACT blocks (window=0 → precise).
-        let wp = run_warm_parallel(Arc::clone(&store), &base, name, device_size, block_size, &trace, 0, conc, &pic, rtt, throughput).await;
+        let wp = run_warm_parallel(Arc::clone(&store), &base, name, &mkey, device_size, block_size, &trace, 0, conc, &pic, rtt, throughput).await;
         // ext4/raw delivery B: parallel warm, 32MiB-coalesced (window) per pack.
-        let ww = run_warm_parallel(Arc::clone(&store), &base, name, device_size, block_size, &trace, win as u32, conc, &pic, rtt, throughput).await;
+        let ww = run_warm_parallel(Arc::clone(&store), &base, name, &mkey, device_size, block_size, &trace, win as u32, conc, &pic, rtt, throughput).await;
 
         // EROFS delivery: measured contiguous reorder (1 GET).
-        let contents = read_blocks_content(Arc::clone(&store), &base, name, device_size, block_size, &trace, &pic).await;
+        let contents = read_blocks_content(Arc::clone(&store), &base, name, &mkey, device_size, block_size, &trace, &pic).await;
         let s3_re = Arc::new(InMemory::new());
         build_image_from_contents(Arc::clone(&s3_re), "reord", &contents).await;
         let pic_re_dir = TempDir::new().unwrap();
@@ -790,6 +794,90 @@ async fn real_trace_study() {
             bs.demand_gets, mib(bs.demand_bytes), serial_ms(bs.demand_gets, bs.demand_bytes),
         );
     }
+}
+
+/// LAYERED-image study: replay each layer's captured boot trace against THAT
+/// layer's own ext4 manifest (layered images are N shared, immutable layer
+/// blobs — reorder is impossible, so the candidates are readahead vs a
+/// cross-layer parallel precise warm). Sums across layers.
+///   GLIDEFS_LAYERED_CONFIG=/tmp/prof-cfg.toml GLIDEFS_LAYERED_NAME=python_layered \
+///   GLIDEFS_LAYERED_TRACE=/tmp/python_layered.bootset \
+///   cargo test --features test-utils --test integration boot_replay::layered_study \
+///     -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "needs a blessed layered image + captured per-layer traces"]
+async fn layered_study() {
+    use glidefs::config::Settings;
+    use glidefs::oci::layer_store::{get_image_descriptor, layer_base_path};
+    use glidefs::parse_object_store::parse_url_opts;
+
+    let Ok(cfg_path) = std::env::var("GLIDEFS_LAYERED_CONFIG") else {
+        eprintln!("set GLIDEFS_LAYERED_CONFIG / GLIDEFS_LAYERED_NAME / GLIDEFS_LAYERED_TRACE");
+        return;
+    };
+    let name = std::env::var("GLIDEFS_LAYERED_NAME").unwrap();
+    let trace_prefix = std::env::var("GLIDEFS_LAYERED_TRACE").unwrap();
+    let rtt_ms = std::env::var("GLIDEFS_REAL_RTT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(40u64);
+    let conc: usize = std::env::var("GLIDEFS_REAL_CONCURRENCY").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
+    let rtt = Duration::from_millis(rtt_ms);
+    let throughput = 100u64 * 1024 * 1024;
+
+    let settings = Settings::from_file(std::path::Path::new(&cfg_path)).unwrap();
+    let (store, path_from_url) = parse_url_opts(
+        &settings.storage.url.parse().unwrap(),
+        settings.cloud_provider_env_vars().into_iter(),
+        Some(settings.storage.connect_timeout()),
+        Some(settings.storage.request_timeout()),
+    )
+    .unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::from(store);
+    let db_path = path_from_url.to_string();
+    let desc = get_image_descriptor(&store, &db_path, &name).await.unwrap().expect("image descriptor");
+
+    println!("\n=== LAYERED study {name}: {} layers (RTT={rtt_ms}ms, {} MiB/s, conc={conc}) ===", desc.layers.len(), throughput / (1024 * 1024));
+    let serial_ms = |g: u64, b: u64| g as f64 * rtt_ms as f64 + (b as f64 / throughput as f64) * 1000.0;
+
+    let (mut tot_rd_g, mut tot_rd_b, mut tot_wp_g, mut tot_wp_b) = (0u64, 0u64, 0u64, 0u64);
+    let mut tot_blocks = 0usize;
+    for (i, digest) in desc.layers.iter().enumerate() {
+        let tf = format!("{trace_prefix}.L{i}");
+        let trace: Vec<u64> = match std::fs::read_to_string(&tf) {
+            Ok(s) => s.lines().filter_map(|l| l.trim().parse().ok()).collect(),
+            Err(_) => continue, // layer faulted nothing
+        };
+        if trace.is_empty() {
+            continue;
+        }
+        let base = layer_base_path(&db_path, digest);
+        let cs = ContentStore::new(Arc::clone(&store), &base);
+        let (data, _e) = cs.get_manifest("layer").await.unwrap().expect("layer manifest");
+        let vm = VolumeManifest::deserialize(&data).unwrap();
+        let (device_size, block_size) = (vm.size, vm.block_size);
+
+        let pic_dir = TempDir::new().unwrap();
+        let pic = Arc::new(PackIndexCache::open(pic_dir.path()).await.unwrap());
+        let dev = format!("lyr{i}");
+        let _ = run_trial_real(Arc::clone(&store), &base, &dev, "layer", device_size, block_size, &trace, 0, &pic, Duration::ZERO, 0).await;
+        let reada = run_trial_real(Arc::clone(&store), &base, &dev, "layer", device_size, block_size, &trace, 32 * 1024 * 1024, &pic, rtt, throughput).await;
+        let wp = run_warm_parallel(Arc::clone(&store), &base, &dev, "layer", device_size, block_size, &trace, 0, conc, &pic, rtt, throughput).await;
+        println!(
+            "  L{i} {}: {} blks | readahead {} GET/{:.1} MiB | warm-precise {} GET/{:.1} MiB",
+            &digest[..19.min(digest.len())], trace.len(),
+            reada.demand_gets, reada.demand_bytes as f64 / (1024.0 * 1024.0),
+            wp.demand_gets, wp.demand_bytes as f64 / (1024.0 * 1024.0),
+        );
+        tot_rd_g += reada.demand_gets; tot_rd_b += reada.demand_bytes;
+        tot_wp_g += wp.demand_gets; tot_wp_b += wp.demand_bytes;
+        tot_blocks += trace.len();
+    }
+    // readahead is reactive/serial across the whole boot; the precise warm runs
+    // ONE cross-layer parallel pass (ceil(total_gets/conc) waves).
+    let rd_ms = serial_ms(tot_rd_g, tot_rd_b);
+    let wp_ms = (tot_wp_g as f64 / conc as f64).ceil() * rtt_ms as f64 + (tot_wp_b as f64 / throughput as f64) * 1000.0;
+    println!("\n  TOTAL {tot_blocks} blocks across {} layers:", desc.layers.len());
+    println!("    readahead (baseline):       {tot_rd_g} GETs, {:.1} MiB → {rd_ms:.0} ms", tot_rd_b as f64 / (1024.0 * 1024.0));
+    println!("    warm-precise (cross-layer): {tot_wp_g} GETs, {:.1} MiB → {wp_ms:.0} ms  ({:.1}× over readahead)", tot_wp_b as f64 / (1024.0 * 1024.0), rd_ms / wp_ms.max(1.0));
+    println!("    reorder: N/A — layers are shared & immutable, cannot reorder.");
 }
 
 // ============================================================================

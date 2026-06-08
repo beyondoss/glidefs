@@ -85,6 +85,21 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let object_store: Arc<dyn object_store::ObjectStore> = Arc::from(object_store);
     let db_path = path_from_url.to_string();
+
+    // Layered images are stored as N content-addressed ext4 layer blobs, served
+    // via overlayfs over per-layer block devices. Profile that faithfully.
+    if std::env::var("GLIDEFS_PROFILE_LAYERED").as_deref() == Ok("1") {
+        return profile_layered(
+            Arc::clone(&object_store),
+            &db_path,
+            name,
+            &run_cmd,
+            max_blocks,
+            std::env::var("GLIDEFS_BOOT_SET_OUT").ok(),
+        )
+        .await;
+    }
+
     let base = format!("{}/exports/{}", db_path, s3_prefix);
     let content_store = Arc::new(ContentStore::new(Arc::clone(&object_store), &base));
 
@@ -253,5 +268,224 @@ async fn main() -> anyhow::Result<()> {
         }
         println!("  wrote boot block list → {out}");
     }
+    Ok(())
+}
+
+/// Profile a LAYERED image: serve each content-addressed ext4 layer over its own
+/// ublk device (each with a read-fault recorder), overlayfs-stack them, run the
+/// entrypoint in a chroot, and capture the boot blocks faulted in EACH layer.
+/// Layers are immutable + shared across images, so they CANNOT be reordered —
+/// the per-type mechanism is forced to a runtime precise warm; this measures the
+/// real per-layer scatter that warm must cover.
+#[cfg(feature = "ublk")]
+async fn profile_layered(
+    object_store: std::sync::Arc<dyn object_store::ObjectStore>,
+    db_path: &str,
+    name: &str,
+    run_cmd: &[String],
+    max_blocks: usize,
+    out_prefix: Option<String>,
+) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use glidefs::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
+    use glidefs::block::content_store::ContentStore;
+    use glidefs::block::handler::BlockHandler;
+    use glidefs::block::metrics::ExportMetrics;
+    use glidefs::block::pack::DEFAULT_FLUSH_THRESHOLD;
+    use glidefs::block::pack_index_cache::PackIndexCache;
+    use glidefs::block::ublk::UblkServer;
+    use glidefs::block::volume_manifest::VolumeManifest;
+    use glidefs::block::write_cache::{WriteCache, WriteCacheConfig};
+    use glidefs::block::write_trace::{boot_set_from_trace, WriteTracer};
+    use glidefs::oci::layer_store::{get_image_descriptor, layer_base_path};
+    use tokio::sync::Notify;
+
+    if !std::path::Path::new("/dev/ublk-control").exists() {
+        anyhow::bail!("/dev/ublk-control absent — need root + ublk");
+    }
+    let desc = get_image_descriptor(&object_store, db_path, name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("image descriptor 'images/{name}' not found"))?;
+    eprintln!("[layered] {name}: {} layers (bottom→top)", desc.layers.len());
+
+    let tmp = tempfile::TempDir::new()?;
+    let mut server = UblkServer::new();
+
+    // Per-layer serving stack + tracer. Keep everything alive for the run.
+    struct Layer {
+        digest: String,
+        vm: Arc<parking_lot::RwLock<VolumeManifest>>,
+        tracer: Arc<WriteTracer>,
+        rtrace: std::path::PathBuf,
+        dev: std::path::PathBuf,
+        dev_name: String,
+        lower: std::path::PathBuf,
+        block_size: u32,
+    }
+    let mut layers: Vec<Layer> = Vec::new();
+
+    for (i, digest) in desc.layers.iter().enumerate() {
+        let base = layer_base_path(db_path, digest);
+        let cs = Arc::new(ContentStore::new(Arc::clone(&object_store), &base));
+        let (data, _e) = cs
+            .get_manifest("layer")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("layer manifest missing for {digest}"))?;
+        let manifest = VolumeManifest::deserialize(&data)?;
+        let device_size = manifest.size;
+        let block_size = manifest.block_size;
+        let vm = Arc::new(parking_lot::RwLock::new(manifest));
+
+        let rtrace = tmp.path().join(format!("L{i}.rtrace"));
+        let tracer = Arc::new(WriteTracer::new(&rtrace, block_size, device_size / u64::from(block_size), digest)?);
+        let cache = Arc::new(WriteCache::open_fresh_active(WriteCacheConfig {
+            cache_dir: tmp.path().to_path_buf(),
+            device_name: format!("proflyr-{i}"),
+            device_size,
+            block_size: block_size as usize,
+            wal_sync: false,
+        })?);
+        let foyer_dir = tmp.path().join(format!("foyer{i}"));
+        std::fs::create_dir_all(&foyer_dir)?;
+        let clean: Arc<dyn BlockCache> = Arc::new(
+            FoyerBlockCache::open(FoyerCacheConfig {
+                memory_bytes: 32 * 1024 * 1024,
+                ssd_bytes: 128 * 1024 * 1024,
+                ssd_dir: foyer_dir,
+                direct: false,
+                io_uring: false,
+            })
+            .await?,
+        );
+        let pic = Arc::new(PackIndexCache::open(&tmp.path().join(format!("pic{i}"))).await?);
+        let handler = Arc::new(
+            BlockHandler::new(
+                cache,
+                cs,
+                clean,
+                pic,
+                Arc::clone(&vm),
+                device_size,
+                true,
+                Arc::new(ExportMetrics::new()),
+                Arc::new(AtomicU64::new(0f64.to_bits())),
+                Arc::new(Notify::const_new()),
+                DEFAULT_FLUSH_THRESHOLD,
+                None,
+            )
+            .with_read_tracer(Some(Arc::clone(&tracer))),
+        );
+        let dev_name = format!("proflyr-{i}");
+        let dev = server.add_device(&dev_name, Arc::clone(&handler)).await?;
+        let lower = tmp.path().join(format!("lower{i}"));
+        std::fs::create_dir_all(&lower)?;
+        eprintln!("[layered] L{i} {} → {} ({:.1} MB)", &digest[..19.min(digest.len())], dev.display(), device_size as f64 / 1e6);
+        layers.push(Layer { digest: digest.clone(), vm, tracer, rtrace, dev, dev_name, lower, block_size });
+    }
+
+    // Mount each layer ext4 ro, overlay-stack (top = last layer), chroot + run.
+    let merged = tmp.path().join("merged");
+    let upper = tmp.path().join("upper");
+    let work = tmp.path().join("work");
+    for d in [&merged, &upper, &work] {
+        std::fs::create_dir_all(d)?;
+    }
+    let mounts: Vec<(std::path::PathBuf, std::path::PathBuf)> =
+        layers.iter().map(|l| (l.dev.clone(), l.lower.clone())).collect();
+    let lowerdirs: Vec<String> = layers.iter().rev().map(|l| l.lower.display().to_string()).collect();
+    let run_cmd_c = run_cmd.to_vec();
+    let ran = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        use std::process::Command;
+        for (dev, lower) in &mounts {
+            let m = Command::new("mount").args(["-t", "ext4", "-o", "ro"]).arg(dev).arg(lower).status();
+            if !matches!(m, Ok(s) if s.success()) {
+                return Err(format!("mount ext4 {} failed: {m:?}", dev.display()));
+            }
+        }
+        let opt = format!(
+            "lowerdir={},upperdir={},workdir={}",
+            lowerdirs.join(":"),
+            upper.display(),
+            work.display()
+        );
+        let m = Command::new("mount").args(["-t", "overlay", "overlay", "-o", &opt]).arg(&merged).status();
+        if !matches!(m, Ok(s) if s.success()) {
+            return Err(format!("overlay mount failed: {m:?}"));
+        }
+        let _ = Command::new("mount").args(["--bind", "/proc"]).arg(merged.join("proc")).status();
+        let _ = Command::new("mount").args(["--bind", "/dev"]).arg(merged.join("dev")).status();
+        let _ = Command::new("mount").args(["--bind", "/sys"]).arg(merged.join("sys")).status();
+        let timeout_s = std::env::var("GLIDEFS_PROFILE_TIMEOUT").unwrap_or_else(|_| "60".into());
+        let mut chroot = Command::new("timeout");
+        chroot.args(["--signal=KILL", &timeout_s, "chroot"]).arg(&merged);
+        chroot.args(&run_cmd_c);
+        chroot.env_clear();
+        chroot.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        chroot.env("HOME", "/root");
+        chroot.env("LANG", "C");
+        let st = chroot.status();
+        eprintln!("[layered] workload exited: {st:?}");
+        let _ = Command::new("umount").arg(merged.join("sys")).status();
+        let _ = Command::new("umount").arg(merged.join("dev")).status();
+        let _ = Command::new("umount").arg(merged.join("proc")).status();
+        let _ = Command::new("umount").arg(&merged).status();
+        for (_, lower) in mounts.iter().rev() {
+            let _ = Command::new("umount").arg(lower).status();
+        }
+        Ok(())
+    })
+    .await;
+
+    for l in &layers {
+        server.remove_device(&l.dev_name).await.ok();
+        l.tracer.finish();
+    }
+    match ran {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => anyhow::bail!("layered profiling: {e}"),
+        Err(e) => anyhow::bail!("layered profiling task panicked: {e}"),
+    }
+
+    // Per-layer boot set + scatter; combined totals.
+    println!("\n==== LAYERED BOOT SET: {name} ====");
+    let (mut tot_blocks, mut tot_packs, mut tot_mib) = (0usize, 0usize, 0.0f64);
+    for (i, l) in layers.iter().enumerate() {
+        let bytes = std::fs::read(&l.rtrace).unwrap_or_default();
+        let bs = boot_set_from_trace(&bytes, max_blocks);
+        if bs.is_empty() {
+            continue;
+        }
+        let vm = l.vm.read();
+        let mut packs = std::collections::HashSet::new();
+        for &b in &bs {
+            if let Some(pids) = vm.chunk_pack_ids(vm.chunk_idx_for_block(b)) {
+                for p in pids {
+                    packs.insert(*p);
+                }
+            }
+        }
+        let mib = bs.len() as f64 * l.block_size as f64 / (1024.0 * 1024.0);
+        println!(
+            "  L{i} {}: {} blocks, {:.1} MiB, {} packs",
+            &l.digest[..19.min(l.digest.len())], bs.len(), mib, packs.len()
+        );
+        tot_blocks += bs.len();
+        tot_packs += packs.len();
+        tot_mib += mib;
+        if let Some(p) = &out_prefix {
+            use std::io::Write;
+            let mut f = std::fs::File::create(format!("{p}.L{i}"))?;
+            for b in &bs {
+                writeln!(f, "{b}")?;
+            }
+        }
+    }
+    println!(
+        "  TOTAL boot set: {tot_blocks} blocks, {tot_mib:.1} MiB across {tot_packs} layer-packs (in {} layers)",
+        layers.len()
+    );
+    println!("  → cannot reorder shared immutable layers ⇒ runtime PRECISE warm across layer-packs.");
     Ok(())
 }
