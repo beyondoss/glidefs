@@ -834,6 +834,33 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<Bytes, CacheError> {
+        self.resolve_block_windowed(
+            block_index,
+            clean_cache,
+            pack_index_cache,
+            volume_manifest,
+            content_store,
+            metrics,
+            self.inner.readahead_window_bytes.load(Ordering::Relaxed),
+        )
+        .await
+    }
+
+    /// `resolve_block` with an explicit cold-fetch `window`. `window == 0` fetches
+    /// EXACTLY the requested block (no pack-window over-fetch) — used by the
+    /// precise boot warm; the guest read paths pass the configured readahead
+    /// window so this never changes their behavior.
+    #[allow(clippy::too_many_arguments)] // mirrors the read-path resolver's deps
+    async fn resolve_block_windowed(
+        &self,
+        block_index: usize,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: Option<&super::super::metrics::ExportMetrics>,
+        window: u32,
+    ) -> Result<Bytes, CacheError> {
         let location = self
             .locate_block(
                 block_index,
@@ -862,7 +889,7 @@ impl WriteCache<Active> {
                     clean_cache,
                     pack_index_cache,
                     metrics,
-                    self.inner.readahead_window_bytes.load(Ordering::Relaxed),
+                    window,
                 )
                 .await?;
                 // fetch_with_window always returns the requested block or errors
@@ -1309,6 +1336,57 @@ impl WriteCache<Active> {
             }
             off += n as u64;
         }
+    }
+
+    /// Warm the clean cache with the DATA of a bounded, SCATTERED set of blocks —
+    /// the precise boot working set of a non-EROFS base (ext4/raw/btrfs/f2fs),
+    /// which cannot reorder its layout into a contiguous prefix. Fetches EXACTLY
+    /// those blocks (window = 0, zero over-fetch) and in PARALLEL (a high
+    /// concurrency cap), so the many scattered round-trips overlap instead of
+    /// serializing. This is the writable counterpart to `prefetch_data_range`'s
+    /// contiguous-prefix warm. Best-effort: a failed block is logged and skipped.
+    ///
+    /// MUST NOT 32 MiB-window-coalesce: concurrent windowed fetches race before
+    /// the cache populates and pull overlapping windows, blowing a ~10 MiB boot
+    /// set up to 900 MiB-2.3 GiB (the measured "warm-window" catastrophe). The
+    /// list is already bounded at bless; `MAX_WARM_BLOCKS` is a defensive cap so
+    /// the lazy tail still faults on demand.
+    pub async fn prefetch_data_blocks(
+        &self,
+        blocks: &[u64],
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) {
+        use futures::stream::{self, StreamExt};
+        const CONCURRENCY: usize = 64; // overlap the scattered per-block GETs
+        const MAX_WARM_BLOCKS: usize = 8192; // 1 GiB ceiling; preserves lazy tail
+
+        let n = blocks.len().min(MAX_WARM_BLOCKS);
+        if n < blocks.len() {
+            warn!(total = blocks.len(), capped = n, "boot block list exceeds warm cap; truncating");
+        }
+
+        stream::iter(blocks[..n].iter().copied())
+            .for_each_concurrent(CONCURRENCY, |b| async move {
+                if let Err(e) = self
+                    .resolve_block_windowed(
+                        b as usize,
+                        clean_cache,
+                        pack_index_cache,
+                        volume_manifest,
+                        content_store,
+                        Some(metrics),
+                        0, // precise: fetch exactly this block, no window over-fetch
+                    )
+                    .await
+                {
+                    warn!(block = b, error = %e, "boot block precise warm failed");
+                }
+            })
+            .await;
     }
 }
 

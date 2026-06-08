@@ -36,7 +36,8 @@ pub async fn pull_image(
     auth: &Credentials,
     handler: Arc<BlockHandler>,
     options: IngestOptions,
-) -> Result<ResolvedImage, PullError> {
+    emit_boot_set: bool,
+) -> Result<(ResolvedImage, Vec<u64>), PullError> {
     let resolved = client.resolve(image, auth).await?;
 
     debug!(
@@ -58,25 +59,55 @@ pub async fn pull_image(
         layer_files.push(file);
     }
 
-    // Merge all layers into a single ext4 filesystem.
+    // Merge all layers into a single ext4 filesystem. When asked, statically
+    // derive the boot working set (ELF closure) so the writer reports where it
+    // placed those files; ext4 can't reorder them contiguously (unlike EROFS),
+    // so the server precisely warms their scattered device blocks at open.
     let writer_options = options.writer_options.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let config = resolved.config.clone();
+    let boot_blocks = tokio::task::spawn_blocking(move || -> io::Result<Vec<u64>> {
         let rt = tokio::runtime::Handle::current();
         let adapter = super::BlockAdapter::new(&handler, rt);
+        let mut writer_options = writer_options;
+        if emit_boot_set {
+            let boot_paths = crate::oci::boot_set::derive_boot_paths(&config, &mut layer_files);
+            if !boot_paths.is_empty() {
+                writer_options.push(ext4::writer::WriterOption::PriorityOrder(boot_paths));
+            }
+        }
         let convert_opts = ext4::tar_convert::ConvertOptions {
             writer_options,
             ..Default::default()
         };
-        let mut adapter =
-            ext4::convert_oci_layers_to_ext4(&mut layer_files, adapter, &convert_opts)?;
+        let (mut adapter, ranges) =
+            ext4::convert_oci_layers_to_ext4_with_boot_blocks(&mut layer_files, adapter, &convert_opts)?;
         adapter.flush()?;
-        Ok::<_, io::Error>(())
+        Ok(boot_ranges_to_blocks(&ranges))
     })
     .await
-    .map_err(|e| PullError::Io(io::Error::other(format!("task panicked: {e}"))))?;
+    .map_err(|e| PullError::Io(io::Error::other(format!("task panicked: {e}"))))??;
 
-    result?;
-    Ok(resolved)
+    Ok((resolved, boot_blocks))
+}
+
+/// Convert the ext4 writer's boot-set byte ranges `(device_offset, len)` to the
+/// sorted, deduplicated set of device block indices they touch (the block layer
+/// is positional, so byte offset / block size = block index).
+fn boot_ranges_to_blocks(ranges: &[(u64, u64)]) -> Vec<u64> {
+    use crate::oci::ext4_store::BLOCK_SIZE;
+    let bs = u64::from(BLOCK_SIZE);
+    let mut set = std::collections::BTreeSet::new();
+    for &(off, len) in ranges {
+        if len == 0 {
+            continue;
+        }
+        let first = off / bs;
+        let last = (off + len - 1) / bs;
+        for b in first..=last {
+            set.insert(b);
+        }
+    }
+    set.into_iter().collect()
 }
 
 /// Download and decompress a single layer to a seekable temp file.

@@ -962,6 +962,117 @@ async fn prefetch_warm_real() {
     assert_eq!(reread_gets, 0, "boot region must be fully cached after warm");
 }
 
+/// END-TO-END proof of the non-EROFS precise warm: open a REAL blessed ext4 base
+/// cold (carries a `.boot-set` sidecar — the boot set's scattered device blocks),
+/// run the ACTUAL `prefetch_data_blocks` precise warm against the real store
+/// (GET-counted), and compare bytes against plain readahead replaying the same
+/// blocks. The win is BYTES (zero over-fetch) + parallelism, not GET count
+/// (precise = one GET/block). ext4 cannot reorder, so this is its shippable best.
+///   GLIDEFS_REAL_CONFIG=research-bootset/repro-config.toml \
+///   GLIDEFS_WARM_NAME=nginx-ext4-bs GLIDEFS_REAL_PREFIX=prof \
+///   cargo test --features test-utils --test integration \
+///     boot_replay::prefetch_precise_warm_real -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "needs a configured object store + a blessed ext4 base with a .boot-set"]
+async fn prefetch_precise_warm_real() {
+    use glidefs::block::manifest::deserialize_block_list;
+    use glidefs::config::Settings;
+    use glidefs::parse_object_store::parse_url_opts;
+
+    let Ok(cfg_path) = std::env::var("GLIDEFS_REAL_CONFIG") else {
+        eprintln!("set GLIDEFS_REAL_CONFIG / GLIDEFS_WARM_NAME [/ GLIDEFS_REAL_PREFIX]");
+        return;
+    };
+    let name = std::env::var("GLIDEFS_WARM_NAME").unwrap_or_else(|_| "nginx-ext4-bs".into());
+    let prefix = std::env::var("GLIDEFS_REAL_PREFIX").unwrap_or_else(|_| "prof".into());
+
+    let settings = Settings::from_file(std::path::Path::new(&cfg_path)).unwrap();
+    let (store, path_from_url) = parse_url_opts(
+        &settings.storage.url.parse().unwrap(),
+        settings.cloud_provider_env_vars().into_iter(),
+        Some(settings.storage.connect_timeout()),
+        Some(settings.storage.request_timeout()),
+    )
+    .unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::from(store);
+    let base = format!("{path_from_url}/exports/{prefix}");
+
+    // Load the manifest (for size/block) and the .boot-set sidecar.
+    let cs0 = ContentStore::new(Arc::clone(&store), &base);
+    let (mdata, _e) = cs0.get_manifest(&format!("bases/{name}")).await.unwrap().expect("manifest");
+    let vm0 = VolumeManifest::deserialize(&mdata).unwrap();
+    let (device_size, block_size) = (vm0.size, vm0.block_size);
+    let raw = cs0.get_boot_set(&name).await.unwrap().expect("base must carry a .boot-set");
+    let blocks = deserialize_block_list(&raw).unwrap();
+    let boot_mib = blocks.len() as f64 * block_size as f64 / (1024.0 * 1024.0);
+    println!("\nimage={name} boot blocks={} ({boot_mib:.2} MiB exact)", blocks.len());
+
+    // Arm A — baseline: cold cache, production readahead, replay the boot blocks.
+    let a = {
+        let latency = Arc::new(LatencyStore::new(Arc::clone(&store), Duration::ZERO, 0));
+        let content_store = ContentStore::new(Arc::clone(&latency) as Arc<dyn ObjectStore>, &base);
+        let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::deserialize(&mdata).unwrap()));
+        let dir = TempDir::new().unwrap();
+        let cache = WriteCache::open_fresh_active(WriteCacheConfig {
+            cache_dir: dir.path().to_path_buf(),
+            device_name: format!("{name}-rd"),
+            device_size,
+            block_size: block_size as usize,
+            wal_sync: false,
+        })
+        .unwrap();
+        let clean: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(512 * 1024 * 1024));
+        let pic = Arc::new(PackIndexCache::open(TempDir::new().unwrap().path()).await.unwrap());
+        let metrics = ExportMetrics::new();
+        cache.set_readahead_window_bytes(32 * 1024 * 1024);
+        latency.reset();
+        for &b in &blocks {
+            cache.read(b * block_size as u64, block_size as usize, clean.as_ref(), &pic, &vm, &content_store, &metrics).await.unwrap();
+        }
+        (latency.gets(), latency.bytes() as f64 / (1024.0 * 1024.0))
+    };
+
+    // Arm B — the precise parallel warm (what the router runs at device open).
+    let b = {
+        let latency = Arc::new(LatencyStore::new(Arc::clone(&store), Duration::ZERO, 0));
+        let content_store = ContentStore::new(Arc::clone(&latency) as Arc<dyn ObjectStore>, &base);
+        let vm = Arc::new(parking_lot::RwLock::new(VolumeManifest::deserialize(&mdata).unwrap()));
+        let dir = TempDir::new().unwrap();
+        let cache = WriteCache::open_fresh_active(WriteCacheConfig {
+            cache_dir: dir.path().to_path_buf(),
+            device_name: format!("{name}-precise"),
+            device_size,
+            block_size: block_size as usize,
+            wal_sync: false,
+        })
+        .unwrap();
+        let clean: Arc<dyn BlockCache> = Arc::new(SimpleBlockCache::new(512 * 1024 * 1024));
+        let pic = Arc::new(PackIndexCache::open(TempDir::new().unwrap().path()).await.unwrap());
+        let metrics = ExportMetrics::new();
+        latency.reset();
+        cache.prefetch_data_blocks(&blocks, clean.as_ref(), &pic, &vm, &content_store, &metrics).await;
+        let after = (latency.gets(), latency.bytes() as f64 / (1024.0 * 1024.0));
+        // Every boot block must now be hot: replaying them costs ZERO GETs.
+        latency.reset();
+        for &bk in &blocks {
+            cache.read(bk * block_size as u64, block_size as usize, clean.as_ref(), &pic, &vm, &content_store, &metrics).await.unwrap();
+        }
+        (after.0, after.1, latency.gets())
+    };
+
+    println!(
+        "  readahead replay : {} GET(s), {:.1} MiB fetched\n  \
+         precise warm     : {} GET(s), {:.1} MiB fetched (exact); re-read: {} GET(s)",
+        a.0, a.1, b.0, b.1, b.2,
+    );
+
+    // The precise warm fetches the EXACT boot bytes (no window over-fetch) and
+    // leaves the whole set hot. Over-fetch ratio must be ~1.0 and << readahead's.
+    assert!(b.1 <= boot_mib * 1.10 + 0.5, "precise warm must not over-fetch: {:.1} MiB for {:.1} MiB boot set", b.1, boot_mib);
+    assert!(b.1 <= a.1, "precise warm must fetch no more than readahead: {:.1} vs {:.1} MiB", b.1, a.1);
+    assert_eq!(b.2, 0, "boot blocks must be hot after the precise warm");
+}
+
 /// LAYERED-image study: replay each layer's captured boot trace against THAT
 /// layer's own ext4 manifest (layered images are N shared, immutable layer
 /// blobs — reorder is impossible, so the candidates are readahead vs a

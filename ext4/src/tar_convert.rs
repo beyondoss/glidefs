@@ -69,9 +69,27 @@ where
     R: Read + Seek,
     W: Read + Write + Seek,
 {
+    Ok(convert_oci_layers_to_ext4_with_boot_blocks(layers, output, options)?.0)
+}
+
+/// Like [`convert_oci_layers_to_ext4`] but also returns the byte ranges
+/// `(device_offset, len)` where the [`WriterOption::PriorityOrder`](crate::writer::WriterOption)
+/// files' data was placed — the boot working set's physical layout. ext4 cannot
+/// reorder it into a contiguous prefix (unlike EROFS), so the server warms these
+/// scattered ranges precisely at device open. Empty when no priority paths were
+/// given. Map to device block indices and store as the base's boot set.
+pub fn convert_oci_layers_to_ext4_with_boot_blocks<R, W>(
+    layers: &mut [R],
+    output: W,
+    options: &ConvertOptions,
+) -> io::Result<(W, Vec<(u64, u64)>)>
+where
+    R: Read + Seek,
+    W: Read + Write + Seek,
+{
     let mut fs = Writer::new(output, &options.writer_options);
     merge_layers(layers, &mut fs, options)?;
-    fs.close()
+    fs.close_with_boot_blocks()
 }
 
 /// Merge multiple OCI layers into a single **EROFS** filesystem image.

@@ -465,11 +465,40 @@ impl ContentStore {
         Ok(names)
     }
 
+    /// Upload a base's boot SET — the bounded, precise boot working set (a device
+    /// block list, [`serialize_block_list`](super::manifest::serialize_block_list)).
+    /// Stored beside the base manifest as `bases/{name}.boot-set`. Consumed by the
+    /// device-open precise warm for non-EROFS images (which cannot reorder).
+    pub async fn put_boot_set(&self, name: &str, data: Vec<u8>) -> Result<(), ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/manifests/bases/{}.boot-set", self.base_path, name);
+        let path = ObjectPath::from(key);
+        let result = self.object_store.put(&path, PutPayload::from(data)).await;
+        self.record_s3_result(&result);
+        result?;
+        debug!(name = %name, "uploaded boot set");
+        Ok(())
+    }
+
+    /// Download a base's boot set. Returns `None` if absent (e.g. an EROFS base,
+    /// which carries its hint as the manifest `prefetch_len` instead).
+    pub async fn get_boot_set(&self, name: &str) -> Result<Option<Vec<u8>>, ContentStoreError> {
+        self.check_circuit()?;
+        let key = format!("{}/manifests/bases/{}.boot-set", self.base_path, name);
+        let path = ObjectPath::from(key);
+        let result = self.object_store.get(&path).await;
+        self.record_s3_result(&result);
+        match result {
+            Ok(response) => Ok(Some(response.bytes().await?.to_vec())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// List all manifest names under `manifests/` (not just bases).
     ///
     /// Returns paths relative to `manifests/`, e.g. `"vm1"`, `"bases/ubuntu-22.04"`.
-    /// Filters out legacy sidecar artifacts (`.boot-set`, `.hot-set`) that older
-    /// builds may have left in the bucket — they are no longer produced.
+    /// Filters out the `.boot-set` sidecar (and legacy `.hot-set`).
     pub async fn list_all_manifests(&self) -> Result<Vec<String>, ContentStoreError> {
         self.check_circuit()?;
         let prefix_str = format!("{}/manifests/", self.base_path);

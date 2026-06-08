@@ -27,9 +27,10 @@
 //! entrypoint. NOT a complete sandbox — it runs untrusted image code with only
 //! chroot + network isolation + a timeout; treat the builder accordingly.
 
-#![cfg(target_os = "linux")]
-// libc FFI: fanotify_init/fanotify_mark/read/close + geteuid — the fanotify API
-// has no safe wrapper in our nix version. All pointers are local stack buffers.
+// Gated to Linux by the `#[cfg(target_os = "linux")]` on the `mod boot_capture`
+// declaration. libc FFI: fanotify_init/fanotify_mark/read/close + geteuid — the
+// fanotify API has no safe wrapper in our nix version; all pointers are local
+// stack buffers.
 #![allow(unsafe_code)]
 
 use std::collections::HashSet;
@@ -61,10 +62,10 @@ pub fn capture_boot_paths<R: Read + Seek>(
     // Operators can override the boot command — the image default Cmd (e.g. a
     // bare `python3` REPL) often exercises far less than the real app's startup.
     // `GLIDEFS_PROFILE_CMD` is run via `/bin/sh -c` inside the image.
-    if let Ok(cmd) = std::env::var("GLIDEFS_PROFILE_CMD") {
-        if !cmd.trim().is_empty() {
-            argv = vec!["/bin/sh".into(), "-c".into(), cmd];
-        }
+    if let Ok(cmd) = std::env::var("GLIDEFS_PROFILE_CMD")
+        && !cmd.trim().is_empty()
+    {
+        argv = vec!["/bin/sh".into(), "-c".into(), cmd];
     }
     if argv.is_empty() {
         bail!("image config names no entrypoint/cmd to run");
@@ -295,7 +296,7 @@ fn drain_events(fan: c_int, root: &Path, out: &mut Vec<String>, seen: &mut HashS
         if n <= 0 {
             break; // EAGAIN (empty) or error
         }
-        let n = n as usize;
+        let n = n.unsigned_abs(); // n > 0 here
         let mut off = 0;
         while off + META <= n {
             let meta: libc::fanotify_event_metadata =
@@ -304,12 +305,12 @@ fn drain_events(fan: c_int, root: &Path, out: &mut Vec<String>, seen: &mut HashS
             if evlen < META || off + evlen > n {
                 break;
             }
-            if meta.vers == libc::FANOTIFY_METADATA_VERSION && meta.fd >= 0 {
-                if let Some(p) = fd_to_image_path(meta.fd, root) {
-                    if seen.insert(p.clone()) {
-                        out.push(p);
-                    }
-                }
+            if meta.vers == libc::FANOTIFY_METADATA_VERSION
+                && meta.fd >= 0
+                && let Some(p) = fd_to_image_path(meta.fd, root)
+                && seen.insert(p.clone())
+            {
+                out.push(p);
             }
             if meta.fd >= 0 {
                 unsafe { libc::close(meta.fd) };

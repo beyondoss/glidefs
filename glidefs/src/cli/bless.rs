@@ -277,12 +277,16 @@ pub async fn run_bless_oci(
 
     info!("pulling and ingesting layers");
 
-    pull_image(
+    // emit_boot_set = true: derive the static ELF-closure boot set and capture
+    // where the ext4 writer placed it, so the server can precisely warm those
+    // scattered device blocks at open (ext4 cannot reorder them into a prefix).
+    let (_resolved, boot_blocks) = pull_image(
         &registry_client,
         &image,
         &Credentials::Anonymous,
         Arc::clone(&handler),
         ingest_opts,
+        true,
     )
     .await
     .map_err(|e| anyhow::anyhow!("pull failed: {e}"))?;
@@ -311,13 +315,24 @@ pub async fn run_bless_oci(
     }
 
     // --- Save manifest as base. Index warming on fork comes from the manifest's
-    // pack list; no sidecar artifact is written. ---
+    // pack list. For non-EROFS bases we also store the precise boot block list
+    // (the boot set's scattered device blocks) for the device-open precise warm —
+    // ext4 can't reorder it into a contiguous prefix the way EROFS does. ---
     let manifest_key = format!("bases/{}", name);
     let manifest_data = volume_manifest.read().serialize()?;
     content_store
         .put_manifest(&manifest_key, manifest_data, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
+
+    if !boot_blocks.is_empty() {
+        let data = crate::block::manifest::serialize_block_list(&boot_blocks);
+        content_store
+            .put_boot_set(&name, data)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to upload boot set: {e}"))?;
+        info!(blocks = boot_blocks.len(), "stored precise boot set for ext4 base");
+    }
 
     let elapsed = start.elapsed();
 
@@ -331,14 +346,6 @@ pub async fn run_bless_oci(
     Ok(())
 }
 
-/// Bless an OCI image into a **read-only EROFS** base — the correct format for
-/// an immutable container/OCI rootfs served daemonless (kernel `erofs` over
-/// ublk; the guest's writes go to an overlay upper, never into the image).
-///
-/// Same pipeline as [`run_bless_oci`] (pull → write into a volume → drain → hot
-/// set + manifest), but it merges the layers into a deterministic, grid-aligned
-/// EROFS image (via the hand-rolled writer) instead of ext4. The image is
-/// content-addressed and dedups across images; the consumer mounts it read-only.
 /// Select the EROFS boot set. With `profile`, RUN the image once and capture the
 /// real boot working set via fanotify (covers dlopen'd libraries + config/data
 /// that static ELF analysis cannot see), unioned with the static closure as a
@@ -381,6 +388,16 @@ fn derive_boot_set(
     crate::oci::boot_set::derive_boot_paths(config, layers)
 }
 
+/// Bless an OCI image into a **read-only EROFS** base — the correct format for
+/// an immutable container/OCI rootfs served daemonless (kernel `erofs` over
+/// ublk; the guest's writes go to an overlay upper, never into the image).
+///
+/// Same pipeline as [`run_bless_oci`] (pull → write into a volume → drain →
+/// manifest), but it merges the layers into a deterministic, grid-aligned EROFS
+/// image (via the hand-rolled writer) instead of ext4, and the boot set is laid
+/// contiguously at the front (manifest `prefetch_len`) rather than warmed as a
+/// scattered block list. The image is content-addressed and dedups across
+/// images; the consumer mounts it read-only.
 pub async fn run_bless_oci_erofs(
     image_ref: String,
     name: String,
