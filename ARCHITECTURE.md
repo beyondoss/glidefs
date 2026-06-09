@@ -712,6 +712,9 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 | `/api/manifests/{s3_prefix}/{name}` | `HEAD` | Check manifest existence (200/404). No data transfer, no running export required. |
 | `/api/exports/{name}/drain` | `POST` | Flush all dirty blocks to S3 (no versioned snapshot) |
 | `/api/exports/{name}/promote` | `POST` | Toggle readonly → read-write |
+| `/api/exports/{name}/promote-base` | `POST` | Publish a snapshot's manifest under `bases/{base_name}` (no data re-upload). Body: `{"base_name":"...","sequence":N}`. Idempotent; the promoted base is forkable and profileable like a blessed one. |
+| `/api/profile/{s3_prefix}/{name}` | `POST` | Start a background boot-set profile of `bases/{name}` (202). Body (all optional): `{"cmd","seed_paths","fs_type","runs","timeout_secs","force","untrusted","max_blocks"}`. `seed_paths` are faulted under the tracer before the entrypoint. 503 when the server has no `[profile]` config. |
+| `/api/profile/{s3_prefix}/{name}` | `GET` | Profile status: `{"state":"running"}` in-flight; `{"state":"complete"}` when `.boot-set.meta` exists; 404 when neither (never profiled, or last attempt failed). |
 | `/api/exports/{name}/metrics` | `GET` | Per-export metrics snapshot (JSON) |
 | `/metrics` | `GET` | Prometheus scrape endpoint (all exports) |
 | `/health` | `GET` | Liveness probe (always 200) |

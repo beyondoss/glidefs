@@ -136,6 +136,7 @@ fn create_router_config(s3: Arc<dyn ObjectStore>, dir: &TempDir) -> RouterConfig
         nbd_dead_conn_timeout: 0,
         max_exports: 10_000,
         manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+        profile: None,
     }
 }
 
@@ -1009,6 +1010,7 @@ async fn test_readahead_prefetches_next_pack_index() {
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .unwrap(),
@@ -1069,6 +1071,7 @@ async fn test_readahead_prefetches_next_pack_index() {
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .unwrap(),

@@ -64,6 +64,7 @@ mod fio_bench {
                     nbd_dead_conn_timeout: 0,
                     max_exports: 10_000,
                     manifest_cache_bytes: glidefs::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+                    profile: None,
                 })
                 .await
                 .expect("failed to create router"),

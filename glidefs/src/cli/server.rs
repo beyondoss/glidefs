@@ -151,6 +151,7 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
             nbd_dead_conn_timeout: nbd_config.nbd_dead_conn_timeout(),
             max_exports: nbd_config.max_exports(),
             manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: settings.profile.clone(),
         })
         .await
         .context("Failed to initialize export router")?,

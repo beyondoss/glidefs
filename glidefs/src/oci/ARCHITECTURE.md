@@ -346,6 +346,15 @@ glidefs profile --name py --s3-prefix prod -c cfg.toml --cmd 'python3 -c "import
 - `--cmd` overrides the recorded entrypoint; `--runs 1..3` rank-merges; `--timeout`
   caps a long-running server (its startup reads ARE the boot set).
 
+The capture engine is shared (`oci/profile_runner.rs`): the CLI above and the
+daemon's `POST /api/profile/{s3_prefix}/{name}` both drive it. The API form exists
+for orchestrators that compose images at runtime (fork base → write files →
+snapshot → `POST /api/exports/{name}/promote-base` → profile the promoted base):
+it runs in the serving daemon (background task, `GET` the same path for status)
+and accepts `seed_paths` — absolute in-image paths faulted under the tracer before
+the entrypoint — so a caller that knows which files it composed in can pin them
+into the boot set without knowing the boot's dynamic working set.
+
 ### The isolation sandbox
 
 The profiler runs an image's entrypoint, so the run is wrapped in a pluggable

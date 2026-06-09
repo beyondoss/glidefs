@@ -113,6 +113,9 @@ pub enum RouterError {
     #[error("OCI pull error: {0}")]
     OciPull(String),
 
+    #[error("Profile error: {0}")]
+    Profile(String),
+
     #[error(
         "Export limit reached: cannot create export '{name}' (router holds {current} of max {max})"
     )]
@@ -128,6 +131,37 @@ pub enum RouterError {
 pub struct BlessStatus {
     pub state: String,
     pub oci_image: String,
+}
+
+/// Status of an in-flight boot-set profile operation.
+///
+/// `state` is `"running"` while the capture is in flight. Like bless, the
+/// in-flight entry is removed on completion or failure — callers observe
+/// completion via the `.boot-set.meta` sidecar (the GET handler checks it)
+/// and failure as "no in-flight task AND no sidecar".
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProfileStatus {
+    pub state: String,
+}
+
+/// Parameters for a daemon-side boot-set profile run
+/// (`POST /api/profile/{s3_prefix}/{name}`).
+#[derive(Clone, Debug)]
+pub struct ProfileParams {
+    /// Entrypoint override; falls back to the base's recorded runspec.
+    pub cmd: Option<String>,
+    /// Extra absolute in-image paths to fault under the tracer (unioned with
+    /// the runspec's static seed). Lets the caller pin files it composed into
+    /// the image into the boot set.
+    pub seed_paths: Vec<String>,
+    pub fs_type: Option<String>,
+    pub runs: u32,
+    pub timeout_secs: u64,
+    pub force: bool,
+    /// `true` refuses the namespaces sandbox (host kernel mounts the fs).
+    pub untrusted: bool,
+    /// Cap on captured blocks per run.
+    pub max_blocks: usize,
 }
 
 /// Information about an export.
@@ -281,6 +315,9 @@ pub struct RouterConfig {
     /// `DEFAULT_MANIFEST_CACHE_BYTES`. Sized for the volume scale of
     /// the deployment — 10TB volumes need MB-per-manifest headroom.
     pub manifest_cache_bytes: usize,
+    /// `[profile]` settings for the daemon profile API (`POST /api/profile/…`).
+    /// `None` disables the API (requests are rejected with an explanatory error).
+    pub profile: Option<crate::config::ProfileConfig>,
 }
 
 /// Multi-tenant export router.
@@ -372,6 +409,15 @@ pub struct ExportRouter {
     /// In-flight OCI bless tasks: "{s3_prefix}/{name}" → status.
     /// Entries exist only while in-flight. Removed on completion or failure.
     bless_tasks: RwLock<HashMap<String, BlessStatus>>,
+
+    /// In-flight boot-set profile tasks: "{s3_prefix}/{name}" → status.
+    /// Same lifecycle as `bless_tasks`: entries exist only while in-flight;
+    /// completion is observable via the `.boot-set.meta` sidecar in S3.
+    profile_tasks: RwLock<HashMap<String, ProfileStatus>>,
+
+    /// `[profile]` config from the server settings. `None` when the daemon
+    /// was started without one — profile API requests are then rejected.
+    profile_config: Option<crate::config::ProfileConfig>,
 
     /// Owns the lifetime of `cache_dir` when constructed via `new_for_test()`.
     /// `Drop` removes the dir; production routers leave the field `None`.
@@ -675,6 +721,8 @@ impl ExportRouter {
             ublk_server,
             manifest_cache,
             bless_tasks: RwLock::new(HashMap::new()),
+            profile_tasks: RwLock::new(HashMap::new()),
+            profile_config: config.profile,
             #[cfg(test)]
             _test_temp_dir: None,
         })
@@ -1617,6 +1665,68 @@ impl ExportRouter {
         Ok(())
     }
 
+    /// Promote a frozen snapshot of an export to a base manifest.
+    ///
+    /// Publishes the snapshot's manifest (already flushed and immutable) under
+    /// `bases/{base_name}` in the export's S3 namespace — no data re-upload,
+    /// the manifest's pack references resolve as-is because forks share their
+    /// parent's prefix. The promoted base behaves exactly like a blessed one:
+    /// it can be forked by name and profiled (`.boot-set` warm on fork).
+    ///
+    /// Idempotent: returns `Ok(false)` without writing when `bases/{base_name}`
+    /// already exists. Returns `Ok(true)` when newly promoted.
+    pub async fn promote_snapshot_to_base(
+        &self,
+        name: &str,
+        sequence: u64,
+        base_name: &str,
+    ) -> Result<bool, RouterError> {
+        validate_export_name(name)?;
+        validate_export_name(base_name)?;
+        let content_store = {
+            let entry = self
+                .exports
+                .get(name)
+                .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            Arc::clone(&entry.value().content_store)
+        };
+
+        let manifest_name = format!("bases/{}", base_name);
+        if content_store
+            .head_manifest(&manifest_name)
+            .await
+            .map_err(RouterError::ContentStore)?
+        {
+            debug!(
+                export = %name,
+                base = %base_name,
+                "promote: base already exists, skipping"
+            );
+            return Ok(false);
+        }
+
+        let snapshot_bytes = content_store
+            .get_snapshot(name, sequence)
+            .await
+            .map_err(RouterError::ContentStore)?
+            .ok_or_else(|| {
+                RouterError::Manifest(format!(
+                    "snapshot {sequence} of '{name}' not found — snapshot before promoting"
+                ))
+            })?;
+        content_store
+            .put_manifest(&manifest_name, snapshot_bytes, None)
+            .await
+            .map_err(RouterError::ContentStore)?;
+        info!(
+            export = %name,
+            sequence,
+            base = %base_name,
+            "promoted snapshot to base manifest"
+        );
+        Ok(true)
+    }
+
     /// Check if a manifest exists in S3 (HEAD request, no data transfer).
     ///
     /// Does not require a running export — resolves the manifest path from
@@ -1637,6 +1747,142 @@ impl ExportRouter {
     /// Get the status of an in-flight bless task.
     pub async fn get_bless_status(&self, key: &str) -> Option<BlessStatus> {
         self.bless_tasks.read().await.get(key).cloned()
+    }
+
+    /// Get the status of an in-flight profile task.
+    pub async fn get_profile_status(&self, key: &str) -> Option<ProfileStatus> {
+        self.profile_tasks.read().await.get(key).cloned()
+    }
+
+    /// Build a ContentStore for an arbitrary prefix, reusing the router's
+    /// shared S3 infra (circuit breaker + transfer semaphores).
+    fn content_store_for_prefix(&self, s3_prefix: &str) -> Arc<ContentStore> {
+        let base = format!("{}/exports/{}", self.db_path, s3_prefix);
+        let mut cs = ContentStore::new(Arc::clone(&self.object_store), &base)
+            .with_circuit_breaker(Arc::clone(&self.s3_circuit_breaker));
+        if let Some(sem) = &self.upload_semaphore {
+            cs = cs.with_upload_semaphore(Arc::clone(sem));
+        }
+        if let Some(sem) = &self.download_semaphore {
+            cs = cs.with_download_semaphore(Arc::clone(sem));
+        }
+        Arc::new(cs)
+    }
+
+    /// Check if a base's `.boot-set.meta` commit marker exists in S3.
+    ///
+    /// The profile GET handler uses this to report `complete` for finished
+    /// profiles (in-flight entries are removed on exit, like bless).
+    pub async fn boot_set_meta_exists(
+        &self,
+        s3_prefix: &str,
+        name: &str,
+    ) -> Result<bool, RouterError> {
+        let cs = self.content_store_for_prefix(s3_prefix);
+        Ok(cs
+            .get_boot_set_meta(name)
+            .await
+            .map_err(RouterError::ContentStore)?
+            .is_some())
+    }
+
+    /// Start a boot-set profile of `bases/{name}` in the background.
+    ///
+    /// Returns immediately with the current status:
+    /// - If a profile is already in-flight for this key, returns its status.
+    /// - Otherwise spawns a background capture task and returns `running`.
+    ///
+    /// The capture itself ([`crate::oci::profile_runner::profile_base`]) is
+    /// idempotent on the base manifest's ETag, so re-POSTing for an unchanged
+    /// base costs a few S3 GETs and publishes nothing. Completion/failure are
+    /// observed the same way as bless: the in-flight entry disappears, and
+    /// `.boot-set.meta` existence distinguishes success from failure.
+    pub async fn start_profile(
+        self: &Arc<Self>,
+        s3_prefix: &str,
+        name: &str,
+        params: ProfileParams,
+    ) -> Result<ProfileStatus, RouterError> {
+        validate_export_name(name)?;
+        let Some(profile_cfg) = self.profile_config.clone() else {
+            return Err(RouterError::Profile(
+                "no [profile] section in the server config — profiling is disabled".to_string(),
+            ));
+        };
+
+        let key = format!("{s3_prefix}/{name}");
+        // Check if already in-flight; double-check under the write lock.
+        {
+            let tasks = self.profile_tasks.read().await;
+            if let Some(status) = tasks.get(&key) {
+                return Ok(status.clone());
+            }
+        }
+        let status = ProfileStatus {
+            state: "running".to_string(),
+        };
+        {
+            let mut tasks = self.profile_tasks.write().await;
+            if let Some(existing) = tasks.get(&key) {
+                return Ok(existing.clone());
+            }
+            tasks.insert(key.clone(), status.clone());
+        }
+
+        let router = Arc::clone(self);
+        let content_store = self.content_store_for_prefix(s3_prefix);
+        let name_owned = name.to_string();
+        let cleanup_key = key;
+        let _handle = spawn_supervised("profile-bg", async move {
+            // Guard removes the profile_tasks entry on any exit (return,
+            // error, panic) — same rationale as the bless guard above.
+            struct ProfileGuard {
+                router: Arc<ExportRouter>,
+                key: String,
+            }
+            impl Drop for ProfileGuard {
+                fn drop(&mut self) {
+                    let router = Arc::clone(&self.router);
+                    let key = std::mem::take(&mut self.key);
+                    tokio::spawn(async move {
+                        router.profile_tasks.write().await.remove(&key);
+                    });
+                }
+            }
+            let _guard = ProfileGuard {
+                router: Arc::clone(&router),
+                key: cleanup_key,
+            };
+
+            let spec = crate::oci::profile_runner::ProfileSpec {
+                name: name_owned.clone(),
+                cmd: params.cmd,
+                seed_paths: params.seed_paths,
+                fs_type: params.fs_type,
+                sandbox: None, // [profile] config decides (ns default, firecracker in prod)
+                trusted: !params.untrusted,
+                runs: params.runs,
+                timeout: Duration::from_secs(params.timeout_secs.max(1)),
+                force: params.force,
+                max_blocks: params.max_blocks,
+            };
+            match crate::oci::profile_runner::profile_base(content_store, &profile_cfg, spec).await
+            {
+                Ok(crate::oci::profile_runner::ProfileOutcome::UpToDate { .. }) => {
+                    info!(name = %name_owned, "profile: boot set already up to date");
+                }
+                Ok(crate::oci::profile_runner::ProfileOutcome::Profiled {
+                    block_count, ..
+                }) => {
+                    info!(name = %name_owned, block_count, "profile: boot set published");
+                }
+                Err(e) => {
+                    error!(name = %name_owned, error = %e, "profile task failed");
+                }
+            }
+        });
+
+        Ok(status)
     }
 
     /// Start an OCI image bless operation.
@@ -2975,6 +3221,7 @@ impl ExportRouter {
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .expect("failed to create test router");
@@ -3147,6 +3394,7 @@ mod tests {
             nbd_dead_conn_timeout: 0,
             max_exports: 2,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .unwrap();
@@ -3232,6 +3480,7 @@ mod tests {
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .expect("failed to create test router")
@@ -3948,6 +4197,99 @@ mod tests {
             &data[..],
             "Fork should read source's data"
         );
+    }
+
+    #[tokio::test]
+    async fn test_promote_snapshot_to_base() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // Compose: create export, write data, snapshot (the instd staging flow).
+        router
+            .create_export(test_export_config("composed"), false, None, None)
+            .await
+            .unwrap();
+        let handler = router.get_handler("composed").await.unwrap();
+        let data = vec![0xDD; 128 * 1024];
+        handler.write(0, &data, false).await.unwrap();
+        let snap = router.snapshot_export("composed", None).await.unwrap();
+
+        // Promote the snapshot to a base manifest.
+        let promoted = router
+            .promote_snapshot_to_base("composed", snap.sequence, "rootfs-abc123")
+            .await
+            .unwrap();
+        assert!(promoted, "first promote should publish the base");
+        assert!(
+            router
+                .head_manifest("composed", "bases/rootfs-abc123")
+                .await
+                .unwrap(),
+            "promoted base manifest should exist"
+        );
+
+        // Idempotent: a second promote is a no-op.
+        let again = router
+            .promote_snapshot_to_base("composed", snap.sequence, "rootfs-abc123")
+            .await
+            .unwrap();
+        assert!(!again, "second promote should skip");
+
+        // The promoted base forks like a blessed one and serves the data.
+        let fork_config = ExportConfig {
+            name: "vm-clone".to_string(),
+            size_gb: 0.01,
+            s3_prefix: Some("composed".to_string()), // share the parent's prefix
+            block_size: None,
+            flush_threshold: None,
+            flush_mode: None,
+            transport: None,
+            compaction_cooldown: None,
+        };
+        router
+            .create_export(fork_config, false, Some("bases/rootfs-abc123"), None)
+            .await
+            .unwrap();
+        let fork_handler = router.get_handler("vm-clone").await.unwrap();
+        let fork_data = fork_handler.read(0, 128 * 1024).await.unwrap();
+        assert_eq!(
+            fork_data.as_ref(),
+            &data[..],
+            "fork of the promoted base should read the composed data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_promote_missing_snapshot_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        router
+            .create_export(test_export_config("composed2"), false, None, None)
+            .await
+            .unwrap();
+        // No snapshot taken — promote must refuse rather than publish garbage.
+        let err = router
+            .promote_snapshot_to_base("composed2", 1, "rootfs-missing")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RouterError::Manifest(_)),
+            "expected Manifest error for missing snapshot, got {err:?}"
+        );
+        assert!(
+            !router
+                .head_manifest("composed2", "bases/rootfs-missing")
+                .await
+                .unwrap()
+        );
+
+        // Unknown export.
+        let err = router
+            .promote_snapshot_to_base("no-such-export", 1, "rootfs-x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RouterError::ExportNotFound(_)));
     }
 
     #[tokio::test]
@@ -4845,6 +5187,7 @@ mod tests {
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .unwrap();
@@ -4884,6 +5227,7 @@ mod tests {
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .unwrap();
@@ -4934,6 +5278,7 @@ mod tests {
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .unwrap();
@@ -4966,6 +5311,7 @@ mod tests {
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .unwrap();
@@ -5076,6 +5422,7 @@ mod tests {
             nbd_dead_conn_timeout: 0,
             max_exports: 10_000,
             manifest_cache_bytes: DEFAULT_MANIFEST_CACHE_BYTES,
+            profile: None,
         })
         .await
         .unwrap();
