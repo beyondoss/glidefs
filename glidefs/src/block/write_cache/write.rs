@@ -439,16 +439,32 @@ impl WriteCache<Active> {
         let block_size = self.inner.config.block_size as u64;
         let start_block = offset / block_size;
         let end_block = (offset + length - 1) / block_size;
-        // `require_promotion=false`: the kernel WRITE_FIXED is about to
-        // overwrite the entire block, so we don't NEED the prior data —
-        // we only want to preserve it for SYNCING blocks where the
-        // flushing file is still around (so the post-WRITE_FIXED state
-        // accurately reflects a "promote then overwrite" rather than
-        // a torn promote-eviction race). For NOT_PRESENT blocks that
-        // raced with an eviction (flushing file already dropped),
-        // returning `BlockEvicted` would fail writes that are otherwise
-        // perfectly recoverable (kernel will write the whole block).
-        self.inner.promote_syncing_blocks(df, start_block, end_block, false)?;
+
+        // `require_promotion` hinges on whether the kernel WRITE_FIXED will
+        // overwrite EVERY touched block in full.
+        //
+        // * Block-aligned, block-multiple write (`fully_covers`): WRITE_FIXED
+        //   replaces all bytes of every block, so we don't need the prior
+        //   data. `require_promotion=false` lets an evicted block stay
+        //   NOT_PRESENT — the kernel write reconstructs it whole. (Preserves
+        //   the large-IO fast path that motivated ZC.)
+        //
+        // * SUB-BLOCK write (`!fully_covers`): WRITE_FIXED touches only part
+        //   of the block; the remainder must already be present in the active
+        //   file. If a flush evicted the block in the unguarded gap between
+        //   `pre_write` and gate acquisition (DIRTY→SYNCING→NOT_PRESENT,
+        //   flushing file dropped), promoting a no-op here would leave the
+        //   remainder as sparse zeros, the commit would still mark the block
+        //   DIRTY, and the half-zero block would be uploaded — read back as
+        //   zeros after a cold restart. That is the `fio_verify_random_cold_
+        //   wake` corruption. `require_promotion=true` surfaces it as
+        //   `BlockEvicted` so the caller (`BlockHandler::zc_prepare_write`)
+        //   re-backfills from S3 and retries — exactly what USER_COPY's
+        //   `pwrite_and_commit` does (require_promotion=true) and
+        //   `backfill_and_write` retries on.
+        let fully_covers = offset % block_size == 0 && length % block_size == 0;
+        self.inner
+            .promote_syncing_blocks(df, start_block, end_block, !fully_covers)?;
         Ok(())
     }
 

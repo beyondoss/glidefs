@@ -1487,31 +1487,48 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                         }
                         use std::os::unix::io::AsRawFd;
                         let fd = (*gate).as_raw_fd_for_ublk_zc();
-                        if let Err(e) = self.handler.zc_promote_for_write_with(
+                        match self.handler.zc_promote_for_write_with(
                             &*gate,
                             offset,
                             u64::from(length),
                         ) {
-                            tracing::warn!(?e, offset, length, "ZC promote failed (inline)");
-                            return ZcDispatch::Inline {
-                                action: ZcAction::Complete(-libc::EIO),
-                                keepalive: None,
-                            };
+                            Ok(()) => {
+                                let action = ZcAction::Chunks(vec![ZcChunk {
+                                    op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
+                                    buf_offset: 0,
+                                    length,
+                                }]);
+                                return ZcDispatch::Inline {
+                                    action,
+                                    keepalive: Some(Box::new(gate)),
+                                };
+                            }
+                            Err(crate::block::error::CommandError::BlockEvicted) => {
+                                // A flush evicted a (sub-block) block out from
+                                // under us — eviction doesn't take the rotation
+                                // gate, so it can race even while we hold the
+                                // read side. Drop the gate and fall through to
+                                // the deferred path, which re-backfills the
+                                // block from S3 before the kernel write. Without
+                                // this, a partial WRITE_FIXED would land on
+                                // sparse zeros → corrupt block (see
+                                // `zc_prepare_write`).
+                                drop(gate);
+                            }
+                            Err(e) => {
+                                tracing::warn!(?e, offset, length, "ZC promote failed (inline)");
+                                return ZcDispatch::Inline {
+                                    action: ZcAction::Complete(-libc::EIO),
+                                    keepalive: None,
+                                };
+                            }
                         }
-                        let action = ZcAction::Chunks(vec![ZcChunk {
-                            op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
-                            buf_offset: 0,
-                            length,
-                        }]);
-                        return ZcDispatch::Inline {
-                            action,
-                            keepalive: Some(Box::new(gate)),
-                        };
+                    } else {
+                        // Pre-write needs async backfill — drop the gate
+                        // before falling through (the deferred path
+                        // re-acquires it after the async backfill resolves).
+                        drop(gate);
                     }
-                    // Pre-write needs async backfill — drop the gate
-                    // before falling through (the deferred path
-                    // re-acquires it after the async backfill resolves).
-                    drop(gate);
                 }
 
                 // Slow path: gate contended OR backfill required.
@@ -1519,42 +1536,22 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 let handle = handle.clone();
                 self.runtime.spawn(async move {
                     let mut guard = SubmitGuard::new(tag, handle);
-                    match handler.pre_write(offset, u64::from(length)).await {
-                        Ok(()) => {
-                            // Acquire the rotation gate, then read fd from
-                            // the gate's own deref. Calling
-                            // `data_file.read()` again while the read_arc
-                            // guard is held would self-deadlock if a writer
-                            // is queued (parking_lot is task-fair — a new
-                            // read attempt queues behind the writer, which
-                            // is itself queued behind the inflight reader).
-                            let gate = handler.zc_inflight_enter();
-                            let fd = {
-                                use std::os::unix::io::AsRawFd;
-                                (*gate).as_raw_fd_for_ublk_zc()
-                            };
-                            // Promote any SYNCING blocks BEFORE the kernel
-                            // writes. The stateright write-phase model
-                            // requires `Promote* → PwriteData → WalAppend
-                            // → TransitionDirty`. For USER_COPY,
-                            // `pwrite_and_commit` does all four under one
-                            // lock. For ZC the kernel does PwriteData
-                            // (WRITE_FIXED) and we can't reorder around
-                            // it — so promote happens here, before the
-                            // kernel's data write, holding the gate the
-                            // whole way. Running promote AFTER WRITE_FIXED
-                            // would re-copy flushing-file (old) data on top
-                            // of the just-landed new data → silent
-                            // rollback (caught by the soak test).
-                            if let Err(e) = handler.zc_promote_for_write_with(
-                                &*gate,
-                                offset,
-                                u64::from(length),
-                            ) {
-                                tracing::warn!(?e, offset, length, "ZC promote failed");
-                                guard.commit(ZcAction::Complete(-libc::EIO), None);
-                                return;
-                            }
+                    // `zc_prepare_write` backfills NOT_PRESENT blocks, acquires
+                    // the rotation gate, and promotes SYNCING blocks under the
+                    // gate — re-backfilling if a flush evicts a block in the
+                    // unguarded backfill→gate window (the
+                    // `fio_verify_random_cold_wake` corruption for sub-block
+                    // writes). It returns the held gate; we submit WRITE_FIXED
+                    // and forward the gate as keepalive so it outlives the
+                    // kernel I/O (and `after_write`'s commit). Promote runs
+                    // BEFORE the kernel data write to satisfy the stateright
+                    // phase order `Promote* → PwriteData → WalAppend →
+                    // TransitionDirty`; running it after WRITE_FIXED would
+                    // re-copy stale flushing-file data over the new bytes.
+                    match handler.zc_prepare_write(offset, u64::from(length)).await {
+                        Ok(gate) => {
+                            use std::os::unix::io::AsRawFd;
+                            let fd = (*gate).as_raw_fd_for_ublk_zc();
                             let action = ZcAction::Chunks(vec![ZcChunk {
                                 op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
                                 buf_offset: 0,
@@ -1563,7 +1560,7 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                             guard.commit(action, Some(Box::new(gate)));
                         }
                         Err(e) => {
-                            tracing::warn!(?e, offset, length, "ZC pre_write failed");
+                            tracing::warn!(?e, offset, length, "ZC prepare_write failed");
                             guard.commit(ZcAction::Complete(-libc::EIO), None);
                         }
                     }

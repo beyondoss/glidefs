@@ -2437,6 +2437,80 @@ async fn test_promote_does_not_zero_not_present_when_ff_stale() {
     }
 }
 
+/// Regression for the ZC-only `fio_verify_random_cold_wake` corruption
+/// (CI run 27189103705, "bad magic header 0" at a 128 KiB-aligned offset).
+///
+/// The ublk zero-copy write entry point `zc_promote_for_write_with` must, for
+/// a SUB-BLOCK write whose target block was evicted in the unguarded
+/// `pre_write`→gate window (NOT_PRESENT, flushing file gone), return
+/// `BlockEvicted` — so `BlockHandler::zc_prepare_write` re-backfills the
+/// remainder from S3 before the kernel `WRITE_FIXED`. The pre-fix behavior
+/// (`require_promotion=false` unconditionally) returned `Ok`, letting the
+/// partial `WRITE_FIXED` land on sparse zeros while the commit marked the
+/// block DIRTY — a half-zero block uploaded to S3 and read back as zeros after
+/// a cold restart. This is the ZC twin of the USER_COPY safety net asserted by
+/// [`test_promote_syncing_blocks_silent_skip_when_ff_none`]; the ZC path was
+/// never wired to it.
+///
+/// A FULL-block write is still allowed to proceed (`Ok`): the kernel
+/// `WRITE_FIXED` overwrites every byte, so the evicted prior data isn't needed
+/// — this preserves the large-IO ZC fast path.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+#[tokio::test]
+async fn zc_promote_rejects_subblock_write_to_evicted_block() {
+    let block_size = 128 * 1024usize;
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    // Drive block 0 into the post-eviction steady state: real data written,
+    // rotated (DIRTY→SYNCING), evicted (SYNCING→NOT_PRESENT), flushing file
+    // dropped. Its authoritative data now lives "in S3".
+    h.cache.write(0, &vec![0xAA_u8; block_size]).unwrap();
+    assert_eq!(h.cache.rotate_and_snapshot().unwrap(), vec![0]);
+    assert!(h.cache.inner.transition_syncing_to_not_present(0));
+    h.cache
+        .inner
+        .flushing_active
+        .store(false, Ordering::Release);
+    drop(h.cache.inner.flushing_file.lock().take());
+    assert_eq!(
+        h.cache.inner.state_map.get(0),
+        SparseBlockState::NOT_PRESENT
+    );
+    assert!(h.cache.inner.flushing_file.lock().is_none());
+
+    // SUB-BLOCK write (4 KiB of a 128 KiB block): must reject so the caller
+    // re-backfills. Before the fix this returned Ok and corrupted the block.
+    {
+        let df = h.cache.inner.data_file.read();
+        let res = h.cache.zc_promote_for_write_with(&df, 0, 4096);
+        assert!(
+            matches!(res, Err(super::CacheError::BlockEvicted)),
+            "sub-block ZC write to an evicted block must return BlockEvicted, got: {res:?}"
+        );
+        assert_eq!(
+            h.cache.inner.state_map.get(0),
+            SparseBlockState::NOT_PRESENT,
+            "block must stay NOT_PRESENT — not promoted-to-zeros + marked DIRTY"
+        );
+    }
+
+    // FULL-block write (the whole 128 KiB): allowed to proceed — WRITE_FIXED
+    // overwrites every byte, so the evicted prior data is not needed.
+    {
+        let df = h.cache.inner.data_file.read();
+        let res = h.cache.zc_promote_for_write_with(&df, 0, block_size as u64);
+        assert!(
+            res.is_ok(),
+            "full-block ZC write must skip promote (Ok), got: {res:?}"
+        );
+        assert_eq!(
+            h.cache.inner.state_map.get(0),
+            SparseBlockState::NOT_PRESENT,
+            "full-block promote is a no-op for an evicted block (kernel write reconstructs it)"
+        );
+    }
+}
+
 /// Regression test: post-rotation zero-write must survive crash recovery.
 ///
 /// Scenario:
