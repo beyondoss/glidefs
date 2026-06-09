@@ -151,7 +151,11 @@ pub enum Commands {
         /// Hard per-run timeout in seconds.
         #[arg(long, default_value = "30")]
         timeout: u64,
-        /// Filesystem type of the base (`ext4` | `erofs`). Inferred if omitted.
+        /// Filesystem of the base, passed straight to the sandbox's `mount -t`
+        /// (namespaces) or the guest init (firecracker): `ext4`, `erofs`, `btrfs`,
+        /// `f2fs`, … — any single-fs image the kernel can mount. Inferred from the
+        /// `.runspec` / EROFS hint if omitted. (Partitioned multi-partition VM
+        /// disks aren't supported yet — the image must be a bare filesystem.)
         #[arg(long)]
         fs_type: Option<String>,
         /// Number of boot runs to rank-merge (1–3).
