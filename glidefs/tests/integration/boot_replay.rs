@@ -506,7 +506,6 @@ async fn run_trial(
         let vm = &vm;
         let cs = &content_store;
         let metrics = &metrics;
-        let pic = pic;
         async move {
             cache
                 .read(b * BLOCK as u64, BLOCK, clean, pic, vm, cs, metrics)
