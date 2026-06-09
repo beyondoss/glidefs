@@ -642,9 +642,12 @@ Ring buffer (4 entries) tracks recent chunk accesses. When 3+ consecutive chunks
 
 ### Boot Prefetch on Fork Open
 
-When a fork is created from a base manifest, the router spawns one background task (stored in `ExportState`, aborted on teardown) that **index-warms** the export — bounded, never pulling the whole image: it fetches this export's pack indices from its **own VolumeManifest** (the real chunk indices via `all_pack_ids`/`chunks.keys()`). One fetch per pack (bounded by pack count), so even a lazily-read tail block costs one S3 GET (data) instead of two (index + data). This is the same mechanism as startup `prefetch_chunk_metas`.
+When a fork is created from a base manifest, the router spawns one background task (stored in `ExportState`, aborted on teardown) that warms the export in two bounded tiers (never pulling the whole image):
 
-There is no data prefetch and no `.hot-set` artifact: the hot set was a list of *every* non-zero block fed to a chunk-index API (a no-op for any image past chunk 0 — see `volume_manifest::block_index_is_not_chunk_index`), and data-prefetching it would have negated lazy loading. (`router.rs:create_export`, `write_cache/read.rs:prefetch_chunks`)
+1. **Index warm** — fetches this export's pack indices from its **own VolumeManifest** (the real chunk indices via `all_pack_ids`/`chunks.keys()`). One fetch per pack, so even a lazily-read tail block costs one S3 GET (data) instead of two (index + data). Same mechanism as startup `prefetch_chunk_metas`.
+2. **Data warm (the boot set)** — if the base was profiled, warms its *precise boot working set* so the guest's first reads are cache hits: an EROFS base carries a contiguous `prefetch_len` region (one range GET); a non-EROFS base carries a `bases/{name}.boot-set` sidecar (precise, coalesced, parallel — zero over-fetch). Bounded, so the lazy tail still demand-faults; the readahead window backstops anything the warm hasn't reached. Forks inherit by base name — profile once per base. See `glidefs/src/oci/ARCHITECTURE.md` → "Boot-set profiling". (`router.rs:create_export`, `write_cache/read.rs:prefetch_chunks`/`prefetch_data_range`/`prefetch_data_blocks`)
+
+The legacy `.hot-set` (every non-zero block fed to a chunk-index API — a no-op past chunk 0, see `volume_manifest::block_index_is_not_chunk_index`) was removed; the boot set replaces it with a *bounded, profiled* working set that doesn't negate lazy loading.
 
 ## Data Integrity
 
@@ -690,7 +693,7 @@ CRC32 is stored in `crc_map: SparseCrcMap` on `CacheInner` — a lock-free two-l
 
 ### Bless Pipeline
 
-`glidefs bless` reads a raw disk image sequentially, processes one 128 MiB volume chunk at a time (streaming — never accumulates the full image). For each chunk: deduplicates 128 KB blocks by hash, then `stream_chunk_pack()` uploads the chunk as a GLPK pack via `WriteMultipart` — the previous chunk's upload runs concurrently with the next chunk's disk reads (one upload in flight at a time). Builds a GLVM VolumeManifest from the uploaded pack IDs. Output: VolumeManifest at `exports/{s3_prefix}/manifests/bases/{name}`. (Index warming on fork comes from this manifest; bless writes no prefetch sidecar.) `bless --oci` ingests OCI layers into **ext4** (writable bases); `bless --oci --erofs` instead emits a read-only **EROFS** rootfs for the overlay/immutable case. (`cli/bless.rs`)
+`glidefs bless` reads a raw disk image sequentially, processes one 128 MiB volume chunk at a time (streaming — never accumulates the full image). For each chunk: deduplicates 128 KB blocks by hash, then `stream_chunk_pack()` uploads the chunk as a GLPK pack via `WriteMultipart` — the previous chunk's upload runs concurrently with the next chunk's disk reads (one upload in flight at a time). Builds a GLVM VolumeManifest from the uploaded pack IDs. Output: VolumeManifest at `exports/{s3_prefix}/manifests/bases/{name}`. (Index warming on fork comes from this manifest; a raw `--image` bless writes no boot-set sidecar — raw VM disks have no OCI entrypoint to profile. The boot-set data warm is produced for OCI bases by `--profile` / `glidefs profile`; see `glidefs/src/oci/ARCHITECTURE.md` → "Boot-set profiling".) `bless --oci` ingests OCI layers into **ext4** (writable bases); `bless --oci --erofs` instead emits a read-only **EROFS** rootfs for the overlay/immutable case. (`cli/bless.rs`)
 
 ## Management API
 

@@ -237,6 +237,11 @@ Determinism is maintained by:
 | `oci/export.rs`               | `export_tar()`: GlideFS blocks → ext4 → tar stream pipeline              |
 | `oci/pull.rs`                 | `pull_image()`: resolve manifest, download + decompress layers, ingest    |
 | `oci/push.rs`                 | `push_image()` / `push_delta_image()`: export + compress + upload to registry |
+| `oci/boot_set.rs`             | **Static** boot-set derivation: ELF `DT_NEEDED` closure of the entrypoint, no execution |
+| `oci/boot_capture_served.rs`  | **Runtime** boot-set capture: serve over ublk + read-tracer, run entrypoint via the sandbox, rank-merge |
+| `oci/boot_capture.rs`         | fanotify file-capture fallback (no ublk); trusted-only, host mount ns |
+| `oci/boot_meta.rs`            | `BootSetMeta` (fingerprint sidecar) + `RunSpec` (recorded entrypoint) JSON types |
+| `oci/sandbox/`                | Pluggable isolation for the profiler run: `Sandbox` trait, `NamespaceSandbox`, `FirecrackerSandbox`, cgroup + seccomp; `vm_init/init.c` (the microVM init) |
 | `ext4/format.rs`              | On-disk types, constants, parsing (SuperBlock, ParsedInode, extents, xattrs) |
 | `ext4/writer.rs`              | Deterministic ext4 writer; ported from Microsoft/hcsshim compactext4     |
 | `ext4/reader.rs`              | ext4 reader: `walk()`, `to_tar()`, extent resolution, xattr parsing       |
@@ -283,6 +288,93 @@ Both are kernel-native with no userspace daemon. Pick ext4 when the base must be
 ### Why inline data
 
 Container images contain thousands of small configuration files, JSON, and scripts. Files ≤200 bytes stored as inline data (inside the inode, no data block allocated) eliminate block allocation overhead and improve read locality. Disabled by default for compatibility with kernels that may not support `EXT4_FEATURE_INCOMPAT_INLINE_DATA`.
+
+## Boot-set profiling & cold-start prefetch
+
+A cold boot of an S3-backed image faults its working set one block at a time. The
+automatic 32 MiB pack-window readahead helps, but real boot working sets are small
+(0.5–6 % of the image) yet scattered across most packs — so readahead issues 4–15
+GETs and over-fetches 2–12× (see `research-bootset/FINDINGS.md`). The **boot set**
+is the precise list of blocks a boot actually reads; warming it on device open
+turns those scattered faults into cache hits.
+
+### Two producers
+
+| Producer | Where | What it captures | When |
+| --- | --- | --- | --- |
+| **Static derivation** (`boot_set.rs`) | in `bless`, no execution | the entrypoint's ELF `PT_INTERP` + transitive `DT_NEEDED` closure + `ld.so.cache` + init | always (the floor) |
+| **Runtime block-capture** (`boot_capture_served.rs`) | `glidefs profile` / `bless --profile` | the **exact** device blocks the kernel faults, *including fs metadata* (inode/dir blocks), by serving the blessed image over a throwaway ublk device with a read-tracer and running the entrypoint | opt-in (needs root + ublk) |
+
+Static alone covers a compiled binary's boot (~92 % for nginx) but only ~50 % of an
+interpreter (python `dlopen`s extensions static analysis can't see). The runtime
+capture closes that gap and is the production source; the static closure is unioned
+in as a backstop. Multiple runs are **rank-merged** (`--runs`, Borda by frequency
+then earliest first-touch) to absorb boot nondeterminism.
+
+### How the boot set is delivered (two mechanisms, both bounded)
+
+- **EROFS** can reorder its layout: bless lays the static boot paths first via
+  `WriterOption::PriorityOrder` → a contiguous prefix whose byte extent is stored as
+  `VolumeManifest.prefetch_len` (manifest v6). On device open the router warms
+  `[0, prefetch_len)` — one range GET.
+- **ext4 / raw** can't reorder (packs are positional), so the precise captured block
+  list is stored as a `bases/{name}.boot-set` sidecar and warmed PRECISELY at device
+  open (coalesced runs, parallel, zero over-fetch). EROFS `--profile` also writes a
+  `.boot-set` to cut the range warm's residual over-fetch.
+
+The device-open warm lives in `router.rs:create_export` (tier-2 data warm, after the
+tier-1 index warm); the readahead window always backstops any block the warm hasn't
+reached. **Forks inherit automatically** — the warm keys off the base name, so
+profiling a base once serves every fork/app image built on it.
+
+### Decoupled, idempotent profiling: `glidefs profile`
+
+Profiling RUNS the image, so it is kept **off the bless critical path**. Bless writes
+the base fast (no run) and records a `bases/{name}.runspec` (the entrypoint argv/env
++ the static closure). A separate `glidefs profile --name <base> --s3-prefix <p>
+--config <c>` then captures the boot set:
+
+```
+glidefs bless --oci python:3.12-slim --erofs --name py --s3-prefix prod -c cfg.toml
+glidefs profile --name py --s3-prefix prod -c cfg.toml --cmd 'python3 -c "import ssl"'
+```
+
+- **Idempotent**: keyed on the base manifest's S3 ETag, written to a
+  `bases/{name}.boot-set.meta` sidecar. Re-running on an unchanged base is a no-op;
+  re-blessing (new content → new ETag) re-profiles. `--force` overrides.
+- **Atomic publish**: `.boot-set` then `.boot-set.meta` (the commit marker) last.
+- `--cmd` overrides the recorded entrypoint; `--runs 1..3` rank-merges; `--timeout`
+  caps a long-running server (its startup reads ARE the boot set).
+
+### The isolation sandbox
+
+The profiler runs an image's entrypoint, so the run is wrapped in a pluggable
+`Sandbox` (`oci/sandbox/`). The ublk read-tracer observes faults *below* the sandbox
+boundary, so the backend is swappable without touching capture. Two concerns:
+
+- **Accident protection** (every backend, always): a hard wall-clock timeout that
+  kills the whole process tree, cgroup v2 cpu/memory/pids caps, and leak-proof RAII
+  teardown of mounts + the ublk device — for a buggy *trusted* entrypoint that hangs
+  or runs away.
+- **Attack protection** (backend-dependent), selected via `[profile] sandbox` /
+  `--sandbox`:
+  - **`NamespaceSandbox`** (default, **trusted images**): mount + pid + net + ipc +
+    uts namespaces, `pivot_root` onto the image, fresh `/proc` + minimal `/dev` + ro
+    `/sys`, **all capabilities dropped** + `no_new_privs` + a seccomp allowlist,
+    network off. Privileged setup as real root then drop everything (no user ns — a
+    block-device fs isn't `FS_USERNS_MOUNT`). Fully contains untrusted *userspace*
+    but shares the host kernel for the fs mount, so it is **trusted-only**;
+    `--untrusted` + `ns` is refused.
+  - **`FirecrackerSandbox`** (**untrusted images**): boots a microVM whose **guest
+    kernel** mounts the untrusted fs (the ublk device is a `virtio-blk` drive), so a
+    malicious filesystem image can't reach the host kernel. The host tracer still
+    captures the faults (below the VM). A static-musl init (`vm_init/init.c`, baked
+    into an initramfs by `build.rs`) mounts the image, runs the entrypoint, and
+    reports its exit code over the console. ~0.85 s/run — no slower than namespaces.
+
+Requirements: root + the `ublk` feature for capture; Firecracker additionally needs
+`/dev/kvm`, a `firecracker` binary, and a guest kernel (`[profile] kernel_image`).
+Profiling is a build/CI-node operation, never on the serving path.
 
 ## OCI Images and VM Booting
 
