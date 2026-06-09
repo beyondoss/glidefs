@@ -1,0 +1,120 @@
+# Stress loop for the intermittent fio_verify_random_cold_wake ZC corruption.
+#
+# Runs ONLY that test, N times, on the zero-copy transport, with glidefs
+# debug tracing enabled — to (a) measure recurrence probability on a real ZC
+# kernel and (b) capture promote/backfill/eviction trace context at the
+# failure. Push to this branch to (re)trigger; throwaway workflow, not for
+# main.
+name: ZC stress (fio_verify_random_cold_wake)
+
+on:
+  push:
+    branches: [jared/zc-stress]
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Number of test iterations"
+        default: "10"
+
+jobs:
+  zc-stress:
+    name: ZC cold-wake stress loop
+    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    env:
+      RUST_LOG: "glidefs=debug"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          # Reuse the zero-copy job's cache so the release build is warm.
+          shared-key: "kernel-devices-zero-copy"
+      - name: Install kernel modules + fio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r) fio
+      - name: Binary-patch ublk_drv.ko (work around 1015 ublk_init_queues NULL deref)
+        run: |
+          uname -r
+          KO_SRC="/lib/modules/$(uname -r)/kernel/drivers/block/ublk_drv.ko.zst"
+          if [ ! -f "$KO_SRC" ]; then
+            echo "module not at $KO_SRC — modules-extra not installed?"
+            ls /lib/modules/$(uname -r)/kernel/drivers/block/
+            exit 1
+          fi
+          sudo rmmod ublk_drv 2>/dev/null || true
+          sudo zstd -d --force "$KO_SRC" -o /tmp/ublk_drv.ko
+          sudo chown $(id -u):$(id -g) /tmp/ublk_drv.ko
+          python3 - <<'PY'
+          import re, sys
+          PATH = "/tmp/ublk_drv.ko"
+          MAGIC = b"~Module signature appended~\n"
+          def strip_sig(buf):
+              if bytes(buf[-len(MAGIC):]) != MAGIC:
+                  print("no appended signature to strip", file=sys.stderr)
+                  return buf
+              sig_len = int.from_bytes(buf[-len(MAGIC)-4:-len(MAGIC)], "big")
+              total = sig_len + 12 + len(MAGIC)
+              del buf[-total:]
+              print(f"stripped module signature ({total} bytes)", file=sys.stderr)
+              return buf
+          data = bytearray(open(PATH, "rb").read())
+          matches = list(re.finditer(b'\x39\xf0\x72\xd6', bytes(data)))
+          if len(matches) == 0:
+              print("buggy pattern not present — kernel not affected, skipping", file=sys.stderr)
+              sys.exit(0)
+          if len(matches) > 1:
+              nop_pattern = list(re.finditer(b'\x39\xf0\x90\x90', bytes(data)))
+              if nop_pattern:
+                  print("module already patched — skipping", file=sys.stderr)
+                  sys.exit(0)
+              print(f"ambiguous: {len(matches)} matches of 39 f0 72 d6", file=sys.stderr)
+              sys.exit(1)
+          off = matches[0].start() + 2
+          data[off:off+2] = b'\x90\x90'
+          data = strip_sig(data)
+          open(PATH, "wb").write(bytes(data))
+          print(f"patched offset {hex(off)}")
+          PY
+          sudo zstd --force /tmp/ublk_drv.ko -o "$KO_SRC"
+          sudo depmod -a
+      - name: Load kernel modules
+        run: |
+          sudo modprobe ublk_drv
+          if [ ! -e /dev/ublk-control ]; then
+            echo "::error::/dev/ublk-control missing after modprobe ublk_drv"
+            sudo dmesg | grep -iE 'ublk|signature|lockdown' | tail -20 || true
+            exit 1
+          fi
+      - name: Install ublk udev rule
+        run: |
+          sudo cp deploy/udev/99-glidefs-ublk.rules /etc/udev/rules.d/99-glidefs-ublk.rules
+          sudo udevadm control --reload-rules
+      - name: Report kernel version
+        run: uname -r
+      - name: Build test binary once
+        run: cargo test -p glidefs --release --features fio-bench --test fio_verify --no-run
+      - name: Stress loop
+        run: |
+          N="${{ github.event.inputs.iterations || '10' }}"
+          fails=0
+          for i in $(seq 1 "$N"); do
+            echo "::group::iteration $i/$N"
+            if sudo -E env "PATH=$PATH" RUST_LOG="$RUST_LOG" \
+              cargo test -p glidefs --release --features fio-bench --test fio_verify \
+              fio_verify_random_cold_wake -- --nocapture; then
+              echo "iteration $i: PASS"
+            else
+              fails=$((fails+1))
+              echo "::error::iteration $i: FAIL (total failures: $fails)"
+              sudo dmesg --color=never | tail -100 || true
+            fi
+            echo "::endgroup::"
+          done
+          echo "=== stress summary: $fails/$N failed ==="
+          [ "$fails" -eq 0 ]
+      - name: Kernel logs (on failure)
+        if: failure()
+        run: sudo dmesg --color=never | tail -200
