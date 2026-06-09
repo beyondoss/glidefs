@@ -1066,7 +1066,7 @@ async fn prefetch_precise_warm_real() {
 
     println!(
         "  readahead replay : {} GET(s), {:.1} MiB fetched\n  \
-         precise warm     : {} GET(s), {:.1} MiB fetched (exact); re-read: {} GET(s)",
+         coalesced warm   : {} GET(s), {:.1} MiB fetched; re-read: {} GET(s)",
         a.0, a.1, b.0, b.1, b.2,
     );
 
@@ -1131,11 +1131,13 @@ async fn prefetch_precise_warm_real() {
         );
     }
 
-    // The precise warm fetches the EXACT boot bytes (no window over-fetch) and
-    // leaves the whole set hot. Over-fetch ratio must be ~1.0 and << readahead's.
-    assert!(b.1 <= boot_mib * 1.10 + 0.5, "precise warm must not over-fetch: {:.1} MiB for {:.1} MiB boot set", b.1, boot_mib);
-    assert!(b.1 <= a.1, "precise warm must fetch no more than readahead: {:.1} vs {:.1} MiB", b.1, a.1);
-    assert_eq!(b.2, 0, "boot blocks must be hot after the precise warm");
+    // The coalesced warm collapses the boot set to ~one GET per pack (tiny S3
+    // request footprint) and leaves the whole set hot. It over-fetches the merged
+    // gaps, but the invariant is it still fetches STRICTLY LESS than readahead
+    // would (so the warm is always a net win) and uses far fewer GETs.
+    assert!(b.0 <= a.0, "coalesced warm must use no more GETs than readahead: {} vs {}", b.0, a.0);
+    assert!(b.1 <= a.1, "coalesced warm must fetch no more than readahead: {:.1} vs {:.1} MiB", b.1, a.1);
+    assert_eq!(b.2, 0, "boot blocks must be hot after the warm");
 }
 
 /// LAYERED-image study: replay each layer's captured boot trace against THAT

@@ -1367,15 +1367,19 @@ impl WriteCache<Active> {
         use futures::stream::{self, StreamExt};
         const CONCURRENCY: usize = 128; // overlap the runs; the warm is I/O-bound
         const MAX_WARM_BLOCKS: usize = 8192; // 1 GiB ceiling; preserves lazy tail
-        // Gap-coalescing knob: merge runs separated by <= MAX_GAP blocks into one
-        // range GET, trading the gap's bytes for a saved round-trip. MEASURED
-        // net-NEGATIVE at this concurrency: a real boot set is ~50-70 runs < 128,
-        // so it already warms in ONE concurrency wave (1 RTT) — merging can't save
-        // a wave, it only adds gap bytes (ext4 python: 69→21 GETs but 7.3→14.9
-        // MiB → 113→189 ms). So keep it 0 (exact, zero over-fetch); concurrency,
-        // not coalescing, hides the round-trips. Only worth >0 if a boot set ever
-        // exceeds CONCURRENCY runs (then fewer-but-fatter GETs cut wave count).
-        const MAX_GAP: u64 = 0;
+        // Gap-coalescing: merge runs separated by <= MAX_GAP blocks into one range
+        // GET. This optimizes the warm's REQUEST FOOTPRINT, not its wall-clock: it
+        // collapses a boot set to ~one GET per pack (ext4 python 72→6, EROFS 51→8),
+        // so the warm holds only a handful of the shared S3 download permits. That
+        // makes a mass cold-start (many exports forking at once) a non-event — the
+        // warm can't crowd guests' demand reads out of the budget — WITHOUT needing
+        // a priority semaphore. Cost is bounded byte over-fetch (the merged gaps,
+        // ~2.6-4.8× here) — still LESS than readahead would fetch, so the warm
+        // stays a strict win; and it's safe because readahead backstops any boot
+        // block the (now fatter, slightly slower) warm hasn't reached yet. 64 is
+        // the knee: large GET collapse, bounded over-fetch (won't bridge a pack's
+        // one huge internal gap the way an unbounded per-pack span would).
+        const MAX_GAP: u64 = 64;
 
         let mut sorted: Vec<u64> = blocks.to_vec();
         sorted.sort_unstable();
