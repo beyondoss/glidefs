@@ -129,6 +129,51 @@ pub struct BlessRequest {
     pub insecure: bool,
 }
 
+/// Request to promote an export snapshot to a base manifest
+/// (POST /api/exports/{name}/promote-base).
+#[derive(Debug, Deserialize)]
+pub struct PromoteBaseRequest {
+    /// Name to publish under `bases/` (the namespace blessed bases live in).
+    pub base_name: String,
+    /// Snapshot sequence to promote (must already exist — snapshot first).
+    pub sequence: u64,
+}
+
+/// Request to profile a base's boot set (POST /api/profile/{s3_prefix}/{name}).
+#[derive(Debug, Deserialize)]
+pub struct ProfileRequest {
+    /// Entrypoint override, run via `/bin/sh -c`. Falls back to the base's
+    /// recorded runspec; an error if neither is present.
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// Extra absolute in-image paths faulted under the tracer before the
+    /// entrypoint (unioned with the runspec's static seed).
+    #[serde(default)]
+    pub seed_paths: Vec<String>,
+    #[serde(default)]
+    pub fs_type: Option<String>,
+    #[serde(default = "default_profile_runs")]
+    pub runs: u32,
+    #[serde(default = "default_profile_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub untrusted: bool,
+    #[serde(default = "default_profile_max_blocks")]
+    pub max_blocks: usize,
+}
+
+fn default_profile_runs() -> u32 {
+    1
+}
+fn default_profile_timeout_secs() -> u64 {
+    30
+}
+fn default_profile_max_blocks() -> usize {
+    200_000
+}
+
 /// Generic API response.
 #[derive(Debug, Serialize)]
 pub struct ApiResponse {
@@ -701,6 +746,52 @@ where
             }
         }
 
+        // POST /api/exports/{name}/promote-base - Publish a snapshot's manifest
+        // under bases/{base_name} (no data re-upload; forkable + profileable)
+        (Method::POST, ["api", "exports", name, "promote-base"]) => {
+            let body = match req.into_body().collect().await {
+                Ok(b) => b.to_bytes(),
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            let promote_req: PromoteBaseRequest = match serde_json::from_slice(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    return Ok(error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid JSON: {}", e),
+                    ));
+                }
+            };
+            match router
+                .promote_snapshot_to_base(name, promote_req.sequence, &promote_req.base_name)
+                .await
+            {
+                Ok(promoted) => json_response(
+                    StatusCode::OK,
+                    &ApiResponse::success(if promoted {
+                        format!(
+                            "Promoted snapshot seq={} of '{}' to bases/{}",
+                            promote_req.sequence, name, promote_req.base_name
+                        )
+                    } else {
+                        format!("bases/{} already exists", promote_req.base_name)
+                    }),
+                ),
+                Err(RouterError::ExportNotFound(name)) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid export or base name",
+                ),
+                Err(RouterError::Manifest(m)) => {
+                    error_response(StatusCode::NOT_FOUND, &m)
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
         // GET /api/exports/{name}/metrics - Get I/O metrics
         (Method::GET, ["api", "exports", name, "metrics"]) => {
             match router.get_export_metrics(name).await {
@@ -851,6 +942,95 @@ where
                         &crate::block::router::BlessStatus {
                             state: "complete".to_string(),
                             oci_image: String::new(),
+                        },
+                    ),
+                    Ok(false) => empty_response(StatusCode::NOT_FOUND),
+                    Err(e) => {
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                    }
+                }
+            }
+        }
+
+        // POST /api/profile/{s3_prefix}/{name} - Start a boot-set profile of bases/{name}
+        (Method::POST, ["api", "profile", s3_prefix, name]) => {
+            if s3_prefix.contains("..") || name.contains("..") {
+                return Ok(error_response(StatusCode::BAD_REQUEST, "Invalid path"));
+            }
+            if !is_valid_export_name(name) {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid name '{}'", name),
+                ));
+            }
+
+            let body = match req.collect().await {
+                Ok(b) => {
+                    let bytes = b.to_bytes();
+                    if bytes.len() > 65_536 {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            "Request body too large (max 64KB)",
+                        ));
+                    }
+                    bytes
+                }
+                Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
+            };
+            let profile_req: ProfileRequest = if body.is_empty() {
+                serde_json::from_slice(b"{}").unwrap()
+            } else {
+                match serde_json::from_slice(&body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return Ok(error_response(
+                            StatusCode::BAD_REQUEST,
+                            &format!("Invalid JSON: {}", e),
+                        ));
+                    }
+                }
+            };
+
+            let params = crate::block::router::ProfileParams {
+                cmd: profile_req.cmd,
+                seed_paths: profile_req.seed_paths,
+                fs_type: profile_req.fs_type,
+                runs: profile_req.runs,
+                timeout_secs: profile_req.timeout_secs,
+                force: profile_req.force,
+                untrusted: profile_req.untrusted,
+                max_blocks: profile_req.max_blocks,
+            };
+            match router.start_profile(s3_prefix, name, params).await {
+                Ok(status) => json_response(StatusCode::ACCEPTED, &status),
+                Err(RouterError::Profile(m)) => {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, &m)
+                }
+                Err(RouterError::InvalidExportName(_)) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid name '{}'", name),
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/profile/{s3_prefix}/{name} - Poll profile status.
+        // running → in-flight; complete → .boot-set.meta exists; 404 → neither
+        // (never profiled, or the last attempt failed).
+        (Method::GET, ["api", "profile", s3_prefix, name]) => {
+            if s3_prefix.contains("..") || name.contains("..") {
+                return Ok(error_response(StatusCode::BAD_REQUEST, "Invalid path"));
+            }
+
+            let key = format!("{s3_prefix}/{name}");
+            if let Some(status) = router.get_profile_status(&key).await {
+                json_response(StatusCode::OK, &status)
+            } else {
+                match router.boot_set_meta_exists(s3_prefix, name).await {
+                    Ok(true) => json_response(
+                        StatusCode::OK,
+                        &crate::block::router::ProfileStatus {
+                            state: "complete".to_string(),
                         },
                     ),
                     Ok(false) => empty_response(StatusCode::NOT_FOUND),
@@ -1235,6 +1415,7 @@ mod tests {
                 nbd_dead_conn_timeout: 0,
                 max_exports: 10_000,
                 manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+                profile: None,
             })
             .await
             .expect("failed to create test router"),
@@ -1500,6 +1681,7 @@ mod tests {
                 nbd_dead_conn_timeout: 0,
                 max_exports: 10_000,
                 manifest_cache_bytes: crate::block::router::DEFAULT_MANIFEST_CACHE_BYTES,
+                profile: None,
             })
             .await
             .expect("failed to create test router"),
@@ -1783,6 +1965,105 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let router = create_test_router(&temp).await;
         let resp = request(&router, Method::POST, "/api/exports/nope/promote", None).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_promote_base_lifecycle() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        let resp = request(&router, Method::POST, "/api/exports/vol1/snapshot", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let snap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let sequence = snap["sequence"].as_u64().unwrap();
+
+        // Promote the snapshot to a base manifest.
+        let promote_body = format!(r#"{{"base_name": "rootfs-test", "sequence": {sequence}}}"#);
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/promote-base",
+            Some(&promote_body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The promoted base is visible to the manifest HEAD endpoint.
+        let resp = request(
+            &router,
+            Method::HEAD,
+            "/api/manifests/vol1/bases/rootfs-test",
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Idempotent re-promote.
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/promote-base",
+            Some(&promote_body),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Missing snapshot sequence → 404, nothing published.
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/promote-base",
+            Some(r#"{"base_name": "rootfs-bad", "sequence": 999}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_promote_base_invalid_body_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/vol1/promote-base",
+            Some("not json"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_profile_disabled_returns_503() {
+        // Test routers have no [profile] config — the POST must be rejected
+        // with an explanatory 503, not spawn anything.
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        let resp = request(&router, Method::POST, "/api/profile/pfx/base1", Some("{}")).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_profile_status_unknown_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        // No in-flight task and no .boot-set.meta sidecar → 404.
+        let resp = request(&router, Method::GET, "/api/profile/pfx/base1", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

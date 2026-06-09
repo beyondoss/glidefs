@@ -8,6 +8,7 @@ pub mod export;
 pub mod ext4_store;
 pub mod ingest;
 pub mod layer_store;
+pub mod profile_runner;
 pub mod pull;
 pub mod push;
 pub mod sandbox;
