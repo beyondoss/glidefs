@@ -124,6 +124,19 @@ pub fn apply_seccomp() -> Result<()> {
     Ok(())
 }
 
+// The libc crate exposes SYS_sendfile / SYS_fadvise64 on x86_64 but NOT on
+// aarch64, even though the syscalls exist there (asm-generic numbers 71 / 223).
+// Alias them per-arch so both ALLOWED lists can reference them uniformly without
+// a cross-compile break. (x86_64's numbers differ — taken from the libc consts.)
+#[cfg(target_arch = "x86_64")]
+const NR_SENDFILE: i64 = libc::SYS_sendfile;
+#[cfg(target_arch = "x86_64")]
+const NR_FADVISE64: i64 = libc::SYS_fadvise64;
+#[cfg(target_arch = "aarch64")]
+const NR_SENDFILE: i64 = 71;
+#[cfg(target_arch = "aarch64")]
+const NR_FADVISE64: i64 = 223;
+
 /// The allowlisted syscalls — the normal file-I/O / memory / thread / signal /
 /// time / id / local-socket surface a libc runtime boot needs. Kept generous on
 /// purpose: an over-narrow list just limps a profile (EPERM, no death); the
@@ -207,9 +220,9 @@ const ALLOWED: &[i64] = &[
     libc::SYS_fchownat,
     libc::SYS_utimensat,
     libc::SYS_copy_file_range,
-    libc::SYS_sendfile,
+    NR_SENDFILE,
     libc::SYS_splice,
-    libc::SYS_fadvise64,
+    NR_FADVISE64,
     libc::SYS_readahead,
     libc::SYS_fallocate,
     libc::SYS_memfd_create,
@@ -385,9 +398,9 @@ const ALLOWED: &[i64] = &[
     libc::SYS_fchownat,
     libc::SYS_utimensat,
     libc::SYS_copy_file_range,
-    libc::SYS_sendfile,
+    NR_SENDFILE,
     libc::SYS_splice,
-    libc::SYS_fadvise64,
+    NR_FADVISE64,
     libc::SYS_readahead,
     libc::SYS_fallocate,
     libc::SYS_memfd_create,

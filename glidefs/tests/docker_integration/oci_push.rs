@@ -406,7 +406,7 @@ async fn test_pull_multi_layer_roundtrip() {
     let options = glidefs::oci::IngestOptions {
         writer_options: vec![WriterOption::MaximumDiskSize(DEVICE_SIZE as i64)],
     };
-    glidefs::oci::pull_image(&client, &image, &auth, Arc::clone(&pull_handler), options)
+    glidefs::oci::pull_image(&client, &image, &auth, Arc::clone(&pull_handler), options, None)
         .await
         .unwrap();
 
