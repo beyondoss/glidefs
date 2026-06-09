@@ -8,12 +8,15 @@ use crate::block::pack_index_cache::PackIndexCache;
 use crate::block::volume_manifest::VolumeManifest;
 use crate::block::write_cache::{WriteCache, WriteCacheConfig};
 use crate::config::Settings;
+use crate::oci::boot_capture_served::BootProfileOptions;
+use crate::oci::boot_meta::{BootSetMeta, RunSpec, BOOT_SET_META_VERSION};
 use crate::oci::ext4_store::{deterministic_uuid, store_ext4_stream, BLOCK_SIZE};
 use crate::oci::ingest::IngestOptions;
 use crate::oci::layer_store::{
     ensure_layer_stored, put_image_descriptor, ImageDescriptor,
 };
 use crate::oci::pull::{pull_image, pull_layer_to_tempfile};
+use crate::oci::sandbox::{select_sandbox, Sandbox};
 use crate::parse_object_store::parse_url_opts;
 use anyhow::{Context, Result};
 use ext4::writer::WriterOption;
@@ -21,7 +24,7 @@ use oci_registry::{Credentials, RegistryClient};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::info;
 
@@ -39,6 +42,75 @@ fn bless_scratch_dir() -> PathBuf {
         return var_tmp.to_path_buf();
     }
     std::env::temp_dir()
+}
+
+/// Resolve the per-run profile timeout from `GLIDEFS_PROFILE_TIMEOUT` (seconds).
+fn profile_timeout() -> Duration {
+    std::env::var("GLIDEFS_PROFILE_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .map_or(Duration::from_secs(30), Duration::from_secs)
+}
+
+/// Build the block-level profiling options for `bless --profile`. Images blessed
+/// here are first-party, so the namespace backend is trusted-appropriate; the
+/// backend + cgroup limits still come from `[profile]` config. `runs` is tunable
+/// via `GLIDEFS_PROFILE_RUNS` (default 1).
+fn profiling_opts(settings: &Settings, static_seed: Vec<String>) -> Result<BootProfileOptions> {
+    let pcfg = settings.profile.clone().unwrap_or_default();
+    let sandbox: Arc<dyn Sandbox> = Arc::from(
+        select_sandbox(&pcfg.sandbox_config(None, /* trusted */ true))
+            .context("select profiling sandbox")?,
+    );
+    let runs = std::env::var("GLIDEFS_PROFILE_RUNS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    Ok(BootProfileOptions {
+        sandbox,
+        limits: pcfg.resource_limits(),
+        runs,
+        timeout: profile_timeout(),
+        static_seed,
+        max_blocks: 200_000,
+    })
+}
+
+/// Record the boot-set provenance (`.boot-set.meta`) + the run command
+/// (`.runspec`) so a later, decoupled `glidefs profile` can skip an unchanged
+/// base and reconstruct the entrypoint. Best-effort: never fails the bless.
+#[allow(clippy::too_many_arguments)]
+async fn record_profile_sidecars(
+    content_store: &ContentStore,
+    name: &str,
+    fingerprint: Option<&str>,
+    fs_type: &str,
+    block_count: usize,
+    argv: &[String],
+    env: &[String],
+    workdir: &str,
+    static_seed: &[String],
+    config_digest: Option<String>,
+) {
+    let runspec = RunSpec {
+        argv: argv.to_vec(),
+        env: env.to_vec(),
+        workdir: workdir.to_string(),
+        fs_type: fs_type.to_string(),
+        static_seed: static_seed.to_vec(),
+        config_digest: config_digest.clone(),
+    };
+    if let Err(e) = content_store.put_runspec(name, runspec.to_json()).await {
+        info!(error = %e, "could not write .runspec sidecar (non-fatal)");
+    }
+    let meta = BootSetMeta {
+        version: BOOT_SET_META_VERSION,
+        fingerprint: fingerprint.unwrap_or_default().to_string(),
+        fs_type: fs_type.to_string(),
+        block_count: block_count as u64,
+        profiled_at: chrono::Utc::now().to_rfc3339(),
+        config_digest,
+    };
+    if let Err(e) = content_store.put_boot_set_meta(name, meta.to_json()).await {
+        info!(error = %e, "could not write .boot-set.meta sidecar (non-fatal)");
+    }
 }
 
 pub async fn run_bless(
@@ -329,27 +401,26 @@ pub async fn run_bless_oci(
     // ext4 can't reorder it into a contiguous prefix the way EROFS does. ---
     let manifest_key = format!("bases/{}", name);
     let manifest_data = volume_manifest.read().serialize()?;
-    content_store
+    let manifest_etag = content_store
         .put_manifest(&manifest_key, manifest_data, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
 
-    // Upgrade the boot set to the EXACT block-level capture when possible: serve
-    // the just-blessed image, run the entrypoint under a read tracer, record the
-    // device blocks the kernel actually fetched (file data AND fs metadata). This
-    // closes the ~21% metadata gap the writer-mapped set leaves. Best-effort —
-    // a no-ublk build / capture failure keeps the fallback `boot_blocks`.
-    if block_capture {
-        let (mut argv, env, _wd) = crate::oci::boot_set::run_command(&resolved.config);
-        if let Ok(cmd) = std::env::var("GLIDEFS_PROFILE_CMD") {
-            if !cmd.trim().is_empty() {
-                argv = vec!["/bin/sh".into(), "-c".into(), cmd];
-            }
+    // The entrypoint to profile (image default, overridable via GLIDEFS_PROFILE_CMD).
+    let (mut argv, env, workdir) = crate::oci::boot_set::run_command(&resolved.config);
+    if let Ok(cmd) = std::env::var("GLIDEFS_PROFILE_CMD") {
+        if !cmd.trim().is_empty() {
+            argv = vec!["/bin/sh".into(), "-c".into(), cmd];
         }
-        let timeout = std::env::var("GLIDEFS_PROFILE_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map_or(std::time::Duration::from_secs(30), std::time::Duration::from_secs);
+    }
+
+    // Upgrade the boot set to the EXACT block-level capture when possible: serve
+    // the just-blessed image, run the entrypoint under the isolation sandbox + a
+    // read tracer, record the device blocks the kernel actually fetched (file data
+    // AND fs metadata). This closes the ~21% metadata gap the writer-mapped set
+    // leaves. Best-effort — a no-ublk build / capture failure keeps the fallback.
+    if block_capture {
+        let opts = profiling_opts(&settings, Vec::new())?;
         if let Some(exact) = crate::oci::boot_capture_served::capture_boot_blocks_served(
             Arc::clone(&content_store),
             Arc::clone(&volume_manifest),
@@ -358,9 +429,9 @@ pub async fn run_bless_oci(
             "ext4",
             &argv,
             &env,
+            &workdir,
             &name,
-            timeout,
-            200_000,
+            &opts,
         )
         .await
         {
@@ -379,6 +450,21 @@ pub async fn run_bless_oci(
             .map_err(|e| anyhow::anyhow!("failed to upload boot set: {e}"))?;
         info!(blocks = boot_blocks.len(), "stored precise boot set for ext4 base");
     }
+    // Record provenance + the run command so a later `glidefs profile` can skip an
+    // unchanged base and reconstruct the entrypoint (decoupled re-profiling).
+    record_profile_sidecars(
+        &content_store,
+        &name,
+        manifest_etag.as_deref(),
+        "ext4",
+        boot_blocks.len(),
+        &argv,
+        &env,
+        &workdir,
+        &[],
+        Some(resolved.manifest_digest.clone()),
+    )
+    .await;
 
     let elapsed = start.elapsed();
 
@@ -522,36 +608,38 @@ pub async fn run_bless_oci_erofs(
     let scratch2 = scratch.clone();
     let config_bytes = resolved.config.clone();
     info!(profile, "deriving boot set + merging layers into EROFS");
-    let prefetch_len = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let boot_paths = crate::oci::boot_set::derive_boot_paths(&config_bytes, &mut layer_files);
-        if !boot_paths.is_empty() {
-            info!(count = boot_paths.len(), "boot set ready; EROFS will reorder it first");
-        }
-        let mut writer_options = vec![
-            WriterOption::Uuid(uuid),
-            // Align large file payloads to the dedup block grid (cross-image
-            // dedup); EROFS has no reserved blocks so this is always safe.
-            WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
-            WriterOption::SpoolDir(scratch2.clone()),
-        ];
-        // The boot set is laid first and contiguously; its byte extent comes
-        // back as the prefetch length the server warms on open.
-        if !boot_paths.is_empty() {
-            writer_options.push(WriterOption::PriorityOrder(boot_paths));
-        }
-        let opts = ext4::tar_convert::ConvertOptions {
-            convert_backslash: false,
-            writer_options,
-        };
-        let (_, prefetch_len) = ext4::convert_oci_layers_to_erofs_with_prefetch(
-            &mut layer_files,
-            BlockAdapter::new(&handler_for_write, rt),
-            &opts,
-        )
-        .map_err(|e| anyhow::anyhow!("erofs conversion failed: {e}"))?;
-        Ok(prefetch_len)
-    })
-    .await??;
+    let (prefetch_len, boot_paths) =
+        tokio::task::spawn_blocking(move || -> Result<(u64, Vec<String>)> {
+            let boot_paths =
+                crate::oci::boot_set::derive_boot_paths(&config_bytes, &mut layer_files);
+            if !boot_paths.is_empty() {
+                info!(count = boot_paths.len(), "boot set ready; EROFS will reorder it first");
+            }
+            let mut writer_options = vec![
+                WriterOption::Uuid(uuid),
+                // Align large file payloads to the dedup block grid (cross-image
+                // dedup); EROFS has no reserved blocks so this is always safe.
+                WriterOption::AlignData { align: BLOCK_SIZE, min_size: BLOCK_SIZE },
+                WriterOption::SpoolDir(scratch2.clone()),
+            ];
+            // The boot set is laid first and contiguously; its byte extent comes
+            // back as the prefetch length the server warms on open.
+            if !boot_paths.is_empty() {
+                writer_options.push(WriterOption::PriorityOrder(boot_paths.clone()));
+            }
+            let opts = ext4::tar_convert::ConvertOptions {
+                convert_backslash: false,
+                writer_options,
+            };
+            let (_, prefetch_len) = ext4::convert_oci_layers_to_erofs_with_prefetch(
+                &mut layer_files,
+                BlockAdapter::new(&handler_for_write, rt),
+                &opts,
+            )
+            .map_err(|e| anyhow::anyhow!("erofs conversion failed: {e}"))?;
+            Ok((prefetch_len, boot_paths))
+        })
+        .await??;
     // Persist the boot-set extent so device open warms `[0, prefetch_len)`.
     if prefetch_len > 0 {
         volume_manifest.write().prefetch_len = Some(prefetch_len);
@@ -577,28 +665,29 @@ pub async fn run_bless_oci_erofs(
     // --- Save manifest as base ---
     let manifest_key = format!("bases/{}", name);
     let manifest_data = volume_manifest.read().serialize()?;
-    content_store
+    let manifest_etag = content_store
         .put_manifest(&manifest_key, manifest_data, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
+
+    // The entrypoint to profile (image default, overridable via GLIDEFS_PROFILE_CMD).
+    let (mut argv, env, workdir) = crate::oci::boot_set::run_command(&resolved.config);
+    if let Ok(cmd) = std::env::var("GLIDEFS_PROFILE_CMD") {
+        if !cmd.trim().is_empty() {
+            argv = vec!["/bin/sh".into(), "-c".into(), cmd];
+        }
+    }
 
     // --- Precise-coalesced warm for EROFS too: with --profile, capture the EXACT
     // boot blocks of the reordered image (serve -t erofs + read-trace) and store
     // them as a `.boot-set`. The reorder already made the boot set contiguous, so
     // these coalesce into a handful of exact range GETs — cutting the range warm's
-    // over-fetch (~4.4×) while keeping its low GET count. The manifest's
-    // `prefetch_len` stays as the range-warm fallback when no block list exists. ---
+    // over-fetch (~4.4×) while keeping its low GET count. The static closure is
+    // unioned in (read under the tracer). The manifest's `prefetch_len` stays as
+    // the range-warm fallback when no block list exists. ---
+    let mut captured = 0usize;
     if profile {
-        let (mut argv, env, _wd) = crate::oci::boot_set::run_command(&resolved.config);
-        if let Ok(cmd) = std::env::var("GLIDEFS_PROFILE_CMD") {
-            if !cmd.trim().is_empty() {
-                argv = vec!["/bin/sh".into(), "-c".into(), cmd];
-            }
-        }
-        let timeout = std::env::var("GLIDEFS_PROFILE_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .map_or(std::time::Duration::from_secs(30), std::time::Duration::from_secs);
+        let opts = profiling_opts(&settings, boot_paths.clone())?;
         if let Some(blocks) = crate::oci::boot_capture_served::capture_boot_blocks_served(
             Arc::clone(&content_store),
             Arc::clone(&volume_manifest),
@@ -607,12 +696,13 @@ pub async fn run_bless_oci_erofs(
             "erofs",
             &argv,
             &env,
+            &workdir,
             &name,
-            timeout,
-            200_000,
+            &opts,
         )
         .await
         {
+            captured = blocks.len();
             let data = crate::block::manifest::serialize_block_list(&blocks);
             content_store
                 .put_boot_set(&name, data)
@@ -623,6 +713,22 @@ pub async fn run_bless_oci_erofs(
             info!("EROFS block-level profiling unavailable/failed; using prefetch_len range warm");
         }
     }
+    // Record provenance + the run command (incl. the static reorder paths) so a
+    // later `glidefs profile` can skip an unchanged base, reconstruct the
+    // entrypoint, and union the static closure.
+    record_profile_sidecars(
+        &content_store,
+        &name,
+        manifest_etag.as_deref(),
+        "erofs",
+        captured,
+        &argv,
+        &env,
+        &workdir,
+        &boot_paths,
+        Some(resolved.manifest_digest.clone()),
+    )
+    .await;
 
     println!("Blessed '{}' from OCI image as read-only EROFS:", name);
     println!("  Image:           {}", image_ref);

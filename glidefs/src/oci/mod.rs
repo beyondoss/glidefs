@@ -2,6 +2,7 @@ pub mod block_adapter;
 #[cfg(target_os = "linux")]
 pub mod boot_capture;
 pub mod boot_capture_served;
+pub mod boot_meta;
 pub mod boot_set;
 pub mod export;
 pub mod ext4_store;
@@ -9,6 +10,7 @@ pub mod ingest;
 pub mod layer_store;
 pub mod pull;
 pub mod push;
+pub mod sandbox;
 
 pub use block_adapter::BlockAdapter;
 // Re-exports for external consumers (oci-distribution crate, docker integration tests).

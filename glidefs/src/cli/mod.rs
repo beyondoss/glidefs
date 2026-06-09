@@ -4,6 +4,7 @@ use std::path::PathBuf;
 pub mod bless;
 pub mod gc;
 pub mod handoff_cmd;
+pub mod profile;
 pub mod push;
 pub mod server;
 
@@ -123,6 +124,49 @@ pub enum Commands {
         /// Path to GC state file for grace period tracking
         #[arg(long, default_value = "gc-state.json")]
         state_file: PathBuf,
+    },
+    /// Profile a blessed base's boot working set (off the bless critical path).
+    ///
+    /// Runs the base's entrypoint once inside an isolation sandbox over a
+    /// throwaway ublk device, records the exact boot blocks, and stores them as
+    /// the base's `.boot-set` metadata (inherited by every fork of the base).
+    /// Idempotent: skips when the base is unchanged since the last profile.
+    Profile {
+        /// Base name to profile (must already be blessed at `bases/{name}`).
+        #[arg(long)]
+        name: String,
+        /// S3 prefix (export namespace) the base lives in. Mirrors `bless`.
+        #[arg(long)]
+        s3_prefix: String,
+        /// Config file (storage URL + credentials; `[profile]` sandbox settings).
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Isolation backend override: `ns` (default) or `firecracker`.
+        #[arg(long)]
+        sandbox: Option<String>,
+        /// Command to profile, run via `/bin/sh -c` inside the image. Overrides
+        /// the base's recorded entrypoint (the `.runspec` from bless).
+        #[arg(long)]
+        cmd: Option<String>,
+        /// Hard per-run timeout in seconds.
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+        /// Filesystem type of the base (`ext4` | `erofs`). Inferred if omitted.
+        #[arg(long)]
+        fs_type: Option<String>,
+        /// Number of boot runs to rank-merge (1–3).
+        #[arg(long, default_value = "1")]
+        runs: u32,
+        /// Re-profile even if the base is unchanged since the last profile.
+        #[arg(long)]
+        force: bool,
+        /// Mark the image untrusted: refuses the namespaces backend (which shares
+        /// the host kernel) and requires `--sandbox firecracker`.
+        #[arg(long)]
+        untrusted: bool,
+        /// Cap on captured blocks.
+        #[arg(long, default_value = "200000")]
+        max_blocks: usize,
     },
 }
 

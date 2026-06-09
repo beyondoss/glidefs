@@ -7,50 +7,182 @@
 //! tables, directory blocks) — measured ~21% of an ext4 boot, costing a large
 //! readahead over-fetch tail. Those reads only exist at the BLOCK layer, so we
 //! capture there: serve the blessed image over a throwaway ublk device with a
-//! read-fault recorder, kernel-mount it, run the entrypoint once under a hard
-//! timeout, and record the EXACT device blocks the kernel fetched (data AND
-//! metadata). Zero over-fetch, ~100% coverage, and indifferent to the
-//! filesystem — the same mechanism generalizes to raw/btrfs/f2fs (P3).
+//! read-fault recorder, run the entrypoint once **under an isolation sandbox**
+//! ([`crate::oci::sandbox`]) under a hard timeout, and record the EXACT device
+//! blocks the kernel fetched (data AND metadata). Zero over-fetch, ~100% coverage,
+//! and indifferent to the filesystem — the same mechanism generalizes to
+//! raw/btrfs/f2fs.
+//!
+//! The entrypoint is run through the pluggable [`Sandbox`] (hardened namespaces by
+//! default — see [`crate::oci::sandbox`]) so a buggy or hostile entrypoint cannot
+//! escape, OOM, or hang the build node. The run is repeated `runs` times and the
+//! ordered block lists are **rank-merged** (boot nondeterminism), and the static
+//! boot-set closure is read under the tracer so the captured set is the **union**
+//! of the real boot and the static closure by construction.
 //!
 //! Requires the `ublk` feature + root + an arch-compatible entrypoint. Best-
 //! effort: any failure returns `None` and bless falls back to the fanotify+writer
 //! (or static) boot set.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::oci::sandbox::{ResourceLimits, Sandbox};
+
+/// Knobs for a block-level capture: the isolation backend, accident-protection
+/// limits, how many runs to rank-merge, the per-run timeout, the static-seed
+/// closure to union in, and the capture cap.
+pub struct BootProfileOptions {
+    /// Isolation backend (built by the caller via `select_sandbox`, so the
+    /// trusted-image gate surfaces there). Moved into `spawn_blocking`, hence `Arc`.
+    pub sandbox: Arc<dyn Sandbox>,
+    /// cgroup cpu/memory/pids caps for the run (accident protection).
+    pub limits: ResourceLimits,
+    /// Number of boot runs to rank-merge (1–3; 1 ≈ 97% stable per REAP).
+    pub runs: u32,
+    /// Hard per-run wall-clock timeout.
+    pub timeout: Duration,
+    /// Absolute in-image paths (the static ELF closure) to read under the tracer
+    /// so the captured set unions the static boot-set by construction.
+    pub static_seed: Vec<String>,
+    /// Cap on captured blocks per run.
+    pub max_blocks: usize,
+}
+
+/// Rank-merge ordered block lists from multiple boot runs into one ordered union.
+/// A block ranks higher the more runs include it, then by its earliest (best)
+/// first-touch position, then by index — deterministic and stable. With one run
+/// this is just that run's first-touch order.
+pub fn rank_merge(runs: &[Vec<u64>]) -> Vec<u64> {
+    use std::collections::HashMap;
+    let mut count: HashMap<u64, u32> = HashMap::new();
+    let mut best_rank: HashMap<u64, usize> = HashMap::new();
+    for run in runs {
+        for (rank, &b) in run.iter().enumerate() {
+            *count.entry(b).or_insert(0) += 1;
+            let e = best_rank.entry(b).or_insert(usize::MAX);
+            if rank < *e {
+                *e = rank;
+            }
+        }
+    }
+    let mut blocks: Vec<u64> = count.keys().copied().collect();
+    blocks.sort_by(|&a, &b| {
+        count[&b]
+            .cmp(&count[&a])
+            .then(best_rank[&a].cmp(&best_rank[&b]))
+            .then(a.cmp(&b))
+    });
+    blocks
+}
+
 #[cfg(not(feature = "ublk"))]
+#[allow(clippy::too_many_arguments)]
 pub async fn capture_boot_blocks_served(
     _content_store: std::sync::Arc<crate::block::content_store::ContentStore>,
-    _volume_manifest: std::sync::Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+    _volume_manifest: std::sync::Arc<
+        parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+    >,
     _device_size: u64,
     _block_size: u32,
     _fs_type: &str,
-    _run_cmd: &[String],
+    _argv: &[String],
     _env: &[String],
+    _workdir: &str,
     _base_name: &str,
-    _timeout: std::time::Duration,
-    _max_blocks: usize,
+    _opts: &BootProfileOptions,
 ) -> Option<Vec<u64>> {
-    tracing::info!("boot profiling: built without the `ublk` feature — skipping block-level capture");
+    tracing::info!(
+        "boot profiling: built without the `ublk` feature — skipping block-level capture"
+    );
     None
 }
 
-/// Serve the blessed image over ublk, mount it, run the entrypoint under a read
-/// tracer, and return the EXACT device blocks the boot read (first-touch order),
-/// or `None` on any failure. See the module docs.
+/// Serve the blessed image over ublk, run the entrypoint under the sandbox + read
+/// tracer `runs` times, and return the rank-merged union of the exact boot blocks
+/// (incl. the static closure), or `None` on failure. See the module docs.
 #[cfg(feature = "ublk")]
-#[allow(clippy::too_many_arguments)] // a self-contained serving stack's deps
+#[allow(clippy::too_many_arguments)]
 pub async fn capture_boot_blocks_served(
     content_store: std::sync::Arc<crate::block::content_store::ContentStore>,
-    volume_manifest: std::sync::Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+    volume_manifest: std::sync::Arc<
+        parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+    >,
     device_size: u64,
     block_size: u32,
     fs_type: &str,
-    run_cmd: &[String],
+    argv: &[String],
     env: &[String],
+    workdir: &str,
     base_name: &str,
-    timeout: std::time::Duration,
-    max_blocks: usize,
+    opts: &BootProfileOptions,
 ) -> Option<Vec<u64>> {
-    use std::sync::Arc;
+    if argv.is_empty() {
+        return None;
+    }
+    if !std::path::Path::new("/dev/ublk-control").exists() {
+        tracing::warn!("boot profiling: /dev/ublk-control absent — need root + ublk; skipping");
+        return None;
+    }
+
+    let runs = opts.runs.clamp(1, 3);
+    let mut captured: Vec<Vec<u64>> = Vec::with_capacity(runs as usize);
+    for run in 0..runs {
+        match capture_once(
+            &content_store,
+            &volume_manifest,
+            device_size,
+            block_size,
+            fs_type,
+            argv,
+            env,
+            workdir,
+            base_name,
+            run,
+            opts,
+        )
+        .await
+        {
+            Some(blocks) if !blocks.is_empty() => {
+                tracing::info!(run, blocks = blocks.len(), "captured boot run");
+                captured.push(blocks);
+            }
+            _ => tracing::warn!(run, "boot run captured nothing"),
+        }
+    }
+
+    if captured.is_empty() {
+        tracing::warn!("boot profiling: no run captured anything — no boot set");
+        return None;
+    }
+    let merged = rank_merge(&captured);
+    tracing::info!(
+        runs = captured.len(),
+        blocks = merged.len(),
+        "rank-merged boot set"
+    );
+    Some(merged)
+}
+
+/// One serve+run+capture cycle. A fresh cold serving stack + ublk device per run,
+/// so each run's first-touch order is independent (no host page-cache carryover).
+#[cfg(feature = "ublk")]
+#[allow(clippy::too_many_arguments)]
+async fn capture_once(
+    content_store: &std::sync::Arc<crate::block::content_store::ContentStore>,
+    volume_manifest: &std::sync::Arc<
+        parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+    >,
+    device_size: u64,
+    block_size: u32,
+    fs_type: &str,
+    argv: &[String],
+    env: &[String],
+    workdir: &str,
+    base_name: &str,
+    run: u32,
+    opts: &BootProfileOptions,
+) -> Option<Vec<u64>> {
     use std::sync::atomic::AtomicU64;
 
     use crate::block::cache::{BlockCache, FoyerBlockCache, FoyerCacheConfig};
@@ -60,21 +192,20 @@ pub async fn capture_boot_blocks_served(
     use crate::block::pack_index_cache::PackIndexCache;
     use crate::block::ublk::UblkServer;
     use crate::block::write_cache::{WriteCache, WriteCacheConfig};
-    use crate::block::write_trace::{boot_set_from_trace, WriteTracer};
+    use crate::block::write_trace::{WriteTracer, boot_set_from_trace};
+    use crate::oci::sandbox::SandboxSpec;
     use tokio::sync::Notify;
-
-    if run_cmd.is_empty() {
-        return None;
-    }
-    if !std::path::Path::new("/dev/ublk-control").exists() {
-        tracing::warn!("boot profiling: /dev/ublk-control absent — need root + ublk; skipping");
-        return None;
-    }
 
     let tmp = tempfile::TempDir::new().ok()?;
     let rtrace = tmp.path().join("boot.rtrace");
     let tracer = Arc::new(
-        WriteTracer::new(&rtrace, block_size, device_size / u64::from(block_size), base_name).ok()?,
+        WriteTracer::new(
+            &rtrace,
+            block_size,
+            device_size / u64::from(block_size),
+            base_name,
+        )
+        .ok()?,
     );
 
     // A FRESH cold serving stack reading from the same store: cold reads fault to
@@ -82,7 +213,7 @@ pub async fn capture_boot_blocks_served(
     let cache = Arc::new(
         WriteCache::open_fresh_active(WriteCacheConfig {
             cache_dir: tmp.path().to_path_buf(),
-            device_name: format!("profile-{base_name}"),
+            device_name: format!("profile-{base_name}-{run}"),
             device_size,
             block_size: block_size as usize,
             wal_sync: false,
@@ -106,10 +237,10 @@ pub async fn capture_boot_blocks_served(
     let handler = Arc::new(
         BlockHandler::new(
             cache,
-            content_store,
+            Arc::clone(content_store),
             clean,
             pack_index_cache,
-            volume_manifest,
+            Arc::clone(volume_manifest),
             device_size,
             true, // read-only serve
             Arc::new(ExportMetrics::new()),
@@ -121,7 +252,7 @@ pub async fn capture_boot_blocks_served(
         .with_read_tracer(Some(Arc::clone(&tracer))),
     );
 
-    let dev_name = format!("profile-{base_name}").replace('/', "-");
+    let dev_name = format!("profile-{base_name}-{run}").replace('/', "-");
     let mut server = UblkServer::new();
     let dev = match server.add_device(&dev_name, Arc::clone(&handler)).await {
         Ok(d) => d,
@@ -130,64 +261,32 @@ pub async fn capture_boot_blocks_served(
             return None;
         }
     };
-    tracing::info!(dev = %dev.display(), ?run_cmd, "boot profiling: serving image, mounting + running");
+    tracing::info!(dev = %dev.display(), run, ?argv, "boot profiling: serving image, running entrypoint");
 
-    // Mount + chroot-run the workload while ublk serves I/O. Long-running servers
-    // are killed after their startup reads — that IS the boot working set.
-    let fs_type = fs_type.to_string();
-    let run_cmd = run_cmd.to_vec();
-    let env = env.to_vec();
-    let secs = timeout.as_secs().max(1).to_string();
-    let mnt = tempfile::TempDir::new().ok()?;
-    let mnt_path = mnt.path().to_path_buf();
-    let ran = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        use std::process::Command;
-        let m = Command::new("mount")
-            .args(["-t", &fs_type, "-o", "ro"])
-            .arg(&dev)
-            .arg(&mnt_path)
-            .status();
-        if !matches!(m, Ok(s) if s.success()) {
-            return Err(format!("mount -t {fs_type} {} failed: {m:?}", dev.display()));
-        }
-        for sub in ["proc", "dev", "sys"] {
-            let _ = Command::new("mount").args(["--bind", &format!("/{sub}")]).arg(mnt_path.join(sub)).status();
-        }
-        let mut chroot = Command::new("unshare");
-        chroot.arg("--net").arg("timeout").args(["--signal=KILL", &secs, "chroot"]).arg(&mnt_path);
-        chroot.args(&run_cmd);
-        chroot.env_clear();
-        let mut have_path = false;
-        for e in &env {
-            if let Some((k, v)) = e.split_once('=') {
-                if k == "PATH" {
-                    have_path = true;
-                }
-                chroot.env(k, v);
-            }
-        }
-        if !have_path {
-            chroot.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
-        }
-        chroot.env("HOME", "/root").env("LANG", "C");
-        let st = chroot.status();
-        tracing::info!("boot profiling: workload exited: {st:?}");
-        for sub in ["sys", "dev", "proc"] {
-            let _ = Command::new("umount").arg(mnt_path.join(sub)).status();
-        }
-        let _ = Command::new("umount").arg("-l").arg(&mnt_path).status();
-        Ok(())
-    })
-    .await;
+    // Run the entrypoint through the isolation sandbox (blocking) while ublk
+    // serves I/O. The sandbox mounts the device, runs the entrypoint under a hard
+    // timeout + cgroup limits, then reads the static-seed closure under the tracer.
+    let spec = SandboxSpec {
+        device: dev.clone(),
+        fs_type: fs_type.to_string(),
+        argv: argv.to_vec(),
+        env: env.to_vec(),
+        workdir: workdir.to_string(),
+        timeout: opts.timeout,
+        limits: opts.limits.clone(),
+        static_seed: opts.static_seed.clone(),
+    };
+    let sandbox = Arc::clone(&opts.sandbox);
+    let ran = tokio::task::spawn_blocking(move || sandbox.run(&spec)).await;
 
-    // Always tear the device down.
+    // ALWAYS tear the device down (before processing the trace).
     server.remove_device(&dev_name).await.ok();
     tracer.finish();
 
     match ran {
-        Ok(Ok(())) => {}
+        Ok(Ok(outcome)) => tracing::info!(?outcome, run, "boot profiling: run finished"),
         Ok(Err(e)) => {
-            tracing::warn!("boot profiling: {e}");
+            tracing::warn!(error = %e, run, "boot profiling: sandbox run failed");
             return None;
         }
         Err(e) => {
@@ -197,10 +296,39 @@ pub async fn capture_boot_blocks_served(
     }
 
     let bytes = std::fs::read(&rtrace).ok()?;
-    let blocks = boot_set_from_trace(&bytes, max_blocks);
+    let blocks = boot_set_from_trace(&bytes, opts.max_blocks);
     if blocks.is_empty() {
-        tracing::warn!("boot profiling: workload read nothing — no boot set captured");
         return None;
     }
     Some(blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rank_merge;
+
+    #[test]
+    fn rank_merge_single_run_preserves_order() {
+        let runs = vec![vec![5, 1, 9, 3]];
+        assert_eq!(rank_merge(&runs), vec![5, 1, 9, 3]);
+    }
+
+    #[test]
+    fn rank_merge_prefers_frequency_then_earliest() {
+        // 7 in both runs (count 2) → first. 1 in both → next. Singletons after,
+        // ordered by best rank then index.
+        let runs = vec![vec![7, 1, 2], vec![7, 1, 8]];
+        let merged = rank_merge(&runs);
+        assert_eq!(&merged[..2], &[7, 1]);
+        assert!(merged.contains(&2) && merged.contains(&8));
+        assert_eq!(merged.len(), 4);
+    }
+
+    #[test]
+    fn rank_merge_unions_all_blocks() {
+        let runs = vec![vec![1, 2], vec![3, 4], vec![2, 5]];
+        let mut merged = rank_merge(&runs);
+        merged.sort_unstable();
+        assert_eq!(merged, vec![1, 2, 3, 4, 5]);
+    }
 }

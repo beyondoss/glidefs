@@ -57,10 +57,33 @@ fn install_panic_hook() {
     }));
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     install_panic_hook();
 
+    // In-namespace sandbox helper (`glidefs __sandbox_init <spec>`): a fresh
+    // re-exec from `unshare`, running as PID 1 of a new pid ns. It `fork()`s, so
+    // it MUST run before the tokio runtime starts — forking a multi-threaded
+    // process is unsafe. Sniff argv directly and never start the runtime.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("__sandbox_init") {
+        let spec = argv.get(2).cloned().unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        oci::sandbox::namespaces::run_sandbox_init(&spec);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = spec;
+            eprintln!("__sandbox_init is Linux-only");
+            std::process::exit(2);
+        }
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // Successor-mode entry: if the predecessor spawned us with
     // `--handoff-from <socket>`, take over and continue serving instead
     // of doing a cold-start. We sniff argv directly so the rest of the
@@ -106,6 +129,34 @@ async fn main() -> Result<()> {
                     cli::bless::run_bless_oci(image_ref, name, s3_prefix, profile, config).await?;
                 }
             }
+        }
+        cli::Commands::Profile {
+            name,
+            s3_prefix,
+            config,
+            sandbox,
+            cmd,
+            timeout,
+            fs_type,
+            runs,
+            force,
+            untrusted,
+            max_blocks,
+        } => {
+            cli::profile::run_profile(cli::profile::ProfileArgs {
+                name,
+                s3_prefix,
+                config,
+                sandbox,
+                cmd,
+                timeout,
+                fs_type,
+                runs,
+                force,
+                untrusted,
+                max_blocks,
+            })
+            .await?;
         }
         cli::Commands::Push {
             manifest,
