@@ -15,6 +15,34 @@
 //! Oracle: `ev[b][p]` = last value written to page p of block b. Invariant
 //! (read table — sync_read_local_block / locate_block): in any quiescent state
 //! a read returns ev, i.e. NP→s3, DIRTY→ssd, SYNCING→flushing all equal ev.
+//!
+//! ## `zc`: the ublk zero-copy write path (vs USER_COPY)
+//!
+//! With `zc=false` the writer models USER_COPY's `backfill_and_write`: it
+//! fetches the prior block and writes the MERGED full block (prior + new page)
+//! ATOMICALLY under the rotation gate (one `Pwrite`). The backfilled remainder
+//! and the new bytes land together, so a flush eviction can never strand the
+//! remainder — this path is correct even pre-fix, which is why the
+//! `fio_verify_random_cold_wake` corruption was USER_COPY-clean.
+//!
+//! With `zc=true` the writer models the real ublk ZC path, which is NOT atomic:
+//!   1. `Backfill` — `pre_write`/`backfill_blocks_in_range` fetches the prior
+//!      block into the active file and marks it DIRTY, WITHOUT the rotation
+//!      gate (it awaits S3). This is a separate write from the slice write.
+//!   2. (gap) — a flush can rotate+evict the just-backfilled DIRTY block here,
+//!      because `pre_write` returned before the gate was taken.
+//!   3. `Lock` → `Promote` — under the gate.
+//!   4. `Pwrite` — the kernel `WRITE_FIXED` writes ONLY the slice (one page),
+//!      NOT a merged full block. The remainder must already be in the active
+//!      file from step 1.
+//! If step 2 evicted the block, the remainder is gone; without the fix
+//! (`require_promotion` for sub-block writes) `Promote` silently skips, the
+//! slice `Pwrite` lands on a sparse-zero block, the commit marks it DIRTY, and
+//! the half-zero block is uploaded — read back as zeros after a cold restart.
+//! The fix sets `require_promotion=true` for sub-block writes so `Promote`
+//! returns BlockEvicted → the writer re-backfills (retry to `Check`). This is
+//! the model twin of the Rust regression test
+//! `write_cache::tests::zc_promote_rejects_subblock_write_to_evicted_block`.
 
 use stateright::*;
 use std::fmt;
@@ -38,6 +66,7 @@ fn is_zero(p: &Page) -> bool { p.iter().all(|&v| v == 0) }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum W {
     Check, SlowFetch, SlowRecheck, SlowClaim,
+    Backfill, // ZC only: pre_write backfill (no gate) — evictable gap before Lock
     Lock, Promote, SetPresent, Pwrite, Dirty, Unlock, Done,
 }
 
@@ -67,7 +96,7 @@ impl fmt::Display for A {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(self, f) }
 }
 
-pub struct M { pub fix: bool }
+pub struct M { pub fix: bool, pub zc: bool }
 
 impl M {
     // Advance writer `wi` by one real-code step. Returns false if it produced a
@@ -76,6 +105,28 @@ impl M {
         let (b, p, v, mut prior, mut req, ph) = s.w[wi].clone().unwrap();
         let is_full = p == PAGES;
         let next = match ph {
+            // ZC path: pre_write backfills (separate, gated-free) then the
+            // kernel WRITE_FIXED writes only the slice. require_promotion is
+            // true for SUB-BLOCK writes ONLY with the fix; the buggy pre-fix
+            // ZC code passed false unconditionally.
+            W::Check if self.zc => match s.bs[b] {
+                // Present block (inline fast path): `try_zc_inflight_enter`
+                // takes the rotation gate BEFORE the present-check, so no
+                // flush rotation can interleave before promote — model that by
+                // taking `rl` here and going straight to Promote (no gap). An
+                // async eviction (SYNCING→NP) can still race a held gate;
+                // require_promotion=true (fix, sub-block) surfaces it as
+                // BlockEvicted → the retry falls back to the deferred
+                // re-backfill path.
+                BS::Dirty | BS::Syncing => { req = self.fix && !is_full; s.rl[wi] = true; W::Promote }
+                BS::Clean => W::Check,
+                // Full-block ZC write: WRITE_FIXED overwrites everything, no
+                // backfill, require_promotion=false (correct even with fix).
+                BS::NP if is_full => { req = false; W::Lock }
+                // Sub-block ZC write: deferred path — backfill (NO gate) then
+                // write. The Backfill→Lock gap is the real eviction window.
+                BS::NP => { req = self.fix; W::Backfill }
+            },
             W::Check => match s.bs[b] {
                 BS::Dirty | BS::Syncing => { req = true; W::Lock }   // write_with_eviction_check
                 BS::Clean => W::Check,
@@ -86,6 +137,22 @@ impl M {
                     else { W::SlowFetch }
                 }
             },
+            // ZC pre_write: backfill_blocks_in_range fetches the prior block
+            // into the active file + marks DIRTY when S3 has data, then
+            // cache.pre_write set_presents the block. NO rotation gate is held
+            // — a flush may rotate+evict between this step and W::Lock (the
+            // gap that produces the corruption for sub-block writes). `prior`
+            // stays zero() so the later Pwrite writes ONLY the slice (the
+            // kernel WRITE_FIXED does not merge — unlike USER_COPY).
+            W::Backfill => {
+                if !is_zero(&s.s3[b]) {
+                    s.ssd[b] = s.s3[b];
+                    s.bs[b] = BS::Dirty;
+                } else if s.bs[b] == BS::NP {
+                    s.bs[b] = BS::Clean; // set_present (no S3 data to fetch)
+                }
+                W::Lock
+            }
             W::SlowFetch => {
                 prior = s.s3[b];
                 // FIX: we already hold the claim (CLEAN), so this S3 read is
@@ -174,8 +241,23 @@ impl Model for M {
             }
             if let Some((_, _, _, _, _, ref ph)) = s.w[wi] {
                 if !matches!(ph, W::Done) {
-                    let holds_rl = matches!(ph, W::Promote | W::SetPresent | W::Pwrite | W::Dirty | W::Unlock);
-                    if !(holds_rl && s.wrl) { a.push(A::TW(wi)); }
+                    // A step that touches the data_file is blocked while a
+                    // rotation holds the data_file WRITE lock (`wrl`):
+                    //  * `Backfill` = `cache.write`, takes the read lock.
+                    //  * `Lock` acquires the rotation read-gate.
+                    //  * `Promote`..`Unlock` run under the held read-gate.
+                    // `rotate_and_snapshot` does Snapshot+Rotate atomically
+                    // under the write lock, so NONE of these can interleave
+                    // it — modeling them as blocked-while-`wrl` keeps the
+                    // snapshot/rotate pair atomic w.r.t. backfills and writes
+                    // (otherwise a backfill could mark a block DIRTY between
+                    // Snapshot and the all-ssd-zeroing Rotate, stranding it —
+                    // an interleaving the real read/write lock forbids).
+                    let needs_file = matches!(
+                        ph,
+                        W::Backfill | W::Lock | W::Promote | W::SetPresent | W::Pwrite | W::Dirty | W::Unlock
+                    );
+                    if !(needs_file && s.wrl) { a.push(A::TW(wi)); }
                 }
             }
         }
@@ -294,19 +376,41 @@ impl Model for M {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn run(fix: bool) -> impl Checker<M> {
-        M { fix }.checker().threads(4).spawn_dfs().join()
+    fn run(fix: bool, zc: bool) -> impl Checker<M> {
+        M { fix, zc }.checker().threads(4).spawn_dfs().join()
     }
+
+    // ---- USER_COPY path (zc=false): merged full-block write under the gate ----
     #[test]
     fn without_fix_finds_corruption() {
-        let r = run(false);
+        let r = run(false, false);
         eprintln!("[no-fix] {} states", r.unique_state_count());
         r.assert_any_discovery("read returns last write");
     }
     #[test]
     fn with_fix_is_clean() {
-        let r = run(true);
+        let r = run(true, false);
         eprintln!("[fix] {} states", r.unique_state_count());
+        r.assert_properties();
+    }
+
+    // ---- ublk ZERO-COPY path (zc=true): backfill + slice-write with a gap ----
+    //
+    // Pre-fix the ZC path passed require_promotion=false for sub-block writes;
+    // a flush eviction in the backfill→gate gap then strands the remainder as
+    // zeros (the `fio_verify_random_cold_wake` corruption). With the fix
+    // (require_promotion=true for sub-block writes + re-backfill retry) the ZC
+    // path is clean.
+    #[test]
+    fn zc_without_fix_finds_corruption() {
+        let r = run(false, true);
+        eprintln!("[zc no-fix] {} states", r.unique_state_count());
+        r.assert_any_discovery("read returns last write");
+    }
+    #[test]
+    fn zc_with_fix_is_clean() {
+        let r = run(true, true);
+        eprintln!("[zc fix] {} states", r.unique_state_count());
         r.assert_properties();
     }
 }

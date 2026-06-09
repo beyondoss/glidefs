@@ -1466,6 +1466,78 @@ impl BlockHandler {
             })
     }
 
+    /// Prepare a ublk zero-copy write: backfill NOT_PRESENT blocks, acquire the
+    /// rotation gate, and promote SYNCING blocks — re-backfilling if a flush
+    /// evicts a block in the unguarded window between `pre_write` and gate
+    /// acquisition. Returns the held rotation gate; the caller submits the
+    /// kernel `WRITE_FIXED` and `commit_after_zc_write_with` while holding it
+    /// (pass it as the ZC keepalive so it outlives the kernel I/O).
+    ///
+    /// # Why the retry loop exists
+    ///
+    /// `pre_write` runs WITHOUT the gate — it awaits S3 backfill, and holding
+    /// the rotation read-gate across S3 I/O would stall flush rotation. So a
+    /// flush can rotate + evict a freshly-backfilled DIRTY block
+    /// (DIRTY→SYNCING→NOT_PRESENT, flushing file deleted) after `pre_write`
+    /// returns but before we take the gate. For a SUB-BLOCK write the kernel
+    /// `WRITE_FIXED` only overwrites part of the block, so the evicted
+    /// remainder must be re-fetched — otherwise the block is left with sparse
+    /// zeros, marked DIRTY by the commit, and uploaded corrupt (read back as
+    /// zeros after a cold restart — the `fio_verify_random_cold_wake`
+    /// failure). `zc_promote_for_write_with` detects this for sub-block writes
+    /// (`require_promotion=true`) and returns `BlockEvicted`; we drop the gate
+    /// and re-backfill. This mirrors the USER_COPY `backfill_and_write` retry
+    /// on the same error.
+    ///
+    /// The inline fast path ([`GlidefsZcTarget::dispatch`]'s WRITE arm) holds
+    /// the gate across `pre_write_sync`, so it only races eviction for already-
+    /// present (SYNCING) blocks; on `BlockEvicted` it falls through to this
+    /// deferred path, which re-backfills.
+    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    pub async fn zc_prepare_write(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> CommandResult<
+        parking_lot::lock_api::ArcRwLockReadGuard<
+            parking_lot::RawRwLock,
+            crate::block::write_cache::SyncFile,
+        >,
+    > {
+        // Bounded: a retry only happens when a flush eviction actually raced
+        // this write. A handful absorbs even pathological flush churn; the cap
+        // prevents an unbounded spin if something is wedged — we'd rather fail
+        // the IO loudly (-EIO) than hang the queue.
+        const MAX_BACKFILL_RETRIES: usize = 16;
+        for attempt in 0..MAX_BACKFILL_RETRIES {
+            self.pre_write(offset, length).await?;
+            let gate = self.zc_inflight_enter();
+            match self.zc_promote_for_write_with(&gate, offset, length) {
+                Ok(()) => return Ok(gate),
+                Err(CommandError::BlockEvicted) => {
+                    // A flush evicted a block in the backfill→gate gap. Drop
+                    // the gate (so rotation can proceed) and re-backfill.
+                    drop(gate);
+                    tracing::debug!(
+                        offset,
+                        length,
+                        attempt,
+                        "ZC write: block evicted in backfill→gate gap; re-backfilling"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        tracing::error!(
+            offset,
+            length,
+            retries = MAX_BACKFILL_RETRIES,
+            "ZC write: gave up after repeated flush-eviction races during backfill"
+        );
+        Err(CommandError::IoError)
+    }
+
     /// Phase 2 of ublk zero-copy write: metadata commit for kernel-completed
     /// data write.
     ///
