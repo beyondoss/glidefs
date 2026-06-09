@@ -144,6 +144,26 @@ curl -X PUT localhost:8080/api/exports/vm-1 \
   -d '{"size_gb": 50, "manifest_name": "bases/ubuntu-22.04-v1"}'
 ```
 
+### Boot-set profiling (faster cold start)
+
+A cold boot faults its working set from S3 a block at a time. Profiling captures the
+precise blocks a boot reads so the server can warm them on fork-open — turning
+scattered faults into cache hits. It's a **one-time, per-base** step (forks inherit
+it), run off the bless critical path on a build node (needs root + the `ublk` build
+feature):
+
+```sh
+# 1. bless (fast, no image run)
+glidefs bless --oci python:3.12-slim --erofs --name py --s3-prefix bases -c glidefs.toml
+# 2. profile (separate, idempotent — skips if the base is unchanged)
+glidefs profile --name py --s3-prefix bases -c glidefs.toml --cmd 'python3 -c "import ssl"'
+```
+
+The entrypoint runs inside an isolation sandbox: hardened Linux namespaces by default
+(`--sandbox ns`, trusted images) or a Firecracker microVM (`--sandbox firecracker`,
+required for untrusted user images — a guest kernel mounts the image). See
+`glidefs/src/oci/ARCHITECTURE.md` → "Boot-set profiling".
+
 ## Deployments
 
 Fork is instant — parent blocks are copy-on-write, not copied. Two flows.

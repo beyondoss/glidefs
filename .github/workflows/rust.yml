@@ -21,6 +21,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+      # musl-gcc + cpio let build.rs bake the boot-set profiling initramfs
+      # (oci/sandbox/vm_init/init.c) instead of emitting an empty placeholder.
+      - name: Install initramfs toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cpio
       - name: Clippy (ext4, oci-registry, oci-distribution)
         run: cargo clippy -p ext4 -p oci-registry -p oci-distribution --tests
       - name: Clippy (glidefs)
@@ -35,10 +39,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+      - name: Install initramfs toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cpio
       - name: Test (ext4, oci-registry, oci-distribution)
         run: cargo test -p ext4 -p oci-registry -p oci-distribution --verbose
       - name: Test (glidefs)
         run: cargo test -p glidefs --features test-utils --verbose
+
+  vm-init:
+    name: VM profiling initramfs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install initramfs toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cpio
+      # Build the Firecracker boot-set-profiling init (static musl PID 1) the same
+      # way build.rs does, and assert the cpio is non-empty and contains /init.
+      # This keeps init.c compiling + packable; a broken init would fail CI here
+      # rather than silently degrading `--sandbox firecracker` to a placeholder.
+      - name: Build + validate initramfs
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/glidefs-vm-initramfs.cpio"
+          bash glidefs/src/oci/sandbox/vm_init/build.sh "$out"
+          test -s "$out"
+          cpio -t < "$out" | grep -qx init
+          echo "initramfs OK: $(stat -c%s "$out") bytes"
 
   docker-integration:
     name: Docker Integration Tests

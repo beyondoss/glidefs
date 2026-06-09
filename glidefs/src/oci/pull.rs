@@ -30,13 +30,25 @@ pub const DEFAULT_MAX_LAYER_DECOMPRESSED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// All layers are downloaded and decompressed to temp files, then merged into
 /// a single ext4 filesystem using OCI layer semantics (topmost layer wins,
 /// whiteouts delete lower-layer entries).
+/// How to produce a non-EROFS base's precise boot set during `pull_image`.
+/// `None` (passed as no `BootSet`) emits nothing.
+pub struct BootSet {
+    /// Run the image once and capture its REAL boot set (fanotify); else use the
+    /// static ELF-closure seed. Profiling needs root + an arch-compatible
+    /// entrypoint and falls back to static on failure.
+    pub profile: bool,
+    /// Scratch dir for the profile run (rootfs extraction). Unused when `!profile`.
+    pub scratch: std::path::PathBuf,
+}
+
 pub async fn pull_image(
     client: &oci_registry::RegistryClient,
     image: &Reference,
     auth: &Credentials,
     handler: Arc<BlockHandler>,
     options: IngestOptions,
-) -> Result<ResolvedImage, PullError> {
+    boot_set: Option<BootSet>,
+) -> Result<(ResolvedImage, Vec<u64>), PullError> {
     let resolved = client.resolve(image, auth).await?;
 
     debug!(
@@ -58,25 +70,61 @@ pub async fn pull_image(
         layer_files.push(file);
     }
 
-    // Merge all layers into a single ext4 filesystem.
+    // Merge all layers into a single ext4 filesystem. When a boot set is
+    // requested, select its paths (profiled real boot, or the static ELF-closure
+    // seed) and hand them to the writer as PriorityOrder; ext4 can't reorder them
+    // contiguously (unlike EROFS), so it instead REPORTS where it placed them and
+    // the server precisely warms those scattered device blocks at open.
     let writer_options = options.writer_options.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let config = resolved.config.clone();
+    let boot_blocks = tokio::task::spawn_blocking(move || -> io::Result<Vec<u64>> {
         let rt = tokio::runtime::Handle::current();
         let adapter = super::BlockAdapter::new(&handler, rt);
+        let mut writer_options = writer_options;
+        if let Some(bs) = &boot_set {
+            let boot_paths = crate::oci::boot_set::select_boot_paths(
+                &config,
+                &mut layer_files,
+                bs.profile,
+                &bs.scratch,
+            );
+            if !boot_paths.is_empty() {
+                writer_options.push(ext4::writer::WriterOption::PriorityOrder(boot_paths));
+            }
+        }
         let convert_opts = ext4::tar_convert::ConvertOptions {
             writer_options,
             ..Default::default()
         };
-        let mut adapter =
-            ext4::convert_oci_layers_to_ext4(&mut layer_files, adapter, &convert_opts)?;
+        let (mut adapter, ranges) =
+            ext4::convert_oci_layers_to_ext4_with_boot_blocks(&mut layer_files, adapter, &convert_opts)?;
         adapter.flush()?;
-        Ok::<_, io::Error>(())
+        Ok(boot_ranges_to_blocks(&ranges))
     })
     .await
-    .map_err(|e| PullError::Io(io::Error::other(format!("task panicked: {e}"))))?;
+    .map_err(|e| PullError::Io(io::Error::other(format!("task panicked: {e}"))))??;
 
-    result?;
-    Ok(resolved)
+    Ok((resolved, boot_blocks))
+}
+
+/// Convert the ext4 writer's boot-set byte ranges `(device_offset, len)` to the
+/// sorted, deduplicated set of device block indices they touch (the block layer
+/// is positional, so byte offset / block size = block index).
+fn boot_ranges_to_blocks(ranges: &[(u64, u64)]) -> Vec<u64> {
+    use crate::oci::ext4_store::BLOCK_SIZE;
+    let bs = u64::from(BLOCK_SIZE);
+    let mut set = std::collections::BTreeSet::new();
+    for &(off, len) in ranges {
+        if len == 0 {
+            continue;
+        }
+        let first = off / bs;
+        let last = (off + len - 1) / bs;
+        for b in first..=last {
+            set.insert(b);
+        }
+    }
+    set.into_iter().collect()
 }
 
 /// Download and decompress a single layer to a seekable temp file.

@@ -1,0 +1,21 @@
+[cache]
+dir = "/tmp/glidefs-prof-cache"
+disk_size_gb = 20.0
+memory_size_gb = 1.0
+
+[storage]
+url = "s3://glidefs/prof"
+
+[aws]
+endpoint = "http://127.0.0.1:9100"
+region = "us-east-1"
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+allow_http = "true"
+
+[servers.nbd]
+addresses = ["127.0.0.1:10809"]
+
+[[servers.nbd.exports]]
+name = "default"
+size_gb = 100.0

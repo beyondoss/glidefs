@@ -1,0 +1,54 @@
+-- scatter_stride=1 rtt=5ms --
+  demand-only      boot p50=  246.3ms p95=  249.1ms  gets(med)=   32
+  readahead(32M)   boot p50=   49.6ms p95=   49.8ms  gets(med)=    1
+  boot-set         boot p50=   49.6ms p95=   49.8ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=312 z=-0.01 p=0.9923  Hodges-Lehmann Δmedian=-0.0ms
+-- scatter_stride=1 rtt=20ms --
+  demand-only      boot p50=  728.4ms p95=  732.3ms  gets(med)=   32
+  readahead(32M)   boot p50=   64.5ms p95=   65.1ms  gets(med)=    1
+  boot-set         boot p50=   64.7ms p95=   65.0ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=273 z=-0.77 p=0.4434  Hodges-Lehmann Δmedian=+0.1ms
+-- scatter_stride=1 rtt=40ms --
+  demand-only      boot p50= 1370.0ms p95= 1373.9ms  gets(med)=   32
+  readahead(32M)   boot p50=   84.5ms p95=   85.0ms  gets(med)=    1
+  boot-set         boot p50=   84.7ms p95=   85.4ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=194 z=-2.30 p=0.0215  Hodges-Lehmann Δmedian=+0.2ms
+-- scatter_stride=8 rtt=5ms --
+  demand-only      boot p50=  245.5ms p95=  250.1ms  gets(med)=   32
+  readahead(32M)   boot p50=   49.4ms p95=   49.8ms  gets(med)=    1
+  boot-set         boot p50=   49.6ms p95=   50.0ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=164 z=-2.88 p=0.0040  Hodges-Lehmann Δmedian=+0.2ms
+-- scatter_stride=8 rtt=20ms --
+  demand-only      boot p50=  727.2ms p95=  730.1ms  gets(med)=   32
+  readahead(32M)   boot p50=   64.6ms p95=   65.1ms  gets(med)=    1
+  boot-set         boot p50=   64.7ms p95=   65.3ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=271 z=-0.81 p=0.4207  Hodges-Lehmann Δmedian=+0.1ms
+-- scatter_stride=8 rtt=40ms --
+  demand-only      boot p50= 1371.4ms p95= 1374.9ms  gets(med)=   32
+  readahead(32M)   boot p50=   84.5ms p95=   85.1ms  gets(med)=    1
+  boot-set         boot p50=   84.6ms p95=   85.1ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=    1
+  Mann-Whitney boot-set vs readahead: U=259 z=-1.04 p=0.2992  Hodges-Lehmann Δmedian=+0.1ms
+-- scatter_stride=1024 rtt=5ms --
+  demand-only      boot p50=  246.2ms p95=  250.5ms  gets(med)=   32
+  readahead(32M)   boot p50=  245.2ms p95=  251.1ms  gets(med)=   32
+  boot-set         boot p50=   49.8ms p95=   50.3ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=   32
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-195.7ms
+-- scatter_stride=1024 rtt=20ms --
+  demand-only      boot p50=  729.0ms p95=  734.0ms  gets(med)=   32
+  readahead(32M)   boot p50=  728.7ms p95=  740.1ms  gets(med)=   32
+  boot-set         boot p50=   64.6ms p95=   65.3ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=   32
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-664.5ms
+-- scatter_stride=1024 rtt=40ms --
+  demand-only      boot p50= 1368.4ms p95= 1371.6ms  gets(med)=   32
+  readahead(32M)   boot p50= 1368.5ms p95= 1373.3ms  gets(med)=   32
+  boot-set         boot p50=   84.7ms p95=   85.2ms  gets(med)=    1
+  warm             boot p50=    0.2ms p95=    0.2ms  gets(med)=   32
+  Mann-Whitney boot-set vs readahead: U=0 z=-6.06 p=0.0000  Hodges-Lehmann Δmedian=-1283.9ms

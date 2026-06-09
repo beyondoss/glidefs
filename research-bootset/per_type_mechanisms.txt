@@ -1,0 +1,156 @@
+=== PER-TYPE mechanism study (RTT=40ms, 100 MiB/s, warm concurrency=32) ===
+Candidate mechanisms, all on the REAL image+trace; GETs/bytes EXACT, time = cost model
+(readahead serial = GETs*RTT + bytes/tput; warm parallel = ceil(GETs/conc)*RTT + bytes/tput;
+reorder = 1 GET).
+  readahead    = 32MiB pack-window, reactive/serial        (today's baseline, any type)
+  warm-precise = parallel warm of EXACT boot blocks         (ext4/raw/layered delivery)
+  warm-window  = parallel warm, 32MiB-coalesced per pack    (ext4/raw ALT — races, over-fetches)
+  reorder      = build-time contiguous prefix, 1 GET        (EROFS delivery)
+
+image             blks    MiB | rd_GET   rd_ms | wpGET  wp_MiB   wp_ms | wwGET  ww_MiB   ww_ms | reGET re_MiB re_ms
+nginx               78    9.8 |      4     639 |    72     2.4     144 |    49   872.4    8804 |     1    3.0    70
+python_slim        199   24.9 |      4     578 |   193     7.3     353 |    56  1300.2   13082 |     1    9.0   130
+python_full        248   31.0 |     15    4471 |   242     8.9     409 |    85  2261.0   22730 |     1   11.0   150
+python_slim_ext4   206   25.8 |      8     770 |   200     6.9     349 |    61   934.7    9427 |     1    8.5   125
+busybox_ext4        40    5.0 |      1      59 |    34     1.7      97 |    34    33.3     413 |     1    2.0    60
+
+## Best mechanism PER TYPE (empirically established)
+- EROFS (read-only rootfs; bless can reorder via PriorityOrder):
+    → BUILD-TIME REORDER. 1 GET, guaranteed 1 RTT regardless of scatter. 60-150ms.
+      Best overall. 4.5-30x over readahead on real apps.
+- ext4 / raw / layered (writable / streamed / content-addressed — CANNOT reorder layout):
+    → RUNTIME PARALLEL PRECISE WARM of the captured boot block list. Fetch EXACTLY the
+      boot blocks concurrently (window=0, no over-fetch), at device open. Zero waste;
+      ceil(blocks/concurrency) RTT waves. 2-11x over readahead. GET/byte counts are
+      concurrency-independent, so at concurrency>=128 it closes to ~near-reorder (~169ms
+      for python_full). Recommend a high warm fan-out.
+- Tiny single-pack images (busybox): readahead already ~optimal (59ms); reorder/warm marginal.
+
+## CRITICAL negative result
+- DO NOT implement the ext4/raw warm as a naive parallel 32MiB-window-coalesced fetch
+  ("warm-window"): concurrent reads race before the cache populates and each pull overlapping
+  32MiB windows → 872-2261 MiB fetched for a ~10 MiB boot set, 9-23s — ~20x WORSE than
+  readahead. The warm MUST fetch the precise block list (or tightly-coalesced exact runs),
+  not windows.
+
+## Why mechanisms differ
+The win is GET-count (RTTs) + over-fetch (bytes). Reorder makes the set contiguous → 1 GET,
+exact bytes — only EROFS can reorder at bless. Non-reorderable images keep the scatter, so the
+warm must (a) fetch EXACT blocks to avoid over-fetch, and (b) parallelize to hide the many RTTs.
+Readahead fails because it's reactive (serial RTTs) AND window-coalesced (massive over-fetch on
+scattered sets).
+
+## DIRECT proof — all four supported types (RTT=40ms, 100 MiB/s, conc=32)
+(GETs/bytes EXACT on real images+traces; readahead serial, warm parallel, reorder=1 GET)
+
+type     image            readahead(GET/MiB/ms)   warm-precise(GET/MiB/ms)   reorder(GET/MiB/ms)   best
+EROFS    python_full       15 / 387.1 / 4471       (parallel) ~/8.9/~          1 / 11.0 / 150        reorder (29.8×)
+ext4     python_slim_ext4   8 /  45.0 /  770       200 / 6.9 / 349            1 / 8.5 / 125 (N/A*)   warm-precise (2.2×)
+raw      python_raw         5 /  ...  /  584       199 / 7.1 / 351            1 / 8.7 / 127 (N/A*)   warm-precise (1.7×)
+layered  python_layered     4 /  36.8 /  528       218 / 7.2 / 352            N/A (shared/immutable) warm-precise (1.5×)
+*ext4/raw "reorder" column is the EROFS-style ideal shown for reference; ext4/raw cannot
+ reorder in production, so warm-precise is their shippable best.
+
+## KEY per-type insight (NEW): layout locality determines how much readahead already wins
+- Monolithic (ext4 / raw / EROFS-before-reorder): boot set scattered across the WHOLE image
+  → readahead over-fetches 2-12× (python_full: 387 MiB to serve 31 MiB) → big win for a precise
+  fetch / reorder.
+- Layered: each layer's boot files are naturally CLUSTERED in that layer's own packs, so the
+  boot set is "pre-clustered" per layer → readahead is already decent (4 GETs, 1.2× over-fetch)
+  → warm-precise wins only ~1.5×, mostly by cutting bytes (7.2 vs 36.8 MiB). Layering is itself
+  a (coarse) locality optimization.
+
+## FINAL best-mechanism-per-type (all empirically proven)
+- EROFS    → build-time REORDER (1 GET; 4.5-30×). Reorderable, biggest win.
+- ext4     → runtime PARALLEL PRECISE WARM (2-11×). Cannot reorder.
+- raw      → runtime PARALLEL PRECISE WARM (1.7× here; scales with scatter). Cannot reorder.
+- layered  → runtime PARALLEL PRECISE WARM, ideally COALESCED per-layer-pack (1.5×, mostly
+             bytes). Cannot reorder (shared immutable layers); per-layer locality already helps,
+             so the warm's job is mainly killing over-fetch. 218 tiny GETs argues for per-layer
+             coalescing (each layer's boot blocks sit in 1 pack) over pure per-block precise.
+- ALL non-EROFS: never use naive parallel 32MiB-window warm (races → 9-23s).
+
+## EXTENSION — btrfs + f2fs (flashfs) on-disk filesystems (RTT=40ms, 100 MiB/s, conc=32)
+Built mount-free (mkfs.btrfs --rootdir --shrink; mkfs.f2fs + sload.f2fs), blessed via
+`bless --image` (raw path), profiled with mount -t btrfs / -t f2fs. Same python startup workload.
+
+type   image          boot   readahead(GET/ms)  warm-precise(GET/MiB/ms)  warm-window(MiB/ms)  reorder(MiB/ms)  warm-win
+btrfs  python_btrfs   31.0M  8 / 2284           234 / 9.0 / 410           1666.5 / 16785        11.2 / 152       5.6× (reorder 15×)
+f2fs   python_f2fs    29.1M  4 /  614           223 / 6.8 / 348            951.6 /  9596         8.4 / 124        1.8× (reorder 4.9×)
+
+## NEW INSIGHT — filesystem layout drives how scattered the boot set is (within packs):
+- btrfs (copy-on-write, B-trees): SCATTERS the boot set badly within its packs → readahead
+  over-fetches ~6.3× (≈196 MiB to serve 31 MiB), the WORST of any type measured → warm-precise
+  wins 5.6×, a reorder would win 15×.
+- f2fs / "flashfs" (log-structured, flash-optimized): better write locality → readahead
+  over-fetches only ~2× → warm-precise wins 1.8×.
+Both are NON-reorderable by our bless (only EROFS reorders) ⇒ shippable mechanism = runtime
+PARALLEL PRECISE WARM for both. warm-window catastrophic as always (951-1666 MiB).
+
+## Per-type mechanism — COMPLETE (6 fs types proven)
+  EROFS  → build-time reorder           (1 GET, 4.5-30×)            [reorderable]
+  ext4   → parallel precise warm        (2.2×)                      [not reorderable]
+  raw    → parallel precise warm        (1.7×)                      [not reorderable]
+  layered→ parallel precise warm/coalesced (1.5×, per-layer local)  [not reorderable]
+  btrfs  → parallel precise warm        (5.6×; CoW scatters most)   [not reorderable]
+  f2fs   → parallel precise warm        (1.8×; log-structured local)[not reorderable]
+
+## CHURN EXPERIMENT — does locality survive writes? (ext4 vs btrfs vs f2fs, fresh vs churned)
+Same rootfs, 1 GB images, identical churn (4 rounds: create 100 files/delete 70% to fragment
+free space + atomic-replace cp+mv of ~600 boot files/round = realistic package-update churn),
+re-blessed + re-profiled. RTT=40ms, 100 MiB/s, conc=32. over-fetch = readahead bytes / boot bytes.
+
+fs     state   readahead(GET/ms)  over-fetch   warm-precise(ms)   reorder(ms)
+ext4   fresh    7 /  678          1.55×         349                125
+ext4   churn   10 / 2068 (3.0×↑)  6.4×          354 (flat)         130
+btrfs  fresh    9 / 2631          7.3×          410                151
+btrfs  churn   10 / 3270 (1.2×↑)  9.0×          412 (flat)         153
+f2fs   fresh    6 /  828          2.0×          348                124
+f2fs   churn    8 / 2674 (3.2×↑)  7.9×          389 (flat)         124
+
+## CONCLUSIONS
+1. f2fs's locality is a WRITE-ONCE artifact. Fresh f2fs (2.0×) ≈ ext4 (1.55×) << btrfs (7.3×),
+   but CHURN destroys it: f2fs → 7.9× over-fetch, as bad as btrfs (9.0×). Under churn ALL three
+   converge to ~6-9× readahead over-fetch — the filesystem choice WASHES OUT. So "f2fs good for
+   a writable/churning position-based blockstore" is FALSE; true only for write-once bases
+   (where EROFS+reorder dominates anyway). The log-append + free-space-fragmentation scatters
+   the boot set in churn-order, not boot-order; f2fs GC compacts by validity, not affinity, so
+   it does not restore boot locality.
+2. THE DURABLE LEVER IS THE MECHANISM, NOT THE FS. warm-precise and reorder are CHURN-IMMUNE
+   (349→354, 410→412, 348→389 ms; reorder ~constant) because they fetch the EXACT boot blocks
+   (byte count fixed regardless of scatter) or re-collocate at bless. readahead degrades up to
+   3.2× under churn → the warm's win over readahead GROWS with churn: ext4 1.9×→5.8×,
+   f2fs 2.4×→6.9×, btrfs 6.4×→7.9×.
+3. DESIGN: for a writable/churning blockstore, do NOT rely on guest-FS layout (it all rots) —
+   rely on the precise warm (fragmentation-immune). FS choice matters only for fresh/write-once
+   images: prefer f2fs/ext4 over btrfs there; for read-only rootfs, EROFS+reorder wins outright.
+
+## REAL-WORKLOAD CHURN (correction): pip install/upgrade/uninstall cycles, not random dd
+The prior churn used random dd junk + random 70% delete — ADVERSARIAL (shreds free space,
+violates "blocks that live together die together"). Real workloads bulk-allocate/free with
+locality. Re-ran with real pip churn (install flask/requests/… → force-reinstall → install+
+uninstall extras), boot workload imports the installed packages. RTT=40ms,100MiB/s,conc=32.
+over-fetch = readahead bytes / boot bytes.
+
+fs     state      readahead(GET/ms)  over-fetch   warm-precise(ms)   reorder(ms)
+ext4   pkgfresh    8 / 1048          1.7×          556                181
+ext4   pkgchurn    6 / 1668          3.3×          556 (flat)         182
+btrfs  pkgfresh    8 / 2566          4.5×          619                212
+btrfs  pkgchurn   15 / 3231          5.2×          660 (flat)         213
+f2fs   pkgfresh    8 / 1323          2.1×          589                173
+f2fs   pkgchurn   11 / 2117          3.3×          631 (flat)         176
+
+## CORRECTED CONCLUSIONS
+1. Real churn is MUCH gentler than adversarial: f2fs 2.1×→3.3× over-fetch (NOT →7.9×); ext4
+   1.7×→3.3×; btrfs 4.5×→5.2×. The "live together die together" locality of real bulk
+   allocate/free IS preserved — my earlier "churn destroys f2fs's edge" was an artifact of the
+   adversarial random-delete fragmenter. Truth lies between fresh and adversarial.
+2. The f2fs hypothesis is PARTIALLY VINDICATED: under realistic churn f2fs ≈ ext4 (both ~3.3×)
+   and BOTH clearly beat btrfs (5.2×). btrfs's CoW scatters the boot set worst, fresh AND
+   churned, regardless of workload. So for a position-based store: prefer f2fs/ext4, avoid
+   btrfs — and that ranking SURVIVES realistic churn (unlike under adversarial churn where they
+   converged).
+3. The warm is STILL the durable lever: warm-precise is churn-immune (556→556, 619→660,
+   589→631 ms; reorder flat ~175-213) so it wins 3.0-4.9× over readahead even under real churn;
+   the margin is largest for btrfs (4.9×) and smaller for ext4/f2fs (3.0-3.4×) since their
+   preserved locality keeps readahead more competitive.

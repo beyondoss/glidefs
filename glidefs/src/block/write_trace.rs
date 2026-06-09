@@ -41,6 +41,12 @@ pub enum TraceOp {
     Write = 0,
     Trim = 1,
     WriteZeroes = 2,
+    /// Guest read. Used by the disposable boot-fault profiler to capture the
+    /// *boot working set* — the bounded set of blocks a workload touches during
+    /// startup — in first-touch order. (`WriteTracer` is a general block-I/O
+    /// tracer despite the name.) Profiling-only; never recorded on the
+    /// production read hot path.
+    Read = 3,
 }
 
 /// Records block-level I/O to a binary trace file.
@@ -203,6 +209,31 @@ pub fn iter_entries(data: &[u8]) -> impl Iterator<Item = TraceEntry> + '_ {
         span: u16::from_le_bytes(chunk[6..8].try_into().unwrap()),
         elapsed_us: u64::from_le_bytes(chunk[8..16].try_into().unwrap()),
     })
+}
+
+/// Extract the **boot working set** from a read trace: the distinct block
+/// indices touched by `Read` ops, in first-touch order, capped at `max_blocks`.
+///
+/// First-touch order is what makes a downstream layout/prefetch contiguous-and-
+/// coalescing-friendly (the same ordering eStargz/Nydus use). The cap bounds the
+/// prefetch so it can never devolve into "download the whole image".
+pub fn boot_set_from_trace(data: &[u8], max_blocks: usize) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
+    let mut order = Vec::new();
+    for e in iter_entries(data) {
+        if e.op != TraceOp::Read as u16 {
+            continue;
+        }
+        for b in e.block_index..e.block_index.saturating_add(u32::from(e.span.max(1))) {
+            if seen.insert(b) {
+                order.push(u64::from(b));
+                if order.len() >= max_blocks {
+                    return order;
+                }
+            }
+        }
+    }
+    order
 }
 
 #[cfg(test)]

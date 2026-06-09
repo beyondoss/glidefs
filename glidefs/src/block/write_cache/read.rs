@@ -395,6 +395,7 @@ impl WriteCache<Active> {
                 clean_cache,
                 pack_index_cache,
                 Some(metrics),
+                self.inner.readahead_window_bytes.load(Ordering::Relaxed),
             )
             .await?;
             for (i, data) in fetched {
@@ -562,6 +563,7 @@ impl WriteCache<Active> {
                 clean_cache,
                 pack_index_cache,
                 Some(metrics),
+                self.inner.readahead_window_bytes.load(Ordering::Relaxed),
             )
             .await?;
             for (i, data) in fetched {
@@ -832,6 +834,33 @@ impl WriteCache<Active> {
         content_store: &ContentStore,
         metrics: Option<&super::super::metrics::ExportMetrics>,
     ) -> Result<Bytes, CacheError> {
+        self.resolve_block_windowed(
+            block_index,
+            clean_cache,
+            pack_index_cache,
+            volume_manifest,
+            content_store,
+            metrics,
+            self.inner.readahead_window_bytes.load(Ordering::Relaxed),
+        )
+        .await
+    }
+
+    /// `resolve_block` with an explicit cold-fetch `window`. `window == 0` fetches
+    /// EXACTLY the requested block (no pack-window over-fetch) — used by the
+    /// precise boot warm; the guest read paths pass the configured readahead
+    /// window so this never changes their behavior.
+    #[allow(clippy::too_many_arguments)] // mirrors the read-path resolver's deps
+    async fn resolve_block_windowed(
+        &self,
+        block_index: usize,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: Option<&super::super::metrics::ExportMetrics>,
+        window: u32,
+    ) -> Result<Bytes, CacheError> {
         let location = self
             .locate_block(
                 block_index,
@@ -860,6 +889,7 @@ impl WriteCache<Active> {
                     clean_cache,
                     pack_index_cache,
                     metrics,
+                    window,
                 )
                 .await?;
                 // fetch_with_window always returns the requested block or errors
@@ -898,9 +928,14 @@ impl WriteCache<Active> {
         clean_cache: &dyn BlockCache,
         pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
         metrics: Option<&super::super::metrics::ExportMetrics>,
+        window: u32,
     ) -> Result<HashMap<usize, Bytes>, CacheError> {
         use crate::block::block_map::{blake3_128, decompress_block, Blake3Hash};
-        const WINDOW: u32 = 32 * 1024 * 1024; // 32 MiB of pack bytes per GET
+        // Pack bytes pulled per cold-miss GET. Production default is
+        // `DEFAULT_READAHEAD_WINDOW_BYTES` (32 MiB); the boot-set replay harness
+        // sweeps it via `WriteCache::set_readahead_window_bytes`. `window == 0`
+        // yields an empty in-window set → every request falls through to the
+        // per-block coalesced fetch (pure demand, no speculative over-fetch).
 
         let mut out: HashMap<usize, Bytes> = HashMap::new();
         // (index, pack_id, chunk_idx, hash, offset, comp_len) for per-block fallback.
@@ -926,7 +961,7 @@ impl WriteCache<Active> {
                 }
             };
             let win_start = reqs.iter().map(|t| t.2).min().unwrap_or(0);
-            let win_end = win_start.saturating_add(WINDOW);
+            let win_end = win_start.saturating_add(window);
             let mut in_win: Vec<&crate::block::pack::PackIndexEntry> = idx_entries
                 .iter()
                 .filter(|e| e.offset >= win_start && e.offset < win_end)
@@ -1258,5 +1293,174 @@ impl WriteCache<Active> {
             .await;
     }
 
+    /// Warm the clean cache with the actual DATA of `[0, len)` — the EROFS
+    /// build-time priority region (the metadata region plus the contiguous
+    /// boot working-set data run laid down first by `WriterOption::PriorityOrder`).
+    /// Unlike [`prefetch_chunk`](Self::prefetch_chunk) (which warms only pack
+    /// *indices*), this drives the full read path so decompressed blocks land in
+    /// the clean cache; the guest's first boot reads then hit cache instead of
+    /// S3. Because the region is contiguous and positional, the read path's
+    /// pack-window coalescing collapses it into a single range GET. Best-effort:
+    /// a failed sub-read is logged and skipped, never propagated. Reads in
+    /// bounded steps to cap peak memory.
+    pub async fn prefetch_data_range(
+        &self,
+        len: u64,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) {
+        const STEP: u64 = 4 * 1024 * 1024; // 4 MiB read window
+        let mut off = 0u64;
+        while off < len {
+            let n = STEP.min(len - off) as usize;
+            match self
+                .read(
+                    off,
+                    n,
+                    clean_cache,
+                    pack_index_cache,
+                    volume_manifest,
+                    content_store,
+                    metrics,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(off, n, error = %e, "boot data prefetch read failed");
+                    break;
+                }
+            }
+            off += n as u64;
+        }
+    }
+
+    /// Warm the clean cache with the DATA of a bounded boot working set — the
+    /// precise warm for any base that cannot reorder into a contiguous prefix
+    /// (ext4/raw/btrfs/f2fs), and also the EROFS warm once its exact boot blocks
+    /// are captured. PRECISE-COALESCED: the block list is sorted and contiguous
+    /// runs are fetched as single range GETs (exact bytes, ZERO over-fetch), with
+    /// runs issued in PARALLEL so the scattered round-trips overlap. Best-effort.
+    ///
+    /// "Coalesced" here means joining ADJACENT boot blocks into one range GET —
+    /// not the 32 MiB pack-window: a window pulls unrequested bytes and, fetched
+    /// concurrently before the cache fills, races into 900 MiB-2.3 GiB of
+    /// over-fetch (the "warm-window" catastrophe). Run-coalescing has none of
+    /// that — it fetches exactly the boot blocks, just in fewer requests
+    /// (measured: a 213-block boot set is 72 runs → 72 GETs, not 213).
+    ///
+    /// `MAX_WARM_BLOCKS` bounds the warm so the lazy tail still faults on demand.
+    /// Callers should warm pack indices first (`prefetch_chunks`) so per-pack
+    /// index lookups don't add a GET per run.
+    pub async fn prefetch_data_blocks(
+        &self,
+        blocks: &[u64],
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) {
+        use futures::stream::{self, StreamExt};
+        const CONCURRENCY: usize = 128; // overlap the runs; the warm is I/O-bound
+        const MAX_WARM_BLOCKS: usize = 8192; // 1 GiB ceiling; preserves lazy tail
+        // Gap-coalescing: merge runs separated by <= MAX_GAP blocks into one range
+        // GET. This optimizes the warm's REQUEST FOOTPRINT, not its wall-clock: it
+        // collapses a boot set to ~one GET per pack (ext4 python 72→6, EROFS 51→8),
+        // so the warm holds only a handful of the shared S3 download permits. That
+        // makes a mass cold-start (many exports forking at once) a non-event — the
+        // warm can't crowd guests' demand reads out of the budget — WITHOUT needing
+        // a priority semaphore. Cost is bounded byte over-fetch (the merged gaps,
+        // ~2.6-4.8× here) — still LESS than readahead would fetch, so the warm
+        // stays a strict win; and it's safe because readahead backstops any boot
+        // block the (now fatter, slightly slower) warm hasn't reached yet. 64 is
+        // the knee: large GET collapse, bounded over-fetch (won't bridge a pack's
+        // one huge internal gap the way an unbounded per-pack span would).
+        const MAX_GAP: u64 = 64;
+
+        let mut sorted: Vec<u64> = blocks.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() > MAX_WARM_BLOCKS {
+            warn!(total = sorted.len(), capped = MAX_WARM_BLOCKS, "boot block list exceeds warm cap; truncating");
+            sorted.truncate(MAX_WARM_BLOCKS);
+        }
+
+        // Coalesce sorted blocks into [start, span) runs, joining runs whose gap
+        // is <= MAX_GAP. `span` includes the merged gaps; prefetch_run fetches the
+        // written ones and skips holes.
+        let mut runs: Vec<(u64, usize)> = Vec::new();
+        let mut i = 0;
+        while i < sorted.len() {
+            let start = sorted[i];
+            let mut end = sorted[i];
+            let mut j = i + 1;
+            while j < sorted.len() && sorted[j] <= end + MAX_GAP + 1 {
+                end = sorted[j];
+                j += 1;
+            }
+            runs.push((start, (end - start + 1) as usize));
+            i = j;
+        }
+
+        stream::iter(runs)
+            .for_each_concurrent(CONCURRENCY, |(start, count)| async move {
+                if let Err(e) = self
+                    .prefetch_run(
+                        start,
+                        count,
+                        clean_cache,
+                        pack_index_cache,
+                        volume_manifest,
+                        content_store,
+                        metrics,
+                    )
+                    .await
+                {
+                    warn!(start, count, error = %e, "boot run precise warm failed");
+                }
+            })
+            .await;
+    }
+
+    /// Warm one contiguous run `[start, start+count)` precisely: locate each
+    /// block, then fetch the still-needed ones with `window = 0`, which coalesces
+    /// same-pack adjacent blocks into a single range GET (exact bytes, no
+    /// over-fetch). Blocks already local/cached/zero are skipped.
+    #[allow(clippy::too_many_arguments)] // mirrors the read-path resolver's deps
+    async fn prefetch_run(
+        &self,
+        start: u64,
+        count: usize,
+        clean_cache: &dyn BlockCache,
+        pack_index_cache: &crate::block::pack_index_cache::PackIndexCache,
+        volume_manifest: &parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>,
+        content_store: &ContentStore,
+        metrics: &super::super::metrics::ExportMetrics,
+    ) -> Result<(), CacheError> {
+        let mut entries = Vec::with_capacity(count);
+        for k in 0..count {
+            let block = (start as usize) + k;
+            if let BlockLocation::NeedsFetch {
+                pack_id,
+                chunk_idx,
+                expected_hash,
+                pack_offset,
+                comp_length,
+            } = self
+                .locate_block(block, clean_cache, pack_index_cache, volume_manifest, content_store, Some(metrics))
+                .await?
+            {
+                entries.push((k, pack_id, chunk_idx, expected_hash, pack_offset, comp_length));
+            }
+        }
+        if !entries.is_empty() {
+            Self::fetch_with_window(&entries, content_store, clean_cache, pack_index_cache, Some(metrics), 0).await?;
+        }
+        Ok(())
+    }
 }
 

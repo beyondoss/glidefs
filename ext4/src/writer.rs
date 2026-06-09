@@ -277,6 +277,14 @@ pub struct Writer<W: Read + Write + Seek> {
     /// cleared from it so the filesystem is consistent. Empty unless alignment
     /// is enabled.
     free_holes: Vec<(u32, u32)>,
+    /// Boot working-set paths (normalized, no leading `/`) whose physical data
+    /// placement should be reported via [`close_with_boot_blocks`]. ext4 cannot
+    /// reorder these contiguously (unlike EROFS), so the server warms their
+    /// scattered blocks precisely at device open. Empty = no tracking.
+    boot_paths: std::collections::HashSet<String>,
+    /// Byte ranges `(device_offset, len)` of the boot-set files' data, collected
+    /// as their extents are written. Converted to device block indices by bless.
+    boot_ranges: Vec<(u64, u64)>,
 }
 
 impl<W: Read + Write + Seek> Writer<W> {
@@ -299,6 +307,8 @@ impl<W: Read + Write + Seek> Writer<W> {
             data_align_min: 0,
             data_start_block: 0,
             free_holes: Vec::new(),
+            boot_paths: std::collections::HashSet::new(),
+            boot_ranges: Vec::new(),
         };
         for opt in opts {
             match opt {
@@ -321,9 +331,13 @@ impl<W: Read + Write + Seek> Writer<W> {
                     w.data_align = i64::from(*align);
                     w.data_align_min = i64::from(*min_size);
                 }
-                // EROFS-writer concerns; the ext4 writer streams + has its own
-                // block allocator, so it ignores both.
-                WriterOption::PriorityOrder(_) | WriterOption::SpoolDir(_) => {}
+                // ext4 cannot REORDER (it streams via its own block allocator),
+                // but it records WHERE the priority files land so the server can
+                // precisely warm their scattered blocks at device open.
+                WriterOption::PriorityOrder(paths) => {
+                    w.boot_paths = paths.iter().map(|p| norm_boot_path(p)).collect();
+                }
+                WriterOption::SpoolDir(_) => {}
             }
         }
         w
@@ -846,6 +860,16 @@ impl<W: Read + Write + Seek> Writer<W> {
         let start_block = self.data_start_block;
         let end_block = self.block();
         let runs = self.physical_runs(start_block, end_block);
+
+        // Record this file's physical data placement if it's in the boot set, so
+        // the server can precisely warm its (scattered) device blocks on open.
+        // `pos` is the device byte offset, so ext4 block b lives at b * BLOCK_SIZE.
+        if !self.boot_paths.is_empty() && self.boot_paths.contains(&norm_boot_path(&self.cur_name)) {
+            for &(phys, len) in &runs {
+                self.boot_ranges
+                    .push((u64::from(phys) * BLOCK_SIZE, u64::from(len) * BLOCK_SIZE));
+            }
+        }
 
         // Flatten runs into extent leaves, each at most MAX_BLOCKS_PER_EXTENT.
         // For an unfragmented file this yields exactly the same leaves the old
@@ -1543,7 +1567,16 @@ impl<W: Read + Write + Seek> Writer<W> {
 
     /// Finalize the filesystem. Must be called after all files are added.
     #[must_use = "close() finalizes the filesystem; the returned writer contains the complete image"]
-    pub fn close(mut self) -> io::Result<W> {
+    pub fn close(self) -> io::Result<W> {
+        Ok(self.close_with_boot_blocks()?.0)
+    }
+
+    /// Like [`close`](Self::close) but also returns the byte ranges
+    /// `(device_offset, len)` of the [`WriterOption::PriorityOrder`] files' data
+    /// — the boot working set's physical placement. Empty when no priority paths
+    /// were given (or none matched). bless maps these to device block indices and
+    /// stores them as the base's precise-warm boot set.
+    pub fn close_with_boot_blocks(mut self) -> io::Result<(W, Vec<(u64, u64)>)> {
         self.finish_inode()?;
 
         let root = self.root_number();
@@ -1751,8 +1784,20 @@ impl<W: Read + Write + Seek> Writer<W> {
         self.seek_block(disk_size)?;
 
         self.f.flush()?;
-        self.f.into_inner().map_err(|e| e.into_error())
+        let boot_ranges = std::mem::take(&mut self.boot_ranges);
+        let w = self.f.into_inner().map_err(|e| e.into_error())?;
+        Ok((w, boot_ranges))
     }
+}
+
+/// Normalize a path for boot-set matching: drop a leading `./` and `/` so the
+/// caller's absolute paths match the writer's tar-relative `cur_name`.
+fn norm_boot_path(p: &str) -> String {
+    let mut s = p;
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    s.trim_start_matches('/').to_string()
 }
 
 // Implement std::io::Write so callers can use io::copy

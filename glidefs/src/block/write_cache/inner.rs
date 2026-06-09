@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write as IoWrite};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use tracing::{debug, info, warn};
 
 use crate::block::block_map::{Blake3Hash, SequenceNumber, SparseBlockState, SparseStateMap};
@@ -361,6 +361,10 @@ impl PromoteClaimBitmap {
     }
 }
 
+/// Default pack-window readahead size: 32 MiB of pack bytes per cold-miss GET.
+/// This is the production baseline the boot-set work is measured against.
+pub(crate) const DEFAULT_READAHEAD_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
+
 pub(crate) struct CacheInner {
     /// Configuration
     pub(super) config: WriteCacheConfig,
@@ -372,6 +376,16 @@ pub(crate) struct CacheInner {
     /// so legacy LZ4 packs stay readable regardless of this.
     /// Atomic so it can be set post-construction; set once before any flush.
     pub(super) compression_level: AtomicI32,
+
+    /// Pack-window readahead size in bytes for the cold-miss fetch path
+    /// (`fetch_with_window`). On a cold miss we pull one contiguous range GET of
+    /// this many pack bytes and cache every block in it. Defaults to
+    /// [`DEFAULT_READAHEAD_WINDOW_BYTES`] (the production value). Atomic so the
+    /// boot-set replay harness can sweep it — `0` disables the window (pure
+    /// demand fetch, the cold floor arm); larger values raise coverage at the
+    /// cost of accuracy (the accuracy↔coverage tradeoff). Not on the hot path:
+    /// read once per cold-miss batch.
+    pub(super) readahead_window_bytes: AtomicU32,
 
     /// Local cache file (data).
     /// Uses positional I/O (pread/pwrite) which is thread-safe. RwLock is

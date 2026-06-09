@@ -25,6 +25,10 @@ pub struct Settings {
     pub azure: Option<AzureConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gcp: Option<GcsConfig>,
+    /// Boot-set profiling sandbox config (used by `glidefs profile` and
+    /// `bless --profile`). Optional; absent = namespace backend with defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileConfig>,
 }
 
 impl Settings {
@@ -49,6 +53,66 @@ impl Settings {
             .as_ref()
             .map(|n| n.ublk_nr_queues())
             .unwrap_or(1)
+    }
+}
+
+/// Boot-set profiling configuration (`[profile]`).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileConfig {
+    /// Isolation backend: `"ns"` (default) or `"firecracker"`.
+    #[serde(default)]
+    pub sandbox: crate::oci::sandbox::SandboxKind,
+    /// Firecracker binary path (Firecracker backend; defaults to `$PATH` lookup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firecracker_bin: Option<PathBuf>,
+    /// Guest kernel image path (Firecracker backend).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_image: Option<PathBuf>,
+    /// Profiling initramfs path (Firecracker backend; the `glidefs-vm-init` cpio).
+    /// Defaults to the initramfs baked in at build time by `build.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initramfs: Option<PathBuf>,
+    /// Guest RAM in MiB (Firecracker backend; default 512).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_mib: Option<u32>,
+    /// cgroup `memory.max` for the run, in MiB (default 4096).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_max_mb: Option<u64>,
+    /// cgroup `pids.max` for the run (default 4096).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids_max: Option<u64>,
+    /// cgroup `cpu.max` as a percent of one CPU (default 400 = 4 cores).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_max_percent: Option<u32>,
+}
+
+impl ProfileConfig {
+    /// Build the backend selection. `kind_override` (from a CLI `--sandbox` flag)
+    /// wins over the config; `trusted` reflects whether the image is first-party.
+    pub fn sandbox_config(
+        &self,
+        kind_override: Option<crate::oci::sandbox::SandboxKind>,
+        trusted: bool,
+    ) -> crate::oci::sandbox::SandboxConfig {
+        crate::oci::sandbox::SandboxConfig {
+            kind: kind_override.unwrap_or(self.sandbox),
+            trusted,
+            firecracker_bin: self.firecracker_bin.clone(),
+            kernel_image: self.kernel_image.clone(),
+            initramfs: self.initramfs.clone(),
+            mem_mib: self.mem_mib,
+        }
+    }
+
+    /// Resolve the cgroup resource limits, falling back to profiling defaults.
+    pub fn resource_limits(&self) -> crate::oci::sandbox::ResourceLimits {
+        let d = crate::oci::sandbox::ResourceLimits::profiling_defaults();
+        crate::oci::sandbox::ResourceLimits {
+            memory_max_bytes: self.memory_max_mb.map(|mb| mb * 1024 * 1024).or(d.memory_max_bytes),
+            pids_max: self.pids_max.or(d.pids_max),
+            cpu_max_percent: self.cpu_max_percent.or(d.cpu_max_percent),
+        }
     }
 }
 
@@ -876,6 +940,7 @@ impl Settings {
             aws: Some(AwsConfig(aws_config)),
             azure: None,
             gcp: None,
+            profile: None,
         }
     }
 

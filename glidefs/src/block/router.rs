@@ -1277,23 +1277,83 @@ impl ExportRouter {
             }
         }
 
-        // Index warm on device open (forked exports only): fetch this export's
-        // pack indices from its OWN manifest (the real chunk indices), so even a
-        // lazily-read tail block costs one S3 GET (data) instead of two (index +
-        // data). Cheap — one fetch per pack, bounded by pack count. The
-        // JoinHandle is stored in ExportState so teardown can abort it.
-        let prefetch_handle = if manifest_name.is_some() {
+        // Boot prefetch on device open (forked exports only). Two tiers, both
+        // driven by the export's OWN manifest — no sidecar artifact:
+        //   1. INDEX warm: fetch this export's pack indices (the real chunk
+        //      indices) so even a lazily-read tail block costs one S3 GET (data)
+        //      instead of two (index + data). Cheap — one fetch per pack.
+        //   2. DATA warm — by image type (a base has at most one):
+        //      2a. EROFS: the manifest carries a `prefetch_len` (build-time
+        //          `PriorityOrder` reorder), so warm the contiguous
+        //          `[0, prefetch_len)` priority region — ONE range GET, boot reads
+        //          become cache hits.
+        //      2b. non-EROFS (ext4/raw/...): the base carries a `.boot-set`
+        //          sidecar — a bounded list of the boot set's SCATTERED device
+        //          blocks (these images can't reorder). Warm them PRECISELY and
+        //          in parallel (exact blocks, no over-fetch).
+        //      Both bounded → the lazy tail still faults on demand.
+        // The JoinHandle is stored in ExportState so teardown can abort it.
+        let prefetch_handle = if let Some(mname) = manifest_name {
             let cache_clone = Arc::clone(&cache);
             let cmc = Arc::clone(&pack_index_cache);
             let vm = Arc::clone(&volume_manifest);
             let cs = Arc::clone(&content_store);
+            let clean_cache_clone = Arc::clone(&clean_cache);
+            let metrics_clone = Arc::clone(&metrics);
+            let prefetch_len = volume_manifest.read().prefetch_len;
+            // The base name for the `.boot-set` sidecar (strip the bless prefix).
+            let boot_set_name = mname.strip_prefix("bases/").unwrap_or(mname).to_string();
             // The manifest's REAL chunk indices (NOT block indices — see
             // volume_manifest::block_index_is_not_chunk_index).
             let chunk_indices: Vec<u64> =
                 volume_manifest.read().chunks.keys().map(|&c| u64::from(c)).collect();
 
             Some(spawn_supervised("boot-prefetch", async move {
+                // Tier 1: index warm from the manifest's real chunks, so the data
+                // warm's per-pack index lookups don't each cost a GET.
                 cache_clone.prefetch_chunks(&chunk_indices, &cmc, &vm, &cs).await;
+                // Tier 2: DATA warm. Prefer the `.boot-set` — a PRECISE-COALESCED
+                // warm of the exact boot blocks (zero over-fetch), for ANY base
+                // including EROFS once its exact blocks are captured at bless. Fall
+                // back to the contiguous `[0, prefetch_len)` range warm for EROFS
+                // bases that carry only the reorder hint (no captured block list).
+                let boot_set = match cs.get_boot_set(&boot_set_name).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("failed to fetch boot set: {e}");
+                        None
+                    }
+                };
+                if let Some(data) = boot_set {
+                    match crate::block::manifest::deserialize_block_list(&data) {
+                        Ok(blocks) => {
+                            info!(blocks = blocks.len(), "warming precise boot block set (coalesced)");
+                            cache_clone
+                                .prefetch_data_blocks(
+                                    &blocks,
+                                    clean_cache_clone.as_ref(),
+                                    &cmc,
+                                    &vm,
+                                    &cs,
+                                    &metrics_clone,
+                                )
+                                .await;
+                        }
+                        Err(e) => warn!("failed to parse boot set: {e}"),
+                    }
+                } else if let Some(plen) = prefetch_len {
+                    info!(prefetch_len = plen, "warming priority data region (range fallback)");
+                    cache_clone
+                        .prefetch_data_range(
+                            plen,
+                            clean_cache_clone.as_ref(),
+                            &cmc,
+                            &vm,
+                            &cs,
+                            &metrics_clone,
+                        )
+                        .await;
+                }
                 info!("boot prefetch complete");
             }))
         } else {
@@ -1800,12 +1860,18 @@ impl ExportRouter {
 
         info!("pulling and ingesting layers");
 
-        pull_image(
+        // Static boot set only: server-side bless never RUNS the untrusted image
+        // (no --profile); operators get the profiled boot set via the CLI.
+        let (_pulled, boot_blocks) = pull_image(
             &registry_client,
             &image,
             &credentials,
             Arc::clone(&handler),
             ingest_opts,
+            Some(crate::oci::pull::BootSet {
+                profile: false,
+                scratch: std::env::temp_dir(),
+            }),
         )
         .await
         .map_err(|e| RouterError::OciPull(format!("pull failed: {e}")))?;
@@ -1843,7 +1909,8 @@ impl ExportRouter {
         }
 
         // --- Save manifest as a base. Index warming on fork is driven by the
-        // manifest's pack list, so no sidecar artifact is written here. ---
+        // manifest's pack list; non-EROFS bases also store the precise boot block
+        // list for the device-open precise warm (ext4 can't reorder it). ---
         let manifest_key = format!("bases/{}", name);
         let manifest_data = volume_manifest
             .read()
@@ -1853,6 +1920,10 @@ impl ExportRouter {
             .put_manifest(&manifest_key, manifest_data, None)
             .await
             .map_err(RouterError::ContentStore)?;
+        if !boot_blocks.is_empty() {
+            let data = crate::block::manifest::serialize_block_list(&boot_blocks);
+            content_store.put_boot_set(name, data).await.map_err(RouterError::ContentStore)?;
+        }
 
         let elapsed = start.elapsed();
         info!(

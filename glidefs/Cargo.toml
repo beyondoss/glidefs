@@ -85,6 +85,9 @@ sd-notify = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 ublk-core = { path = "ublk-core", optional = true }
 io-uring = { version = "0.7", optional = true }
+# seccomp BPF for the boot-set profiling sandbox (Firecracker's own, audited
+# crate — avoids hand-rolling cBPF with the x32 ABI guard). Linux-only.
+seccompiler = "0.5"
 
 [dev-dependencies]
 tokio = { version = "1.49", features = ["test-util"] }
@@ -147,6 +150,11 @@ path = "src/bin/pack_size_measure.rs"
 [[bin]]
 name = "ublk_cleanup"
 path = "src/bin/ublk_cleanup.rs"
+required-features = ["ublk"]
+
+[[bin]]
+name = "boot_profile"
+path = "src/bin/boot_profile.rs"
 required-features = ["ublk"]
 
 [[test]]

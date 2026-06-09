@@ -209,6 +209,12 @@ pub struct BlockHandler {
     /// Optional write trace recorder. Zero cost when None.
     write_tracer: Option<Arc<WriteTracer>>,
 
+    /// Optional read-fault recorder. Set ONLY by the disposable boot-fault
+    /// profiler (Phase 0) to capture the boot working set in first-touch order;
+    /// always `None` on the production read path (one branch-predicted
+    /// `Option::is_some` per read when unset). Records `TraceOp::Read`.
+    read_tracer: Option<Arc<WriteTracer>>,
+
     /// Per-block write serialization (sharded async locks).
     ///
     /// ublk runs multiple I/O queues, so a single guest's sub-block (4 KiB)
@@ -273,12 +279,20 @@ impl BlockHandler {
             flush_notify,
             flush_threshold,
             write_tracer,
+            read_tracer: None,
             block_write_locks: (0..WRITE_LOCK_SHARDS)
                 .map(|_| tokio::sync::Mutex::new(()))
                 .collect(),
             #[cfg(feature = "test-utils")]
             backfill_sync: None,
         }
+    }
+
+    /// Attach a read-fault recorder. Used ONLY by the disposable boot-fault
+    /// profiler to capture the boot working set; never set in production.
+    pub fn with_read_tracer(mut self, tracer: Option<Arc<WriteTracer>>) -> Self {
+        self.read_tracer = tracer;
+        self
     }
 
     /// Attach sync points for deterministic interleaving tests.
@@ -817,6 +831,12 @@ impl BlockHandler {
 
         self.metrics.record_guest_read(u64::from(clamped_len));
 
+        // Boot-fault profiler hook (None in production): record the faulted block
+        // range in first-touch order so the profiler can derive the boot set.
+        if let Some(t) = &self.read_tracer {
+            t.record(offset, u64::from(clamped_len), crate::block::write_trace::TraceOp::Read);
+        }
+
         let data = self
             .cache
             .read(
@@ -878,6 +898,11 @@ impl BlockHandler {
         ) as u32;
 
         self.metrics.record_guest_read(u64::from(clamped_len));
+
+        // Boot-fault profiler hook (None in production).
+        if let Some(t) = &self.read_tracer {
+            t.record(offset, u64::from(clamped_len), crate::block::write_trace::TraceOp::Read);
+        }
 
         // Fast path: all blocks present on local SSD → pread directly into
         // caller buffer. Zero allocation, zero memcpy.
