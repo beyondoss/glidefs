@@ -2511,6 +2511,168 @@ async fn zc_promote_rejects_subblock_write_to_evicted_block() {
     }
 }
 
+/// Regression for the RESIDUAL `fio_verify_random_cold_wake` corruption that
+/// survived the first fix (PR #77): the promote-claim WAITER bypass.
+///
+/// `promote_syncing_blocks` serializes concurrent promoters of one block via
+/// `promote_claim`. A waiter that loses `try_claim` used to park and then
+/// unconditionally skip its own pread/pwrite — assuming the holder promoted.
+/// But a holder that hits the stale-NP-zero check bails with `BlockEvicted`
+/// having promoted NOTHING; the waiter then returned `Ok`, its caller's
+/// sub-block WRITE_FIXED landed on sparse zeros, and the commit marked the
+/// half-zero block DIRTY — uploaded corrupt, read back as zeros after a cold
+/// restart. Observed in CI as a 128 KiB block with ~30 of 32 pages zeroed and
+/// the 2 surviving pages being exactly the waiters' slices.
+///
+/// The fix makes the waiter RE-CHECK the block state after the release: if
+/// the holder promoted, the state is DIRTY → done; if the holder bailed, the
+/// state is still NOT_PRESENT → the waiter claims and runs the same
+/// stale-zero check itself, getting the same `BlockEvicted` → its caller
+/// re-backfills from S3.
+///
+/// Here the "erroring holder" is simulated by claiming the block directly
+/// and releasing WITHOUT promoting — the exact observable behavior of a
+/// holder whose stale-zero check fired.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zc_promote_waiter_must_recheck_after_holder_bails() {
+    let block_size = 128 * 1024usize;
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    // Same stale-NP-zero setup as the sub-block rejection test: block 0
+    // evicted in gen N (data in S3), gen N+1's flushing file holds sparse
+    // zeros at block 0's offset.
+    h.cache.write(0, &vec![0xAA_u8; block_size]).unwrap();
+    assert_eq!(h.cache.rotate_and_snapshot().unwrap(), vec![0]);
+    assert!(h.cache.inner.transition_syncing_to_not_present(0));
+    h.cache.inner.flushing_active.store(false, Ordering::Release);
+    drop(h.cache.inner.flushing_file.lock().take());
+    h.cache.write(block_size as u64, &vec![0xBB_u8; block_size]).unwrap();
+    assert_eq!(h.cache.rotate_and_snapshot().unwrap(), vec![1]);
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::NOT_PRESENT);
+    assert!(h.cache.inner.flushing_file.lock().is_some());
+
+    // Become the "holder that will bail": claim block 0's promote slot.
+    assert!(h.cache.inner.promote_claim.try_claim(0), "test claims block 0");
+
+    // The waiter: a concurrent sub-block ZC promote of the same block. It
+    // must lose try_claim and park until we release.
+    let result = std::thread::scope(|s| {
+        let cache = &h.cache;
+        let waiter = s.spawn(move || {
+            let df = cache.inner.data_file.read();
+            cache.zc_promote_for_write_with(&df, 0, 4096)
+        });
+        // Let the waiter reach wait_for_release, then release WITHOUT
+        // promoting — what a BlockEvicted-bailing holder does.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        h.cache.inner.promote_claim.release(0);
+        waiter.join().expect("waiter thread panicked")
+    });
+
+    assert!(
+        matches!(result, Err(super::CacheError::BlockEvicted)),
+        "waiter must re-check after the holder bails and hit the same \
+         BlockEvicted (so its caller re-backfills) — NOT proceed onto sparse \
+         zeros; got: {result:?}"
+    );
+    assert_eq!(
+        h.cache.inner.state_map.get(0),
+        SparseBlockState::NOT_PRESENT,
+        "block must stay NOT_PRESENT — neither holder nor waiter promoted zeros"
+    );
+}
+
+/// A guest-write promote that observes CLEAN with the promote claim HELD —
+/// an S3 materialization mid-flight (`claim_block_for_materialization`) —
+/// must bail with `BlockEvicted` (gate-free retry) rather than proceed:
+/// proceeding would slice into unmaterialized bytes; parking in-gate would
+/// deadlock against the materializer's `write_materialized` write-lock.
+/// CLEAN with the claim FREE proceeds (zero-prior / full-writer-covered).
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+#[tokio::test]
+async fn zc_promote_bails_on_inflight_materialization() {
+    let block_size = 128 * 1024usize;
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    // Take a materialization claim: block 0 NP → CLEAN + held promote claim.
+    let claim = h
+        .cache
+        .claim_block_for_materialization(0)
+        .expect("claim should win on a NOT_PRESENT block");
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::CLEAN);
+
+    // Guest sub-block promote during the materialization: must bail.
+    {
+        let df = h.cache.inner.data_file.read();
+        let res = h.cache.zc_promote_for_write_with(&df, 0, 4096);
+        assert!(
+            matches!(res, Err(super::CacheError::BlockEvicted)),
+            "promote over an in-flight materialization must bail BlockEvicted, got: {res:?}"
+        );
+    }
+
+    // Materialization finishes (data write + DIRTY) — here simulated by the
+    // claim dropping with the block left CLEAN (zero-prior outcome).
+    drop(claim);
+
+    // CLEAN with a free claim is safe: zero-prior remainder.
+    {
+        let df = h.cache.inner.data_file.read();
+        let res = h.cache.zc_promote_for_write_with(&df, 0, 4096);
+        assert!(
+            res.is_ok(),
+            "promote over CLEAN with a free claim must proceed, got: {res:?}"
+        );
+    }
+}
+
+/// `write_materialized` must ABORT (Ok(false)) when the materialization
+/// claim was STOLEN — a straggler guest write committed the block
+/// (CLEAN→DIRTY) while the S3 fetch was in flight. Landing the stale
+/// pre-image would roll the committed newer data back.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+#[tokio::test]
+async fn write_materialized_aborts_on_stolen_claim() {
+    let block_size = 128 * 1024usize;
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    let claim = h
+        .cache
+        .claim_block_for_materialization(0)
+        .expect("claim should win on a NOT_PRESENT block");
+
+    // Steal: a guest write commits while our "fetch" is in flight — the
+    // commit path (`wal_append_and_mark_dirty`) dirties any non-DIRTY block.
+    let guest = vec![0xD7_u8; block_size];
+    h.cache.inner.data_file.read().write_all_at(&guest, 0).unwrap();
+    assert!(h.cache.inner.state_map.cas(0, SparseBlockState::CLEAN, SparseBlockState::DIRTY).is_ok());
+
+    // Our stale pre-image must NOT land.
+    let stale = vec![0x11_u8; block_size];
+    let landed = h.cache.write_materialized(0, &stale, 0).unwrap();
+    assert!(!landed, "write_materialized must abort on a stolen claim");
+    drop(claim);
+
+    let mut buf = vec![0u8; block_size];
+    h.cache.inner.data_file.read().read_exact_at(&mut buf, 0).unwrap();
+    assert!(
+        buf.iter().all(|&b| b == 0xD7),
+        "guest data must survive — stale pre-image must not have landed"
+    );
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::DIRTY);
+
+    // Control: an unstolen claim lands normally.
+    let claim2 = h.cache.claim_block_for_materialization(1);
+    assert!(claim2.is_some());
+    let landed = h
+        .cache
+        .write_materialized(block_size as u64, &vec![0x22_u8; block_size], 1)
+        .unwrap();
+    assert!(landed, "unstolen materialization must land");
+    assert_eq!(h.cache.inner.state_map.get(1), SparseBlockState::DIRTY);
+}
+
 /// Regression test: post-rotation zero-write must survive crash recovery.
 ///
 /// Scenario:

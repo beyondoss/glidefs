@@ -81,6 +81,63 @@ impl WriteCache<Active> {
         self.write_inner(offset, data, false)
     }
 
+    /// Write a MATERIALIZED full block (S3 pre-image, possibly merged with
+    /// guest data) for a block claimed via
+    /// [`claim_block_for_materialization`](Self::claim_block_for_materialization).
+    ///
+    /// Returns `Ok(true)` if the write landed, `Ok(false)` if the claim was
+    /// STOLEN — a concurrent guest write committed the block (CLEAN→DIRTY via
+    /// `wal_append_and_mark_dirty`, which dirties any non-DIRTY block) while
+    /// our fetch was in flight. In that case the block holds NEWER guest
+    /// data; landing our (stale) pre-image would roll it back, so we skip.
+    /// The caller falls back to writing only its own guest sub-range (or
+    /// nothing, for a pure backfill).
+    ///
+    /// **Why the data_file WRITE lock:** the stealer's data write may be a
+    /// kernel `WRITE_FIXED` whose only userspace bracket is the rotation
+    /// read-gate held from dispatch to commit. Acquiring the write lock
+    /// drains every in-flight gated writer first, so after the CLEAN
+    /// re-check under the lock there is no unordered data write left to
+    /// race: still-CLEAN ⇒ nobody wrote (any future writer enters through
+    /// the gate we now hold); DIRTY ⇒ a steal committed and we abort.
+    /// (Found by the stateright faithful model — a straggler full-block
+    /// writer whose pre_write predates our claim can land data + commit
+    /// between our claim and our pwrite.)
+    pub fn write_materialized(
+        &self,
+        offset: u64,
+        data: &[u8],
+        block_idx: usize,
+    ) -> Result<bool, CacheError> {
+        use crate::block::block_map::SparseBlockState;
+        if data.is_empty() {
+            return Ok(true);
+        }
+        let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
+            CacheError::offset_out_of_bounds(u64::MAX, self.inner.config.device_size)
+        })?;
+        if end > self.inner.config.device_size {
+            return Err(CacheError::offset_out_of_bounds(
+                end,
+                self.inner.config.device_size,
+            ));
+        }
+        let block_size = self.inner.config.block_size as u64;
+        let start_block = offset / block_size;
+        let end_block = (end - 1) / block_size;
+
+        let df = self.inner.data_file.write();
+        if self.inner.state_map.get(block_idx) != SparseBlockState::CLEAN {
+            // Stolen: a guest write committed newer data for this block.
+            return Ok(false);
+        }
+        df.write_all_at(data, offset)?;
+        self.inner.capture_page_crcs(offset, data);
+        self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
+        drop(df);
+        Ok(true)
+    }
+
     /// Write data with eviction detection for sub-block backfill safety.
     ///
     /// Like `write()`, but returns `CacheError::BlockEvicted` if any block

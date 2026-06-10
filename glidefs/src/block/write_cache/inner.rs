@@ -359,6 +359,11 @@ impl PromoteClaimBitmap {
         self.in_flight.lock().remove(&idx);
         self.released.notify_all();
     }
+
+    /// Whether any task currently holds the claim for `idx`.
+    pub(super) fn is_claimed(&self, idx: usize) -> bool {
+        self.in_flight.lock().contains(&idx)
+    }
 }
 
 /// Default pack-window readahead size: 32 MiB of pack bytes per cold-miss GET.
@@ -968,12 +973,6 @@ impl CacheInner {
                 if idx >= self.num_blocks {
                     continue;
                 }
-                let state = self.state_map.get(idx);
-                if state != SparseBlockState::SYNCING
-                    && state != SparseBlockState::NOT_PRESENT
-                {
-                    continue;
-                }
                 let offset = block * block_size;
                 let valid = std::cmp::min(
                     block_size,
@@ -982,13 +981,18 @@ impl CacheInner {
                 if valid == 0 {
                     continue;
                 }
-                // Per-block promote claim. The state CAS stays at the end
-                // (kept idempotent for the eviction-during-promote contract
-                // covered by `pf02_eviction_during_promote_read`), but we
-                // also need to prevent two concurrent promoters from
-                // racing their pwrites: if A's pwrite, A's WRITE_FIXED,
-                // and B's pwrite interleave in that order, B's OLD bytes
-                // clobber A's just-landed NEW bytes — the blktests
+                // One overall deadline bounds the total time spent waiting
+                // on other promoters of this block, so a panicking holder
+                // can't park us indefinitely across re-check iterations.
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5);
+                // Per-block promote claim + RE-CHECK loop. The state CAS
+                // stays at the end (kept idempotent for the eviction-during-
+                // promote contract covered by `pf02_eviction_during_promote_
+                // read`), but we also need to prevent two concurrent
+                // promoters from racing their pwrites: if A's pwrite, A's
+                // WRITE_FIXED, and B's pwrite interleave in that order, B's
+                // OLD bytes clobber A's just-landed NEW bytes — the blktests
                 // block/042 corruption flake.
                 //
                 // The `promote_claim` bitmap is a side-band gate orthogonal
@@ -997,114 +1001,177 @@ impl CacheInner {
                 // pread+pwrite window so the flush thread's
                 // `transition_syncing_to_not_present` can still race
                 // through to NOT_PRESENT.
-                if !self.promote_claim.try_claim(idx) {
-                    // Another promoter holds the claim. Park on the
-                    // condvar until they release — bounded by a deadline
-                    // so a panicking holder can't park us indefinitely.
-                    // Once the claim is released, whatever the prior
-                    // promoter did is visible in the active file, so we
-                    // skip our own pread/pwrite; the caller's subsequent
-                    // pwrite will land on top correctly.
-                    let deadline = std::time::Instant::now()
-                        + std::time::Duration::from_secs(5);
-                    if !self.promote_claim.wait_for_release(idx, deadline) {
-                        tracing::warn!(
-                            block = idx,
-                            "promote: timed out waiting for prior promote claim release; proceeding"
-                        );
-                    }
-                    continue;
-                }
-                // We hold the claim. Wrap the rest in a RAII guard so a
-                // panic or early return — including the `?` propagation on
-                // pwrite errors — releases the claim and wakes waiters.
-                // Without this, a panicking holder would park every
-                // subsequent promoter for the full 5 s deadline.
-                struct ClaimGuard<'a> {
-                    claim: &'a PromoteClaimBitmap,
-                    idx: usize,
-                }
-                impl<'a> Drop for ClaimGuard<'a> {
-                    fn drop(&mut self) {
-                        self.claim.release(self.idx);
-                    }
-                }
-                let _guard = ClaimGuard { claim: &self.promote_claim, idx };
-
-                // Propagate errors: silent skip on a flushing-read failure
-                // would leave the active file as zeros for un-covered
-                // bytes of the sibling's WRITE_FIXED.
-                ff.read_exact_at(&mut buf[..valid], offset)?;
-
-                // The flushing file is only an authoritative data source for
-                // SYNCING blocks — those were claimed (DIRTY→SYNCING) by the
-                // CURRENT flush's rotation, so their bytes are in it. A
-                // NOT_PRESENT block is different: it may have been evicted by an
-                // EARLIER flush, in which case its real data is in S3 and THIS
-                // flushing generation holds only sparse zeros at its offset.
-                // Promoting those zeros into the active file masks the real data,
-                // and the next flush packs the zeros — silent data loss (a
-                // cold-read-as-zero that fsck/CRC verify catches as corruption).
                 //
-                // So never promote a NOT_PRESENT block whose flushing-file data is
-                // all zeros: its bytes aren't reliably here. Route the caller to
-                // the S3 backfill path (BlockEvicted), which fetches the
-                // authoritative block — the evicting flush uploaded its pack and
-                // recorded it in the manifest before transitioning it to
-                // NOT_PRESENT, so S3 has the current data (zero or not). A
-                // genuinely-zero just-evicted block costs one redundant S3 fetch;
-                // a stale one is rescued from corruption.
-                if state == SparseBlockState::NOT_PRESENT
-                    && buf[..valid].iter().all(|&b| b == 0)
-                {
-                    if require_promotion {
-                        return Err(super::CacheError::BlockEvicted);
+                // **Why a waiter must RE-CHECK instead of skipping:** the
+                // claim holder may have promoted NOTHING — it bails with
+                // `BlockEvicted` when the block is NOT_PRESENT with stale
+                // zeros in the flushing file (`require_promotion`), or skips
+                // for the same condition on the plain-write path. A waiter
+                // that blindly proceeds after the release would return `Ok`
+                // without anyone having recovered the block's bytes; its
+                // caller's sub-block pwrite/WRITE_FIXED then lands on sparse
+                // zeros and the commit marks the half-zero block DIRTY —
+                // uploaded corrupt, read back as zeros after a cold restart.
+                // That was the residual `fio_verify_random_cold_wake`
+                // corruption (~30 of 32 pages zero, the 2 survivors being
+                // exactly the waiters' slices). Re-reading the state closes
+                // it: holder promoted → state is DIRTY → break; holder
+                // bailed → state is still NOT_PRESENT/SYNCING → we claim and
+                // run the same stale-zero check ourselves.
+                loop {
+                    let state = self.state_map.get(idx);
+                    if state == SparseBlockState::CLEAN {
+                        // CLEAN = claimed by a writer, data pending. Two
+                        // sub-cases, distinguished by the promote claim:
+                        //
+                        // * claim HELD ⇒ an S3 MATERIALIZATION is in flight
+                        //   (`claim_block_for_materialization` holds the
+                        //   claim across fetch + `write_materialized`). For
+                        //   a guest-write promote (`require_promotion`),
+                        //   proceeding would let the caller's slice land on
+                        //   unmaterialized bytes. Bail with `BlockEvicted` —
+                        //   the caller retries WITHOUT the rotation gate
+                        //   (its backfill CLEAN-wait parks gate-free). We
+                        //   must NOT park here: our caller holds the
+                        //   rotation read gate, and the materializer's
+                        //   `write_materialized` acquires the data_file
+                        //   WRITE lock — waiting in-gate on its claim is a
+                        //   lock-order deadlock.
+                        //   (The materializer's own embedded promote passes
+                        //   require_promotion=false and breaks below — no
+                        //   self-trip.)
+                        //
+                        // * claim FREE ⇒ the CLEAN owner is a zero-prior
+                        //   claim (remainder legitimately sparse zeros) or a
+                        //   full-block writer (its own guest write covers
+                        //   every byte) — safe to proceed. No new
+                        //   materializer can appear: materialization claims
+                        //   only NOT_PRESENT blocks.
+                        if require_promotion && self.promote_claim.is_claimed(idx) {
+                            return Err(super::CacheError::BlockEvicted);
+                        }
+                        break;
                     }
-                    // Best-effort (plain write): leave NOT_PRESENT so set_present
-                    // + the caller's write reconstruct it; don't write zeros.
-                    continue;
-                }
-
-                #[cfg(feature = "test-utils")]
-                {
-                    let sp = self.promote_sync.lock().clone();
-                    if let Some(sp) = sp {
-                        sp.gate_sync(PromoteStep::AfterRead, idx);
+                    if state != SparseBlockState::SYNCING
+                        && state != SparseBlockState::NOT_PRESENT
+                    {
+                        // Present (DIRTY) — promoted by a prior holder or
+                        // never needed promotion. Nothing to do.
+                        break;
                     }
-                }
-
-                df.write_all_at(&buf[..valid], offset)?;
-
-                #[cfg(feature = "test-utils")]
-                {
-                    let sp = self.promote_sync.lock().clone();
-                    if let Some(sp) = sp {
-                        sp.gate_sync(PromoteStep::BeforeCas, idx);
+                    if !self.promote_claim.try_claim(idx) {
+                        // Another promoter holds the claim. Park on the
+                        // condvar until they release, then RE-CHECK the
+                        // state (loop) — never assume the holder succeeded.
+                        if !self.promote_claim.wait_for_release(idx, deadline) {
+                            tracing::warn!(
+                                block = idx,
+                                "promote: timed out waiting for prior promote claim release"
+                            );
+                            if require_promotion {
+                                // Refuse to proceed on an unverified block —
+                                // the caller re-backfills from S3. Erring is
+                                // recoverable; proceeding can corrupt.
+                                return Err(super::CacheError::BlockEvicted);
+                            }
+                            // Plain-write path: best-effort proceed, same as
+                            // the pre-deadline behavior.
+                            break;
+                        }
+                        continue;
                     }
-                }
+                    // We hold the claim. Wrap the rest in a RAII guard so a
+                    // panic or early return — including the `?` propagation on
+                    // pwrite errors — releases the claim and wakes waiters.
+                    // Without this, a panicking holder would park every
+                    // subsequent promoter for the full 5 s deadline.
+                    struct ClaimGuard<'a> {
+                        claim: &'a PromoteClaimBitmap,
+                        idx: usize,
+                    }
+                    impl<'a> Drop for ClaimGuard<'a> {
+                        fn drop(&mut self) {
+                            self.claim.release(self.idx);
+                        }
+                    }
+                    let _guard = ClaimGuard { claim: &self.promote_claim, idx };
 
-                // Final CAS preserves the original contract: SYNCING→DIRTY
-                // or NOT_PRESENT→DIRTY at the end of promote. Eviction may
-                // have raced (state→NOT_PRESENT) — in that case CAS fails
-                // harmlessly; the pwrite we already landed is still
-                // correct in the active file.
-                if state == SparseBlockState::SYNCING {
-                    if self
+                    // Propagate errors: silent skip on a flushing-read failure
+                    // would leave the active file as zeros for un-covered
+                    // bytes of the sibling's WRITE_FIXED.
+                    ff.read_exact_at(&mut buf[..valid], offset)?;
+
+                    // The flushing file is only an authoritative data source for
+                    // SYNCING blocks — those were claimed (DIRTY→SYNCING) by the
+                    // CURRENT flush's rotation, so their bytes are in it. A
+                    // NOT_PRESENT block is different: it may have been evicted by an
+                    // EARLIER flush, in which case its real data is in S3 and THIS
+                    // flushing generation holds only sparse zeros at its offset.
+                    // Promoting those zeros into the active file masks the real data,
+                    // and the next flush packs the zeros — silent data loss (a
+                    // cold-read-as-zero that fsck/CRC verify catches as corruption).
+                    //
+                    // So never promote a NOT_PRESENT block whose flushing-file data is
+                    // all zeros: its bytes aren't reliably here. Route the caller to
+                    // the S3 backfill path (BlockEvicted), which fetches the
+                    // authoritative block — the evicting flush uploaded its pack and
+                    // recorded it in the manifest before transitioning it to
+                    // NOT_PRESENT, so S3 has the current data (zero or not). A
+                    // genuinely-zero just-evicted block costs one redundant S3 fetch;
+                    // a stale one is rescued from corruption.
+                    if state == SparseBlockState::NOT_PRESENT
+                        && buf[..valid].iter().all(|&b| b == 0)
+                    {
+                        if require_promotion {
+                            return Err(super::CacheError::BlockEvicted);
+                        }
+                        // Best-effort (plain write): leave NOT_PRESENT so set_present
+                        // + the caller's write reconstruct it; don't write zeros.
+                        break;
+                    }
+
+                    #[cfg(feature = "test-utils")]
+                    {
+                        let sp = self.promote_sync.lock().clone();
+                        if let Some(sp) = sp {
+                            sp.gate_sync(PromoteStep::AfterRead, idx);
+                        }
+                    }
+
+                    df.write_all_at(&buf[..valid], offset)?;
+
+                    #[cfg(feature = "test-utils")]
+                    {
+                        let sp = self.promote_sync.lock().clone();
+                        if let Some(sp) = sp {
+                            sp.gate_sync(PromoteStep::BeforeCas, idx);
+                        }
+                    }
+
+                    // Final CAS preserves the original contract: SYNCING→DIRTY
+                    // or NOT_PRESENT→DIRTY at the end of promote. Eviction may
+                    // have raced (state→NOT_PRESENT) — in that case CAS fails
+                    // harmlessly; the pwrite we already landed is still
+                    // correct in the active file.
+                    if state == SparseBlockState::SYNCING {
+                        if self
+                            .state_map
+                            .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                            .is_ok()
+                        {
+                            self.syncing_block_count.fetch_sub(1, Ordering::Release);
+                            self.dirty_block_count.fetch_add(1, Ordering::Release);
+                        }
+                    } else if self
                         .state_map
-                        .cas(idx, SparseBlockState::SYNCING, SparseBlockState::DIRTY)
+                        .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
                         .is_ok()
                     {
-                        self.syncing_block_count.fetch_sub(1, Ordering::Release);
                         self.dirty_block_count.fetch_add(1, Ordering::Release);
                     }
-                } else if self
-                    .state_map
-                    .cas(idx, SparseBlockState::NOT_PRESENT, SparseBlockState::DIRTY)
-                    .is_ok()
-                {
-                    self.dirty_block_count.fetch_add(1, Ordering::Release);
+                    // _guard drops here, releasing the claim + waking waiters.
+                    break;
                 }
-                // _guard drops here, releasing the claim + waking waiters.
             }
         } else if require_promotion {
             // No flushing file available. If any block in the range needs
@@ -1119,6 +1186,16 @@ impl CacheInner {
                 let state = self.state_map.get(idx);
                 if state == SparseBlockState::SYNCING
                     || state == SparseBlockState::NOT_PRESENT
+                {
+                    return Err(super::CacheError::BlockEvicted);
+                }
+                // Same as the flushing-file branch's CLEAN arm: a CLEAN
+                // block whose promote claim is held is an in-flight S3
+                // materialization — bail so the caller retries gate-free
+                // (its backfill CLEAN-wait). A rotation needn't be active
+                // for a materialization to be.
+                if state == SparseBlockState::CLEAN
+                    && self.promote_claim.is_claimed(idx)
                 {
                     return Err(super::CacheError::BlockEvicted);
                 }
