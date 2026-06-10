@@ -2627,6 +2627,36 @@ async fn zc_promote_bails_on_inflight_materialization() {
     }
 }
 
+/// USER_COPY twin of the materialization-park protection: the live
+/// USER_COPY write path (`backfill_and_write` → `write_with_eviction_check`,
+/// require_promotion=true through the SAME shared promote loop) must also
+/// bail `BlockEvicted` when it observes CLEAN with an in-flight
+/// materialization — not slice into unmaterialized bytes. Pins the
+/// transport entry point, not just the shared internals.
+#[tokio::test]
+async fn uc_write_eviction_check_bails_on_inflight_materialization() {
+    let block_size = 128 * 1024usize;
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    let claim = h
+        .cache
+        .claim_block_for_materialization(0)
+        .expect("claim should win on a NOT_PRESENT block");
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::CLEAN);
+
+    let res = h.cache.write_with_eviction_check(0, &[0xCC; 4096]);
+    assert!(
+        matches!(res, Err(super::CacheError::BlockEvicted)),
+        "USER_COPY eviction-checked write over an in-flight materialization \
+         must bail BlockEvicted, got: {res:?}"
+    );
+
+    drop(claim);
+    // Claim free: CLEAN is zero-prior-valid — the write proceeds.
+    let res = h.cache.write_with_eviction_check(0, &[0xCC; 4096]);
+    assert!(res.is_ok(), "write over CLEAN with free claim must proceed, got: {res:?}");
+}
+
 /// `write_materialized` must ABORT (Ok(false)) when the materialization
 /// claim was STOLEN — a straggler guest write committed the block
 /// (CLEAN→DIRTY) while the S3 fetch was in flight. Landing the stale

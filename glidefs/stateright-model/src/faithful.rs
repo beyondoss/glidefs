@@ -627,6 +627,15 @@ mod tests {
         eprintln!("[fix] {} states", r.unique_state_count());
         r.assert_properties();
     }
+    /// The waiter bypass is transport-independent (the promote claim is
+    /// shared code): USER_COPY with promote_fix alone corrupts too — ZC just
+    /// makes the evicted state far more reachable in practice.
+    #[test]
+    fn uc_promote_fix_alone_still_corrupts() {
+        let r = run(true, false, false, false);
+        eprintln!("[uc promote-fix-only] {} states", r.unique_state_count());
+        r.assert_any_discovery("read returns last write");
+    }
     /// BUG #3 (model-found): fetch-before-claim backfill ABA. With both
     /// promote fixes in place but claim_first missing, a sibling's newer
     /// write can be committed + uploaded + evicted back to NOT_PRESENT
@@ -673,3 +682,4 @@ mod tests {
         r.assert_properties();
     }
 }
+
