@@ -545,11 +545,93 @@ impl WriteCache<Active> {
     }
 
     /// Try to claim a NOT_PRESENT block (CAS NOT_PRESENT → CLEAN).
-    /// Returns true if this call won the transition, false if already present.
+    /// Returns true if this call won the transition, false if already
+    /// present OR if the block's promote claim is currently held.
+    ///
+    /// The CAS is linearized THROUGH the promote claim: a promote holder
+    /// captures the block state, preads the flushing file, and pwrites the
+    /// copy into the active file — if a writer could claim the state
+    /// (NP→CLEAN) and land guest data between that capture and the pwrite,
+    /// the promote's stale flushing-file copy would clobber the committed
+    /// newer write (the promote-side CAS "fails harmlessly", but its pwrite
+    /// has already landed — found by the stateright faithful model). Taking
+    /// the promote claim for the duration of the CAS makes "who materializes
+    /// this block" a single linearization point: a promoter in flight ⇒ the
+    /// claim fails and the caller waits/retries; a won claim ⇒ no promoter
+    /// can start (promote re-reads state under its claim and CLEAN is not
+    /// promotable).
     #[inline]
     pub fn try_claim_block(&self, block_idx: usize) -> bool {
-        self.inner.try_set_present(block_idx)
+        if !self.inner.promote_claim.try_claim(block_idx) {
+            return false;
+        }
+        let won = self.inner.try_set_present(block_idx);
+        self.inner.promote_claim.release(block_idx);
+        won
     }
+
+    /// Revert a claim taken by [`try_claim_block`] (CAS CLEAN → NOT_PRESENT).
+    ///
+    /// For the claim-first backfill error path: a claimed block whose S3
+    /// fetch failed must not stay CLEAN — sibling writers park on the
+    /// CLEAN-wait expecting a CLEAN→DIRTY transition that would never come.
+    /// Returns true if this call performed the transition.
+    #[inline]
+    pub fn unclaim_block(&self, block_idx: usize) -> bool {
+        use crate::block::block_map::SparseBlockState;
+        self.inner
+            .state_map
+            .cas(block_idx, SparseBlockState::CLEAN, SparseBlockState::NOT_PRESENT)
+            .is_ok()
+    }
+
+    /// Claim a NOT_PRESENT block for MATERIALIZATION (S3 backfill), holding
+    /// the block's promote claim until the returned guard drops.
+    ///
+    /// Returns `None` if the block is already present (or another promoter/
+    /// materializer holds the promote claim — caller re-checks/waits, same
+    /// as a lost [`try_claim_block`]). On `Some`, the block is CLEAN and the
+    /// promote claim is HELD: `promote_syncing_blocks` treats CLEAN with a
+    /// held claim as "materialization in flight" and parks instead of
+    /// breaking — so a concurrent sub-block writer can neither slice-write
+    /// an unmaterialized block nor have the materializer's full-block
+    /// pwrite land over its committed data. CLEAN with a FREE claim is safe
+    /// to proceed past: it is either a zero-prior block (remainder is
+    /// legitimately sparse zeros) or a full-block writer's claim (its own
+    /// guest write covers every byte).
+    ///
+    /// Drop order: finish the data write (`cache.write` → DIRTY) BEFORE
+    /// dropping the guard, so waiters re-check and observe DIRTY.
+    pub fn claim_block_for_materialization(
+        &self,
+        block_idx: usize,
+    ) -> Option<MaterializationClaim<'_>> {
+        if !self.inner.promote_claim.try_claim(block_idx) {
+            return None;
+        }
+        if !self.inner.try_set_present(block_idx) {
+            self.inner.promote_claim.release(block_idx);
+            return None;
+        }
+        Some(MaterializationClaim { cache_inner: &self.inner, block_idx })
+    }
+}
+
+/// RAII guard for a block claimed for S3 materialization — holds the block's
+/// promote claim from [`WriteCache::claim_block_for_materialization`] until
+/// drop. See that method for the protocol.
+pub struct MaterializationClaim<'a> {
+    cache_inner: &'a super::inner::CacheInner,
+    block_idx: usize,
+}
+
+impl Drop for MaterializationClaim<'_> {
+    fn drop(&mut self) {
+        self.cache_inner.promote_claim.release(self.block_idx);
+    }
+}
+
+impl WriteCache<Active> {
 
     /// Get the block state as a typed value.
     #[inline]
@@ -1484,9 +1566,25 @@ impl WriteCache<Active> {
         // CAS failure means a guest write re-dirtied the block during flush.
         // Promote-on-write already copied the full block from flushing → active
         // before the guest pwrite, so the active file has complete data.
-        for &chunk_index in &flushed_blocks {
-            if !self.inner.transition_syncing_to_not_present(chunk_index) {
-                total_stats.blocks_cas_failed += 1;
+        //
+        // **Why the eviction batch holds the data_file WRITE lock:** an
+        // eviction landing while a writer is mid-flight (rotation read-gate
+        // held, kernel WRITE_FIXED queued or in progress) flips the block to
+        // NOT_PRESENT under that writer — a sibling's backfill can then
+        // claim the "empty" block and pwrite the (stale) S3 pre-image
+        // UNORDERED against the in-flight write, rolling its committed data
+        // back (found by the stateright faithful model; the same eviction-
+        // under-writer enabled the `fio_verify_random_cold_wake` zeros
+        // corruption). Taking the write lock drains every in-flight gate
+        // holder first — same exclusion rotation itself uses — so eviction
+        // only ever observes quiescent blocks. Bounded by in-flight I/O
+        // latency, once per flush cycle.
+        {
+            let _df = self.inner.data_file.write();
+            for &chunk_index in &flushed_blocks {
+                if !self.inner.transition_syncing_to_not_present(chunk_index) {
+                    total_stats.blocks_cas_failed += 1;
+                }
             }
         }
 

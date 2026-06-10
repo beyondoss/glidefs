@@ -56,8 +56,21 @@ mod fio_verify {
         cache_dir: TempDir,
     }
 
+    /// Honor `RUST_LOG` so CI stress runs can capture glidefs tracing
+    /// (promote/backfill/eviction events) alongside the fio output.
+    fn init_tracing() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_writer(std::io::stderr)
+                .try_init();
+        });
+    }
+
     impl VerifyServer {
         async fn start(s3: Arc<dyn ObjectStore>) -> Self {
+            init_tracing();
             let cache_dir = TempDir::new().unwrap();
             let clean_cache: Arc<dyn BlockCache> =
                 Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));

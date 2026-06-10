@@ -433,7 +433,7 @@ impl BlockHandler {
         let start_block = offset / block_size_u64;
         let end_block = (offset + len - 1) / block_size_u64;
 
-        for block in start_block..=end_block {
+        'block_loop: for block in start_block..=end_block {
             let idx = block as usize;
             // Wait for any in-flight backfill claim on this block to finish
             // its data pwrite (state transitions CLEAN→DIRTY). Without this
@@ -452,26 +452,46 @@ impl BlockHandler {
             // caller is writing).
             let clean_deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(5);
-            while self.cache.block_state(idx).is_clean() {
-                if std::time::Instant::now() >= clean_deadline {
-                    tracing::warn!(
-                        block = idx,
-                        "backfill: timed out waiting for prior writer's CLEAN→DIRTY transition; proceeding"
-                    );
-                    break;
+            loop {
+                while self.cache.block_state(idx).is_clean() {
+                    if std::time::Instant::now() >= clean_deadline {
+                        tracing::warn!(
+                            block = idx,
+                            "backfill: timed out waiting for prior writer's CLEAN→DIRTY transition; proceeding"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                if self.cache.is_block_present(idx) {
+                    continue 'block_loop;
+                }
+                // Check if the write covers the full block — no backfill
+                // data needed, but the block claim must still be WON: a
+                // concurrent sub-block backfill that holds the claim is
+                // about to pwrite the (stale) S3 pre-image as a FULL block,
+                // and nothing else orders that pwrite against our caller's
+                // upcoming full-block data write. Owning the claim (CLEAN)
+                // parks the sibling's backfill until our commit transitions
+                // the block CLEAN→DIRTY — its present-check then skips the
+                // stale pwrite entirely. Losing the claim sends us back to
+                // the CLEAN-wait. (Found by the stateright faithful model:
+                // a full-block writer racing a claim-first sub-block
+                // backfill rolled the block back to the stale S3 image.)
+                let block_start = block * block_size_u64;
+                let zero_start = offset.max(block_start);
+                let zero_end = (offset + len).min(block_start + block_size_u64);
+                if zero_end - zero_start >= block_size_u64 {
+                    if self.cache.try_claim_block(idx) {
+                        continue 'block_loop;
+                    }
+                    // Another writer claimed between our present-check and
+                    // the CAS — re-enter the CLEAN-wait.
+                    continue;
+                }
+                break;
             }
-            if self.cache.is_block_present(idx) {
-                continue;
-            }
-            // Check if the zero covers the full block — no backfill needed.
             let block_start = block * block_size_u64;
-            let zero_start = offset.max(block_start);
-            let zero_end = (offset + len).min(block_start + block_size_u64);
-            if zero_end - zero_start >= block_size_u64 {
-                continue;
-            }
             // Check if this block has S3 data before doing the expensive resolve.
             let has_s3_data = {
                 let (bo, pids) = {
@@ -501,7 +521,23 @@ impl BlockHandler {
             if !has_s3_data {
                 continue;
             }
-            // Fetch prior data from S3.
+            // Claim-gated backfill, CLAIM FIRST: only one caller fetches and
+            // writes the S3 block to the cache file. The materialization
+            // claim does two jobs: the state claim (CLEAN) pins the block
+            // across the async fetch — flush never touches CLEAN and
+            // sibling pre_writes park on the CLEAN-wait — closing the
+            // fetch-before-claim ABA where a sibling's newer write could be
+            // uploaded + evicted during our fetch and then overwritten with
+            // the stale prior; AND the held PROMOTE claim marks the
+            // materialization as in-flight, so a guest-write promote that
+            // observes CLEAN parks instead of slicing into unmaterialized
+            // bytes (both found by the stateright faithful model). Losers
+            // skip: their caller's promote/CLEAN-wait orders them behind
+            // this materialization.
+            let Some(claim) = self.cache.claim_block_for_materialization(idx) else {
+                continue;
+            };
+            // Fetch prior data from S3 while holding the claim.
             let block_data = match self.cache.resolve_block_for_backfill(
                 idx,
                 self.clean_cache.as_ref(),
@@ -511,26 +547,49 @@ impl BlockHandler {
                 Some(&self.metrics),
             ).await {
                 Ok(data) => data,
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    // Revert the state claim — a dangling CLEAN block parks
+                    // every sibling writer on the CLEAN-wait. (The promote
+                    // claim releases when `claim` drops.)
+                    self.cache.unclaim_block(idx);
+                    return Err(e.into());
+                }
             };
-            // Skip if the resolved data is all zeros — the data file already
-            // has zeros (sparse or set_len). Writing zeros would create
-            // unnecessary dirty blocks and WAL entries, and on ublk could
-            // trigger a flush rotation that invalidates the io_uring
-            // registered fd.
+            // Skip the pwrite if the resolved data is all zeros — the data
+            // file already has zeros (sparse or set_len). Writing zeros
+            // would create unnecessary dirty blocks and WAL entries, and on
+            // ublk could trigger a flush rotation that invalidates the
+            // io_uring registered fd. The block stays CLEAN (claimed) —
+            // `cache.pre_write` would set_present it anyway, and the
+            // caller's WRITE_FIXED → commit transitions it DIRTY. Dropping
+            // `claim` frees the promote claim: CLEAN + free claim = zeros
+            // are the block's legitimate content.
             if block_data.iter().all(|&b| b == 0) {
+                drop(claim);
                 continue;
             }
-            // CAS-gated backfill: only one caller writes the S3 block to
-            // the cache file. Loser skips; their caller's subsequent
-            // `WRITE_FIXED` is correctness-equivalent because the winner
-            // pwrites stale S3 data and the loser's `WRITE_FIXED` is the
-            // *guest's intended new bytes* — both writers are racing to
-            // produce the same logical state.
-            if !self.cache.try_claim_block(idx) {
-                continue;
+            // Materialized write: under the data_file WRITE lock with a
+            // CLEAN re-check — aborts if a straggler guest write stole the
+            // claim (committed newer data) while we fetched. On a steal the
+            // block is DIRTY with the guest's bytes; our stale pre-image
+            // must NOT land. The caller's own WRITE_FIXED still follows.
+            match self.cache.write_materialized(block_start, &block_data, idx) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        block = idx,
+                        "backfill: claim stolen by concurrent guest write; skipping stale pre-image"
+                    );
+                }
+                Err(e) => {
+                    self.cache.unclaim_block(idx);
+                    return Err(e.into());
+                }
             }
-            self.cache.write(block_start, &block_data)?;
+            // Data write complete (block DIRTY) — NOW release the promote
+            // claim so guest-write promotes that bailed re-check and see
+            // DIRTY.
+            drop(claim);
         }
 
         Ok(())
@@ -681,8 +740,22 @@ impl BlockHandler {
                 // === NOT_PRESENT: backfill from S3 ===
 
                 if write_len >= block_size {
-                    // Full block overwrite — no prior data to preserve.
-                    self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    // Full block overwrite — no prior data to preserve, but
+                    // the block claim must be WON first: a concurrent
+                    // sub-block backfill holding the claim is about to
+                    // pwrite the stale S3 pre-image as a full block, and
+                    // nothing else orders that pwrite against ours (stale
+                    // image clobbers our committed data). Losing the CAS
+                    // re-enters the retry loop, whose CLEAN-wait parks until
+                    // the claim holder commits. (Found by the stateright
+                    // faithful model.)
+                    if !self.cache.try_claim_block(idx) {
+                        continue 'block_retry;
+                    }
+                    if let Err(e) = self.cache.write(write_start, &data[data_offset..data_offset + write_len]) {
+                        self.cache.unclaim_block(idx);
+                        return Err(e.into());
+                    }
                     break 'block_retry;
                 }
 
@@ -732,52 +805,72 @@ impl BlockHandler {
                     break 'block_retry;
                 }
 
-                // Fetch prior data from S3 BEFORE claiming.
-                let prior = self.cache.resolve_block_for_backfill(
+                _backfill_gate!(BackfillStep::BeforeCas, idx, crate::block::block_map::SparseBlockState::NOT_PRESENT);
+
+                // CLAIM FIRST (materialization claim: CAS NOT_PRESENT→CLEAN
+                // + held promote claim), THEN fetch. The state claim pins
+                // the block for the duration of the async S3 fetch: flush
+                // never touches CLEAN (only DIRTY is snapshotted, only
+                // SYNCING is evicted) and sibling writers park on the
+                // CLEAN-wait. Fetch-before-claim had an ABA hole: during the
+                // fetch a sibling could commit NEW data and a full flush
+                // cycle could upload it and evict the block back to
+                // NOT_PRESENT — the old `is_not_present()` re-check then
+                // passed, the claim succeeded, and the merged write
+                // resurrected the STALE prior, silently rolling back the
+                // acknowledged newer write. The held promote claim
+                // additionally marks the materialization in-flight so
+                // guest-write promotes park on CLEAN instead of racing our
+                // merged pwrite (both found by the stateright faithful
+                // model).
+                let Some(claim) = self.cache.claim_block_for_materialization(idx) else {
+                    // Another writer/materializer owns it. Re-enter outer
+                    // match to wait for their write to complete.
+                    continue 'block_retry;
+                };
+
+                _backfill_gate!(BackfillStep::AfterCas, idx, self.cache.block_state(idx).raw());
+
+                // Fetch prior data from S3 while holding the claim.
+                let prior = match self.cache.resolve_block_for_backfill(
                     idx,
                     self.clean_cache.as_ref(),
                     &self.pack_index_cache,
                     &self.volume_manifest,
                     &self.content_store,
                     Some(&self.metrics),
-                ).await.map_err(|e| {
-                    tracing::warn!(
-                        block = idx,
-                        error = %e,
-                        "S3 backfill failed for sub-block write — rejecting write to prevent data corruption"
-                    );
-                    CommandError::IoError
-                })?;
+                ).await {
+                    Ok(prior) => prior,
+                    Err(e) => {
+                        // Revert the state claim — a dangling CLEAN block
+                        // parks every sibling writer on the CLEAN-wait.
+                        // (The promote claim releases when `claim` drops.)
+                        self.cache.unclaim_block(idx);
+                        tracing::warn!(
+                            block = idx,
+                            error = %e,
+                            "S3 backfill failed for sub-block write — rejecting write to prevent data corruption"
+                        );
+                        return Err(CommandError::IoError);
+                    }
+                };
 
                 _backfill_gate!(BackfillStep::S3FetchDone, idx, self.cache.block_state(idx).raw());
 
-                // Re-check state after the async fetch. Another writer or
-                // flush rotation may have changed the block state.
-                if !self.cache.block_state(idx).is_not_present() {
-                    // State changed during fetch — re-enter outer match.
-                    continue 'block_retry;
-                }
-
-                // If prior data is all zeros, just write the sub-block.
+                // If prior data is all zeros, just write the sub-block. The
+                // block is CLEAN (claimed); cache.write transitions it DIRTY
+                // and the rest of the block stays sparse zeros — consistent
+                // with the all-zero prior.
                 if prior.is_empty() || prior.iter().all(|&b| b == 0) {
                     self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
+                    drop(claim);
                     break 'block_retry;
                 }
 
-                _backfill_gate!(BackfillStep::BeforeCas, idx, crate::block::block_map::SparseBlockState::NOT_PRESENT);
-
-                // Non-zero prior: claim the block, merge, and write.
-                if !self.cache.try_claim_block(idx) {
-                    // Another writer claimed it. Re-enter outer match to
-                    // wait for their write to complete.
-                    continue 'block_retry;
-                }
-
-                _backfill_gate!(BackfillStep::AfterCas, idx, self.cache.block_state(idx).raw());
-
-                // We won the claim. Merge guest data onto prior block.
+                // We hold the claim. Merge guest data onto prior block.
                 let mut block_buf = prior.to_vec();
                 if block_buf.len() != block_size {
+                    self.cache.unclaim_block(idx);
                     tracing::error!(
                         block = idx,
                         expected = block_size,
@@ -792,8 +885,30 @@ impl BlockHandler {
 
                 _backfill_gate!(BackfillStep::BeforeWrite, idx, self.cache.block_state(idx).raw());
 
-                self.cache.write(block_start, &block_buf)?;
-                break 'block_retry;
+                // Materialized write (write lock + CLEAN re-check). A steal
+                // means a concurrent guest write committed newer data while
+                // we fetched — our merged block embeds the STALE pre-image,
+                // so discard it and re-enter the state machine: the block is
+                // now DIRTY, and the has_local_data arm writes only our own
+                // guest sub-range on top.
+                match self.cache.write_materialized(block_start, &block_buf, idx) {
+                    Ok(true) => {
+                        drop(claim);
+                        break 'block_retry;
+                    }
+                    Ok(false) => {
+                        tracing::debug!(
+                            block = idx,
+                            "backfill_and_write: claim stolen by concurrent guest write; rewriting sub-range only"
+                        );
+                        drop(claim);
+                        continue 'block_retry;
+                    }
+                    Err(e) => {
+                        self.cache.unclaim_block(idx);
+                        return Err(e.into());
+                    }
+                }
             }
         }
 
@@ -1291,6 +1406,16 @@ impl BlockHandler {
         let block_size = self.cache.block_size() as u64;
         let start_block = offset / block_size;
         let end_block = (offset + length - 1) / block_size;
+        // Claims taken during the scan. If a LATER block forces the
+        // deferred fallback (return None), these must be released —
+        // otherwise the deferred path's backfill CLEAN-waits 5 s on our
+        // own abandoned claim.
+        let mut claimed: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
+        let unclaim_all = |claimed: &smallvec::SmallVec<[usize; 8]>| {
+            for &i in claimed {
+                self.cache.unclaim_block(i);
+            }
+        };
         for block in start_block..=end_block {
             #[allow(clippy::cast_possible_truncation)]
             let idx = block as usize;
@@ -1303,6 +1428,7 @@ impl BlockHandler {
             // whose `backfill_blocks_in_range` has the bounded
             // CLEAN-wait that correctly serializes this.
             if self.cache.block_state(idx).is_clean() {
+                unclaim_all(&claimed);
                 return None;
             }
             if self.cache.is_block_present(idx) {
@@ -1313,9 +1439,23 @@ impl BlockHandler {
             let write_end = (offset + length).min(block_start + block_size);
             if write_end - write_start < block_size {
                 // Partial write to NOT_PRESENT block — needs backfill.
+                unclaim_all(&claimed);
                 return None;
             }
-            // Full-block write to NOT_PRESENT block — no backfill needed.
+            // Full-block write to NOT_PRESENT block — no backfill data
+            // needed, but the block claim must be WON before proceeding
+            // inline: a concurrent sub-block backfill holding the claim is
+            // about to pwrite the stale S3 pre-image as a full block, and
+            // our inline WRITE_FIXED would otherwise race it unordered
+            // (stale image clobbers committed guest data). Losing the CAS
+            // means someone else owns the block right now — fall back to
+            // the deferred path, whose backfill CLEAN-wait parks until
+            // their commit. (Found by the stateright faithful model.)
+            if !self.cache.try_claim_block(idx) {
+                unclaim_all(&claimed);
+                return None;
+            }
+            claimed.push(idx);
         }
         Some(self.cache.pre_write(offset, length).map_err(CommandError::from))
     }

@@ -166,18 +166,20 @@ async fn write_write_sequential() {
         async move { h.write(0, &d, false).await }
     });
 
-    // Advance A through all steps.
+    // Advance A through all steps. Claim-first order: the materialization
+    // claim (BeforeCas/AfterCas) precedes the S3 fetch — the claim pins the
+    // block across the fetch (ABA fix).
     let ev = events.wait_for(0, BackfillStep::StateChecked).await;
     assert_eq!(ev.block_state, 0, "A should see NOT_PRESENT");
-    sp.release(0);
-
-    events.wait_for(0, BackfillStep::S3FetchDone).await;
     sp.release(0);
 
     events.wait_for(0, BackfillStep::BeforeCas).await;
     sp.release(0);
 
     events.wait_for(0, BackfillStep::AfterCas).await;
+    sp.release(0);
+
+    events.wait_for(0, BackfillStep::S3FetchDone).await;
     sp.release(0);
 
     events.wait_for(0, BackfillStep::BeforeWrite).await;
@@ -207,10 +209,13 @@ async fn write_write_sequential() {
     );
 }
 
-/// Interleaving 2: Both writers fetch from S3, A wins CAS, B re-checks and
-/// sees state changed → retries via 'block_retry, sees DIRTY, writes sub-block.
+/// Interleaving 2 (claim-first): A materializes (claim → fetch → merged
+/// write) while B is held at its state check; B then loses the claim and
+/// retries via 'block_retry, sees DIRTY, writes its sub-block on top.
+/// (Pre-claim-first this test scripted "both fetch, then race the CAS" —
+/// that ordering allowed the stale-prior ABA and no longer exists.)
 #[tokio::test]
-async fn write_write_both_fetch_a_wins_cas() {
+async fn write_write_a_materializes_b_held_at_state_check() {
     let (handler, event_rx, sp, cache, _cs, _pic, _vm, _cc, _dir) =
         setup_cold_fork_with_sync(0xAA, 1).await;
     let mut events = EventCollector::new(event_rx);
@@ -235,29 +240,27 @@ async fn write_write_both_fetch_a_wins_cas() {
     assert_eq!(ev_a.block_state, 0);
     assert_eq!(ev_b.block_state, 0);
 
-    // Release both to fetch from S3.
-    sp.release(0);
-    sp.release(1);
-
-    // Both arrive at S3FetchDone.
-    events.wait_for(0, BackfillStep::S3FetchDone).await;
-    events.wait_for(1, BackfillStep::S3FetchDone).await;
-
-    // Release A to CAS, hold B.
+    // Drive A through the full materialization while B stays parked:
+    // claim (BeforeCas/AfterCas) → fetch (S3FetchDone) → merged write.
     sp.release(0);
     events.wait_for(0, BackfillStep::BeforeCas).await;
     sp.release(0);
     events.wait_for(0, BackfillStep::AfterCas).await;
+    sp.release(0);
+    events.wait_for(0, BackfillStep::S3FetchDone).await;
     sp.release(0);
     events.wait_for(0, BackfillStep::BeforeWrite).await;
     sp.release(0);
 
     a_handle.await.unwrap().unwrap();
 
-    // Now release B. B's post-fetch re-check sees state changed → retries.
+    // Release B: its claim attempt fails (block is DIRTY — A materialized
+    // and committed) → continue 'block_retry → re-check sees DIRTY → B
+    // writes only its own sub-range.
+    sp.release(1);
+    events.wait_for(1, BackfillStep::BeforeCas).await;
     sp.release(1);
 
-    // B re-enters 'block_retry loop. Release through its retry.
     let ev = events.wait_for(1, BackfillStep::StateChecked).await;
     assert!(
         ev.block_state == 2 || ev.block_state == 1,
@@ -491,9 +494,12 @@ async fn probe_try_pread_rejects_clean() {
     );
 }
 
-/// Interleaving 3: Both reach CAS, A wins, B loses → retries.
+/// Interleaving 3 (claim-first): both reach the claim point, A wins the
+/// materialization claim and completes (fetch + merged write), B loses →
+/// retries via 'block_retry, CLEAN-waits if needed, sees DIRTY, writes its
+/// sub-block.
 #[tokio::test]
-async fn write_write_both_reach_cas_a_wins() {
+async fn write_write_both_reach_claim_a_wins() {
     let (handler, event_rx, sp, cache, _cs, _pic, _vm, _cc, _dir) =
         setup_cold_fork_with_sync(0xAA, 1).await;
     let mut events = EventCollector::new(event_rx);
@@ -512,29 +518,28 @@ async fn write_write_both_reach_cas_a_wins() {
         async move { h.write(SUB_BLOCK as u64, &d, false).await }
     });
 
-    // Both: StateChecked (NOT_PRESENT) → release → S3FetchDone → release → BeforeCas
+    // Both: StateChecked (NOT_PRESENT) → release → both park at BeforeCas
+    // (the claim point now precedes the fetch).
     events.wait_for(0, BackfillStep::StateChecked).await;
     events.wait_for(1, BackfillStep::StateChecked).await;
     sp.release(0);
     sp.release(1);
 
-    events.wait_for(0, BackfillStep::S3FetchDone).await;
-    events.wait_for(1, BackfillStep::S3FetchDone).await;
-    sp.release(0);
-    sp.release(1);
-
-    // Both at BeforeCas. Release A first so A wins the CAS.
     events.wait_for(0, BackfillStep::BeforeCas).await;
-    sp.release(0);
+    events.wait_for(1, BackfillStep::BeforeCas).await;
 
+    // Release A first so A wins the materialization claim, then drive it
+    // through fetch + merged write to completion.
+    sp.release(0);
     events.wait_for(0, BackfillStep::AfterCas).await;
+    sp.release(0);
+    events.wait_for(0, BackfillStep::S3FetchDone).await;
     sp.release(0);
     events.wait_for(0, BackfillStep::BeforeWrite).await;
     sp.release(0);
     a_handle.await.unwrap().unwrap();
 
-    // Now release B at BeforeCas. B will lose CAS → continue 'block_retry.
-    events.wait_for(1, BackfillStep::BeforeCas).await;
+    // Now release B at BeforeCas. B loses the claim → continue 'block_retry.
     sp.release(1);
 
     // B retries: StateChecked with DIRTY.
