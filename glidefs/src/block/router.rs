@@ -1172,9 +1172,14 @@ impl ExportRouter {
         }
     }
 
-    /// Discover all exports from S3.
+    /// Discover ALL exports under the global `{db_path}/exports/` prefix.
     ///
-    /// Lists the `{db_path}/exports/` prefix and loads each `export.json` in parallel.
+    /// Lists the prefix and loads each `export.json` in parallel. Boot no
+    /// longer uses this (it would resurrect every export on a shared bucket as
+    /// a live device — see [`discover_local_exports`]); retained for tests and
+    /// potential admin/debug enumeration, hence `allow(dead_code)` in the
+    /// binary build where it currently has no non-test caller.
+    #[allow(dead_code)]
     pub async fn discover_exports(&self) -> Result<Vec<ExportConfig>, RouterError> {
         use futures::stream::{self, StreamExt};
 
