@@ -753,6 +753,7 @@ impl TestServer {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         self.router
             .create_export(config, false, None, None)
@@ -773,6 +774,7 @@ impl TestServer {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         self.router.save_export(&config).await.unwrap();
     }
@@ -788,6 +790,7 @@ impl TestServer {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         self.router
             .create_export(config, false, Some(name), None)
@@ -808,6 +811,7 @@ impl TestServer {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         self.router
             .create_export(config, false, Some(name), None)
@@ -833,6 +837,7 @@ impl TestServer {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         self.router
             .create_export(config, false, Some(source_manifest), None)
@@ -859,6 +864,7 @@ impl TestServer {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         self.router
             .create_export(config, false, Some(source_manifest), Some(snapshot_sequence))
@@ -879,6 +885,7 @@ impl TestServer {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         self.router
             .create_export(config, true, Some(source_manifest), None)

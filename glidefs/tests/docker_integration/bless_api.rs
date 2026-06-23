@@ -387,6 +387,7 @@ async fn test_bless_api_full_flow() {
         flush_mode: None,
         transport: None,
         compaction_cooldown: None,
+        source: None,
     };
     router
         .create_export(config, false, Some("bases/myimage"), None)

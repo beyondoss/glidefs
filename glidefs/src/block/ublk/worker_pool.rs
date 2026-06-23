@@ -790,11 +790,26 @@ async fn run_worker_loop(
             state.executor.tick();
         }
 
-        // Drive io_uring. Block in the kernel for up to WORKER_IDLE_NSEC
-        // unless an SQE completes or eventfd fires. With nothing hosted,
-        // we still spin a short timeout so Shutdown via channel-close is
-        // promptly noticed.
-        let to_wait = if state.executor.all_done() { 0 } else { 1 };
+        // Drive io_uring. ALWAYS block in the kernel for up to
+        // WORKER_IDLE_NSEC, waking immediately when an SQE completes or the
+        // eventfd fires.
+        //
+        // The eventfd watcher is a *daemon* task (`spawn_daemon` above) that
+        // keeps a `PollAdd` permanently armed on the eventfd and re-arms it
+        // forever, independent of any hosted queue. Every `WorkerHandle::send`
+        // (AddQueue / RemoveQueue / Shutdown) writes the eventfd → PollAdd CQE
+        // → `io_uring_enter` returns at once. So a queue-less worker has
+        // nothing to gain from busy-polling: no I/O can target it until a
+        // queue is assigned, and that assignment wakes it via the eventfd.
+        //
+        // Previously this was `if all_done() { 0 } else { 1 }` — i.e. a worker
+        // with no hosted queues used `to_wait = 0`, making `io_uring_enter`
+        // return instantly and busy-spin a full core. With N idle workers
+        // (N = pool size − workers hosting queues) that burned ~N cores doing
+        // nothing; on a host running few VMs that's most of the pool. Channel
+        // close (sender dropped with no final message) is still noticed within
+        // one WORKER_IDLE_NSEC tick, which is fine for shutdown latency.
+        let to_wait = 1;
         let ts = io_uring::types::Timespec::new().nsec(WORKER_IDLE_NSEC);
         let submit_result = ring.with_mut(|r| {
             let args = io_uring::types::SubmitArgs::new().timespec(&ts);

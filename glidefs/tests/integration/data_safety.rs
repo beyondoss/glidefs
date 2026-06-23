@@ -2217,6 +2217,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router1.create_export(config, false, None, None).await.unwrap();
 
@@ -2287,6 +2288,7 @@ async fn test_cold_wake_stress_concurrent_writes() {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router2.create_export(config2, false, Some("vol1"), None).await.unwrap();
 
@@ -2567,6 +2569,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router1
             .create_export(config1, false, None, None)
@@ -2625,6 +2628,7 @@ async fn test_concurrent_sub_block_writes_same_not_present_block() {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router2
             .create_export(config2, false, Some("vol"), None)

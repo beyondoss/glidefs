@@ -77,13 +77,13 @@ curl -X PUT localhost:8080/api/exports/my-vm \
   -d '{"size_gb": 500}'
 # → {"name":"my-vm","size_bytes":500000000000,"readonly":false,"transport":"nbd","device":"/dev/nbd0"}
 
-# Fork from the current state of an existing export
+# Fork from the current state of an existing export — by logical name alone
 curl -X PUT localhost:8080/api/exports/my-vm-fork \
-  -d '{"size_gb": 500, "manifest_name": "my-vm"}'
+  -d '{"size_gb": 500, "from": "volume:my-vm"}'
 
-# Fork from a specific snapshot (returns sequence from POST /snapshot)
+# Fork from a specific snapshot (snapshot_id comes from POST /snapshot)
 curl -X PUT localhost:8080/api/exports/my-vm-fork \
-  -d '{"size_gb": 500, "manifest_name": "my-vm", "snapshot_sequence": 42}'
+  -d '{"size_gb": 500, "from": "snapshot:my-vm@42"}'
 
 # Use ublk transport (Linux 6.0+, requires --features ublk)
 curl -X PUT localhost:8080/api/exports/my-vm \
@@ -112,7 +112,9 @@ PUT is idempotent. Same size → returns current state. Larger size → grows th
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/exports` | GET | List exports (includes transport + device path) |
-| `/api/exports/{name}` | PUT | Create or resize export. `manifest_name` + optional `snapshot_sequence` to fork. |
+| `/api/exports/{name}` | PUT | Create or resize export by name. To fork, set `from` to `"image:<name>"`, `"volume:<name>"`, or `"snapshot:<id>"`. |
+| `/api/resolve/{name}` | GET | Resolve a volume's location (`s3_prefix`, `manifest_name`, …) by name — reads S3 directly, works on any node. |
+| `/api/images/{name}` | GET | Resolve a blessed image's location (`pool`, `manifest`) by name. |
 | `/api/exports/{name}` | GET | Get export info |
 | `/api/exports/{name}` | DELETE | Remove export. `?purge=true` deletes local cache and all S3 snapshots. |
 | `/api/exports/{name}/drain` | POST | Flush all dirty blocks to S3 (no snapshot created) |
@@ -137,11 +139,11 @@ glidefs bless --image ubuntu-22.04.raw --name ubuntu-22.04-v1 --s3-prefix bases 
 
 Exports forked from base images share blocks via content addressing. Identical data is stored once.
 
-Fork from a blessed image using `manifest_name: "bases/{name}"`:
+Fork from a blessed image using `from: "image:{name}"`:
 
 ```sh
 curl -X PUT localhost:8080/api/exports/vm-1 \
-  -d '{"size_gb": 50, "manifest_name": "bases/ubuntu-22.04-v1"}'
+  -d '{"size_gb": 50, "from": "image:ubuntu-22.04-v1"}'
 ```
 
 ### Boot-set profiling (faster cold start)
@@ -180,7 +182,7 @@ curl -sX POST localhost:8080/api/exports/prod/snapshot \
 
 # 2. Fork — instant CoW, no data copied
 curl -X PUT localhost:8080/api/exports/vm-deploy-7 \
-  -d '{"size_gb": 50, "manifest_name": "prod"}'
+  -d '{"size_gb": 50, "from": "volume:prod"}'
 # → {"device": "/dev/nbd1", ...}
 
 # 3. Mount + sync code + start
@@ -229,7 +231,7 @@ if [ "$STATUS" -eq 200 ]; then
 else
   # Miss: fork from base, run setup, tag result
   curl -X PUT localhost:8080/api/exports/setup-work \
-    -d '{"size_gb": 50, "manifest_name": "bases/ubuntu-24.04-v1"}'
+    -d '{"size_gb": 50, "from": "image:ubuntu-24.04-v1"}'
 
   mount /dev/nbd1 /mnt
   mise install node@22 && npm ci --prefix /mnt/app
@@ -242,9 +244,9 @@ else
   SOURCE="setup-${SETUP_HASH}"
 fi
 
-# Fork from setup state, sync code, deploy
+# Fork from setup state (a tag is forkable as an image), sync code, deploy
 curl -X PUT localhost:8080/api/exports/vm-deploy-8 \
-  -d "{\"size_gb\": 50, \"manifest_name\": \"${SOURCE}\"}"
+  -d "{\"size_gb\": 50, \"from\": \"image:${SOURCE}\"}"
 ```
 
 Same `IMAGE_ID + LOCKFILE_HASH` next deploy → HEAD returns 200 → setup is skipped entirely.
@@ -405,15 +407,15 @@ SEQ=$(curl -sX POST localhost:8080/api/exports/my-vm/snapshot | jq .sequence)
 curl localhost:8080/api/exports/my-vm/snapshots
 # → [1, 5, 42]
 
-# Fork a new export from snapshot 42 (read-only parent blocks, CoW overlay for writes)
+# Fork a new export from snapshot $SEQ (read-only parent blocks, CoW overlay for writes)
 curl -X PUT localhost:8080/api/exports/my-vm-test \
-  -d "{\"size_gb\": 500, \"manifest_name\": \"my-vm\", \"snapshot_sequence\": $SEQ}"
+  -d "{\"size_gb\": 500, \"from\": \"snapshot:my-vm@$SEQ\"}"
 
 # Delete a snapshot when done
 curl -X DELETE localhost:8080/api/exports/my-vm/snapshots/5
 ```
 
-`snapshot_sequence` is optional. Omit it to fork from the current state.
+To fork from the live current state instead of a snapshot, use `from: "volume:my-vm"`.
 
 **GC and snapshots**: GC scans all snapshot manifests before deleting any pack. Packs referenced by a snapshot are kept alive even if they're no longer in the current manifest. Deleting a snapshot unpins its exclusive packs — they become eligible for GC after the grace period (default 24h).
 
@@ -425,7 +427,7 @@ curl -X DELETE localhost:8080/api/exports/my-vm
 
 # 2. Fork from the target snapshot into the same name
 curl -X PUT localhost:8080/api/exports/my-vm \
-  -d '{"size_gb": 500, "manifest_name": "my-vm", "snapshot_sequence": 5}'
+  -d '{"size_gb": 500, "from": "snapshot:my-vm@5"}'
 ```
 
 No data is copied — the new export reads parent blocks from the existing S3 packs via the CoW overlay.
@@ -434,7 +436,7 @@ No data is copied — the new export reads parent blocks from the existing S3 pa
 
 ```sh
 curl -X PUT localhost:8080/api/exports/my-vm-rollback \
-  -d '{"size_gb": 500, "manifest_name": "my-vm", "snapshot_sequence": 5}'
+  -d '{"size_gb": 500, "from": "snapshot:my-vm@5"}'
 # verify my-vm-rollback, then swap at the load balancer
 ```
 
