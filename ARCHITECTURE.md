@@ -177,14 +177,19 @@ Each pack is self-describing — the block index is a footer (trailer → index 
 
 ```
 {db_path}/
-└── exports/{s3_prefix}/                         ← ContentStore root (shared by exports + bless)
-    ├── manifests/{export_name}                  ← VolumeManifest GLVM (chunk_idx → [pack_ids])
-    ├── manifests/{tag_name}                     ← Named manifest tag (same format, arbitrary name)
-    ├── manifests/bases/{image_name}             ← Blessed base image VolumeManifest (glidefs bless)
-    ├── snapshots/{export_name}/{sequence:020}   ← Versioned VolumeManifest (zero-padded sequence)
-    └── chunks/{chunk_idx:04}/
-        └── {pack_id:016x}.pack                 ← GLPK pack (self-describing: header+index+data)
+├── exports/{s3_prefix}/                         ← ContentStore root (shared by exports + bless)
+│   ├── manifests/{export_name}                  ← VolumeManifest GLVM (chunk_idx → [pack_ids])
+│   ├── manifests/{tag_name}                     ← Named manifest tag (same format, arbitrary name)
+│   ├── manifests/bases/{image_name}             ← Blessed base image VolumeManifest (glidefs bless)
+│   ├── snapshots/{export_name}/{sequence:020}   ← Versioned VolumeManifest (zero-padded sequence)
+│   └── chunks/{chunk_idx:04}/
+│       └── {pack_id:016x}.pack                 ← GLPK pack (self-describing: header+index+data)
+└── index/                                       ← Logical→physical resolution (name-keyed, prefix-independent)
+    ├── images/{image_name}.json                 ← image:<name>    → {pool, manifest}
+    └── snapshots/{volume}@{seq}.json            ← snapshot:<id>   → {pool, volume, sequence, parent}
 ```
+
+(The volume index is `exports/{name}/export.json` itself — name-keyed and pool-independent — so it doubles as both the export definition and the `volume:<name>` resolver.)
 
 Chunk directories use 4-digit zero-padded indices (`chunks/0000/`, `chunks/0001/`, ...). A 1 TB device has 8,192 chunks (128 MiB each). A compacted chunk has exactly 1 pack file; an uncompacted chunk may have up to `DEFAULT_COMPACTION_THRESHOLD` (16) packs.
 
@@ -462,14 +467,18 @@ GC reconcile_prefix():
 
 ```
 PUT /api/exports/fork-vm
-    { "manifest_name": "prod-vm", "snapshot_sequence": 42, "size_gb": 10 }
+    { "from": "snapshot:prod-vm@42", "size_gb": 10 }      ← logical: no pool, no manifest, no sequence
     │
     ▼
-router.create_export(config, readonly=false, manifest_name=Some("prod-vm"), snapshot_sequence=Some(42))
+resolve_source(Snapshot("prod-vm@42"))                   ← GET index/snapshots/prod-vm@42.json
+    → ResolvedSource { pool: "prod-vm", manifest_name: "prod-vm", snapshot_sequence: 42 }
+    │
+    ▼
+router.create_export(config{s3_prefix="prod-vm"}, readonly=false, manifest_name=Some("prod-vm"), snapshot_sequence=Some(42))
     │
     ├── content_store.get_snapshot("prod-vm", 42)   ← GET snapshots/prod-vm/00000000000000000042
     ├── VolumeManifest::deserialize()
-    ├── ContentStore::put_manifest("fork-vm", ...)  ← PUT manifests/fork-vm
+    ├── ContentStore::put_manifest("fork-vm", ...)  ← PUT manifests/fork-vm  (in prod-vm's pool, CoW)
     └── WriteCache::open_fresh_active(config)        ← empty local block map
 ```
 
@@ -701,18 +710,20 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/exports/{name}` | `PUT` | Create or resize export (idempotent). With `manifest_name` + optional `snapshot_sequence`: fork from parent or specific snapshot. |
+| `/api/exports/{name}` | `PUT` | Create, fork, re-attach, or resize a volume by **name alone** (idempotent). Body is fully logical — no `s3_prefix`/`manifest_name`/`snapshot_sequence`. To fork, set `from` to `"image:<name>"`, `"volume:<name>"`, or `"snapshot:<id>"`; GlideFS resolves it to a pool + manifest and places the new volume in the source's pool for CoW. Omit `from` for a blank volume. |
+| `/api/resolve/{name}` | `GET` | Resolve a volume's physical location (`{s3_prefix, manifest_name, size_gb,…}`) from the durable name-keyed index, reading `export.json` straight from S3. Works on **any** node — even one that has never attached or discovered the volume. The primitive behind dead-node recovery. |
+| `/api/images/{name}` | `GET` | Resolve a blessed image's location (`{name, pool, manifest}`) from the logical image index. |
 | `/api/exports/{name}` | `GET` | Get export info (size, readonly, transport, device path) |
 | `/api/exports/{name}` | `DELETE` | Remove export. `?purge=true` also deletes local cache and all S3 snapshots. |
 | `/api/exports` | `GET` | List all active exports |
-| `/api/exports/{name}/snapshot` | `POST` | Flush dirty blocks → S3, upload versioned manifest. Optional body `{"tag":"name"}` also publishes named alias. Returns `{sequence, manifest_etag}`. |
+| `/api/exports/{name}/snapshot` | `POST` | Flush dirty blocks → S3, upload versioned manifest, and register the snapshot in the logical index. Optional body `{"tag":"name"}` also publishes a named alias. Returns `{snapshot_id, sequence, manifest_etag}` — fork from it via `from: "snapshot:<snapshot_id>"`. |
 | `/api/exports/{name}/snapshots` | `GET` | List snapshot sequences in ascending order |
 | `/api/exports/{name}/snapshots/{seq}` | `DELETE` | Delete a specific snapshot (idempotent) |
 | `/api/exports/{name}/tag` | `POST` | Publish current manifest under a named alias without re-flushing. Body: `{"tag":"name"}`. |
 | `/api/manifests/{s3_prefix}/{name}` | `HEAD` | Check manifest existence (200/404). No data transfer, no running export required. |
 | `/api/exports/{name}/drain` | `POST` | Flush all dirty blocks to S3 (no versioned snapshot) |
 | `/api/exports/{name}/promote` | `POST` | Toggle readonly → read-write |
-| `/api/exports/{name}/promote-base` | `POST` | Publish a snapshot's manifest under `bases/{base_name}` (no data re-upload). Body: `{"base_name":"...","sequence":N}`. Idempotent; the promoted base is forkable and profileable like a blessed one. |
+| `/api/exports/{name}/promote-base` | `POST` | Publish a snapshot's manifest under `bases/{base_name}` (no data re-upload) and register it in the image index. Body: `{"base_name":"...","sequence":N}`. Idempotent; the promoted base is forkable (`from: "image:<base_name>"`) and profileable like a blessed one. |
 | `/api/profile/{s3_prefix}/{name}` | `POST` | Start a background boot-set profile of `bases/{name}` (202). Body (all optional): `{"cmd","seed_paths","fs_type","runs","timeout_secs","force","untrusted","max_blocks"}`. `seed_paths` are faulted under the tracer before the entrypoint. 503 when the server has no `[profile]` config. |
 | `/api/profile/{s3_prefix}/{name}` | `GET` | Profile status: `{"state":"running"}` in-flight; `{"state":"complete"}` when `.boot-set.meta` exists; 404 when neither (never profiled, or last attempt failed). |
 | `/api/exports/{name}/metrics` | `GET` | Per-export metrics snapshot (JSON) |
@@ -723,6 +734,37 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 ### Export Persistence & Discovery
 
 Export definitions are saved to S3 as `{db_path}/exports/{name}/export.json`. On startup, `discover_exports()` lists all `export.json` files under the `exports/` prefix and loads them 32-wide parallel, then `create_export()` recovers each from local WAL 16-wide parallel. No S3 writes on the recovery path. (`router.rs:save_export`, `router.rs:discover_exports`, `cli/server.rs`)
+
+### Logical Naming & Resolution (GlideFS owns the logical→physical mapping)
+
+Callers address everything by **stable logical name** and never supply a physical
+`s3_prefix` or `manifest_name`. GlideFS owns three durable, name-keyed, prefix-independent
+indexes — read on every resolve so **any node** can locate data from a name alone (the
+basis for dead-node recovery: kill the node holding a mapping, the bytes stay addressable).
+
+| Index | Key | S3 location | Resolves a… | Written by |
+|-------|-----|-------------|-------------|------------|
+| **Volume** | volume name | `{db_path}/exports/{name}/export.json` | `volume:<name>` → `(pool, manifests/{name})` | every create/fork/re-attach (`save_export`) |
+| **Image** | image name | `{db_path}/index/images/{name}.json` | `image:<name>` → `(pool, bases/{name})` | bless (HTTP + `glidefs bless` CLI) and `promote-base` (`index_image` / `registry::put_image_entry`) |
+| **Snapshot** | `{volume}@{seq}` | `{db_path}/index/snapshots/{id}.json` | `snapshot:<id>` → `(pool, volume, sequence)` | `snapshot_export` (`save_snapshot_entry`) |
+
+A create/fork request carries a logical `from` ref (`FromRef`, `block/registry.rs`); the
+router's `resolve_source()` turns it into the physical coordinates the existing fork
+machinery needs, and **places the new volume in the source's pool so CoW pack sharing
+works**. The physical S3 layout is unchanged — only the *addressing* moved from the caller
+into GlideFS. Lineage (`ExportConfig::source`, and a snapshot entry's `parent`) records the
+`from` ref so GlideFS, not the caller, owns the parent/child graph.
+
+Re-attach: a `PUT` for a volume not held locally consults the volume index first; if it
+exists, GlideFS adopts the persisted pool + geometry and attaches the real data instead of
+creating a fresh empty volume at the wrong pool. (`router.rs:resolve_export`,
+`router.rs:resolve_source`, `api.rs:create_or_attach_volume`.)
+
+**Remaining physical surface (build-time admin only).** A few endpoints still take a
+`{s3_prefix}` path segment — `HEAD /api/manifests/{s3_prefix}/{name}` and
+`POST|GET /api/profile/{s3_prefix}/{name}`. These are image-authoring/admin operations, not
+the volume create/fork data path; the orchestrator's runtime volume lifecycle uses logical
+names exclusively.
 
 ## Observability
 

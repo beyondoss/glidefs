@@ -113,6 +113,26 @@ async fn record_profile_sidecars(
     }
 }
 
+/// Register a freshly-blessed base in the logical image index so it is forkable
+/// by `from: "image:<name>"` from any node (best-effort; the base bytes are
+/// already durable, a missing index entry is backfilled on the next bless).
+async fn register_image_index(
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    db_path: &str,
+    name: &str,
+    s3_prefix: &str,
+    manifest_key: &str,
+) {
+    let entry = crate::block::registry::ImageEntry {
+        name: name.to_string(),
+        pool: s3_prefix.to_string(),
+        manifest: manifest_key.to_string(),
+    };
+    if let Err(e) = crate::block::registry::put_image_entry(object_store, db_path, &entry).await {
+        tracing::warn!(image = %name, error = %e, "failed to write image index entry");
+    }
+}
+
 pub async fn run_bless(
     image_path: PathBuf,
     name: String,
@@ -167,6 +187,7 @@ pub async fn run_bless(
         .put_manifest(&manifest_key, volume_manifest.serialize()?, None)
         .await
         .context("Failed to upload manifest")?;
+    register_image_index(&object_store, &db_path, &name, &s3_prefix, &manifest_key).await;
 
     let elapsed = start.elapsed();
 
@@ -405,6 +426,7 @@ pub async fn run_bless_oci(
         .put_manifest(&manifest_key, manifest_data, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
+    register_image_index(&object_store, &db_path, &name, &s3_prefix, &manifest_key).await;
 
     // The entrypoint to profile (image default, overridable via GLIDEFS_PROFILE_CMD).
     let (mut argv, env, workdir) = crate::oci::boot_set::run_command(&resolved.config);
@@ -669,6 +691,7 @@ pub async fn run_bless_oci_erofs(
         .put_manifest(&manifest_key, manifest_data, None)
         .await
         .map_err(|e| anyhow::anyhow!("failed to upload manifest: {e}"))?;
+    register_image_index(&object_store, &db_path, &name, &s3_prefix, &manifest_key).await;
 
     // The entrypoint to profile (image default, overridable via GLIDEFS_PROFILE_CMD).
     let (mut argv, env, workdir) = crate::oci::boot_set::run_command(&resolved.config);

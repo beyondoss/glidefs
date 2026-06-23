@@ -5,6 +5,7 @@
 //! Used by orchestrators for microVM scale-to-zero and live migration.
 
 use crate::block::metrics::prometheus_header;
+use crate::block::registry::FromRef;
 use crate::block::router::{ExportInfo, ExportRouter, RouterError};
 use crate::config::ExportConfig;
 use crate::task;
@@ -25,20 +26,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use url::form_urlencoded;
 
-/// Request to create or update an export (PUT /api/exports/{name}).
-/// Name comes from URL path, not body.
+/// Request to create, fork, re-attach, or resize a volume
+/// (`PUT /api/exports/{name}`). Name comes from the URL path, not the body.
+///
+/// Fully logical: callers never supply an `s3_prefix` or `manifest_name`. To
+/// fork, set `from` to a logical ref (`"image:<name>"`, `"volume:<name>"`,
+/// `"snapshot:<id>"`); GlideFS resolves it to a pool + manifest internally and
+/// places the new volume in the source's pool for CoW pack sharing.
 #[derive(Debug, Deserialize)]
-pub struct PutExportRequest {
+pub struct CreateVolumeRequest {
     pub size_gb: f64,
+    /// Logical source to fork from. Omit (or `null`) for a fresh blank volume.
     #[serde(default)]
-    pub s3_prefix: Option<String>,
+    pub from: Option<String>,
     #[serde(default)]
     pub readonly: bool,
     #[serde(default)]
     pub block_size: Option<usize>,
-    /// If set, fork this export from the named S3 manifest.
-    #[serde(default)]
-    pub manifest_name: Option<String>,
     /// Blocks per S3 pack (default: inherit from global config). 0 = manual mode.
     #[serde(default)]
     pub flush_threshold: Option<usize>,
@@ -48,9 +52,6 @@ pub struct PutExportRequest {
     /// Block device transport: "nbd" (default) or "ublk" (Linux 6.0+).
     #[serde(default)]
     pub transport: Option<String>,
-    /// If set (with manifest_name), fork from this specific snapshot sequence.
-    #[serde(default)]
-    pub snapshot_sequence: Option<u64>,
     /// Cooldown compaction window in flush cycles (0/unset = disabled). Defers
     /// dead-ratio compaction of a chunk until it has been idle this many cycles;
     /// cuts S3 PUT write-amp on overwrite-heavy DB volumes. Typical value: 8.
@@ -114,6 +115,36 @@ impl From<ExportInfo> for ExportInfoResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ListExportsResponse {
     pub exports: Vec<ExportInfoResponse>,
+}
+
+/// Response for `GET /api/resolve/{name}`: where a volume's data physically
+/// lives, resolved from the durable name-keyed index (`export.json`). Lets any
+/// node locate a volume given only its stable name — no `s3_prefix` required.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResolveResponse {
+    pub name: String,
+    /// Effective S3 prefix (pool) holding this volume's packs + manifests.
+    pub s3_prefix: String,
+    /// Manifest name within the pool (equals the volume name).
+    pub manifest_name: String,
+    pub size_gb: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+}
+
+impl ResolveResponse {
+    fn from_config(name: &str, cfg: &ExportConfig) -> Self {
+        ResolveResponse {
+            name: name.to_string(),
+            s3_prefix: cfg.s3_prefix().to_string(),
+            manifest_name: name.to_string(),
+            size_gb: cfg.size_gb,
+            block_size: cfg.block_size,
+            transport: cfg.transport.clone(),
+        }
+    }
 }
 
 /// Request to bless an OCI image (POST /api/bless/{s3_prefix}/{name}).
@@ -289,6 +320,169 @@ where
     handle_request(router, req).await
 }
 
+/// Create, fork, re-attach, or resize a volume — the body of
+/// `PUT /api/exports/{name}`. Inputs are fully logical: `req` carries no
+/// physical coordinates and `from` is the parsed logical source ref. This
+/// function owns the create/fork/re-attach/resize decision and feeds the
+/// existing physical machinery (`create_export`) the coordinates it resolved.
+async fn create_or_attach_volume(
+    router: &Arc<ExportRouter>,
+    name: &str,
+    req: &CreateVolumeRequest,
+    from: &FromRef,
+) -> Response<BoxBody> {
+    // Already attached on this node → resize-or-noop (idempotent create).
+    if let Some(export) = router.get_export_info(name).await {
+        let current_size_gb = export.size as f64 / 1_073_741_824.0;
+        if req.size_gb > current_size_gb {
+            return match router.resize_export(name, req.size_gb).await {
+                Ok(()) => {
+                    let transport = export.transport.as_str();
+                    #[cfg(target_os = "linux")]
+                    if let Err(e) = router.register_device(name, transport).await {
+                        warn!(export = %name, error = %e, "device re-registration after resize failed");
+                    }
+                    let _ = transport;
+                    match router.get_export_info(name).await {
+                        Some(info) => {
+                            json_response(StatusCode::OK, &ExportInfoResponse::from(info))
+                        }
+                        None => error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Export resized but not found in map",
+                        ),
+                    }
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            };
+        }
+        return json_response(StatusCode::OK, &ExportInfoResponse::from(export));
+    }
+
+    // Not attached here. Resolve the durable, name-keyed index (export.json):
+    // if this volume already exists in S3 (created on another node, or before
+    // this node booted), recover its pool and ATTACH the real data — never
+    // create a fresh empty volume at the wrong pool. Resolve-by-name.
+    let resolved = match router.resolve_export(name).await {
+        Ok(r) => r,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to resolve export '{}': {}", name, e),
+            );
+        }
+    };
+
+    let (config, fork_manifest, fork_seq) = if let Some(existing) = resolved {
+        // RE-ATTACH: adopt the persisted pool + on-disk geometry (these MUST
+        // match the stored data); honor runtime prefs; never re-fork, never
+        // shrink. `from` is ignored — the volume already exists.
+        let config = ExportConfig {
+            name: name.to_string(),
+            size_gb: req.size_gb.max(existing.size_gb),
+            s3_prefix: existing.s3_prefix.clone(),
+            block_size: req.block_size.or(existing.block_size),
+            flush_threshold: req.flush_threshold.or(existing.flush_threshold),
+            flush_mode: req.flush_mode.clone().or(existing.flush_mode.clone()),
+            transport: req.transport.clone().or(existing.transport.clone()),
+            compaction_cooldown: req.compaction_cooldown.or(existing.compaction_cooldown),
+            source: existing.source.clone(),
+        };
+        info!(
+            export = %name,
+            s3_prefix = %config.s3_prefix(),
+            "re-attaching volume from persisted index"
+        );
+        (config, None, None)
+    } else {
+        // CREATE or FORK: resolve the logical source to physical coordinates.
+        // The source's pool becomes the new volume's pool so CoW pack sharing
+        // works; blank volumes get their own pool (= their name).
+        let src = match router.resolve_source(from).await {
+            Ok(s) => s,
+            Err(RouterError::SourceNotFound(s)) => {
+                return error_response(StatusCode::NOT_FOUND, &format!("source not found: {s}"));
+            }
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+        let config = ExportConfig {
+            name: name.to_string(),
+            size_gb: req.size_gb,
+            s3_prefix: src.pool,
+            block_size: req.block_size,
+            flush_threshold: req.flush_threshold,
+            flush_mode: req.flush_mode.clone(),
+            transport: req.transport.clone(),
+            compaction_cooldown: req.compaction_cooldown,
+            source: from.as_source(),
+        };
+        (config, src.manifest_name, src.snapshot_sequence)
+    };
+
+    let transport = config.transport.as_deref().unwrap_or("nbd").to_string();
+    let is_fork = fork_manifest.is_some();
+
+    let t_handler = Instant::now();
+    let t_create = Instant::now();
+    let create_result = router
+        .create_export(config.clone(), req.readonly, fork_manifest.as_deref(), fork_seq)
+        .await;
+    let create_ms = t_create.elapsed().as_millis() as u64;
+
+    match create_result {
+        Ok(()) => {
+            // Persist the index entry and register the device concurrently.
+            // save_export MUST succeed; register_device is best-effort.
+            let t_io = Instant::now();
+            #[cfg(target_os = "linux")]
+            let (save_result, register_result) = tokio::join!(
+                router.save_export(&config),
+                router.register_device(name, &transport),
+            );
+            #[cfg(not(target_os = "linux"))]
+            let save_result = router.save_export(&config).await;
+
+            if let Err(e) = save_result {
+                // Without teardown, the in-memory entry silently shadows the
+                // missing S3 export.json — retries hit create_export's
+                // idempotency check and never re-attempt the S3 write.
+                router.cleanup_failed_create(name, &transport).await;
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &format!(
+                        "Export definition not persisted to S3 ({e}); \
+                         in-memory state cleaned up, retry the request"
+                    ),
+                );
+            }
+            #[cfg(target_os = "linux")]
+            if let Err(e) = register_result {
+                warn!(export = %name, error = %e, "device registration failed");
+            }
+            let _ = transport;
+
+            tracing::info!(
+                target: "glidefs.timing",
+                export = %name,
+                fork = is_fork,
+                create_export_ms = create_ms,
+                io_ms = t_io.elapsed().as_millis() as u64,
+                total_ms = t_handler.elapsed().as_millis() as u64,
+                "PUT /api/exports timing"
+            );
+
+            match router.get_export_info(name).await {
+                Some(info) => json_response(StatusCode::CREATED, &ExportInfoResponse::from(info)),
+                None => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Export created but not found in map",
+                ),
+            }
+        }
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// Handle API requests.
 async fn handle_request<B>(
     router: Arc<ExportRouter>,
@@ -347,7 +541,7 @@ where
                 Err(e) => return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string())),
             };
 
-            let put_req: PutExportRequest = match serde_json::from_slice(&body) {
+            let put_req: CreateVolumeRequest = match serde_json::from_slice(&body) {
                 Ok(r) => r,
                 Err(e) => {
                     return Ok(error_response(
@@ -412,168 +606,16 @@ where
                 }
             }
 
-            if let Some(ref prefix) = put_req.s3_prefix
-                && (prefix.contains("..") || prefix.starts_with('/'))
-            {
-                return Ok(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "Invalid s3_prefix: must not contain '..' or start with '/'",
-                ));
-            }
-
-            if put_req.snapshot_sequence.is_some() && put_req.manifest_name.is_none() {
-                return Ok(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "snapshot_sequence requires manifest_name to be set",
-                ));
-            }
-
-            // Check if export already exists (direct lookup, not a full scan)
-            let existing = router.get_export_info(name).await;
-
-            match existing {
-                Some(export) => {
-                    // Export exists - check if resize needed
-                    let current_size_gb = export.size as f64 / 1_073_741_824.0;
-                    if put_req.size_gb > current_size_gb {
-                        // Need to grow
-                        match router.resize_export(name, put_req.size_gb).await {
-                            Ok(()) => {
-                                // Re-register device after resize (device was removed)
-                                let transport = export.transport.as_str();
-                                #[cfg(target_os = "linux")]
-                                if let Err(e) = router.register_device(name, transport).await {
-                                    warn!(export = %name, error = %e, "device re-registration after resize failed");
-                                }
-                                let _ = transport; // suppress unused warning on non-Linux
-                                match router.get_export_info(name).await {
-                                    Some(info) => json_response(
-                                        StatusCode::OK,
-                                        &ExportInfoResponse::from(info),
-                                    ),
-                                    None => error_response(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        "Export resized but not found in map",
-                                    ),
-                                }
-                            }
-                            Err(e) => {
-                                error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
-                            }
-                        }
-                    } else {
-                        // Already at or above requested size - return current state
-                        json_response(StatusCode::OK, &ExportInfoResponse::from(export))
-                    }
+            // Parse the logical source ref (`from`). GlideFS resolves it to a
+            // pool + manifest internally — callers never supply physical coords.
+            let from = match FromRef::parse(put_req.from.as_deref()) {
+                Ok(f) => f,
+                Err(e) => {
+                    return Ok(error_response(StatusCode::BAD_REQUEST, &e.to_string()));
                 }
-                None => {
-                    // Export doesn't exist - create it
-                    let transport = put_req.transport.as_deref().unwrap_or("nbd").to_string();
-                    let config = ExportConfig {
-                        name: name.to_string(),
-                        size_gb: put_req.size_gb,
-                        s3_prefix: put_req.s3_prefix,
-                        block_size: put_req.block_size,
-                        flush_threshold: put_req.flush_threshold,
-                        flush_mode: put_req.flush_mode,
-                        transport: put_req.transport,
-                        compaction_cooldown: put_req.compaction_cooldown,
-                    };
+            };
 
-                    let t_handler = Instant::now();
-                    let t_create = Instant::now();
-                    let create_result = router
-                        .create_export(
-                            config.clone(),
-                            put_req.readonly,
-                            put_req.manifest_name.as_deref(),
-                            put_req.snapshot_sequence,
-                        )
-                        .await;
-                    let t_create_ms = t_create.elapsed().as_millis();
-                    match create_result
-                    {
-                        Ok(()) => {
-                            // Run S3 persist and device registration concurrently.
-                            // save_export must succeed; register_device is best-effort.
-                            let t_join = Instant::now();
-                            #[cfg(target_os = "linux")]
-                            let (save_result, register_result) = tokio::join!(
-                                async {
-                                    let t = Instant::now();
-                                    let r = router.save_export(&config).await;
-                                    (r, t.elapsed().as_millis())
-                                },
-                                async {
-                                    let t = Instant::now();
-                                    let r = router.register_device(name, &transport).await;
-                                    (r, t.elapsed().as_millis())
-                                },
-                            );
-                            #[cfg(not(target_os = "linux"))]
-                            let save_result = {
-                                let t = Instant::now();
-                                let r = router.save_export(&config).await;
-                                (r, t.elapsed().as_millis())
-                            };
-                            let t_join_ms = t_join.elapsed().as_millis();
-                            #[cfg(target_os = "linux")]
-                            let (save_result, t_save_ms) = save_result;
-                            #[cfg(target_os = "linux")]
-                            let (register_result, t_register_ms) = register_result;
-                            #[cfg(not(target_os = "linux"))]
-                            let (save_result, t_save_ms) = save_result;
-                            #[cfg(not(target_os = "linux"))]
-                            let t_register_ms: u128 = 0;
-
-                            tracing::info!(
-                                target: "glidefs.timing",
-                                export = %name,
-                                fork = put_req.manifest_name.is_some(),
-                                total_ms = t_handler.elapsed().as_millis() as u64,
-                                create_export_ms = t_create_ms as u64,
-                                join_ms = t_join_ms as u64,
-                                save_export_ms = t_save_ms as u64,
-                                register_device_ms = t_register_ms as u64,
-                                "PUT /api/exports timing"
-                            );
-
-                            if let Err(e) = save_result {
-                                // Without teardown, the in-memory entry silently
-                                // shadows the missing S3 export.json — retries
-                                // hit `create_export`'s idempotency check and
-                                // never re-attempt the S3 write.
-                                router.cleanup_failed_create(name, &transport).await;
-                                return Ok(error_response(
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    &format!(
-                                        "Export definition not persisted to S3 ({e}); \
-                                         in-memory state cleaned up, retry the request"
-                                    ),
-                                ));
-                            }
-
-                            #[cfg(target_os = "linux")]
-                            if let Err(e) = register_result {
-                                warn!(export = %name, error = %e, "device registration failed");
-                            }
-                            let _ = transport; // suppress unused warning on non-Linux
-
-                            match router.get_export_info(name).await {
-                                Some(info) => json_response(
-                                    StatusCode::CREATED,
-                                    &ExportInfoResponse::from(info),
-                                ),
-                                None => error_response(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Export created but not found in map",
-                                ),
-                            }
-                        }
-                        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-                    }
-                }
-            }
+            create_or_attach_volume(&router, name, &put_req, &from).await
         }
 
         // GET /api/exports/{name} - Get export info
@@ -588,6 +630,49 @@ where
                     StatusCode::NOT_FOUND,
                     &format!("Export '{}' not found", name),
                 ),
+            }
+        }
+
+        // GET /api/resolve/{name} - Resolve a volume's physical location by its
+        // stable logical name. Reads export.json directly from S3, so it works on
+        // ANY node — even one that has never attached or discovered the volume.
+        // This is the durable logical→physical mapping GlideFS owns.
+        (Method::GET, ["api", "resolve", name]) => {
+            if !is_valid_export_name(name) {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid name '{}'", name),
+                ));
+            }
+            match router.resolve_export(name).await {
+                Ok(Some(cfg)) => {
+                    json_response(StatusCode::OK, &ResolveResponse::from_config(name, &cfg))
+                }
+                Ok(None) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Export '{}' not found", name),
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/images/{name} - Resolve a logical image's physical location
+        // from the durable image index. Lets any node locate an image (and thus
+        // fork from it via `from: "image:<name>"`) by name alone.
+        (Method::GET, ["api", "images", name]) => {
+            if !is_valid_export_name(name) {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid name '{}'", name),
+                ));
+            }
+            match router.load_image_entry(name).await {
+                Ok(Some(entry)) => json_response(StatusCode::OK, &entry),
+                Ok(None) => error_response(
+                    StatusCode::NOT_FOUND,
+                    &format!("Image '{}' not found", name),
+                ),
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
         }
 
@@ -1556,6 +1641,156 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    // =========================================================================
+    // Phase 1: resolve-by-name + re-attach across nodes (shared S3, fresh node)
+    // =========================================================================
+
+    async fn body_json(resp: Response<BoxBody>) -> serde_json::Value {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Seed a persisted volume binding directly (simulating a forked volume
+    /// whose CoW pool differs from its name), bypassing the device layer.
+    fn custom_pool_config(name: &str, pool: &str) -> ExportConfig {
+        ExportConfig {
+            name: name.to_string(),
+            size_gb: 0.01,
+            s3_prefix: Some(pool.to_string()),
+            block_size: None,
+            flush_threshold: None,
+            flush_mode: None,
+            transport: None,
+            compaction_cooldown: None,
+            source: Some(format!("volume:{pool}")),
+        }
+    }
+
+    /// A volume living in a CUSTOM pool (name != pool, as forks do) must be
+    /// resolvable by name alone on a fresh node that never attached or
+    /// discovered it.
+    #[tokio::test]
+    async fn test_resolve_by_name_custom_pool_fresh_node() {
+        let shared: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+
+        // Node A persists the binding (name=vol1 lives in pool "custompool").
+        let temp_a = TempDir::new().unwrap();
+        let node_a = create_test_router_with_store(&temp_a, Arc::clone(&shared)).await;
+        node_a
+            .save_export(&custom_pool_config("vol1", "custompool"))
+            .await
+            .unwrap();
+
+        // Node B: fresh node, same bucket, never saw vol1.
+        let temp_b = TempDir::new().unwrap();
+        let node_b = create_test_router_with_store(&temp_b, Arc::clone(&shared)).await;
+        let resp = request(&node_b, Method::GET, "/api/resolve/vol1", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["s3_prefix"], "custompool");
+        assert_eq!(v["manifest_name"], "vol1");
+    }
+
+    /// Re-attaching by name on a fresh node must adopt the persisted custom
+    /// pool — NOT create a fresh empty volume at the wrong pool and clobber
+    /// export.json.
+    #[tokio::test]
+    async fn test_reattach_by_name_adopts_persisted_pool() {
+        let shared: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+
+        let temp_a = TempDir::new().unwrap();
+        let node_a = create_test_router_with_store(&temp_a, Arc::clone(&shared)).await;
+        node_a
+            .save_export(&custom_pool_config("vol1", "custompool"))
+            .await
+            .unwrap();
+
+        // Node B re-attaches by name alone (no physical coords exist anymore).
+        let temp_b = TempDir::new().unwrap();
+        let node_b = create_test_router_with_store(&temp_b, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_b,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // The binding survived: a THIRD fresh node still resolves to custompool,
+        // proving node B adopted the pool instead of overwriting export.json.
+        let temp_c = TempDir::new().unwrap();
+        let node_c = create_test_router_with_store(&temp_c, Arc::clone(&shared)).await;
+        let resp = request(&node_c, Method::GET, "/api/resolve/vol1", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["s3_prefix"], "custompool");
+    }
+
+    /// A blank volume (no `from`) gets its own pool (= its name).
+    #[tokio::test]
+    async fn test_create_blank_volume_owns_pool() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/v2",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = request(&router, Method::GET, "/api/resolve/v2", None).await;
+        assert_eq!(body_json(resp).await["s3_prefix"], "v2");
+    }
+
+    /// Forking from a logical source that doesn't exist → 404.
+    #[tokio::test]
+    async fn test_create_from_unknown_image_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/v3",
+            Some(r#"{"size_gb": 0.01, "from": "image:ghost"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A malformed `from` ref → 400.
+    #[tokio::test]
+    async fn test_create_from_invalid_ref_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/v4",
+            Some(r#"{"size_gb": 0.01, "from": "bogus:x"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_missing_returns_404() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        let resp = request(&router, Method::GET, "/api/resolve/ghost", None).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_invalid_name_returns_400() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        let resp = request(&router, Method::GET, "/api/resolve/-bad", None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// Wraps `InMemory` and fails `put_opts` when armed. Used to simulate
     /// the S3 outage that makes `save_export` return `Err` mid-PUT.
     struct PutFailingStore {
@@ -2114,11 +2349,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_api_fork_from_snapshot_sequence() {
+    async fn test_api_fork_from_snapshot() {
         let temp = TempDir::new().unwrap();
         let router = create_test_router(&temp).await;
 
-        // Create source export
+        // Create source volume.
         request(
             &router,
             Method::PUT,
@@ -2127,35 +2362,111 @@ mod tests {
         )
         .await;
 
-        // Snapshot source
+        // Snapshot it → GlideFS assigns a stable snapshot id.
         let resp = request(&router, Method::POST, "/api/exports/source/snapshot", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let snap: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let seq = snap["sequence"].as_u64().unwrap();
+        let snap = body_json(resp).await;
+        let id = snap["snapshot_id"]
+            .as_str()
+            .expect("snapshot response carries a stable snapshot_id")
+            .to_string();
 
-        // Fork from snapshot_sequence via API
-        let body = format!(
-            r#"{{"size_gb": 0.01, "s3_prefix": "source", "manifest_name": "source", "snapshot_sequence": {}}}"#,
-            seq
-        );
+        // Fork a new volume from the snapshot by logical id alone — no pool,
+        // no manifest, no sequence.
+        let body = format!(r#"{{"size_gb": 0.01, "from": "snapshot:{}"}}"#, id);
         let resp = request(&router, Method::PUT, "/api/exports/fork1", Some(&body)).await;
         assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // fork1 was placed in source's pool for CoW sharing.
+        let resp = request(&router, Method::GET, "/api/resolve/fork1", None).await;
+        assert_eq!(body_json(resp).await["s3_prefix"], "source");
     }
 
     #[tokio::test]
-    async fn test_api_snapshot_sequence_without_manifest_name_returns_400() {
+    async fn test_api_fork_from_image() {
         let temp = TempDir::new().unwrap();
         let router = create_test_router(&temp).await;
 
+        // Create + snapshot a source volume, then promote the snapshot to a
+        // named image — this registers the logical image index entry.
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/golden",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        let resp = request(&router, Method::POST, "/api/exports/golden/snapshot", None).await;
+        let seq = body_json(resp).await["sequence"].as_u64().unwrap();
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/golden/promote-base",
+            Some(&format!(
+                r#"{{"sequence": {}, "base_name": "ubuntu"}}"#,
+                seq
+            )),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The image is now resolvable by logical name.
+        let resp = request(&router, Method::GET, "/api/images/ubuntu", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let img = body_json(resp).await;
+        assert_eq!(img["pool"], "golden");
+        assert_eq!(img["manifest"], "bases/ubuntu");
+
+        // Fork a new volume from the image by logical name alone.
         let resp = request(
             &router,
             Method::PUT,
-            "/api/exports/vol1",
-            Some(r#"{"size_gb": 0.01, "snapshot_sequence": 1}"#),
+            "/api/exports/vm1",
+            Some(r#"{"size_gb": 0.01, "from": "image:ubuntu"}"#),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // vm1 was placed in the image's pool (CoW sharing) and records lineage.
+        let resp = request(&router, Method::GET, "/api/resolve/vm1", None).await;
+        assert_eq!(body_json(resp).await["s3_prefix"], "golden");
+    }
+
+    #[tokio::test]
+    async fn test_tag_is_forkable_as_image() {
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+
+        // Create a volume and tag its current manifest under a name.
+        request(
+            &router,
+            Method::PUT,
+            "/api/exports/work",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        let resp = request(
+            &router,
+            Method::POST,
+            "/api/exports/work/tag",
+            Some(r#"{"tag": "setup-v1"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The tag is registered in the image index and resolvable by name.
+        let resp = request(&router, Method::GET, "/api/images/setup-v1", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // And forkable via `from: "image:<tag>"`.
+        let resp = request(
+            &router,
+            Method::PUT,
+            "/api/exports/deploy",
+            Some(r#"{"size_gb": 0.01, "from": "image:setup-v1"}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
     // =========================================================================

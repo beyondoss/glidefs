@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod pack;
 pub mod pack_index_cache;
 pub mod readahead;
+pub mod registry;
 pub mod scrubber;
 
 pub mod metrics;

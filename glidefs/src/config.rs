@@ -434,6 +434,14 @@ pub struct ExportConfig {
     /// every dead-ratio crossing, the default). Typical enabled value: 8.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub compaction_cooldown: Option<u64>,
+
+    /// Lineage: the logical source this volume was created from, as a `FromRef`
+    /// string (`"image:<name>"`, `"volume:<name>"`, `"snapshot:<id>"`). `None`
+    /// for a blank volume or a volume created before lineage tracking. Recorded
+    /// in the durable name-keyed index so GlideFS — not the caller — owns the
+    /// parent/child graph. See `block::registry`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub source: Option<String>,
 }
 
 impl ExportConfig {
@@ -584,6 +592,7 @@ impl NbdConfig {
                 flush_mode: None,
                 transport: None,
                 compaction_cooldown: None,
+                source: None,
             }];
         }
 
@@ -597,6 +606,7 @@ impl NbdConfig {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         }]
     }
 }
@@ -920,6 +930,7 @@ impl Settings {
                         flush_mode: None,
                         transport: None,
                         compaction_cooldown: None,
+                        source: None,
                     }],
                     device_name: None,
                     device_size_gb: None,

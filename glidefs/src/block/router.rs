@@ -9,6 +9,7 @@ use crate::block::content_store::ContentStore;
 use crate::block::flush_scheduler::flush_scheduler;
 use crate::block::handler::BlockHandler;
 use crate::block::pack_index_cache::PackIndexCache;
+use crate::block::registry::{FromRef, ImageEntry, ResolvedSource, SnapshotEntry};
 use crate::block::metrics::{ExportMetrics, MetricsSnapshot};
 use crate::block::state::Active;
 use crate::block::volume_manifest::VolumeManifest;
@@ -124,6 +125,12 @@ pub enum RouterError {
         current: usize,
         max: usize,
     },
+
+    #[error("Invalid `from` ref: {0}")]
+    InvalidFromRef(String),
+
+    #[error("Source not found: {0}")]
+    SourceNotFound(String),
 }
 
 /// Status of an in-flight OCI bless operation.
@@ -207,6 +214,10 @@ pub struct AggregateStats {
 pub struct SnapshotResponse {
     pub manifest_etag: Option<String>,
     pub sequence: u64,
+    /// Stable logical snapshot id (`"{volume}@{sequence}"`). Callers fork from
+    /// this via `from: "snapshot:<id>"` — they never handle the raw sequence or
+    /// pool. Recorded in the durable snapshot index (when `snapshot_persisted`).
+    pub snapshot_id: String,
     /// Whether the versioned snapshot was persisted to S3.
     /// `false` means the manifest was saved but the versioned snapshot key wasn't.
     pub snapshot_persisted: bool,
@@ -1002,6 +1013,138 @@ impl ExportRouter {
         }
     }
 
+    /// Resolve a volume's persisted physical location by its stable logical name.
+    ///
+    /// Reads `export.json` (the name-keyed, prefix-independent index) directly
+    /// from S3, so ANY node can learn where a volume's data lives given only its
+    /// name — even one that never attached or discovered it. This is the
+    /// durable logical→physical mapping GlideFS owns: callers no longer need to
+    /// remember `s3_prefix`. Returns `None` if no such volume was ever persisted.
+    pub async fn resolve_export(&self, name: &str) -> Result<Option<ExportConfig>, RouterError> {
+        validate_export_name(name)?;
+        self.load_export(name).await
+    }
+
+    // =========================================================================
+    // Logical registry: image + snapshot indexes (sibling of export.json).
+    //
+    // These durable, name-keyed JSON objects let GlideFS resolve a logical
+    // `from` ref (`image:`/`volume:`/`snapshot:`) to physical coordinates, so
+    // callers never supply an `s3_prefix` or `manifest_name`. See
+    // `crate::block::registry`.
+    // =========================================================================
+
+    /// S3 path for an image-index entry.
+    fn index_image_path(&self, name: &str) -> Path {
+        crate::block::registry::image_index_path(&self.db_path, name)
+    }
+
+    /// S3 path for a snapshot-index entry.
+    fn index_snapshot_path(&self, id: &str) -> Path {
+        crate::block::registry::snapshot_index_path(&self.db_path, id)
+    }
+
+    /// Persist an image-index entry (idempotent).
+    pub async fn save_image_entry(&self, entry: &ImageEntry) -> Result<(), RouterError> {
+        let path = self.index_image_path(&entry.name);
+        let json = serde_json::to_vec(entry)?;
+        self.object_store
+            .put(&path, Bytes::from(json).into())
+            .await?;
+        debug!("Saved image index entry: {}", path);
+        Ok(())
+    }
+
+    /// Load an image-index entry by logical name.
+    pub async fn load_image_entry(&self, name: &str) -> Result<Option<ImageEntry>, RouterError> {
+        let path = self.index_image_path(name);
+        match self.object_store.get(&path).await {
+            Ok(result) => {
+                let data = result.bytes().await?;
+                Ok(Some(serde_json::from_slice(&data)?))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist a snapshot-index entry (idempotent).
+    pub async fn save_snapshot_entry(&self, entry: &SnapshotEntry) -> Result<(), RouterError> {
+        let path = self.index_snapshot_path(&entry.id);
+        let json = serde_json::to_vec(entry)?;
+        self.object_store
+            .put(&path, Bytes::from(json).into())
+            .await?;
+        debug!("Saved snapshot index entry: {}", path);
+        Ok(())
+    }
+
+    /// Load a snapshot-index entry by stable id.
+    pub async fn load_snapshot_entry(
+        &self,
+        id: &str,
+    ) -> Result<Option<SnapshotEntry>, RouterError> {
+        let path = self.index_snapshot_path(id);
+        match self.object_store.get(&path).await {
+            Ok(result) => {
+                let data = result.bytes().await?;
+                Ok(Some(serde_json::from_slice(&data)?))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Resolve a logical [`FromRef`] to the physical coordinates the existing
+    /// fork machinery needs. This is the heart of "callers speak names only":
+    /// the source's pool becomes the new volume's pool (so CoW pack sharing
+    /// works), and the source manifest/sequence drive the fork.
+    pub async fn resolve_source(
+        &self,
+        from: &FromRef,
+    ) -> Result<ResolvedSource, RouterError> {
+        match from {
+            FromRef::Blank => Ok(ResolvedSource::blank()),
+            FromRef::Image(name) => {
+                let entry = self
+                    .load_image_entry(name)
+                    .await?
+                    .ok_or_else(|| RouterError::SourceNotFound(format!("image:{name}")))?;
+                Ok(ResolvedSource {
+                    pool: Some(entry.pool),
+                    manifest_name: Some(entry.manifest),
+                    snapshot_sequence: None,
+                })
+            }
+            FromRef::Volume(name) => {
+                let cfg = self
+                    .load_export(name)
+                    .await?
+                    .ok_or_else(|| RouterError::SourceNotFound(format!("volume:{name}")))?;
+                // Fork from the volume's current committed manifest, which lives
+                // at `manifests/{name}` within the volume's pool.
+                Ok(ResolvedSource {
+                    pool: Some(cfg.s3_prefix().to_string()),
+                    manifest_name: Some(name.clone()),
+                    snapshot_sequence: None,
+                })
+            }
+            FromRef::Snapshot(id) => {
+                let entry = self
+                    .load_snapshot_entry(id)
+                    .await?
+                    .ok_or_else(|| RouterError::SourceNotFound(format!("snapshot:{id}")))?;
+                // Snapshots are read via `get_snapshot(volume, sequence)`, so the
+                // fork "manifest name" is the owning volume's name.
+                Ok(ResolvedSource {
+                    pool: Some(entry.pool),
+                    manifest_name: Some(entry.volume),
+                    snapshot_sequence: Some(entry.sequence),
+                })
+            }
+        }
+    }
+
     /// Delete export definition from S3 (idempotent).
     async fn delete_export_definition(&self, name: &str) -> Result<(), RouterError> {
         let path = self.export_json_path(name);
@@ -1563,17 +1706,20 @@ impl ExportRouter {
 
         // Clone Arc'd components from the per-shard guard, then drop the
         // guard so we don't hold it across .await on the snapshot below.
-        let (cache, content_store, pack_index_cache, volume_manifest) = {
+        let (cache, content_store, pack_index_cache, volume_manifest, pool) = {
             let entry = self
                 .exports
                 .get(name)
                 .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
             let s = entry.value();
+            // Effective pool: the volume's s3_prefix, or its name by default.
+            let pool = s.s3_prefix.clone().unwrap_or_else(|| name.to_string());
             (
                 Arc::clone(&s.cache),
                 Arc::clone(&s.content_store),
                 Arc::clone(&s.pack_index_cache),
                 Arc::clone(&s.volume_manifest),
+                pool,
             )
         };
 
@@ -1623,12 +1769,43 @@ impl ExportRouter {
                 .put_manifest(tag, result.manifest_bytes.clone(), None)
                 .await
                 .map_err(RouterError::ContentStore)?;
+            // Make the tag forkable by `from: "image:<tag>"`.
+            self.index_image(tag, &pool, tag).await;
             info!("Tagged snapshot of '{}' as '{}'", name, tag);
+        }
+
+        // Record the snapshot in the durable logical index so it is forkable by
+        // a stable id (`snapshot:<id>`) from any node — GlideFS owns the
+        // snapshot→location mapping, not the caller. Only index a snapshot whose
+        // versioned key was actually persisted.
+        let snapshot_id = crate::block::registry::snapshot_id(name, result.sequence);
+        if result.snapshot_persisted {
+            // Lineage: the parent volume's own source, if any.
+            let parent = self.load_export(name).await.ok().flatten().and_then(|c| c.source);
+            let entry = SnapshotEntry {
+                id: snapshot_id.clone(),
+                pool: pool.clone(),
+                volume: name.to_string(),
+                sequence: result.sequence,
+                label: tag.map(|t| t.to_string()),
+                parent,
+            };
+            if let Err(e) = self.save_snapshot_entry(&entry).await {
+                // Non-fatal: the snapshot bytes are durable; only the logical
+                // index entry failed. Surface it but don't fail the snapshot.
+                warn!(
+                    export = %name,
+                    snapshot_id = %snapshot_id,
+                    error = %e,
+                    "failed to persist snapshot index entry"
+                );
+            }
         }
 
         Ok(SnapshotResponse {
             manifest_etag: result.manifest_etag,
             sequence: result.sequence,
+            snapshot_id,
             snapshot_persisted: result.snapshot_persisted,
             tag: tag.map(|t| t.to_string()),
         })
@@ -1644,7 +1821,7 @@ impl ExportRouter {
         validate_export_name(tag)?;
         // Clone the Arc'd content_store + serialize manifest under the
         // shard guard; drop the guard before the .await on put_manifest.
-        let (manifest_bytes, content_store) = {
+        let (manifest_bytes, content_store, pool) = {
             let entry = self
                 .exports
                 .get(name)
@@ -1655,12 +1832,16 @@ impl ExportRouter {
                 .read()
                 .serialize()
                 .map_err(|e| RouterError::Manifest(e.to_string()))?;
-            (manifest_bytes, Arc::clone(&s.content_store))
+            let pool = s.s3_prefix.clone().unwrap_or_else(|| name.to_string());
+            (manifest_bytes, Arc::clone(&s.content_store), pool)
         };
         content_store
             .put_manifest(tag, manifest_bytes, None)
             .await
             .map_err(RouterError::ContentStore)?;
+        // A tag is a named, forkable manifest — register it in the image index
+        // so it resolves via `from: "image:<tag>"`.
+        self.index_image(tag, &pool, tag).await;
         info!("Tagged export '{}' as '{}'", name, tag);
         Ok(())
     }
@@ -1683,12 +1864,14 @@ impl ExportRouter {
     ) -> Result<bool, RouterError> {
         validate_export_name(name)?;
         validate_export_name(base_name)?;
-        let content_store = {
+        let (content_store, pool) = {
             let entry = self
                 .exports
                 .get(name)
                 .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
-            Arc::clone(&entry.value().content_store)
+            let s = entry.value();
+            let pool = s.s3_prefix.clone().unwrap_or_else(|| name.to_string());
+            (Arc::clone(&s.content_store), pool)
         };
 
         let manifest_name = format!("bases/{}", base_name);
@@ -1702,6 +1885,9 @@ impl ExportRouter {
                 base = %base_name,
                 "promote: base already exists, skipping"
             );
+            // Ensure the logical image index points at the existing base, so
+            // `image:<base_name>` resolves even if the entry predates indexing.
+            self.index_image(base_name, &pool, &manifest_name).await;
             return Ok(false);
         }
 
@@ -1718,6 +1904,9 @@ impl ExportRouter {
             .put_manifest(&manifest_name, snapshot_bytes, None)
             .await
             .map_err(RouterError::ContentStore)?;
+        // Register the blessed base in the logical image index so it is forkable
+        // by `from: "image:<base_name>"` from any node.
+        self.index_image(base_name, &pool, &manifest_name).await;
         info!(
             export = %name,
             sequence,
@@ -1725,6 +1914,22 @@ impl ExportRouter {
             "promoted snapshot to base manifest"
         );
         Ok(true)
+    }
+
+    /// Record (idempotently, best-effort) an image-index entry mapping a logical
+    /// image name to its physical `(pool, manifest)`. Best-effort: a failed
+    /// index write is logged but does not fail the publish — the base bytes are
+    /// durable; a missing index entry only affects logical resolution and is
+    /// backfilled on the next promote/bless.
+    async fn index_image(&self, name: &str, pool: &str, manifest: &str) {
+        let entry = ImageEntry {
+            name: name.to_string(),
+            pool: pool.to_string(),
+            manifest: manifest.to_string(),
+        };
+        if let Err(e) = self.save_image_entry(&entry).await {
+            warn!(image = %name, error = %e, "failed to persist image index entry");
+        }
     }
 
     /// Check if a manifest exists in S3 (HEAD request, no data transfer).
@@ -2166,6 +2371,9 @@ impl ExportRouter {
             .put_manifest(&manifest_key, manifest_data, None)
             .await
             .map_err(RouterError::ContentStore)?;
+        // Register the blessed image in the logical index so it is forkable by
+        // `from: "image:<name>"` from any node.
+        self.index_image(name, s3_prefix, &manifest_key).await;
         if !boot_blocks.is_empty() {
             let data = crate::block::manifest::serialize_block_list(&boot_blocks);
             content_store.put_boot_set(name, data).await.map_err(RouterError::ContentStore)?;
@@ -2767,6 +2975,10 @@ impl ExportRouter {
         // Remove export (preserves cache files)
         self.remove_export(name, false).await?;
 
+        // Preserve lineage across resize: remove_export(purge=false) left
+        // export.json in S3, so recover its `source` ref before recreating.
+        let prior_source = self.load_export(name).await.ok().flatten().and_then(|c| c.source);
+
         // Recreate with new size, loading from the manifest we just drained.
         // This preserves access to pre-resize data via the block_map.
         let config = ExportConfig {
@@ -2779,6 +2991,7 @@ impl ExportRouter {
             transport: Some(transport),
             // Preserve the cooldown knob across resize (0 if it was disabled).
             compaction_cooldown: (compaction_cooldown != 0).then_some(compaction_cooldown),
+            source: prior_source,
         };
 
         self.create_export(config.clone(), readonly, Some(name), None)
@@ -3408,6 +3621,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router.create_export(make("a"), false, None, None).await.unwrap();
         router.create_export(make("b"), false, None, None).await.unwrap();
@@ -3496,6 +3710,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         }
     }
 
@@ -3947,6 +4162,7 @@ mod tests {
                 flush_mode: None,
                 transport: None,
                 compaction_cooldown: None,
+                source: None,
             },
             ExportConfig {
                 name: "discover-vol2".to_string(),
@@ -3957,6 +4173,7 @@ mod tests {
                 flush_mode: None,
                 transport: None,
                 compaction_cooldown: None,
+                source: None,
             },
             ExportConfig {
                 name: "discover-vol3".to_string(),
@@ -3967,6 +4184,7 @@ mod tests {
                 flush_mode: None,
                 transport: None,
                 compaction_cooldown: None,
+                source: None,
             },
         ];
 
@@ -4183,6 +4401,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router
             .create_export(fork_config, false, Some("source"), None)
@@ -4245,6 +4464,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router
             .create_export(fork_config, false, Some("bases/rootfs-abc123"), None)
@@ -4316,6 +4536,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router
             .create_export(fork_config, false, Some("src"), None)
@@ -4369,6 +4590,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router
             .create_export(fork_config, false, Some("src"), None)
@@ -4403,6 +4625,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
 
         let result = router
@@ -4442,6 +4665,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router
             .create_export(b_config, false, Some("a"), None)
@@ -4464,6 +4688,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router
             .create_export(c_config, false, Some("b"), None)
@@ -4583,6 +4808,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router
             .create_export(fork_config, false, Some("parent"), None)
@@ -4882,6 +5108,7 @@ mod tests {
             flush_mode: Some("manual".to_string()),
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router.create_export(config, false, None, None).await.unwrap();
 
@@ -4932,6 +5159,7 @@ mod tests {
             flush_mode: Some("manual".to_string()),
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router.create_export(config, false, None, None).await.unwrap();
 
@@ -4976,6 +5204,7 @@ mod tests {
             flush_mode: Some("manual".to_string()),
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         assert_eq!(
             manual.flush_threshold_or(500),
@@ -4992,6 +5221,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         assert_eq!(custom.flush_threshold_or(500), 1000, "export override wins");
 
@@ -5004,6 +5234,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         assert_eq!(
             default.flush_threshold_or(500),
@@ -5027,6 +5258,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: Some(8),
+            source: None,
         };
         router.save_export(&config).await.unwrap();
 
@@ -5325,6 +5557,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         fork_router
             .create_export(fork_config, false, Some("parent"), None)
@@ -5402,6 +5635,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         }).await.unwrap();
         drop(child);
 
@@ -5437,6 +5671,7 @@ mod tests {
                     flush_mode: None,
                     transport: None,
                     compaction_cooldown: None,
+                    source: None,
                 },
                 false,
                 Some("child"),
@@ -5551,6 +5786,7 @@ mod tests {
             flush_mode: None,
             transport: None,
             compaction_cooldown: None,
+            source: None,
         };
         router
             .create_export(fork_config, false, Some("parent"), None)
