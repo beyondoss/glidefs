@@ -166,13 +166,15 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
         nbd_config.max_exports(),
     );
 
-    // Discover exports from S3.
-    info!("Discovering exports from S3...");
-    let discovered_count = match router.discover_exports().await {
+    // Recover only THIS node's working set — the exports it owns a device for
+    // (per the local device maps), not every export.json in the shared bucket.
+    // Anything else attaches on demand by name (resolve-by-name).
+    info!("Recovering this node's exports from local device map...");
+    let discovered_count = match router.discover_local_exports().await {
         Ok(discovered) => {
             use futures::stream::{self, StreamExt};
             let total = discovered.len();
-            info!("Found {} export(s) in S3, recovering in parallel...", total);
+            info!("Found {} local export(s), recovering in parallel...", total);
 
             let s3_prefixes: std::collections::HashSet<String> = discovered
                 .iter()

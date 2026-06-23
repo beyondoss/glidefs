@@ -40,6 +40,17 @@ use tracing::{debug, error, info, trace, warn};
 /// volumes — see `VolumeManifest::size_estimate` for the math.
 pub const DEFAULT_MANIFEST_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Per-transport device-map filenames in `cache_dir`. Each maps
+/// `export_name → dev_id` and is rewritten on every device add/remove, so it
+/// names exactly the exports this node currently owns a device for. Boot uses
+/// these (via `discover_local_exports`) to recover only the node's working set
+/// instead of every `export.json` in the shared bucket. Kept in sync with
+/// `block::ublk::DEVICE_MAP_FILE` and `block::nbd::DEVICE_MAP_FILE` (private to
+/// those modules; the `ublk` one is feature-gated, so we don't reference them
+/// across the boundary).
+const UBLK_DEVICE_MAP_FILE: &str = "ublk_devices.json";
+const NBD_DEVICE_MAP_FILE: &str = "nbd_devices.json";
+
 
 /// Encodes a base-manifest key for the foyer manifest cache.
 fn base_manifest_cache_key(s3_prefix: &str, manifest_name: &str) -> String {
@@ -1206,6 +1217,73 @@ impl ExportRouter {
             .collect()
             .await;
 
+        Ok(exports)
+    }
+
+    /// Discover only the exports **this node** currently owns a device for.
+    ///
+    /// Unlike [`discover_exports`], which lists every `export.json` under the
+    /// global `{db_path}/exports/` prefix — and would resurrect every export on
+    /// a shared bucket as a live kernel device — this reads the node-local
+    /// device maps (`ublk_devices.json` / `nbd_devices.json` in `cache_dir`,
+    /// rewritten on every device add/remove) and loads only those exports'
+    /// configs. A node thus recovers only its working set on boot; everything
+    /// else stays dormant in S3 and attaches on demand by name
+    /// (`resolve_export` / `PUT /api/exports/{name}`). A fresh node (no maps)
+    /// recovers nothing — correct, it attaches by name when a caller asks.
+    pub async fn discover_local_exports(&self) -> Result<Vec<ExportConfig>, RouterError> {
+        use futures::stream::{self, StreamExt};
+
+        // Union of export names this node has a (ublk or nbd) device for.
+        // Values are dev ids we don't need here, so accept any JSON value.
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for file in [UBLK_DEVICE_MAP_FILE, NBD_DEVICE_MAP_FILE] {
+            let path = self.cache_dir.join(file);
+            match std::fs::read_to_string(&path) {
+                Ok(data) => {
+                    match serde_json::from_str::<HashMap<String, serde_json::Value>>(&data) {
+                        Ok(map) => names.extend(map.into_keys()),
+                        Err(e) => warn!("corrupt device map {}, ignoring: {}", file, e),
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("failed to read device map {}: {}", file, e),
+            }
+        }
+
+        if names.is_empty() {
+            info!("No local device-map entries — recovering no exports (fresh node / clean state)");
+            return Ok(Vec::new());
+        }
+
+        let total = names.len();
+        let exports: Vec<ExportConfig> = stream::iter(names)
+            .map(|name| async move {
+                match self.load_export(&name).await {
+                    Ok(Some(config)) => Some(config),
+                    Ok(None) => {
+                        // Stale map entry: the device was persisted but the
+                        // export.json was purged. Skip — the map is rewritten
+                        // without it on the next persist_devices.
+                        debug!("Local device-map entry '{}' has no export.json, skipping", name);
+                        None
+                    }
+                    Err(e) => {
+                        warn!("Failed to load local export '{}': {}", name, e);
+                        None
+                    }
+                }
+            })
+            .buffer_unordered(32)
+            .filter_map(|x| async { x })
+            .collect()
+            .await;
+
+        info!(
+            "Recovered {}/{} local export(s) from device map",
+            exports.len(),
+            total
+        );
         Ok(exports)
     }
 
@@ -4200,6 +4278,47 @@ mod tests {
         assert!(names.contains(&"discover-vol1"));
         assert!(names.contains(&"discover-vol2"));
         assert!(names.contains(&"discover-vol3"));
+    }
+
+    #[tokio::test]
+    async fn test_discover_local_exports_only_mapped() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+
+        // S3 holds three exports (as if created across the shared bucket)...
+        for name in ["local-a", "local-b", "global-c"] {
+            router.save_export(&test_export_config(name)).await.unwrap();
+        }
+
+        // ...but THIS node's device maps own only local-a (ublk) + local-b
+        // (nbd), plus a stale "ghost" entry whose export.json was purged.
+        std::fs::write(
+            temp_dir.path().join("ublk_devices.json"),
+            r#"{"local-a":1,"ghost":99}"#,
+        )
+        .unwrap();
+        std::fs::write(temp_dir.path().join("nbd_devices.json"), r#"{"local-b":0}"#).unwrap();
+
+        let discovered = router.discover_local_exports().await.unwrap();
+        let mut names: Vec<_> = discovered.iter().map(|c| c.name.clone()).collect();
+        names.sort();
+        // Only mapped exports with an export.json: not global-c (in S3 but not
+        // owned here), not ghost (mapped but no export.json).
+        assert_eq!(names, vec!["local-a".to_string(), "local-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_discover_local_exports_empty_without_maps() {
+        let temp_dir = TempDir::new().unwrap();
+        let router = create_test_router(&temp_dir).await;
+        // export.json exists in S3, but no device maps on disk → a fresh node
+        // recovers nothing (it attaches by name on demand instead).
+        router
+            .save_export(&test_export_config("orphan"))
+            .await
+            .unwrap();
+        let discovered = router.discover_local_exports().await.unwrap();
+        assert!(discovered.is_empty());
     }
 
     #[tokio::test]
