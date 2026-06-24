@@ -198,8 +198,13 @@ pub struct ExportInfo {
     pub s3_bytes: u64,
     /// Filesystem used bytes from ext4 superblock (None if not ext4 or read failed).
     pub fs_used_bytes: Option<u64>,
-    /// Single-attach fencing generation owning this export (0 = un-fenced).
+    /// Single-attach fencing token, high half: the orchestrator placement
+    /// generation owning this export (0 = un-fenced on this half).
     pub generation: u64,
+    /// Single-attach fencing token, low half: the node-lease claim revision
+    /// owning this export (0 = un-fenced on this half). Composed with
+    /// `generation` into the fence token; see [`crate::block::fence`].
+    pub lease_revision: u64,
 }
 
 /// Readiness check result for health endpoint.
@@ -1039,25 +1044,29 @@ impl ExportRouter {
     }
 
     /// Single-attach fence (attach side). Decide whether the node attaching this
-    /// already-created export with placement generation `my_gen` is admitted, and
-    /// on admission **seize** the volume by stamping `my_gen` into the manifest so
-    /// any strictly-older incumbent is fenced at its next sync.
+    /// already-created export with composite token `(my_gen, my_lease)` is
+    /// admitted, and on admission **seize** the volume by stamping the winning
+    /// token into the manifest so any strictly-older incumbent is fenced at its
+    /// next sync.
     ///
     /// Must be called on an export already present in the map (after
     /// `create_export`), before serving I/O — a rejected attach has uploaded zero
     /// data packs, so there is nothing to orphan.
     ///
-    /// Rule mirrors [`crate::block::fence`]: `my_gen >= stored ⇒ Grant`. `my_gen
-    /// == 0` is the back-compat bypass (caller does not participate in fencing) —
-    /// always granted, never seizes. The seize is a manifest If-Match CAS; a
+    /// Rule mirrors [`crate::block::fence`]: the fence compares the composite
+    /// `(generation, lease_revision)` tokens, `my >= stored ⇒ Grant`. `my_gen ==
+    /// 0 && my_lease == 0` is the back-compat bypass (caller does not participate
+    /// in fencing) — always granted, never seizes. A caller sending only a
+    /// `lease_revision` DOES participate. The seize is a manifest If-Match CAS; a
     /// concurrent attach that moves the manifest triggers a bounded re-read and
     /// re-evaluation.
     pub async fn enforce_attach_fence(
         &self,
         name: &str,
         my_gen: u64,
+        my_lease: u64,
     ) -> Result<crate::block::fence::Fence, RouterError> {
-        use crate::block::fence::{fence_attach, Fence};
+        use crate::block::fence::{compose_token, fence_attach, Fence};
 
         let (content_store, volume_manifest, cache) = {
             let entry = self
@@ -1075,28 +1084,38 @@ impl ExportRouter {
         // Bounded retries: a concurrent attach can move the manifest out from
         // under our seize CAS; re-read and re-evaluate the fence each time.
         for _ in 0..3u32 {
-            let stored_gen = volume_manifest.read().generation;
-            if fence_attach(stored_gen, my_gen) == Fence::Reject {
+            let (stored_gen, stored_lease) = {
+                let m = volume_manifest.read();
+                (m.generation, m.lease_revision)
+            };
+            if fence_attach(stored_gen, stored_lease, my_gen, my_lease) == Fence::Reject {
                 return Ok(Fence::Reject);
             }
 
-            // Granted. The accepted generation is the higher of the two (== my_gen
-            // once the fence passes, unless my_gen is the 0 bypass).
-            let effective = stored_gen.max(my_gen);
-            *cache.inner.current_generation.lock() = effective;
+            // Granted. The accepted token is the higher composite of the two
+            // (== my token once the fence passes, unless this is the 0/0 bypass).
+            // Decompose it back into (generation, lease_revision) to stamp.
+            let stored_token = compose_token(stored_gen, stored_lease);
+            let my_token = compose_token(my_gen, my_lease);
+            let effective_token = stored_token.max(my_token);
+            let effective_gen = (effective_token >> 64) as u64;
+            let effective_lease = (effective_token & u128::from(u64::MAX)) as u64;
+            *cache.inner.current_generation.lock() = effective_gen;
+            *cache.inner.current_lease_revision.lock() = effective_lease;
 
-            // No seize needed: a non-participating caller (my_gen == 0), or an
-            // equal-generation re-attach that doesn't change the stored value.
-            if my_gen == 0 || effective == stored_gen {
+            // No seize needed: a fully non-participating caller (0/0 bypass), or
+            // an equal-token re-attach that doesn't change the stored value.
+            if (my_gen == 0 && my_lease == 0) || effective_token == stored_token {
                 return Ok(Fence::Grant);
             }
 
-            // Seize: stamp the new generation into the manifest via the existing
+            // Seize: stamp the new token into the manifest via the existing
             // If-Match CAS so an older incumbent's next sync is rejected.
             let expected_etag = cache.inner.manifest_etag.lock().clone();
             let bytes = {
                 let mut m = volume_manifest.write();
-                m.generation = effective;
+                m.generation = effective_gen;
+                m.lease_revision = effective_lease;
                 m.serialize()
                     .map_err(|e| RouterError::Manifest(format!("serialize manifest: {e}")))?
             };
@@ -1106,12 +1125,12 @@ impl ExportRouter {
             {
                 Ok(new_etag) => {
                     *cache.inner.manifest_etag.lock() = new_etag;
-                    info!(export = %name, generation = effective, "attach fence: seized volume");
+                    info!(export = %name, generation = effective_gen, lease_revision = effective_lease, "attach fence: seized volume");
                     return Ok(Fence::Grant);
                 }
                 Err(crate::block::content_store::ContentStoreError::PreconditionFailed(_)) => {
                     // A concurrent attach moved the manifest. Reload it (and its
-                    // ETag) and re-run the fence against the fresh generation.
+                    // ETag) and re-run the fence against the fresh token.
                     match content_store.get_manifest(name).await {
                         Ok(Some((data, etag))) => {
                             let vm = VolumeManifest::deserialize(&data).map_err(|e| {
@@ -2623,6 +2642,7 @@ impl ExportRouter {
             let manifest = state.volume_manifest.read();
             let s3_bytes = manifest.chunks.len() as u64 * manifest.chunk_size;
             let generation = manifest.generation;
+            let lease_revision = manifest.lease_revision;
             drop(manifest);
             let info = ExportInfo {
                 name: name.to_string(),
@@ -2635,6 +2655,7 @@ impl ExportRouter {
                 s3_bytes,
                 fs_used_bytes: None,
                 generation,
+                lease_revision,
             };
             (info, Arc::clone(&state.handler))
         };
@@ -2676,6 +2697,7 @@ impl ExportRouter {
                     s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
                     fs_used_bytes: None,
                     generation: manifest.generation,
+                    lease_revision: manifest.lease_revision,
                 };
                 (info, Arc::clone(&state.handler))
             })
