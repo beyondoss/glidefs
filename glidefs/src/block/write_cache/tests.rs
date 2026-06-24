@@ -244,6 +244,68 @@ impl V2Harness {
     fn manifest(&self) -> VolumeManifest {
         self.volume_manifest.read().clone()
     }
+
+    /// Raw flush returning the Result (so a test can assert on the error).
+    async fn try_flush(&self) -> Result<FlushStats, CacheError> {
+        self.cache
+            .flush_to_s3(
+                &self.content_store,
+                &self.pack_index_cache,
+                &self.volume_manifest,
+            )
+            .await
+    }
+}
+
+/// Sync-time single-attach fence: an incumbent writer at generation 5 that has
+/// been superseded by a newer generation 6 (which seized the S3 manifest) is
+/// FENCED at its next manifest sync — the flush returns `Fenced` and the write
+/// path latches closed so the guest stops getting ACKs.
+#[tokio::test]
+async fn test_sync_fence_supersedes_incumbent() {
+    let h = V2Harness::new().await;
+
+    // Incumbent owns generation 5.
+    *h.cache.inner.current_generation.lock() = 5;
+
+    // First flush commits at generation 5; the S3 manifest now carries gen 5.
+    h.cache.write(0, b"first").unwrap();
+    h.try_flush().await.expect("first flush at gen 5 succeeds");
+    assert_eq!(h.manifest().generation, 5, "in-memory manifest stamped gen 5");
+
+    // A newer generation (6) seizes the S3 manifest out from under us — this is
+    // what node B's attach does. It bumps the generation and the ETag.
+    let (data, etag) = h
+        .content_store
+        .get_manifest("test")
+        .await
+        .unwrap()
+        .expect("manifest exists in S3");
+    let mut s3_vm = VolumeManifest::deserialize(&data).unwrap();
+    assert_eq!(s3_vm.generation, 5);
+    s3_vm.generation = 6;
+    h.content_store
+        .put_manifest("test", s3_vm.serialize().unwrap(), etag.as_deref())
+        .await
+        .expect("newer generation seizes the manifest");
+
+    // The incumbent writes more and flushes → its cached ETag is stale, it
+    // re-reads, sees gen 6 > 5, and is FENCED (terminal, not a transient retry).
+    h.cache.write(8192, b"second").unwrap();
+    match h.try_flush().await {
+        Err(CacheError::Fenced { held, superseded_by }) => {
+            assert_eq!(held, 5);
+            assert_eq!(superseded_by, 6);
+        }
+        other => panic!("expected Fenced, got {other:?}"),
+    }
+
+    // The write path is now latched closed: further guest writes are rejected so
+    // the guest stops receiving ACKs for writes that can never commit.
+    match h.cache.write(16384, b"after-fence") {
+        Err(CacheError::Fenced { .. }) => {}
+        other => panic!("expected writes to be fenced, got {other:?}"),
+    }
 }
 
 #[tokio::test]

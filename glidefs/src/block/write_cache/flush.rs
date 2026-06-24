@@ -1490,6 +1490,13 @@ impl WriteCache<Active> {
                 total_stats.touched_chunks.insert(chunk_idx);
                 vm.append_pack(chunk_idx, pack_id);
             }
+            // Stamp our composite fencing token (generation + lease_revision)
+            // into every synced manifest so a strictly-older incumbent's sync is
+            // rejected (and so a fresh node learns the owner token). 0/0 =
+            // un-fenced (zero churn: the manifest stays v5/v6); a generation-only
+            // token (lease_revision 0) stays v7/v8.
+            vm.generation = *self.inner.current_generation.lock();
+            vm.lease_revision = *self.inner.current_lease_revision.lock();
         }
 
         #[cfg(feature = "test-utils")]
@@ -1523,10 +1530,61 @@ impl WriteCache<Active> {
                         break;
                     }
                     Err(e @ crate::block::content_store::ContentStoreError::PreconditionFailed(_)) => {
-                        // Another host owns this manifest. Don't retry —
-                        // every attempt fails with the same stale ETag.
-                        // Return Err: outer flush_dirty_inner re-dirties
-                        // the SYNCING blocks via flushing-file recovery.
+                        // Another writer moved the manifest. Distinguish a single-
+                        // attach FENCE (a strictly-newer composite token took the
+                        // volume — terminal) from a transient same-token race.
+                        let held = *self.inner.current_generation.lock();
+                        let held_lease = *self.inner.current_lease_revision.lock();
+                        let held_token =
+                            crate::block::fence::compose_token(held, held_lease);
+                        if held_token > 0 {
+                            match content_store.get_manifest(&self.inner.export_name).await {
+                                Ok(Some((data, _etag))) => {
+                                    if let Ok(s3_vm) =
+                                        crate::block::volume_manifest::VolumeManifest::deserialize(
+                                            &data,
+                                        )
+                                    {
+                                        let s3_token = crate::block::fence::compose_token(
+                                            s3_vm.generation,
+                                            s3_vm.lease_revision,
+                                        );
+                                        if s3_token > held_token {
+                                            // Superseded — we are fenced. Latch the
+                                            // flag so the write path rejects further
+                                            // guest writes, then return terminal so
+                                            // the scheduler stops. A strictly-newer
+                                            // composite covers BOTH a cross-node
+                                            // re-placement (higher generation) and a
+                                            // same-node re-fork (same generation,
+                                            // higher lease_revision).
+                                            self.inner.fenced.store(
+                                                true,
+                                                std::sync::atomic::Ordering::Release,
+                                            );
+                                            warn!(
+                                                export = %self.inner.export_name,
+                                                held,
+                                                held_lease,
+                                                superseded_by = s3_vm.generation,
+                                                superseded_by_lease = s3_vm.lease_revision,
+                                                "manifest sync FENCED: volume taken by a newer token"
+                                            );
+                                            return Err(CacheError::Fenced {
+                                                held,
+                                                superseded_by: s3_vm.generation,
+                                            });
+                                        }
+                                    }
+                                }
+                                // Couldn't read/parse S3 manifest — fall through to
+                                // the transient path (re-dirty + retry next cycle).
+                                Ok(None) | Err(_) => {}
+                            }
+                        }
+                        // Transient same-generation race (e.g. a concurrent flush).
+                        // Return Err: outer flush_dirty_inner re-dirties the SYNCING
+                        // blocks via flushing-file recovery and the next cycle retries.
                         return Err(e.into());
                     }
                     Err(e) => {

@@ -57,6 +57,22 @@ pub struct CreateVolumeRequest {
     /// cuts S3 PUT write-amp on overwrite-heavy DB volumes. Typical value: 8.
     #[serde(default)]
     pub compaction_cooldown: Option<u64>,
+    /// Single-attach fencing token (the orchestrator's monotonic per-instance
+    /// placement generation). When `> 0`, the attach is admitted only if this
+    /// generation is `>=` the volume's stored generation; a strictly-newer
+    /// generation fences an older holder out (see [`crate::block::fence`]).
+    /// Omitted / `0` = the caller does not participate in the high half.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// Single-attach fencing token, low half: the node-lease claim revision.
+    /// Orders same-`node_id` incarnations (a node-death re-fork does NOT advance
+    /// the orchestrator [`Self::generation`], so this is what fences it). The
+    /// fence compares the composite `(generation, lease_revision)`. Omitted /
+    /// `0` = the caller does not participate in the low half. The back-compat
+    /// bypass requires BOTH halves to be 0; a caller sending only a
+    /// `lease_revision` DOES participate. (See [`crate::block::fence`].)
+    #[serde(default)]
+    pub lease_revision: Option<u64>,
 }
 
 /// Optional request body for POST /api/exports/{name}/snapshot.
@@ -93,6 +109,16 @@ pub struct ExportInfoResponse {
     /// Filesystem used bytes from ext4 superblock (None if not ext4 or read failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_used_bytes: Option<u64>,
+    /// Current single-attach fencing generation (high half) owning this export
+    /// (0 / omitted = un-fenced on this half). Lets a caller confirm which
+    /// generation won the attach.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    /// Current single-attach fencing lease revision (low half) owning this
+    /// export (0 / omitted = un-fenced on this half). Lets a caller confirm
+    /// which same-node incarnation won the attach.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_revision: Option<u64>,
 }
 
 impl From<ExportInfo> for ExportInfoResponse {
@@ -107,6 +133,8 @@ impl From<ExportInfo> for ExportInfoResponse {
             dirty_bytes: e.dirty_bytes,
             s3_bytes: e.s3_bytes,
             fs_used_bytes: e.fs_used_bytes,
+            generation: (e.generation > 0).then_some(e.generation),
+            lease_revision: (e.lease_revision > 0).then_some(e.lease_revision),
         }
     }
 }
@@ -331,8 +359,36 @@ async fn create_or_attach_volume(
     req: &CreateVolumeRequest,
     from: &FromRef,
 ) -> Response<BoxBody> {
+    // Single-attach fencing token: high half = orchestrator placement
+    // generation, low half = node-lease claim revision. 0/0 = the caller does
+    // not participate in fencing (back-compat bypass); a lease-only token still
+    // participates.
+    let my_gen = req.generation.unwrap_or(0);
+    let my_lease = req.lease_revision.unwrap_or(0);
+
     // Already attached on this node → resize-or-noop (idempotent create).
     if let Some(export) = router.get_export_info(name).await {
+        // Re-PUT of an already-attached export: re-run the fence. A strictly
+        // higher composite token (the same instance re-placed cross-node OR
+        // re-forked same-node) seizes and is honored; a stale token is rejected.
+        match router.enforce_attach_fence(name, my_gen, my_lease).await {
+            Ok(crate::block::fence::Fence::Grant) => {}
+            Ok(crate::block::fence::Fence::Reject) => {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    &format!(
+                        "attach rejected: volume '{name}' is owned by a newer token \
+                         than (generation={my_gen}, lease_revision={my_lease}) (fenced)"
+                    ),
+                );
+            }
+            Err(e) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("attach fence failed for '{name}': {e}"),
+                );
+            }
+        }
         let current_size_gb = export.size as f64 / 1_073_741_824.0;
         if req.size_gb > current_size_gb {
             return match router.resize_export(name, req.size_gb).await {
@@ -431,6 +487,31 @@ async fn create_or_attach_volume(
 
     match create_result {
         Ok(()) => {
+            // Attach-time fence + seize, BEFORE persisting the index, registering
+            // the device, or serving any I/O. A rejected attach has uploaded zero
+            // data packs, so there is nothing to orphan — this is what prevents
+            // the at-sync orphaned-packs data loss. Skipped for the 0/0 bypass.
+            match router.enforce_attach_fence(name, my_gen, my_lease).await {
+                Ok(crate::block::fence::Fence::Grant) => {}
+                Ok(crate::block::fence::Fence::Reject) => {
+                    router.cleanup_failed_create(name, &transport).await;
+                    return error_response(
+                        StatusCode::CONFLICT,
+                        &format!(
+                            "attach rejected: volume '{name}' is owned by a newer token \
+                             than (generation={my_gen}, lease_revision={my_lease}) (fenced)"
+                        ),
+                    );
+                }
+                Err(e) => {
+                    router.cleanup_failed_create(name, &transport).await;
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("attach fence failed for '{name}': {e}"),
+                    );
+                }
+            }
+
             // Persist the index entry and register the device concurrently.
             // save_export MUST succeed; register_device is best-effort.
             let t_io = Instant::now();
@@ -1726,6 +1807,214 @@ mod tests {
         let resp = request(&node_c, Method::GET, "/api/resolve/vol1", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await["s3_prefix"], "custompool");
+    }
+
+    /// Single-attach generation fence: two nodes sharing one object store cannot
+    /// both own a volume. A stale generation is rejected (409); a newer one wins
+    /// and fences the old owner's stale re-attach.
+    #[tokio::test]
+    async fn test_attach_generation_fence_prevents_split_brain() {
+        let shared: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+
+        // Node A attaches vol1 at generation 5 → wins and seizes the manifest.
+        let temp_a = TempDir::new().unwrap();
+        let node_a = create_test_router_with_store(&temp_a, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_a,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 5}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let info: ExportInfoResponse = serde_json::from_slice(
+            &resp.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(info.generation, Some(5), "node A owns generation 5");
+
+        // Node B attaches with a STALE generation 4 → fenced (409), no clobber.
+        let temp_b = TempDir::new().unwrap();
+        let node_b = create_test_router_with_store(&temp_b, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_b,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 4}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a stale generation must be fenced out"
+        );
+
+        // Node B attaches with a NEWER generation 6 → wins, bumps the manifest.
+        let resp = request(
+            &node_b,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 6}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let info: ExportInfoResponse = serde_json::from_slice(
+            &resp.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(info.generation, Some(6), "node B took ownership at generation 6");
+
+        // The old owner (gen 5) tries to re-attach on a fresh node → now fenced,
+        // because the volume is owned by the strictly-newer generation 6.
+        let temp_a2 = TempDir::new().unwrap();
+        let node_a2 = create_test_router_with_store(&temp_a2, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_a2,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 5}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "the superseded owner must not be able to re-attach"
+        );
+
+        // Re-attach at the SAME winning generation 6 is idempotent (>= rule).
+        let resp = request(
+            &node_b,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 6}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "re-attaching the owning generation must be admitted"
+        );
+    }
+
+    /// Same-node re-fork fence: a node-death re-fork onto the SAME node does NOT
+    /// advance the orchestrator placement generation — only the node-lease claim
+    /// revision advances. The composite token `(generation, lease_revision)` is
+    /// what fences here: at a fixed generation, the higher lease_revision seizes
+    /// and the stale incarnation is rejected. This is the case the widening
+    /// exists for.
+    #[tokio::test]
+    async fn test_attach_lease_revision_fence_same_node() {
+        let shared: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+
+        // Incarnation A attaches vol1 at generation 7, lease_revision 1 → wins
+        // and seizes the manifest.
+        let temp_a = TempDir::new().unwrap();
+        let node_a = create_test_router_with_store(&temp_a, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_a,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 7, "lease_revision": 1}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let info: ExportInfoResponse = serde_json::from_slice(
+            &resp.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(info.generation, Some(7));
+        assert_eq!(info.lease_revision, Some(1), "incarnation A owns lease rev 1");
+
+        // The SAME-node re-fork: generation is unchanged (7), but the node-lease
+        // revision advances to 2 → the fresher incarnation seizes the volume.
+        let temp_b = TempDir::new().unwrap();
+        let node_b = create_test_router_with_store(&temp_b, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_b,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 7, "lease_revision": 2}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "the same-generation, higher-lease-revision incarnation must seize"
+        );
+        let info: ExportInfoResponse = serde_json::from_slice(
+            &resp.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(info.generation, Some(7));
+        assert_eq!(info.lease_revision, Some(2), "incarnation B took ownership at lease rev 2");
+
+        // The stale predecessor (gen 7, lease rev 1) re-attaches on a fresh node →
+        // now fenced, because the volume is owned by the strictly-newer composite
+        // token (7, 2) — the orchestrator generation never moved.
+        let temp_a2 = TempDir::new().unwrap();
+        let node_a2 = create_test_router_with_store(&temp_a2, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_a2,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 7, "lease_revision": 1}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "the stale same-node predecessor must not be able to re-attach"
+        );
+
+        // Re-attach at the SAME winning token (7, 2) is idempotent (>= rule).
+        let resp = request(
+            &node_b,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 7, "lease_revision": 2}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "re-attaching the owning token must be admitted"
+        );
+    }
+
+    /// Back-compat: a caller that does not send a generation (the gen-0 bypass)
+    /// is never fenced, even against a volume already owned at a high generation.
+    #[tokio::test]
+    async fn test_attach_without_generation_bypasses_fence() {
+        let shared: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+
+        let temp_a = TempDir::new().unwrap();
+        let node_a = create_test_router_with_store(&temp_a, Arc::clone(&shared)).await;
+        request(
+            &node_a,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 9}"#),
+        )
+        .await;
+
+        // A legacy caller (no generation field) attaches on a fresh node → granted.
+        let temp_b = TempDir::new().unwrap();
+        let node_b = create_test_router_with_store(&temp_b, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_b,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01}"#),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "the gen-0 bypass must not be fenced"
+        );
     }
 
     /// A blank volume (no `from`) gets its own pool (= its name).

@@ -504,6 +504,31 @@ pub(crate) struct CacheInner {
     /// `None` means first upload (unconditional PUT).
     pub(crate) manifest_etag: Mutex<Option<String>>,
 
+    /// Single-attach fencing generation this writer was granted at attach (the
+    /// orchestrator's monotonic per-instance placement generation; see
+    /// [`crate::block::fence`]). Seeded at attach. Stamped into the manifest on
+    /// every sync and compared against S3 on a precondition failure: if a strictly
+    /// newer generation has taken the volume, this writer is FENCED. `0` =
+    /// un-fenced (legacy / non-participating caller); the fence is a no-op.
+    pub(crate) current_generation: Mutex<u64>,
+
+    /// Single-attach fencing token, low half: the node-lease claim revision this
+    /// writer was granted at attach. Composed with [`Self::current_generation`]
+    /// into the `u128` fence token (see [`crate::block::fence::compose_token`]),
+    /// stamped into the manifest on every sync, and compared against S3 on a
+    /// precondition failure. Orders same-`node_id` incarnations (a node-death
+    /// re-fork does NOT advance the orchestrator generation). `0` = un-fenced on
+    /// this half.
+    pub(crate) current_lease_revision: Mutex<u64>,
+
+    /// Set once this writer is FENCED — a strictly-newer generation took the
+    /// volume (detected at manifest sync). Latches forever: once fenced, the
+    /// write path rejects further guest writes so the guest stops receiving
+    /// ACKs for writes that can never durably commit, and the flush scheduler
+    /// stops. Self-contained so the cache fences itself without reaching for the
+    /// handler/router.
+    pub(crate) fenced: AtomicBool,
+
     /// Per-page CRC32C checksums captured at pwrite time from the guest's write
     /// buffer. One entry per block, value is per-page CRC array. Upsert via
     /// `insert()` — allocation happens outside the shard lock, lock hold time

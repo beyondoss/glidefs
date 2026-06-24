@@ -29,6 +29,46 @@ pub const VOLUME_MANIFEST_VERSION: u16 = 5;
 /// serve an export BEFORE enabling prefetch hints for it.
 pub const VOLUME_MANIFEST_VERSION_PREFETCH: u16 = 6;
 
+/// Version 7 adds an 8-byte `generation` trailer (the single-attach fencing
+/// token, see [`super::fence`]) after the chunk entries, before the CRC.
+/// Written ONLY when `generation > 0`, so an un-fenced manifest is byte-identical
+/// to v5/v6. `prefetch_len` and `generation` are independent options, so the
+/// four combinations get distinct versions:
+///   - v5 — neither trailer
+///   - v6 — prefetch_len only
+///   - v7 — generation only
+///   - v8 — both (prefetch_len first, then generation)
+///
+/// DEPLOY-ORDER CAVEAT (same as v6): once any export persists a v7/v8 manifest,
+/// an older daemon that predates these constants rejects it with
+/// [`VolumeManifestError::UnsupportedVersion`]. Roll out the v7-aware binary to
+/// every node that may serve an export BEFORE enabling fencing for it.
+pub const VOLUME_MANIFEST_VERSION_GENERATION: u16 = 7;
+
+/// Version 8 — both the `prefetch_len` (v6) and `generation` (v7) trailers.
+pub const VOLUME_MANIFEST_VERSION_PREFETCH_GENERATION: u16 = 8;
+
+/// Version 9 widens the fencing token to the **composite** `(generation,
+/// lease_revision)` (see [`super::fence`]). When `lease_revision > 0` the
+/// manifest must persist both halves, so v9 carries a fixed 16-byte fence
+/// trailer (`generation` u64 LE, then `lease_revision` u64 LE) after the chunk
+/// entries (no prefetch trailer), before the CRC.
+///
+/// v9/v10 are emitted ONLY when `lease_revision > 0` — a participating same-node
+/// token. A volume fenced on the orchestrator generation alone (lease_revision
+/// == 0) stays byte-identical to v5/v6/v7/v8, so existing exports and
+/// generation-only callers see zero churn. A v9/v10 manifest read by a daemon
+/// that predates these constants is rejected as
+/// [`VolumeManifestError::UnsupportedVersion`]; same deploy-order caveat as v7 —
+/// roll out the v9-aware binary before enabling lease-revision fencing.
+///   - v9  — composite fence trailer only (no prefetch_len)
+///   - v10 — prefetch_len (8B) then composite fence trailer (16B)
+pub const VOLUME_MANIFEST_VERSION_COMPOSITE: u16 = 9;
+
+/// Version 10 — both the `prefetch_len` (v6) trailer and the v9 composite fence
+/// trailer (`generation` then `lease_revision`). See [`VOLUME_MANIFEST_VERSION_COMPOSITE`].
+pub const VOLUME_MANIFEST_VERSION_PREFETCH_COMPOSITE: u16 = 10;
+
 /// Default chunk size for v4: 128 MiB (= 1 ext4 block group).
 pub const DEFAULT_CHUNK_SIZE: u64 = 128 * 1024 * 1024;
 
@@ -63,6 +103,21 @@ pub struct VolumeManifest {
     /// the server warms `[0, prefetch_len)` into the clean cache so the guest's
     /// first reads are cache hits. `None` = no hint (legacy / non-prioritized).
     pub prefetch_len: Option<u64>,
+    /// Single-attach fencing token, high half: the orchestrator's per-instance
+    /// placement generation. The highest generation that has owned this volume;
+    /// checked (composed with [`Self::lease_revision`]) at attach and at every
+    /// manifest sync to fence a partitioned/superseded writer (see
+    /// [`super::fence`]). `0` = un-fenced on this half.
+    pub generation: u64,
+    /// Single-attach fencing token, low half: the node-lease claim revision.
+    /// Orders same-`node_id` incarnations (a node-death re-fork onto the same
+    /// node does NOT advance `generation`, so this is what fences it). The fence
+    /// compares the composite `(generation, lease_revision)`; see
+    /// [`super::fence::compose_token`]. `0` = un-fenced on this half (legacy
+    /// export, generation-only caller, or non-participating caller). Persisted
+    /// only when `> 0` (manifest v9/v10), so generation-only exports stay
+    /// byte-identical to v5/v6/v7/v8.
+    pub lease_revision: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +145,8 @@ impl VolumeManifest {
             block_size,
             chunks: BTreeMap::new(),
             prefetch_len: None,
+            generation: 0,
+            lease_revision: 0,
         }
     }
 
@@ -240,15 +297,41 @@ impl VolumeManifest {
             .values()
             .map(|e| 4 + 2 + e.packs.len() * 8) // chunk_idx + pack_count(u16) + packs
             .sum();
-        // v6 appends an 8-byte prefetch_len trailer; only emitted when set, so
-        // manifests without a hint are byte-identical to v5 (no churn).
-        let prefetch_trailer = if self.prefetch_len.is_some() { 8 } else { 0 };
-        let version = if self.prefetch_len.is_some() {
-            VOLUME_MANIFEST_VERSION_PREFETCH
+        // v6 appends an 8-byte prefetch_len trailer; v7 an 8-byte generation
+        // trailer; v8 both. v9/v10 widen the fence to a 16-byte composite
+        // trailer (generation + lease_revision). Each is emitted only when
+        // present, so an un-hinted, un-fenced manifest stays byte-identical to
+        // v5 (no churn), and a generation-only fence stays byte-identical to
+        // v7/v8 (the lease half only forces v9/v10 once it is non-zero).
+        let has_prefetch = self.prefetch_len.is_some();
+        let has_lease_revision = self.lease_revision > 0;
+        let has_generation = self.generation > 0;
+        let prefetch_trailer = if has_prefetch { 8 } else { 0 };
+        // Fence trailer: 16 bytes (composite) when lease_revision participates,
+        // else 8 bytes (generation only) when generation participates, else 0.
+        let fence_trailer = if has_lease_revision {
+            16
+        } else if has_generation {
+            8
         } else {
-            VOLUME_MANIFEST_VERSION
+            0
         };
-        let total = GLVM_HEADER_SIZE + entries_size + prefetch_trailer + 4; // +4 for CRC32
+        let version = if has_lease_revision {
+            if has_prefetch {
+                VOLUME_MANIFEST_VERSION_PREFETCH_COMPOSITE
+            } else {
+                VOLUME_MANIFEST_VERSION_COMPOSITE
+            }
+        } else {
+            match (has_prefetch, has_generation) {
+                (false, false) => VOLUME_MANIFEST_VERSION,
+                (true, false) => VOLUME_MANIFEST_VERSION_PREFETCH,
+                (false, true) => VOLUME_MANIFEST_VERSION_GENERATION,
+                (true, true) => VOLUME_MANIFEST_VERSION_PREFETCH_GENERATION,
+            }
+        };
+        let total =
+            GLVM_HEADER_SIZE + entries_size + prefetch_trailer + fence_trailer + 4; // +4 for CRC32
         let mut buf = Vec::with_capacity(total);
 
         // Header (32 bytes).
@@ -276,9 +359,19 @@ impl VolumeManifest {
             }
         }
 
-        // v6 prefetch_len trailer (before CRC, covered by it).
+        // Trailers (before CRC, covered by it). Order is fixed: prefetch_len
+        // first, then the fence trailer — deserialize reads them in the same
+        // order. The fence trailer is the composite (generation + lease_revision,
+        // 16 bytes) when lease_revision participates (v9/v10), else generation
+        // only (8 bytes, v7/v8).
         if let Some(len) = self.prefetch_len {
             buf.extend_from_slice(&len.to_le_bytes());
+        }
+        if has_lease_revision {
+            buf.extend_from_slice(&self.generation.to_le_bytes());
+            buf.extend_from_slice(&self.lease_revision.to_le_bytes());
+        } else if has_generation {
+            buf.extend_from_slice(&self.generation.to_le_bytes());
         }
 
         // CRC32 trailer.
@@ -311,10 +404,33 @@ impl VolumeManifest {
             return Err(VolumeManifestError::BadMagic);
         }
         let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
-        if version != VOLUME_MANIFEST_VERSION && version != VOLUME_MANIFEST_VERSION_PREFETCH {
+        if !matches!(
+            version,
+            VOLUME_MANIFEST_VERSION
+                | VOLUME_MANIFEST_VERSION_PREFETCH
+                | VOLUME_MANIFEST_VERSION_GENERATION
+                | VOLUME_MANIFEST_VERSION_PREFETCH_GENERATION
+                | VOLUME_MANIFEST_VERSION_COMPOSITE
+                | VOLUME_MANIFEST_VERSION_PREFETCH_COMPOSITE
+        ) {
             return Err(VolumeManifestError::UnsupportedVersion(u32::from(version)));
         }
-        let has_prefetch = version == VOLUME_MANIFEST_VERSION_PREFETCH;
+        let has_prefetch = matches!(
+            version,
+            VOLUME_MANIFEST_VERSION_PREFETCH
+                | VOLUME_MANIFEST_VERSION_PREFETCH_GENERATION
+                | VOLUME_MANIFEST_VERSION_PREFETCH_COMPOSITE
+        );
+        // v7/v8 carry a generation-only (8-byte) fence trailer.
+        let has_generation = matches!(
+            version,
+            VOLUME_MANIFEST_VERSION_GENERATION | VOLUME_MANIFEST_VERSION_PREFETCH_GENERATION
+        );
+        // v9/v10 carry the composite (16-byte) fence trailer: generation + lease_revision.
+        let has_composite = matches!(
+            version,
+            VOLUME_MANIFEST_VERSION_COMPOSITE | VOLUME_MANIFEST_VERSION_PREFETCH_COMPOSITE
+        );
         let chunk_count = u32::from_le_bytes(data[6..10].try_into().unwrap()) as usize;
         let chunk_size = u64::from(u32::from_le_bytes(data[10..14].try_into().unwrap()));
         let block_size = u32::from_le_bytes(data[14..18].try_into().unwrap());
@@ -350,14 +466,35 @@ impl VolumeManifest {
             chunks.insert(chunk_idx, ChunkEntry { packs });
         }
 
-        // v6 prefetch_len trailer sits between the last chunk entry and the CRC.
+        // Trailers sit between the last chunk entry and the CRC, in fixed order:
+        // prefetch_len (v6/v8) first, then generation (v7/v8).
         let prefetch_len = if has_prefetch {
             if pos + 8 > crc_offset {
                 return Err(VolumeManifestError::TooShort);
             }
-            Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
+            let v = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            Some(v)
         } else {
             None
+        };
+        let (generation, lease_revision) = if has_composite {
+            // v9/v10: composite (generation u64 LE, then lease_revision u64 LE).
+            if pos + 16 > crc_offset {
+                return Err(VolumeManifestError::TooShort);
+            }
+            let g = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            let l = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
+            (g, l)
+        } else if has_generation {
+            // v7/v8: generation only; lease_revision defaults to 0 (back-compat).
+            if pos + 8 > crc_offset {
+                return Err(VolumeManifestError::TooShort);
+            }
+            let g = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            (g, 0)
+        } else {
+            (0, 0)
         };
 
         Ok(VolumeManifest {
@@ -366,6 +503,8 @@ impl VolumeManifest {
             block_size,
             chunks,
             prefetch_len,
+            generation,
+            lease_revision,
         })
     }
 }
@@ -412,6 +551,165 @@ mod tests {
         assert_eq!(back, m);
     }
 
+    /// Generation 0 (un-fenced) stays byte-identical v5 — zero churn for
+    /// existing exports — and round-trips to 0.
+    #[test]
+    fn generation_zero_stays_v5_and_roundtrips() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 0xdead_beef);
+        let bytes = m.serialize().unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            VOLUME_MANIFEST_VERSION,
+            "generation 0 must still be written as v5"
+        );
+        let back = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.generation, 0);
+        assert_eq!(back, m);
+    }
+
+    /// A fenced manifest (generation > 0, no prefetch) is written as v7 and the
+    /// token round-trips.
+    #[test]
+    fn generation_only_is_v7_and_roundtrips() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 1);
+        m.append_pack(3, 9);
+        m.generation = 42;
+        let bytes = m.serialize().unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            VOLUME_MANIFEST_VERSION_GENERATION,
+            "a fenced manifest must be written as v7"
+        );
+        let back = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.generation, 42);
+        assert_eq!(back, m);
+    }
+
+    /// Both options present → v8, with prefetch_len first then generation, both
+    /// round-tripping.
+    #[test]
+    fn prefetch_and_generation_is_v8_and_roundtrips() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 1);
+        m.prefetch_len = Some(7 * 1024 * 1024);
+        m.generation = 99;
+        let bytes = m.serialize().unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            VOLUME_MANIFEST_VERSION_PREFETCH_GENERATION,
+            "prefetch + generation must be written as v8"
+        );
+        // Trailer order: prefetch_len (8) then generation (8), before the CRC (4).
+        let plen = &bytes[bytes.len() - 20..bytes.len() - 12];
+        let gen_bytes = &bytes[bytes.len() - 12..bytes.len() - 4];
+        assert_eq!(u64::from_le_bytes(plen.try_into().unwrap()), 7 * 1024 * 1024);
+        assert_eq!(u64::from_le_bytes(gen_bytes.try_into().unwrap()), 99);
+        let back = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.prefetch_len, Some(7 * 1024 * 1024));
+        assert_eq!(back.generation, 99);
+        assert_eq!(back.lease_revision, 0);
+        assert_eq!(back, m);
+    }
+
+    /// lease_revision 0 (un-participating low half) never forces v9/v10: a
+    /// generation-only fence stays byte-identical to v7, so existing fenced
+    /// exports see zero churn.
+    #[test]
+    fn lease_revision_zero_stays_v7() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 1);
+        m.generation = 42;
+        m.lease_revision = 0;
+        let bytes = m.serialize().unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            VOLUME_MANIFEST_VERSION_GENERATION,
+            "lease_revision 0 must stay v7 (generation-only)"
+        );
+        let back = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.generation, 42);
+        assert_eq!(back.lease_revision, 0);
+        assert_eq!(back, m);
+    }
+
+    /// A composite fence (lease_revision > 0, no prefetch) is written as v9 and
+    /// both halves round-trip. This is the same-node re-fork case: generation may
+    /// be unchanged while the lease revision advances.
+    #[test]
+    fn composite_is_v9_and_roundtrips() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 1);
+        m.append_pack(3, 9);
+        m.generation = 7;
+        m.lease_revision = 4;
+        let bytes = m.serialize().unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            VOLUME_MANIFEST_VERSION_COMPOSITE,
+            "a composite fence must be written as v9"
+        );
+        // Trailer: generation (8) then lease_revision (8), before the CRC (4).
+        let gen_bytes = &bytes[bytes.len() - 20..bytes.len() - 12];
+        let lease_bytes = &bytes[bytes.len() - 12..bytes.len() - 4];
+        assert_eq!(u64::from_le_bytes(gen_bytes.try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(lease_bytes.try_into().unwrap()), 4);
+        let back = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.generation, 7);
+        assert_eq!(back.lease_revision, 4);
+        assert_eq!(back, m);
+    }
+
+    /// A lease-only composite (generation 0, lease_revision > 0) still persists
+    /// both halves as v9 and round-trips — a participating same-node token need
+    /// not carry an orchestrator generation.
+    #[test]
+    fn composite_lease_only_is_v9_and_roundtrips() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 1);
+        m.generation = 0;
+        m.lease_revision = 5;
+        let bytes = m.serialize().unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            VOLUME_MANIFEST_VERSION_COMPOSITE,
+        );
+        let back = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.generation, 0);
+        assert_eq!(back.lease_revision, 5);
+        assert_eq!(back, m);
+    }
+
+    /// prefetch + composite fence → v10, with prefetch_len first then the
+    /// composite (generation, lease_revision), all round-tripping.
+    #[test]
+    fn prefetch_and_composite_is_v10_and_roundtrips() {
+        let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
+        m.append_pack(0, 1);
+        m.prefetch_len = Some(3 * 1024 * 1024);
+        m.generation = 12;
+        m.lease_revision = 8;
+        let bytes = m.serialize().unwrap();
+        assert_eq!(
+            u16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+            VOLUME_MANIFEST_VERSION_PREFETCH_COMPOSITE,
+            "prefetch + composite must be written as v10"
+        );
+        // Trailer order: prefetch_len (8), generation (8), lease_revision (8), CRC (4).
+        let plen = &bytes[bytes.len() - 28..bytes.len() - 20];
+        let gen_bytes = &bytes[bytes.len() - 20..bytes.len() - 12];
+        let lease_bytes = &bytes[bytes.len() - 12..bytes.len() - 4];
+        assert_eq!(u64::from_le_bytes(plen.try_into().unwrap()), 3 * 1024 * 1024);
+        assert_eq!(u64::from_le_bytes(gen_bytes.try_into().unwrap()), 12);
+        assert_eq!(u64::from_le_bytes(lease_bytes.try_into().unwrap()), 8);
+        let back = VolumeManifest::deserialize(&bytes).unwrap();
+        assert_eq!(back.prefetch_len, Some(3 * 1024 * 1024));
+        assert_eq!(back.generation, 12);
+        assert_eq!(back.lease_revision, 8);
+        assert_eq!(back, m);
+    }
+
     /// Format stability: the v6 trailer is purely additive — a v6 manifest is
     /// exactly 8 bytes longer than the identical v5 one, and those 8 bytes are
     /// the LE `prefetch_len` sitting right before the CRC32.
@@ -450,14 +748,14 @@ mod tests {
         let mut m = VolumeManifest::new(8 * 1024 * 1024, 4096);
         m.append_pack(0, 1);
         let mut bytes = m.serialize().unwrap();
-        bytes[4..6].copy_from_slice(&7u16.to_le_bytes()); // forge version 7
+        bytes[4..6].copy_from_slice(&99u16.to_le_bytes()); // forge an unknown version
         // recompute CRC so we exercise the version check, not the CRC check
         let crc_off = bytes.len() - 4;
         let crc = crc_fast::crc32_iscsi(&bytes[..crc_off]);
         bytes[crc_off..].copy_from_slice(&crc.to_le_bytes());
         match VolumeManifest::deserialize(&bytes) {
-            Err(VolumeManifestError::UnsupportedVersion(7)) => {}
-            other => panic!("expected UnsupportedVersion(7), got {other:?}"),
+            Err(VolumeManifestError::UnsupportedVersion(99)) => {}
+            other => panic!("expected UnsupportedVersion(99), got {other:?}"),
         }
     }
 
