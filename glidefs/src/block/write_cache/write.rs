@@ -158,6 +158,21 @@ impl WriteCache<Active> {
         data: &[u8],
         require_promotion: bool,
     ) -> Result<(), CacheError> {
+        // Single-attach fence: once a strictly-newer generation has taken this
+        // volume, reject all further guest writes. They could never durably
+        // commit (the manifest sync is fenced), so ACKing them would be a lie.
+        if self
+            .inner
+            .fenced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let held = *self.inner.current_generation.lock();
+            return Err(CacheError::Fenced {
+                held,
+                superseded_by: 0,
+            });
+        }
+
         let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
             CacheError::offset_out_of_bounds(u64::MAX, self.inner.config.device_size)
         })?;

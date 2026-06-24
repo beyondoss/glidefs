@@ -50,6 +50,15 @@ pub enum CacheError {
     /// abort and let the predecessor revive.
     #[error("WAL file is locked by another process (pid in flock owner): {0}")]
     Locked(std::path::PathBuf),
+
+    /// Single-attach fence tripped: a strictly newer generation has taken this
+    /// volume, so this writer has been superseded and must not commit. Terminal
+    /// — unlike a transient manifest race, retrying cannot succeed. The caller
+    /// must stop the flush loop and tear the export down (the guest's writes
+    /// since the last successful sync are dropped, which is correct: this node
+    /// was partitioned and those writes were never durably committed).
+    #[error("fenced: volume taken by generation {superseded_by} (this writer holds {held})")]
+    Fenced { held: u64, superseded_by: u64 },
 }
 
 impl CacheError {
@@ -67,12 +76,15 @@ impl CacheError {
         CacheError::InvalidMetadata
     }
 
-    /// True when the error is an S3 precondition failure (ETag mismatch),
-    /// indicating another host has taken ownership of this export's manifest.
+    /// True when the error means another writer owns this export and the flush
+    /// scheduler must stop: either an S3 precondition failure (ETag mismatch) or
+    /// a single-attach [`CacheError::Fenced`] (a strictly-newer generation took
+    /// the volume).
     pub fn is_manifest_conflict(&self) -> bool {
         matches!(
             self,
             CacheError::ContentStore(ContentStoreError::PreconditionFailed(_))
+                | CacheError::Fenced { .. }
         )
     }
 }

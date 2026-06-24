@@ -371,6 +371,8 @@ impl WriteCache<Initializing> {
 
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),
+            current_generation: parking_lot::Mutex::new(0),
+            fenced: std::sync::atomic::AtomicBool::new(false),
             page_crcs: dashmap::DashMap::new(),
             pages_per_block: block_size / 4096,
             flushing_active: AtomicBool::new(false),
@@ -461,6 +463,8 @@ impl WriteCache<Initializing> {
 
             flush_lock: tokio::sync::Mutex::new(()),
             manifest_etag: parking_lot::Mutex::new(None),
+            current_generation: parking_lot::Mutex::new(0),
+            fenced: std::sync::atomic::AtomicBool::new(false),
             page_crcs: dashmap::DashMap::new(),
             pages_per_block: block_size / 4096,
             flushing_active: AtomicBool::new(false),

@@ -198,6 +198,8 @@ pub struct ExportInfo {
     pub s3_bytes: u64,
     /// Filesystem used bytes from ext4 superblock (None if not ext4 or read failed).
     pub fs_used_bytes: Option<u64>,
+    /// Single-attach fencing generation owning this export (0 = un-fenced).
+    pub generation: u64,
 }
 
 /// Readiness check result for health endpoint.
@@ -1034,6 +1036,106 @@ impl ExportRouter {
     pub async fn resolve_export(&self, name: &str) -> Result<Option<ExportConfig>, RouterError> {
         validate_export_name(name)?;
         self.load_export(name).await
+    }
+
+    /// Single-attach fence (attach side). Decide whether the node attaching this
+    /// already-created export with placement generation `my_gen` is admitted, and
+    /// on admission **seize** the volume by stamping `my_gen` into the manifest so
+    /// any strictly-older incumbent is fenced at its next sync.
+    ///
+    /// Must be called on an export already present in the map (after
+    /// `create_export`), before serving I/O — a rejected attach has uploaded zero
+    /// data packs, so there is nothing to orphan.
+    ///
+    /// Rule mirrors [`crate::block::fence`]: `my_gen >= stored ⇒ Grant`. `my_gen
+    /// == 0` is the back-compat bypass (caller does not participate in fencing) —
+    /// always granted, never seizes. The seize is a manifest If-Match CAS; a
+    /// concurrent attach that moves the manifest triggers a bounded re-read and
+    /// re-evaluation.
+    pub async fn enforce_attach_fence(
+        &self,
+        name: &str,
+        my_gen: u64,
+    ) -> Result<crate::block::fence::Fence, RouterError> {
+        use crate::block::fence::{fence_attach, Fence};
+
+        let (content_store, volume_manifest, cache) = {
+            let entry = self
+                .exports
+                .get(name)
+                .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+            let s = entry.value();
+            (
+                Arc::clone(&s.content_store),
+                Arc::clone(&s.volume_manifest),
+                Arc::clone(&s.cache),
+            )
+        };
+
+        // Bounded retries: a concurrent attach can move the manifest out from
+        // under our seize CAS; re-read and re-evaluate the fence each time.
+        for _ in 0..3u32 {
+            let stored_gen = volume_manifest.read().generation;
+            if fence_attach(stored_gen, my_gen) == Fence::Reject {
+                return Ok(Fence::Reject);
+            }
+
+            // Granted. The accepted generation is the higher of the two (== my_gen
+            // once the fence passes, unless my_gen is the 0 bypass).
+            let effective = stored_gen.max(my_gen);
+            *cache.inner.current_generation.lock() = effective;
+
+            // No seize needed: a non-participating caller (my_gen == 0), or an
+            // equal-generation re-attach that doesn't change the stored value.
+            if my_gen == 0 || effective == stored_gen {
+                return Ok(Fence::Grant);
+            }
+
+            // Seize: stamp the new generation into the manifest via the existing
+            // If-Match CAS so an older incumbent's next sync is rejected.
+            let expected_etag = cache.inner.manifest_etag.lock().clone();
+            let bytes = {
+                let mut m = volume_manifest.write();
+                m.generation = effective;
+                m.serialize()
+                    .map_err(|e| RouterError::Manifest(format!("serialize manifest: {e}")))?
+            };
+            match content_store
+                .put_manifest(name, bytes, expected_etag.as_deref())
+                .await
+            {
+                Ok(new_etag) => {
+                    *cache.inner.manifest_etag.lock() = new_etag;
+                    info!(export = %name, generation = effective, "attach fence: seized volume");
+                    return Ok(Fence::Grant);
+                }
+                Err(crate::block::content_store::ContentStoreError::PreconditionFailed(_)) => {
+                    // A concurrent attach moved the manifest. Reload it (and its
+                    // ETag) and re-run the fence against the fresh generation.
+                    match content_store.get_manifest(name).await {
+                        Ok(Some((data, etag))) => {
+                            let vm = VolumeManifest::deserialize(&data).map_err(|e| {
+                                RouterError::Manifest(format!("reload manifest: {e}"))
+                            })?;
+                            *volume_manifest.write() = vm;
+                            *cache.inner.manifest_etag.lock() = etag;
+                        }
+                        Ok(None) => {
+                            // Manifest vanished mid-seize; drop the ETag so the
+                            // next attempt creates it.
+                            *cache.inner.manifest_etag.lock() = None;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Err(RouterError::Manifest(format!(
+            "attach fence for '{name}': manifest contended, could not seize after retries"
+        )))
     }
 
     // =========================================================================
@@ -2520,6 +2622,7 @@ impl ExportRouter {
             let block_size = state.cache.block_size() as u64;
             let manifest = state.volume_manifest.read();
             let s3_bytes = manifest.chunks.len() as u64 * manifest.chunk_size;
+            let generation = manifest.generation;
             drop(manifest);
             let info = ExportInfo {
                 name: name.to_string(),
@@ -2531,6 +2634,7 @@ impl ExportRouter {
                 dirty_bytes: state.cache.dirty_block_count() * block_size,
                 s3_bytes,
                 fs_used_bytes: None,
+                generation,
             };
             (info, Arc::clone(&state.handler))
         };
@@ -2571,6 +2675,7 @@ impl ExportRouter {
                     dirty_bytes: state.cache.dirty_block_count() * block_size,
                     s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
                     fs_used_bytes: None,
+                    generation: manifest.generation,
                 };
                 (info, Arc::clone(&state.handler))
             })
