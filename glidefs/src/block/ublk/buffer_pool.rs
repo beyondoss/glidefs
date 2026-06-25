@@ -375,11 +375,11 @@ fn try_alloc_zeroed(len: usize) -> Option<Vec<u8>> {
 /// (init OOM, see [`worker_pool`]), a fallibly-allocated heap buffer — counted
 /// in `GLOBAL_HEAP_FALLBACKS` so sustained degradation is alertable.
 ///
-/// Returns `None` only in the doubly-degraded case where the pool is absent
-/// *and* even the heap fallback can't be committed (host critically OOM). The
-/// caller must fail that single I/O with `EIO` — never abort. This is the
-/// per-I/O sibling of the init-path fix: neither `mmap` nor `vec` failure may
-/// take down storage for every VM on the host.
+/// Returns `None` for an invalid oversized request or in the doubly-degraded
+/// case where the pool is absent and even the heap fallback can't be committed
+/// (host critically OOM). The caller must fail that single I/O with `EIO` —
+/// never abort. This is the per-I/O sibling of the init-path fix: neither
+/// `mmap` nor `vec` failure may take down storage for every VM on the host.
 pub async fn acquire_io_buf(len: usize) -> Option<IoBuf> {
     if len > SLOT_SIZE {
         return None;
