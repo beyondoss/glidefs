@@ -2125,22 +2125,29 @@ async fn io_task_user_copy(
                 // the daemon keeps serving instead of aborting; the worker
                 // upgrades back to the pool once memory recovers.
                 //
-                // `None` is the doubly-degraded case: no pool *and* the heap
-                // fallback couldn't be committed (host critically OOM). Fail
-                // just this one I/O with EIO — the daemon stays up serving
-                // every other tag and VM; the kernel retries the I/O. The
-                // alternative, an infallible alloc, would SIGABRT the whole
-                // daemon and take down storage host-wide.
+                // `None` means either an invalid oversized request or the
+                // doubly-degraded case: no pool *and* the heap fallback couldn't
+                // be committed (host critically OOM). Fail just this one I/O
+                // with EIO — the daemon stays up serving every other tag and VM.
                 let Some(mut iobuf) = super::buffer_pool::acquire_io_buf(length as usize).await
                 else {
                     tracing::error!(
                         qid, tag, length,
-                        "bounce buffer alloc failed (host OOM) — failing this I/O with EIO",
+                        max_len = super::buffer_pool::SLOT_SIZE,
+                        "bounce buffer unavailable or length invalid — failing this I/O with EIO",
                     );
                     q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), -libc::EIO).await?;
                     continue;
                 };
-                let buf: &mut [u8] = iobuf.as_mut_slice(length as usize);
+                let Some(buf) = iobuf.as_mut_slice(length as usize) else {
+                    tracing::error!(
+                        qid, tag, length,
+                        max_len = super::buffer_pool::SLOT_SIZE,
+                        "bounce buffer length exceeds slot size — failing this I/O with EIO",
+                    );
+                    q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), -libc::EIO).await?;
+                    continue;
+                };
 
                 if op == sys::UBLK_IO_OP_WRITE {
                     // Copy WRITE data out of the kernel cmd buffer into ours.
