@@ -240,9 +240,11 @@ pub struct PoolSlot {
 
 impl PoolSlot {
     #[inline]
-    pub fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
-        debug_assert!(len <= SLOT_SIZE, "slot len {len} exceeds slot size {SLOT_SIZE}");
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, len) }
+    pub fn as_mut_slice(&mut self, len: usize) -> Option<&mut [u8]> {
+        if len > SLOT_SIZE {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts_mut(self.ptr, len) })
     }
 
     #[inline]
@@ -343,10 +345,10 @@ impl IoBuf {
     /// The first `len` bytes of the buffer. `len` is bounded by `SLOT_SIZE`
     /// upstream (a single ublk I/O never exceeds `IO_BUF_BYTES`).
     #[inline]
-    pub fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+    pub fn as_mut_slice(&mut self, len: usize) -> Option<&mut [u8]> {
         match self {
             IoBuf::Pooled(slot) => slot.as_mut_slice(len),
-            IoBuf::Heap(v) => &mut v[..len],
+            IoBuf::Heap(v) => v.get_mut(..len),
         }
     }
 }
@@ -379,6 +381,9 @@ fn try_alloc_zeroed(len: usize) -> Option<Vec<u8>> {
 /// per-I/O sibling of the init-path fix: neither `mmap` nor `vec` failure may
 /// take down storage for every VM on the host.
 pub async fn acquire_io_buf(len: usize) -> Option<IoBuf> {
+    if len > SLOT_SIZE {
+        return None;
+    }
     match worker_pool() {
         Some(pool) => Some(IoBuf::Pooled(pool.acquire().await)),
         None => match try_alloc_zeroed(len) {
@@ -426,12 +431,25 @@ mod tests {
     fn try_acquire_round_trip() {
         let pool = Rc::new(WorkerBufferPool::new().unwrap());
         let mut slot = pool.try_acquire().unwrap();
-        let buf = slot.as_mut_slice(4096);
+        let buf = slot.as_mut_slice(4096).unwrap();
         buf[0] = 0x42;
         buf[4095] = 0x42;
         assert_eq!(pool.acquires.load(Ordering::Relaxed), 1);
         drop(slot);
         assert_eq!(pool.free.borrow().len(), POOL_SLOTS);
+    }
+
+    #[test]
+    fn pool_slot_rejects_oversized_slice() {
+        let pool = Rc::new(WorkerBufferPool::new().unwrap());
+        let mut slot = pool.try_acquire().unwrap();
+        assert!(slot.as_mut_slice(SLOT_SIZE).is_some());
+        assert!(slot.as_mut_slice(SLOT_SIZE + 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn acquire_io_buf_rejects_oversized_len() {
+        assert!(acquire_io_buf(SLOT_SIZE + 1).await.is_none());
     }
 
     #[test]

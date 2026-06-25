@@ -2140,7 +2140,15 @@ async fn io_task_user_copy(
                     q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), -libc::EIO).await?;
                     continue;
                 };
-                let buf: &mut [u8] = iobuf.as_mut_slice(length as usize);
+                let Some(buf) = iobuf.as_mut_slice(length as usize) else {
+                    tracing::error!(
+                        qid, tag, length,
+                        max_len = super::buffer_pool::SLOT_SIZE,
+                        "bounce buffer length exceeds slot size — failing this I/O with EIO",
+                    );
+                    q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), -libc::EIO).await?;
+                    continue;
+                };
 
                 if op == sys::UBLK_IO_OP_WRITE {
                     // Copy WRITE data out of the kernel cmd buffer into ours.
