@@ -1994,6 +1994,13 @@ pub(super) async fn io_task_zero_copy(
     if wake_fd < 0 {
         return Err(UblkError::IOError(std::io::Error::last_os_error()));
     }
+    // Own the eventfd immediately so any early return before the
+    // `ZcThreadGuard` is constructed (notably thread-spawn failure under
+    // resource exhaustion) closes it instead of leaking one fd per queue.
+    // The ZC thread only borrows the raw value (RawFd is Copy); ownership
+    // stays here until we hand it to the guard below.
+    let wake_owned =
+        unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(wake_fd) };
 
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     let join = std::thread::Builder::new()
@@ -2010,6 +2017,9 @@ pub(super) async fn io_task_zero_copy(
             let _ = done_tx.send(result);
         })
         .map_err(|e| UblkError::IOError(std::io::Error::other(e.to_string())))?;
+    // Spawn succeeded: release ownership without closing — the guard now
+    // manages the fd's lifetime (close after join, see below).
+    let wake_fd: RawFd = std::os::fd::IntoRawFd::into_raw_fd(wake_owned);
 
     // Drop guard: if the future is cancelled (worker pool shutdown
     // during handoff cutover, panic during normal shutdown, etc.):
