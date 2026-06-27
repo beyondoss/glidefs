@@ -233,6 +233,15 @@ async fn capture_once(
         .await
         .ok()?,
     );
+    // Keep a handle to close the foyer clean cache before `tmp` (the TempDir)
+    // is dropped. foyer's SSD-tier region files stay open until the storage
+    // engine is closed; if the TempDir's `remove_dir_all` runs first, those
+    // files become deleted-but-held fds that never free until the daemon
+    // exits — so a daemon that profiles many images leaks them unbounded into
+    // $TMPDIR (which is tmpfs on many hosts → node-wide ENOSPC).
+    let clean_for_close = Arc::clone(&clean);
+
+    let result = async {
     let pack_index_cache = Arc::new(PackIndexCache::open(tmp.path()).await.ok()?);
     let handler = Arc::new(
         BlockHandler::new(
@@ -301,6 +310,16 @@ async fn capture_once(
         return None;
     }
     Some(blocks)
+    }
+    .await;
+
+    // Close the foyer clean cache (flush + release device fds) BEFORE `tmp` is
+    // dropped, so the TempDir cleanup actually frees the region files instead
+    // of orphaning them. Runs on every exit path (including the early `None`s
+    // above) because the work above is wrapped in the `result` async block.
+    clean_for_close.close().await;
+
+    result
 }
 
 #[cfg(test)]

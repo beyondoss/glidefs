@@ -29,6 +29,14 @@ pub trait BlockCache: Send + Sync {
     fn insert(&self, hash: Blake3Hash, data: Bytes);
     /// Remove a block from the cache.
     fn remove(&self, hash: &Blake3Hash);
+    /// Flush and shut down the cache, releasing any backing device fds.
+    ///
+    /// Must be awaited before a short-lived cache's directory is removed:
+    /// foyer's SSD-tier region files stay open until the storage engine is
+    /// closed, so dropping the dir first orphans them as deleted-but-held fds
+    /// that pin the filesystem for the whole process lifetime. Default no-op
+    /// for in-memory implementations that hold no fds.
+    async fn close(&self) {}
 }
 
 // ============================================================================
@@ -134,6 +142,12 @@ impl BlockCache for FoyerBlockCache {
 
     fn remove(&self, hash: &Blake3Hash) {
         self.inner.remove(hash);
+    }
+
+    async fn close(&self) {
+        if let Err(e) = self.inner.close().await {
+            tracing::warn!(error = %e, "foyer clean cache close failed");
+        }
     }
 }
 
