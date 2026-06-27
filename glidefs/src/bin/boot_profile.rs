@@ -136,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         timeout,
         static_seed: Vec::new(),
         max_blocks,
+        scratch_dir: None,
     };
     let boot_set = capture_boot_blocks_served(
         Arc::clone(&content_store),
