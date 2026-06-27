@@ -70,6 +70,7 @@ fn profiling_opts(settings: &Settings, static_seed: Vec<String>) -> Result<BootP
         timeout: profile_timeout(),
         static_seed,
         max_blocks: 200_000,
+        scratch_dir: None,
     })
 }
 

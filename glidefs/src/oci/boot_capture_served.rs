@@ -47,6 +47,16 @@ pub struct BootProfileOptions {
     pub static_seed: Vec<String>,
     /// Cap on captured blocks per run.
     pub max_blocks: usize,
+    /// Parent directory for the per-run scratch (write cache + foyer clean
+    /// cache). `None` falls back to `std::env::temp_dir()`.
+    ///
+    /// The long-lived daemon MUST set this to a real on-disk path (e.g. the
+    /// configured `[cache].dir`): `std::env::temp_dir()` is `/tmp`, which is a
+    /// tmpfs on many hosts, so the profiler's disk cache would otherwise run in
+    /// RAM. Setting it here makes placement correct by construction, regardless
+    /// of whether `$TMPDIR` is exported in the unit. Short-lived CLI callers can
+    /// leave it `None` — their scratch is reclaimed when the process exits.
+    pub scratch_dir: Option<std::path::PathBuf>,
 }
 
 /// Rank-merge ordered block lists from multiple boot runs into one ordered union.
@@ -196,7 +206,16 @@ async fn capture_once(
     use crate::oci::sandbox::SandboxSpec;
     use tokio::sync::Notify;
 
-    let tmp = tempfile::TempDir::new().ok()?;
+    // Scratch (write cache + foyer clean cache) goes under `opts.scratch_dir`
+    // when set — keeping the profiler's disk cache off a tmpfs `/tmp`. Falls
+    // back to `std::env::temp_dir()` only for callers that opt out (None).
+    let tmp = match opts.scratch_dir.as_deref() {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).ok()?;
+            tempfile::TempDir::new_in(dir).ok()?
+        }
+        None => tempfile::TempDir::new().ok()?,
+    };
     let rtrace = tmp.path().join("boot.rtrace");
     let tracer = Arc::new(
         WriteTracer::new(

@@ -2241,6 +2241,9 @@ impl ExportRouter {
         let router = Arc::clone(self);
         let content_store = self.content_store_for_prefix(s3_prefix);
         let name_owned = name.to_string();
+        // Profiler scratch lands under the daemon's on-disk cache dir, never a
+        // tmpfs /tmp (foyer clean-cache regions would otherwise run in RAM).
+        let scratch_dir = self.cache_dir.clone();
         let cleanup_key = key;
         let _handle = spawn_supervised("profile-bg", async move {
             // Guard removes the profile_tasks entry on any exit (return,
@@ -2275,7 +2278,13 @@ impl ExportRouter {
                 force: params.force,
                 max_blocks: params.max_blocks,
             };
-            match crate::oci::profile_runner::profile_base(content_store, &profile_cfg, spec).await
+            match crate::oci::profile_runner::profile_base(
+                content_store,
+                &profile_cfg,
+                spec,
+                Some(scratch_dir),
+            )
+            .await
             {
                 Ok(crate::oci::profile_runner::ProfileOutcome::UpToDate { .. }) => {
                     info!(name = %name_owned, "profile: boot set already up to date");

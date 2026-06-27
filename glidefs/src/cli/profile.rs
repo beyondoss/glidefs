@@ -77,7 +77,7 @@ pub async fn run_profile(args: ProfileArgs) -> Result<()> {
         max_blocks: args.max_blocks,
     };
 
-    match profile_base(content_store, &pcfg, spec).await? {
+    match profile_base(content_store, &pcfg, spec, None).await? {
         ProfileOutcome::UpToDate { fingerprint } => {
             println!(
                 "Boot set for '{}' is up to date (fingerprint {}); skipping. Use --force to re-profile.",

@@ -78,6 +78,10 @@ pub async fn profile_base(
     content_store: Arc<ContentStore>,
     profile_cfg: &ProfileConfig,
     spec: ProfileSpec,
+    // Parent dir for per-run profiler scratch. The daemon passes its
+    // configured `[cache].dir` so the scratch lands on disk, not a tmpfs
+    // `/tmp`; CLI callers pass `None` (process-lifetime scratch).
+    scratch_dir: Option<std::path::PathBuf>,
 ) -> Result<ProfileOutcome> {
     // --- Load the base manifest + its fingerprint (ETag) ---
     let (data, etag) = content_store
@@ -182,6 +186,7 @@ pub async fn profile_base(
         timeout: spec.timeout.max(Duration::from_secs(1)),
         static_seed,
         max_blocks: spec.max_blocks,
+        scratch_dir,
     };
     let blocks = capture_boot_blocks_served(
         Arc::clone(&content_store),
