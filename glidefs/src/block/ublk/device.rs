@@ -13,10 +13,6 @@
 
 use crate::block::handler::BlockHandler;
 use crate::task;
-use ublk_core::ctrl::{UblkCtrl, UblkCtrlBuilder};
-use ublk_core::helpers::IoBuf;
-use ublk_core::io::{UblkDev, UblkQueue};
-use ublk_core::{sys, BufDesc, UblkError, UblkFlags};
 use std::cell::{Cell, UnsafeCell};
 use std::future::Future;
 use std::os::unix::io::RawFd;
@@ -25,6 +21,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context as TaskContext, Poll, Wake, Waker};
+use ublk_core::ctrl::{UblkCtrl, UblkCtrlBuilder};
+use ublk_core::helpers::IoBuf;
+use ublk_core::io::{UblkDev, UblkQueue};
+use ublk_core::{BufDesc, UblkError, UblkFlags, sys};
 
 /// Per-queue I/O depth (max inflight commands per queue).
 ///
@@ -228,10 +228,12 @@ impl UblkDevice {
         // spawn_blocking to keep the async runtime responsive.
         let dev_id_for_recover = dev_id;
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let ctrl = UblkCtrl::new_simple(dev_id_for_recover)
-                .map_err(|e| anyhow::anyhow!("UblkCtrl::new_simple({dev_id_for_recover}) failed: {e}"))?;
-            ctrl.start_user_recover()
-                .map_err(|e| anyhow::anyhow!("start_user_recover({dev_id_for_recover}) failed: {e}"))?;
+            let ctrl = UblkCtrl::new_simple(dev_id_for_recover).map_err(|e| {
+                anyhow::anyhow!("UblkCtrl::new_simple({dev_id_for_recover}) failed: {e}")
+            })?;
+            ctrl.start_user_recover().map_err(|e| {
+                anyhow::anyhow!("start_user_recover({dev_id_for_recover}) failed: {e}")
+            })?;
             Ok(())
         })
         .await??;
@@ -308,8 +310,7 @@ impl UblkDevice {
         //
         // `GLIDEFS_BOUNCE_MODE=1` (test-only) disables both transports and
         // forces the legacy per-tag-IoBuf path.
-        let use_zc = features.zero_copy
-            && std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none();
+        let use_zc = features.zero_copy && std::env::var_os("GLIDEFS_BOUNCE_MODE").is_none();
         if use_zc {
             dev_flags |= UblkFlags::UBLK_DEV_F_PREFER_ZERO_COPY;
             tracing::info!(
@@ -393,9 +394,7 @@ impl UblkDevice {
 
                 let tgt_init = move |d: &mut UblkDev| {
                     d.tgt.dev_size = dev_size;
-                    d.set_target_json(
-                        serde_json::json!({ "export_name": export_for_json }),
-                    );
+                    d.set_target_json(serde_json::json!({ "export_name": export_for_json }));
                     d.tgt.params = sys::ublk_params {
                         types: sys::UBLK_PARAM_TYPE_BASIC | sys::UBLK_PARAM_TYPE_DISCARD,
                         basic: sys::ublk_param_basic {
@@ -443,9 +442,7 @@ impl UblkDevice {
                             qid,
                             ready: ready_tx,
                         })
-                        .map_err(|_| {
-                            anyhow::anyhow!("worker {worker_idx} channel closed")
-                        })?;
+                        .map_err(|_| anyhow::anyhow!("worker {worker_idx} channel closed"))?;
                     super::device::signal_eventfd(snap.eventfd.fd());
                     readys.push((*worker_idx, ready_rx));
                 }
@@ -453,13 +450,12 @@ impl UblkDevice {
 
                 for (qid_, (worker_idx, ready_rx)) in readys.into_iter().enumerate() {
                     let t_recv = std::time::Instant::now();
-                    let result = ready_rx.blocking_recv().map_err(|_| {
-                        anyhow::anyhow!("worker {worker_idx} dropped ready sender")
-                    })?;
+                    let result = ready_rx
+                        .blocking_recv()
+                        .map_err(|_| anyhow::anyhow!("worker {worker_idx} dropped ready sender"))?;
                     timings.ready_recv_us += t_recv.elapsed().as_micros();
-                    result.map_err(|s| {
-                        anyhow::anyhow!("worker {worker_idx} AddQueue failed: {s}")
-                    })?;
+                    result
+                        .map_err(|s| anyhow::anyhow!("worker {worker_idx} AddQueue failed: {s}"))?;
                     // `configure_queue` records the queue's owner thread
                     // tid and, on the last queue, calls `build_json` —
                     // which is what populates `/run/ublksrvd/{dev_id}.json`
@@ -488,9 +484,8 @@ impl UblkDevice {
                 // END_USER_RECOVERY for the recovery path; ublk-core's
                 // start_dev() picks based on device state).
                 let t = std::time::Instant::now();
-                ctrl.start_dev(&dev).map_err(|e| {
-                    anyhow::anyhow!("start_dev failed: {e:?}")
-                })?;
+                ctrl.start_dev(&dev)
+                    .map_err(|e| anyhow::anyhow!("start_dev failed: {e:?}"))?;
                 timings.start_dev_us = t.elapsed().as_micros();
 
                 let dev_id = i32::try_from(ctrl.dev_info().dev_id)
@@ -582,10 +577,9 @@ impl UblkDevice {
         // send RemoveQueue messages without holding the UblkServer mutex
         // (the mutex serializes unrelated operations; the slow path here
         // is `kill_dev` which we drive outside the lock).
-        let worker_handles: Vec<super::worker_pool::WorkerHandleSnapshot> =
-            (0..actual_nr_queues)
-                .map(|qid| pool.worker_snapshot(&export_name, qid, preferred_node))
-                .collect();
+        let worker_handles: Vec<super::worker_pool::WorkerHandleSnapshot> = (0..actual_nr_queues)
+            .map(|qid| pool.worker_snapshot(&export_name, qid, preferred_node))
+            .collect();
 
         Ok(Self {
             dev_id: dev_id_assigned,
@@ -686,7 +680,10 @@ impl UblkDevice {
         use futures::stream::{FuturesUnordered, StreamExt};
         let mut remove_acks = FuturesUnordered::new();
         for (qid, handle) in worker_handles.iter().enumerate() {
-            let key = super::worker_pool::QueueKey { dev_id, qid: qid as u16 };
+            let key = super::worker_pool::QueueKey {
+                dev_id,
+                qid: qid as u16,
+            };
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             let msg = super::worker_pool::WorkerMsg::RemoveQueue { key, done: done_tx };
             match handle.inbox.try_send(msg) {
@@ -699,7 +696,8 @@ impl UblkDevice {
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     tracing::warn!(
-                        dev_id, qid,
+                        dev_id,
+                        qid,
                         "worker inbox closed during unregister (worker thread exited?)"
                     );
                 }
@@ -781,10 +779,7 @@ impl UblkDevice {
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             handle
                 .inbox
-                .send(super::worker_pool::WorkerMsg::RemoveQueue {
-                    key,
-                    done: done_tx,
-                })
+                .send(super::worker_pool::WorkerMsg::RemoveQueue { key, done: done_tx })
                 .await
                 .map_err(|_| anyhow::anyhow!("worker channel closed for qid {qid}"))?;
             super::device::signal_eventfd(handle.eventfd.fd());
@@ -878,7 +873,10 @@ impl Drop for EventFd {
 pub(super) fn signal_eventfd(fd: RawFd) {
     let val: u64 = 1;
     let ret = unsafe { libc::write(fd, &val as *const u64 as *const libc::c_void, 8) };
-    debug_assert!(ret == 8 || ret == -1, "eventfd write returned unexpected {ret}");
+    debug_assert!(
+        ret == 8 || ret == -1,
+        "eventfd write returned unexpected {ret}"
+    );
 }
 
 /// Drain accumulated eventfd signals (non-blocking read).
@@ -886,7 +884,10 @@ pub(super) fn drain_eventfd(fd: RawFd) {
     let mut val: u64 = 0;
     let ret = unsafe { libc::read(fd, &mut val as *mut u64 as *mut libc::c_void, 8) };
     // EAGAIN is expected when no signals are pending (EFD_NONBLOCK).
-    debug_assert!(ret == 8 || ret == -1, "eventfd read returned unexpected {ret}");
+    debug_assert!(
+        ret == 8 || ret == -1,
+        "eventfd read returned unexpected {ret}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +918,10 @@ impl WakeupBits {
     pub(super) fn new(num_words: usize, efd: Arc<EventFd>) -> Self {
         assert!(num_words > 0, "WakeupBits needs at least one word");
         let words: Vec<AtomicU64> = (0..num_words).map(|_| AtomicU64::new(0)).collect();
-        Self { words: words.into_boxed_slice(), efd }
+        Self {
+            words: words.into_boxed_slice(),
+            efd,
+        }
     }
 
     /// Total task index capacity (number of bits).
@@ -1090,13 +1094,15 @@ impl<'a> QueueExecutor<'a> {
     /// the event loop exit.
     pub(super) fn spawn_daemon(&mut self, future: impl Future<Output = ()> + 'a) {
         debug_assert_eq!(
-            self.alive.get(), 0,
+            self.alive.get(),
+            0,
             "spawn_daemon must be called before spawn"
         );
         let idx = self.tasks.len();
         assert!(
             idx < self.bits.capacity(),
-            "QueueExecutor capacity {} exceeded by spawn_daemon", self.bits.capacity()
+            "QueueExecutor capacity {} exceeded by spawn_daemon",
+            self.bits.capacity()
         );
         self.tasks.push(UnsafeCell::new(Some(Box::pin(future))));
         self.wakers.push(Waker::from(Arc::new(TaskWaker {
@@ -1237,7 +1243,6 @@ fn panic_payload_to_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
         "<non-string panic>"
     }
 }
-
 
 /// Per-tag async I/O task. Runs in a worker's [`QueueExecutor`] and
 /// pumps the FETCH → dispatch → COMMIT cycle for one tag's lifetime.
@@ -1515,7 +1520,10 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                         ) {
                             Ok(()) => {
                                 let action = ZcAction::Chunks(vec![ZcChunk {
-                                    op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
+                                    op: ZcChunkOp::WriteFixed {
+                                        fd,
+                                        dst_offset: offset,
+                                    },
                                     buf_offset: 0,
                                     length,
                                 }]);
@@ -1574,7 +1582,10 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                             use std::os::unix::io::AsRawFd;
                             let fd = (*gate).as_raw_fd_for_ublk_zc();
                             let action = ZcAction::Chunks(vec![ZcChunk {
-                                op: ZcChunkOp::WriteFixed { fd, dst_offset: offset },
+                                op: ZcChunkOp::WriteFixed {
+                                    fd,
+                                    dst_offset: offset,
+                                },
                                 buf_offset: 0,
                                 length,
                             }]);
@@ -1631,8 +1642,7 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                     // plane window (pwrite + READ_FIXED).
                     {
                         let gate = handler.zc_inflight_enter();
-                        if let Some(action) =
-                            try_zc_read_hot_path(&handler, &*gate, offset, length)
+                        if let Some(action) = try_zc_read_hot_path(&handler, &*gate, offset, length)
                         {
                             guard.commit(action, Some(Box::new(gate)));
                             return;
@@ -1664,7 +1674,10 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 });
                 ZcDispatch::Deferred
             }
-            _ => ZcDispatch::Inline { action: ZcAction::Complete(-libc::EIO), keepalive: None },
+            _ => ZcDispatch::Inline {
+                action: ZcAction::Complete(-libc::EIO),
+                keepalive: None,
+            },
         }
     }
 
@@ -1693,10 +1706,17 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
             })
             .map(|g| &**g);
         let Some(df) = df else {
-            tracing::error!(offset, length, "ZC after_write: missing rotation-gate keepalive");
+            tracing::error!(
+                offset,
+                length,
+                "ZC after_write: missing rotation-gate keepalive"
+            );
             return -libc::EIO;
         };
-        match self.handler.commit_after_zc_write_with(df, offset, u64::from(length), false) {
+        match self
+            .handler
+            .commit_after_zc_write_with(df, offset, u64::from(length), false)
+        {
             Ok(()) => {
                 #[allow(clippy::cast_possible_wrap)]
                 let r = length as i32;
@@ -1722,7 +1742,10 @@ struct SubmitGuard {
 
 impl SubmitGuard {
     fn new(tag: u16, handle: ublk_core::zc::ZcQueueHandle) -> Self {
-        Self { tag, handle: Some(handle) }
+        Self {
+            tag,
+            handle: Some(handle),
+        }
     }
 
     fn commit(
@@ -1743,7 +1766,11 @@ impl Drop for SubmitGuard {
                 tag = self.tag,
                 "ZC dispatch task dropped without commit — sending -EIO"
             );
-            handle.submit(self.tag, ublk_core::zc::ZcAction::Complete(-libc::EIO), None);
+            handle.submit(
+                self.tag,
+                ublk_core::zc::ZcAction::Complete(-libc::EIO),
+                None,
+            );
         }
     }
 }
@@ -1794,7 +1821,9 @@ fn try_zc_read_hot_path(
         let chunk_start_byte = block_idx * block_size;
         let slice_start = if block_idx == start_block {
             #[allow(clippy::cast_possible_truncation)]
-            { (offset - chunk_start_byte) as u32 }
+            {
+                (offset - chunk_start_byte) as u32
+            }
         } else {
             0
         };
@@ -1963,7 +1992,8 @@ pub(super) async fn io_task_zero_copy(
     // on zero-block chunks — kernel reads zeros directly into bio, no
     // userspace memset, no per-tag scratch buffer.
     let dev_zero_path = std::ffi::CString::new("/dev/zero").unwrap();
-    let dev_zero_fd = unsafe { libc::open(dev_zero_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    let dev_zero_fd =
+        unsafe { libc::open(dev_zero_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if dev_zero_fd < 0 {
         return Err(UblkError::IOError(std::io::Error::last_os_error()));
     }
@@ -2125,7 +2155,8 @@ async fn io_task_user_copy(
     let qid = q.get_qid();
 
     // Initial fetch — no buffer attached, empty slice.
-    q.submit_io_prep_cmd(tag, BufDesc::Slice(&[]), 0, None).await?;
+    q.submit_io_prep_cmd(tag, BufDesc::Slice(&[]), 0, None)
+        .await?;
 
     loop {
         let iod = q.get_iod(tag);
@@ -2163,20 +2194,26 @@ async fn io_task_user_copy(
                 let Some(mut iobuf) = super::buffer_pool::acquire_io_buf(length as usize).await
                 else {
                     tracing::error!(
-                        qid, tag, length,
+                        qid,
+                        tag,
+                        length,
                         max_len = super::buffer_pool::SLOT_SIZE,
                         "bounce buffer unavailable or length invalid — failing this I/O with EIO",
                     );
-                    q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), -libc::EIO).await?;
+                    q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), -libc::EIO)
+                        .await?;
                     continue;
                 };
                 let Some(buf) = iobuf.as_mut_slice(length as usize) else {
                     tracing::error!(
-                        qid, tag, length,
+                        qid,
+                        tag,
+                        length,
                         max_len = super::buffer_pool::SLOT_SIZE,
                         "bounce buffer length exceeds slot size — failing this I/O with EIO",
                     );
-                    q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), -libc::EIO).await?;
+                    q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), -libc::EIO)
+                        .await?;
                     continue;
                 };
 
@@ -2199,7 +2236,13 @@ async fn io_task_user_copy(
                     };
                     if ret < 0 {
                         let err = std::io::Error::last_os_error();
-                        tracing::error!(?err, qid, tag, length, "USER_COPY pread WRITE-data failed");
+                        tracing::error!(
+                            ?err,
+                            qid,
+                            tag,
+                            length,
+                            "USER_COPY pread WRITE-data failed"
+                        );
                         -err.raw_os_error().unwrap_or(libc::EIO)
                     } else {
                         handle_io(op, offset, length, fua, buf, handler).await
@@ -2218,7 +2261,13 @@ async fn io_task_user_copy(
                         };
                         if ret < 0 {
                             let err = std::io::Error::last_os_error();
-                            tracing::error!(?err, qid, tag, res, "USER_COPY pwrite READ-data failed");
+                            tracing::error!(
+                                ?err,
+                                qid,
+                                tag,
+                                res,
+                                "USER_COPY pwrite READ-data failed"
+                            );
                             -err.raw_os_error().unwrap_or(libc::EIO)
                         } else {
                             res
@@ -2236,7 +2285,8 @@ async fn io_task_user_copy(
             _ => -libc::EINVAL,
         };
 
-        q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), result).await?;
+        q.submit_io_commit_cmd(tag, BufDesc::Slice(&[]), result)
+            .await?;
     }
 }
 
@@ -2351,7 +2401,8 @@ async fn handle_io(
             // Run through the panic-isolating wrapper so a write_cache
             // panic marks the export degraded instead of poisoning peer
             // queues (parallel to NBD's run_mutating_request).
-            let result = run_mutating("ublk-write", handler, || handler.write(offset, buf, fua)).await;
+            let result =
+                run_mutating("ublk-write", handler, || handler.write(offset, buf, fua)).await;
             if result == 0 {
                 i32::try_from(length).unwrap_or(-libc::EIO)
             } else {
@@ -2420,9 +2471,10 @@ mod tests {
         let clean_cache: Arc<dyn crate::block::cache::BlockCache> =
             Arc::new(SimpleBlockCache::new(64 * 1024 * 1024));
         let pack_index_cache = Arc::new(PackIndexCache::open(temp.path()).await.unwrap());
-        let volume_manifest = Arc::new(parking_lot::RwLock::new(
-            VolumeManifest::new(DEVICE_SIZE, BLOCK_SIZE as u32),
-        ));
+        let volume_manifest = Arc::new(parking_lot::RwLock::new(VolumeManifest::new(
+            DEVICE_SIZE,
+            BLOCK_SIZE as u32,
+        )));
         let metrics = Arc::new(ExportMetrics::new());
         let cache = WriteCache::open(config).unwrap().skip_recovery_for_test();
         let handler = BlockHandler::new(
@@ -2450,13 +2502,27 @@ mod tests {
         let (handler, _dir) = make_handler(false).await;
 
         let mut buf = vec![0x42u8; BLOCK_SIZE];
-        let result =
-            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+        let result = handle_io(
+            ublk_core::sys::UBLK_IO_OP_WRITE,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            &mut buf,
+            &handler,
+        )
+        .await;
         assert_eq!(result, BLOCK_SIZE as i32);
 
         let mut buf = vec![0u8; BLOCK_SIZE];
-        let result =
-            handle_io(ublk_core::sys::UBLK_IO_OP_READ, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+        let result = handle_io(
+            ublk_core::sys::UBLK_IO_OP_READ,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            &mut buf,
+            &handler,
+        )
+        .await;
         assert_eq!(result, BLOCK_SIZE as i32);
         assert_eq!(buf, vec![0x42u8; BLOCK_SIZE]);
     }
@@ -2464,16 +2530,30 @@ mod tests {
     #[tokio::test]
     async fn flush_returns_ok() {
         let (handler, _dir) = make_handler(false).await;
-        let result =
-            handle_io(ublk_core::sys::UBLK_IO_OP_FLUSH, 0, 0, false, &mut [], &handler).await;
+        let result = handle_io(
+            ublk_core::sys::UBLK_IO_OP_FLUSH,
+            0,
+            0,
+            false,
+            &mut [],
+            &handler,
+        )
+        .await;
         assert_eq!(result, 0);
     }
 
     #[tokio::test]
     async fn discard_returns_ok() {
         let (handler, _dir) = make_handler(false).await;
-        let result =
-            handle_io(ublk_core::sys::UBLK_IO_OP_DISCARD, 0, BLOCK_SIZE as u32, false, &mut [], &handler).await;
+        let result = handle_io(
+            ublk_core::sys::UBLK_IO_OP_DISCARD,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            &mut [],
+            &handler,
+        )
+        .await;
         assert_eq!(result, 0);
     }
 
@@ -2498,16 +2578,39 @@ mod tests {
 
         // Write non-zero data.
         let mut buf = vec![0xFFu8; BLOCK_SIZE];
-        handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+        handle_io(
+            ublk_core::sys::UBLK_IO_OP_WRITE,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            &mut buf,
+            &handler,
+        )
+        .await;
 
         // Write zeroes over it.
-        let result =
-            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE_ZEROES, 0, BLOCK_SIZE as u32, false, &mut [], &handler).await;
+        let result = handle_io(
+            ublk_core::sys::UBLK_IO_OP_WRITE_ZEROES,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            &mut [],
+            &handler,
+        )
+        .await;
         assert_eq!(result, 0);
 
         // Read back — should be zeros.
         let mut buf = vec![0xFFu8; BLOCK_SIZE];
-        handle_io(ublk_core::sys::UBLK_IO_OP_READ, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+        handle_io(
+            ublk_core::sys::UBLK_IO_OP_READ,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            &mut buf,
+            &handler,
+        )
+        .await;
         assert_eq!(buf, vec![0u8; BLOCK_SIZE]);
     }
 
@@ -2541,8 +2644,15 @@ mod tests {
         // BlockHandler — confirms the protection actually fires for ublk
         // requests, not just NBD.
         let mut buf = vec![0x42u8; BLOCK_SIZE];
-        let next =
-            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+        let next = handle_io(
+            ublk_core::sys::UBLK_IO_OP_WRITE,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            &mut buf,
+            &handler,
+        )
+        .await;
         assert_eq!(next, -libc::EIO);
     }
 
@@ -2563,9 +2673,19 @@ mod tests {
     async fn read_beyond_device_returns_zeros() {
         let (handler, _dir) = make_handler(false).await;
         let mut buf = vec![0xFFu8; BLOCK_SIZE];
-        let result =
-            handle_io(ublk_core::sys::UBLK_IO_OP_READ, DEVICE_SIZE, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
-        assert_eq!(result, BLOCK_SIZE as i32, "OOB read should succeed with zero-fill");
+        let result = handle_io(
+            ublk_core::sys::UBLK_IO_OP_READ,
+            DEVICE_SIZE,
+            BLOCK_SIZE as u32,
+            false,
+            &mut buf,
+            &handler,
+        )
+        .await;
+        assert_eq!(
+            result, BLOCK_SIZE as i32,
+            "OOB read should succeed with zero-fill"
+        );
         assert!(buf.iter().all(|&b| b == 0), "OOB read should return zeros");
     }
 
@@ -2573,8 +2693,15 @@ mod tests {
     async fn write_with_fua_succeeds() {
         let (handler, _dir) = make_handler(false).await;
         let mut buf = vec![0xABu8; BLOCK_SIZE];
-        let result =
-            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, true, &mut buf, &handler).await;
+        let result = handle_io(
+            ublk_core::sys::UBLK_IO_OP_WRITE,
+            0,
+            BLOCK_SIZE as u32,
+            true,
+            &mut buf,
+            &handler,
+        )
+        .await;
         assert_eq!(result, BLOCK_SIZE as i32);
     }
 
@@ -2582,16 +2709,30 @@ mod tests {
     async fn write_readonly_returns_erofs() {
         let (handler, _dir) = make_handler(true).await;
         let mut buf = vec![0x42u8; BLOCK_SIZE];
-        let result =
-            handle_io(ublk_core::sys::UBLK_IO_OP_WRITE, 0, BLOCK_SIZE as u32, false, &mut buf, &handler).await;
+        let result = handle_io(
+            ublk_core::sys::UBLK_IO_OP_WRITE,
+            0,
+            BLOCK_SIZE as u32,
+            false,
+            &mut buf,
+            &handler,
+        )
+        .await;
         assert_eq!(result, -libc::EROFS);
     }
 
     #[tokio::test]
     async fn zero_length_read_returns_zero() {
         let (handler, _dir) = make_handler(false).await;
-        let result =
-            handle_io(ublk_core::sys::UBLK_IO_OP_READ, 0, 0, false, &mut [], &handler).await;
+        let result = handle_io(
+            ublk_core::sys::UBLK_IO_OP_READ,
+            0,
+            0,
+            false,
+            &mut [],
+            &handler,
+        )
+        .await;
         assert_eq!(result, 0);
     }
 
