@@ -29,7 +29,7 @@ pub fn zc_no_payload(op: u32) -> Option<ZcNoPayload> {
     match op {
         UBLK_IO_OP_FLUSH => Some(ZcNoPayload::RunHandler),
         UBLK_IO_OP_DISCARD => Some(ZcNoPayload::AdvertisedNoop),
-        UBLK_IO_OP_WRITE_ZEROES => Some(ZcNoPayload::AdvertisedNoop),
+        UBLK_IO_OP_WRITE_ZEROES => Some(ZcNoPayload::RunHandler),
         _ => None,
     }
 }

@@ -1422,6 +1422,14 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
         use ublk_core::zc::{ZcAction, ZcChunk, ZcChunkOp, ZcDispatch};
 
         match u32::from(op) {
+            op if crate::block::ublk_zc_policy::zc_no_payload(op)
+                == Some(crate::block::ublk_zc_policy::ZcNoPayload::AdvertisedNoop) =>
+            {
+                ZcDispatch::Inline {
+                    action: ZcAction::Complete(0),
+                    keepalive: None,
+                }
+            }
             sys::UBLK_IO_OP_FLUSH => {
                 // FLUSH must be Deferred, not Inline. `handler.flush()` →
                 // `cache.flush()` acquires `data_file.read()` task-fairly.
@@ -1452,8 +1460,21 @@ impl ublk_core::zc::ZcTarget for GlidefsZcTarget {
                 });
                 ZcDispatch::Deferred
             }
-            sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
-                ZcDispatch::Inline { action: ZcAction::Complete(0), keepalive: None }
+            sys::UBLK_IO_OP_WRITE_ZEROES => {
+                // Advertised (max_write_zeroes_sectors = 16 MiB). The USER_COPY
+                // path calls handler.write_zeroes; ZC used to Complete(0) and
+                // leave guest-visible stale bytes. Run the same handler.
+                let handler = Arc::clone(&self.handler);
+                let handle = handle.clone();
+                self.runtime.spawn(async move {
+                    let mut guard = SubmitGuard::new(tag, handle);
+                    let res = run_mutating("ublk-zc-write-zeroes", &handler, || {
+                        handler.write_zeroes(offset, length, false)
+                    })
+                    .await;
+                    guard.commit(ZcAction::Complete(res), None);
+                });
+                ZcDispatch::Deferred
             }
             sys::UBLK_IO_OP_WRITE => {
                 // Inline fast path: avoid `runtime.spawn` + mpsc/eventfd
@@ -2454,6 +2475,21 @@ mod tests {
         let result =
             handle_io(ublk_core::sys::UBLK_IO_OP_DISCARD, 0, BLOCK_SIZE as u32, false, &mut [], &handler).await;
         assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn zc_policy_opcodes_match_sys() {
+        use crate::block::ublk_zc_policy::{self, ZcNoPayload};
+        assert_eq!(sys::UBLK_IO_OP_FLUSH, ublk_zc_policy::UBLK_IO_OP_FLUSH);
+        assert_eq!(sys::UBLK_IO_OP_DISCARD, ublk_zc_policy::UBLK_IO_OP_DISCARD);
+        assert_eq!(
+            sys::UBLK_IO_OP_WRITE_ZEROES,
+            ublk_zc_policy::UBLK_IO_OP_WRITE_ZEROES
+        );
+        assert_eq!(
+            ublk_zc_policy::zc_no_payload(sys::UBLK_IO_OP_WRITE_ZEROES),
+            Some(ZcNoPayload::RunHandler)
+        );
     }
 
     #[tokio::test]
