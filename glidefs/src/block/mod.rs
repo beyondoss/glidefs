@@ -35,6 +35,10 @@ pub mod write_trace;
 #[allow(unsafe_code)] // Netlink socket FFI
 pub mod nbd;
 
+// Opcode policy for ublk zero-copy no-payload ops. Lives outside the
+// Linux/ublk cfg so the WRITE_ZEROES-must-run contract is testable here.
+pub mod ublk_zc_policy;
+
 // ublk transport (Linux 6.0+, io_uring-based userspace block device)
 #[cfg(all(target_os = "linux", feature = "ublk"))]
 #[allow(unsafe_code)] // io_uring + eventfd FFI, single-threaded executor
