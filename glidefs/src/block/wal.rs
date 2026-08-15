@@ -325,8 +325,9 @@ impl Wal {
 
     /// Replay a WAL file, returning entries with sequence > min_sequence.
     ///
-    /// Returns `Ok(vec![])` if the file does not exist. Stops at the first
-    /// corrupted or truncated entry (torn tail is discarded, not an error).
+    /// Returns `Ok(vec![])` if the file does not exist. A torn last record
+    /// (short read) is discarded. A complete 20 B record whose CRC fails is
+    /// skipped so a mid-file bitrot does not hide later DIRTY marks.
     pub fn replay(path: &Path, min_sequence: u64) -> io::Result<Vec<WalEntry>> {
         let file = match File::open(path) {
             Ok(f) => f,
@@ -345,13 +346,19 @@ impl Wal {
                     }
                 }
                 Ok(None) => break,  // clean EOF
-                Err(e) => {
-                    // Log corruption type (CRC mismatch vs short read) for diagnostics.
-                    // This is expected for torn writes after unclean shutdown.
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                     tracing::warn!(
                         recovered = entries.len(),
                         error = %e,
-                        "WAL replay stopped at corrupted/truncated entry"
+                        "skipping WAL record with bad CRC"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        recovered = entries.len(),
+                        error = %e,
+                        "WAL replay stopped at truncated entry"
                     );
                     break;
                 }
@@ -481,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wal_crc_corruption() {
+    fn test_wal_crc_corruption_keeps_suffix() {
         let dir = TempDir::new().unwrap();
         let wal_path = dir.path().join("test.wal");
 
