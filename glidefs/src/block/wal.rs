@@ -1,4 +1,8 @@
-#![allow(clippy::cast_possible_wrap, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 //! Write-Ahead Log for crash recovery.
 //!
 //! Append-only log on local SSD. Each entry records which chunk was modified
@@ -186,9 +190,8 @@ impl Wal {
                 // two processes see "no PID" and both try to claim:
                 // only one will get the flock.
                 // SAFETY: lockfile is a valid open fd we own.
-                let lock_ret = unsafe {
-                    libc::flock(lockfile.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)
-                };
+                let lock_ret =
+                    unsafe { libc::flock(lockfile.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if lock_ret != 0 {
                     let err = io::Error::last_os_error();
                     return Err(if err.kind() == io::ErrorKind::WouldBlock {
@@ -255,21 +258,18 @@ impl Wal {
         // `Wal` for its entire lifetime (closed only in `Drop`). The read
         // guard taken above excludes concurrent `truncate`. `buf`/`buf.len()`
         // describe a live, initialized slice; the kernel only reads from it.
-        let written = unsafe {
-            libc::write(
-                self.fd,
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-            )
-        };
+        let written =
+            unsafe { libc::write(self.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
         if written < 0 {
             return Err(io::Error::last_os_error());
         }
         let written = written as usize;
         if written != buf.len() {
-            return Err(io::Error::other(
-                format!("WAL short write: expected {} bytes, wrote {}", buf.len(), written),
-            ));
+            return Err(io::Error::other(format!(
+                "WAL short write: expected {} bytes, wrote {}",
+                buf.len(),
+                written
+            )));
         }
 
         Ok(())
@@ -345,7 +345,7 @@ impl Wal {
                         entries.push(entry);
                     }
                 }
-                Ok(None) => break,  // clean EOF
+                Ok(None) => break, // clean EOF
                 Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                     tracing::warn!(
                         recovered = entries.len(),
@@ -479,7 +479,8 @@ mod tests {
         {
             let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
             // Write a partial header (less than a full entry)
-            file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02]).unwrap();
+            file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02])
+                .unwrap();
             file.flush().unwrap();
         }
 
@@ -504,7 +505,11 @@ mod tests {
         {
             // Each entry is 20 bytes. Entry 2 ends at byte 40.
             let crc_offset = 40 - 4; // = 36
-            let mut file = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
             use std::io::{Seek, SeekFrom};
             file.seek(SeekFrom::Start(crc_offset)).unwrap();
             let mut crc_bytes = [0u8; 4];
@@ -589,7 +594,11 @@ mod tests {
             // Entry 1: block_index(8) + seq(8) + crc(4) = 20 bytes
             let entry_1_end: u64 = 20;
             let crc_offset = entry_1_end - 4;
-            let mut file = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
             use std::io::{Seek, SeekFrom};
             file.seek(SeekFrom::Start(crc_offset)).unwrap();
             let mut crc_bytes = [0u8; 4];
@@ -632,7 +641,10 @@ mod tests {
         }
 
         let entries = Wal::replay(&wal_path, 0).unwrap();
-        assert!(entries.is_empty(), "fully corrupted WAL should yield empty replay");
+        assert!(
+            entries.is_empty(),
+            "fully corrupted WAL should yield empty replay"
+        );
     }
 
     #[test]
@@ -684,7 +696,11 @@ mod tests {
         drop(wal);
 
         let entries = Wal::replay(&wal_path, 0).unwrap();
-        assert_eq!(entries.len(), 800, "all 8×100 entries should be recoverable");
+        assert_eq!(
+            entries.len(),
+            800,
+            "all 8×100 entries should be recoverable"
+        );
 
         // All sequence numbers should be present (order may vary)
         let mut seqs: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
