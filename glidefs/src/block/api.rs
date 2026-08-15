@@ -61,16 +61,15 @@ pub struct CreateVolumeRequest {
     /// placement generation). When `> 0`, the attach is admitted only if this
     /// generation is `>=` the volume's stored generation; a strictly-newer
     /// generation fences an older holder out (see [`crate::block::fence`]).
-    /// Omitted / `0` = the caller does not participate in the high half.
+    /// Omitted / `0` on both halves is Grant only against an unfenced volume.
     #[serde(default)]
     pub generation: Option<u64>,
     /// Single-attach fencing token, low half: the node-lease claim revision.
     /// Orders same-`node_id` incarnations (a node-death re-fork does NOT advance
     /// the orchestrator [`Self::generation`], so this is what fences it). The
     /// fence compares the composite `(generation, lease_revision)`. Omitted /
-    /// `0` = the caller does not participate in the low half. The back-compat
-    /// bypass requires BOTH halves to be 0; a caller sending only a
-    /// `lease_revision` DOES participate. (See [`crate::block::fence`].)
+    /// `0` on both halves is Grant only against an unfenced volume. A caller
+    /// sending only a `lease_revision` participates. (See [`crate::block::fence`].)
     #[serde(default)]
     pub lease_revision: Option<u64>,
 }
@@ -360,8 +359,8 @@ async fn create_or_attach_volume(
     from: &FromRef,
 ) -> Response<BoxBody> {
     // Single-attach fencing token: high half = orchestrator placement
-    // generation, low half = node-lease claim revision. 0/0 = the caller does
-    // not participate in fencing (back-compat bypass); a lease-only token still
+    // generation, low half = node-lease claim revision. 0/0 is Grant only
+    // against an unfenced volume; a lease-only token still
     // participates.
     let my_gen = req.generation.unwrap_or(0);
     let my_lease = req.lease_revision.unwrap_or(0);
@@ -490,7 +489,8 @@ async fn create_or_attach_volume(
             // Attach-time fence + seize, BEFORE persisting the index, registering
             // the device, or serving any I/O. A rejected attach has uploaded zero
             // data packs, so there is nothing to orphan — this is what prevents
-            // the at-sync orphaned-packs data loss. Skipped for the 0/0 bypass.
+            // the at-sync orphaned-packs data loss. (0,0) is Grant only
+            // against an unfenced volume.
             match router.enforce_attach_fence(name, my_gen, my_lease).await {
                 Ok(crate::block::fence::Fence::Grant) => {}
                 Ok(crate::block::fence::Fence::Reject) => {
@@ -1983,10 +1983,10 @@ mod tests {
         );
     }
 
-    /// Back-compat: a caller that does not send a generation (the gen-0 bypass)
-    /// is never fenced, even against a volume already owned at a high generation.
+    /// A caller that omits generation (token 0,0) is admitted only against an
+    /// unfenced volume. Once the volume holds a real token, (0,0) is 409.
     #[tokio::test]
-    async fn test_attach_without_generation_bypasses_fence() {
+    async fn test_attach_without_generation_is_fenced() {
         let shared: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store::memory::InMemory::new());
 
@@ -2000,7 +2000,6 @@ mod tests {
         )
         .await;
 
-        // A legacy caller (no generation field) attaches on a fresh node → granted.
         let temp_b = TempDir::new().unwrap();
         let node_b = create_test_router_with_store(&temp_b, Arc::clone(&shared)).await;
         let resp = request(
@@ -2012,8 +2011,8 @@ mod tests {
         .await;
         assert_eq!(
             resp.status(),
-            StatusCode::CREATED,
-            "the gen-0 bypass must not be fenced"
+            StatusCode::CONFLICT,
+            "a (0,0) caller must not attach a volume already owned at gen 9"
         );
     }
 
