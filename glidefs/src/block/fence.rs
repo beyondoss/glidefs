@@ -66,18 +66,16 @@ pub fn attach_fence(stored_token: u128, my_token: u128) -> Fence {
     }
 }
 
-/// Call-site wrapper applying the back-compat bypass around [`attach_fence`],
-/// composing the caller's `(generation, lease_revision)` against the stored
-/// `(stored_generation, stored_lease_revision)`.
+/// Call-site wrapper around [`attach_fence`], composing the caller's
+/// `(generation, lease_revision)` against the stored token.
 ///
-/// Fencing engages only when the caller opts in with a non-zero token. A caller
-/// presenting `generation == 0 && lease_revision == 0` (a legacy instd that
-/// sends neither, or any non-participating client) is always granted and never
-/// bumps the stored token. Note the bypass requires BOTH halves to be zero: a
-/// caller that sends only a `lease_revision` (generation 0, lease > 0) DOES
-/// participate and is fenced on the composite. Roll-out is therefore one-way per
-/// volume: once a volume has been stamped with any non-zero token, only callers
-/// presenting a high-enough composite are admitted.
+/// A `(0, 0)` caller is only admitted against an unfenced volume
+/// (stored token also `(0, 0)` — first attach / homelab with no
+/// orchestrator generation). Once the volume holds a real token,
+/// `(0, 0)` is `Reject`: the same machine as
+/// `attach_fence(stored, compose(0, 0))`. A caller that sends only a
+/// `lease_revision` (generation 0, lease > 0) participates and is
+/// ordered on the composite.
 #[must_use]
 pub fn fence_attach(
     stored_generation: u64,
@@ -85,9 +83,6 @@ pub fn fence_attach(
     my_generation: u64,
     my_lease_revision: u64,
 ) -> Fence {
-    if my_generation == 0 && my_lease_revision == 0 {
-        return Fence::Grant;
-    }
     attach_fence(
         compose_token(stored_generation, stored_lease_revision),
         compose_token(my_generation, my_lease_revision),
