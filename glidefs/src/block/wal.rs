@@ -508,9 +508,16 @@ mod tests {
             file.flush().unwrap();
         }
 
-        let entries = Wal::replay(&wal_path, 0).unwrap();
-        assert_eq!(entries.len(), 1, "should recover only entry 1 before corruption");
-        assert_eq!(entries[0].sequence, 1);
+        match Wal::replay(&wal_path, 0) {
+            Err(_) => {}
+            Ok(entries) => {
+                let seqs: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
+                assert!(
+                    seqs.contains(&3),
+                    "mid-file CRC must not drop later CRC-ok records; got {seqs:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -586,9 +593,16 @@ mod tests {
             file.flush().unwrap();
         }
 
-        // Replay should recover zero entries — corruption at entry 0 means everything is lost
-        let entries = Wal::replay(&wal_path, 0).unwrap();
-        assert_eq!(entries.len(), 0, "corrupted first entry should yield zero recovered entries");
+        match Wal::replay(&wal_path, 0) {
+            Err(_) => {}
+            Ok(entries) => {
+                let seqs: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
+                assert!(
+                    seqs.contains(&3),
+                    "first-record CRC miss must not drop later CRC-ok records; got {seqs:?}"
+                );
+            }
+        }
     }
 
     #[test]
