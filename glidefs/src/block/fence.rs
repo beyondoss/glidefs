@@ -166,13 +166,17 @@ mod tests {
     }
 
     #[test]
-    fn zero_token_bypass_always_grants() {
-        // A fully non-participating caller (generation == 0 AND
-        // lease_revision == 0) is never fenced, even against an already-fenced
-        // volume — this is the back-compat bypass.
-        assert_eq!(fence_attach(5, 0, 0, 0), Fence::Grant);
+    fn zero_token_does_not_bypass_a_fenced_volume() {
+        // First attach against an unfenced volume is still Grant.
         assert_eq!(fence_attach(0, 0, 0, 0), Fence::Grant);
-        assert_eq!(fence_attach(9, 4, 0, 0), Fence::Grant);
+        // Once a volume holds a real token, (0,0) must not sneak in —
+        // that is the same machine as attach_fence(stored, compose(0,0)).
+        assert_eq!(fence_attach(5, 0, 0, 0), Fence::Reject);
+        assert_eq!(fence_attach(9, 4, 0, 0), Fence::Reject);
+        assert_eq!(
+            fence_attach(9, 4, 0, 0),
+            attach_fence(compose_token(9, 4), compose_token(0, 0))
+        );
     }
 
     #[test]
