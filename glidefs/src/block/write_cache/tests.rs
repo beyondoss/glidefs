@@ -2742,7 +2742,7 @@ async fn write_materialized_aborts_on_stolen_claim() {
 
     // Our stale pre-image must NOT land.
     let stale = vec![0x11_u8; block_size];
-    let landed = h.cache.write_materialized(0, &stale, 0).unwrap();
+    let landed = h.cache.write_materialized(0, &stale, &claim).unwrap();
     assert!(!landed, "write_materialized must abort on a stolen claim");
     drop(claim);
 
@@ -2755,14 +2755,78 @@ async fn write_materialized_aborts_on_stolen_claim() {
     assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::DIRTY);
 
     // Control: an unstolen claim lands normally.
-    let claim2 = h.cache.claim_block_for_materialization(1);
-    assert!(claim2.is_some());
+    let claim2 = h
+        .cache
+        .claim_block_for_materialization(1)
+        .expect("claim should win on a NOT_PRESENT block");
     let landed = h
         .cache
-        .write_materialized(block_size as u64, &vec![0x22_u8; block_size], 1)
+        .write_materialized(block_size as u64, &vec![0x22_u8; block_size], &claim2)
         .unwrap();
     assert!(landed, "unstolen materialization must land");
     assert_eq!(h.cache.inner.state_map.get(1), SparseBlockState::DIRTY);
+}
+
+/// `write_materialized` must ABORT when the block cycled all the way back to
+/// CLEAN under a DIFFERENT owner — the stale-prior RMW (issue #92).
+///
+/// `CLEAN` is not an identity. Across a slow S3 fetch the claimed block can
+/// be stolen (CLEAN→DIRTY), uploaded and evicted by a flush
+/// (→SYNCING→NOT_PRESENT) and then re-claimed by a LATER writer — the ublk ZC
+/// `pre_write` marks its blocks present (NOT_PRESENT→CLEAN) and only lands
+/// the guest bytes afterwards, via the kernel `WRITE_FIXED`. A commit gated
+/// on "state == CLEAN" alone passes there and pwrites the fetched pre-image
+/// over the newer writer's data — rolling back a write that was already
+/// acknowledged AND uploaded. The claim token closes it: the bypassing
+/// NOT_PRESENT→CLEAN invalidates the live claim before flipping the state.
+#[tokio::test]
+async fn write_materialized_aborts_when_block_was_reclaimed() {
+    let block_size = 128 * 1024usize;
+    let h = V2Harness::with_config(2 * block_size as u64, block_size).await;
+
+    // Writer M claims block 0 for materialization and starts a (slow) fetch.
+    let claim = h
+        .cache
+        .claim_block_for_materialization(0)
+        .expect("claim should win on a NOT_PRESENT block");
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::CLEAN);
+
+    // While M fetches: a guest write steals the block and commits...
+    assert!(h.cache.inner.state_map.cas(0, SparseBlockState::CLEAN, SparseBlockState::DIRTY).is_ok());
+    // ...a flush uploads it to S3 and evicts it...
+    assert!(h.cache.inner.state_map.cas(0, SparseBlockState::DIRTY, SparseBlockState::SYNCING).is_ok());
+    assert!(h.cache.inner.state_map.cas(0, SparseBlockState::SYNCING, SparseBlockState::NOT_PRESENT).is_ok());
+    // ...and a LATER writer claims the now-NOT_PRESENT block the way the ublk
+    // ZC `pre_write` does (mark present, land the bytes afterwards).
+    h.cache.inner.set_present(0);
+    assert_eq!(
+        h.cache.inner.state_map.get(0),
+        SparseBlockState::CLEAN,
+        "the later writer's claim must have taken the block"
+    );
+    let guest = vec![0xD7_u8; block_size];
+    h.cache.inner.data_file.read().write_all_at(&guest, 0).unwrap();
+
+    // M's fetch finally completes. Its pre-image is stale — it must not land.
+    let stale = vec![0x11_u8; block_size];
+    let landed = h.cache.write_materialized(0, &stale, &claim).unwrap();
+    assert!(
+        !landed,
+        "write_materialized must abort: the CLEAN it sees belongs to a later writer"
+    );
+
+    // The error path must not knock the later writer's claim back to
+    // NOT_PRESENT either — that would strand its in-flight data write.
+    assert!(!claim.unclaim(), "unclaim must not revert a later writer's claim");
+    assert_eq!(h.cache.inner.state_map.get(0), SparseBlockState::CLEAN);
+    drop(claim);
+
+    let mut buf = vec![0u8; block_size];
+    h.cache.inner.data_file.read().read_exact_at(&mut buf, 0).unwrap();
+    assert!(
+        buf.iter().all(|&b| b == 0xD7),
+        "the later writer's data must survive — stale pre-image must not have landed"
+    );
 }
 
 /// Regression test: post-rotation zero-write must survive crash recovery.

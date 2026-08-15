@@ -103,13 +103,28 @@ impl WriteCache<Active> {
     /// (Found by the stateright faithful model — a straggler full-block
     /// writer whose pre_write predates our claim can land data + commit
     /// between our claim and our pwrite.)
+    ///
+    /// **Why the state check is not enough on its own:** `CLEAN` is not an
+    /// identity. Across a slow fetch the block can be stolen, uploaded by a
+    /// flush, evicted to `NOT_PRESENT` and then re-claimed by a LATER writer
+    /// (the ublk ZC `pre_write` marks its blocks present before the kernel
+    /// lands the bytes) — arriving back at `CLEAN` with someone else's write
+    /// pending. Landing the pre-image there resurrects it over data that has
+    /// already been acknowledged and uploaded. So the commit is gated on the
+    /// claim's token as well, in the same critical section: `is_valid` ⇒ no
+    /// bypassing `NOT_PRESENT → CLEAN` has happened since we claimed.
     pub fn write_materialized(
         &self,
         offset: u64,
         data: &[u8],
-        block_idx: usize,
+        claim: &super::flush::MaterializationClaim<'_>,
     ) -> Result<bool, CacheError> {
         use crate::block::block_map::SparseBlockState;
+        debug_assert!(
+            std::ptr::eq(claim.cache_inner, std::sync::Arc::as_ptr(&self.inner)),
+            "materialization claim belongs to a different cache"
+        );
+        let block_idx = claim.block_idx();
         if data.is_empty() {
             return Ok(true);
         }
@@ -127,15 +142,28 @@ impl WriteCache<Active> {
         let end_block = (end - 1) / block_size;
 
         let df = self.inner.data_file.write();
-        if self.inner.state_map.get(block_idx) != SparseBlockState::CLEAN {
-            // Stolen: a guest write committed newer data for this block.
-            return Ok(false);
-        }
-        df.write_all_at(data, offset)?;
-        self.inner.capture_page_crcs(offset, data);
-        self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
+        // Claim-identity + state check and the pwrite are one critical
+        // section: `if_valid` holds the claim map, so a bypassing
+        // NOT_PRESENT→CLEAN (which invalidates first, flips second) can
+        // neither be missed here nor slip in before the pwrite lands.
+        let landed = self
+            .inner
+            .promote_claim
+            .if_valid(block_idx, claim.token, || -> Result<bool, CacheError> {
+                if self.inner.state_map.get(block_idx) != SparseBlockState::CLEAN {
+                    // Stolen: a guest write committed newer data for this block.
+                    return Ok(false);
+                }
+                df.write_all_at(data, offset)?;
+                self.inner.capture_page_crcs(offset, data);
+                self.wal_append_and_mark_dirty(&df, start_block, end_block)?;
+                Ok(true)
+            })
+            // Claim no longer ours: the block was re-claimed by a later
+            // writer while we fetched. Our pre-image is stale — skip it.
+            .unwrap_or(Ok(false))?;
         drop(df);
-        Ok(true)
+        Ok(landed)
     }
 
     /// Write data with eviction detection for sub-block backfill safety.

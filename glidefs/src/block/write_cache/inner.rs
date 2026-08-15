@@ -312,27 +312,105 @@ impl HandoffPhase {
 /// state for an occasionally-held flag. Sparse storage costs O(in-flight),
 /// independent of device size.
 ///
-/// Empty cost: `Mutex<HashSet>` ≈ 64 B per export.
+/// Empty cost: `Mutex<HashMap>` ≈ 64 B per export.
 /// Per-claim cost: one short mutex critical section (insert/remove). The
 /// mutex contends only during the promote handshake itself, never on the
 /// data plane.
+///
+/// ## Claim identity (`ClaimToken`)
+///
+/// A materialization claim ([`WriteCache::claim_block_for_materialization`])
+/// is held across an S3 fetch — seconds, not microseconds. `CLEAN` alone is
+/// therefore NOT proof that the block is still the one the holder claimed:
+/// the block can be stolen (CLEAN→DIRTY), flushed (→SYNCING→NOT_PRESENT) and
+/// re-claimed by an unrelated writer, ending back at CLEAN. A commit gated
+/// only on "state == CLEAN" would land the holder's now-stale pre-image on
+/// top of that later writer's data — resurrecting a pre-image over an
+/// already-durable page.
+///
+/// Every claim therefore carries a monotonically-increasing [`ClaimToken`],
+/// and any `NOT_PRESENT → CLEAN` transition that does NOT go through the
+/// claim ([`CacheInner::set_present`], i.e. the ublk ZC `pre_write` path)
+/// invalidates whatever claim is live for that block *before* it flips the
+/// state. `is_valid(idx, token)` is then an exact "this CLEAN is still
+/// mine" test, and the holder aborts instead of clobbering.
 pub(crate) struct PromoteClaimBitmap {
-    in_flight: parking_lot::Mutex<std::collections::HashSet<usize>>,
+    in_flight: parking_lot::Mutex<std::collections::HashMap<usize, ClaimSlot>>,
     released: parking_lot::Condvar,
+    next_token: AtomicU64,
+}
+
+/// Identity of one claim on a block. Compared by value — a claim that was
+/// invalidated or replaced never matches its holder's token again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClaimToken(u64);
+
+struct ClaimSlot {
+    token: ClaimToken,
+    /// Cleared when someone else materializes/claims this block underneath
+    /// the holder. A stale holder must not commit.
+    valid: bool,
 }
 
 impl PromoteClaimBitmap {
     pub(super) fn new() -> Self {
         Self {
-            in_flight: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            in_flight: parking_lot::Mutex::new(std::collections::HashMap::new()),
             released: parking_lot::Condvar::new(),
+            next_token: AtomicU64::new(1),
         }
     }
 
     /// Insert `idx` into the in-flight set. `true` iff this caller's
     /// insertion was new (i.e., they own the claim).
     pub(super) fn try_claim(&self, idx: usize) -> bool {
-        self.in_flight.lock().insert(idx)
+        self.try_claim_token(idx).is_some()
+    }
+
+    /// [`Self::try_claim`], returning the claim's identity. Callers that
+    /// hold the claim across an await point (S3 materialization) must use
+    /// this and gate their commit on [`Self::is_valid`].
+    pub(super) fn try_claim_token(&self, idx: usize) -> Option<ClaimToken> {
+        let token = ClaimToken(self.next_token.fetch_add(1, Ordering::Relaxed));
+        let mut g = self.in_flight.lock();
+        if g.contains_key(&idx) {
+            return None;
+        }
+        g.insert(idx, ClaimSlot { token, valid: true });
+        Some(token)
+    }
+
+    /// Is `token` still the live, un-invalidated claim on `idx`?
+    pub(super) fn is_valid(&self, idx: usize, token: ClaimToken) -> bool {
+        self.if_valid(idx, token, || ()).is_some()
+    }
+
+    /// Run `f` iff `token` is still the live claim on `idx`, holding the
+    /// claim map across it — so a bypassing `NOT_PRESENT → CLEAN` cannot
+    /// slip in between the validity test and the commit it guards.
+    ///
+    /// `f` must not re-enter the claim map (the mutex is not reentrant).
+    pub(super) fn if_valid<R>(
+        &self,
+        idx: usize,
+        token: ClaimToken,
+        f: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let g = self.in_flight.lock();
+        match g.get(&idx) {
+            Some(slot) if slot.valid && slot.token == token => Some(f()),
+            _ => None,
+        }
+    }
+
+    /// Invalidate the live claim on `idx`, if any. Called by every
+    /// `NOT_PRESENT → CLEAN` transition that bypasses the claim, BEFORE the
+    /// state flips — so a holder that reads `CLEAN` and then finds its token
+    /// still valid is guaranteed to be looking at its own claim.
+    pub(super) fn invalidate(&self, idx: usize) {
+        if let Some(slot) = self.in_flight.lock().get_mut(&idx) {
+            slot.valid = false;
+        }
     }
 
     /// Park until another task `release`s `idx` (or `deadline` passes).
@@ -342,7 +420,7 @@ impl PromoteClaimBitmap {
     /// thread, but only for the actual wait, with no CPU burn.
     pub(super) fn wait_for_release(&self, idx: usize, deadline: std::time::Instant) -> bool {
         let mut g = self.in_flight.lock();
-        while g.contains(&idx) {
+        while g.contains_key(&idx) {
             let now = std::time::Instant::now();
             if now >= deadline {
                 return false;
@@ -362,7 +440,7 @@ impl PromoteClaimBitmap {
 
     /// Whether any task currently holds the claim for `idx`.
     pub(super) fn is_claimed(&self, idx: usize) -> bool {
-        self.in_flight.lock().contains(&idx)
+        self.in_flight.lock().contains_key(&idx)
     }
 }
 
@@ -854,11 +932,29 @@ impl CacheInner {
     }
 
     /// Mark block as present (lock-free CAS NOT_PRESENT -> CLEAN).
+    ///
+    /// Unlike [`WriteCache::try_claim_block`] this does NOT linearize through
+    /// the promote claim — the ublk ZC `pre_write` marks its blocks present
+    /// and only lands the guest bytes later (kernel `WRITE_FIXED`), so it
+    /// cannot hold the claim across the transition. That makes it the one
+    /// path that can install a CLEAN on a block some materializer still
+    /// believes it owns (its claim's CLEAN having been stolen + flushed +
+    /// evicted meanwhile). Invalidate that claim BEFORE flipping the state:
+    /// the holder's `write_materialized` then aborts instead of landing its
+    /// stale S3 pre-image over the newer, already-durable data.
+    ///
+    /// The claim map is only touched when the block is actually NOT_PRESENT
+    /// — the steady-state overwrite path (block already present) stays
+    /// lock-free.
     #[inline]
     pub(super) fn set_present(&self, block_num: usize) {
         if block_num >= self.num_blocks {
             return;
         }
+        if self.state_map.is_present(block_num) {
+            return;
+        }
+        self.promote_claim.invalidate(block_num);
         self.state_map.set_present(block_num);
     }
 

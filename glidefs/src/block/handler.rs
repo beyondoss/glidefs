@@ -450,6 +450,17 @@ impl BlockHandler {
             // NOT_PRESENT (even if the data pwrite never completed, the
             // guest's WRITE_FIXED is the source of truth for the bytes the
             // caller is writing).
+            //
+            // A LIVE (merely slow) winner can't clobber us afterwards
+            // either. Its commit (`write_materialized`) takes the data_file
+            // WRITE lock, and our data lands under the rotation READ gate
+            // held from before WRITE_FIXED through the DIRTY commit — so the
+            // two are ordered, never interleaved: the winner either lands
+            // its merged block before ours (our bytes go on top) or finds
+            // the block DIRTY and aborts. And if the block is meanwhile
+            // evicted and RE-claimed, `pre_write`'s `set_present`
+            // invalidates the winner's claim token, so its stale pre-image
+            // aborts there too. See `MaterializationClaim::is_valid`.
             let clean_deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(5);
             loop {
@@ -549,9 +560,12 @@ impl BlockHandler {
                 Ok(data) => data,
                 Err(e) => {
                     // Revert the state claim — a dangling CLEAN block parks
-                    // every sibling writer on the CLEAN-wait. (The promote
-                    // claim releases when `claim` drops.)
-                    self.cache.unclaim_block(idx);
+                    // every sibling writer on the CLEAN-wait. Claim-checked:
+                    // if the block was re-claimed underneath us, the CLEAN is
+                    // a later writer's and must not be knocked back to
+                    // NOT_PRESENT. (The promote claim releases when `claim`
+                    // drops.)
+                    claim.unclaim();
                     return Err(e.into());
                 }
             };
@@ -573,16 +587,16 @@ impl BlockHandler {
             // claim (committed newer data) while we fetched. On a steal the
             // block is DIRTY with the guest's bytes; our stale pre-image
             // must NOT land. The caller's own WRITE_FIXED still follows.
-            match self.cache.write_materialized(block_start, &block_data, idx) {
+            match self.cache.write_materialized(block_start, &block_data, &claim) {
                 Ok(true) => {}
                 Ok(false) => {
                     tracing::debug!(
                         block = idx,
-                        "backfill: claim stolen by concurrent guest write; skipping stale pre-image"
+                        "backfill: claim stolen or re-claimed by a concurrent guest write; skipping stale pre-image"
                     );
                 }
                 Err(e) => {
-                    self.cache.unclaim_block(idx);
+                    claim.unclaim();
                     return Err(e.into());
                 }
             }
@@ -844,8 +858,10 @@ impl BlockHandler {
                     Err(e) => {
                         // Revert the state claim — a dangling CLEAN block
                         // parks every sibling writer on the CLEAN-wait.
-                        // (The promote claim releases when `claim` drops.)
-                        self.cache.unclaim_block(idx);
+                        // Claim-checked: a CLEAN that is no longer ours
+                        // belongs to a later writer. (The promote claim
+                        // releases when `claim` drops.)
+                        claim.unclaim();
                         tracing::warn!(
                             block = idx,
                             error = %e,
@@ -861,7 +877,16 @@ impl BlockHandler {
                 // block is CLEAN (claimed); cache.write transitions it DIRTY
                 // and the rest of the block stays sparse zeros — consistent
                 // with the all-zero prior.
+                //
+                // Only while the claim is still ours: if the block was
+                // stolen, flushed out and re-claimed while we fetched, "the
+                // remainder is legitimately zeros" no longer holds (the S3
+                // image moved on), so re-enter the state machine instead.
                 if prior.is_empty() || prior.iter().all(|&b| b == 0) {
+                    if !claim.is_valid() {
+                        drop(claim);
+                        continue 'block_retry;
+                    }
                     self.cache.write(write_start, &data[data_offset..data_offset + write_len])?;
                     drop(claim);
                     break 'block_retry;
@@ -870,7 +895,7 @@ impl BlockHandler {
                 // We hold the claim. Merge guest data onto prior block.
                 let mut block_buf = prior.to_vec();
                 if block_buf.len() != block_size {
-                    self.cache.unclaim_block(idx);
+                    claim.unclaim();
                     tracing::error!(
                         block = idx,
                         expected = block_size,
@@ -885,13 +910,14 @@ impl BlockHandler {
 
                 _backfill_gate!(BackfillStep::BeforeWrite, idx, self.cache.block_state(idx).raw());
 
-                // Materialized write (write lock + CLEAN re-check). A steal
-                // means a concurrent guest write committed newer data while
-                // we fetched — our merged block embeds the STALE pre-image,
-                // so discard it and re-enter the state machine: the block is
-                // now DIRTY, and the has_local_data arm writes only our own
-                // guest sub-range on top.
-                match self.cache.write_materialized(block_start, &block_buf, idx) {
+                // Materialized write (write lock + CLEAN + claim-identity
+                // re-check). A steal means a concurrent guest write committed
+                // newer data while we fetched — our merged block embeds the
+                // STALE pre-image, so discard it and re-enter the state
+                // machine: the block is now DIRTY (or re-claimed by a later
+                // writer), and the retry writes only our own guest sub-range
+                // on top of whatever materialized it.
+                match self.cache.write_materialized(block_start, &block_buf, &claim) {
                     Ok(true) => {
                         drop(claim);
                         break 'block_retry;
@@ -899,13 +925,13 @@ impl BlockHandler {
                     Ok(false) => {
                         tracing::debug!(
                             block = idx,
-                            "backfill_and_write: claim stolen by concurrent guest write; rewriting sub-range only"
+                            "backfill_and_write: claim stolen or re-claimed by a concurrent guest write; rewriting sub-range only"
                         );
                         drop(claim);
                         continue 'block_retry;
                     }
                     Err(e) => {
-                        self.cache.unclaim_block(idx);
+                        claim.unclaim();
                         return Err(e.into());
                     }
                 }

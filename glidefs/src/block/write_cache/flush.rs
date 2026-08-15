@@ -602,18 +602,21 @@ impl WriteCache<Active> {
     ///
     /// Drop order: finish the data write (`cache.write` → DIRTY) BEFORE
     /// dropping the guard, so waiters re-check and observe DIRTY.
+    ///
+    /// The claim carries a [`ClaimToken`](super::inner::ClaimToken) identity:
+    /// `CLEAN` alone does not prove the block is still the one that was
+    /// claimed (see [`MaterializationClaim::is_valid`]), so the commit
+    /// ([`WriteCache::write_materialized`]) takes the guard, not a bare index.
     pub fn claim_block_for_materialization(
         &self,
         block_idx: usize,
     ) -> Option<MaterializationClaim<'_>> {
-        if !self.inner.promote_claim.try_claim(block_idx) {
-            return None;
-        }
+        let token = self.inner.promote_claim.try_claim_token(block_idx)?;
         if !self.inner.try_set_present(block_idx) {
             self.inner.promote_claim.release(block_idx);
             return None;
         }
-        Some(MaterializationClaim { cache_inner: &self.inner, block_idx })
+        Some(MaterializationClaim { cache_inner: &self.inner, block_idx, token })
     }
 }
 
@@ -621,8 +624,59 @@ impl WriteCache<Active> {
 /// promote claim from [`WriteCache::claim_block_for_materialization`] until
 /// drop. See that method for the protocol.
 pub struct MaterializationClaim<'a> {
-    cache_inner: &'a super::inner::CacheInner,
-    block_idx: usize,
+    pub(super) cache_inner: &'a super::inner::CacheInner,
+    pub(super) block_idx: usize,
+    pub(super) token: super::inner::ClaimToken,
+}
+
+impl MaterializationClaim<'_> {
+    /// The block this claim owns.
+    #[inline]
+    pub fn block_idx(&self) -> usize {
+        self.block_idx
+    }
+
+    /// Is this still the live claim on the block?
+    ///
+    /// A materialization claim is held across an S3 fetch, so `CLEAN` on its
+    /// own is not proof of ownership: the block can be stolen (CLEAN→DIRTY),
+    /// uploaded + evicted by a flush (→SYNCING→NOT_PRESENT) and re-claimed by
+    /// a later writer — landing back on CLEAN with someone else's data
+    /// pending. Committing the fetched pre-image then rolls that later,
+    /// already-durable write back to the S3 image. The token distinguishes
+    /// the two: any bypassing `NOT_PRESENT → CLEAN` (the ublk ZC `pre_write`)
+    /// invalidates the live claim before flipping the state.
+    ///
+    /// Must be evaluated in the same critical section as the state check —
+    /// `write_materialized` does both under the `data_file` write lock.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.cache_inner
+            .promote_claim
+            .is_valid(self.block_idx, self.token)
+    }
+
+    /// Revert this claim (CAS CLEAN → NOT_PRESENT) for the backfill error
+    /// path: a claimed block whose S3 fetch failed must not stay CLEAN —
+    /// sibling writers park on the CLEAN-wait expecting a CLEAN→DIRTY
+    /// transition that would never come.
+    ///
+    /// No-op if the claim is no longer ours: the CLEAN we would revert is
+    /// then a *later* writer's claim, and knocking it back to NOT_PRESENT
+    /// would strand that writer's in-flight data write on an unclaimed block.
+    /// Returns true if this call performed the transition.
+    pub fn unclaim(&self) -> bool {
+        use crate::block::block_map::SparseBlockState;
+        self.cache_inner
+            .promote_claim
+            .if_valid(self.block_idx, self.token, || {
+                self.cache_inner
+                    .state_map
+                    .cas(self.block_idx, SparseBlockState::CLEAN, SparseBlockState::NOT_PRESENT)
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    }
 }
 
 impl Drop for MaterializationClaim<'_> {
