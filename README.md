@@ -35,8 +35,13 @@ curl -fsSL https://raw.githubusercontent.com/paraglidehq/glidefs/main/install.sh
 Or build from source:
 
 ```sh
-cargo build --release -p glidefs
+cargo build --release -p glidefs --features ublk
 ```
+
+`ublk` is not a default feature. Omit it and the daemon builds fine, starts
+fine, and reports healthy — but it has no ublk transport at all, so it serves
+only NBD exports and cannot adopt the `/dev/ublkbN` devices a previous process
+left QUIESCED. Drop `--features ublk` only on hosts that use NBD exclusively.
 
 ## Quick Start
 
