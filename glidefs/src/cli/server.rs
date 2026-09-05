@@ -762,24 +762,49 @@ async fn dispatch_handoff(
 ) -> bool {
     let router = Arc::clone(router);
     let cfg = config_path.clone();
-    match run_predecessor_handoff_with_opts(router, cfg, dry_run).await {
+    let cutover = match run_predecessor_handoff_with_opts(router, cfg, dry_run).await {
         Ok(outcome) => {
             tracing::info!(?outcome, dry_run, "handoff complete");
-            if !dry_run
-                && matches!(outcome, crate::handoff::HandoffOutcome::Succeeded { .. })
-            {
+            let cutover = !dry_run
+                && matches!(outcome, crate::handoff::HandoffOutcome::Succeeded { .. });
+            if cutover {
                 info!("handoff succeeded — predecessor exiting to release listener fds");
                 *handoff_succeeded = true;
-                return true;
             }
-            // Aborted (incl. dry-run-complete) or Revived — keep serving.
-            false
+            // Otherwise: Aborted (incl. dry-run-complete) or Revived — keep serving.
+            cutover
         }
         Err(e) => {
             tracing::error!(error = %e, dry_run, "handoff failed; predecessor continues serving");
             false
         }
+    };
+
+    if !cutover {
+        // **Clear systemd's `reloading` state.** `run_predecessor` sends
+        // `sd_notify(RELOADING=1)` as soon as it accepts the successor's
+        // HELLO, but only the cutover path clears it — via
+        // `notify_handoff_to`, which moves MainPID and re-asserts READY.
+        // Every other outcome (abort, revive, dry-run, or an `Err` out of
+        // the state machine) leaves the unit stuck in
+        // `ActiveState=reloading` even though this process is healthy and
+        // still serving every export.
+        //
+        // systemd resolves that stall by SIGKILLing us at
+        // `TimeoutStartSec` (600s in the shipped unit) and cold-restarting
+        // the service. Cold start re-derives exports from the local device
+        // map plus each export's S3 `export.json`, so an export that isn't
+        // S3-discoverable is dropped outright — along with the guest whose
+        // block device it backed. Without this line, a deliberately safe,
+        // non-destructive abort escalates into an outage ten minutes later.
+        //
+        // READY=1 is idempotent: harmless when we never reached RELOADING
+        // (aborts before HELLO), and a no-op when the daemon isn't running
+        // under systemd at all ($NOTIFY_SOCKET unset).
+        crate::sd_notify::notify_ready();
     }
+
+    cutover
 }
 
 async fn run_predecessor_handoff_with_opts(
