@@ -87,7 +87,15 @@ pub async fn build_router_only(config_path: PathBuf) -> Result<BuiltRouter> {
 
     std::fs::create_dir_all(&cache_dir)?;
 
-    crate::storage_compatibility::check_if_match_support(&object_store, &db_path).await?;
+    // Waits for storage rather than exiting: nothing here has touched kernel state
+    // yet (see `wait_for_if_match_support`).
+    crate::storage_compatibility::wait_for_if_match_support(
+        &object_store,
+        &db_path,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
 
     let nbd_config = settings
         .servers
