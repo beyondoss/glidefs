@@ -106,6 +106,36 @@ pub async fn stored_bytes_exact(
     vm.read().stored_bytes()
 }
 
+/// Why a snapshot could not be sized.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotSizeError {
+    #[error("snapshot not found")]
+    NotFound,
+    #[error("snapshot manifest: {0}")]
+    Corrupt(String),
+    #[error(transparent)]
+    Store(#[from] ContentStoreError),
+}
+
+/// A registered snapshot's stored bytes, from its own manifest: exact, or
+/// `Ok(None)` when an exact figure could not be produced (same rules and the
+/// same process-wide cap as an export's). Needs no attached export, so it
+/// works after the boot export is gone.
+pub async fn snapshot_stored_bytes(
+    content_store: &ContentStore,
+    pack_index_cache: &Arc<PackIndexCache>,
+    name: &str,
+    sequence: u64,
+) -> Result<Option<u64>, SnapshotSizeError> {
+    let data = content_store
+        .get_snapshot(name, sequence)
+        .await?
+        .ok_or(SnapshotSizeError::NotFound)?;
+    let vm = VolumeManifest::deserialize(&data).map_err(|e| SnapshotSizeError::Corrupt(e.to_string()))?;
+    let vm = Arc::new(parking_lot::RwLock::new(vm));
+    Ok(stored_bytes_exact(&vm, content_store, pack_index_cache).await)
+}
+
 /// Background form, after export open: warm the counts so the first API read
 /// does not pay for them.
 pub async fn backfill_live_counts(

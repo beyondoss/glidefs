@@ -75,6 +75,9 @@ pub enum RouterError {
     #[error("Export '{0}' not found")]
     ExportNotFound(String),
 
+    #[error("Snapshot {1} of export '{0}' not found")]
+    SnapshotNotFound(String, u64),
+
     #[error(
         "Invalid export name '{0}': must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric"
     )]
@@ -2659,6 +2662,30 @@ impl ExportRouter {
         cs.list_snapshots(name)
             .await
             .map_err(RouterError::ContentStore)
+    }
+
+    /// A registered snapshot's stored bytes (non-zero blocks x block size),
+    /// from the snapshot's own manifest. Does not need the export attached:
+    /// the location comes from the durable name index, so it works after the
+    /// boot export has been released. `Ok(None)` = no exact figure possible.
+    pub async fn snapshot_stored_bytes(
+        &self,
+        name: &str,
+        sequence: u64,
+    ) -> Result<Option<u64>, RouterError> {
+        use crate::block::live_count::{SnapshotSizeError, snapshot_stored_bytes};
+        validate_export_name(name)?;
+        let config = self
+            .load_export(name)
+            .await?
+            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+        let cs = self.content_store_for_prefix(config.s3_prefix());
+        match snapshot_stored_bytes(&cs, &self.pack_index_cache, name, sequence).await {
+            Ok(b) => Ok(b),
+            Err(SnapshotSizeError::NotFound) => Err(RouterError::SnapshotNotFound(name.to_string(), sequence)),
+            Err(SnapshotSizeError::Corrupt(m)) => Err(RouterError::Manifest(m)),
+            Err(SnapshotSizeError::Store(e)) => Err(RouterError::ContentStore(e)),
+        }
     }
 
     /// Delete a specific snapshot for an export (idempotent).

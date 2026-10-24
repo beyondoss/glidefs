@@ -730,6 +730,7 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 | `/api/exports` | `GET` | List all active exports. Each carries `stored_bytes` (non-zero blocks × block_size; see VolumeManifest), omitted when it cannot be computed exactly |
 | `/api/exports/{name}/snapshot` | `POST` | Flush dirty blocks → S3, upload versioned manifest, and register the snapshot in the logical index. Optional body `{"tag":"name"}` also publishes a named alias. Returns `{snapshot_id, sequence, manifest_etag}` — fork from it via `from: "snapshot:<snapshot_id>"`. |
 | `/api/exports/{name}/snapshots` | `GET` | List snapshot sequences in ascending order |
+| `/api/exports/{name}/snapshots/{seq}` | `GET` | A snapshot's `stored_bytes`, sized from the snapshot's own manifest (exact or omitted; same rules and process-wide cap as an export's). Resolves the location from the durable name index, so it works after the export is released. 404 when the snapshot does not exist. |
 | `/api/exports/{name}/snapshots/{seq}` | `DELETE` | Delete a specific snapshot (idempotent) |
 | `/api/exports/{name}/tag` | `POST` | Publish current manifest under a named alias without re-flushing. Body: `{"tag":"name"}`. |
 | `/api/manifests/{s3_prefix}/{name}` | `HEAD` | Check manifest existence (200/404). No data transfer, no running export required. |

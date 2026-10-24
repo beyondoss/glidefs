@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 use glidefs::block::cache::BlockCache;
 use glidefs::block::content_store::ContentStore;
-use glidefs::block::live_count::{backfill_live_counts, stored_bytes_exact};
+use glidefs::block::live_count::{SnapshotSizeError, backfill_live_counts, snapshot_stored_bytes, stored_bytes_exact};
 use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::WriteCache;
@@ -521,4 +521,55 @@ async fn backfill_across_many_exports_is_globally_bounded() {
     let peak = gate.peak.load(std::sync::atomic::Ordering::SeqCst);
     assert!(peak >= 2, "the test must actually overlap fetches (peak {peak})");
     assert!(peak <= MAX_CONCURRENT_CHUNKS, "peak {peak} index fetches exceeds the global cap {MAX_CONCURRENT_CHUNKS}");
+}
+
+/// A snapshot is sized from its own manifest, as it was when taken, whatever
+/// the volume did since; counts are computed from the indexes when the
+/// manifest has none, and it is exact or absent, never partial.
+#[tokio::test]
+async fn a_snapshots_size_comes_from_its_own_manifest() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) = create_test_cache(&dir, "sb-snap", Arc::clone(&s3)).await;
+    for i in 0..5 {
+        write(&cache, i, &block(i as u8 + 1));
+    }
+    flush(&cache, &cs, &pic, &vm).await;
+    let snap = cache.snapshot(&cs, &pic, &vm).await.unwrap().sequence;
+
+    // The volume moves on: zero two blocks, add one.
+    write(&cache, 0, &vec![0u8; BS]);
+    write(&cache, 1, &vec![0u8; BS]);
+    write(&cache, 9, &block(90));
+    flush(&cache, &cs, &pic, &vm).await;
+    assert_stored(&cs, &vm, 4, "the volume now").await;
+
+    let (cold, _keep) = fresh_index_cache().await;
+    assert_eq!(
+        snapshot_stored_bytes(&cs, &cold, "sb-snap", snap).await.unwrap(),
+        Some(5 * BS as u64),
+        "the snapshot keeps its own figure"
+    );
+
+    // A snapshot manifest written before counts existed: computed from the indexes.
+    let data = cs.get_snapshot("sb-snap", snap).await.unwrap().unwrap();
+    let mut legacy = VolumeManifest::deserialize(&data).unwrap();
+    for e in legacy.chunks.values_mut() {
+        e.live_blocks = None;
+    }
+    cs.put_snapshot("sb-snap", 777, legacy.serialize().unwrap()).await.unwrap();
+    let (cold2, _keep2) = fresh_index_cache().await;
+    assert_eq!(snapshot_stored_bytes(&cs, &cold2, "sb-snap", 777).await.unwrap(), Some(5 * BS as u64));
+
+    // Absent snapshot.
+    assert!(matches!(
+        snapshot_stored_bytes(&cs, &cold2, "sb-snap", 12345).await,
+        Err(SnapshotSizeError::NotFound)
+    ));
+
+    // An unreachable index: no figure, never a smaller one.
+    let packs = legacy.chunks[&0].packs.clone();
+    s3.delete(&pack_key(0, packs[0])).await.unwrap();
+    let (cold3, _keep3) = fresh_index_cache().await;
+    assert_eq!(snapshot_stored_bytes(&cs, &cold3, "sb-snap", 777).await.unwrap(), None);
 }
