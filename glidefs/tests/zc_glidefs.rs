@@ -41,6 +41,12 @@ use object_store::memory::InMemory;
 use object_store::ObjectStore;
 use tempfile::TempDir;
 
+/// The soaks assert on process-wide RSS, so they hold this exclusively;
+/// every other test holds it shared. Tests within a soak's window would
+/// otherwise count against its leak budget (two soaks running together
+/// each saw the other's ~1 GiB warm-up).
+static RSS_EXCLUSIVE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 const DEVICE_SIZE_GB: f64 = 0.5; // 512 MiB
 const EXPORT_NAME: &str = "zc-test";
 
@@ -227,6 +233,7 @@ async fn zc_glidefs_soak() {
         eprintln!("skip [zc-soak]: USER_COPY transport (soak is ZC-tuned)");
         return;
     }
+    let _rss_guard = RSS_EXCLUSIVE.write().await;
     // Init a stderr tracing subscriber so glidefs internal diagnostics
     // (Zero-source returns, InMemory-of-zeros, promote anomalies) surface
     // when the soak fails — this is exactly the data we need to root-
@@ -414,6 +421,7 @@ async fn zc_glidefs_multi_device_soak() {
         eprintln!("skip [zc-multi-soak]: USER_COPY transport (soak is ZC-tuned)");
         return;
     }
+    let _rss_guard = RSS_EXCLUSIVE.write().await;
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::INFO)
@@ -559,6 +567,15 @@ async fn zc_glidefs_multi_device_soak() {
         workers.push(tokio::task::spawn_blocking(move || soak_loop(&dev, duration)));
     }
 
+    // Sample RSS at the midpoint. The first half is warm-up (caches,
+    // allocator arenas, the InMemory mock filling to its GC steady state)
+    // and scales with how fast the runner pushes data; only growth after
+    // that point indicates a leak.
+    let rss_mid_probe = tokio::spawn(async move {
+        tokio::time::sleep(duration / 2).await;
+        read_rss_bytes()
+    });
+
     let mut total_cycles = 0u64;
     let mut total_bytes = 0u64;
     let mut errors = 0usize;
@@ -580,6 +597,7 @@ async fn zc_glidefs_multi_device_soak() {
     }
 
     let rss_end = read_rss_bytes();
+    let rss_mid = rss_mid_probe.await.expect("rss probe");
     let fds_end = count_open_fds();
 
     gc_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -596,27 +614,33 @@ async fn zc_glidefs_multi_device_soak() {
     let mb = total_bytes as f64 / (1024.0 * 1024.0);
     let mbps = mb / duration.as_secs_f64();
     let rss_growth = rss_end.saturating_sub(rss_start);
+    let rss_late_growth = rss_end.saturating_sub(rss_mid);
     eprintln!(
         "[zc-multi-soak] OK: {n_devices} devices, {total_cycles} cycle-runs, \
          {mb:.0} MB ({mbps:.0} MB/s aggregate), \
-         rss start={} MiB end={} MiB grew={} MiB, fds start={fds_start} end={fds_end}",
+         rss start={} MiB mid={} MiB end={} MiB grew={} MiB (late {} MiB), \
+         fds start={fds_start} end={fds_end}",
         rss_start / (1024 * 1024),
+        rss_mid / (1024 * 1024),
         rss_end / (1024 * 1024),
         rss_growth / (1024 * 1024),
+        rss_late_growth / (1024 * 1024),
     );
 
     assert_eq!(errors, 0, "{errors} drivers failed — see logs above");
 
-    // Per-device RSS bound. The 1h single-device soak grew 264 MiB
-    // (allocator HWM + GC steady state); the per-device delta is
-    // roughly constant. Allow 64 MiB per device + 256 MiB base —
-    // catches unbounded growth without false-positiving on jemalloc
-    // arenas at small N.
-    let rss_budget_mib: u64 = 256 + 64 * n_devices as u64;
+    // Per-device RSS bound on second-half growth. Total growth is
+    // dominated by warm-up and tracks runner throughput: ~575 MiB on a
+    // CI VM at ~470 MB/s, ~1.2 GiB on a 2 GB/s host, half of it the
+    // InMemory mock. It plateaus — 30s and 60s runs end at the same RSS —
+    // so the late half stays flat (0–140 MiB observed at 2 GB/s) unless
+    // something leaks while gigabytes keep flowing.
+    let rss_budget_mib: u64 = 64 * n_devices as u64;
     assert!(
-        rss_growth < rss_budget_mib * 1024 * 1024,
-        "RSS grew by {} MiB across {n_devices} devices ({:?}) — budget {} MiB",
-        rss_growth / (1024 * 1024),
+        rss_late_growth < rss_budget_mib * 1024 * 1024,
+        "RSS grew by {} MiB in the second half of the run across {n_devices} devices \
+         ({:?}) — budget {} MiB",
+        rss_late_growth / (1024 * 1024),
         duration,
         rss_budget_mib,
     );
@@ -782,6 +806,7 @@ async fn zc_glidefs_concurrent_rw_race_on_evicted_block() {
         eprintln!("skip [zc-rw-race]: {why}");
         return;
     }
+    let _rss_guard = RSS_EXCLUSIVE.read().await;
     if std::env::var("GLIDEFS_TEST_FORCE_USER_COPY").is_ok_and(|v| !v.is_empty()) {
         eprintln!(
             "skip [zc-rw-race]: USER_COPY path doesn't have this race \
@@ -936,6 +961,7 @@ async fn zc_glidefs_rotation_race_under_load() {
         eprintln!("skip [zc-rotation-race]: {why}");
         return;
     }
+    let _rss_guard = RSS_EXCLUSIVE.read().await;
 
     // Flush threshold = 4 blocks: every ~16 KiB of dirty data triggers a
     // rotation. With 128 MiB device + heavy writes, we get hundreds of
@@ -1068,6 +1094,7 @@ async fn zc_glidefs_flush_rotation_deadlock() {
         eprintln!("skip [zc-flush-deadlock]: {why}");
         return;
     }
+    let _rss_guard = RSS_EXCLUSIVE.read().await;
 
     // flush_threshold=2: every couple of dirty blocks triggers a
     // rotation. Combined with continuous writes, the writer side of the
@@ -1174,6 +1201,7 @@ where
         eprintln!("skip [{name}]: {why}");
         return;
     }
+    let _rss_guard = RSS_EXCLUSIVE.read().await;
 
     let (router, _cache_dir) = setup_router().await;
     let handler = router.get_handler(EXPORT_NAME).await.expect("handler");
