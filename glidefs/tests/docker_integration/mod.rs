@@ -21,9 +21,9 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use tempfile::TempDir;
 use testcontainers::ContainerAsync;
-use testcontainers::core::ExecCommand;
+use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
+use testcontainers::{GenericImage, ImageExt};
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::minio::MinIO;
 use tokio_util::sync::CancellationToken;
 
 use glidefs::block::cache::{BlockCache, SimpleBlockCache};
@@ -305,15 +305,43 @@ fn register_minio_atexit_cleanup(container_id: String) {
     }
 }
 
+/// MinIO no longer publishes images (the Docker Hub and Quay repos are
+/// gone). Chainguard builds it from source; its free tier only serves
+/// `latest`, so pin the digest to keep runs reproducible.
+const MINIO_IMAGE: &str = "cgr.dev/chainguard/minio";
+const MINIO_TAG: &str =
+    "latest@sha256:73297936408b731668ca0e835ac9add1a35cb6026a125c2f0cd476d9ef48222c";
+
+/// Run host `curl -sf <args>`; true on HTTP 2xx.
+async fn host_curl(args: &[&str]) -> bool {
+    tokio::process::Command::new("curl")
+        .arg("-sf")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success())
+}
+
 struct SharedMinio {
-    _container: ContainerAsync<MinIO>,
+    _container: ContainerAsync<GenericImage>,
     endpoint: String,
 }
 
 async fn shared_minio() -> &'static SharedMinio {
     SHARED_MINIO
         .get_or_init(|| async {
-            let minio = MinIO::default().start().await.unwrap();
+            let minio = GenericImage::new(MINIO_IMAGE, MINIO_TAG)
+                .with_exposed_port(9000.tcp())
+                .with_wait_for(WaitFor::message_on_stderr("API: http"))
+                .with_cmd(["server", "/data"])
+                // The image's /data sits on a lower overlay layer, where
+                // MinIO's directory renames fail with EXDEV.
+                .with_mount(Mount::tmpfs_mount("/data"))
+                .start()
+                .await
+                .unwrap();
             register_minio_atexit_cleanup(minio.id().to_string());
             let host = minio.get_host().await.unwrap();
 
@@ -341,23 +369,12 @@ async fn shared_minio() -> &'static SharedMinio {
 
             // Wait for MinIO HTTP to actually answer — `start()` returns
             // before the server is fully accepting requests on heavily
-            // loaded CI hosts.
+            // loaded CI hosts. Probe from the host: the image is distroless
+            // (no curl inside).
             let endpoint = format!("http://{}:{}", host, port);
             for attempt in 0..20 {
-                let probe = minio
-                    .exec(ExecCommand::new(vec![
-                        "curl",
-                        "-sf",
-                        "-o",
-                        "/dev/null",
-                        "http://localhost:9000/minio/health/ready",
-                    ]))
-                    .await;
-                if let Ok(mut r) = probe {
-                    let _ = r.stdout_to_vec().await;
-                    if r.exit_code().await.unwrap_or(Some(1)) == Some(0) {
-                        break;
-                    }
+                if host_curl(&["-o", "/dev/null", &format!("{endpoint}/minio/health/ready")]).await {
+                    break;
                 }
                 if attempt == 19 {
                     panic!("MinIO never became ready after 20 attempts");
@@ -387,42 +404,27 @@ impl TestContext {
         // MinIO bucket names: lowercase, 3-63 chars, alphanumeric + hyphen.
         let bucket = format!("test-bucket-{id:06}");
 
-        // Create the bucket via the shared MinIO. Use the container's own
-        // curl + SigV4 auth (reqwest basic_auth doesn't work against S3).
+        // Create the bucket with host curl + SigV4 (reqwest basic_auth
+        // doesn't work against S3).
+        let bucket_url = format!("{}/{bucket}", minio.endpoint);
         for attempt in 0..10 {
-            let result = minio
-                ._container
-                .exec(ExecCommand::new(vec![
-                    "curl".to_string(),
-                    "-sf".to_string(),
-                    "-X".to_string(),
-                    "PUT".to_string(),
-                    "--aws-sigv4".to_string(),
-                    "aws:amz:us-east-1:s3".to_string(),
-                    "-u".to_string(),
-                    "minioadmin:minioadmin".to_string(),
-                    format!("http://localhost:9000/{bucket}"),
-                ]))
-                .await;
-            match result {
-                Ok(mut r) => {
-                    let _ = r.stdout_to_vec().await;
-                    if r.exit_code().await.unwrap_or(Some(1)) == Some(0) {
-                        break;
-                    }
-                    if attempt >= 9 {
-                        panic!(
-                            "bucket creation failed for {bucket} after retries (exit {:?})",
-                            r.exit_code().await,
-                        );
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-                Err(_) if attempt < 9 => {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
-                Err(e) => panic!("bucket creation exec failed for {bucket}: {e}"),
+            let created = host_curl(&[
+                "-X",
+                "PUT",
+                "--aws-sigv4",
+                "aws:amz:us-east-1:s3",
+                "-u",
+                "minioadmin:minioadmin",
+                &bucket_url,
+            ])
+            .await;
+            if created {
+                break;
             }
+            if attempt >= 9 {
+                panic!("bucket creation failed for {bucket} after retries");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(
