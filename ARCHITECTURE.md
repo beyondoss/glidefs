@@ -570,17 +570,29 @@ Header (32 bytes):
   chunk_size:   u32 LE   (bytes per chunk, 134217728 = 128 MiB)
   block_size:   u32 LE   (131072 = 128 KB)
   device_size:  u64 LE
-  reserved:     [u8; 6]
+  flags:        u8       (bit 0: live-block counts trailer present)
+  reserved:     [u8; 5]
 
 Chunk entries (chunk_count entries, sorted by chunk_idx):
   chunk_idx:    u32 LE
   pack_count:   u16 LE   (1–65535, typically 1–16 before compaction, 1 after)
   packs:        [u64 LE; pack_count]  (pack IDs, ordered oldest-to-newest)
 
+Trailers, in order (each present per version): prefetch_len, fence
+(generation / lease_revision), then live-block counts:
+  live_blocks:  [u32 LE; chunk_count]  (chunk entry order; u32::MAX = unknown)
+
 CRC32 trailer: 4 bytes
 ```
 
 Sparse: only chunks with written data appear. Absent chunk = all-zero / unwritten.
+
+**Stored bytes (what is billed).** `live_blocks` is the number of blocks in the chunk whose newest pack-index entry per `chunk_offset` has `comp_length > 0` (`comp_length == 0` is a zero tombstone). The export's `stored_bytes` (`GET /api/exports`, `glidefs_stored_bytes`) is `Σ live_blocks × block_size`: the data actually stored, base image included. Deduplication and compression are GlideFS's saving and do not reduce it. The sum is O(chunks) over the in-memory manifest; reading it does no I/O.
+
+- **Flush** recomputes the touched chunk's count *absolutely* from the merged view of its existing pack indexes plus the new pack's entries, so overwrite, data→zero and zero→data are all exact and any drift self-heals. An index missing from the cache is fetched from S3; if that fails the flush fails and retries like any flush that hits an S3 error. A known count is never dropped.
+- **Compaction** never changes the count: it rewrites packs, not content. `replace_packs_cas` leaves `live_blocks` alone, so a flush that races it stays correct.
+- **Never partial.** `VolumeManifest::stored_bytes()` is `None` while any chunk's count is unknown, and the export API never returns a smaller sum. Counts are unknown only for manifests written before counts existed. A background task after export open (`live_count.rs`, not on the attach path) computes them from the pack indexes; if an API read arrives first it computes the unknown chunks itself, and if that fails `stored_bytes` is omitted from the response (and the gauge withheld). All of this is capped process-wide at `MAX_CONCURRENT_CHUNKS` chunk computations (8, each fetching its indexes one at a time), so many unknown exports cannot stampede S3; flush is never throttled by it. Forks clone the base manifest's counts, so inherited chunks count in full.
+- Readers that predate the trailer stop before it and ignore it.
 
 `VolumeManifest::all_pack_ids()` returns `HashSet<(u32, PackId)>` — GC uses the composite `(chunk_idx, pack_id)` key, not pack_id alone, since the same 64-bit value can theoretically appear in different chunks. (`volume_manifest.rs`)
 
@@ -715,9 +727,10 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 | `/api/images/{name}` | `GET` | Resolve a blessed image's location (`{name, pool, manifest}`) from the logical image index. |
 | `/api/exports/{name}` | `GET` | Get export info (size, readonly, transport, device path) |
 | `/api/exports/{name}` | `DELETE` | Remove export. `?purge=true` also deletes local cache and all S3 snapshots. |
-| `/api/exports` | `GET` | List all active exports |
+| `/api/exports` | `GET` | List all active exports. Each carries `stored_bytes` (non-zero blocks × block_size; see VolumeManifest), omitted when it cannot be computed exactly |
 | `/api/exports/{name}/snapshot` | `POST` | Flush dirty blocks → S3, upload versioned manifest, and register the snapshot in the logical index. Optional body `{"tag":"name"}` also publishes a named alias. Returns `{snapshot_id, sequence, manifest_etag}` — fork from it via `from: "snapshot:<snapshot_id>"`. |
 | `/api/exports/{name}/snapshots` | `GET` | List snapshot sequences in ascending order |
+| `/api/exports/{name}/snapshots/{seq}` | `GET` | A snapshot's `stored_bytes`, sized from the snapshot's own manifest (exact or omitted; same rules and process-wide cap as an export's). Resolves the location from the durable name index, so it works after the export is released. 404 when the snapshot does not exist. |
 | `/api/exports/{name}/snapshots/{seq}` | `DELETE` | Delete a specific snapshot (idempotent) |
 | `/api/exports/{name}/tag` | `POST` | Publish current manifest under a named alias without re-flushing. Body: `{"tag":"name"}`. |
 | `/api/manifests/{s3_prefix}/{name}` | `HEAD` | Check manifest existence (200/404). No data transfer, no running export required. |
@@ -785,6 +798,7 @@ Per-export Prometheus metrics exposed at `/metrics`. Latency histograms are samp
 | `glidefs_write_amplification` | Gauge | S3 bytes / guest bytes (should be ~1.0) |
 | `glidefs_coalesce_ratio` | Gauge | Guest writes per S3 batch (higher = better batching) |
 | `glidefs_dirty_blocks` | Gauge | Blocks waiting for S3 sync |
+| `glidefs_stored_bytes` | Gauge | Non-zero blocks × block_size per export (the billed storage figure) |
 | `glidefs_syncing_blocks` | Gauge | Blocks currently uploading |
 | `glidefs_read_latency_seconds` | Histogram | End-to-end block read latency |
 | `glidefs_write_latency_seconds` | Histogram | End-to-end block write latency |
@@ -909,7 +923,8 @@ Histogram buckets: `<100µs`, `<1ms`, `<10ms`, `<100ms`, `<1s`, `>=1s`.
 | File | Purpose |
 |------|---------|
 | `block/pack.rs` | GLPK format: `stream_pack_to_writer`, `assemble_pack` (tests/bench), `parse_pack_index` (suffix), `PackId = u64`, `PackIndexEntry` |
-| `block/volume_manifest.rs` | Binary GLVM: `VolumeManifest`, `ChunkEntry`, `append_pack`, `replace_packs`, `all_pack_ids`, CRC32 |
+| `block/volume_manifest.rs` | Binary GLVM: `VolumeManifest`, `ChunkEntry` (packs + `live_blocks`), `append_pack`, `stored_bytes`, `replace_packs`, `all_pack_ids`, CRC32 |
+| `block/live_count.rs` | Background backfill of unknown per-chunk live-block counts after export open |
 | `block/pack_index_cache.rs` | `PackIndexCache`: Foyer HybridCache keyed by `PackId`; `lookup_block`, `insert_entries`, `known_hashes` |
 | `block/content_store.rs` | S3 typed I/O: `stream_chunk_pack` (WriteMultipart), `get_chunk_block`, `get_pack_index` (suffix-read), manifests, snapshots |
 | `block/manifest.rs` | S3 key helpers (`manifest_s3_key`, `snapshot_s3_key`) |

@@ -103,8 +103,10 @@ pub struct ExportInfoResponse {
     pub s3_prefix: Option<String>,
     /// Unflushed bytes waiting to be synced to S3.
     pub dirty_bytes: u64,
-    /// Total logical bytes stored in S3.
-    pub s3_bytes: u64,
+    /// Bytes actually stored: non-zero blocks x block_size. Exact or omitted
+    /// (a count that cannot be computed withholds the figure); never partial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
     /// Filesystem used bytes from ext4 superblock (None if not ext4 or read failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_used_bytes: Option<u64>,
@@ -120,6 +122,16 @@ pub struct ExportInfoResponse {
     pub lease_revision: Option<u64>,
 }
 
+/// A snapshot's size, from its own manifest.
+#[derive(Debug, Serialize)]
+pub struct SnapshotInfoResponse {
+    pub name: String,
+    pub sequence: u64,
+    /// Non-zero blocks x block size: exact or omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
+}
+
 impl From<ExportInfo> for ExportInfoResponse {
     fn from(e: ExportInfo) -> Self {
         ExportInfoResponse {
@@ -130,7 +142,7 @@ impl From<ExportInfo> for ExportInfoResponse {
             device: e.device.map(|p| p.to_string_lossy().into_owned()),
             s3_prefix: e.s3_prefix,
             dirty_bytes: e.dirty_bytes,
-            s3_bytes: e.s3_bytes,
+            stored_bytes: e.stored_bytes,
             fs_used_bytes: e.fs_used_bytes,
             generation: (e.generation > 0).then_some(e.generation),
             lease_revision: (e.lease_revision > 0).then_some(e.lease_revision),
@@ -860,6 +872,37 @@ where
                     &format!("Invalid export name '{}'", name),
                 ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        // GET /api/exports/{name}/snapshots/{sequence} - A snapshot's stored bytes,
+        // from its own manifest (no attached export needed). `stored_bytes` is
+        // omitted when an exact figure cannot be given; never partial.
+        (Method::GET, ["api", "exports", name, "snapshots", seq_str]) => {
+            match seq_str.parse::<u64>() {
+                Err(_) => error_response(
+                    StatusCode::BAD_REQUEST,
+                    "snapshot sequence must be a valid u64",
+                ),
+                Ok(sequence) => match router.snapshot_stored_bytes(name, sequence).await {
+                    Ok(stored_bytes) => json_response(
+                        StatusCode::OK,
+                        &SnapshotInfoResponse { name: name.to_string(), sequence, stored_bytes },
+                    ),
+                    Err(RouterError::ExportNotFound(_) | RouterError::SnapshotNotFound(..)) => {
+                        error_response(
+                            StatusCode::NOT_FOUND,
+                            &format!("Snapshot {sequence} of '{name}' not found"),
+                        )
+                    }
+                    Err(RouterError::InvalidExportName(_)) => error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("Invalid export name '{}'", name),
+                    ),
+                    Err(e) => {
+                        error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+                    }
+                },
             }
         }
 
@@ -2588,6 +2631,39 @@ mod tests {
         // No in-flight task and no .boot-set.meta sidecar → 404.
         let resp = request(&router, Method::GET, "/api/profile/pfx/base1", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A snapshot's size comes from its own manifest, so it answers after the
+    /// export is gone, and a snapshot that does not exist is a 404.
+    #[tokio::test]
+    async fn test_snapshot_stored_bytes_outlives_the_export() {
+        use http_body_util::BodyExt;
+        let temp = TempDir::new().unwrap();
+        let router = create_test_router(&temp).await;
+        request(&router, Method::PUT, "/api/exports/vol1", Some(r#"{"size_gb": 0.01}"#)).await;
+        let resp = request(&router, Method::POST, "/api/exports/vol1/snapshot", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let seq = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["sequence"].as_u64().unwrap();
+
+        let size = |resp: Response<BoxBody>| async move {
+            assert_eq!(resp.status(), StatusCode::OK);
+            let b = resp.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()
+        };
+        let uri = format!("/api/exports/vol1/snapshots/{seq}");
+        let live = size(request(&router, Method::GET, &uri, None).await).await;
+        assert_eq!(live["stored_bytes"], 0, "a blank volume stores nothing: {live}");
+
+        let gone = request(&router, Method::DELETE, "/api/exports/vol1", None).await;
+        assert_eq!(gone.status(), StatusCode::OK);
+        let after = size(request(&router, Method::GET, &uri, None).await).await;
+        assert_eq!(after["stored_bytes"], 0, "still answers with the export released");
+
+        let missing = request(&router, Method::GET, "/api/exports/vol1/snapshots/9999", None).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let bad = request(&router, Method::GET, "/api/exports/vol1/snapshots/x", None).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

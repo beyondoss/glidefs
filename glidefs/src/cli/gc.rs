@@ -1126,7 +1126,7 @@ mod tests {
 
         // Create a VolumeManifest referencing only pack_a
         let mut vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        vm.append_pack(chunk_idx, pack_a);
+        vm.append_pack(chunk_idx, pack_a, None);
         content_store
             .put_manifest("vm1", vm.serialize().unwrap(), None)
             .await
@@ -1494,7 +1494,7 @@ mod tests {
 
         // Now update manifest to reference the pack -> it's live again.
         let mut vm2 = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        vm2.append_pack(chunk_idx, pack_id);
+        vm2.append_pack(chunk_idx, pack_id, None);
         content_store
             .put_manifest("vm1", vm2.serialize().unwrap(), None)
             .await
@@ -1541,8 +1541,8 @@ mod tests {
 
         // Manifest references pack_0a in chunk 0 and pack_5a in chunk 5.
         let mut vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        vm.append_pack(0, pack_0a);
-        vm.append_pack(5, pack_5a);
+        vm.append_pack(0, pack_0a, None);
+        vm.append_pack(5, pack_5a, None);
         content_store
             .put_manifest("vm1", vm.serialize().unwrap(), None)
             .await
@@ -1588,7 +1588,7 @@ mod tests {
 
         // Main manifest references only pack_main.
         let mut vm_main = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        vm_main.append_pack(chunk_idx, pack_main);
+        vm_main.append_pack(chunk_idx, pack_main, None);
         content_store
             .put_manifest("vm1", vm_main.serialize().unwrap(), None)
             .await
@@ -1596,7 +1596,7 @@ mod tests {
 
         // Snapshot references pack_snap (keeping it alive).
         let mut vm_snap = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        vm_snap.append_pack(chunk_idx, pack_snap);
+        vm_snap.append_pack(chunk_idx, pack_snap, None);
         content_store
             .put_snapshot("vm1", 1, vm_snap.serialize().unwrap())
             .await
@@ -1829,7 +1829,7 @@ mod tests {
 
         // Live manifest references only pack_main.
         let mut vm_main = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        vm_main.append_pack(chunk_idx, pack_main);
+        vm_main.append_pack(chunk_idx, pack_main, None);
         content_store
             .put_manifest("vm1", vm_main.serialize().unwrap(), None)
             .await
@@ -1837,7 +1837,7 @@ mod tests {
 
         // Snapshot references pack_snap_only (the only thing keeping it alive).
         let mut vm_snap = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        vm_snap.append_pack(chunk_idx, pack_snap_only);
+        vm_snap.append_pack(chunk_idx, pack_snap_only, None);
         content_store
             .put_snapshot("vm1", 1, vm_snap.serialize().unwrap())
             .await
@@ -1909,9 +1909,9 @@ mod tests {
 
         // Base manifest references A, B, C
         let mut base_vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        base_vm.append_pack(chunk_idx, pack_a);
-        base_vm.append_pack(chunk_idx, pack_b);
-        base_vm.append_pack(chunk_idx, pack_c);
+        base_vm.append_pack(chunk_idx, pack_a, None);
+        base_vm.append_pack(chunk_idx, pack_b, None);
+        base_vm.append_pack(chunk_idx, pack_c, None);
         content_store
             .put_manifest("bases/ubuntu", base_vm.serialize().unwrap(), None)
             .await
@@ -1919,7 +1919,7 @@ mod tests {
 
         // Fork manifest references A, B, C + D
         let mut fork_vm = base_vm.clone();
-        fork_vm.append_pack(chunk_idx, pack_d);
+        fork_vm.append_pack(chunk_idx, pack_d, None);
         content_store
             .put_manifest("fork-1", fork_vm.serialize().unwrap(), None)
             .await
@@ -1993,7 +1993,7 @@ mod tests {
 
         // Base manifest references base_pack
         let mut base_vm = VolumeManifest::new(1024 * 1024 * 1024, 131072);
-        base_vm.append_pack(chunk_idx, base_pack);
+        base_vm.append_pack(chunk_idx, base_pack, None);
         content_store
             .put_manifest("bases/ubuntu", base_vm.serialize().unwrap(), None)
             .await
@@ -2001,7 +2001,7 @@ mod tests {
 
         // Fork manifest references base_pack + fork_pack
         let mut fork_vm = base_vm.clone();
-        fork_vm.append_pack(chunk_idx, fork_pack);
+        fork_vm.append_pack(chunk_idx, fork_pack, None);
         content_store
             .put_manifest("fork-1", fork_vm.serialize().unwrap(), None)
             .await

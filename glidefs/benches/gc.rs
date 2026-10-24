@@ -184,7 +184,7 @@ async fn run_scenario(scenario: &Scenario) -> Result {
             cs.put_chunk_pack(chunk_idx, pack_id, vec![42u8; 64])
                 .await
                 .unwrap();
-            vm.append_pack(chunk_idx, pack_id);
+            vm.append_pack(chunk_idx, pack_id, None);
         }
         cs.put_manifest(&export_name, vm.serialize().unwrap(), None)
             .await

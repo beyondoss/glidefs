@@ -75,6 +75,9 @@ pub enum RouterError {
     #[error("Export '{0}' not found")]
     ExportNotFound(String),
 
+    #[error("Snapshot {1} of export '{0}' not found")]
+    SnapshotNotFound(String, u64),
+
     #[error(
         "Invalid export name '{0}': must be 1-128 chars, alphanumeric/hyphen/underscore/dot, starting with alphanumeric"
     )]
@@ -182,6 +185,32 @@ pub struct ProfileParams {
     pub max_blocks: usize,
 }
 
+/// What an export's stored-bytes answer needs if a chunk count is unknown.
+struct StoredSource {
+    vm: Arc<parking_lot::RwLock<VolumeManifest>>,
+    content_store: Arc<ContentStore>,
+    pack_index_cache: Arc<PackIndexCache>,
+}
+
+impl StoredSource {
+    fn of(s: &ExportState) -> Self {
+        Self {
+            vm: Arc::clone(&s.volume_manifest),
+            content_store: Arc::clone(&s.content_store),
+            pack_index_cache: Arc::clone(&s.pack_index_cache),
+        }
+    }
+
+    /// `known` when the manifest already had every count; otherwise compute the
+    /// unknown ones (globally bounded) or withhold the figure.
+    async fn exact(&self, known: Option<u64>) -> Option<u64> {
+        if known.is_some() {
+            return known;
+        }
+        crate::block::live_count::stored_bytes_exact(&self.vm, &self.content_store, &self.pack_index_cache).await
+    }
+}
+
 /// Information about an export.
 #[derive(Clone, Debug)]
 pub struct ExportInfo {
@@ -194,8 +223,12 @@ pub struct ExportInfo {
     pub s3_prefix: Option<String>,
     /// Unflushed bytes waiting to be synced to S3.
     pub dirty_bytes: u64,
-    /// Total logical bytes stored in S3 (chunks × chunk_size).
-    pub s3_bytes: u64,
+    /// Bytes actually stored: non-zero blocks × block_size (dedup and
+    /// compression do not reduce it). Always exact or `None`: a chunk whose
+    /// count is unknown is computed from its pack indexes before answering, and
+    /// if that fails the figure is withheld, never partial. This is what
+    /// snapshots and volumes are billed on.
+    pub stored_bytes: Option<u64>,
     /// Filesystem used bytes from ext4 superblock (None if not ext4 or read failed).
     pub fs_used_bytes: Option<u64>,
     /// Single-attach fencing token, high half: the orchestrator placement
@@ -265,7 +298,7 @@ pub struct ExportState {
     /// caught panic (already logged + counted by spawn_supervised),
     /// `Err(JoinError)` = aborted or unwind-after-catch (rare).
     flush_handle: JoinHandle<Result<(), task::Panicked>>,
-    /// Background boot-prefetch task (if spawned). Aborted on teardown
+    /// Background boot-prefetch / live-count backfill task (if spawned). Aborted on teardown
     /// to release Arc references to cache/content_store/etc.
     prefetch_handle: Option<JoinHandle<Result<(), task::Panicked>>>,
 }
@@ -1750,6 +1783,14 @@ impl ExportRouter {
                         .await;
                 }
                 info!("boot prefetch complete");
+                crate::block::live_count::backfill_live_counts(&vm, &cs, &cmc).await;
+            }))
+        } else if crate::block::live_count::needs_backfill(&volume_manifest) {
+            let vm = Arc::clone(&volume_manifest);
+            let cs = Arc::clone(&content_store);
+            let pic = Arc::clone(&pack_index_cache);
+            Some(spawn_supervised("live-count-backfill", async move {
+                crate::block::live_count::backfill_live_counts(&vm, &cs, &pic).await;
             }))
         } else {
             None
@@ -2623,6 +2664,30 @@ impl ExportRouter {
             .map_err(RouterError::ContentStore)
     }
 
+    /// A registered snapshot's stored bytes (non-zero blocks x block size),
+    /// from the snapshot's own manifest. Does not need the export attached:
+    /// the location comes from the durable name index, so it works after the
+    /// boot export has been released. `Ok(None)` = no exact figure possible.
+    pub async fn snapshot_stored_bytes(
+        &self,
+        name: &str,
+        sequence: u64,
+    ) -> Result<Option<u64>, RouterError> {
+        use crate::block::live_count::{SnapshotSizeError, snapshot_stored_bytes};
+        validate_export_name(name)?;
+        let config = self
+            .load_export(name)
+            .await?
+            .ok_or_else(|| RouterError::ExportNotFound(name.to_string()))?;
+        let cs = self.content_store_for_prefix(config.s3_prefix());
+        match snapshot_stored_bytes(&cs, &self.pack_index_cache, name, sequence).await {
+            Ok(b) => Ok(b),
+            Err(SnapshotSizeError::NotFound) => Err(RouterError::SnapshotNotFound(name.to_string(), sequence)),
+            Err(SnapshotSizeError::Corrupt(m)) => Err(RouterError::Manifest(m)),
+            Err(SnapshotSizeError::Store(e)) => Err(RouterError::ContentStore(e)),
+        }
+    }
+
     /// Delete a specific snapshot for an export (idempotent).
     pub async fn delete_export_snapshot(
         &self,
@@ -2644,12 +2709,12 @@ impl ExportRouter {
 
     /// Get info for a single export.
     pub async fn get_export_info(&self, name: &str) -> Option<ExportInfo> {
-        let (mut info, handler) = {
+        let (mut info, handler, stored) = {
             let entry = self.exports.get(name)?;
             let state = entry.value();
             let block_size = state.cache.block_size() as u64;
             let manifest = state.volume_manifest.read();
-            let s3_bytes = manifest.chunks.len() as u64 * manifest.chunk_size;
+            let stored_bytes = manifest.stored_bytes();
             let generation = manifest.generation;
             let lease_revision = manifest.lease_revision;
             drop(manifest);
@@ -2661,13 +2726,14 @@ impl ExportRouter {
                 device: None,
                 s3_prefix: state.s3_prefix.clone(),
                 dirty_bytes: state.cache.dirty_block_count() * block_size,
-                s3_bytes,
+                stored_bytes,
                 fs_used_bytes: None,
                 generation,
                 lease_revision,
             };
-            (info, Arc::clone(&state.handler))
+            (info, Arc::clone(&state.handler), StoredSource::of(state))
         };
+        info.stored_bytes = stored.exact(info.stored_bytes).await;
         info.device = self.get_device_path(name).await;
         info.fs_used_bytes = read_fs_used_bytes(&handler).await;
         Some(info)
@@ -2688,7 +2754,7 @@ impl ExportRouter {
     pub async fn list_exports(&self) -> Vec<ExportInfo> {
         // First pass: collect basic info and handlers, dropping each
         // shard guard immediately as we walk.
-        let (mut result, handlers): (Vec<ExportInfo>, Vec<Arc<BlockHandler>>) = self
+        let (mut result, handlers): (Vec<ExportInfo>, Vec<(Arc<BlockHandler>, StoredSource)>) = self
             .exports
             .iter()
             .map(|entry| {
@@ -2703,18 +2769,19 @@ impl ExportRouter {
                     device: None,
                     s3_prefix: state.s3_prefix.clone(),
                     dirty_bytes: state.cache.dirty_block_count() * block_size,
-                    s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
+                    stored_bytes: manifest.stored_bytes(),
                     fs_used_bytes: None,
                     generation: manifest.generation,
                     lease_revision: manifest.lease_revision,
                 };
-                (info, Arc::clone(&state.handler))
+                (info, (Arc::clone(&state.handler), StoredSource::of(state)))
             })
             .unzip();
 
         // Second pass: populate device paths and fs_used_bytes (async,
         // outside any shard guard).
-        for (info, handler) in result.iter_mut().zip(handlers.iter()) {
+        for (info, (handler, stored)) in result.iter_mut().zip(handlers.iter()) {
+            info.stored_bytes = stored.exact(info.stored_bytes).await;
             info.device = self.get_device_path(&info.name).await;
             info.fs_used_bytes = read_fs_used_bytes(handler).await;
         }
@@ -3014,6 +3081,8 @@ impl ExportRouter {
             .collect()
     }
 
+    /// Sync snapshot: the stored-bytes gauge is withheld while a chunk's count
+    /// is unknown (the API read computes it; a scrape never does I/O).
     fn snapshot_export_metrics(s: &ExportState) -> MetricsSnapshot {
         let block_size = s.cache.block_size() as u64;
         let dirty_blocks = s.cache.dirty_block_count();
@@ -3022,7 +3091,7 @@ impl ExportRouter {
             dirty_blocks,
             s.cache.syncing_block_count(),
             dirty_blocks * block_size,
-            manifest.chunks.len() as u64 * manifest.chunk_size,
+            manifest.stored_bytes(),
         )
     }
 

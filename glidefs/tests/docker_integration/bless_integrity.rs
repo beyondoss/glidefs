@@ -227,7 +227,7 @@ async fn bless_image_to_s3(
             .stream_chunk_pack(chunk_idx, pack_id, blocks, block_size)
             .await
             .expect("pack upload failed");
-        volume_manifest.append_pack(chunk_idx, pack_id);
+        volume_manifest.append_pack(chunk_idx, pack_id, None);
     }
 
     // Save manifest as base (index warming on fork comes from the manifest's

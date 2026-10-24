@@ -276,7 +276,7 @@ async fn test_delete_snapshot_frees_packs_for_gc() {
 
     // Build a snapshot manifest that includes the orphan pack along with live packs
     let mut snap_vm = volume_manifest.read().clone();
-    snap_vm.append_pack(0, orphan_pack_id);
+    snap_vm.append_pack(0, orphan_pack_id, None);
     let snap_seq = 1u64;
     cs.put_snapshot("vm1", snap_seq, snap_vm.serialize().unwrap())
         .await

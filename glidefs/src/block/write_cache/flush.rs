@@ -1295,7 +1295,7 @@ impl WriteCache<Active> {
 
         let mut total_stats = FlushStats::default();
         let mut flushed_blocks: Vec<usize> = Vec::new();
-        let mut staged_appends: Vec<(u32, crate::block::pack::PackId)> = Vec::new();
+        let mut staged_appends: Vec<(u32, crate::block::pack::PackId, Option<u32>)> = Vec::new();
         let crcs = Arc::new(crcs);
 
         // Pipelined flush: compute batches sequentially (needs flushing file),
@@ -1306,7 +1306,7 @@ impl WriteCache<Active> {
         use futures::FutureExt;
 
         type UploadResult = Result<
-            (u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>),
+            (u32, crate::block::pack::PackId, Option<u32>, Vec<crate::block::pack::PackIndexEntry>),
             CacheError,
         >;
         let mut in_flight: FuturesUnordered<std::pin::Pin<Box<dyn std::future::Future<Output = UploadResult> + Send + '_>>> =
@@ -1390,12 +1390,24 @@ impl WriteCache<Active> {
             // chunk. Pack indices are already warmed (above), so get_entries
             // hits the in-memory cache (~100ns per pack). Returns None if any
             // pack index is missing — dedup is unsafe without the full picture.
-            let existing_hashes: Option<std::collections::HashMap<u32, Blake3Hash>> = {
+            let existing_blocks = {
                 let pack_ids = volume_manifest.read()
                     .chunk_pack_ids(chunk_idx)
                     .map(|ids| ids.to_vec())
                     .unwrap_or_default();
-                pack_index_cache.existing_block_hashes(&pack_ids).await
+                // Never partial: an index the cache lost since the warm above is
+                // fetched here, and a failed fetch fails the flush (it retries
+                // like any flush that hits an S3 error) rather than dropping
+                // dedup or, worse, a known live-block count.
+                Some(
+                    crate::block::live_count::load_existing(
+                        pack_index_cache, &content_store, chunk_idx, &pack_ids,
+                    )
+                    .await
+                    .map_err(|e| CacheError::Io(std::io::Error::other(format!(
+                        "chunk {chunk_idx}: pack index unavailable: {e}"
+                    ))))?,
+                )
             };
 
             // Build one pack entry per dirty block, each at its actual
@@ -1423,9 +1435,9 @@ impl WriteCache<Active> {
                     // content at this offset, OR if the block is zero and
                     // no prior entry exists (reads return zeros by default).
                     // Only safe when ALL pack indices are cached (Some map).
-                    if let Some(ref existing) = existing_hashes {
+                    if let Some(ref existing) = existing_blocks {
                         let dominated = match existing.get(&chunk_offset) {
-                            Some(&existing_hash) => existing_hash == hash,
+                            Some(&(existing_hash, _)) => existing_hash == hash,
                             None => hash == zero_hash,
                         };
                         if dominated {
@@ -1473,6 +1485,17 @@ impl WriteCache<Active> {
                 continue;
             }
 
+            // Chunk live-block count after this pack applies: absolute, from the
+            // merged view of the existing packs plus this pack's entries (a
+            // zero block is a tombstone, not live). Always exact: the merged
+            // view above is never partial.
+            let live_blocks = existing_blocks.as_ref().map(|existing| {
+                crate::block::pack_index_cache::live_blocks_after(
+                    existing,
+                    blocks_for_pack.iter().map(|(h, off, _)| (*off, *h != zero_hash)),
+                )
+            });
+
             // Content-addressed pack ID: deterministic from block content.
             let pack_id = crate::block::pack::content_pack_id(&blocks_for_pack);
 
@@ -1499,32 +1522,32 @@ impl WriteCache<Active> {
                 let entries = cs
                     .stream_chunk_pack(chunk_idx, pack_id, blocks_for_pack, blocks_per_chunk)
                     .await?;
-                Ok((chunk_idx, pack_id, entries))
+                Ok((chunk_idx, pack_id, live_blocks, entries))
             }));
 
             // Drain completed uploads to bound memory (don't block compute).
             while let Some(result) = in_flight.next().now_or_never().flatten() {
-                let (ci, pid, index_entries): (u32, crate::block::pack::PackId, Vec<crate::block::pack::PackIndexEntry>) = result?;
+                let (ci, pid, live, index_entries): (u32, crate::block::pack::PackId, Option<u32>, Vec<crate::block::pack::PackIndexEntry>) = result?;
                 total_stats.packs_uploaded += 1;
                 total_stats.bytes_uploaded += index_entries
                     .iter()
                     .map(|e| u64::from(e.comp_length))
                     .sum::<u64>();
                 pack_index_cache.insert_entries(pid, &index_entries);
-                staged_appends.push((ci, pid));
+                staged_appends.push((ci, pid, live));
             }
         }
 
         // Wait for remaining in-flight uploads.
         while let Some(result) = in_flight.next().await {
-            let (chunk_idx, pack_id, index_entries) = result?;
+            let (chunk_idx, pack_id, live, index_entries) = result?;
             total_stats.packs_uploaded += 1;
             total_stats.bytes_uploaded += index_entries
                 .iter()
                 .map(|e| u64::from(e.comp_length))
                 .sum::<u64>();
             pack_index_cache.insert_entries(pack_id, &index_entries);
-            staged_appends.push((chunk_idx, pack_id));
+            staged_appends.push((chunk_idx, pack_id, live));
         }
 
         // **Atomic flush ordering**: Upload → ManifestSync → Evict → Checkpoint → Cleanup.
@@ -1540,9 +1563,9 @@ impl WriteCache<Active> {
         let need_sync = !staged_appends.is_empty();
         if need_sync {
             let mut vm = volume_manifest.write();
-            for (chunk_idx, pack_id) in staged_appends {
+            for (chunk_idx, pack_id, live) in staged_appends {
                 total_stats.touched_chunks.insert(chunk_idx);
-                vm.append_pack(chunk_idx, pack_id);
+                vm.append_pack(chunk_idx, pack_id, live);
             }
             // Stamp our composite fencing token (generation + lease_revision)
             // into every synced manifest so a strictly-older incumbent's sync is

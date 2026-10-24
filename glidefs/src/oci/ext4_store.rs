@@ -137,6 +137,8 @@ struct ChunkUploadResult {
     chunk_idx: u32,
     pack_id: PackId,
     pack_size: u64,
+    /// Non-zero blocks in the pack (zero blocks are never written here).
+    live_blocks: u32,
 }
 
 /// Join the previous in-flight upload (if any) and apply its results.
@@ -147,7 +149,7 @@ async fn join_upload(
 ) -> Result<()> {
     if let Some(handle) = in_flight {
         let result = handle.await.context("upload task panicked")??;
-        volume_manifest.append_pack(result.chunk_idx, result.pack_id);
+        volume_manifest.append_pack(result.chunk_idx, result.pack_id, Some(result.live_blocks));
         stats.packs_uploaded += 1;
         stats.bytes_uploaded += result.pack_size;
         stats.chunks_written += 1;
@@ -198,6 +200,7 @@ async fn start_chunk_upload(
     join_upload(volume_manifest, stats, prev_in_flight).await?;
 
     // Spawn streaming S3 upload — runs concurrently with next chunk's disk reads.
+    let live_blocks = pack_blocks.len() as u32;
     let cs = Arc::clone(content_store);
     let handle = tokio::spawn(async move {
         let entries = cs
@@ -209,6 +212,7 @@ async fn start_chunk_upload(
             chunk_idx,
             pack_id,
             pack_size,
+            live_blocks,
         })
     });
 
