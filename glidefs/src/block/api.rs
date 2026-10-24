@@ -103,8 +103,8 @@ pub struct ExportInfoResponse {
     pub s3_prefix: Option<String>,
     /// Unflushed bytes waiting to be synced to S3.
     pub dirty_bytes: u64,
-    /// Total logical bytes stored in S3.
-    pub s3_bytes: u64,
+    /// Bytes actually stored: non-zero blocks x block_size.
+    pub stored_bytes: u64,
     /// Filesystem used bytes from ext4 superblock (None if not ext4 or read failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_used_bytes: Option<u64>,
@@ -130,7 +130,7 @@ impl From<ExportInfo> for ExportInfoResponse {
             device: e.device.map(|p| p.to_string_lossy().into_owned()),
             s3_prefix: e.s3_prefix,
             dirty_bytes: e.dirty_bytes,
-            s3_bytes: e.s3_bytes,
+            stored_bytes: e.stored_bytes,
             fs_used_bytes: e.fs_used_bytes,
             generation: (e.generation > 0).then_some(e.generation),
             lease_revision: (e.lease_revision > 0).then_some(e.lease_revision),

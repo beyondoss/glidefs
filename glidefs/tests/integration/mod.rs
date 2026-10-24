@@ -21,6 +21,7 @@ mod property_tests;
 mod snapshots;
 mod s3_degraded;
 mod ssd_pressure;
+mod stored_bytes;
 mod transport_stress;
 mod trim;
 mod wake_any_node;

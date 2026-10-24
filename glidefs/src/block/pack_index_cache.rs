@@ -199,30 +199,49 @@ impl PackIndexCache {
         hashes
     }
 
-    /// Build a merged (chunk_offset → hash) map across multiple packs.
+    /// Build a merged (chunk_offset → (hash, comp_length)) map across multiple
+    /// packs.
     ///
     /// Packs are iterated in order (oldest → newest, matching
     /// `VolumeManifest::chunk_pack_ids` ordering). Later entries overwrite
-    /// earlier ones (newest wins). Used for cross-flush dedup: if a block's
-    /// (chunk_offset, hash) matches the map, it's already in S3.
+    /// earlier ones (newest wins). Used for cross-flush dedup (if a block's
+    /// (chunk_offset, hash) matches the map, it's already in S3) and for the
+    /// chunk's live-block count (`comp_length > 0`; 0 is a zero tombstone).
     ///
     /// Returns `None` if any pack index is missing from the cache. An
     /// incomplete map could cause the caller to skip a necessary upload
     /// (e.g., treating a zero block as deduped when a non-zero entry exists
     /// in the uncached pack). Callers must treat `None` as "dedup unsafe."
-    pub async fn existing_block_hashes(
-        &self,
-        pack_ids: &[PackId],
-    ) -> Option<std::collections::HashMap<u32, Blake3Hash>> {
-        let mut map = std::collections::HashMap::new();
+    pub async fn existing_blocks(&self, pack_ids: &[PackId]) -> Option<ExistingBlocks> {
+        let mut map = ExistingBlocks::new();
         for &pack_id in pack_ids {
             let entries = self.get_entries(pack_id).await?;
             for entry in entries.iter() {
-                map.insert(entry.chunk_offset, entry.hash);
+                map.insert(entry.chunk_offset, (entry.hash, entry.comp_length));
             }
         }
         Some(map)
     }
+}
+
+/// A chunk's merged view: `chunk_offset → (hash, comp_length)`, newest wins.
+pub type ExistingBlocks = std::collections::HashMap<u32, (Blake3Hash, u32)>;
+
+/// Live blocks (newest entry non-zero) in `existing` after `new` entries are
+/// applied over it. `new` is `(chunk_offset, is_live)` per block the new pack
+/// writes (`is_live` = not a zero tombstone). Counts overwrites, zeroing
+/// (live → tombstone) and un-zeroing (tombstone/absent → live) correctly.
+pub fn live_blocks_after(
+    existing: &ExistingBlocks,
+    new: impl IntoIterator<Item = (u32, bool)>,
+) -> u32 {
+    let is_live = |&(_, comp_length): &(Blake3Hash, u32)| comp_length > 0;
+    let mut live = existing.values().filter(|e| is_live(e)).count() as i64;
+    for (chunk_offset, now_live) in new {
+        let was_live = existing.get(&chunk_offset).is_some_and(is_live);
+        live += i64::from(now_live) - i64::from(was_live);
+    }
+    live as u32
 }
 
 // ============================================================================
@@ -568,7 +587,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_existing_block_hashes_all_cached() {
+    async fn test_existing_blocks_all_cached() {
         let tmp = TempDir::new().unwrap();
         let cache = open_test_cache(tmp.path()).await;
 
@@ -578,16 +597,16 @@ mod tests {
         cache.insert_entries(pack_b, &[make_entry(1), make_entry(2)]);
 
         // Newest wins: pack_b's entry at offset 1 overrides pack_a's.
-        let map = cache.existing_block_hashes(&[pack_a, pack_b]).await;
+        let map = cache.existing_blocks(&[pack_a, pack_b]).await;
         assert!(map.is_some(), "all packs cached → Some");
         let map = map.unwrap();
         assert_eq!(map.len(), 3); // offsets 0, 1, 2
         // Offset 1: pack_b's hash (newest wins)
-        assert_eq!(map[&1], make_entry(1).hash);
+        assert_eq!(map[&1].0, make_entry(1).hash);
     }
 
     #[tokio::test]
-    async fn test_existing_block_hashes_missing_pack_returns_none() {
+    async fn test_existing_blocks_missing_pack_returns_none() {
         let tmp = TempDir::new().unwrap();
         let cache = open_test_cache(tmp.path()).await;
 
@@ -596,17 +615,48 @@ mod tests {
         cache.insert_entries(pack_a, &[make_entry(0)]);
         // pack_missing is NOT in the cache.
 
-        let map = cache.existing_block_hashes(&[pack_a, pack_missing]).await;
+        let map = cache.existing_blocks(&[pack_a, pack_missing]).await;
         assert!(map.is_none(), "missing pack → None (dedup unsafe)");
     }
 
     #[tokio::test]
-    async fn test_existing_block_hashes_empty_input() {
+    async fn test_existing_blocks_empty_input() {
         let tmp = TempDir::new().unwrap();
         let cache = open_test_cache(tmp.path()).await;
 
-        let map = cache.existing_block_hashes(&[]).await;
+        let map = cache.existing_blocks(&[]).await;
         assert!(map.is_some(), "empty input → Some(empty map)");
         assert!(map.unwrap().is_empty());
+    }
+
+    fn tombstone(chunk_offset: u32) -> PackIndexEntry {
+        PackIndexEntry { comp_length: 0, ..make_entry(chunk_offset) }
+    }
+
+    /// `live_blocks_after` over index entries applied oldest -> newest must
+    /// equal a from-scratch "newest entry per offset, comp_length > 0" count.
+    #[tokio::test]
+    async fn test_live_blocks_after_overwrite_zero_and_unzero() {
+        let tmp = TempDir::new().unwrap();
+        let cache = open_test_cache(tmp.path()).await;
+        cache.insert_entries(0xA, &[make_entry(0), make_entry(1), make_entry(2)]);
+        let existing = cache.existing_blocks(&[0xA]).await.unwrap();
+        assert_eq!(live_blocks_after(&existing, []), 3);
+        // overwrite 1 with new data: still 3
+        assert_eq!(live_blocks_after(&existing, [(1, true)]), 3);
+        // zero 1 (data -> zero): 2
+        assert_eq!(live_blocks_after(&existing, [(1, false)]), 2);
+        // new block 5: 4
+        assert_eq!(live_blocks_after(&existing, [(5, true)]), 4);
+        // zero a block that was never written: unchanged
+        assert_eq!(live_blocks_after(&existing, [(9, false)]), 3);
+
+        // zero -> data: tombstone at 1 in a newer pack, then written again.
+        cache.insert_entries(0xB, &[tombstone(1)]);
+        let existing = cache.existing_blocks(&[0xA, 0xB]).await.unwrap();
+        assert_eq!(live_blocks_after(&existing, []), 2);
+        assert_eq!(live_blocks_after(&existing, [(1, true)]), 3);
+        // zeroing the tombstone again: unchanged
+        assert_eq!(live_blocks_after(&existing, [(1, false)]), 2);
     }
 }

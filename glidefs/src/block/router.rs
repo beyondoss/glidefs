@@ -194,8 +194,10 @@ pub struct ExportInfo {
     pub s3_prefix: Option<String>,
     /// Unflushed bytes waiting to be synced to S3.
     pub dirty_bytes: u64,
-    /// Total logical bytes stored in S3 (chunks × chunk_size).
-    pub s3_bytes: u64,
+    /// Bytes actually stored: non-zero blocks × block_size (dedup and
+    /// compression do not reduce it). Chunks whose count is not yet known are
+    /// excluded. This is what snapshots and volumes are billed on.
+    pub stored_bytes: u64,
     /// Filesystem used bytes from ext4 superblock (None if not ext4 or read failed).
     pub fs_used_bytes: Option<u64>,
     /// Single-attach fencing token, high half: the orchestrator placement
@@ -265,7 +267,7 @@ pub struct ExportState {
     /// caught panic (already logged + counted by spawn_supervised),
     /// `Err(JoinError)` = aborted or unwind-after-catch (rare).
     flush_handle: JoinHandle<Result<(), task::Panicked>>,
-    /// Background boot-prefetch task (if spawned). Aborted on teardown
+    /// Background boot-prefetch / live-count backfill task (if spawned). Aborted on teardown
     /// to release Arc references to cache/content_store/etc.
     prefetch_handle: Option<JoinHandle<Result<(), task::Panicked>>>,
 }
@@ -1750,6 +1752,14 @@ impl ExportRouter {
                         .await;
                 }
                 info!("boot prefetch complete");
+                crate::block::live_count::backfill_live_counts(&vm, &cs, &cmc).await;
+            }))
+        } else if crate::block::live_count::needs_backfill(&volume_manifest) {
+            let vm = Arc::clone(&volume_manifest);
+            let cs = Arc::clone(&content_store);
+            let pic = Arc::clone(&pack_index_cache);
+            Some(spawn_supervised("live-count-backfill", async move {
+                crate::block::live_count::backfill_live_counts(&vm, &cs, &pic).await;
             }))
         } else {
             None
@@ -2649,7 +2659,7 @@ impl ExportRouter {
             let state = entry.value();
             let block_size = state.cache.block_size() as u64;
             let manifest = state.volume_manifest.read();
-            let s3_bytes = manifest.chunks.len() as u64 * manifest.chunk_size;
+            let stored_bytes = manifest.stored_bytes();
             let generation = manifest.generation;
             let lease_revision = manifest.lease_revision;
             drop(manifest);
@@ -2661,7 +2671,7 @@ impl ExportRouter {
                 device: None,
                 s3_prefix: state.s3_prefix.clone(),
                 dirty_bytes: state.cache.dirty_block_count() * block_size,
-                s3_bytes,
+                stored_bytes,
                 fs_used_bytes: None,
                 generation,
                 lease_revision,
@@ -2703,7 +2713,7 @@ impl ExportRouter {
                     device: None,
                     s3_prefix: state.s3_prefix.clone(),
                     dirty_bytes: state.cache.dirty_block_count() * block_size,
-                    s3_bytes: manifest.chunks.len() as u64 * manifest.chunk_size,
+                    stored_bytes: manifest.stored_bytes(),
                     fs_used_bytes: None,
                     generation: manifest.generation,
                     lease_revision: manifest.lease_revision,
@@ -3022,7 +3032,7 @@ impl ExportRouter {
             dirty_blocks,
             s.cache.syncing_block_count(),
             dirty_blocks * block_size,
-            manifest.chunks.len() as u64 * manifest.chunk_size,
+            manifest.stored_bytes(),
         )
     }
 

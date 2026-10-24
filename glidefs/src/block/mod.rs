@@ -25,6 +25,7 @@ pub mod state;
 pub mod sync;
 #[allow(unsafe_code)] // O_APPEND + libc::write/ftruncate/fsync FFI
 pub mod wal;
+pub mod live_count;
 pub mod volume_manifest;
 #[allow(unsafe_code)] // SIMD zero-check, positional I/O, SyncFile
 pub mod write_cache;
