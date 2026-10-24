@@ -43,24 +43,45 @@ mod blktests {
         PathBuf::from("/tmp/blktests")
     }
 
-    /// Clone and build blktests if not already present.
+    /// Pinned blktests revision. Upstream keeps adding tests (block/047
+    /// arrived needing null_blk), and tracking HEAD turns each one into a
+    /// CI failure unrelated to the change under test. Bump deliberately.
+    const BLKTESTS_REV: &str = "9ad5a10fa8ed56f74c23fea2c35f4594a110b8b9";
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Fetch blktests at `BLKTESTS_REV` and build it, if not already present.
     fn ensure_blktests() -> PathBuf {
         let dir = blktests_dir();
-        if !dir.join("check").exists() {
-            eprintln!("[blktests] cloning blktests...");
+        let at_rev = Command::new("git")
+            .current_dir(&dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .is_ok_and(|o| o.status.success() && o.stdout.trim_ascii() == BLKTESTS_REV.as_bytes());
+        if !at_rev {
+            eprintln!("[blktests] fetching blktests {BLKTESTS_REV}...");
             if dir.exists() {
                 std::fs::remove_dir_all(&dir).ok();
             }
-            let status = Command::new("git")
-                .args([
-                    "clone",
-                    "--depth=1",
-                    "https://github.com/osandov/blktests.git",
-                    dir.to_str().unwrap(),
-                ])
-                .status()
-                .expect("git clone failed");
-            assert!(status.success(), "git clone blktests failed");
+            std::fs::create_dir_all(&dir).expect("create blktests dir");
+            assert!(
+                git(&dir, &["init", "-q"])
+                    && git(&dir, &[
+                        "fetch",
+                        "-q",
+                        "--depth=1",
+                        "https://github.com/osandov/blktests.git",
+                        BLKTESTS_REV,
+                    ])
+                    && git(&dir, &["checkout", "-q", "FETCH_HEAD"]),
+                "fetching blktests {BLKTESTS_REV} failed"
+            );
         }
 
         // Always rebuild (fast if already built)
@@ -100,6 +121,7 @@ mod blktests {
             "block/003", // discard/TRIM — glidefs doesn't support TRIM
             "block/008", // needs CPU hotplug (unavailable in CI VMs)
             "block/039", // needs null_blk kernel module
+            "block/047", // needs null_blk kernel module
         ];
 
         // Stream subprocess output line-by-line instead of capturing the
