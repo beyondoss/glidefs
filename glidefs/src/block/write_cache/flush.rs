@@ -1390,12 +1390,24 @@ impl WriteCache<Active> {
             // chunk. Pack indices are already warmed (above), so get_entries
             // hits the in-memory cache (~100ns per pack). Returns None if any
             // pack index is missing — dedup is unsafe without the full picture.
-            let existing_blocks: Option<crate::block::pack_index_cache::ExistingBlocks> = {
+            let existing_blocks = {
                 let pack_ids = volume_manifest.read()
                     .chunk_pack_ids(chunk_idx)
                     .map(|ids| ids.to_vec())
                     .unwrap_or_default();
-                pack_index_cache.existing_blocks(&pack_ids).await
+                // Never partial: an index the cache lost since the warm above is
+                // fetched here, and a failed fetch fails the flush (it retries
+                // like any flush that hits an S3 error) rather than dropping
+                // dedup or, worse, a known live-block count.
+                Some(
+                    crate::block::live_count::load_existing(
+                        pack_index_cache, &content_store, chunk_idx, &pack_ids,
+                    )
+                    .await
+                    .map_err(|e| CacheError::Io(std::io::Error::other(format!(
+                        "chunk {chunk_idx}: pack index unavailable: {e}"
+                    ))))?,
+                )
             };
 
             // Build one pack entry per dirty block, each at its actual
@@ -1475,17 +1487,14 @@ impl WriteCache<Active> {
 
             // Chunk live-block count after this pack applies: absolute, from the
             // merged view of the existing packs plus this pack's entries (a
-            // zero block is a tombstone, not live). `None` when an existing
-            // index was unavailable; billed as unknown until the next flush.
+            // zero block is a tombstone, not live). Always exact: the merged
+            // view above is never partial.
             let live_blocks = existing_blocks.as_ref().map(|existing| {
                 crate::block::pack_index_cache::live_blocks_after(
                     existing,
                     blocks_for_pack.iter().map(|(h, off, _)| (*off, *h != zero_hash)),
                 )
             });
-            if live_blocks.is_none() {
-                warn!(chunk_idx, "pack index unavailable at flush: chunk live-block count unknown");
-            }
 
             // Content-addressed pack ID: deterministic from block content.
             let pack_id = crate::block::pack::content_pack_id(&blocks_for_pack);

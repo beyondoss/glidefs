@@ -17,7 +17,7 @@ use tempfile::TempDir;
 
 use glidefs::block::cache::BlockCache;
 use glidefs::block::content_store::ContentStore;
-use glidefs::block::live_count::backfill_live_counts;
+use glidefs::block::live_count::{backfill_live_counts, stored_bytes_exact};
 use glidefs::block::pack_index_cache::PackIndexCache;
 use glidefs::block::volume_manifest::VolumeManifest;
 use glidefs::block::write_cache::WriteCache;
@@ -57,7 +57,7 @@ async fn assert_stored(cs: &ContentStore, vm: &Vm, expect_blocks: u64, ctx: &str
     let oracle = oracle_live_blocks(cs, vm).await;
     let got = vm.read().stored_bytes();
     assert_eq!(oracle, expect_blocks, "{ctx}: oracle disagrees with the model");
-    assert_eq!(got, oracle * BS as u64, "{ctx}: stored_bytes != oracle x block_size");
+    assert_eq!(got, Some(oracle * BS as u64), "{ctx}: stored_bytes != oracle x block_size");
 }
 
 fn block(seed: u8) -> Vec<u8> {
@@ -182,7 +182,7 @@ async fn compaction_preserves_count_and_tombstones() {
         flush(&cache, &cs, &pic, &vm).await;
     }
     let before = oracle_live_blocks(&cs, &vm).await;
-    assert_eq!(vm.read().stored_bytes(), before * BS as u64, "before compaction");
+    assert_eq!(vm.read().stored_bytes(), Some(before * BS as u64), "before compaction");
     assert!(vm.read().chunk_pack_ids(0).unwrap().len() > 16);
 
     let compact_cc: Arc<dyn BlockCache> = cc.clone();
@@ -233,7 +233,7 @@ async fn flush_racing_compaction_keeps_count_exact() {
         let oracle = oracle_live_blocks(&cs, &vm).await;
         assert_eq!(
             vm.read().stored_bytes(),
-            oracle * BS as u64,
+            Some(oracle * BS as u64),
             "yields={yields}: count drifted from the pack indexes"
         );
     }
@@ -254,7 +254,7 @@ async fn counts_persist_through_manifest_sync() {
 
     let (data, _) = cs.get_manifest("sb-persist").await.unwrap().unwrap();
     let reloaded = VolumeManifest::deserialize(&data).unwrap();
-    assert_eq!(reloaded.stored_bytes(), 8 * BS as u64);
+    assert_eq!(reloaded.stored_bytes(), Some(8 * BS as u64));
     assert!(reloaded.chunks.values().all(|e| e.live_blocks.is_some()));
 }
 
@@ -282,12 +282,12 @@ async fn backfill_recovers_unknown_counts() {
     for e in vm.write().chunks.values_mut() {
         e.live_blocks = None;
     }
-    assert_eq!(vm.read().stored_bytes(), 0, "unknown counts must not bill");
+    assert_eq!(vm.read().stored_bytes(), None, "unknown counts give no figure, not a smaller one");
     assert_eq!(vm.read().unknown_live_chunks().len(), 2);
 
     // Cold caches: the backfill must read indexes itself.
     backfill_live_counts(&vm, &cs, &pic).await;
-    assert_eq!(vm.read().stored_bytes(), truth * BS as u64);
+    assert_eq!(vm.read().stored_bytes(), Some(truth * BS as u64));
 }
 
 /// Randomised op sequences against a model of which blocks hold non-zero data.
@@ -339,4 +339,186 @@ async fn random_ops_match_model_and_oracle() {
             }
         }
     }
+}
+
+async fn fresh_index_cache() -> (Arc<PackIndexCache>, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let pic = Arc::new(PackIndexCache::open(dir.path()).await.unwrap());
+    (pic, dir)
+}
+
+fn pack_key(chunk: u32, pack: u64) -> object_store::path::Path {
+    object_store::path::Path::from(format!("test/chunks/{chunk:04}/{pack:016x}.pack"))
+}
+
+/// A flush whose pack indexes are not in the cache fetches them: the count
+/// stays exact (it is never dropped to unknown, which would bill nothing).
+#[tokio::test]
+async fn flush_with_a_cold_index_cache_keeps_an_exact_count() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) = create_test_cache(&dir, "sb-cold", Arc::clone(&s3)).await;
+    for i in 0..4 {
+        write(&cache, i, &block(i as u8 + 1));
+    }
+    flush(&cache, &cs, &pic, &vm).await;
+    write(&cache, 1, &vec![0u8; BS]);
+    flush(&cache, &cs, &pic, &vm).await;
+    assert_stored(&cs, &vm, 3, "before").await;
+
+    let (cold, _keep) = fresh_index_cache().await;
+    write(&cache, 7, &block(70));
+    write(&cache, 2, &block(71));
+    flush(&cache, &cs, &cold, &vm).await;
+    assert_stored(&cs, &vm, 4, "flush through an empty index cache").await;
+}
+
+/// If an index cannot be loaded the flush fails, as any flush failing on the
+/// object store does, and the known count is untouched.
+#[tokio::test]
+async fn flush_fails_instead_of_dropping_the_count_when_an_index_is_unavailable() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) = create_test_cache(&dir, "sb-missing", Arc::clone(&s3)).await;
+    for i in 0..3 {
+        write(&cache, i, &block(i as u8 + 1));
+    }
+    flush(&cache, &cs, &pic, &vm).await;
+    let before = vm.read().chunks[&0].clone();
+    assert_eq!(before.live_blocks, Some(3));
+
+    s3.delete(&pack_key(0, before.packs[0])).await.unwrap();
+    let (cold, _keep) = fresh_index_cache().await;
+    write(&cache, 5, &block(50));
+    assert!(cache.flush_to_s3(&cs, &cold, &vm).await.is_err(), "the flush must fail, not guess");
+    assert_eq!(vm.read().chunks[&0], before, "pack list and known count untouched");
+}
+
+/// The figure the API gives is exact while chunks are unknown (computed from
+/// the indexes on demand), and absent, never smaller, when it cannot be.
+#[tokio::test]
+async fn stored_bytes_is_exact_or_absent_never_partial() {
+    let s3: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) = create_test_cache(&dir, "sb-exact", Arc::clone(&s3)).await;
+    for i in 0..3 {
+        write(&cache, i, &block(i as u8 + 1));
+    }
+    write(&cache, BPC + 1, &block(9));
+    write(&cache, BPC + 2, &block(10));
+    flush(&cache, &cs, &pic, &vm).await;
+    let truth = oracle_live_blocks(&cs, &vm).await;
+    assert_eq!(truth, 5);
+
+    for e in vm.write().chunks.values_mut() {
+        e.live_blocks = None;
+    }
+    assert_eq!(vm.read().stored_bytes(), None);
+
+    // Only chunk 1 unknown: the known chunk 0 must not be returned as a partial sum.
+    let c0 = vm.read().chunks[&0].packs.clone();
+    vm.write().chunks.get_mut(&0).unwrap().live_blocks = Some(3);
+    let (cold, _keep) = fresh_index_cache().await;
+    assert_eq!(
+        stored_bytes_exact(&vm, &cs, &cold).await,
+        Some(truth * BS as u64),
+        "unknown chunks are computed on demand from their indexes"
+    );
+
+    // Unknown again, one index unreachable: no figure, and nothing smaller.
+    for e in vm.write().chunks.values_mut() {
+        e.live_blocks = None;
+    }
+    s3.delete(&pack_key(0, c0[0])).await.unwrap();
+    let (cold2, _keep2) = fresh_index_cache().await;
+    assert_eq!(stored_bytes_exact(&vm, &cs, &cold2).await, None);
+    assert_eq!(vm.read().stored_bytes(), None);
+}
+
+/// Object store that counts concurrent GETs of pack objects (with a delay so
+/// overlap is visible) and records the high-water mark.
+#[derive(Debug)]
+struct GateStore {
+    inner: InMemory,
+    inflight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+impl std::fmt::Display for GateStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GateStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for GateStore {
+    async fn put_opts(&self, l: &object_store::path::Path, p: object_store::PutPayload, o: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(l, p, o).await
+    }
+    async fn put_multipart_opts(&self, l: &object_store::path::Path, o: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(l, o).await
+    }
+    async fn get_opts(&self, l: &object_store::path::Path, o: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.inflight.fetch_add(1, SeqCst) + 1;
+        self.peak.fetch_max(now, SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let r = self.inner.get_opts(l, o).await;
+        self.inflight.fetch_sub(1, SeqCst);
+        r
+    }
+    async fn delete(&self, l: &object_store::path::Path) -> object_store::Result<()> {
+        self.inner.delete(l).await
+    }
+    fn list(&self, p: Option<&object_store::path::Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(p)
+    }
+    async fn list_with_delimiter(&self, p: Option<&object_store::path::Path>) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(p).await
+    }
+    async fn copy(&self, f: &object_store::path::Path, t: &object_store::path::Path) -> object_store::Result<()> {
+        self.inner.copy(f, t).await
+    }
+    async fn copy_if_not_exists(&self, f: &object_store::path::Path, t: &object_store::path::Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(f, t).await
+    }
+}
+
+/// Many exports with unknown counts, computed at once, never put more than
+/// MAX_CONCURRENT_CHUNKS index fetches in flight process-wide.
+#[tokio::test]
+async fn backfill_across_many_exports_is_globally_bounded() {
+    use glidefs::block::live_count::MAX_CONCURRENT_CHUNKS;
+    let gate = Arc::new(GateStore {
+        inner: InMemory::new(),
+        inflight: Default::default(),
+        peak: Default::default(),
+    });
+    let s3: Arc<dyn ObjectStore> = gate.clone();
+    let dir = TempDir::new().unwrap();
+    let (cache, cs, pic, vm, _cc, _m) = create_test_cache(&dir, "sb-gate", s3).await;
+    // 2 chunks only fit the 256 MiB test device, so reuse one manifest as 12 "exports".
+    for i in 0..4 {
+        write(&cache, i, &block(i as u8 + 1));
+        write(&cache, BPC + i, &block(i as u8 + 9));
+        flush(&cache, &cs, &pic, &vm).await;
+    }
+    let truth = oracle_live_blocks(&cs, &vm).await;
+    let exports: Vec<Vm> = (0..12)
+        .map(|_| {
+            let mut m = vm.read().clone();
+            for e in m.chunks.values_mut() {
+                e.live_blocks = None;
+            }
+            Arc::new(parking_lot::RwLock::new(m))
+        })
+        .collect();
+    let (cold, _keep) = fresh_index_cache().await;
+    gate.peak.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let results = futures::future::join_all(exports.iter().map(|m| stored_bytes_exact(m, &cs, &cold))).await;
+    assert!(results.iter().all(|r| *r == Some(truth * BS as u64)));
+    let peak = gate.peak.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(peak >= 2, "the test must actually overlap fetches (peak {peak})");
+    assert!(peak <= MAX_CONCURRENT_CHUNKS, "peak {peak} index fetches exceeds the global cap {MAX_CONCURRENT_CHUNKS}");
 }

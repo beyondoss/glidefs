@@ -747,12 +747,12 @@ impl MetricsSnapshot {
         dirty_blocks: u64,
         syncing_blocks: u64,
         dirty_bytes: u64,
-        stored_bytes: u64,
+        stored_bytes: Option<u64>,
     ) -> Self {
         self.dirty_blocks = Some(dirty_blocks);
         self.syncing_blocks = Some(syncing_blocks);
         self.dirty_bytes = Some(dirty_bytes);
-        self.stored_bytes = Some(stored_bytes);
+        self.stored_bytes = stored_bytes;
         self
     }
 

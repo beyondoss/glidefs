@@ -103,8 +103,10 @@ pub struct ExportInfoResponse {
     pub s3_prefix: Option<String>,
     /// Unflushed bytes waiting to be synced to S3.
     pub dirty_bytes: u64,
-    /// Bytes actually stored: non-zero blocks x block_size.
-    pub stored_bytes: u64,
+    /// Bytes actually stored: non-zero blocks x block_size. Exact or omitted
+    /// (a count that cannot be computed withholds the figure); never partial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_bytes: Option<u64>,
     /// Filesystem used bytes from ext4 superblock (None if not ext4 or read failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fs_used_bytes: Option<u64>,

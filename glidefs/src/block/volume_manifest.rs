@@ -87,9 +87,9 @@ pub struct ChunkEntry {
     /// A pure function of the chunk's *logical* content, so compaction (which
     /// rewrites packs but not content) never changes it. Flush recomputes it
     /// from the merged pack indexes whenever it appends a pack. `None` =
-    /// unknown (a manifest written before counts existed, or a flush that
-    /// could not load every index); excluded from [`VolumeManifest::stored_bytes`]
-    /// until recomputed, so an unknown count under-bills, never over-bills.
+    /// unknown (a manifest written before counts existed); while any chunk is
+    /// unknown [`VolumeManifest::stored_bytes`] is `None` and the count is
+    /// computed from the pack indexes before a figure is given.
     pub live_blocks: Option<u32>,
 }
 
@@ -260,11 +260,16 @@ impl VolumeManifest {
             .collect()
     }
 
-    /// Bytes actually stored: non-zero blocks x block_size, summed over chunks
-    /// with a known count. O(chunks), no I/O.
-    pub fn stored_bytes(&self) -> u64 {
-        let blocks: u64 = self.chunks.values().filter_map(|e| e.live_blocks).map(u64::from).sum();
-        blocks * u64::from(self.block_size)
+    /// Bytes actually stored: non-zero blocks x block_size, summed over chunks.
+    /// O(chunks), no I/O. `None` while any chunk's count is unknown: a partial
+    /// sum is never returned, because a smaller figure would under-bill without
+    /// bound.
+    pub fn stored_bytes(&self) -> Option<u64> {
+        let mut blocks = 0u64;
+        for e in self.chunks.values() {
+            blocks += u64::from(e.live_blocks?);
+        }
+        Some(blocks * u64::from(self.block_size))
     }
 
     /// Replace a chunk's entire pack list (after compaction).
@@ -1124,7 +1129,10 @@ mod tests {
         assert_eq!(back, m);
         assert_eq!(back.chunks[&0].live_blocks, Some(12), "append sets the count after the pack");
         assert_eq!(back.chunks[&3].live_blocks, None);
-        assert_eq!(back.stored_bytes(), (12 + 5) * 131072);
+        assert_eq!(back.stored_bytes(), None, "an unknown chunk makes the figure unavailable, not smaller");
+        let mut full = back.clone();
+        full.chunks.get_mut(&3).unwrap().live_blocks = Some(2);
+        assert_eq!(full.stored_bytes(), Some((12 + 5 + 2) * 131072));
         assert_eq!(back.unknown_live_chunks(), vec![(3, vec![9])]);
     }
 
@@ -1145,7 +1153,7 @@ mod tests {
         bytes.extend_from_slice(&crc.to_le_bytes());
         let back = VolumeManifest::deserialize(&bytes).unwrap();
         assert!(back.chunks.values().all(|e| e.live_blocks.is_none()));
-        assert_eq!(back.stored_bytes(), 0);
+        assert_eq!(back.stored_bytes(), None, "unknown counts give no figure");
     }
 
     /// A CAS compaction swaps packs but never changes the count; a stale
