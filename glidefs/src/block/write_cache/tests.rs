@@ -3605,43 +3605,69 @@ async fn zc_overwrite_of_user_copy_page_does_not_leave_stale_crc() {
 }
 
 /// T14 part 1: a flush that skipped a block for CRC mismatch must never be
-/// published as a snapshot (or a drain flush): the skipped block's data would be
-/// missing from it.
+/// published. A mismatch no concurrent write explains (cache-file corruption)
+/// fails loudly with retries available -- retrying would upload the corrupt
+/// bytes -- and publishes nothing; the skipped block stays dirty.
 #[tokio::test]
-async fn snapshot_fails_when_a_block_was_crc_skipped() {
+async fn publish_flush_fails_on_unexplained_crc_skip() {
     let h = V2Harness::new().await;
     h.cache.write(0, &vec![0xABu8; 4096]).unwrap();
-    h.cache
-        .inner()
-        .data_file
-        .read()
-        .write_all_at(&vec![0xFFu8; 4096], 0)
-        .unwrap();
+    h.cache.inner().data_file.read().write_all_at(&vec![0xFFu8; 4096], 0).unwrap();
 
+    let _g = h.cache.flush_lock().lock().await;
+    let res = h
+        .cache
+        .flush_until_no_skips(&h.content_store, &h.pack_index_cache, &h.volume_manifest, 3)
+        .await;
+    assert!(
+        matches!(res, Err(super::CacheError::FlushSkippedBlocks { crc_mismatched: 1 })),
+        "unexplained skip must fail without retrying (a retry would upload the corrupt bytes): {res:?}"
+    );
+    assert_eq!(h.cache.dirty_block_count(), 1, "skipped block stays dirty");
+    assert!(
+        h.content_store.list_snapshots(&h.cache.inner().export_name).await.unwrap().is_empty(),
+        "nothing published"
+    );
+}
+
+/// The benign race: a write lands between the CRC drain and rotation, so the
+/// drained baseline is stale for the flushing file. The first pass skips the
+/// block; snapshot() must re-flush internally and succeed with the block's
+/// latest data in S3.
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn snapshot_survives_write_between_crc_drain_and_rotation() {
+    use super::inner::{FlushStep, FlushSyncPoints};
+    let h = V2Harness::new().await;
+    h.cache.write(0, &vec![0xAAu8; 4096]).unwrap();
+
+    let (sp, mut events, proceed) = FlushSyncPoints::new();
+    *h.cache.inner().flush_sync.lock() = Some(std::sync::Arc::new(sp));
+
+    // Deterministic window: at the first AfterCrcPrepass gate (CRCs drained,
+    // not yet rotated) write new data, then release; every other gate just
+    // releases.
+    let inner = h.cache.inner();
+    let writer = tokio::spawn(async move {
+        let mut written = false;
+        while let Some(ev) = events.recv().await {
+            if ev.step == FlushStep::AfterCrcPrepass && !written {
+                // Same effect as WriteCache::write on an already-DIRTY block.
+                let data = vec![0xCCu8; 4096];
+                inner.pwrite_data_file(&data, 0).unwrap();
+                inner.capture_page_crcs(0, &data);
+                written = true;
+            }
+            let _ = proceed.send(());
+        }
+    });
     let res = h
         .cache
         .snapshot(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
         .await;
-    assert!(
-        matches!(res, Err(super::CacheError::FlushSkippedBlocks { crc_mismatched: 1 })),
-        "snapshot must fail loudly on a CRC-skipped block, got: {res:?}"
-    );
-    assert_eq!(h.cache.dirty_block_count(), 1, "skipped block stays dirty for retry");
-
-    assert!(
-        h.content_store.list_snapshots(&h.cache.inner().export_name).await.unwrap().is_empty(),
-        "no snapshot may be published for a lossy flush"
-    );
-
-    // Same guarantee for the drain flush (publishes the manifest for cold readers).
-    h.cache.write(0, &vec![0xABu8; 4096]).unwrap();
-    h.cache.inner().data_file.read().write_all_at(&vec![0xFFu8; 4096], 0).unwrap();
-    let res = h
-        .cache
-        .flush_to_s3(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
-        .await;
-    assert!(
-        matches!(res, Err(super::CacheError::FlushSkippedBlocks { crc_mismatched: 1 })),
-        "flush_to_s3 must fail loudly on a CRC-skipped block, got: {res:?}"
-    );
+    writer.abort();
+    let res = res.expect("snapshot must retry the benign race, not fail");
+    assert_eq!(res.stats.blocks_crc_mismatched, 0, "final pass is clean");
+    assert_eq!(h.cache.dirty_block_count(), 0);
+    assert_eq!(h.read(0, 4096).await, vec![0xCCu8; 4096], "latest write is in the snapshot");
 }

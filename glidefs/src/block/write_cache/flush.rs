@@ -133,13 +133,18 @@ fn compute_flush_batch(
                                 crc_mismatched: true,
                             });
                         }
+                        // A newer write already re-recorded a baseline for this
+                        // block (map was drained empty before rotation): the
+                        // drained one was stale, not the data. A write race.
+                        let raced = inner.page_crcs.contains_key(&(chunk_index as u32));
                         debug!(
                             chunk_index,
+                            raced,
                             "page CRC mismatch — block will retry next flush cycle"
                         );
                         return Ok(BlockResult::Skipped {
                             chunk_index,
-                            cas_failed: false,
+                            cas_failed: raced,
                             crc_mismatched: true,
                         });
                     }
@@ -193,6 +198,9 @@ fn compute_flush_batch(
                 }
                 if crc_mismatched {
                     stats.blocks_crc_mismatched += 1;
+                    if cas_failed {
+                        stats.blocks_crc_raced += 1;
+                    }
                 }
             }
             BlockResult::Computed {
@@ -245,6 +253,9 @@ fn drain_page_crcs(inner: &CacheInner) -> HashMap<usize, Box<[u32]>> {
     });
     map
 }
+
+/// Flush passes a snapshot / drain flush may take to get a skip-free cut.
+const PUBLISH_FLUSH_PASSES: usize = 3;
 
 impl WriteCache<Active> {
     /// Set the block compression level/codec used by the flush path.
@@ -1328,6 +1339,7 @@ impl WriteCache<Active> {
             total_stats.blocks_deduped += batch.stats.blocks_deduped;
             total_stats.blocks_cas_failed += batch.stats.blocks_cas_failed;
             total_stats.blocks_crc_mismatched += batch.stats.blocks_crc_mismatched;
+            total_stats.blocks_crc_raced += batch.stats.blocks_crc_raced;
 
             // Transition skipped blocks back to DIRTY.
             //
@@ -1846,6 +1858,50 @@ impl WriteCache<Active> {
         Ok(())
     }
 
+    /// Flush until a pass skips no block for CRC mismatch, at most `max_passes`
+    /// times. Caller holds `flush_lock`.
+    ///
+    /// A snapshot / drain manifest is a claim that every block dirty at the cut
+    /// is in S3, so it must never follow a pass that skipped one. The benign
+    /// cause of a skip is a write landing between the CRC drain and rotation
+    /// (stale drained baseline); skipped blocks go back to DIRTY with a fresh
+    /// baseline, so the next pass picks them up. If skips persist through the
+    /// last pass, or any skip is not explained by a write race (possible
+    /// corruption), fail with [`CacheError::FlushSkippedBlocks`] and publish
+    /// nothing.
+    pub(crate) async fn flush_until_no_skips(
+        &self,
+        content_store: &ContentStore,
+        pack_index_cache: &Arc<crate::block::pack_index_cache::PackIndexCache>,
+        volume_manifest: &Arc<parking_lot::RwLock<crate::block::volume_manifest::VolumeManifest>>,
+        max_passes: usize,
+    ) -> Result<(FlushStats, u64), CacheError> {
+        let mut pass = 1;
+        loop {
+            let (stats, seq) = self
+                .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
+                .await?;
+            if stats.blocks_crc_mismatched == 0 {
+                return Ok((stats, seq));
+            }
+            // Unexplained mismatch = possible cache-file corruption: retrying
+            // would re-read the same bytes with no baseline and upload them.
+            // Only write races are retried.
+            let unexplained = stats.blocks_crc_mismatched - stats.blocks_crc_raced;
+            if unexplained > 0 || pass >= max_passes {
+                return Err(CacheError::FlushSkippedBlocks {
+                    crc_mismatched: stats.blocks_crc_mismatched,
+                });
+            }
+            warn!(
+                pass,
+                raced = stats.blocks_crc_raced,
+                "flush skipped blocks that raced a write; re-flushing before publishing"
+            );
+            pass += 1;
+        }
+    }
+
     /// Flush dirty blocks to S3 + upload manifest (drain/snapshot path).
     ///
     /// `flush_dirty_inner` is now atomic (uploads packs, syncs manifest,
@@ -1864,13 +1920,8 @@ impl WriteCache<Active> {
     ) -> Result<FlushStats, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, _seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
+            .flush_until_no_skips(content_store, pack_index_cache, volume_manifest, PUBLISH_FLUSH_PASSES)
             .await?;
-        if stats.blocks_crc_mismatched > 0 {
-            return Err(CacheError::FlushSkippedBlocks {
-                crc_mismatched: stats.blocks_crc_mismatched,
-            });
-        }
         if stats.packs_uploaded == 0 {
             // No packs uploaded → atomic flush skipped its internal sync.
             // Push the manifest unconditionally so the export is
@@ -1906,13 +1957,8 @@ impl WriteCache<Active> {
     ) -> Result<SnapshotResult, CacheError> {
         let _flush_guard = self.inner.flush_lock.lock().await;
         let (stats, seq_cutpoint) = self
-            .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
+            .flush_until_no_skips(content_store, pack_index_cache, volume_manifest, PUBLISH_FLUSH_PASSES)
             .await?;
-        if stats.blocks_crc_mismatched > 0 {
-            return Err(CacheError::FlushSkippedBlocks {
-                crc_mismatched: stats.blocks_crc_mismatched,
-            });
-        }
 
         let manifest_bytes = volume_manifest.read().serialize()?;
         let manifest_etag = self.inner.manifest_etag.lock().clone();

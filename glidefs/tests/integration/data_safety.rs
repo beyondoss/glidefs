@@ -628,9 +628,13 @@ async fn test_ssd_corruption_detected_during_flush() {
         file.write_all_at(&garbage, 0).unwrap();
     }
 
-    let stats2 = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap();
     // Write-time CRC detects the corruption: baseline (0x11) != flushing file (0xFF).
-    assert_eq!(stats2.blocks_crc_mismatched, 1);
+    // The drain flush must fail loudly rather than publish a manifest without it.
+    let err = cache.flush_to_s3(&cs, &pic, &vm).await.unwrap_err();
+    assert!(
+        matches!(err, glidefs::block::write_cache::CacheError::FlushSkippedBlocks { crc_mismatched: 1 }),
+        "got: {err:?}"
+    );
     assert_eq!(cache.dirty_block_count(), 1, "corrupted block remains dirty");
 
     // Fix: overwrite with correct data and flush again.

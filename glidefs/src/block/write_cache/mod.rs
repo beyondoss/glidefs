@@ -73,6 +73,12 @@ pub struct FlushStats {
     /// `blocks_crc_mismatched - blocks_cas_failed` at low write rates warrants
     /// SSD health investigation.
     pub blocks_crc_mismatched: usize,
+    /// Subset of `blocks_crc_mismatched` explained by a concurrent write (the
+    /// drained baseline was stale because a newer write re-recorded one, or the
+    /// block was re-dirtied). Retrying such a block is safe; the remainder
+    /// (`blocks_crc_mismatched - blocks_crc_raced`) is unexplained and means the
+    /// cache file may be corrupt.
+    pub blocks_crc_raced: usize,
     /// CRC queue entries drained this flush cycle. Includes duplicates from
     /// overwrites to the same page between flushes.
     pub crc_entries_drained: usize,

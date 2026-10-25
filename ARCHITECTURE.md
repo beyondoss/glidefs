@@ -338,7 +338,7 @@ After flush:   {name}.cache          ← active
 11. Finalize: CAS SYNCING→NOT_PRESENT (evict), copy skipped blocks flushing→active
 12. `flushing_active.store(false)`, drop flushing_file, `unlink("{name}.flushing")`
 
-**CRC baselines and zero-copy**: USER_COPY writes record per-page CRC32C baselines at pwrite time; ublk zero-copy writes never see the bytes, so `commit_after_zc_write_with` invalidates (zeroes) any older baseline for the touched pages instead. A flush that skips any block for CRC mismatch is not a complete cut: `snapshot()` and `flush_to_s3()` return `CacheError::FlushSkippedBlocks` and publish nothing (the blocks stay dirty for the next flush).
+**CRC baselines and zero-copy**: USER_COPY writes record per-page CRC32C baselines at pwrite time; ublk zero-copy writes never see the bytes, so `commit_after_zc_write_with` invalidates (zeroes) any older baseline for the touched pages instead. A flush that skips any block for CRC mismatch is not a complete cut: `snapshot()` and `flush_to_s3()` re-flush (up to 3 passes) while skips are explained by a write race, and return `CacheError::FlushSkippedBlocks` publishing nothing if skips persist or any skip is unexplained (possible cache-file corruption).
 
 **SSD footprint**: With 128KB blocks, 500 blocks_per_pack, 5s flush interval: ~64MB active + ~64MB flushing = ~128MB per export during flush. Outside flush: just dirty blocks since last flush.
 
