@@ -37,6 +37,13 @@ pub enum CacheError {
     )]
     UnsupportedBlockSize(usize, usize),
 
+    /// A flush skipped dirty blocks because their data failed the write-time
+    /// CRC check. The flush is not a complete cut of the volume, so it must not
+    /// be published as a snapshot or drain-complete. The skipped blocks stay
+    /// dirty and are retried by the next flush.
+    #[error("flush skipped {crc_mismatched} block(s) that failed their CRC check; not publishing")]
+    FlushSkippedBlocks { crc_mismatched: usize },
+
     #[error("Block evicted during flush — retry with backfill")]
     BlockEvicted,
 

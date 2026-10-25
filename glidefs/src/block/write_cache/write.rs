@@ -578,8 +578,9 @@ impl WriteCache<Active> {
     ///
     /// The CRC capture that `pwrite_and_commit` does is omitted — for ZC
     /// the data never enters userspace, so we have no source bytes to
-    /// hash. Flush handles a missing CRC entry by skipping per-page
-    /// verification (see `flush.rs` `stored_crc == 0` branch).
+    /// hash. Instead any existing baseline for the touched pages is
+    /// invalidated (a stale one would fail verification), and flush skips
+    /// per-page verification (see `flush.rs` `stored_crc == 0` branch).
     ///
     /// See `BlockHandler::commit_after_zc_write_with` for the integrity
     /// contract: cache-file corruption in the WRITE_FIXED→flush window
@@ -605,6 +606,9 @@ impl WriteCache<Active> {
         // before WRITE_FIXED. Promoting again would re-copy from the
         // flushing file (now containing pre-WRITE_FIXED data) on top of
         // the kernel's just-landed new data — silent write rollback.
+        // The kernel just replaced these bytes: any baseline CRC left by an
+        // earlier USER_COPY write is now stale and would fail flush verification.
+        self.inner.invalidate_page_crcs(offset, length);
         self.wal_append_and_mark_dirty(df, start_block, end_block)?;
         Ok(())
     }

@@ -3572,3 +3572,76 @@ async fn test_mixed_codec_across_flushes_cold_read() {
     assert_eq!(&h.read(0, 128 * 1024).await[..], &b0[..], "legacy LZ4 block");
     assert_eq!(&h.read(128 * 1024, 128 * 1024).await[..], &b1[..], "zstd block");
 }
+
+/// T14 root cause: a ZC write over a page that already has a write-time CRC
+/// baseline (from an earlier USER_COPY write in the same flush window) left the
+/// stale CRC in place, because the ZC commit never touches `page_crcs`. Flush
+/// then compared the kernel-written bytes against the old baseline, counted a
+/// CRC mismatch, and skipped the block.
+///
+/// This drives exactly the ZC call sequence (`zc_promote_for_write_with` ->
+/// kernel WRITE_FIXED, simulated with a raw pwrite -> `commit_after_zc_write_with`)
+/// on a 6.12 kernel where the real ublk ZC path is unavailable.
+#[cfg(all(target_os = "linux", feature = "ublk"))]
+#[tokio::test]
+async fn zc_overwrite_of_user_copy_page_does_not_leave_stale_crc() {
+    let h = V2Harness::new().await;
+    h.cache.write(0, &vec![0xAAu8; 4096]).unwrap(); // USER_COPY: baseline CRC(0xAA)
+
+    {
+        let df = h.cache.inner.data_file.read();
+        h.cache.zc_promote_for_write_with(&df, 0, 4096).unwrap();
+        df.write_all_at(&vec![0xBBu8; 4096], 0).unwrap(); // kernel WRITE_FIXED
+        h.cache.commit_after_zc_write_with(&df, 0, 4096).unwrap();
+    }
+
+    let (stats, _) = h
+        .cache
+        .flush_packs(&h.content_store, &h.pack_index_cache, &h.volume_manifest, None)
+        .await
+        .unwrap();
+    assert_eq!(stats.blocks_crc_mismatched, 0, "ZC overwrite must not trip a stale CRC");
+    assert_eq!(h.cache.dirty_block_count(), 0, "block must be flushed, not skipped");
+}
+
+/// T14 part 1: a flush that skipped a block for CRC mismatch must never be
+/// published as a snapshot (or a drain flush): the skipped block's data would be
+/// missing from it.
+#[tokio::test]
+async fn snapshot_fails_when_a_block_was_crc_skipped() {
+    let h = V2Harness::new().await;
+    h.cache.write(0, &vec![0xABu8; 4096]).unwrap();
+    h.cache
+        .inner()
+        .data_file
+        .read()
+        .write_all_at(&vec![0xFFu8; 4096], 0)
+        .unwrap();
+
+    let res = h
+        .cache
+        .snapshot(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .await;
+    assert!(
+        matches!(res, Err(super::CacheError::FlushSkippedBlocks { crc_mismatched: 1 })),
+        "snapshot must fail loudly on a CRC-skipped block, got: {res:?}"
+    );
+    assert_eq!(h.cache.dirty_block_count(), 1, "skipped block stays dirty for retry");
+
+    assert!(
+        h.content_store.list_snapshots(&h.cache.inner().export_name).await.unwrap().is_empty(),
+        "no snapshot may be published for a lossy flush"
+    );
+
+    // Same guarantee for the drain flush (publishes the manifest for cold readers).
+    h.cache.write(0, &vec![0xABu8; 4096]).unwrap();
+    h.cache.inner().data_file.read().write_all_at(&vec![0xFFu8; 4096], 0).unwrap();
+    let res = h
+        .cache
+        .flush_to_s3(&h.content_store, &h.pack_index_cache, &h.volume_manifest)
+        .await;
+    assert!(
+        matches!(res, Err(super::CacheError::FlushSkippedBlocks { crc_mismatched: 1 })),
+        "flush_to_s3 must fail loudly on a CRC-skipped block, got: {res:?}"
+    );
+}

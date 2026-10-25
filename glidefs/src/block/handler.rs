@@ -1727,7 +1727,7 @@ impl BlockHandler {
     /// time."
     ///
     /// **For ZC writes the bio never enters userspace.** We can't compute
-    /// the source CRC, so the per-page entry stays at 0 and flush skips
+    /// the source CRC, so the commit invalidates any older baseline for the touched pages (entry 0) and flush skips
     /// verification for those pages. This loses one specific check: cache
     /// file corruption between WRITE_FIXED completion and the flush read.
     /// On modern hardware (ECC RAM + mainline kernel + NVMe with internal

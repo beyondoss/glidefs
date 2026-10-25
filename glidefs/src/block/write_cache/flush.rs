@@ -1866,6 +1866,11 @@ impl WriteCache<Active> {
         let (stats, _seq_cutpoint) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
+        if stats.blocks_crc_mismatched > 0 {
+            return Err(CacheError::FlushSkippedBlocks {
+                crc_mismatched: stats.blocks_crc_mismatched,
+            });
+        }
         if stats.packs_uploaded == 0 {
             // No packs uploaded → atomic flush skipped its internal sync.
             // Push the manifest unconditionally so the export is
@@ -1903,6 +1908,11 @@ impl WriteCache<Active> {
         let (stats, seq_cutpoint) = self
             .flush_dirty_inner(content_store, pack_index_cache, volume_manifest, None)
             .await?;
+        if stats.blocks_crc_mismatched > 0 {
+            return Err(CacheError::FlushSkippedBlocks {
+                crc_mismatched: stats.blocks_crc_mismatched,
+            });
+        }
 
         let manifest_bytes = volume_manifest.read().serialize()?;
         let manifest_etag = self.inner.manifest_etag.lock().clone();

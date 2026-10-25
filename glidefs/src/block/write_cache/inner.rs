@@ -881,6 +881,36 @@ impl CacheInner {
         }
     }
 
+    /// Drop write-time CRC baselines for every page a write touched, without
+    /// supplying a replacement.
+    ///
+    /// The ublk zero-copy path never sees the bytes (the kernel writes them
+    /// straight into the cache file), so it cannot compute a new baseline. But
+    /// an earlier USER_COPY / zero_range write in the same flush window may have
+    /// left one; if it survived, flush would compare the new bytes against the
+    /// old CRC and skip the block as corrupt. Entry 0 means "no baseline, skip
+    /// verification" (see `compute_flush_batch`).
+    pub(super) fn invalidate_page_crcs(&self, offset: u64, len: u64) {
+        const PAGE_SIZE: u64 = 4096;
+        if len == 0 || self.page_crcs.is_empty() {
+            return;
+        }
+        let block_size = self.config.block_size as u64;
+        let end = offset + len;
+        for block in offset / block_size..=(end - 1) / block_size {
+            #[allow(clippy::cast_possible_truncation)]
+            let block_key = block as u32; // block numbers fit in u32
+            if let Some(mut entry) = self.page_crcs.get_mut(&block_key) {
+                let block_start = block * block_size;
+                let first = offset.saturating_sub(block_start) / PAGE_SIZE;
+                let last = (end.min(block_start + block_size) - block_start).div_ceil(PAGE_SIZE);
+                for page in first..last {
+                    entry[page as usize] = 0;
+                }
+            }
+        }
+    }
+
     /// Record per-page CRCs for a zero_range operation.
     pub(super) fn capture_zero_page_crcs(&self, offset: u64, len: u64) {
         const PAGE_SIZE: u64 = 4096;
