@@ -791,7 +791,7 @@ impl CacheInner {
     ///
     /// Used by the ublk write path — pwrite via the RwLock ensures writes
     /// always target the current active file, even after file rotation.
-    #[cfg(all(target_os = "linux", feature = "ublk"))]
+    #[cfg(any(test, all(target_os = "linux", feature = "ublk")))]
     #[inline]
     pub(crate) fn pwrite_data_file(&self, data: &[u8], offset: u64) -> std::io::Result<()> {
         self.data_file.read().write_all_at(data, offset)
