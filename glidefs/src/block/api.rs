@@ -572,6 +572,11 @@ async fn create_or_attach_volume(
                 ),
             }
         }
+        // 410 Gone: the volume exists in the index but its lineage (fork
+        // manifest) is lost. Retrying cannot help -- the caller must re-fork.
+        Err(e @ RouterError::LineageLost { .. }) => {
+            error_response(StatusCode::GONE, &format!("lineage_lost: {e}"))
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -1828,6 +1833,16 @@ mod tests {
         let node_a = create_test_router_with_store(&temp_a, Arc::clone(&shared)).await;
         node_a
             .save_export(&custom_pool_config("vol1", "custompool"))
+            .await
+            .unwrap();
+        // A real fork persists its manifest at creation (a forked volume with
+        // no manifest is refused as LineageLost); seed the one this fork has.
+        let cs = crate::block::content_store::ContentStore::new(
+            Arc::clone(&shared),
+            "test/exports/custompool",
+        );
+        let seed = crate::block::volume_manifest::VolumeManifest::new(10 * 1024 * 1024, 128 * 1024);
+        cs.put_manifest("vol1", seed.serialize().unwrap(), None)
             .await
             .unwrap();
 

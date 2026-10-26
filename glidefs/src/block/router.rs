@@ -110,6 +110,15 @@ pub enum RouterError {
     #[error("Manifest error: {0}")]
     Manifest(String),
 
+    /// A forked export's volume manifest is missing, so its lineage (the
+    /// base chain its unwritten blocks resolve through) cannot be restored.
+    /// Serving it would present an empty disk, so the export is refused.
+    #[error(
+        "Export '{name}' was forked from '{source_ref}' but its volume manifest is missing; \
+         lineage lost, refusing to export (re-fork it)"
+    )]
+    LineageLost { name: String, source_ref: String },
+
     #[error(
         "Drain incomplete for '{name}': {remaining} dirty blocks after {iterations} iterations"
     )]
@@ -1637,6 +1646,24 @@ impl ExportRouter {
             let cache = WriteCache::open_fresh_active(cache_config)?;
             t_cache_init_ms = t_cache.elapsed().as_millis();
 
+            // Make the fork's lineage DURABLE before it can serve I/O. The
+            // forked VolumeManifest (the base's block map, resized) is the only
+            // thing that resolves this export's unwritten blocks; held in memory
+            // alone, a crash/OOM/reboot restarted it on the normal path below,
+            // which finds no `manifests/{name}`, "starts fresh" with an EMPTY
+            // manifest and serves an unreadable disk. The PUT also seeds
+            // `manifest_etag`, so later syncs are conditional (If-Match).
+            // Ordered before `save_export` and device registration (the API
+            // runs them after create_export), so any visible export has it.
+            let manifest_bytes = volume_manifest
+                .read()
+                .serialize()
+                .map_err(|e| RouterError::Manifest(format!("serialize fork manifest: {e}")))?;
+            let etag = content_store
+                .put_manifest(&name, manifest_bytes, None)
+                .await?;
+            *cache.inner.manifest_etag.lock() = etag;
+
             info!("Export '{}' created from manifest (fork)", name);
             (Arc::new(cache), volume_manifest)
         } else {
@@ -1674,8 +1701,21 @@ impl ExportRouter {
                     info!("Loaded existing volume manifest for '{}'", name);
                     volume_manifest
                 }
+                Ok(None) if config.source.is_some() => {
+                    // A volume with a recorded lineage (`source`) always has a
+                    // manifest: forks persist theirs at creation. Its absence
+                    // means the block map that resolves this disk's unwritten
+                    // blocks is gone (e.g. a fork created before manifests were
+                    // persisted at fork time). Starting empty would serve a
+                    // disk whose reads fail while looking "recovered"; refuse so
+                    // the caller re-forks.
+                    return Err(RouterError::LineageLost {
+                        name: name.clone(),
+                        source_ref: config.source.clone().unwrap_or_default(),
+                    });
+                }
                 Ok(None) => {
-                    // No manifest in S3 — genuinely new export.
+                    // No manifest in S3 — genuinely new (blank) export.
                     info!("No existing manifest for '{}', starting fresh", name);
                     Arc::new(parking_lot::RwLock::new(
                         VolumeManifest::new(device_size, block_size as u32),

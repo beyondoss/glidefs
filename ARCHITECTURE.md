@@ -386,19 +386,24 @@ Presence is derived: `is_present = state != 0`. This eliminates a separate `pres
 
 ## Fork Path
 
-Forking a VM copies the VolumeManifest — a compact binary blob mapping chunk indices to pack ID lists. That's 2 S3 operations (GET parent manifest, PUT fork manifest). No block data is copied, no local metadata is duplicated.
+Forking a VM copies the VolumeManifest — a compact binary blob mapping chunk indices to pack ID lists. That's 2 S3 operations (GET parent manifest, PUT fork manifest), both before the fork can serve I/O. No block data is copied, no local metadata is duplicated.
 
 ```
 router.create_export(config, fork_from="parent-vm")
     │
     ├── ContentStore::get_manifest("parent-vm")    ← GET manifests/parent-vm (~53KB for 1TB)
     ├── VolumeManifest::deserialize()              ← parse binary GLVM
-    ├── VolumeManifest held in memory              ← NOT uploaded to S3 at create time
-    └── WriteCache::open_fresh_active(config)      ← empty SparseStateMap (all NotPresent)
+    ├── WriteCache::open_fresh_active(config)      ← empty SparseStateMap (all NotPresent)
+    └── ContentStore::put_manifest("fork-vm", ...) ← PUT manifests/fork-vm, seeds manifest_etag
     │
     ▼
-Fork manifest uploaded to S3 on first flush cycle (sync_manifest)
-or explicit drain/snapshot. Crash before first flush → re-fork from parent.
+The fork's manifest is DURABLE before create_export returns (and so before
+export.json is saved or a device is registered). It is the only thing that
+resolves the fork's unwritten blocks; if it lived only in memory, a crash/OOM
+restarted the export on the normal (non-fork) path, which found no
+`manifests/fork-vm`, started with an EMPTY manifest, and served a disk whose
+reads failed ("recovered", `manifest=None`). Later flushes/drains/snapshots
+update it with If-Match as usual.
     │
     ▼
 Fork is live:
@@ -724,7 +729,7 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/exports/{name}` | `PUT` | Create, fork, re-attach, or resize a volume by **name alone** (idempotent). Body is fully logical — no `s3_prefix`/`manifest_name`/`snapshot_sequence`. To fork, set `from` to `"image:<name>"`, `"volume:<name>"`, or `"snapshot:<id>"`; GlideFS resolves it to a pool + manifest and places the new volume in the source's pool for CoW. Omit `from` for a blank volume. |
+| `/api/exports/{name}` | `PUT` | Create, fork, re-attach, or resize a volume by **name alone** (idempotent). Body is fully logical — no `s3_prefix`/`manifest_name`/`snapshot_sequence`. To fork, set `from` to `"image:<name>"`, `"volume:<name>"`, or `"snapshot:<id>"`; GlideFS resolves it to a pool + manifest and places the new volume in the source's pool for CoW. Omit `from` for a blank volume. Returns **410 Gone** (`lineage_lost: …`) when a re-attach finds a forked volume whose manifest is lost: do not retry, delete (`?purge=true`) and re-fork. |
 | `/api/resolve/{name}` | `GET` | Resolve a volume's physical location (`{s3_prefix, manifest_name, size_gb,…}`) from the durable name-keyed index, reading `export.json` straight from S3. Works on **any** node — even one that has never attached or discovered the volume. The primitive behind dead-node recovery. |
 | `/api/images/{name}` | `GET` | Resolve a blessed image's location (`{name, pool, manifest}`) from the logical image index. |
 | `/api/exports/{name}` | `GET` | Get export info (size, readonly, transport, device path) |
@@ -748,7 +753,7 @@ HTTP REST API for orchestrators (scale-to-zero, live migration). (`api.rs`)
 
 ### Export Persistence & Discovery
 
-Export definitions are saved to S3 as `{db_path}/exports/{name}/export.json`. On startup, `discover_exports()` lists all `export.json` files under the `exports/` prefix and loads them 32-wide parallel, then `create_export()` recovers each from local WAL 16-wide parallel. No S3 writes on the recovery path. (`router.rs:save_export`, `router.rs:discover_exports`, `cli/server.rs`)
+Export definitions are saved to S3 as `{db_path}/exports/{name}/export.json`. On startup, `discover_exports()` lists all `export.json` files under the `exports/` prefix and loads them 32-wide parallel, then `create_export()` recovers each from local WAL 16-wide parallel. No S3 writes on the recovery path. Recovery loads each export's own `manifests/{name}` (forks persist theirs at creation, see Fork Path) and replays the WAL on top; a volume with a recorded `source` (a fork) whose manifest is missing is **refused** with `RouterError::LineageLost` rather than started empty — at boot it is logged and left out of the router, and a later `PUT /api/exports/{name}` returns **410 Gone** with body `lineage_lost: …`. Blank volumes (no `source`) may legitimately have no manifest before their first flush and still recover from the WAL. Proof: `tests/integration/fork_recovery.rs`. (`router.rs:save_export`, `router.rs:discover_exports`, `cli/server.rs`)
 
 ### Logical Naming & Resolution (GlideFS owns the logical→physical mapping)
 

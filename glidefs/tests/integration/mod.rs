@@ -16,6 +16,7 @@ mod data_safety;
 mod flush_ordering;
 mod failure_injection;
 mod flush_safety;
+mod fork_recovery;
 mod gc;
 mod property_tests;
 mod snapshots;
