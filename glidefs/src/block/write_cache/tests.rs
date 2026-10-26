@@ -308,6 +308,40 @@ async fn test_sync_fence_supersedes_incumbent() {
     }
 }
 
+/// The drain of an IDLE superseded writer (no dirty blocks, so no packs and no
+/// atomic-flush manifest sync) used to PUT the manifest through the bare
+/// `flush_to_s3` path and surface a raw ETag `PreconditionFailed` -- an
+/// evacuated source's release-time drain looked like a storage fault. It must
+/// classify as `Fenced` exactly like the dirty path, and must not write.
+#[tokio::test]
+async fn test_idle_drain_of_superseded_writer_is_fenced() {
+    let h = V2Harness::new().await;
+    *h.cache.inner.current_generation.lock() = 5;
+    h.cache.write(0, b"first").unwrap();
+    h.try_flush().await.expect("first flush at gen 5 succeeds");
+
+    let (data, etag) = h.content_store.get_manifest("test").await.unwrap().unwrap();
+    let mut s3_vm = VolumeManifest::deserialize(&data).unwrap();
+    s3_vm.generation = 6;
+    let newer = s3_vm.serialize().unwrap();
+    h.content_store
+        .put_manifest("test", newer.clone(), etag.as_deref())
+        .await
+        .expect("newer generation seizes the manifest");
+
+    // No new writes: nothing dirty, nothing to upload.
+    match h.try_flush().await {
+        Err(CacheError::Fenced { held, superseded_by }) => {
+            assert_eq!((held, superseded_by), (5, 6));
+        }
+        other => panic!("expected Fenced from an idle drain, got {other:?}"),
+    }
+    // Repeatable, and the new owner's manifest is byte-identical.
+    assert!(matches!(h.try_flush().await, Err(CacheError::Fenced { .. })));
+    let (after, _) = h.content_store.get_manifest("test").await.unwrap().unwrap();
+    assert_eq!(&after[..], &newer[..], "superseded writer must not write");
+}
+
 #[tokio::test]
 async fn test_flush_end_to_end() {
     let h = V2Harness::new().await;

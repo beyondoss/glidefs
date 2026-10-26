@@ -7,6 +7,7 @@
 use crate::block::metrics::prometheus_header;
 use crate::block::registry::FromRef;
 use crate::block::router::{ExportInfo, ExportRouter, RouterError};
+use crate::block::write_cache::CacheError;
 use crate::config::ExportConfig;
 use crate::task;
 use bytes::Bytes;
@@ -24,6 +25,10 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+
+/// Stable body prefix of the 409 a drain answers when a newer fence token owns
+/// the volume. Callers match this prefix, never the free-form remainder.
+pub const SUPERSEDED_PREFIX: &str = "superseded:";
 use url::form_urlencoded;
 
 /// Request to create, fork, re-attach, or resize a volume
@@ -788,6 +793,16 @@ where
                 Err(RouterError::InvalidExportName(_)) => error_response(
                     StatusCode::BAD_REQUEST,
                     &format!("Invalid export name '{}'", name),
+                ),
+                // A newer fence token owns the volume: this export has nothing
+                // left to drain and must not write. Stable typed signal (body
+                // prefix `superseded:`) for callers that release the export
+                // without data movement; the volume's S3 state is untouched.
+                Err(RouterError::Cache(e @ CacheError::Fenced { .. })) => error_response(
+                    StatusCode::CONFLICT,
+                    &format!(
+                        "{SUPERSEDED_PREFIX} volume '{name}' is owned by a newer fence token ({e})"
+                    ),
                 ),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
@@ -1865,6 +1880,73 @@ mod tests {
         let resp = request(&node_c, Method::GET, "/api/resolve/vol1", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await["s3_prefix"], "custompool");
+    }
+
+    /// An evacuated source's release: node A's export is superseded by node B's
+    /// newer fence token. A drain answers a typed 409 `superseded:` (not a 500),
+    /// the retained delete releases the export promptly instead of retrying a
+    /// drain that cannot succeed, and node B's manifest is untouched.
+    #[tokio::test]
+    async fn test_drain_of_superseded_export_is_409_and_delete_releases_without_writing() {
+        let shared: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+
+        let temp_a = TempDir::new().unwrap();
+        let node_a = create_test_router_with_store(&temp_a, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_a,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 5}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Node B (the new owner) takes the volume at generation 6.
+        let temp_b = TempDir::new().unwrap();
+        let node_b = create_test_router_with_store(&temp_b, Arc::clone(&shared)).await;
+        let resp = request(
+            &node_b,
+            Method::PUT,
+            "/api/exports/vol1",
+            Some(r#"{"size_gb": 0.01, "generation": 6}"#),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let cs = crate::block::content_store::ContentStore::new(
+            Arc::clone(&shared),
+            "test/exports/vol1",
+        );
+        let (owner_before, _) = cs.get_manifest("vol1").await.unwrap().unwrap();
+
+        // The old owner's release-time drain: typed, stable, repeatable.
+        for _ in 0..2 {
+            let resp = request(&node_a, Method::POST, "/api/exports/vol1/drain", None).await;
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = body_json(resp).await;
+            assert!(
+                body["error"].as_str().unwrap().starts_with(SUPERSEDED_PREFIX),
+                "stable body prefix, got {body}"
+            );
+        }
+
+        // The retained delete drops the export without looping on the drain.
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            request(&node_a, Method::DELETE, "/api/exports/vol1", None),
+        )
+        .await
+        .expect("a superseded export must be released promptly, not retried");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(node_a.get_export_info("vol1").await.is_none(), "export dropped");
+
+        // The old owner never wrote: the new owner's manifest is byte-identical
+        // and it still serves the volume.
+        let (owner_after, _) = cs.get_manifest("vol1").await.unwrap().unwrap();
+        assert_eq!(&owner_after[..], &owner_before[..]);
+        let resp = request(&node_b, Method::POST, "/api/exports/vol1/drain", None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "the new owner still drains fine");
     }
 
     /// Single-attach generation fence: two nodes sharing one object store cannot

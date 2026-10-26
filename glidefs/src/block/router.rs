@@ -3679,6 +3679,7 @@ impl ExportRouter {
             //    Exponential backoff on consecutive errors prevents tight-looping
             //    when S3 is down (100 rapid retries → log spam + wasted network).
             let mut drain_done = false;
+            let mut fenced_out = false;
             let mut backoff = Duration::from_millis(100);
             for _ in 0..MAX_DRAIN_ITERATIONS {
                 match cache.flush_to_s3(&content_store, &pack_index_cache, &volume_manifest).await {
@@ -3688,6 +3689,17 @@ impl ExportRouter {
                     }
                     Ok(_) => {
                         backoff = Duration::from_millis(100);
+                    }
+                    // Superseded by a newer fence token: the volume belongs to
+                    // another holder now. Retrying cannot succeed and the dirty
+                    // blocks were never committed (correctly dropped); looping
+                    // here is what held an evacuated source's export for
+                    // minutes.
+                    Err(e @ CacheError::Fenced { .. }) => {
+                        metrics.record_flush_error();
+                        warn!("Teardown drain for '{}' abandoned: {}", name, e);
+                        fenced_out = true;
+                        break;
                     }
                     Err(e) => {
                         metrics.record_flush_error();
@@ -3711,7 +3723,10 @@ impl ExportRouter {
 
             // Best-effort final manifest sync — persists references to any packs
             // that were successfully uploaded even if the full drain didn't complete.
-            if let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await {
+            // A superseded writer never writes the manifest again.
+            if !fenced_out
+                && let Err(e) = cache.sync_manifest(&content_store, &volume_manifest).await
+            {
                 warn!(
                     "Final manifest sync for '{}' failed: {} — flushed packs may be orphaned",
                     name, e,
