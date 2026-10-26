@@ -1872,7 +1872,7 @@ impl BlockHandler {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::block::cache::SimpleBlockCache;
     use crate::block::pack::DEFAULT_FLUSH_THRESHOLD;
@@ -1882,7 +1882,7 @@ mod tests {
     use object_store::memory::InMemory;
     use tempfile::TempDir;
 
-    async fn test_handler() -> (BlockHandler, TempDir) {
+    pub(crate) async fn test_handler() -> (BlockHandler, TempDir) {
         test_handler_with_readonly(false).await
     }
 

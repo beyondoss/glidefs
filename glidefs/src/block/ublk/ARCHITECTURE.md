@@ -2,7 +2,7 @@
 
 Takes I/O commands from the Linux ublk kernel driver over io_uring, dispatches them to a `BlockHandler`, and commits results back to the kernel — exposing a `/dev/ublkbN` block device for each named export.
 
-The userspace side is a fixed-size **worker pool**: queues from thousands of devices are multiplexed across `K = min(num_cpus, 32)` worker threads, each owning one io_uring and one async executor. There is no per-device thread.
+The userspace side is a fixed-size **worker pool**: queues from thousands of devices are multiplexed across `K = min(num_cpus, 32)` worker threads, each owning one io_uring and one async executor. There is no per-device thread — on either transport. The user-copy transport runs queues on these workers; the zero-copy transport runs them on a second, equally bounded set of workers paired with them (see [Zero-copy transport](#zero-copy-transport)).
 
 ## Data Flow
 
@@ -67,6 +67,7 @@ Worker pool drop      ──► all io_uring fds close ──► kernel quiesces
 | Term | What It Controls | NOT |
 |------|------------------|-----|
 | `UblkServer` | Lifecycle of all devices (add, recover, remove); owns the `WorkerPool`; persists export→ID mapping | Does not handle I/O — only control plane |
+| `ZcPool` / ZC worker | Up to `K` lazily started threads, one per `WorkerPool` worker index, each owning one `DEFER_TASKRUN` io_uring that multiplexes the zero-copy queues placed on it | Not per queue or per device — a ZC queue is two table slots on a worker, not a thread |
 | `WorkerPool` | A fixed set of `K` worker threads; routes per-queue messages to a worker | Not a thread-per-device pool — worker count is decoupled from device count |
 | `Worker` | One OS thread, one io_uring, one `QueueExecutor`, one `EventFd`; hosts many queues from many devices | Not pinned to a device — it serves any queue routed to it |
 | `WorkerRing` | `Rc<RefCell<IoUring<…>>>` shared inside one worker; sparse fixed-file table holds all hosted cdev fds | Not `Send` — pinned to its worker thread |
@@ -146,6 +147,31 @@ The eventfd is registered with the worker's io_uring via `PollAdd`. The write pr
 ### Panic isolation
 
 `QueueExecutor::tick` polls each task inside `catch_unwind`. A panic in one device's task is reported and the task is dropped; co-tenants on the same worker keep running. This is essential at the worker-pool topology: a bug serving one export must not take out every export hosted on that worker.
+
+### Zero-copy transport
+
+On kernels with `UBLK_F_AUTO_BUF_REG + UBLK_F_SUPPORT_ZERO_COPY` (>= 6.15; usable >= 6.17) a device is created zero-copy and the kernel DMAs bio pages straight to and from the cache file. The data plane is different enough that it cannot share the user-copy worker's ring: the kernel auto-registers each bio into the **ring's registered-buffer table**, and the ring must be `SINGLE_ISSUER | DEFER_TASKRUN`. So zero-copy queues run on **ZC workers** (`zc_pool.rs` → `ublk-core/src/zc.rs`):
+
+```
+UblkQueue (hosted by user-copy worker i, as always)
+  └─ io_task(tag 0) ── ZcPool::add_queue(prefer i) ──► ZC worker j   (j = i, or next with room)
+  └─ io_task(tag 1..)  returns immediately                │  one thread, one ring, many queues
+                                                          ▼
+                              ring: sparse buffer table (ZC_BUF_TABLE = 16384 entries)
+                                    sparse fixed-file table (ZC_MAX_QUEUES = 256 entries)
+                                    io-wq capped (ZC_IOWQ_BOUNDED / ZC_IOWQ_UNBOUNDED)
+                              queue in slot s owns buffer indices [s*64, s*64+64), cdev at fixed file s
+```
+
+- **One thread, one ring per worker, not per queue.** The previous design spawned a thread and a ring per `(device, queue)`: 4 threads, 4 rings and ~4 io-wq workers per device, i.e. ~10,000 threads and ~5.5 MB (much of it kernel memory) per VM at ~1,400 devices. Now thread count, ring memory and io-wq workers are `O(K)`; an idle device costs table slots and its armed FETCH commands, no thread.
+- **Placement** reuses the user-copy hash (`worker_for(export, qid, numa_node)`), so a device's queues still land on distinct workers and keep the XOR-with-qid parallelism. A ring's buffer table caps it at 256 queues (`IORING_MAX_REG_BUFFERS = 16384` / 64 tags); a full worker spills the queue to the next one on the same node, then other nodes. Capacity is `K * 256` queues (8192 at `K = 32`, i.e. 2048 four-queue devices).
+- **`user_data`** carries `(queue slot, tag, op)`; every CQE is routed by slot. A slot is reused only after every SQE submitted for the old queue has returned its CQE, so a late CQE cannot reach the next tenant.
+- **Queue end**: the kernel's `STOP_DEV` aborts each armed FETCH. When the worker has seen all of them it clears the queue's fixed-file slot (the kernel's `DEL_DEV` waits for that reference), unmaps the io_desc area and fires `done`, which completes tag 0's `io_task` — and `UblkQueue::Drop` — exactly as on the user-copy path. (Fixed-file slot updates are only safe on kernels >= 6.13 — per-slot rsrc nodes — which zero-copy implies.)
+- **Quiesce/handoff** needs the *ring* closed, not just the queue forgotten (io_uring cannot cancel an armed ublk uring_cmd). `WorkerPool::shutdown` therefore, after the user-copy workers exit, calls `ZcPool::shutdown`, which stops and joins every ZC worker; returning means every ZC ring is closed. Dropping a cancelled `io_task_zero_copy` only tells its worker to stop serving that queue.
+- **Never block in `dispatch` / `after_*`**: they run on the ZC worker thread shared by every queue on it. Blocking work belongs on the deferred path (tokio dispatch runtime), as before.
+- **io-wq punts**: `READ_FIXED`/`WRITE_FIXED` complete inline only if the file supports non-blocking I/O. Measured on 6.12 (ext4): buffered `WRITE_FIXED` to the cache file is **always** punted to an io-wq worker (ext4 has no buffered-write nowait), and so is every op on the per-queue scratch memfd (shmem lacks `FMODE_NOWAIT`); cache-file reads and `/dev/zero` reads are not. An uncapped ring grows a kernel worker per blocked request (~5,100 `iou-wrk` threads at 1,385 devices), so each ring caps io-wq with `IORING_REGISTER_IOWQ_MAX_WORKERS`.
+
+Host-level budget (`K` ZC workers, default `min(cpus, 32)`): `K` threads + the shared dispatch runtime (`cpus` threads), `K` rings (~1 MB each: SQ 4096, CQ 32768, 16384-entry buffer table), at most `K * (16 + 4)` io-wq workers. Per device: 4 scratch memfds (sparse; 64 x 128 KiB virtual each, resident only for cold-read slices) and nothing else that scales with the thread or ring count.
 
 ### Sparse fixed-file table
 
@@ -271,6 +297,8 @@ On hardware where the kernel can't identify the backing device's node (single-so
 |------|-------------|
 | `mod.rs` | `UblkServer`: add/remove/recover devices; owns the `WorkerPool`; persists export→device-ID map to `ublk_devices.json`; probes `KernelFeatures` at startup; orphan sweep on recovery |
 | `worker_pool.rs` | `WorkerPool` + `Worker` + `WorkerMsg`: fixed-size thread pool, mpsc message routing, CPU affinity, runtime-sized `WakeupBits`, hash-based queue assignment |
+| `zc_pool.rs` | `ZcPool`: lazily started ZC worker threads paired by index with `WorkerPool` workers; queue placement with spill-over; `shutdown` closes every ZC ring |
+| `../../../ublk-core/src/zc.rs` | `run_zc_worker`: the multiplexed zero-copy io_uring loop (slots, buffer-index ranges, CQE routing, retire, io-wq cap) |
 | `device.rs` | `UblkDevice` record + `QueueExecutor` + `WakeupBits` + `TaskWaker` + per-tag `io_task` I/O loop + `dispatch_io` / `handle_io` |
 
 ## Configuration
@@ -280,7 +308,9 @@ On hardware where the kernel can't identify the backing device's node (single-so
 | `K` (workers) | `min(num_cpus, 32)` | Number of worker threads; each owns one io_uring |
 | `WORKER_WAKEUP_WORDS` | 1024 | `WakeupBits` size per worker → 65 536 task slots per worker |
 | `MAX_FIXED_FILES` | 4096 | io_uring sparse fixed-file slots per worker (one slot per hosted cdev fd) |
-| `QUEUE_DEPTH` | 64 | Inflight I/O capacity per queue; also the per-tag task count |
+| `QUEUE_DEPTH` | 64 | Inflight I/O capacity per queue; also the per-tag task count (and the ZC per-queue buffer-index width, `ZC_MAX_QUEUE_DEPTH`) |
+| `ZC_MAX_QUEUES` | 256 | Zero-copy queues one ZC worker hosts (`ZC_BUF_TABLE / 64`) |
+| `ZC_IOWQ_BOUNDED` / `ZC_IOWQ_UNBOUNDED` | 16 / 4 | Cap on kernel io-wq workers per ZC ring (regular files / everything else) |
 | `IO_BUF_BYTES` | 512 KB | Per-tag bounce buffer |
 | `URING_IDLE_SECS` | 2 s | `io_uring_enter` timeout when a worker has no hosted queues |
 | `RECOVERY_CONCURRENCY` | 16 | Parallel reattaches at startup |
@@ -296,6 +326,7 @@ On hardware where the kernel can't identify the backing device's node (single-so
 | `QueueExecutor::spawn` at capacity | `SpawnError::AtCapacity` returned via `ready` oneshot; `add_device` aborts | Caller sees 500; operator distributes load or raises `WORKER_WAKEUP_WORDS` |
 | A task panics inside `tick()` | `catch_unwind` captures it; task is dropped; co-tenants keep running | The kernel sees no COMMIT for that tag and may eventually timeout the I/O |
 | I/O dispatch error (handler returns `Err`) | Negative errno sent to kernel; kernel propagates to application | Application retries; no device state corruption |
+| ZC worker full / `ZcPool::add_queue` fails | tag 0's `io_task` logs and returns; the kernel `START_DEV` waits for FETCHes that never arrive | Capacity is `K * 256` queues; spill-over tries every worker before failing |
 | Daemon crash (`kill -9`) | All io_uring fds close → kernel quiesces every attached device | `recover_quiesced_devices()` reattaches all devices within seconds of next start |
 | Daemon graceful exit (SIGTERM) | Worker pool dropped; same path as crash. **`kill_dev` is intentionally not called.** | Same as crash |
 | Worker thread panics outside `tick()` | Worker join handle reports the error on shutdown | Pool exits; daemon restarts via systemd; recovery reattaches devices |

@@ -30,8 +30,9 @@ use crate::block::handler::BlockHandler;
 use ublk_core::io::{UblkDev, UblkQueue, WorkerRing};
 use ublk_core::UblkUringData;
 
-use super::device::{drain_eventfd, io_task, signal_eventfd, EventFd, QueueExecutor};
+use super::device::{drain_eventfd, io_task, signal_eventfd, EventFd, QueueExecutor, ZcRoute};
 use super::numa::NodeTopology;
+use super::zc_pool::ZcPool;
 
 /// Bounded inbox capacity. 64 is comfortable for the AddQueue/RemoveQueue
 /// traffic we expect (one device add ≈ `nr_queues` messages).
@@ -152,6 +153,7 @@ impl WorkerHandle {
         idx: usize,
         cpu: usize,
         tokio_handle: tokio::runtime::Handle,
+        zc: Arc<ZcPool>,
     ) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::channel(WORKER_INBOX_CAPACITY);
         // Build the eventfd async-side so we can hand a clone to the
@@ -179,6 +181,7 @@ impl WorkerHandle {
                         tokio_handle,
                         efd_for_thread,
                         stats_for_thread,
+                        zc,
                     )
                 }));
                 if let Err(payload) = result {
@@ -248,6 +251,9 @@ pub(super) struct WorkerPool {
     /// num_nodes`.
     nodes: Vec<Vec<WorkerHandle>>,
     topology: Arc<dyn NodeTopology>,
+    /// Zero-copy workers, paired by index with the workers above. Lazily
+    /// started, so a host without kernel ZC never creates a thread.
+    zc: Arc<ZcPool>,
 }
 
 impl WorkerPool {
@@ -285,16 +291,24 @@ impl WorkerPool {
         let per_node = (total_workers / num_nodes).max(1);
 
         let handle = tokio::runtime::Handle::current();
+        // `(node_index, cpu)` per worker, in worker-index order. Round-robin
+        // within each node's CPU list so workers pin to distinct CPUs when
+        // there are enough; otherwise they share.
+        let layout: Vec<(usize, usize)> = nodes_topo
+            .iter()
+            .enumerate()
+            .flat_map(|(ni, node)| {
+                (0..per_node).map(move |slot| (ni, node.cpus[slot % node.cpus.len()]))
+            })
+            .collect();
+        let zc = Arc::new(ZcPool::new(&layout));
         let mut nodes: Vec<Vec<WorkerHandle>> = Vec::with_capacity(num_nodes);
         let mut next_idx = 0usize;
         for node in nodes_topo {
             let mut node_workers = Vec::with_capacity(per_node);
-            for slot in 0..per_node {
-                // Round-robin within the node's CPU list so workers
-                // 0..per_node pin to distinct CPUs when there are
-                // enough; otherwise they share.
-                let cpu = node.cpus[slot % node.cpus.len()];
-                match WorkerHandle::spawn(next_idx, cpu, handle.clone()) {
+            for _ in 0..per_node {
+                let cpu = layout[next_idx].1;
+                match WorkerHandle::spawn(next_idx, cpu, handle.clone(), Arc::clone(&zc)) {
                     Ok(h) => node_workers.push(h),
                     Err(e) => {
                         tracing::error!(
@@ -318,7 +332,7 @@ impl WorkerPool {
             per_node,
             "ublk worker pool spawned"
         );
-        Ok(Self { nodes, topology })
+        Ok(Self { nodes, topology, zc })
     }
 
     pub(super) fn num_workers(&self) -> usize {
@@ -466,6 +480,11 @@ impl WorkerPool {
             .collect();
         futures::future::join_all(join_futs).await;
 
+        // The workers' executors are gone, so every ZC queue has been told
+        // to stop. Close the ZC rings too: the kernel moves a device to
+        // QUIESCED only when the last ring touching its cdev closes.
+        self.zc.shutdown().await;
+
         tracing::info!(count = total, "ublk worker pool shut down");
         Ok(())
     }
@@ -538,6 +557,8 @@ struct WorkerState<'a> {
     /// Set when a `WorkerMsg::Shutdown` arrives. The main loop exits as
     /// soon as the inbox is fully drained for this iteration.
     shutdown_done: Option<oneshot::Sender<()>>,
+    /// Zero-copy workers; a ZC queue's `io_task` hands its ring to one.
+    zc: Arc<ZcPool>,
     /// Live counters this worker publishes to anyone reading via
     /// `WorkerHandle::stats()`. Updated after AddQueue / RemoveQueue /
     /// every `tick()` so used/hosted_queues reflect the latest state.
@@ -551,6 +572,7 @@ fn worker_thread_main(
     tokio_handle: tokio::runtime::Handle,
     eventfd: Arc<EventFd>,
     stats: Arc<WorkerStats>,
+    zc: Arc<ZcPool>,
 ) {
     // Pin this worker thread to its assigned CPU. The CPU is chosen by
     // `WorkerPool::new` from the worker's owning NUMA node's `cpulist`,
@@ -631,6 +653,7 @@ fn worker_thread_main(
         hosted: HashMap::new(),
         pending_removes: Vec::new(),
         shutdown_done: None,
+        zc,
         stats: Arc::clone(&stats),
     };
     // Publish the fixed slot capacity once so readers see a sensible
@@ -968,8 +991,12 @@ fn handle_add_queue(
     for tag in 0..queue_depth {
         let q_for_task = q.clone();
         let h_for_task = Arc::clone(&handler);
+        let zc_route = ZcRoute {
+            pool: Arc::clone(&state.zc),
+            preferred: worker_idx,
+        };
         state.executor.spawn(async move {
-            match io_task(&q_for_task, tag, &h_for_task).await {
+            match io_task(&q_for_task, tag, &h_for_task, &zc_route).await {
                 Ok(()) => {}
                 Err(ublk_core::UblkError::QueueIsDown) => {
                     // Normal kill_dev / shutdown path.
@@ -1194,5 +1221,194 @@ mod tests {
             assert!(w.idx < 4);
         }
         pool.shutdown().await.expect("shutdown");
+    }
+
+    // -----------------------------------------------------------------
+    // Zero-copy thread budget
+    // -----------------------------------------------------------------
+
+    /// Threads of this process that exist because of ZC queues: the ZC
+    /// workers (`glidefs-zc-*`, minus the shared dispatch runtime, a host
+    /// constant) and io-wq workers the kernel spawned for our rings.
+    fn zc_threads() -> (usize, usize) {
+        let (mut zc, mut iowq) = (0, 0);
+        for t in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+            let comm = std::fs::read_to_string(t.path().join("comm")).unwrap_or_default();
+            if comm.starts_with("glidefs-zc-") && !comm.starts_with("glidefs-zc-disp") {
+                zc += 1;
+            } else if comm.starts_with("iou-wrk") {
+                iowq += 1;
+            }
+        }
+        (zc, iowq)
+    }
+
+    /// Host a ZC queue set for `devices` real (never started) kernel ublk
+    /// devices on a `workers`-thread pool and report the ZC thread cost.
+    ///
+    /// The kernel here may be too old for AUTO_BUF_REG, so the transport is
+    /// *simulated at the transport boundary*: each device is a genuine
+    /// `UBLK_CMD_ADD_DEV` device whose userspace `dev_info.flags` is marked
+    /// zero-copy, which is exactly the bit `io_task` dispatches on. The ZC
+    /// worker then does everything it does in production (mmap the cdev's
+    /// io_desc area, arm queue_depth FETCH uring_cmds per queue) minus
+    /// the bio DMA, which needs a started device on a >= 6.17 kernel.
+    async fn zc_thread_cost(devices: usize, workers: usize) -> (usize, usize) {
+        use std::sync::mpsc as std_mpsc;
+        use ublk_core::ctrl::UblkCtrlBuilder;
+        use ublk_core::io::UblkDev;
+        use ublk_core::{sys, UblkFlags};
+
+        let pool = WorkerPool::new(workers, single_node_topo()).expect("spawn pool");
+        let (handler, _tmp) = crate::block::handler::tests::test_handler().await;
+        let handler = Arc::new(handler);
+
+        let mut snaps = Vec::new();
+        for i in 0..devices {
+            for qid in 0..4u16 {
+                snaps.push(pool.worker_snapshot(&format!("zcpool-{i}"), qid, None));
+            }
+        }
+
+        let (armed_tx, armed_rx) = std_mpsc::channel::<Result<(), String>>();
+        let (teardown_tx, teardown_rx) = std_mpsc::channel::<()>();
+        // The control plane's io_uring is thread-local: build, use and drop
+        // every ctrl on this one thread, as `register_inner` does.
+        let handler_for_ctrl = Arc::clone(&handler);
+        let ctrl_thread = std::thread::spawn(move || {
+            let mut keep = Vec::new();
+            let mut readys = Vec::new();
+            let r: Result<(), String> = (|| {
+                for i in 0..devices {
+                    let ctrl = UblkCtrlBuilder::default()
+                        .name("zcpool-test")
+                        .id(-1)
+                        .nr_queues(4)
+                        .depth(crate::block::ublk::device::QUEUE_DEPTH)
+                        .io_buf_bytes(crate::block::ublk::device::IO_BUF_BYTES)
+                        .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                        .ctrl_flags(u64::from(sys::UBLK_F_CMD_IOCTL_ENCODE))
+                        .build()
+                        .map_err(|e| format!("ctrl build: {e:?}"))?;
+                    let mut dev = UblkDev::new(
+                        ctrl.get_name(),
+                        |d: &mut UblkDev| {
+                            d.tgt.dev_size = 1 << 20;
+                            Ok(())
+                        },
+                        &ctrl,
+                    )
+                    .map_err(|e| format!("UblkDev::new: {e:?}"))?;
+                    // The simulated-ZC bit (see fn docs).
+                    dev.dev_info.flags |=
+                        u64::from(sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_SUPPORT_ZERO_COPY);
+                    let dev = Arc::new(dev);
+                    for qid in 0..4u16 {
+                        let snap = &snaps[i * 4 + qid as usize];
+                        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                        snap.inbox
+                            .blocking_send(WorkerMsg::AddQueue {
+                                dev: Arc::clone(&dev),
+                                handler: Arc::clone(&handler_for_ctrl),
+                                qid,
+                                ready: ready_tx,
+                            })
+                            .map_err(|_| "worker channel closed".to_string())?;
+                        signal_eventfd(snap.eventfd.fd());
+                        readys.push(ready_rx);
+                    }
+                    keep.push((ctrl, dev));
+                }
+                for r in readys {
+                    r.blocking_recv()
+                        .map_err(|_| "ready dropped".to_string())?
+                        .map_err(|e| format!("AddQueue: {e}"))?;
+                }
+                Ok(())
+            })();
+            let failed = r.is_err();
+            let _ = armed_tx.send(r);
+            if failed {
+                // fall through to cleanup too
+            }
+            let _ = teardown_rx.recv();
+            // cdev fds first, then DEL_DEV via the ctrl's Drop.
+            let (ctrls, devs): (Vec<_>, Vec<_>) = keep.into_iter().unzip();
+            drop(devs);
+            drop(ctrls);
+        });
+
+        let armed = tokio::task::spawn_blocking(move || armed_rx.recv())
+            .await
+            .unwrap()
+            .expect("ctrl thread");
+        armed.expect("device setup");
+
+        // Let the io_tasks run their first poll and the ZC workers arm.
+        // Sample until the count stops moving.
+        let mut last = (usize::MAX, usize::MAX);
+        let mut stable = 0;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let now = zc_threads();
+            if now == last {
+                stable += 1;
+                if stable >= 10 {
+                    break;
+                }
+            } else {
+                stable = 0;
+                last = now;
+            }
+        }
+        let cost = zc_threads();
+        zc_hosted_assert(&pool, devices * 4).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), pool.shutdown())
+            .await
+            .expect("pool shutdown hung")
+            .expect("pool shutdown");
+        teardown_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || ctrl_thread.join().unwrap())
+            .await
+            .unwrap();
+        cost
+    }
+
+    /// Every queue really was placed on a ZC worker (so a low thread count
+    /// is not just "nothing happened").
+    async fn zc_hosted_assert(pool: &WorkerPool, queues: usize) {
+        for _ in 0..100 {
+            if pool.zc.hosted_queues() == queues {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(pool.zc.hosted_queues(), queues, "ZC queues were not all placed");
+    }
+
+    /// Thread count must be set by the host (worker count), not by how many
+    /// devices exist. On the per-queue-thread design this is 4 threads per
+    /// device (32 at 8 devices, 160 at 40).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zc_threads_are_bounded_by_workers_not_devices() {
+        if !std::path::Path::new("/dev/ublk-control").exists()
+            || unsafe { libc::geteuid() } != 0
+        {
+            eprintln!("skip: needs root and /dev/ublk-control");
+            return;
+        }
+        const WORKERS: usize = 4;
+        // The kernel's `ublks_max` defaults to 64 devices host-wide; leave
+        // room for whatever else is running.
+        const LARGE: usize = 40;
+        let (small, small_iowq) = zc_thread_cost(8, WORKERS).await;
+        let (large, large_iowq) = zc_thread_cost(LARGE, WORKERS).await;
+        eprintln!("zc threads: 8 devices={small} {LARGE} devices={large} (io-wq {small_iowq}/{large_iowq})");
+        assert!(small >= 1 && large >= 1, "no ZC threads at all — queues not hosted?");
+        assert!(small <= WORKERS, "8 devices spawned {small} ZC threads (> {WORKERS} workers)");
+        assert!(large <= WORKERS, "{LARGE} devices spawned {large} ZC threads (> {WORKERS} workers)");
+        let iowq_cap = WORKERS * (ublk_core::zc::ZC_IOWQ_BOUNDED + ublk_core::zc::ZC_IOWQ_UNBOUNDED) as usize;
+        assert!(large_iowq <= iowq_cap, "io-wq workers {large_iowq} exceed cap {iowq_cap}");
     }
 }

@@ -1,6 +1,6 @@
 //! End-to-end smoke test for kernel zero-copy I/O via `UBLK_F_AUTO_BUF_REG`.
 //!
-//! Exercises [`ublk_core::zc::run_zc_queue`] against a real ublk kernel
+//! Exercises [`ublk_core::zc::run_zc_worker`] against a real ublk kernel
 //! device with a memfd-backed target. The kernel auto-registers each bio
 //! at the io_uring sparse-buffer slot we name in the FETCH's
 //! `ublk_auto_buf_reg`; our worker submits `READ_FIXED` / `WRITE_FIXED`
@@ -19,7 +19,6 @@ use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -27,7 +26,8 @@ use ublk_core::ctrl::UblkCtrlBuilder;
 use ublk_core::io::UblkDev;
 use ublk_core::sys;
 use ublk_core::zc::{
-    run_zc_queue, ZcAction, ZcChunk, ZcChunkOp, ZcDispatch, ZcQueueHandle, ZcTarget,
+    run_zc_worker, zc_worker_channel, ZcAction, ZcChunk, ZcChunkOp, ZcDispatch, ZcQueueHandle,
+    ZcQueueSpec, ZcTarget,
 };
 use ublk_core::UblkFlags;
 
@@ -135,20 +135,23 @@ fn zero_copy_roundtrip() {
     let _backing_owner = unsafe { File::from_raw_fd(backing_fd) };
 
     let target: Arc<dyn ZcTarget> = Arc::new(MemfdTarget { fd: backing_fd });
-    let stop = Arc::new(AtomicBool::new(false));
-    // Eventfd ownership moved to the caller in this revision; in this
-    // smoke test we create + leak (the worker breaks via kernel ABORT
-    // and the test process exits soon after).
-    let wake_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-    assert!(wake_fd >= 0, "eventfd");
-    let worker = {
-        let target = Arc::clone(&target);
-        let stop = Arc::clone(&stop);
-        thread::Builder::new()
-            .name("zc-rt-worker".into())
-            .spawn(move || run_zc_queue(cdev_fd, 0, QUEUE_DEPTH, target, stop, wake_fd))
-            .expect("spawn worker")
-    };
+    let (worker_handle, inbox) = zc_worker_channel().expect("zc worker channel");
+    let worker = thread::Builder::new()
+        .name("zc-rt-worker".into())
+        .spawn(move || run_zc_worker(inbox))
+        .expect("spawn worker");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    worker_handle.add_queue(ZcQueueSpec {
+        key: 1,
+        cdev_fd,
+        qid: 0,
+        queue_depth: QUEUE_DEPTH,
+        target,
+        ready: Box::new(|r| r.expect("queue armed")),
+        done: Box::new(move |_| {
+            let _ = done_tx.send(());
+        }),
+    });
 
     ctrl.start_dev(&dev).expect("start_dev");
 
@@ -184,22 +187,18 @@ fn zero_copy_roundtrip() {
     }
     eprintln!("ROUND-TRIP MATCH");
 
-    stop.store(true, Ordering::SeqCst);
+    // STOP_DEV aborts every armed FETCH; the worker then retires the queue
+    // (clearing its cdev fixed-file slot) and reports `done`.
     let _ = ctrl.stop_dev();
+    let retired = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    worker_handle.shutdown();
     let start = std::time::Instant::now();
     while !worker.is_finished() && start.elapsed() < Duration::from_secs(2) {
         thread::sleep(Duration::from_millis(50));
     }
-    if worker.is_finished() {
-        let _ = worker.join();
-    } else {
-        // Worker still parked in submit_and_wait; data plane already
-        // verified, drop ownership and process::exit so libtest doesn't
-        // wait on the OS thread.
-        std::mem::forget(ctrl);
-        std::mem::forget(dev);
-        std::process::exit(0);
-    }
+    assert!(retired, "queue not retired after STOP_DEV");
+    assert!(worker.is_finished(), "worker did not exit on shutdown");
+    let _ = worker.join();
 }
 
 fn wait_for_bdev(path: &str) -> Option<String> {
