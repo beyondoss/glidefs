@@ -30,7 +30,10 @@ use crate::block::handler::BlockHandler;
 use ublk_core::io::{UblkDev, UblkQueue, WorkerRing};
 use ublk_core::UblkUringData;
 
-use super::device::{drain_eventfd, io_task, signal_eventfd, EventFd, QueueExecutor, ZcRoute};
+use super::device::{
+    drain_eventfd, io_task, is_zero_copy, place_zero_copy, signal_eventfd, EventFd, QueueExecutor,
+    ZcRoute,
+};
 use super::numa::NodeTopology;
 use super::zc_pool::ZcPool;
 
@@ -274,6 +277,25 @@ impl WorkerPool {
         total_workers: usize,
         topology: Arc<dyn NodeTopology>,
     ) -> std::io::Result<Self> {
+        Self::build(total_workers, topology, None)
+    }
+
+    /// As [`Self::new`], with a lower per-ZC-worker queue limit (tests
+    /// exercising a full pool without 256 real queues per worker).
+    #[cfg(test)]
+    pub(super) fn new_with_zc_limit(
+        total_workers: usize,
+        topology: Arc<dyn NodeTopology>,
+        zc_max_queues: usize,
+    ) -> std::io::Result<Self> {
+        Self::build(total_workers, topology, Some(zc_max_queues))
+    }
+
+    fn build(
+        total_workers: usize,
+        topology: Arc<dyn NodeTopology>,
+        zc_max_queues: Option<usize>,
+    ) -> std::io::Result<Self> {
         if total_workers == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -301,7 +323,11 @@ impl WorkerPool {
                 (0..per_node).map(move |slot| (ni, node.cpus[slot % node.cpus.len()]))
             })
             .collect();
-        let zc = Arc::new(ZcPool::new(&layout));
+        let mut zc_pool = ZcPool::new(&layout);
+        if let Some(m) = zc_max_queues {
+            zc_pool = zc_pool.with_max_queues(m);
+        }
+        let zc = Arc::new(zc_pool);
         let mut nodes: Vec<Vec<WorkerHandle>> = Vec::with_capacity(num_nodes);
         let mut next_idx = 0usize;
         for node in nodes_topo {
@@ -987,16 +1013,41 @@ fn handle_add_queue(
     // because `ready` below never fires. All other queues hosted on
     // this worker are also lost. This is a "should be unreachable"
     // path; if it ever fires, it's a bug in `QueueExecutor::available`.
-    let t_spawn_loop = Instant::now();
-    for tag in 0..queue_depth {
-        let q_for_task = q.clone();
-        let h_for_task = Arc::clone(&handler);
+    //
+    // Zero-copy: place the queue on its ZC worker now, before reporting
+    // ready. A full ZC pool refuses this AddQueue, which fails the device
+    // add cleanly; discovering it later, inside tag 0's task, left the
+    // device parked in START_DEV.
+    let mut ready = Some(ready);
+    let mut zc_ticket = if is_zero_copy(&q) {
         let zc_route = ZcRoute {
             pool: Arc::clone(&state.zc),
             preferred: worker_idx,
         };
+        match place_zero_copy(&q, Arc::clone(&handler), &zc_route) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::error!(worker = worker_idx, ?key, error = ?e, "ZC queue placement failed");
+                let _ = ready.take().map(|r| r.send(Err(format!("ZC queue placement failed: {e:?}"))));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let t_spawn_loop = Instant::now();
+    for tag in 0..queue_depth {
+        let q_for_task = q.clone();
+        let h_for_task = Arc::clone(&handler);
+        // Tag 0 of a ZC queue owns the ticket and the `AddQueue` reply: it
+        // answers once the ZC worker has armed the queue.
+        let ticket = if tag == 0 {
+            zc_ticket.take().and_then(|t| ready.take().map(|r| (t, r)))
+        } else {
+            None
+        };
         state.executor.spawn(async move {
-            match io_task(&q_for_task, tag, &h_for_task, &zc_route).await {
+            match io_task(&q_for_task, tag, &h_for_task, ticket).await {
                 Ok(()) => {}
                 Err(ublk_core::UblkError::QueueIsDown) => {
                     // Normal kill_dev / shutdown path.
@@ -1022,7 +1073,10 @@ fn handle_add_queue(
         spawn_loop_us = t_spawn_loop_us as u64,
         "handle_add_queue timing"
     );
-    let _ = ready.send(Ok(()));
+    // User-copy queues are ready now; a ZC queue's tag 0 answers once armed.
+    if let Some(r) = ready.take() {
+        let _ = r.send(Ok(()));
+    }
 }
 
 /// Drain the inbox after a startup failure, sending acks where requested
@@ -1410,5 +1464,181 @@ mod tests {
         assert!(large <= WORKERS, "{LARGE} devices spawned {large} ZC threads (> {WORKERS} workers)");
         let iowq_cap = WORKERS * (ublk_core::zc::ZC_IOWQ_BOUNDED + ublk_core::zc::ZC_IOWQ_UNBOUNDED) as usize;
         assert!(large_iowq <= iowq_cap, "io-wq workers {large_iowq} exceed cap {iowq_cap}");
+    }
+
+    // -----------------------------------------------------------------
+    // Zero-copy capacity: sizing, spread, and a full pool failing cleanly
+    // -----------------------------------------------------------------
+
+    /// The 72-CPU / 2-node AWS metal host: K = min(cpus, 32) workers, 16 per
+    /// node, and a ZC slot for each. The host once got 2 (one per node)
+    /// because the count came from the cgroup CPU quota, not the topology.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metal_host_gets_k_zc_workers() {
+        let topo: Arc<dyn NodeTopology> = Arc::new(FakeTopology::two_node(36, 36));
+        let k = crate::block::ublk::numa::worker_count(&*topo);
+        assert_eq!(k, 32, "72 CPUs on 2 nodes must size the pool at min(cpus, 32)");
+        let pool = WorkerPool::new(k, topo).expect("spawn pool");
+        assert_eq!(pool.num_workers(), 32);
+        assert_eq!(pool.num_nodes(), 2);
+        assert_eq!(pool.zc.num_slots(), 32, "one ZC worker slot per user-copy worker");
+        pool.shutdown().await.expect("shutdown");
+    }
+
+    /// 320 devices x 4 queues (1280 queues; the 2-worker pool topped out at
+    /// 512) all place, and spread across every worker instead of piling on a
+    /// few.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zc_queues_spread_and_none_refused_at_scale() {
+        let topo: Arc<dyn NodeTopology> = Arc::new(FakeTopology::two_node(36, 36));
+        let pool = WorkerPool::new(32, topo).expect("spawn pool");
+        const DEVICES: usize = 320;
+        for i in 0..DEVICES {
+            for qid in 0..4u16 {
+                let preferred = pool.worker_for(&format!("vm-{i}-disk"), qid, None).idx;
+                assert!(
+                    pool.zc.reserve_for_test(preferred).is_some(),
+                    "queue {i}/{qid} refused for capacity"
+                );
+            }
+        }
+        let loads: Vec<usize> = (0..32).map(|w| pool.zc.queues_on(w)).collect();
+        let total: usize = loads.iter().sum();
+        assert_eq!(total, DEVICES * 4);
+        let mean = total / 32;
+        let (min, max) = (*loads.iter().min().unwrap(), *loads.iter().max().unwrap());
+        assert!(min > 0 && max <= 2 * mean, "uneven spread: min {min} max {max} mean {mean}: {loads:?}");
+        pool.shutdown().await.expect("shutdown");
+    }
+
+    /// A preferred worker that is full spills to the next (same node first);
+    /// only when every worker is full does placement say no.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zc_full_worker_spills_then_pool_refuses() {
+        let topo: Arc<dyn NodeTopology> = Arc::new(FakeTopology::two_node(2, 2));
+        let pool = WorkerPool::new_with_zc_limit(4, topo, 3).expect("spawn pool");
+        // Everything prefers worker 0: workers fill in turn, node 0 first.
+        for n in 0..12 {
+            let got = pool.zc.reserve_for_test(0).unwrap_or_else(|| panic!("queue {n} refused"));
+            let expect = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3][n];
+            assert_eq!(got, expect, "queue {n}");
+        }
+        assert!(pool.zc.reserve_for_test(0).is_none(), "13th queue must be refused");
+        pool.shutdown().await.expect("shutdown");
+    }
+
+    /// End to end at the AddQueue layer: when the ZC pool is full the queue's
+    /// `AddQueue` is answered with an error. Before, the refusal surfaced
+    /// later as ENOSPC inside tag 0's `io_task` after `ready` had already
+    /// said OK, so the device add never failed and `START_DEV` waited forever.
+    ///
+    /// ZC is simulated as in `zc_thread_cost`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_zc_pool_fails_the_add_queue_not_the_io_task() {
+        if !std::path::Path::new("/dev/ublk-control").exists() || unsafe { libc::geteuid() } != 0 {
+            eprintln!("skip: needs root and /dev/ublk-control");
+            return;
+        }
+        use ublk_core::ctrl::UblkCtrlBuilder;
+        use ublk_core::io::UblkDev;
+        use ublk_core::{sys, UblkFlags};
+
+        // One worker, room for one device (4 queues).
+        let pool = WorkerPool::new_with_zc_limit(1, single_node_topo(), 4).expect("spawn pool");
+        let (handler, _tmp) = crate::block::handler::tests::test_handler().await;
+        let handler = Arc::new(handler);
+        let snaps: Vec<_> = (0..4u16).map(|q| pool.worker_snapshot("full-zc", q, None)).collect();
+
+        // Each queue's AddQueue reply, per device. The ctrl thread keeps the
+        // devices alive until told to tear down (after the pool, whose ZC
+        // rings pin the cdevs, has shut down).
+        let (replies_tx, replies_rx) = std::sync::mpsc::channel();
+        let (teardown_tx, teardown_rx) = std::sync::mpsc::channel::<()>();
+        let ctrl_thread = std::thread::spawn(move || {
+            let mut keep = Vec::new();
+            let mut replies: Vec<Vec<Result<(), String>>> = Vec::new();
+            for _ in 0..2 {
+                let ctrl = UblkCtrlBuilder::default()
+                    .name("zcfull-test")
+                    .id(-1)
+                    .nr_queues(4)
+                    .depth(crate::block::ublk::device::QUEUE_DEPTH)
+                    .io_buf_bytes(crate::block::ublk::device::IO_BUF_BYTES)
+                    .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+                    .ctrl_flags(u64::from(sys::UBLK_F_CMD_IOCTL_ENCODE))
+                    .build()
+                    .expect("ctrl");
+                let mut dev = UblkDev::new(
+                    ctrl.get_name(),
+                    |d: &mut UblkDev| {
+                        d.tgt.dev_size = 1 << 20;
+                        Ok(())
+                    },
+                    &ctrl,
+                )
+                .expect("dev");
+                dev.dev_info.flags |=
+                    u64::from(sys::UBLK_F_AUTO_BUF_REG | sys::UBLK_F_SUPPORT_ZERO_COPY);
+                let dev = Arc::new(dev);
+                let mut readys = Vec::new();
+                for qid in 0..4u16 {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    snaps[qid as usize]
+                        .inbox
+                        .blocking_send(WorkerMsg::AddQueue {
+                            dev: Arc::clone(&dev),
+                            handler: Arc::clone(&handler),
+                            qid,
+                            ready: tx,
+                        })
+                        .expect("send");
+                    signal_eventfd(snaps[qid as usize].eventfd.fd());
+                    readys.push(rx);
+                }
+                replies.push(
+                    readys
+                        .into_iter()
+                        .map(|rx| {
+                            // A hang here is the bug: the reply must come.
+                            let deadline = Instant::now() + std::time::Duration::from_secs(20);
+                            let mut rx = rx;
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(r) => break r,
+                                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                                        if Instant::now() < deadline =>
+                                    {
+                                        std::thread::sleep(std::time::Duration::from_millis(10))
+                                    }
+                                    Err(_) => break Err("no reply".to_string()),
+                                }
+                            }
+                        })
+                        .collect(),
+                );
+                keep.push((ctrl, dev));
+            }
+            replies_tx.send(replies).unwrap();
+            let _ = teardown_rx.recv();
+            let (ctrls, devs): (Vec<_>, Vec<_>) = keep.into_iter().unzip();
+            drop(devs);
+            drop(ctrls);
+        });
+        let results = tokio::task::spawn_blocking(move || replies_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        assert!(results[0].iter().all(Result::is_ok), "first device must fit: {:?}", results[0]);
+        assert!(
+            results[1].iter().all(Result::is_err),
+            "device past capacity must be refused at AddQueue: {:?}",
+            results[1]
+        );
+        assert!(results[1][0].as_ref().unwrap_err().contains("placement"), "{:?}", results[1]);
+        pool.shutdown().await.expect("shutdown");
+        teardown_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || ctrl_thread.join().unwrap())
+            .await
+            .unwrap();
     }
 }

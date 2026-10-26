@@ -119,10 +119,29 @@ impl NodeTopology for SysfsTopology {
     }
 }
 
+/// Upper bound on ublk workers (user-copy and, paired by index, zero-copy).
+pub const MAX_WORKERS: usize = 32;
+
+/// Number of ublk workers for a host: one per CPU, capped at
+/// [`MAX_WORKERS`].
+///
+/// Counts the topology's CPUs, never `std::thread::available_parallelism`.
+/// That call honours the cgroup CPU *quota*, and glidefs runs under a
+/// `CPUQuota=` unit: a quota of 100% reports 1 CPU on a 72-CPU host, which
+/// sized the pool at 2 workers (one per NUMA node) and capped the ZC path at
+/// 2 x `ZC_MAX_QUEUES` queues. The workers are mostly parked in
+/// `io_uring_enter`; the quota bounds how much CPU they burn, not how many
+/// rings the host needs.
+pub fn worker_count(topology: &dyn NodeTopology) -> usize {
+    let cpus: usize = topology.nodes().iter().map(|n| n.cpus.len()).sum();
+    cpus.clamp(1, MAX_WORKERS)
+}
+
 fn single_node_fallback() -> Vec<NodeInfo> {
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // Online CPUs of the host, ignoring any cgroup quota (see `worker_count`).
+    // SAFETY: sysconf has no preconditions.
+    let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    let num_cpus = usize::try_from(online).ok().filter(|&n| n > 0).unwrap_or(1);
     vec![NodeInfo { id: 0, cpus: (0..num_cpus).collect() }]
 }
 
@@ -302,5 +321,27 @@ mod tests {
             numa_node_for_path(Path::new("/does/not/exist/anywhere")),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_count_tests {
+    use super::*;
+
+    #[test]
+    fn one_worker_per_cpu_capped() {
+        assert_eq!(worker_count(&FakeTopology::single_node(4)), 4);
+        assert_eq!(worker_count(&FakeTopology::two_node(36, 36)), MAX_WORKERS);
+        assert_eq!(worker_count(&FakeTopology::two_node(8, 8)), 16);
+        assert_eq!(worker_count(&FakeTopology::single_node(1)), 1);
+    }
+
+    /// The fallback topology counts the host's CPUs, so a cgroup CPU quota
+    /// (which shrinks `available_parallelism`) cannot shrink the pool.
+    #[test]
+    fn fallback_ignores_cgroup_quota() {
+        let online = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } as usize;
+        let nodes = single_node_fallback();
+        assert_eq!(nodes[0].cpus.len(), online);
     }
 }

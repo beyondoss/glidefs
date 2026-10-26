@@ -121,12 +121,9 @@ impl UblkServer {
                  daemon will use USER_COPY+pool transport"
             );
         }
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(32);
         let topology: Arc<dyn numa::NodeTopology> =
             Arc::new(numa::SysfsTopology::detect());
+        let num_workers = numa::worker_count(&*topology);
         let pool = WorkerPool::new(num_workers, topology)
             .expect("failed to spawn ublk worker pool");
         Self {

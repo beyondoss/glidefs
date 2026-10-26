@@ -26,6 +26,13 @@ use ublk_core::helpers::IoBuf;
 use ublk_core::io::{UblkDev, UblkQueue};
 use ublk_core::{BufDesc, UblkError, UblkFlags, sys};
 
+use super::zc_pool::ZcTicket;
+
+/// Max devices being registered at once (see `register_inner`).
+const REGISTER_CONCURRENCY: usize = 16;
+static REGISTER_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(REGISTER_CONCURRENCY);
+
 /// Per-queue I/O depth (max inflight commands per queue).
 ///
 /// Empirically (see plan: we-do-not-need-dazzling-dewdrop) depth=64 captures
@@ -374,6 +381,14 @@ impl UblkDevice {
             start_dev_us: u128,
             spawn_blocking_total_us: u128,
         }
+        // Bound concurrent registrations. Each holds a blocking thread (and
+        // the thread's CTRL_URING with its io-wq worker) for the whole
+        // add, including START_DEV, so an unbounded burst of creates became a
+        // tokio thread plus an iou-wrk per device.
+        let _permit = REGISTER_PERMITS
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("register semaphore closed"))?;
         let outcome: anyhow::Result<(i32, PathBuf, Arc<UblkDev>, u16, RegTimings)> =
             tokio::task::spawn_blocking(move || {
                 let t_blocking_start = std::time::Instant::now();
@@ -1253,19 +1268,18 @@ pub(super) async fn io_task(
     q: &UblkQueue,
     tag: u16,
     handler: &Arc<BlockHandler>,
-    zc: &ZcRoute,
+    zc_ticket: Option<(ZcTicket, tokio::sync::oneshot::Sender<Result<(), String>>)>,
 ) -> Result<(), UblkError> {
     let dev_flags = q.dev.dev_info.flags;
-    let zero_copy = (dev_flags & u64::from(ublk_core::sys::UBLK_F_AUTO_BUF_REG)) != 0
-        && (dev_flags & u64::from(ublk_core::sys::UBLK_F_SUPPORT_ZERO_COPY)) != 0;
-    if zero_copy {
+    if is_zero_copy(q) {
         // ZC queues are driven by a shared ZC worker (see `zc_pool`) that
-        // owns the ring the queue's FETCHes live on. Tag 0's `io_task`
-        // places the queue on that worker and lives until the queue ends;
-        // all other tags' `io_task`s return immediately so their executor
-        // slots are freed.
-        if tag == 0 {
-            return io_task_zero_copy(q, handler.clone(), zc).await;
+        // owns the ring the queue's FETCHes live on. The queue was placed
+        // on that worker when it was added (`place_zero_copy`, before the
+        // device could start); tag 0's `io_task` holds the ticket and lives
+        // until the queue ends. All other tags' `io_task`s return
+        // immediately so their executor slots are freed.
+        if let Some((ticket, ready)) = zc_ticket {
+            return run_zero_copy(ticket, q.dev.dev_info.dev_id, q.get_qid(), ready).await;
         }
         return Ok(());
     }
@@ -1985,8 +1999,20 @@ fn dev_zero_fd() -> std::io::Result<std::os::fd::RawFd> {
     Ok(ZERO.get_or_init(|| f).as_raw_fd())
 }
 
-/// One async task per queue. Places the queue on a shared ZC worker and
-/// awaits its end.
+/// Whether the queue's device uses the kernel zero-copy transport.
+pub(super) fn is_zero_copy(q: &UblkQueue) -> bool {
+    let dev_flags = q.dev.dev_info.flags;
+    (dev_flags & u64::from(ublk_core::sys::UBLK_F_AUTO_BUF_REG)) != 0
+        && (dev_flags & u64::from(ublk_core::sys::UBLK_F_SUPPORT_ZERO_COPY)) != 0
+}
+
+/// Place a queue on a shared ZC worker. Called from the worker's
+/// `AddQueue` handler, so a full ZC pool (or any other placement failure)
+/// refuses the queue and fails the device add with an error. Placing it later,
+/// inside the queue's task, left the device waiting in `START_DEV` for FETCHes
+/// that never came while the control plane retried.
+///
+/// Drive the returned ticket with [`run_zero_copy`].
 ///
 /// **Why a worker pool, not a thread per queue**: the kernel requires
 /// `IORING_SETUP_SINGLE_ISSUER` on a ZC ring — only one thread may push
@@ -1997,11 +2023,11 @@ fn dev_zero_fd() -> std::io::Result<std::os::fd::RawFd> {
 /// on it (`ublk_core::zc`), so all of that is bounded by the worker count.
 /// The dedicated ZC dispatch runtime (see [`zc_dispatch_runtime`]) still owns
 /// the async handler work.
-pub(super) async fn io_task_zero_copy(
+pub(super) fn place_zero_copy(
     q: &UblkQueue,
     handler: Arc<BlockHandler>,
     zc: &ZcRoute,
-) -> Result<(), UblkError> {
+) -> Result<ZcTicket, UblkError> {
     use std::os::fd::RawFd;
     let cdev_fd: RawFd = q.dev.tgt.fds[0];
     let qid = q.get_qid();
@@ -2045,10 +2071,19 @@ pub(super) async fn io_task_zero_copy(
         scratch_slot_bytes,
     });
 
-    let ticket = zc
-        .pool
-        .add_queue(zc.preferred, cdev_fd, qid, queue_depth, target)?;
+    zc.pool
+        .add_queue(zc.preferred, cdev_fd, qid, queue_depth, target)
+}
 
+/// Await a placed ZC queue until it ends. `ready` is the queue's `AddQueue`
+/// reply: it fires once the ZC worker has armed the queue's FETCHes (or with
+/// why it could not), so the device only starts once every queue is armed.
+pub(super) async fn run_zero_copy(
+    ticket: ZcTicket,
+    dev_id: u32,
+    qid: u16,
+    ready: tokio::sync::oneshot::Sender<Result<(), String>>,
+) -> Result<(), UblkError> {
     // Drop guard: if this future is cancelled (worker pool shutdown during
     // handoff cutover, panic during normal shutdown, etc.) tell the ZC
     // worker to stop serving the queue. The kernel LIVE -> QUIESCED
@@ -2072,12 +2107,18 @@ pub(super) async fn io_task_zero_copy(
     };
 
     match ticket.ready.await {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            let _ = ready.send(Ok(()));
+        }
         Ok(Err(e)) => {
             tracing::error!(dev_id, qid, worker = ticket.worker_idx, error = %e, "ZC queue add failed");
+            let _ = ready.send(Err(format!("ZC queue add failed: {e}")));
             return Err(UblkError::OtherError(-libc::EIO));
         }
-        Err(_) => return Err(UblkError::OtherError(-libc::EIO)),
+        Err(_) => {
+            let _ = ready.send(Err("ZC worker exited before arming the queue".to_string()));
+            return Err(UblkError::OtherError(-libc::EIO));
+        }
     }
 
     // Kernel `STOP_DEV` aborts in-flight FETCHes → the worker observes the

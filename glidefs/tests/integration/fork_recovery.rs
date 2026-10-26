@@ -180,3 +180,60 @@ async fn blank_volume_without_manifest_still_recovers() {
     let got = r2.get_handler("blank").await.unwrap().read(0, BS as u32).await.unwrap();
     assert_eq!(got.as_ref(), &[0x42; BS][..]);
 }
+
+/// `Write` sink that tracing's fmt layer can clone per event.
+#[derive(Clone, Default)]
+struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
+    }
+}
+
+/// Recovery announces itself as "Creating export ... manifest=None" because
+/// `create_export`'s `manifest_name` is the source of a *fresh* fork and a
+/// recovered export has none. That read as "recovered with no manifest" when the
+/// fork's own persisted manifest was in fact loaded. The log must say what
+/// happened: no `manifest=None`, the lineage, and the persisted manifest load.
+#[tokio::test]
+async fn recovered_fork_logs_and_loads_its_persisted_manifest() {
+    let base_data = vec![0xBA; BS];
+    let (crashed, s3) = forked_then_crashed(&base_data, &vec![0xF0; BS]).await;
+    let r = router(crashed.path(), s3).await;
+
+    let buf = LogBuf::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let guard = tracing::subscriber::set_default(sub);
+    let results = boot_recover(&r, crashed.path(), &["fork1"]).await;
+    drop(guard);
+    results[0].1.as_ref().expect("fork recovers");
+
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    assert!(!log.contains("manifest=None"), "misleading recovery log:\n{log}");
+    assert!(
+        log.contains("Creating export 'fork1'") && log.contains("lineage=Some(\"volume:base\")"),
+        "recovery log must show the lineage:\n{log}"
+    );
+    assert!(
+        log.contains("Loaded existing volume manifest for 'fork1'"),
+        "recovery must load the fork's persisted manifest:\n{log}"
+    );
+    let got = r.get_handler("fork1").await.unwrap().read(0, BS as u32).await.unwrap();
+    assert_eq!(got.as_ref(), &base_data[..]);
+}

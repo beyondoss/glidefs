@@ -85,7 +85,7 @@ Worker pool drop      ──► all io_uring fds close ──► kernel quiesces
 
 ### Worker pool
 
-`K = min(num_cpus, 32)` worker threads are spawned at `UblkServer` construction, **partitioned across NUMA nodes**. Each worker:
+`K = min(host CPUs, 32)` worker threads are spawned at `UblkServer` construction, **partitioned across NUMA nodes**. `K` counts the NUMA topology's CPUs (`numa::worker_count`), never `available_parallelism`: that honours the cgroup `CPUQuota=` and sized a 72-CPU host at 2 workers (a hard 512-queue / 128-device ZC cap). Each worker:
 
 1. Builds its own `io_uring` ring (`SINGLE_ISSUER`, sparse fixed-file table of `MAX_FIXED_FILES = 4096` slots).
 2. Builds a `QueueExecutor` with a runtime-sized `WakeupBits` (`WORKER_WAKEUP_WORDS = 1024` → 65 536 task slots).
@@ -170,6 +170,8 @@ UblkQueue (hosted by user-copy worker i, as always)
 - **Quiesce/handoff** needs the *ring* closed, not just the queue forgotten (io_uring cannot cancel an armed ublk uring_cmd). `WorkerPool::shutdown` therefore, after the user-copy workers exit, calls `ZcPool::shutdown`, which stops and joins every ZC worker; returning means every ZC ring is closed. Dropping a cancelled `io_task_zero_copy` only tells its worker to stop serving that queue.
 - **Never block in `dispatch` / `after_*`**: they run on the ZC worker thread shared by every queue on it. Blocking work belongs on the deferred path (tokio dispatch runtime), as before.
 - **io-wq punts**: `READ_FIXED`/`WRITE_FIXED` complete inline only if the file supports non-blocking I/O. Measured on 6.12 (ext4): buffered `WRITE_FIXED` to the cache file is **always** punted to an io-wq worker (ext4 has no buffered-write nowait), and so is every op on the per-queue scratch memfd (shmem lacks `FMODE_NOWAIT`); cache-file reads and `/dev/zero` reads are not. An uncapped ring grows a kernel worker per blocked request (~5,100 `iou-wrk` threads at 1,385 devices), so each ring caps io-wq with `IORING_REGISTER_IOWQ_MAX_WORKERS`.
+
+A ZC queue is placed on its worker inside `AddQueue`, before `ready` fires (`place_zero_copy`); a full pool (`K * 256` queues) or a failed arm answers the `AddQueue` with an error and the device add fails cleanly. Registrations run at most 16 at a time (`REGISTER_PERMITS`), bounding the blocking threads (and their control-ring io-wq workers) a burst of creates can hold.
 
 Host-level budget (`K` ZC workers, default `min(cpus, 32)`): `K` threads + the shared dispatch runtime (`cpus` threads), `K` rings (~1 MB each: SQ 4096, CQ 32768, 16384-entry buffer table), at most `K * (16 + 4)` io-wq workers. Per device: 4 scratch memfds (sparse; 64 x 128 KiB virtual each, resident only for cold-read slices) and nothing else that scales with the thread or ring count.
 
@@ -305,7 +307,7 @@ On hardware where the kernel can't identify the backing device's node (single-so
 
 | Constant / Option | Default | What It Controls at Runtime |
 |------------------|---------|----------------------------|
-| `K` (workers) | `min(num_cpus, 32)` | Number of worker threads; each owns one io_uring |
+| `K` (workers) | `min(host CPUs, 32)` | Number of worker threads; each owns one io_uring |
 | `WORKER_WAKEUP_WORDS` | 1024 | `WakeupBits` size per worker → 65 536 task slots per worker |
 | `MAX_FIXED_FILES` | 4096 | io_uring sparse fixed-file slots per worker (one slot per hosted cdev fd) |
 | `QUEUE_DEPTH` | 64 | Inflight I/O capacity per queue; also the per-tag task count (and the ZC per-queue buffer-index width, `ZC_MAX_QUEUE_DEPTH`) |

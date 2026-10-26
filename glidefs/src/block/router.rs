@@ -1496,12 +1496,13 @@ impl ExportRouter {
         }
 
         info!(
-            "Creating export '{}': size={}GB, s3_prefix={}, readonly={}, manifest={:?}",
+            "Creating export '{}': size={}GB, s3_prefix={}, readonly={}, fork_from={:?}, lineage={:?}",
             name,
             config.size_gb,
             config.s3_prefix(),
             readonly,
             manifest_name,
+            config.source,
         );
 
         // Create metrics for this export (created first so S3BlockStore can use it)
@@ -1698,7 +1699,15 @@ impl ExportRouter {
                     })?;
                     let volume_manifest = Arc::new(parking_lot::RwLock::new(vm));
                     *cache.inner.manifest_etag.lock() = etag;
-                    info!("Loaded existing volume manifest for '{}'", name);
+                    // `fork_from=None` in "Creating export" is not a missing
+                    // manifest: `manifest_name` is only the source of a
+                    // *fresh* fork. A recovered export (a fork included)
+                    // arrives with none and loads its own persisted manifest
+                    // here.
+                    info!(
+                        lineage = ?config.source,
+                        "Loaded existing volume manifest for '{}'", name
+                    );
                     volume_manifest
                 }
                 Ok(None) if config.source.is_some() => {

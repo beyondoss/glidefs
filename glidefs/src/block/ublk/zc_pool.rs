@@ -50,6 +50,9 @@ struct Slot {
 pub(super) struct ZcPool {
     slots: Vec<Slot>,
     next_key: AtomicU64,
+    /// Queues one worker accepts: [`ZC_MAX_QUEUES`] (the ring's table), or
+    /// fewer in tests that exercise the full-pool path.
+    max_queues: usize,
 }
 
 /// A queue placed on a ZC worker.
@@ -79,7 +82,14 @@ impl ZcPool {
                 })
                 .collect(),
             next_key: AtomicU64::new(1),
+            max_queues: ZC_MAX_QUEUES,
         }
+    }
+
+    /// Lower the per-worker queue limit (never above the ring's real limit).
+    pub(super) fn with_max_queues(mut self, max_queues: usize) -> Self {
+        self.max_queues = max_queues.min(ZC_MAX_QUEUES);
+        self
     }
 
     /// Workers that have been started (threads that exist).
@@ -112,7 +122,27 @@ impl ZcPool {
             .chain(rotated().filter(move |&i| self.slots[i].node != node))
     }
 
+    /// Reserve a queue slot, trying `preferred`'s worker, then the rest of
+    /// its node, then every other node. `None` only when every worker's
+    /// ring is full (`K * ZC_MAX_QUEUES` queues host-wide).
+    fn reserve(&self, preferred: usize) -> Option<usize> {
+        self.candidates(preferred).find(|&idx| {
+            let queues = &self.slots[idx].queues;
+            if queues.fetch_add(1, Ordering::AcqRel) >= self.max_queues {
+                queues.fetch_sub(1, Ordering::AcqRel);
+                false
+            } else {
+                true
+            }
+        })
+    }
+
     /// Place a queue on a ZC worker (starting its thread if needed).
+    ///
+    /// Synchronous so the caller can refuse the queue *before* the device
+    /// starts: a queue that cannot be placed fails the export with an error,
+    /// instead of leaving the kernel's `START_DEV` waiting forever for
+    /// FETCHes that will never arrive.
     pub(super) fn add_queue(
         &self,
         preferred: usize,
@@ -121,46 +151,65 @@ impl ZcPool {
         queue_depth: u16,
         target: Arc<dyn ZcTarget>,
     ) -> Result<ZcTicket, UblkError> {
-        for idx in self.candidates(preferred) {
-            let slot = &self.slots[idx];
-            if slot.queues.fetch_add(1, Ordering::AcqRel) >= ZC_MAX_QUEUES {
+        let Some(idx) = self.reserve(preferred) else {
+            tracing::error!(
+                workers = self.slots.len(),
+                capacity = self.slots.len() * self.max_queues,
+                "ZC worker pool is full; refusing queue"
+            );
+            return Err(UblkError::OtherError(-libc::ENOSPC));
+        };
+        let slot = &self.slots[idx];
+        let worker = match self.worker(idx) {
+            Ok(w) => w,
+            Err(e) => {
                 slot.queues.fetch_sub(1, Ordering::AcqRel);
-                continue;
+                return Err(UblkError::IOError(e));
             }
-            let worker = match self.worker(idx) {
-                Ok(w) => w,
-                Err(e) => {
-                    slot.queues.fetch_sub(1, Ordering::AcqRel);
-                    return Err(UblkError::IOError(e));
-                }
-            };
-            let key = self.next_key.fetch_add(1, Ordering::Relaxed);
-            let (ready_tx, ready) = oneshot::channel();
-            let (done_tx, done) = oneshot::channel();
-            let queues = Arc::clone(&slot.queues);
-            worker.add_queue(ZcQueueSpec {
-                key,
-                cdev_fd,
-                qid,
-                queue_depth,
-                target,
-                ready: Box::new(move |r| {
-                    let _ = ready_tx.send(r.map_err(|e| format!("{e:?}")));
-                }),
-                done: Box::new(move |_| {
-                    queues.fetch_sub(1, Ordering::AcqRel);
-                    let _ = done_tx.send(());
-                }),
-            });
-            return Ok(ZcTicket {
-                worker_idx: idx,
-                worker,
-                key,
-                ready,
-                done,
-            });
-        }
-        Err(UblkError::OtherError(-libc::ENOSPC))
+        };
+        let key = self.next_key.fetch_add(1, Ordering::Relaxed);
+        let (ready_tx, ready) = oneshot::channel();
+        let (done_tx, done) = oneshot::channel();
+        let queues = Arc::clone(&slot.queues);
+        worker.add_queue(ZcQueueSpec {
+            key,
+            cdev_fd,
+            qid,
+            queue_depth,
+            target,
+            ready: Box::new(move |r| {
+                let _ = ready_tx.send(r.map_err(|e| format!("{e:?}")));
+            }),
+            done: Box::new(move |_| {
+                queues.fetch_sub(1, Ordering::AcqRel);
+                let _ = done_tx.send(());
+            }),
+        });
+        Ok(ZcTicket {
+            worker_idx: idx,
+            worker,
+            key,
+            ready,
+            done,
+        })
+    }
+
+    /// ZC worker slots (started or not).
+    #[cfg(test)]
+    pub(super) fn num_slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Queues reserved on worker `idx`.
+    #[cfg(test)]
+    pub(super) fn queues_on(&self, idx: usize) -> usize {
+        self.slots[idx].queues.load(Ordering::Relaxed)
+    }
+
+    /// Reserve without starting a worker (placement-only tests).
+    #[cfg(test)]
+    pub(super) fn reserve_for_test(&self, preferred: usize) -> Option<usize> {
+        self.reserve(preferred)
     }
 
     fn worker(&self, idx: usize) -> std::io::Result<ZcWorkerHandle> {
