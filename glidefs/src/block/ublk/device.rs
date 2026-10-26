@@ -33,14 +33,14 @@ use ublk_core::{BufDesc, UblkError, UblkFlags, sys};
 /// the write-path peak. Going higher inflates IoBuf virtual memory without
 /// material throughput. Going lower starts to leave IOPS on the table at
 /// jobs ≥ 4.
-const QUEUE_DEPTH: u16 = 64;
+pub(super) const QUEUE_DEPTH: u16 = 64;
 
 /// Max I/O buffer size per tag. Sized to the WriteCache block size (128 KB) — the
 /// kernel splits any larger upstream bio into 128 KB chunks at `max_sectors_kb`,
 /// which we pin via `max_io_buf_bytes` below. The previous 512 KB was over-spec:
 /// at 5k devices it puts warm-baseline RSS at ~21 GiB; sized to the block size
 /// it's ~5 GiB.
-const IO_BUF_BYTES: u32 = 128 * 1024;
+pub(super) const IO_BUF_BYTES: u32 = 128 * 1024;
 
 /// `IO_BUF_BYTES` as `usize`, for compile-time coupling with
 /// `buffer_pool::SLOT_SIZE`. Keep these two equal.
@@ -1253,17 +1253,19 @@ pub(super) async fn io_task(
     q: &UblkQueue,
     tag: u16,
     handler: &Arc<BlockHandler>,
+    zc: &ZcRoute,
 ) -> Result<(), UblkError> {
     let dev_flags = q.dev.dev_info.flags;
     let zero_copy = (dev_flags & u64::from(ublk_core::sys::UBLK_F_AUTO_BUF_REG)) != 0
         && (dev_flags & u64::from(ublk_core::sys::UBLK_F_SUPPORT_ZERO_COPY)) != 0;
     if zero_copy {
-        // ZC queues are driven by a single dedicated OS thread (per queue)
-        // that owns the queue's ZC io_uring. Tag 0's `io_task` hosts that
-        // thread and lives until it exits; all other tags' `io_task`s
-        // return immediately so their executor slots are freed.
+        // ZC queues are driven by a shared ZC worker (see `zc_pool`) that
+        // owns the ring the queue's FETCHes live on. Tag 0's `io_task`
+        // places the queue on that worker and lives until the queue ends;
+        // all other tags' `io_task`s return immediately so their executor
+        // slots are freed.
         if tag == 0 {
-            return io_task_zero_copy(q, handler.clone()).await;
+            return io_task_zero_copy(q, handler.clone(), zc).await;
         }
         return Ok(());
     }
@@ -1376,9 +1378,9 @@ pub(super) async fn io_task(
 struct GlidefsZcTarget {
     handler: Arc<BlockHandler>,
     runtime: tokio::runtime::Handle,
-    /// `/dev/zero` opened once at queue setup. Used as the source fd for
-    /// `READ_FIXED` covering all-zero chunks — no userspace memset, no
-    /// pwrite of zeros to the cache file.
+    /// Process-wide `/dev/zero` (see [`dev_zero_fd`]; not owned here). Used
+    /// as the source fd for `READ_FIXED` covering all-zero chunks — no
+    /// userspace memset, no pwrite of zeros to the cache file.
     dev_zero_fd: std::os::fd::RawFd,
     /// Per-queue scratch memfd, sized to `queue_depth * max_io_buf_bytes`.
     /// Tag T owns the slot at byte offset `T * scratch_slot_bytes`.
@@ -1406,9 +1408,6 @@ struct GlidefsZcTarget {
 
 impl Drop for GlidefsZcTarget {
     fn drop(&mut self) {
-        if self.dev_zero_fd >= 0 {
-            unsafe { libc::close(self.dev_zero_fd) };
-        }
         if self.scratch_fd >= 0 {
             unsafe { libc::close(self.scratch_fd) };
         }
@@ -1966,20 +1965,42 @@ fn zc_dispatch_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-/// One async task per queue. Spawns a dedicated OS thread for the ZC
-/// io_uring loop, then awaits its completion via a oneshot.
+/// Where a ZC queue's ring lives: the shared ZC worker pool and the worker
+/// index the queue's `(export, qid)` hash selected (placement starts there).
+pub(super) struct ZcRoute {
+    pub(super) pool: Arc<super::zc_pool::ZcPool>,
+    pub(super) preferred: usize,
+}
+
+/// `/dev/zero`, opened once for the process. Source fd for `READ_FIXED` on
+/// zero-block chunks — kernel reads zeros straight into the bio, no
+/// userspace memset, no per-tag scratch. The fd is never closed.
+fn dev_zero_fd() -> std::io::Result<std::os::fd::RawFd> {
+    use std::os::fd::AsRawFd;
+    static ZERO: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+    if let Some(f) = ZERO.get() {
+        return Ok(f.as_raw_fd());
+    }
+    let f = std::fs::File::open("/dev/zero")?;
+    Ok(ZERO.get_or_init(|| f).as_raw_fd())
+}
+
+/// One async task per queue. Places the queue on a shared ZC worker and
+/// awaits its end.
 ///
-/// **Why a dedicated OS thread**: `run_zc_queue` is a synchronous
-/// `submit_and_wait`-driven loop. The kernel requires `IORING_SETUP_SINGLE_
-/// ISSUER` on this ring — only one thread may push SQEs. Folding this into
-/// the existing tokio runtime would mean integrating io_uring as an
-/// `AsyncFd` and submitting via futures, which is a much bigger surgery.
-/// One thread per queue is the cheapest correct hosting; the dedicated ZC
-/// dispatch runtime (see [`zc_dispatch_runtime`]) owns the async handler
-/// work.
+/// **Why a worker pool, not a thread per queue**: the kernel requires
+/// `IORING_SETUP_SINGLE_ISSUER` on a ZC ring — only one thread may push
+/// SQEs — and a ring costs its SQ/CQ memory, a registered-buffer table and
+/// io-wq workers on top of the thread. One of each per queue meant 4 threads,
+/// 4 rings and up to ~4 io-wq workers per device: ~10,000 threads and
+/// ~5.5 MB per VM at ~1,400 devices. A worker multiplexes every queue placed
+/// on it (`ublk_core::zc`), so all of that is bounded by the worker count.
+/// The dedicated ZC dispatch runtime (see [`zc_dispatch_runtime`]) still owns
+/// the async handler work.
 pub(super) async fn io_task_zero_copy(
     q: &UblkQueue,
     handler: Arc<BlockHandler>,
+    zc: &ZcRoute,
 ) -> Result<(), UblkError> {
     use std::os::fd::RawFd;
     let cdev_fd: RawFd = q.dev.tgt.fds[0];
@@ -1988,15 +2009,7 @@ pub(super) async fn io_task_zero_copy(
     let dev_id = q.dev.dev_info.dev_id;
     let runtime = zc_dispatch_runtime().handle().clone();
 
-    // Open /dev/zero once per queue. Used as the source fd for READ_FIXED
-    // on zero-block chunks — kernel reads zeros directly into bio, no
-    // userspace memset, no per-tag scratch buffer.
-    let dev_zero_path = std::ffi::CString::new("/dev/zero").unwrap();
-    let dev_zero_fd =
-        unsafe { libc::open(dev_zero_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if dev_zero_fd < 0 {
-        return Err(UblkError::IOError(std::io::Error::last_os_error()));
-    }
+    let dev_zero_fd = dev_zero_fd().map_err(UblkError::IOError)?;
 
     // Per-queue scratch memfd, sized to queue_depth × max_io_buf_bytes.
     // Each tag T owns slot at byte offset T * max_io_buf_bytes. Used as
@@ -2014,18 +2027,16 @@ pub(super) async fn io_task_zero_copy(
     let scratch_fd =
         unsafe { libc::syscall(libc::SYS_memfd_create, scratch_name.as_ptr(), 0u32) as RawFd };
     if scratch_fd < 0 {
-        unsafe { libc::close(dev_zero_fd) };
         return Err(UblkError::IOError(std::io::Error::last_os_error()));
     }
     if unsafe { libc::ftruncate(scratch_fd, scratch_total as i64) } < 0 {
         let err = std::io::Error::last_os_error();
-        unsafe {
-            libc::close(scratch_fd);
-            libc::close(dev_zero_fd);
-        }
+        unsafe { libc::close(scratch_fd) };
         return Err(UblkError::IOError(err));
     }
 
+    // The target owns `scratch_fd` from here: its Drop closes it, whether
+    // the queue is never placed (below) or ends.
     let target: Arc<dyn ublk_core::zc::ZcTarget> = Arc::new(GlidefsZcTarget {
         handler,
         runtime,
@@ -2033,106 +2044,46 @@ pub(super) async fn io_task_zero_copy(
         scratch_fd,
         scratch_slot_bytes,
     });
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_for_thread = Arc::clone(&stop);
 
-    // Cross-thread wake-up eventfd. Owned out here (not inside
-    // `run_zc_queue`) so the Drop guard can write to it after flipping
-    // `stop` — that's what gives us a synchronous LIVE→QUIESCED
-    // transition during handoff cutover. EFD_NONBLOCK so loop reads
-    // never block; EFD_CLOEXEC because nothing in glidefs forks.
-    let wake_fd: RawFd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-    if wake_fd < 0 {
-        return Err(UblkError::IOError(std::io::Error::last_os_error()));
+    let ticket = zc
+        .pool
+        .add_queue(zc.preferred, cdev_fd, qid, queue_depth, target)?;
+
+    // Drop guard: if this future is cancelled (worker pool shutdown during
+    // handoff cutover, panic during normal shutdown, etc.) tell the ZC
+    // worker to stop serving the queue. The kernel LIVE -> QUIESCED
+    // transition (UBLK_F_USER_RECOVERY contract) needs the ring itself
+    // closed, which `WorkerPool::shutdown` does right after the workers
+    // exit (`ZcPool::shutdown`) — caught by `handoff_durability_crh_per_pr`
+    // + `fs_crash_recovery::test_fs_crash_fsync_honored_ublk`.
+    struct RemoveOnDrop {
+        worker: ublk_core::zc::ZcWorkerHandle,
+        key: u64,
     }
-    // Own the eventfd immediately so any early return before the
-    // `ZcThreadGuard` is constructed (notably thread-spawn failure under
-    // resource exhaustion) closes it instead of leaking one fd per queue.
-    // The ZC thread only borrows the raw value (RawFd is Copy); ownership
-    // stays here until we hand it to the guard below.
-    let wake_owned =
-        unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(wake_fd) };
-
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    let join = std::thread::Builder::new()
-        .name(format!("glidefs-zc-{}-{}", dev_id, qid))
-        .spawn(move || {
-            let result = ublk_core::zc::run_zc_queue(
-                cdev_fd,
-                qid,
-                queue_depth,
-                target,
-                stop_for_thread,
-                wake_fd,
-            );
-            let _ = done_tx.send(result);
-        })
-        .map_err(|e| UblkError::IOError(std::io::Error::other(e.to_string())))?;
-    // Spawn succeeded: release ownership without closing — the guard now
-    // manages the fd's lifetime (close after join, see below).
-    let wake_fd: RawFd = std::os::fd::IntoRawFd::into_raw_fd(wake_owned);
-
-    // Drop guard: if the future is cancelled (worker pool shutdown
-    // during handoff cutover, panic during normal shutdown, etc.):
-    //
-    //   1. Flip `stop = true`
-    //   2. Write to `wake_fd` so any in-flight `submit_and_wait(1)`
-    //      returns immediately via the PollAdd CQE (without this, the
-    //      loop sleeps until the next real CQE — which never comes on a
-    //      quiesced device, deadlocking shutdown).
-    //   3. Join the ZC thread.
-    //   4. Close `wake_fd`.
-    //
-    // The thread sees `stop`, drains pending CQEs non-blockingly, then
-    // breaks → IoUring drops → its fd closes → kernel transitions the
-    // ublk device LIVE→QUIESCED (UBLK_F_USER_RECOVERY contract). That's
-    // the path the successor's recovery requires.
-    //
-    // Caught by `handoff_durability_crh_per_pr` + `fs_crash_recovery::
-    // test_fs_crash_fsync_honored_ublk`.
-    struct ZcThreadGuard {
-        stop: Arc<std::sync::atomic::AtomicBool>,
-        wake_fd: RawFd,
-        join: Option<std::thread::JoinHandle<()>>,
-    }
-    impl Drop for ZcThreadGuard {
+    impl Drop for RemoveOnDrop {
         fn drop(&mut self) {
-            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-            // Wake the loop. Errors ignored — at worst we wait for the
-            // thread's own bounded poll timeout.
-            let one = 1u64.to_ne_bytes();
-            unsafe {
-                libc::write(self.wake_fd, one.as_ptr() as *const _, 8);
-            }
-            if let Some(j) = self.join.take() {
-                let h = j;
-                let detach_after = std::time::Duration::from_secs(5);
-                let start = std::time::Instant::now();
-                while !h.is_finished() && start.elapsed() < detach_after {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                if h.is_finished() {
-                    let _ = h.join();
-                }
-                // else: detach — the thread will exit when the process does.
-            }
-            unsafe { libc::close(self.wake_fd) };
+            // Idempotent: a queue that already ended ignores a stale key.
+            self.worker.remove_queue(self.key);
         }
     }
-    let _zc_guard = ZcThreadGuard {
-        stop,
-        wake_fd,
-        join: Some(join),
+    let _guard = RemoveOnDrop {
+        worker: ticket.worker.clone(),
+        key: ticket.key,
     };
 
-    // Kernel `STOP_DEV` aborts in-flight FETCHes → `run_zc_queue` observes
-    // the ABORT CQEs → exits its loop → `done_tx` fires → we return.
-    // Future cancellation (handoff cutover) hits `ZcThreadGuard::drop`
-    // instead, which signals `stop` and waits for the thread to exit.
-    match done_rx.await {
-        Ok(result) => result,
-        Err(_) => Ok(()),
+    match ticket.ready.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(dev_id, qid, worker = ticket.worker_idx, error = %e, "ZC queue add failed");
+            return Err(UblkError::OtherError(-libc::EIO));
+        }
+        Err(_) => return Err(UblkError::OtherError(-libc::EIO)),
     }
+
+    // Kernel `STOP_DEV` aborts in-flight FETCHes → the worker observes the
+    // ABORT CQEs, releases the queue's slot and fires `done`.
+    let _ = ticket.done.await;
+    Ok(())
 }
 
 /// `UBLK_F_USER_COPY` variant of `io_task`.
